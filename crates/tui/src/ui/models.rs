@@ -41,22 +41,33 @@ pub struct ModelsState {
     /// Hub sizes already fetched this run, so refresh() never regresses an
     /// exact size back to a placeholder.
     remote_sizes: HashMap<String, u64>,
+    loaded: bool,
 }
 
 impl ModelsState {
-    pub fn new(ram_bytes: u64) -> Self {
-        let mut s = Self {
+    /// Empty shell; disk and RAM probing happen on first `/models`.
+    pub fn empty() -> Self {
+        Self {
             selected: 0,
             items: Vec::new(),
             confirm_delete: None,
             download: None,
             footer: None,
-            ram_bytes,
+            ram_bytes: 0,
             status: None,
             remote_sizes: HashMap::new(),
-        };
-        s.refresh();
-        s
+            loaded: false,
+        }
+    }
+
+    /// Load the catalog and local cache the first time the panel opens.
+    pub fn ensure_loaded(&mut self, ram_bytes: u64) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        self.ram_bytes = ram_bytes;
+        self.refresh();
     }
 
     /// Rebuild the item list from the catalog and the local cache.
