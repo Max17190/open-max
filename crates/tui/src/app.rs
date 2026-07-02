@@ -160,13 +160,16 @@ impl App {
             .unwrap_or_else(|| self.project.display().to_string());
         insert_block(
             terminal,
-            vec![Line::from(vec![
-                Span::styled("◆ open max ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("v{version} · {model} · {dir} · /help"),
+            vec![
+                Line::from(vec![
+                    Span::styled("◆ open max", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  v{version}"), Style::default().fg(theme::DIM)),
+                ]),
+                Line::from(Span::styled(
+                    format!("  {model} · {dir} · /help for commands"),
                     Style::default().fg(theme::DIM),
-                ),
-            ])],
+                )),
+            ],
         )?;
 
         // Adopt a still-running server from a previous launch.
