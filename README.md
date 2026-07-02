@@ -39,7 +39,7 @@ openmax
 
 1. Type `/models` to open the model panel.
 2. Press **`u`** once to install `mlx-lm` into `~/.openmax/mlx-venv` (watch progress with `/logs`).
-3. Select a model, press **`d`** to download weights if needed, then **`Enter`** to start the server.
+3. Highlight a model and press **`Enter`**: downloads weights if needed, or starts the server if already cached.
 4. Describe a task. The agent reads your codebase, proposes edits, and asks before mutating files or running shell commands.
 
 Resume the latest session in the current directory:
@@ -80,7 +80,7 @@ openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 | `/logs` | Tail recent MLX server logs |
 | `/quit` | Exit |
 
-Inside `/models`: **↑/↓** or **j/k** to move, **Enter** to serve, **d** download, **u** set up MLX, **s** stop server, **x** delete cached weights.
+Inside `/models`: **↑/↓** or **j/k** to move, **Enter** to download or serve, **u** set up MLX, **s** stop server, **x** delete cached weights.
 
 ## Recommended models
 

@@ -147,10 +147,23 @@ pub fn start_download(core: Arc<Core>, repo: String) -> Result<(), String> {
     *core.download.lock().unwrap() = Some(DownloadProc { repo: repo.clone(), child });
 
     tokio::spawn(async move {
-        let total = repo_total_bytes(&repo).await.unwrap_or(0);
         let dir = repo_cache_dir(&repo);
+
+        core.send(CoreEvent::Download(DownloadEvent::Progress {
+            repo: repo.clone(),
+            done_bytes: dir_size(&dir),
+            total_bytes: 0,
+        }));
+
+        let total = repo_total_bytes(&repo).await.unwrap_or(0);
+
+        core.send(CoreEvent::Download(DownloadEvent::Progress {
+            repo: repo.clone(),
+            done_bytes: dir_size(&dir),
+            total_bytes: total,
+        }));
+
         loop {
-            tokio::time::sleep(Duration::from_millis(700)).await;
             let exited = {
                 let mut slot = core.download.lock().unwrap();
                 match slot.as_mut() {
@@ -158,17 +171,16 @@ pub fn start_download(core: Arc<Core>, repo: String) -> Result<(), String> {
                     None => break, // cancelled and cleared elsewhere
                 }
             };
-            let done = dir_size(&dir);
             core.send(CoreEvent::Download(DownloadEvent::Progress {
                 repo: repo.clone(),
-                done_bytes: done,
+                done_bytes: dir_size(&dir),
                 total_bytes: total,
             }));
             if let Some(status) = exited {
                 *core.download.lock().unwrap() = None;
                 let ok = status.success();
                 let message = if ok {
-                    format!("{repo} downloaded")
+                    format!("{repo} ready")
                 } else {
                     let t = tail.lock().unwrap().join("\n");
                     format!("download failed (exit {:?})\n{t}", status.code())
@@ -176,6 +188,7 @@ pub fn start_download(core: Arc<Core>, repo: String) -> Result<(), String> {
                 core.send(CoreEvent::Download(DownloadEvent::Done { repo: repo.clone(), ok, message }));
                 return;
             }
+            tokio::time::sleep(Duration::from_millis(700)).await;
         }
     });
 
