@@ -196,10 +196,9 @@ impl StreamingWrap {
             } else {
                 self.partial_raw.clone()
             };
-            if !completed.is_empty() {
-                let line = Line::from(Span::raw(completed));
-                self.complete_wrapped.extend(wrap_lines(&[line], width));
-            }
+            // Empty completed lines are paragraph breaks; keep them.
+            let line = Line::from(Span::raw(completed));
+            self.complete_wrapped.extend(wrap_lines(&[line], width));
             self.complete_newlines = new_newlines;
         }
 
@@ -231,13 +230,13 @@ impl StreamingWrap {
         }
 
         if let Some((complete, partial)) = text.rsplit_once('\n') {
-            if !complete.is_empty() {
-                let raw: Vec<Line<'static>> = complete
-                    .lines()
-                    .map(|l| Line::from(Span::raw(l.to_string())))
-                    .collect();
-                self.complete_wrapped = wrap_lines(&raw, width);
-            }
+            // split('\n') rather than lines(): blank lines are paragraph
+            // breaks and must survive, including one before the last newline.
+            let raw: Vec<Line<'static>> = complete
+                .split('\n')
+                .map(|l| Line::from(Span::raw(l.to_string())))
+                .collect();
+            self.complete_wrapped = wrap_lines(&raw, width);
             self.partial_raw = partial.to_string();
             if !partial.is_empty() {
                 self.partial_wrapped =
@@ -262,30 +261,44 @@ mod tests {
             .collect()
     }
 
+    /// Reference semantics: every '\n' separates a line (blank lines are
+    /// paragraph breaks and survive); a trailing empty partial renders nothing.
     fn full_wrap(input: &str, width: u16) -> Vec<String> {
-        if input.is_empty() {
-            return Vec::new();
+        let mut parts: Vec<&str> = input.split('\n').collect();
+        if parts.last() == Some(&"") {
+            parts.pop();
         }
-        let raw: Vec<Line<'static>> = input
-            .lines()
+        let raw: Vec<Line<'static>> = parts
+            .iter()
             .map(|l| Line::from(Span::raw(l.to_string())))
             .collect();
         text(&wrap_lines(&raw, width))
     }
 
-    #[test]
-    fn streaming_wrap_matches_full_rewrap() {
+    fn assert_incremental_matches(chunks: &[&str], width: u16) {
         let mut inc = StreamingWrap::default();
         let mut full = String::new();
-        for chunk in ["fn ", "main() ", "{\n", "    ok\n", "}"] {
+        for chunk in chunks {
             full.push_str(chunk);
-            inc.update(&full, 20);
+            inc.update(&full, width);
             assert_eq!(
                 inc.lines().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>(),
-                full_wrap(&full, 20),
+                full_wrap(&full, width),
                 "after {chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn streaming_wrap_matches_full_rewrap() {
+        assert_incremental_matches(&["fn ", "main() ", "{\n", "    ok\n", "}"], 20);
+    }
+
+    #[test]
+    fn streaming_wrap_keeps_paragraph_breaks() {
+        // Blank line arriving token by token, and as one multi-newline delta.
+        assert_incremental_matches(&["para1", "\n", "\n", "para2"], 20);
+        assert_incremental_matches(&["para1\n\npara2", " more"], 20);
     }
 
     #[test]

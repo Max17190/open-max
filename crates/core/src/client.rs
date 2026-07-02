@@ -45,6 +45,8 @@ struct StreamChunk {
 #[derive(Deserialize)]
 struct StreamChoice {
     finish_reason: Option<String>,
+    // Some servers omit `delta` entirely on the final finish_reason chunk.
+    #[serde(default)]
     delta: StreamDeltaJson,
 }
 

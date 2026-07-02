@@ -59,9 +59,14 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
+/// Reads only a small prefix: this runs on every save and must not scale
+/// with transcript size.
 fn uses_legacy_array_format(path: &PathBuf) -> bool {
-    let Ok(bytes) = std::fs::read(path) else { return false };
-    bytes.iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| *b == b'[')
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut head = [0u8; 64];
+    let Ok(n) = file.read(&mut head) else { return false };
+    head[..n].iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| *b == b'[')
 }
 
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
