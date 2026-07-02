@@ -1,30 +1,81 @@
-//! Writes finished blocks into real terminal scrollback via insert_before.
-//! The live viewport only ever holds transient state; once content is final
-//! it becomes ordinary terminal history: selectable, searchable, scrollable.
+//! The conversation transcript. Finished blocks are stored as styled lines,
+//! wrapped once per width, and rendered bottom anchored above the composer.
+//! A scroll offset (in wrapped lines from the bottom) supports the mouse
+//! wheel and PageUp/PageDown; offset 0 follows the latest output.
 
 use ratatui::prelude::CrosstermBackend;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Terminal;
 use unicode_width::UnicodeWidthChar;
 
 pub type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
-/// Insert a block above the viewport, wrapped to the terminal width, followed
-/// by one blank spacer line.
-pub fn insert_block(terminal: &mut Term, lines: Vec<Line<'static>>) -> std::io::Result<()> {
-    let width = terminal.size()?.width.max(20);
-    let mut wrapped = wrap_lines(lines, width);
-    wrapped.push(Line::default());
-    // insert_before takes u16; feed very long blocks in chunks.
-    for chunk in wrapped.chunks(1024) {
-        let chunk_vec: Vec<Line<'static>> = chunk.to_vec();
-        terminal.insert_before(chunk_vec.len() as u16, |buf| {
-            Paragraph::new(chunk_vec).render(buf.area, buf);
-        })?;
+#[derive(Default)]
+pub struct Transcript {
+    raw: Vec<Line<'static>>,
+    wrapped: Vec<Line<'static>>,
+    width: u16,
+    offset: usize,
+}
+
+impl Transcript {
+    pub fn new() -> Self {
+        Self::default()
     }
-    Ok(())
+
+    /// Append a finished block followed by one blank spacer line.
+    pub fn push(&mut self, mut lines: Vec<Line<'static>>) {
+        lines.push(Line::default());
+        if self.width > 0 {
+            let added = wrap_lines(lines.clone(), self.width);
+            // While scrolled up, keep the visible text anchored in place.
+            if self.offset > 0 {
+                self.offset += added.len();
+            }
+            self.wrapped.extend(added);
+        }
+        self.raw.extend(lines);
+    }
+
+    /// Rewrap the whole transcript when the terminal width changes.
+    pub fn set_width(&mut self, width: u16) {
+        if width != self.width {
+            self.width = width;
+            self.wrapped = wrap_lines(self.raw.clone(), width);
+            self.offset = self.offset.min(self.wrapped.len());
+        }
+    }
+
+    pub fn lines(&self) -> &[Line<'static>] {
+        &self.wrapped
+    }
+
+    pub fn len(&self) -> usize {
+        self.wrapped.len()
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        self.offset = self.offset.saturating_add(n);
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.offset = self.offset.saturating_sub(n);
+    }
+
+    /// Jump back to following the latest output.
+    pub fn follow(&mut self) {
+        self.offset = 0;
+    }
+
+    /// Called once per frame with the maximum meaningful offset.
+    pub fn clamp_offset(&mut self, max: usize) {
+        self.offset = self.offset.min(max);
+    }
 }
 
 /// Span-preserving word wrap. Greedy, breaking at the last space that fits;
@@ -135,5 +186,38 @@ mod tests {
     fn empty_line_survives() {
         let wrapped = wrap_lines(vec![Line::default()], 10);
         assert_eq!(wrapped.len(), 1);
+    }
+
+    #[test]
+    fn transcript_appends_wrapped_blocks_with_spacer() {
+        let mut t = Transcript::new();
+        t.set_width(10);
+        t.push(vec![Line::from("hello world wide")]);
+        // "hello world wide" wraps to two lines at width 10, plus the spacer.
+        assert_eq!(t.len(), 3);
+        assert_eq!(text(t.lines())[0], "hello ");
+    }
+
+    #[test]
+    fn transcript_rewraps_on_width_change() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push(vec![Line::from("abcdefghijklmnopqrst")]);
+        assert_eq!(t.len(), 2);
+        t.set_width(10);
+        assert_eq!(t.len(), 3); // two wrapped lines plus the spacer
+    }
+
+    #[test]
+    fn scrolled_view_stays_anchored_when_new_blocks_arrive() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push(vec![Line::from("one")]);
+        t.scroll_up(2);
+        assert_eq!(t.offset(), 2);
+        t.push(vec![Line::from("two")]); // adds 2 wrapped lines
+        assert_eq!(t.offset(), 4);
+        t.follow();
+        assert_eq!(t.offset(), 0);
     }
 }
