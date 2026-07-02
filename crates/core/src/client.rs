@@ -78,7 +78,14 @@ impl ChatClient {
             }
         }
 
-        let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+        // Local models can spend a long time in prompt processing before the
+        // first byte arrives; keep cancellation responsive throughout.
+        let resp = tokio::select! {
+            r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
+            _ = wait_for(&cancelled) => {
+                return Ok(CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into() });
+            }
+        };
         let status = resp.status();
         let content_type = resp
             .headers()
@@ -101,20 +108,28 @@ impl ChatClient {
         let mut content = String::new();
         let mut partials: Vec<PartialToolCall> = Vec::new();
         let mut finish_reason = String::from("stop");
-        let mut buf = String::new();
+        // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
+        // conversion only happens on complete lines ('\n' is never part of a
+        // multi-byte sequence).
+        let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
 
-        'outer: while let Some(chunk) = stream.next().await {
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = "cancelled".into();
-                break;
-            }
+        'outer: loop {
+            let next = tokio::select! {
+                c = stream.next() => c,
+                _ = wait_for(&cancelled) => {
+                    finish_reason = "cancelled".into();
+                    break;
+                }
+            };
+            let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk);
 
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
-                let line = line.trim();
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                let line_str = String::from_utf8_lossy(&line_bytes);
+                let line = line_str.trim();
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
@@ -213,6 +228,16 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
             function: ToolCallFunction { name: p.name, arguments: p.arguments },
         })
         .collect()
+}
+
+/// Resolves once `cancelled` becomes true; polled at 100ms.
+async fn wait_for(cancelled: &AtomicBool) {
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
