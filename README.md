@@ -88,9 +88,13 @@ Curated MLX community quantizations that work well as coding agents. RAM fit ind
 | Model | Approx. RAM | Notes |
 | --- | --- | --- |
 | Qwen3.6 35B A3B (4-bit) | ~19 GB | MoE flagship; fast agentic coding |
-| Qwen3.6 27B (4-bit) | ~16 GB | Strong dense coder at consumer scale |
+| Gemma 4 31B (4-bit) | ~19 GB | Flagship dense Gemma 4 instruct |
 | Qwen3 Coder 30B A3B (4-bit) | ~18 GB | Agentic MoE coder; reliable tool use |
+| Qwen3.6 27B (4-bit) | ~16 GB | Strong dense coder at consumer scale |
+| Gemma 4 26B A4B (4-bit) | ~16 GB | MoE Gemma 4; 4B active params |
 | gpt-oss 20B (MXFP4) | ~12 GB | Solid tool calling; adjustable reasoning |
+| Gemma 4 12B (QAT 4-bit) | ~11 GB | Unified 12B; QAT holds quality at 4 bits |
+| Gemma 4 E4B (4-bit) | ~5.5 GB | Efficient small Gemma 4 |
 | Qwen2.5 Coder 7B (4-bit) | ~4.5 GB | Light starter model |
 
 Any other Hugging Face repo id works with `/model <repo>`.
