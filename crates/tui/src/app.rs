@@ -914,6 +914,10 @@ impl App {
         let line = Line::from(vec![
             Span::styled("◆ open max", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled(
+                " · the performance harness",
+                Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(
                 format!("  v{version} · {} · /help", self.dir_label),
                 Style::default().fg(theme::DIM),
             ),
