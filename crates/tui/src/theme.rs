@@ -1,11 +1,14 @@
-//! Neutral dark, one accent. The accent carries over from the original app
-//! identity; everything else stays on terminal defaults so Open Max looks
-//! native in any dark terminal.
+//! Neutral dark, one accent — an evil purple. Everything else stays on
+//! terminal defaults so Open Max looks native in any dark terminal.
 
 use ratatui::style::Color;
 
-/// The single brand accent.
-pub const ACCENT: Color = Color::Rgb(0x63, 0xe0, 0xbd);
+/// The single brand accent: electric violet.
+pub const ACCENT: Color = Color::Rgb(0xa8, 0x6e, 0xff);
+/// Shadow purple: the mascot's horns and body shading.
+pub const ACCENT_DEEP: Color = Color::Rgb(0x6d, 0x3f, 0xc4);
+/// Hot magenta: the mascot's eyes.
+pub const EYES: Color = Color::Rgb(0xff, 0x3d, 0x81);
 /// De-emphasized chrome: gutters, hints, timestamps.
 pub const DIM: Color = Color::DarkGray;
 /// Inline code.
