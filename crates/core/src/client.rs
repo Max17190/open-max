@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
@@ -34,6 +35,38 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    finish_reason: Option<String>,
+    delta: StreamDeltaJson,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDeltaJson {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallDelta {
+    index: Option<u64>,
+    id: Option<String>,
+    function: Option<ToolCallFnDelta>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallFnDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 impl ChatClient {
@@ -87,12 +120,11 @@ impl ChatClient {
             }
         };
         let status = resp.status();
-        let content_type = resp
+        let is_json = resp
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .is_some_and(|ct| ct.contains("application/json"));
 
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -100,7 +132,7 @@ impl ChatClient {
         }
 
         // Some servers ignore `stream` and return a complete JSON body.
-        if content_type.contains("application/json") {
+        if is_json {
             let v: Value = resp.json().await.map_err(|e| format!("bad JSON response: {e}"))?;
             return parse_complete_response(&v, &mut on_delta);
         }
@@ -127,51 +159,55 @@ impl ChatClient {
             buf.extend_from_slice(&chunk);
 
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                let line_str = String::from_utf8_lossy(&line_bytes);
-                let line = line_str.trim();
-                if line.is_empty() || line.starts_with(':') {
+                let rest = buf.split_off(pos + 1);
+                let consumed = std::mem::replace(&mut buf, rest);
+                let line = trim_bytes(&consumed[..pos]);
+                if line.is_empty() || line.first() == Some(&b':') {
                     continue;
                 }
-                let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
-                if data == "[DONE]" {
+                let data = strip_data_prefix(line);
+                if data == b"[DONE]" {
                     break 'outer;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-                let Some(choice) = v["choices"].get(0) else { continue };
+                let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
+                let Some(choice) = chunk.choices.into_iter().next() else { continue };
 
-                if let Some(reason) = choice["finish_reason"].as_str() {
-                    finish_reason = reason.to_string();
+                if let Some(reason) = choice.finish_reason {
+                    finish_reason = reason;
                 }
-                let delta = &choice["delta"];
-                if let Some(text) = delta["content"].as_str() {
+                let delta = choice.delta;
+                if let Some(text) = delta.content {
                     if !text.is_empty() {
-                        content.push_str(text);
-                        on_delta(StreamDelta::Content(text.to_string()));
+                        content.push_str(&text);
+                        on_delta(StreamDelta::Content(text));
                     }
                 }
                 // Reasoning models surface thinking under different keys.
-                for key in ["reasoning_content", "reasoning"] {
-                    if let Some(text) = delta[key].as_str() {
-                        if !text.is_empty() {
-                            on_delta(StreamDelta::Reasoning(text.to_string()));
-                        }
+                if let Some(text) = delta.reasoning_content {
+                    if !text.is_empty() {
+                        on_delta(StreamDelta::Reasoning(text));
+                    }
+                } else if let Some(text) = delta.reasoning {
+                    if !text.is_empty() {
+                        on_delta(StreamDelta::Reasoning(text));
                     }
                 }
-                if let Some(calls) = delta["tool_calls"].as_array() {
+                if let Some(calls) = delta.tool_calls {
                     for tc in calls {
-                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                        let idx = tc.index.unwrap_or(0) as usize;
                         while partials.len() <= idx {
                             partials.push(PartialToolCall::default());
                         }
-                        if let Some(id) = tc["id"].as_str() {
-                            partials[idx].id.push_str(id);
+                        if let Some(id) = tc.id {
+                            partials[idx].id.push_str(&id);
                         }
-                        if let Some(name) = tc["function"]["name"].as_str() {
-                            partials[idx].name.push_str(name);
-                        }
-                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                            partials[idx].arguments.push_str(args);
+                        if let Some(function) = tc.function {
+                            if let Some(name) = function.name {
+                                partials[idx].name.push_str(&name);
+                            }
+                            if let Some(args) = function.arguments {
+                                partials[idx].arguments.push_str(&args);
+                            }
                         }
                     }
                 }
@@ -183,6 +219,25 @@ impl ChatClient {
             finish_reason = "tool_calls".into();
         }
         Ok(CompletionResult { content, tool_calls, finish_reason })
+    }
+}
+
+fn trim_bytes(mut s: &[u8]) -> &[u8] {
+    while s.first().is_some_and(|b| b.is_ascii_whitespace()) {
+        s = &s[1..];
+    }
+    while s.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        s = &s[..s.len() - 1];
+    }
+    s
+}
+
+fn strip_data_prefix(line: &[u8]) -> &[u8] {
+    const PREFIX: &[u8] = b"data:";
+    if line.starts_with(PREFIX) {
+        trim_bytes(&line[PREFIX.len()..])
+    } else {
+        line
     }
 }
 
@@ -249,5 +304,29 @@ pub fn truncate(s: &str, max: usize) -> String {
             end -= 1;
         }
         format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_bytes_strips_whitespace() {
+        assert_eq!(trim_bytes(b"  hello \r"), b"hello");
+    }
+
+    #[test]
+    fn strip_data_prefix_bytes() {
+        assert_eq!(super::strip_data_prefix(b"data: {\"x\":1}"), b"{\"x\":1}");
+        assert_eq!(super::strip_data_prefix(b"{\"x\":1}"), b"{\"x\":1}");
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_content() {
+        let line = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
+        let data = super::strip_data_prefix(trim_bytes(line));
+        let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
     }
 }

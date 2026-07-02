@@ -14,6 +14,8 @@ use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 #[derive(Default, Clone)]
 pub struct SessionData {
     pub messages: Vec<ChatMessage>,
+    /// Messages already written to disk; enables append-only persistence.
+    pub persisted_count: usize,
     /// File content captured on first touch by a mutating tool, so the UI can
     /// show a cumulative diff per file at any point in the session.
     pub snapshots: HashMap<String, String>,

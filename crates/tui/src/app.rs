@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::tool_card::{self, DiffText};
-use crate::ui::transcript::{wrap_lines, Term, Transcript};
+use crate::ui::transcript::{wrap_lines, StreamingWrap, Term, Transcript};
 use crate::ui::{markdown, models};
 
 const TICK: Duration = Duration::from_millis(120);
@@ -74,6 +74,22 @@ pub struct App {
     hf_tx: mpsc::UnboundedSender<(String, u64)>,
     should_quit: bool,
     needs_redraw: bool,
+
+    stream_wrap: StreamingWrap,
+    thinking_wrapped: Vec<Line<'static>>,
+    thinking_source: String,
+    tail_width: u16,
+    tail_content_len: usize,
+    tail_stream_len: usize,
+    tail_buf: Vec<Line<'static>>,
+    chat_buf: Vec<Line<'static>>,
+    status_model: String,
+    status_approvals: String,
+    status_ready: bool,
+    status_budget: Option<(usize, usize)>,
+    status_scrolled: bool,
+    status_quit_armed: bool,
+    status_line: Line<'static>,
 }
 
 pub async fn run(
@@ -83,7 +99,6 @@ pub async fn run(
     args: Args,
 ) -> std::io::Result<()> {
     let (hf_tx, mut hf_rx) = mpsc::unbounded_channel();
-    let ram = ram_bytes();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dir_label = project
         .file_name()
@@ -96,7 +111,7 @@ pub async fn run(
         session_id: None,
         mode: Mode::Chat,
         composer: Composer::new(&core.data_dir),
-        models: models::ModelsState::new(ram),
+        models: models::ModelsState::empty(),
         transcript: Transcript::new(),
         running: false,
         stream_text: String::new(),
@@ -119,6 +134,21 @@ pub async fn run(
         hf_tx,
         should_quit: false,
         needs_redraw: true,
+        stream_wrap: StreamingWrap::default(),
+        thinking_wrapped: Vec::new(),
+        thinking_source: String::new(),
+        tail_width: 0,
+        tail_content_len: 0,
+        tail_stream_len: 0,
+        tail_buf: Vec::new(),
+        chat_buf: Vec::new(),
+        status_model: String::new(),
+        status_approvals: String::new(),
+        status_ready: false,
+        status_budget: None,
+        status_scrolled: false,
+        status_quit_armed: false,
+        status_line: Line::default(),
     };
 
     app.startup(&args).await;
@@ -224,25 +254,32 @@ impl App {
         match event {
             TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
                 self.on_key(key).await?;
+                self.needs_redraw = true;
             }
             TermEvent::Paste(text) => {
                 if self.mode == Mode::Chat && self.pending_approval.is_none() {
                     self.composer.insert_str(&text);
+                    self.needs_redraw = true;
                 }
             }
             TermEvent::Mouse(m) => {
                 if self.mode == Mode::Chat {
                     match m.kind {
-                        MouseEventKind::ScrollUp => self.transcript.scroll_up(WHEEL_LINES),
-                        MouseEventKind::ScrollDown => self.transcript.scroll_down(WHEEL_LINES),
+                        MouseEventKind::ScrollUp => {
+                            self.transcript.scroll_up(WHEEL_LINES);
+                            self.needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.transcript.scroll_down(WHEEL_LINES);
+                            self.needs_redraw = true;
+                        }
                         _ => {}
                     }
                 }
             }
-            TermEvent::Resize(_, _) => {}
+            TermEvent::Resize(_, _) => self.needs_redraw = true,
             _ => {}
         }
-        self.needs_redraw = true;
         Ok(())
     }
 
@@ -480,8 +517,12 @@ impl App {
                 self.first_token = None;
                 self.stream_chars = 0;
                 self.stream_text.clear();
+                self.stream_wrap.clear();
+                self.tail_stream_len = 0;
                 self.thinking_chars = 0;
                 self.thinking_tail.clear();
+                self.thinking_source.clear();
+                self.thinking_wrapped.clear();
             }
             Err(e) => self.error(&e),
         }
@@ -522,6 +563,7 @@ impl App {
             }
             "models" => {
                 self.mode = Mode::Models;
+                self.models.ensure_loaded(ram_bytes());
                 self.models.refresh();
                 self.models.status = Some(mlx::status(&self.core).await);
                 self.fetch_missing_sizes();
@@ -651,12 +693,12 @@ impl App {
         match event {
             AgentEvent::Token { text } => {
                 self.first_token.get_or_insert_with(Instant::now);
-                self.stream_chars += text.chars().count();
+                self.stream_chars += text.len();
                 self.stream_text.push_str(&text);
             }
             AgentEvent::Thinking { text } => {
                 self.first_token.get_or_insert_with(Instant::now);
-                self.stream_chars += text.chars().count();
+                self.stream_chars += text.len();
                 self.thinking_chars += text.chars().count();
                 self.thinking_tail.push_str(&text);
                 let overflow = self.thinking_tail.len().saturating_sub(600);
@@ -673,7 +715,11 @@ impl App {
                     self.transcript.push(markdown::render(&text, markdown::highlighter()));
                 }
                 self.stream_text.clear();
+                self.stream_wrap.clear();
+                self.tail_stream_len = 0;
                 self.thinking_tail.clear();
+                self.thinking_source.clear();
+                self.thinking_wrapped.clear();
                 self.thinking_chars = 0;
             }
             AgentEvent::Budget { used_tokens, context_tokens } => {
@@ -880,47 +926,79 @@ impl App {
     /// scroll offset (0 follows the latest output).
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         self.transcript.set_width(area.width);
-        let tail = self.tail_lines(area.width);
+        let tail_len = self.rebuild_tail(area.width);
 
-        let total = self.transcript.len() + tail.len();
+        let total = self.transcript.len() + tail_len;
         let visible = area.height as usize;
         self.transcript.clamp_offset(total.saturating_sub(visible));
         let offset = self.transcript.offset();
 
         let end = total - offset;
         let start = end.saturating_sub(visible);
-        let mut shown: Vec<Line> = Vec::with_capacity(end - start);
+        self.chat_buf.clear();
+        self.chat_buf.reserve(end.saturating_sub(start));
         for i in start..end {
             if i < self.transcript.len() {
-                shown.push(self.transcript.lines()[i].clone());
+                self.chat_buf.push(self.transcript.lines()[i].clone());
             } else {
-                shown.push(tail[i - self.transcript.len()].clone());
+                self.chat_buf
+                    .push(self.tail_buf[i - self.transcript.len()].clone());
             }
         }
 
         // Bottom-align so the conversation grows upward from the composer.
-        let pad = area.height.saturating_sub(shown.len() as u16);
+        let pad = area.height.saturating_sub(self.chat_buf.len() as u16);
         let draw_area = Rect { x: area.x, y: area.y + pad, width: area.width, height: area.height - pad };
-        Paragraph::new(shown).render(draw_area, frame.buffer_mut());
+        Paragraph::new(self.chat_buf.as_slice()).render(draw_area, frame.buffer_mut());
     }
 
-    /// The live, in-progress part of the turn: thinking, streaming text, the
-    /// running tool, and the spinner meta line.
-    fn tail_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line> = Vec::new();
+    /// Rebuild the live tail into `tail_buf`, reusing cached stream/thinking
+    /// wraps when only the spinner meta line changes between ticks.
+    fn rebuild_tail(&mut self, width: u16) -> usize {
+        let width_changed = width != self.tail_width;
+        if width_changed {
+            self.tail_width = width;
+            self.thinking_source.clear();
+        }
+        self.stream_wrap.update(&self.stream_text, width);
+
+        let mut thinking_changed = false;
         if self.show_thinking && !self.thinking_tail.is_empty() {
-            let dim = Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC);
-            for l in self.thinking_tail.lines() {
-                lines.push(Line::from(Span::styled(l.to_string(), dim)));
+            if self.thinking_tail != self.thinking_source {
+                thinking_changed = true;
+                self.thinking_source = self.thinking_tail.clone();
+                let dim = Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC);
+                let raw: Vec<Line<'static>> = self
+                    .thinking_tail
+                    .lines()
+                    .map(|l| Line::from(Span::styled(l.to_string(), dim)))
+                    .collect();
+                self.thinking_wrapped = wrap_lines(&raw, width);
             }
+        } else if !self.thinking_wrapped.is_empty() || !self.thinking_source.is_empty() {
+            thinking_changed = true;
+            self.thinking_wrapped.clear();
+            self.thinking_source.clear();
         }
-        for l in self.stream_text.lines() {
-            lines.push(Line::from(Span::raw(l.to_string())));
+
+        let content_changed = width_changed
+            || self.stream_text.len() != self.tail_stream_len
+            || thinking_changed;
+
+        if content_changed {
+            self.tail_stream_len = self.stream_text.len();
+            self.tail_buf.clear();
+            self.tail_buf
+                .extend(self.thinking_wrapped.iter().cloned());
+            self.tail_buf
+                .extend(self.stream_wrap.lines().cloned());
+            self.tail_content_len = self.tail_buf.len();
+        } else {
+            self.tail_buf.truncate(self.tail_content_len);
         }
-        let mut wrapped = wrap_lines(lines, width);
 
         if let Some((name, summary)) = &self.running_tool {
-            wrapped.push(tool_card::running_line(name, summary));
+            self.tail_buf.push(tool_card::running_line(name, summary));
         }
         if self.running {
             let elapsed = self.turn_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -933,12 +1011,12 @@ impl App {
                 meta.push_str(" · thinking (ctrl+t to peek)");
             }
             meta.push_str(" · esc to cancel");
-            wrapped.push(Line::from(vec![
+            self.tail_buf.push(Line::from(vec![
                 Span::styled(SPINNER[self.spinner_i].to_string(), Style::default().fg(theme::ACCENT)),
                 Span::styled(meta, Style::default().fg(theme::DIM)),
             ]));
         }
-        wrapped
+        self.tail_buf.len()
     }
 
     fn tok_per_sec(&self) -> f64 {
@@ -955,26 +1033,51 @@ impl App {
         }
     }
 
-    fn draw_status(&self, frame: &mut Frame, area: Rect) {
+    fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
+        let ready = self.core.mlx.lock().unwrap().ready;
         let (model, approvals) = {
             let s = self.core.settings.lock().unwrap();
             (s.model.clone(), s.approval_mode.clone())
         };
-        let ready = self.core.mlx.lock().unwrap().ready;
-        let dot_color = if ready { theme::OK } else { theme::DIM };
-        let ctx = self
-            .budget
-            .map(|(u, t)| format!(" · ctx {}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
-            .unwrap_or_default();
-        let short_model = model.rsplit('/').next().unwrap_or(&model).to_string();
-        let scrolled = if self.transcript.offset() > 0 { " · ↑ scrolled (esc to follow)" } else { "" };
-        let right = if self.quit_armed { " · ctrl+c again to quit" } else { "" };
-        let line = Line::from(vec![
-            Span::styled("● ", Style::default().fg(dot_color)),
-            Span::styled(short_model, Style::default().fg(theme::DIM)),
-            Span::styled(format!("{ctx} · {approvals}{scrolled}{right}"), Style::default().fg(theme::DIM)),
-        ]);
-        Paragraph::new(line).render(area, frame.buffer_mut());
+        let scrolled = self.transcript.offset() > 0;
+        let needs_rebuild = model != self.status_model
+            || approvals != self.status_approvals
+            || ready != self.status_ready
+            || self.status_budget != self.budget
+            || self.status_scrolled != scrolled
+            || self.status_quit_armed != self.quit_armed;
+
+        if needs_rebuild {
+            self.status_model = model;
+            self.status_approvals = approvals;
+            self.status_ready = ready;
+            self.status_budget = self.budget;
+            self.status_scrolled = scrolled;
+            self.status_quit_armed = self.quit_armed;
+
+            let dot_color = if ready { theme::OK } else { theme::DIM };
+            let ctx = self
+                .budget
+                .map(|(u, t)| format!(" · ctx {}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
+                .unwrap_or_default();
+            let short_model = self
+                .status_model
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.status_model)
+                .to_string();
+            let scrolled_suffix = if scrolled { " · ↑ scrolled (esc to follow)" } else { "" };
+            let right = if self.quit_armed { " · ctrl+c again to quit" } else { "" };
+            self.status_line = Line::from(vec![
+                Span::styled("● ", Style::default().fg(dot_color)),
+                Span::styled(short_model, Style::default().fg(theme::DIM)),
+                Span::styled(
+                    format!("{ctx} · {}{scrolled_suffix}{right}", self.status_approvals),
+                    Style::default().fg(theme::DIM),
+                ),
+            ]);
+        }
+        Paragraph::new(self.status_line.clone()).render(area, frame.buffer_mut());
     }
 }
 

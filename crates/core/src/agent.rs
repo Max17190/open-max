@@ -97,11 +97,17 @@ async fn run_loop(
 ) {
     let mut messages = {
         let mut sessions_map = core.sessions.lock().await;
-        let data = sessions_map.entry(session_id.to_string()).or_insert_with(|| SessionData {
-            // Hydrate a persisted session after a restart.
-            messages: sessions::load_messages(core, session_id)
-                .unwrap_or_else(|| vec![ChatMessage::system(system_prompt(project_root))]),
-            snapshots: Default::default(),
+        let data = sessions_map.entry(session_id.to_string()).or_insert_with(|| {
+            if let Some(messages) = sessions::load_messages(core, session_id) {
+                let count = messages.len();
+                SessionData { messages, persisted_count: count, snapshots: Default::default() }
+            } else {
+                SessionData {
+                    messages: vec![ChatMessage::system(system_prompt(project_root))],
+                    persisted_count: 0,
+                    snapshots: Default::default(),
+                }
+            }
         });
         data.messages.push(ChatMessage::user(user_text));
         data.messages.clone()
@@ -115,20 +121,20 @@ async fn run_loop(
         settings.max_tokens,
     );
     let schemas = tools::tool_schemas();
-    let known_tools = tools::tool_names();
+    let known_tools = tools::TOOL_NAMES;
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
 
     'turns: for _ in 0..MAX_ITERATIONS {
-        enforce_budget(&mut messages, settings.context_tokens.saturating_sub(settings.max_tokens + 1024));
+        let budget_changed = enforce_budget(&mut messages, settings.context_tokens.saturating_sub(settings.max_tokens + 1024));
         let used = messages.iter().map(|m| m.estimated_tokens()).sum();
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens: settings.context_tokens });
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let result = client
-            .stream_chat(&messages, &schemas, cancelled.clone(), move |delta| {
+            .stream_chat(&messages, schemas, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -148,7 +154,7 @@ async fn run_loop(
         let mut content = result.content.clone();
         let mut tool_calls = result.tool_calls.clone();
         if tool_calls.is_empty() {
-            if let Some((clean, calls)) = fallback::extract_tool_calls(&content, &known_tools) {
+            if let Some((clean, calls)) = fallback::extract_tool_calls(&content, known_tools) {
                 content = clean;
                 tool_calls = calls;
             }
@@ -162,7 +168,7 @@ async fn run_loop(
                 if content.is_empty() { None } else { Some(content.clone()) },
                 if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
             ));
-            save_messages(core, session_id, &messages).await;
+            save_messages(core, session_id, &messages, budget_changed).await;
         }
 
         if cancelled.load(Ordering::Relaxed) {
@@ -244,10 +250,10 @@ async fn run_loop(
             let content = if outcome.ok { outcome.output } else { format!("Error: {}", outcome.output) };
             messages.push(ChatMessage::tool(call.id.clone(), content));
         }
-        save_messages(core, session_id, &messages).await;
+        save_messages(core, session_id, &messages, false).await;
     }
 
-    save_messages(core, session_id, &messages).await;
+    save_messages(core, session_id, &messages, false).await;
     sessions::touch(core, session_id);
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
 }
@@ -263,14 +269,12 @@ async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, 
     }
 }
 
-async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage]) {
-    {
-        let mut sessions_map = core.sessions.lock().await;
-        if let Some(data) = sessions_map.get_mut(session_id) {
-            data.messages = messages.to_vec();
-        }
+async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) {
+    let mut sessions_map = core.sessions.lock().await;
+    if let Some(data) = sessions_map.get_mut(session_id) {
+        data.messages = messages.to_vec();
+        sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite);
     }
-    sessions::save_messages(core, session_id, messages);
 }
 
 async fn request_approval(
@@ -311,39 +315,44 @@ async fn request_approval(
 
 /// Keep the transcript inside the model's context window: first truncate old
 /// tool outputs, then drop the oldest exchanges (always preserving the system
-/// prompt and the original user request).
-fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) {
-    let total = |msgs: &[ChatMessage]| msgs.iter().map(|m| m.estimated_tokens()).sum::<usize>();
-    if total(messages) <= budget {
-        return;
+/// prompt and the original user request). Returns true when messages changed.
+fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
+    let mut total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+    if total <= budget {
+        return false;
     }
     let keep_tail = messages.len().saturating_sub(6);
-    for i in 1..keep_tail {
-        if messages[i].role == "tool" {
-            if let Some(c) = &messages[i].content {
+    for msg in messages.iter_mut().take(keep_tail).skip(1) {
+        if msg.role == "tool" {
+            if let Some(c) = &msg.content {
                 if c.len() > 600 {
                     let mut cut = 400;
                     while !c.is_char_boundary(cut) {
                         cut -= 1;
                     }
-                    messages[i].content = Some(format!("{}\n…[older tool output truncated]", &c[..cut]));
+                    let old = msg.estimated_tokens();
+                    msg.content = Some(format!("{}\n…[older tool output truncated]", &c[..cut]));
+                    total = total.saturating_sub(old).saturating_add(msg.estimated_tokens());
                 }
             }
         }
-        if total(messages) <= budget {
-            return;
+        if total <= budget {
+            return true;
         }
     }
     // Drop whole exchanges starting after [system, first user]. Keep tool
     // replies consistent with the assistant message that requested them.
-    while total(messages) > budget && messages.len() > 6 {
+    while total > budget && messages.len() > 6 {
         let removed = messages.remove(2);
+        total = total.saturating_sub(removed.estimated_tokens());
         if removed.role == "assistant" && removed.tool_calls.is_some() {
             while messages.len() > 2 && messages[2].role == "tool" {
-                messages.remove(2);
+                let tool = messages.remove(2);
+                total = total.saturating_sub(tool.estimated_tokens());
             }
         }
     }
+    true
 }
 
 #[cfg(test)]

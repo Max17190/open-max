@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -40,12 +41,12 @@ pub fn is_mutating(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "bash")
 }
 
-/// Names of every tool the harness exposes, for the fallback call parser.
+/// Every tool name exposed by the harness.
+pub const TOOL_NAMES: &[&str] =
+    &["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"];
+
 pub fn tool_names() -> Vec<String> {
-    ["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    TOOL_NAMES.iter().map(|s| s.to_string()).collect()
 }
 
 /// One-line human summary of a call, shown in approval prompts and tool cards.
@@ -62,8 +63,10 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 
 /// Tool schemas in the OpenAI `tools` wire format. Kept deliberately small and
 /// strict — small local models do much better with fewer, simpler parameters.
-pub fn tool_schemas() -> Value {
-    json!([
+pub fn tool_schemas() -> &'static Value {
+    static SCHEMAS: OnceLock<Value> = OnceLock::new();
+    SCHEMAS.get_or_init(|| {
+        json!([
         {
             "type": "function",
             "function": {
@@ -172,6 +175,7 @@ pub fn tool_schemas() -> Value {
             }
         }
     ])
+    })
 }
 
 /// Resolve a model-supplied relative path, refusing escapes from the project root.

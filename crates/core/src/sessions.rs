@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,6 +57,33 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     let result = f(&mut metas);
     save_index(core, &metas)?;
     Ok(result)
+}
+
+fn uses_legacy_array_format(path: &PathBuf) -> bool {
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    bytes.iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| *b == b'[')
+}
+
+fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+    let mut out = String::new();
+    for msg in messages {
+        out.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
+        out.push('\n');
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
+
+fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    for msg in messages {
+        let line = serde_json::to_string(msg).map_err(|e| e.to_string())?;
+        writeln!(file, "{line}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Sessions for one project, most recently updated first.
@@ -117,13 +145,98 @@ pub fn touch(core: &Core, id: &str) {
 }
 
 pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
-    std::fs::read_to_string(messages_path(core, id))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let path = messages_path(core, id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        serde_json::from_str(&text).ok()
+    } else {
+        Some(
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+        )
+    }
 }
 
-pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage]) {
-    if let Ok(json) = serde_json::to_string(messages) {
-        let _ = std::fs::write(messages_path(core, id), json);
+/// Persist messages. Appends only new tail lines when possible; rewrites the
+/// whole file after budget trimming, legacy migration, or message drops.
+pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
+    let path = messages_path(core, id);
+    let migrate = path.exists() && uses_legacy_array_format(&path);
+    let needs_rewrite = rewrite || migrate || messages.len() < *persisted;
+
+    let result = if needs_rewrite {
+        write_jsonl(&path, messages)
+    } else if messages.len() > *persisted {
+        append_jsonl(&path, &messages[*persisted..])
+    } else {
+        Ok(())
+    };
+
+    if result.is_ok() {
+        *persisted = messages.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Core;
+    use crate::types::ChatMessage;
+
+    #[test]
+    fn jsonl_append_only_writes_new_tail() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "test-session";
+        let mut persisted = 0usize;
+
+        let initial = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        save_messages(&core, id, &initial, &mut persisted, false);
+        assert_eq!(persisted, 2);
+
+        let path = messages_path(&core, id);
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first.matches('\n').count(), 2);
+
+        let mut extended = initial.clone();
+        extended.push(ChatMessage::assistant(Some("hi".into()), None));
+        save_messages(&core, id, &extended, &mut persisted, false);
+        assert_eq!(persisted, 3);
+
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(second.matches('\n').count(), 3);
+        assert!(second.ends_with('\n'));
+
+        let loaded = load_messages(&core, id).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[2].content.as_deref(), Some("hi"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_array_loads_and_rewrites_on_save() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "legacy";
+        let path = messages_path(&core, id);
+        let legacy = r#"[{"role":"user","content":"old"}]"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = load_messages(&core, id).unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        let mut persisted = loaded.len();
+        save_messages(&core, id, &loaded, &mut persisted, false);
+        assert!(!uses_legacy_array_format(&path));
+        assert_eq!(load_messages(&core, id).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

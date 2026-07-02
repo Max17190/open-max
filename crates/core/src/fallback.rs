@@ -24,7 +24,7 @@ const CLOSE_TAG: &str = "</tool_call>";
 /// Try to pull tool calls out of raw assistant text. Returns the text with
 /// call markup removed plus the synthesized calls, or None if nothing valid
 /// was found.
-pub fn extract_tool_calls(content: &str, known_tools: &[String]) -> Option<(String, Vec<ToolCall>)> {
+pub fn extract_tool_calls(content: &str, known_tools: &[&str]) -> Option<(String, Vec<ToolCall>)> {
     let mut spans: Vec<(usize, usize, ToolCallFunction)> = Vec::new();
     collect_tagged(content, &mut spans);
     collect_fenced(content, known_tools, &mut spans);
@@ -81,7 +81,7 @@ fn collect_tagged(content: &str, spans: &mut Vec<(usize, usize, ToolCallFunction
 
 /// Fenced code blocks that carry a call. The `json` info string additionally
 /// requires a known tool name to avoid eating ordinary JSON examples.
-fn collect_fenced(content: &str, known_tools: &[String], spans: &mut Vec<(usize, usize, ToolCallFunction)>) {
+fn collect_fenced(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, usize, ToolCallFunction)>) {
     let mut from = 0;
     while let Some(rel) = content[from..].find("```") {
         let fence_start = from + rel;
@@ -110,14 +110,14 @@ fn collect_fenced(content: &str, known_tools: &[String], spans: &mut Vec<(usize,
 
 /// Parse one candidate JSON body into a call. `required_names`, when given,
 /// rejects names outside the known tool set.
-fn parse_call(body: &str, required_names: Option<&[String]>) -> Option<ToolCallFunction> {
+fn parse_call(body: &str, required_names: Option<&[&str]>) -> Option<ToolCallFunction> {
     let v: Value = serde_json::from_str(body).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
     if name.is_empty() {
         return None;
     }
     if let Some(known) = required_names {
-        if !known.iter().any(|k| k == &name) {
+        if !known.iter().any(|k| *k == name) {
             return None;
         }
     }
@@ -154,14 +154,14 @@ fn tidy(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn known() -> Vec<String> {
-        crate::tools::tool_names()
+    fn known() -> &'static [&'static str] {
+        crate::tools::TOOL_NAMES
     }
 
     #[test]
     fn qwen_single_call_with_prose() {
         let text = "I'll check the directory first.\n<tool_call>\n{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}\n</tool_call>";
-        let (clean, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (clean, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(clean, "I'll check the directory first.");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "list_dir");
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn qwen_multiple_calls_in_order() {
         let text = "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>\n<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"fn main\"}}</tool_call>";
-        let (clean, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (clean, calls) = extract_tool_calls(text, known()).unwrap();
         assert!(clean.is_empty());
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "read_file");
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn unclosed_final_tag_is_tolerated() {
         let text = "Running it now.\n<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"cargo test\"}}";
-        let (clean, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (clean, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(clean, "Running it now.");
         assert_eq!(calls[0].function.name, "bash");
     }
@@ -194,44 +194,44 @@ mod tests {
     #[test]
     fn fenced_tool_call_block() {
         let text = "```tool_call\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.rs\"}}\n```";
-        let (_, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(calls[0].function.name, "glob");
     }
 
     #[test]
     fn fenced_json_requires_known_tool() {
         let call = "Some explanation.\n```json\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"todo\"}}\n```";
-        let (clean, calls) = extract_tool_calls(call, &known()).unwrap();
+        let (clean, calls) = extract_tool_calls(call, known()).unwrap();
         assert_eq!(clean, "Some explanation.");
         assert_eq!(calls[0].function.name, "grep");
 
         let prose = "Here is a config example:\n```json\n{\"name\": \"my-app\", \"arguments\": {\"port\": 3000}}\n```";
-        assert!(extract_tool_calls(prose, &known()).is_none());
+        assert!(extract_tool_calls(prose, known()).is_none());
     }
 
     #[test]
     fn plain_json_fence_without_call_shape_is_ignored() {
         let text = "```json\n{\"dependencies\": {\"serde\": \"1\"}}\n```";
-        assert!(extract_tool_calls(text, &known()).is_none());
+        assert!(extract_tool_calls(text, known()).is_none());
     }
 
     #[test]
     fn malformed_json_in_tag_is_skipped() {
         let text = "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \n</tool_call>";
-        assert!(extract_tool_calls(text, &known()).is_none());
+        assert!(extract_tool_calls(text, known()).is_none());
     }
 
     #[test]
     fn pre_encoded_string_arguments_pass_through() {
         let text = "<tool_call>{\"name\": \"read_file\", \"arguments\": \"{\\\"path\\\": \\\"b.rs\\\"}\"}</tool_call>";
-        let (_, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(calls[0].function.arguments, "{\"path\": \"b.rs\"}");
     }
 
     #[test]
     fn parameters_key_variant() {
         let text = "<tool_call>{\"name\": \"list_dir\", \"parameters\": {\"path\": \"src\"}}</tool_call>";
-        let (_, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["path"],
             "src"
@@ -240,13 +240,13 @@ mod tests {
 
     #[test]
     fn text_without_markup_returns_none() {
-        assert!(extract_tool_calls("All done. The tests pass.", &known()).is_none());
+        assert!(extract_tool_calls("All done. The tests pass.", known()).is_none());
     }
 
     #[test]
     fn tag_quoted_inside_fence_not_double_counted() {
         let text = "```tool_call\n{\"name\": \"bash\", \"arguments\": {\"command\": \"echo <tool_call>\"}}\n```";
-        let (clean, calls) = extract_tool_calls(text, &known()).unwrap();
+        let (clean, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert!(clean.is_empty());
