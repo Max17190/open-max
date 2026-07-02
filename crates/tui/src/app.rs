@@ -26,7 +26,7 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{wrap_lines, StreamingWrap, Term, Transcript};
-use crate::ui::{markdown, mascot, models};
+use crate::ui::{markdown, models};
 
 const TICK: Duration = Duration::from_millis(120);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -69,8 +69,6 @@ pub struct App {
     quit_armed: bool,
     spinner_i: usize,
     tick_i: u64,
-    /// Tick until which the mascot glares after an error block is pushed.
-    error_flash: u64,
     page_h: u16,
 
     hf_tx: mpsc::UnboundedSender<(String, u64)>,
@@ -132,7 +130,6 @@ pub async fn run(
         quit_armed: false,
         spinner_i: 0,
         tick_i: 0,
-        error_flash: 0,
         page_h: 10,
         hf_tx,
         should_quit: false,
@@ -196,8 +193,6 @@ fn ram_bytes() -> u64 {
 
 impl App {
     async fn startup(&mut self, args: &Args) {
-        self.transcript.push(mascot::splash(env!("CARGO_PKG_VERSION")));
-
         // Adopt a still-running server from a previous launch.
         if mlx::reattach(&self.core).await {
             self.models.status = Some(mlx::status(&self.core).await);
@@ -555,16 +550,15 @@ impl App {
                     ("/logs", "recent model server logs"),
                     ("/quit", "exit"),
                 ];
-                let mut block = vec![Line::from(vec![
-                    mascot::micro(),
-                    Span::styled(" keys & commands", Style::default().fg(theme::DIM)),
-                ])];
-                block.extend(lines.iter().map(|(k, v)| {
-                    Line::from(vec![
-                        Span::styled(format!("  {k:<32}"), Style::default().fg(theme::ACCENT)),
-                        Span::styled((*v).to_string(), Style::default().fg(theme::DIM)),
-                    ])
-                }));
+                let block = lines
+                    .iter()
+                    .map(|(k, v)| {
+                        Line::from(vec![
+                            Span::styled(format!("  {k:<32}"), Style::default().fg(theme::ACCENT)),
+                            Span::styled((*v).to_string(), Style::default().fg(theme::DIM)),
+                        ])
+                    })
+                    .collect();
                 self.transcript.push(block);
             }
             "models" => {
@@ -799,13 +793,6 @@ impl App {
         if self.running || self.models.download.is_some() {
             self.spinner_i = (self.spinner_i + 1) % SPINNER.len();
             self.needs_redraw = true;
-        } else if self.mode == Mode::Chat {
-            // Idle mascot: a blink every ~4s (two redraws) and one redraw
-            // when an error glare expires. Otherwise idle stays at zero.
-            let phase = self.tick_i % 32;
-            if phase == 0 || phase == 2 || self.tick_i == self.error_flash {
-                self.needs_redraw = true;
-            }
         }
         // Refresh server status occasionally while the panel is open.
         if self.mode == Mode::Models && self.tick_i.is_multiple_of(16) {
@@ -844,8 +831,6 @@ impl App {
     }
 
     fn error(&mut self, text: &str) {
-        // ~2s of mascot glare (17 ticks at 120ms).
-        self.error_flash = self.tick_i + 17;
         if self.mode == Mode::Models {
             self.models.footer = Some((text.to_string(), true));
         } else {
@@ -924,30 +909,15 @@ impl App {
         self.draw_status(frame, status_area);
     }
 
-    /// The imp reads app state at draw time; no mood state is stored.
-    fn mascot_mood(&self) -> mascot::Mood {
-        if self.pending_approval.is_some() {
-            mascot::Mood::Waiting
-        } else if self.tick_i < self.error_flash {
-            mascot::Mood::Error
-        } else if self.running || self.models.download.is_some() {
-            mascot::Mood::Working
-        } else {
-            mascot::Mood::Idle
-        }
-    }
-
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let version = env!("CARGO_PKG_VERSION");
-        let mut line = mascot::line(self.mascot_mood(), self.tick_i);
-        line.push_span(Span::styled(
-            " open max",
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
-        ));
-        line.push_span(Span::styled(
-            format!("  v{version} · {} · /help", self.dir_label),
-            Style::default().fg(theme::DIM),
-        ));
+        let line = Line::from(vec![
+            Span::styled("◆ open max", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("  v{version} · {} · /help", self.dir_label),
+                Style::default().fg(theme::DIM),
+            ),
+        ]);
         // Second header row stays blank as breathing room above the chat.
         Paragraph::new(line).render(area, frame.buffer_mut());
     }
