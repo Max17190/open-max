@@ -1,0 +1,23 @@
+[package]
+name = "open-max-tui"
+description = "Open Max: a minimal terminal harness for local models on Apple Silicon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openmax"
+path = "src/main.rs"
+
+[dependencies]
+open-max-core = { path = "../core" }
+ratatui = "0.30.2"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+lexopt = "0.3"
+unicode-width = "0.2"
