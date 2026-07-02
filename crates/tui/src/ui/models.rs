@@ -15,6 +15,7 @@ use ratatui::Frame;
 use crate::catalog::MLX_MODELS;
 use crate::theme;
 
+#[derive(Clone)]
 pub struct ModelItem {
     pub repo: String,
     pub label: String,
@@ -33,6 +34,8 @@ pub struct ModelsState {
     pub confirm_delete: Option<String>,
     /// (repo, done, total) while a download runs.
     pub download: Option<(String, u64, u64)>,
+    /// User visible message in the panel footer (text, is_error).
+    pub footer: Option<(String, bool)>,
     pub ram_bytes: u64,
     pub status: Option<MlxStatus>,
     /// Hub sizes already fetched this run, so refresh() never regresses an
@@ -47,6 +50,7 @@ impl ModelsState {
             items: Vec::new(),
             confirm_delete: None,
             download: None,
+            footer: None,
             ram_bytes,
             status: None,
             remote_sizes: HashMap::new(),
@@ -92,6 +96,10 @@ impl ModelsState {
         self.items.get(self.selected).map(|i| i.repo.as_str())
     }
 
+    pub fn selected_item(&self) -> Option<&ModelItem> {
+        self.items.get(self.selected)
+    }
+
     /// Record a live size fetched from the hub for a not-installed repo.
     pub fn set_remote_size(&mut self, repo: &str, bytes: u64) {
         self.remote_sizes.insert(repo.to_string(), bytes);
@@ -126,6 +134,43 @@ fn fit_dot(bytes: Option<u64>, ram: u64) -> Span<'static> {
         theme::ERR
     };
     Span::styled("● ", Style::default().fg(color))
+}
+
+fn download_label(state: &ModelsState, repo: &str) -> String {
+    state
+        .items
+        .iter()
+        .find(|i| i.repo == repo)
+        .map(|i| i.label.clone())
+        .unwrap_or_else(|| repo.to_string())
+}
+
+fn render_download_line(state: &ModelsState, repo: &str, done: u64, total: u64) -> Line<'static> {
+    let label = download_label(state, repo);
+    let width = 20usize;
+    if total > 0 {
+        let pct = (done as f64 / total as f64 * 100.0).min(100.0);
+        let filled = (pct / 100.0 * width as f64) as usize;
+        Line::from(vec![
+            Span::styled("pulling ", Style::default().fg(theme::ACCENT)),
+            Span::raw(format!("{label}  ")),
+            Span::styled(
+                format!("▕{}{}▏", "█".repeat(filled), "░".repeat(width.saturating_sub(filled))),
+                Style::default().fg(theme::ACCENT),
+            ),
+            Span::styled(
+                format!("  {pct:>3.0}%  {} / {}", human_bytes(done), human_bytes(total)),
+                Style::default().fg(theme::DIM),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("pulling ", Style::default().fg(theme::ACCENT)),
+            Span::raw(format!("{label}  ")),
+            Span::styled(format!("▕{}▏", "░".repeat(width)), Style::default().fg(theme::ACCENT)),
+            Span::styled(format!("  …  {}", human_bytes(done)), Style::default().fg(theme::DIM)),
+        ])
+    }
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
@@ -191,29 +236,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
         lines.push(Line::from(spans));
     }
 
-    // Download progress, delete confirmation, or key hints.
+    // Download progress, delete confirmation, status message, or key hints.
     if let Some((repo, done, total)) = &state.download {
-        let pct = if *total > 0 { (*done as f64 / *total as f64 * 100.0).min(100.0) } else { 0.0 };
-        let width = 24usize;
-        let filled = (pct / 100.0 * width as f64) as usize;
-        lines.push(Line::from(vec![
-            Span::styled("⇣ ", Style::default().fg(theme::ACCENT)),
-            Span::raw(format!("{repo}  ")),
-            Span::styled(
-                format!("{}{}", "█".repeat(filled), "░".repeat(width - filled)),
-                Style::default().fg(theme::ACCENT),
-            ),
-            Span::styled(
-                format!(" {:.0}%  {} / {}", pct, human_bytes(*done), human_bytes(*total)),
-                Style::default().fg(theme::DIM),
-            ),
-        ]));
+        lines.push(render_download_line(state, repo, *done, *total));
     } else if let Some(repo) = &state.confirm_delete {
         lines.push(Line::from(vec![
             Span::styled("delete ", Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD)),
             Span::raw(format!("{repo} from disk?  ")),
             Span::styled("[y] yes  [n] no", Style::default().fg(theme::DIM)),
         ]));
+    } else if let Some((msg, is_err)) = &state.footer {
+        let style = if *is_err {
+            Style::default().fg(theme::ERR)
+        } else {
+            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)
+        };
+        lines.push(Line::from(Span::styled(msg.clone(), style)));
     } else {
         let oversized = state
             .items
@@ -224,7 +262,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
         let hint = if oversized {
             "tight fit: raising the gpu wired limit can help (sudo sysctl iogpu.wired_limit_mb=...)".to_string()
         } else {
-            "enter serve · d download · x delete · s stop server · u set up env · esc close".to_string()
+            "↑/↓ navigate · enter download or serve · x delete · s stop · u setup · esc close".to_string()
         };
         lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::DIM))));
     }

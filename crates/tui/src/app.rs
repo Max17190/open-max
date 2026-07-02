@@ -368,28 +368,26 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(repo) = self.models.selected_repo().map(str::to_string) {
-                    let port = {
-                        let mut s = self.core.settings.lock().unwrap();
-                        s.model = repo.clone();
-                        s.mlx_model = repo.clone();
-                        s.base_url = format!("http://127.0.0.1:{}/v1", s.mlx_port);
-                        let _ = config::save(&self.core.data_dir, &s);
-                        s.mlx_port
-                    };
-                    match mlx::start(self.core.clone(), repo.clone(), port) {
-                        Ok(()) => self.note(&format!("starting {repo} (first start downloads weights)")),
-                        Err(e) => self.error(&e),
-                    }
-                    self.models.status = Some(mlx::status(&self.core).await);
+                if self.models.download.is_some() {
+                    self.note("download in progress");
+                    return;
+                }
+                let Some(item) = self.models.selected_item().cloned() else {
+                    return;
+                };
+                if item.installed {
+                    self.serve_selected_model(item.repo).await;
+                } else {
+                    self.begin_model_download(&item);
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(repo) = self.models.selected_repo().map(str::to_string) {
-                    match hf::start_download(self.core.clone(), repo.clone()) {
-                        Ok(()) => self.note(&format!("downloading {repo}")),
-                        Err(e) => self.error(&e),
-                    }
+                if self.models.download.is_some() {
+                    self.note("download in progress");
+                    return;
+                }
+                if let Some(item) = self.models.selected_item().cloned() {
+                    self.begin_model_download(&item);
                 }
             }
             KeyCode::Char('x') => {
@@ -410,6 +408,33 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    fn begin_model_download(&mut self, item: &models::ModelItem) {
+        let total = item.bytes.unwrap_or(0);
+        match hf::start_download(self.core.clone(), item.repo.clone()) {
+            Ok(()) => {
+                self.models.download = Some((item.repo.clone(), 0, total));
+                self.models.footer = None;
+            }
+            Err(e) => self.error(&e),
+        }
+    }
+
+    async fn serve_selected_model(&mut self, repo: String) {
+        let port = {
+            let mut s = self.core.settings.lock().unwrap();
+            s.model = repo.clone();
+            s.mlx_model = repo.clone();
+            s.base_url = format!("http://127.0.0.1:{}/v1", s.mlx_port);
+            let _ = config::save(&self.core.data_dir, &s);
+            s.mlx_port
+        };
+        match mlx::start(self.core.clone(), repo.clone(), port) {
+            Ok(()) => self.note(&format!("starting {repo}")),
+            Err(e) => self.error(&e),
+        }
+        self.models.status = Some(mlx::status(&self.core).await);
     }
 
     // ---------- submission and slash commands ----------
@@ -608,11 +633,11 @@ impl App {
                 DownloadEvent::Progress { repo, done_bytes, total_bytes } => {
                     self.models.download = Some((repo, done_bytes, total_bytes));
                 }
-                DownloadEvent::Done { repo, ok, message } => {
+                DownloadEvent::Done { ok, message, .. } => {
                     self.models.download = None;
                     self.models.refresh();
                     if ok {
-                        self.note(&format!("{repo} is ready to serve"));
+                        self.note(&message);
                     } else {
                         self.error(&message);
                     }
@@ -749,22 +774,30 @@ impl App {
     }
 
     fn note(&mut self, text: &str) {
-        self.transcript.push(vec![Line::from(Span::styled(
-            text.to_string(),
-            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
-        ))]);
+        if self.mode == Mode::Models {
+            self.models.footer = Some((text.to_string(), false));
+        } else {
+            self.transcript.push(vec![Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+            ))]);
+        }
     }
 
     fn error(&mut self, text: &str) {
-        let mut lines = Vec::new();
-        for (i, l) in text.lines().enumerate() {
-            let prefix = if i == 0 { "✗ " } else { "  " };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}{l}"),
-                Style::default().fg(theme::ERR),
-            )));
+        if self.mode == Mode::Models {
+            self.models.footer = Some((text.to_string(), true));
+        } else {
+            let mut lines = Vec::new();
+            for (i, l) in text.lines().enumerate() {
+                let prefix = if i == 0 { "✗ " } else { "  " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{l}"),
+                    Style::default().fg(theme::ERR),
+                )));
+            }
+            self.transcript.push(lines);
         }
-        self.transcript.push(lines);
     }
 
     // ---------- drawing ----------
