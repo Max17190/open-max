@@ -56,26 +56,6 @@ Pick a model for the run:
 openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 ```
 
-## What it looks like
-
-```
-◆ open max v0.2.0 · mlx-community/Qwen2.5-Coder-7B-Instruct-4bit · my-app · /help
-
-> add input validation to the signup form
-
-· read_file  src/forms/signup.rs
-· grep       validate
-· edit_file  src/forms/signup.rs        +12 −3
-  approve? write_file src/forms/signup.rs  [y/n/a]
-
-Added email and password checks; ran `cargo test signup`. 4 passed.
-
-  model · serving Qwen2.5 Coder 7B · context 38% · esc cancels
-> _
-```
-
-Markdown in assistant replies is rendered inline. Tool cards show summaries; press **Ctrl+O** to expand the last tool output.
-
 ## Commands
 
 | Input | Action |
