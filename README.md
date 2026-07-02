@@ -7,7 +7,7 @@ Open Max is a single Rust binary that runs a focused agent loop in your project 
 ## Why Open Max
 
 - **Built for MLX MacBooks.** Provisions a private `mlx-lm` environment, downloads Hugging Face weights, and serves models over a local OpenAI compatible API.
-- **Terminal native.** Finished output lives in native scrollback. A small live viewport at the bottom handles streaming, approvals, and the composer.
+- **A real session.** Open Max takes over the terminal while it runs: a pinned header, the conversation anchored above the composer, wheel scrolling through history. Quit and your shell is exactly as you left it.
 - **Small on purpose.** Seven strict tools, a short system prompt tuned for 7B to 30B models, and context budgeting that drops old tool output before it drops your task.
 - **Visible by default.** Reads, greps, diffs, and shell commands stream as they happen. Writes and `bash` wait for approval unless you say otherwise.
 - **Bring any backend.** Point `~/.openmax/settings.json` at Ollama, LM Studio, vLLM, llama.cpp, or any other OpenAI compatible endpoint.
@@ -62,7 +62,8 @@ openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 | --- | --- |
 | **Enter** | Send message |
 | **Shift+Enter** / **Alt+Enter** | New line in the composer |
-| **Esc** | Cancel the running turn |
+| **Esc** | Cancel the running turn, or jump to the latest output |
+| **Mouse wheel** / **PgUp PgDn** | Scroll the conversation |
 | **Ctrl+O** | Expand last tool output |
 | **Ctrl+T** | Toggle model thinking stream |
 | **Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U / Ctrl+W** | Line editing in the composer |

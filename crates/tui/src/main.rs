@@ -4,17 +4,12 @@ mod input;
 mod theme;
 mod ui;
 
-use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::style::Print;
-use crossterm::terminal::{Clear, ClearType};
 use open_max_core::state::{default_data_dir, Core};
-use ratatui::{TerminalOptions, Viewport};
-
-const VIEWPORT_ROWS: u16 = 10;
 
 const HELP: &str = "openmax: a minimal terminal harness for local models
 
@@ -72,26 +67,10 @@ async fn main() -> std::io::Result<()> {
         s.mlx_model = model.clone();
     }
 
-    // Take over the visible screen so the session starts clean, like a full
-    // app: printing a screenful of newlines pushes the shell prompt and
-    // launch command into scrollback (still there if you scroll up), then the
-    // session begins at the top-left. The viewport starts at the top and
-    // insert_before pushes it down until it reaches the bottom, after which
-    // finished blocks flow into native scrollback as before.
-    let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-    let _ = execute!(
-        std::io::stdout(),
-        Print("\n".repeat(rows as usize)),
-        MoveTo(0, 0),
-        Clear(ClearType::FromCursorDown),
-    );
-
-    // Inline viewport: scrollback stays native; clamp low so tiny terminals
-    // never end up with a viewport as tall as the screen.
-    let height = VIEWPORT_ROWS.min(rows.saturating_sub(2)).max(4);
-    let terminal = ratatui::init_with_options(TerminalOptions {
-        viewport: Viewport::Inline(height),
-    });
+    // Fullscreen session on the alternate screen: openmax owns the whole
+    // terminal while it runs, and your shell (prompt, history, scrollback)
+    // reappears untouched on exit.
+    let terminal = ratatui::init();
 
     // Kitty keyboard protocol makes Shift+Enter distinct; Alt+Enter stays as
     // the fallback everywhere else. Bracketed paste for sane multiline paste.
@@ -105,6 +84,9 @@ async fn main() -> std::io::Result<()> {
         );
     }
     let _ = execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // Mouse capture for wheel scrolling of the transcript. Terminals still
+    // allow text selection with the usual modifier (Option on macOS).
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
 
     let result = app::run(
         terminal,
@@ -114,6 +96,7 @@ async fn main() -> std::io::Result<()> {
     )
     .await;
 
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     if enhanced {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
