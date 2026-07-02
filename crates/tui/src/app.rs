@@ -939,18 +939,17 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let version = env!("CARGO_PKG_VERSION");
-        let [mut top, face] = mascot::lines(self.mascot_mood(), self.tick_i);
-        top.push_span(Span::styled(
-            "  open max",
+        let mut line = mascot::line(self.mascot_mood(), self.tick_i);
+        line.push_span(Span::styled(
+            " open max",
             Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         ));
-        top.push_span(Span::styled(
+        line.push_span(Span::styled(
             format!("  v{version} · {} · /help", self.dir_label),
             Style::default().fg(theme::DIM),
         ));
-        // Row 2 carries the imp's face; the space to its right stays blank
-        // as breathing room above the chat.
-        Paragraph::new(vec![top, face]).render(area, frame.buffer_mut());
+        // Second header row stays blank as breathing room above the chat.
+        Paragraph::new(line).render(area, frame.buffer_mut());
     }
 
     /// Finished transcript plus the live tail, bottom anchored, honoring the
