@@ -17,8 +17,8 @@ Open Max is a single Rust binary that runs a focused agent loop in your project 
 **Requirements:** macOS on Apple Silicon, [Rust](https://rustup.rs), and either [uv](https://docs.astral.sh/uv/) or Python 3.9+ (for the managed MLX server).
 
 ```sh
-git clone https://github.com/maxloffgren/open_max.git
-cd open_max
+git clone https://github.com/Max17190/open-max.git
+cd open-max
 cargo install --path crates/tui --locked
 ```
 
@@ -85,6 +85,7 @@ Markdown in assistant replies is rendered inline. Tool cards show summaries; pre
 | **Esc** | Cancel the running turn |
 | **Ctrl+O** | Expand last tool output |
 | **Ctrl+T** | Toggle model thinking stream |
+| **Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U / Ctrl+W** | Line editing in the composer |
 | **Ctrl+C** twice | Quit (model server keeps running) |
 
 | Slash command | Action |

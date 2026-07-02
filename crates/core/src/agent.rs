@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -90,7 +90,7 @@ impl TokenBatcher {
 async fn run_loop(
     core: &Arc<Core>,
     session_id: &str,
-    project_root: &PathBuf,
+    project_root: &Path,
     user_text: String,
     settings: Settings,
     cancelled: Arc<AtomicBool>,
@@ -116,7 +116,9 @@ async fn run_loop(
     );
     let schemas = tools::tool_schemas();
     let known_tools = tools::tool_names();
-    let mut stop_reason = String::from("stop");
+    // Every break assigns a real reason; this survives only if the model kept
+    // calling tools until the iteration cap.
+    let mut stop_reason = String::from("max_iterations");
 
     'turns: for _ in 0..MAX_ITERATIONS {
         enforce_budget(&mut messages, settings.context_tokens.saturating_sub(settings.max_tokens + 1024));
@@ -153,11 +155,15 @@ async fn run_loop(
         }
         core.send_agent(session_id, AgentEvent::MessageDone { text: content.clone() });
 
-        messages.push(ChatMessage::assistant(
-            if content.is_empty() { None } else { Some(content.clone()) },
-            if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
-        ));
-        save_messages(core, session_id, &messages).await;
+        // Never persist a fully empty assistant message (e.g. a turn cancelled
+        // before the first token): chat templates can reject it on replay.
+        if !content.is_empty() || !tool_calls.is_empty() {
+            messages.push(ChatMessage::assistant(
+                if content.is_empty() { None } else { Some(content.clone()) },
+                if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
+            ));
+            save_messages(core, session_id, &messages).await;
+        }
 
         if cancelled.load(Ordering::Relaxed) {
             stop_reason = "cancelled".into();
@@ -196,13 +202,16 @@ async fn run_loop(
                 snapshot_file(core, session_id, project_root, &args).await;
             }
 
-            let outcome = if tools::is_mutating(name) && settings.approval_mode == "readonly" {
+            // Read live so "[a]lways" during an approval prompt takes effect
+            // for the rest of this turn, not just the next one.
+            let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
+            let outcome = if tools::is_mutating(name) && approval_mode == "readonly" {
                 tools::ToolOutcome {
                     ok: false,
                     output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                     diff: None,
                 }
-            } else if tools::is_mutating(name) && settings.approval_mode == "ask" {
+            } else if tools::is_mutating(name) && approval_mode == "ask" {
                 let approved = request_approval(core, session_id, name, &args, &cancelled).await;
                 if approved {
                     tools::execute(name, &args, project_root).await
@@ -245,7 +254,7 @@ async fn run_loop(
 
 /// Record a file's pre-edit content the first time this session touches it,
 /// enabling cumulative per-file diffs.
-async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &PathBuf, args: &Value) {
+async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, args: &Value) {
     let Some(rel) = args["path"].as_str() else { return };
     let content = std::fs::read_to_string(project_root.join(rel)).unwrap_or_default();
     let mut sessions_map = core.sessions.lock().await;

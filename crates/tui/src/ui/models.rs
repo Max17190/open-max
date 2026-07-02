@@ -2,6 +2,8 @@
 //! hub cache, with live sizes, RAM-fit dots, download progress, and server
 //! control. Rendered inside the live viewport as an overlay mode.
 
+use std::collections::HashMap;
+
 use open_max_core::hf;
 use open_max_core::mlx::MlxStatus;
 use ratatui::layout::Rect;
@@ -19,6 +21,8 @@ pub struct ModelItem {
     pub note: String,
     /// Exact bytes: from disk when installed, from the hub API otherwise.
     pub bytes: Option<u64>,
+    /// Catalog RAM estimate shown until exact bytes are known.
+    pub ram_hint: Option<&'static str>,
     pub installed: bool,
 }
 
@@ -31,6 +35,9 @@ pub struct ModelsState {
     pub download: Option<(String, u64, u64)>,
     pub ram_bytes: u64,
     pub status: Option<MlxStatus>,
+    /// Hub sizes already fetched this run, so refresh() never regresses an
+    /// exact size back to a placeholder.
+    remote_sizes: HashMap<String, u64>,
 }
 
 impl ModelsState {
@@ -42,6 +49,7 @@ impl ModelsState {
             download: None,
             ram_bytes,
             status: None,
+            remote_sizes: HashMap::new(),
         };
         s.refresh();
         s
@@ -58,7 +66,8 @@ impl ModelsState {
                     repo: m.id.to_string(),
                     label: m.label.to_string(),
                     note: m.note.to_string(),
-                    bytes: disk.map(|d| d.bytes),
+                    bytes: disk.map(|d| d.bytes).or_else(|| self.remote_sizes.get(m.id).copied()),
+                    ram_hint: Some(m.ram),
                     installed: disk.is_some(),
                 }
             })
@@ -70,6 +79,7 @@ impl ModelsState {
                     label: i.repo.clone(),
                     note: "local cache".into(),
                     bytes: Some(i.bytes),
+                    ram_hint: None,
                     installed: true,
                 });
             }
@@ -84,6 +94,7 @@ impl ModelsState {
 
     /// Record a live size fetched from the hub for a not-installed repo.
     pub fn set_remote_size(&mut self, repo: &str, bytes: u64) {
+        self.remote_sizes.insert(repo.to_string(), bytes);
         if let Some(item) = self.items.iter_mut().find(|i| i.repo == repo) {
             if item.bytes.is_none() {
                 item.bytes = Some(bytes);
@@ -153,7 +164,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
             .as_ref()
             .map(|s| s.server_running && s.model.as_deref() == Some(item.repo.as_str()))
             .unwrap_or(false);
-        let size = item.bytes.map(human_bytes).unwrap_or_else(|| "…".into());
+        let size = item
+            .bytes
+            .map(human_bytes)
+            .or_else(|| item.ram_hint.map(str::to_string))
+            .unwrap_or_else(|| "…".into());
         let mut spans = vec![
             marker,
             fit_dot(item.bytes, state.ram_bytes),

@@ -45,10 +45,6 @@ impl Composer {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lines.iter().all(|l| l.trim().is_empty())
-    }
-
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
@@ -122,6 +118,12 @@ impl Composer {
                 self.col = 0;
             }
             KeyCode::Char('w') if ctrl => self.delete_word(),
+            KeyCode::Char('a') if ctrl => self.col = 0,
+            KeyCode::Char('e') if ctrl => self.col = self.lines[self.row].chars().count(),
+            KeyCode::Char('k') if ctrl => {
+                let byte = char_to_byte(&self.lines[self.row], self.col);
+                self.lines[self.row].truncate(byte);
+            }
             KeyCode::Char(c) if !ctrl => {
                 self.hist_idx = None;
                 self.insert_char(c);
@@ -248,13 +250,16 @@ impl Composer {
         }
     }
 
-    /// Lines to draw plus the cursor position (x, y) within them.
-    pub fn render(&self) -> (Vec<Line<'static>>, u16, u16) {
+    /// Lines to draw plus the cursor position (x, y) within them. `max_h` is
+    /// the height actually granted by the caller, which can be smaller than
+    /// `height()` on tiny terminals.
+    pub fn render(&self, max_h: u16) -> (Vec<Line<'static>>, u16, u16) {
         let mut out = Vec::new();
-        // Show the last rows that fit the height budget.
-        let visible = self.height() as usize;
-        let first = self.lines.len().saturating_sub(visible);
-        for (i, line) in self.lines.iter().enumerate().skip(first) {
+        // Show the last rows that fit the height budget, sliding up when the
+        // cursor moves into rows that would otherwise be scrolled out.
+        let visible = (self.height().min(max_h.max(1))) as usize;
+        let first = self.lines.len().saturating_sub(visible).min(self.row);
+        for (i, line) in self.lines.iter().enumerate().skip(first).take(visible) {
             let prefix = if i == 0 {
                 Span::styled("❯ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
             } else {

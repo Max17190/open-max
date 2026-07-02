@@ -20,13 +20,25 @@ pub fn tool_block(
     } else {
         ("✗", Style::default().fg(theme::ERR))
     };
-    let mut lines = vec![Line::from(vec![
+    let mut header = vec![
         Span::styled(glyph.to_string(), glyph_style),
         Span::raw(" "),
         Span::styled(name.to_string(), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
-        Span::styled(clip(summary, 90), Style::default().fg(theme::DIM)),
-    ])];
+    ];
+    match diff {
+        // For edits the path plus change counts say it all; the summary would
+        // repeat the path.
+        Some(d) => header.extend([
+            Span::styled(clip(&d.path, 90), Style::default().fg(theme::DIM)),
+            Span::raw("  "),
+            Span::styled(format!("+{}", d.added), Style::default().fg(theme::OK)),
+            Span::raw(" "),
+            Span::styled(format!("−{}", d.removed), Style::default().fg(theme::ERR)),
+        ]),
+        None => header.push(Span::styled(clip(summary, 90), Style::default().fg(theme::DIM))),
+    }
+    let mut lines = vec![Line::from(header)];
 
     match diff {
         Some(d) => lines.extend(diff_lines(&d.diff)),

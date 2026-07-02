@@ -45,7 +45,6 @@ pub struct App {
     session_id: Option<String>,
     mode: Mode,
     composer: Composer,
-    hl: markdown::Highlighter,
     models: models::ModelsState,
 
     running: bool,
@@ -85,7 +84,6 @@ pub async fn run(
         session_id: None,
         mode: Mode::Chat,
         composer: Composer::new(&core.data_dir),
-        hl: markdown::Highlighter::default(),
         models: models::ModelsState::new(ram),
         running: false,
         stream_text: String::new(),
@@ -204,7 +202,7 @@ impl App {
                 "assistant" => {
                     if let Some(text) = &m.content {
                         if !text.trim().is_empty() {
-                            insert_block(terminal, markdown::render(text, &self.hl))?;
+                            insert_block(terminal, markdown::render(text, markdown::highlighter()))?;
                         }
                     }
                     if let Some(calls) = &m.tool_calls {
@@ -637,7 +635,7 @@ impl App {
             }
             AgentEvent::MessageDone { text } => {
                 if !text.trim().is_empty() {
-                    insert_block(terminal, markdown::render(&text, &self.hl))?;
+                    insert_block(terminal, markdown::render(&text, markdown::highlighter()))?;
                 }
                 self.stream_text.clear();
                 self.thinking_tail.clear();
@@ -675,6 +673,7 @@ impl App {
                     "stop" | "tool_calls" => {}
                     "cancelled" => self.note(terminal, "cancelled")?,
                     "length" => self.note(terminal, "stopped: hit the response token limit")?,
+                    "max_iterations" => self.note(terminal, "stopped: reached the tool-call limit for one turn (send a follow-up to continue)")?,
                     "error" => {}
                     other => self.note(terminal, &format!("stopped: {other}"))?,
                 }
@@ -716,7 +715,7 @@ impl App {
             self.needs_redraw = true;
         }
         // Refresh server status occasionally while the panel is open.
-        if self.mode == Mode::Models && self.tick_i % 16 == 0 {
+        if self.mode == Mode::Models && self.tick_i.is_multiple_of(16) {
             self.models.status = Some(mlx::status(&self.core).await);
             self.needs_redraw = true;
         }
@@ -771,9 +770,19 @@ impl App {
             return;
         }
 
-        let status_h = 1u16;
-        let approval_h = if self.pending_approval.is_some() { 1 } else { 0 };
-        let composer_h = self.composer.height();
+        // Clamp every band so the chrome never exceeds the viewport, even on
+        // tiny terminals (rendering outside the buffer panics).
+        let status_h = 1u16.min(area.height);
+        let approval_h = if self.pending_approval.is_some() {
+            1u16.min(area.height.saturating_sub(status_h))
+        } else {
+            0
+        };
+        let composer_h = self
+            .composer
+            .height()
+            .min(area.height.saturating_sub(status_h + approval_h))
+            .max(u16::from(area.height > status_h + approval_h));
         let chrome = status_h + approval_h + composer_h;
         let tail_h = area.height.saturating_sub(chrome);
 
@@ -800,7 +809,7 @@ impl App {
             .render(approval_area, frame.buffer_mut());
         }
 
-        let (composer_lines, cx, cy) = self.composer.render();
+        let (composer_lines, cx, cy) = self.composer.render(composer_h);
         Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
         if self.pending_approval.is_none() {
             frame.set_cursor_position(Position::new(composer_area.x + cx, composer_area.y + cy));

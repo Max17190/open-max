@@ -2,6 +2,8 @@
 //! emphasis, inline code, lists, blockquotes, rules, and syntect-highlighted
 //! fenced code. Enough for model output without pulling in a full parser.
 
+use std::sync::OnceLock;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
@@ -13,6 +15,13 @@ use crate::theme;
 pub struct Highlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
+}
+
+/// Loading syntect's syntax and theme dumps costs tens of milliseconds, so it
+/// happens lazily on the first rendered code fence, not at startup.
+pub fn highlighter() -> &'static Highlighter {
+    static HL: OnceLock<Highlighter> = OnceLock::new();
+    HL.get_or_init(Highlighter::default)
 }
 
 impl Default for Highlighter {
@@ -33,7 +42,6 @@ impl Default for Highlighter {
 pub fn render(text: &str, hl: &Highlighter) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_fence = false;
-    let mut fence_lang = String::new();
     let mut highlighter: Option<HighlightLines> = None;
 
     for raw in text.lines() {
@@ -44,10 +52,10 @@ pub fn render(text: &str, hl: &Highlighter) -> Vec<Line<'static>> {
                 highlighter = None;
             } else {
                 in_fence = true;
-                fence_lang = trimmed.trim_start_matches('`').trim().to_string();
+                let fence_lang = trimmed.trim_start_matches('`').trim();
                 let syntax = hl
                     .syntaxes
-                    .find_syntax_by_token(&fence_lang)
+                    .find_syntax_by_token(fence_lang)
                     .unwrap_or_else(|| hl.syntaxes.find_syntax_plain_text());
                 highlighter = Some(HighlightLines::new(syntax, &hl.theme));
             }

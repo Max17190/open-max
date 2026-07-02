@@ -1216,6 +1216,7 @@ name = "open-max-tui"
 version = "0.2.0"
 dependencies = [
  "crossterm",
+ "futures-util",
  "lexopt",
  "open-max-core",
  "ratatui",
@@ -2293,7 +2294,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
