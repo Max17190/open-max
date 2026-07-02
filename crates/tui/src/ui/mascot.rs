@@ -25,54 +25,48 @@ pub enum Mood {
     Error,
 }
 
-// Header imp, one row of four cells: two horn shoulders flanking the eyes.
-//   ▙▀▀▟
-const HORN_L: &str = "▙";
-const HORN_R: &str = "▟";
+// In the header the imp hides: all that lingers are its two glowing eyes,
+// a pair of quadrant dots in two cells. The full creature only shows itself
+// in the launch splash.
 
-/// The imp's single header row for a given mood and tick. The tick drives
-/// the idle blink and the working pulse; both are pure functions of it, so
-/// the caller decides when a redraw is worth it.
+/// The imp's single header row — just the eyes — for a given mood and tick.
+/// The tick drives the idle blink and the working pulse; both are pure
+/// functions of it, so the caller decides when a redraw is worth it.
 pub fn line(mood: Mood, tick: u64) -> Line<'static> {
-    let horn = Style::default().fg(theme::ACCENT);
-    let (eye_glyph, eye_style) = eyes(mood, tick);
-    Line::from(vec![
-        Span::styled(HORN_L, horn),
-        Span::styled(eye_glyph, eye_style),
-        Span::styled(HORN_R, horn),
-    ])
+    let (glyph, style) = eyes(mood, tick);
+    Line::from(Span::styled(glyph, style))
 }
 
 /// Eye glyphs and style per mood. Every variant is exactly two cells wide so
-/// the sprite never shifts the header text. A blink dims the eyes into the
-/// horn shading instead of painting a background.
+/// the sprite never shifts the header text. A blink dims the eyes toward the
+/// shadow purple instead of painting a background.
 fn eyes(mood: Mood, tick: u64) -> (&'static str, Style) {
     match mood {
         Mood::Idle => {
             if tick % 32 < 2 {
-                ("▀▀", Style::default().fg(theme::ACCENT_DEEP))
+                ("▘▝", Style::default().fg(theme::ACCENT_DEEP))
             } else {
-                ("▀▀", Style::default().fg(theme::EYES))
+                ("▘▝", Style::default().fg(theme::EYES))
             }
         }
         Mood::Working => {
             let glow = if (tick / 2).is_multiple_of(2) { theme::EYES } else { EYE_GLOW };
-            ("▀▀", Style::default().fg(glow))
+            ("▘▝", Style::default().fg(glow))
         }
-        Mood::Waiting => ("██", Style::default().fg(theme::EYES)),
-        Mood::Error => ("▄▄", Style::default().fg(theme::EYES)),
+        Mood::Waiting => ("▌▐", Style::default().fg(theme::EYES)),
+        Mood::Error => ("▗▖", Style::default().fg(theme::EYES)),
     }
 }
 
-/// One-line micro imp for inline headings (e.g. /help).
+/// The lurking eyes for inline headings (e.g. /help).
 pub fn micro() -> Span<'static> {
-    Span::styled("▝▙▟▘", Style::default().fg(theme::ACCENT_DEEP))
+    Span::styled("▘▝", Style::default().fg(theme::ACCENT_DEEP))
 }
 
-/// The launch splash: a larger imp beside the version and a hint line.
-/// Pushed once into the transcript at startup and scrolls away naturally.
-/// Eye cells are bare half-blocks — the sockets beneath them stay on the
-/// terminal background.
+/// The launch splash: the one place the whole imp shows itself, beside the
+/// version and a hint line. Pushed once into the transcript at startup and
+/// scrolls away naturally. Eye cells are bare half-blocks — the sockets
+/// beneath them stay on the terminal background.
 pub fn splash(version: &str) -> Vec<Line<'static>> {
     let deep = Style::default().fg(theme::ACCENT_DEEP);
     let body = Style::default().fg(theme::ACCENT);
@@ -84,25 +78,24 @@ pub fn splash(version: &str) -> Vec<Line<'static>> {
 
     vec![
         Line::default(),
-        Line::from(vec![Span::styled("▝▙▖     ▗▟▘", deep)]),
         Line::from(vec![
-            Span::styled(" ▜▙", deep),
-            Span::styled("▄▄▄▄▄", body),
-            Span::styled("▟▛ ", deep),
+            Span::styled("▝▙", deep),
+            Span::styled("▄▄▄", body),
+            Span::styled("▟▘", deep),
             Span::raw("   "),
             Span::styled(format!("open max v{version}"), title),
         ]),
         Line::from(vec![
-            Span::styled(" ▐██", body),
+            Span::styled("▐█", body),
             Span::styled("▀", eyes),
             Span::styled("█", body),
             Span::styled("▀", eyes),
-            Span::styled("██▌ ", body),
+            Span::styled("█▌", body),
             Span::raw("   "),
             Span::styled("a minimal harness for local models", dim),
         ]),
         Line::from(vec![
-            Span::styled(" ▝▜█████▛▘ ", body),
+            Span::styled("▝▀▀▀▀▀▘", deep),
             Span::raw("   "),
             Span::styled("/models to serve one · /help for commands", dim),
         ]),
