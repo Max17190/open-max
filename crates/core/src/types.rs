@@ -69,6 +69,10 @@ pub enum AgentEvent {
     MessageDone { text: String },
     /// Estimated context usage at the start of a completion.
     Budget { used_tokens: usize, context_tokens: usize },
+    /// Server-reported token accounting for one completion. `cached_tokens`
+    /// near zero on a long session means prefix stability broke and every
+    /// step is paying a full prompt re-prefill.
+    Usage { prompt_tokens: u64, completion_tokens: u64, cached_tokens: Option<u64> },
     ToolStart { call_id: String, name: String, args: serde_json::Value },
     ToolEnd { call_id: String, ok: bool, output: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },

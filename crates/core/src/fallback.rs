@@ -21,6 +21,27 @@ use crate::types::{ToolCall, ToolCallFunction};
 const OPEN_TAG: &str = "<tool_call>";
 const CLOSE_TAG: &str = "</tool_call>";
 
+/// Strip a leaked leading reasoning block from assistant content. Serving
+/// layers normally split reasoning into `reasoning_content`, but when template
+/// coverage lags a model the raw `<think>…</think>` block arrives in
+/// `content`. Persisting it would re-prefill dead reasoning tokens on every
+/// subsequent turn. Handles an unterminated block (stream cut mid-thought) by
+/// treating the rest of the message as reasoning. Returns None when there is
+/// nothing to strip.
+pub fn strip_leading_think(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        if let Some(body) = trimmed.strip_prefix(open) {
+            let rest = match body.find(close) {
+                Some(i) => &body[i + close.len()..],
+                None => "",
+            };
+            return Some(rest.trim_start().to_string());
+        }
+    }
+    None
+}
+
 /// Try to pull tool calls out of raw assistant text. Returns the text with
 /// call markup removed plus the synthesized calls, or None if nothing valid
 /// was found.
@@ -241,6 +262,29 @@ mod tests {
     #[test]
     fn text_without_markup_returns_none() {
         assert!(extract_tool_calls("All done. The tests pass.", known()).is_none());
+    }
+
+    #[test]
+    fn leading_think_block_is_stripped() {
+        assert_eq!(
+            strip_leading_think("<think>hmm, let me see</think>\nThe answer is 4.").as_deref(),
+            Some("The answer is 4.")
+        );
+        assert_eq!(
+            strip_leading_think("  <thinking>pondering</thinking>done").as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn unterminated_think_block_consumes_the_rest() {
+        assert_eq!(strip_leading_think("<think>cut off mid-").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn think_tag_mid_message_is_left_alone() {
+        assert!(strip_leading_think("The `<think>` tag is used by Qwen3.").is_none());
+        assert!(strip_leading_think("plain answer").is_none());
     }
 
     #[test]

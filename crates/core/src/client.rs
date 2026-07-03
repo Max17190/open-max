@@ -17,6 +17,19 @@ pub struct CompletionResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: String,
+    /// Server-reported token accounting, when the backend provides it.
+    pub usage: Option<Usage>,
+}
+
+/// Ground-truth token usage from the server. `cached_tokens` is the number of
+/// prompt tokens served from the prompt cache (mlx-lm reports it under
+/// `prompt_tokens_details`): if it stays near zero across turns, the harness
+/// broke prefix stability and every step is paying a full re-prefill.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: Option<u64>,
 }
 
 /// Minimal client for any OpenAI-compatible /v1/chat/completions endpoint
@@ -40,6 +53,30 @@ struct PartialToolCall {
 #[derive(Deserialize)]
 struct StreamChunk {
     choices: Vec<StreamChoice>,
+    // Sent on the final chunk when the request asks for it via stream_options.
+    usage: Option<UsageJson>,
+}
+
+#[derive(Deserialize)]
+struct UsageJson {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    cached_tokens: Option<u64>,
+}
+
+impl UsageJson {
+    fn into_usage(self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_tokens.unwrap_or(0),
+            completion_tokens: self.completion_tokens.unwrap_or(0),
+            cached_tokens: self.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -73,11 +110,19 @@ struct ToolCallFnDelta {
 
 impl ChatClient {
     pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: f32, max_tokens: usize) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            // No overall timeout: local generations can legitimately take minutes.
-            .build()
-            .expect("failed to build http client");
+        // One client (and connection pool) for the process lifetime: ChatClient
+        // is rebuilt every turn, and rebuilding the pool with it would redo the
+        // TCP/TLS handshake per turn on remote endpoints.
+        static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let http = HTTP
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    // No overall timeout: local generations can legitimately take minutes.
+                    .build()
+                    .expect("failed to build http client")
+            })
+            .clone();
         Self { base_url, api_key, model, temperature, max_tokens, http }
     }
 
@@ -101,6 +146,9 @@ impl ChatClient {
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "stream": true,
+            // Ask for ground-truth token usage (including prompt-cache hits)
+            // on the final chunk; servers that don't know the option ignore it.
+            "stream_options": { "include_usage": true },
         });
         if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
             body["tools"] = tools.clone();
@@ -118,7 +166,7 @@ impl ChatClient {
         let resp = tokio::select! {
             r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
             _ = wait_for(&cancelled) => {
-                return Ok(CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into() });
+                return Ok(CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into(), usage: None });
             }
         };
         let status = resp.status();
@@ -142,6 +190,7 @@ impl ChatClient {
         let mut content = String::new();
         let mut partials: Vec<PartialToolCall> = Vec::new();
         let mut finish_reason = String::from("stop");
+        let mut usage: Option<Usage> = None;
         // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
         // conversion only happens on complete lines ('\n' is never part of a
         // multi-byte sequence).
@@ -172,6 +221,10 @@ impl ChatClient {
                     break 'outer;
                 }
                 let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
+                if let Some(u) = chunk.usage {
+                    usage = Some(u.into_usage());
+                }
+                // The usage-bearing final chunk has an empty choices array.
                 let Some(choice) = chunk.choices.into_iter().next() else { continue };
 
                 if let Some(reason) = choice.finish_reason {
@@ -220,7 +273,7 @@ impl ChatClient {
         if !tool_calls.is_empty() && finish_reason == "stop" {
             finish_reason = "tool_calls".into();
         }
-        Ok(CompletionResult { content, tool_calls, finish_reason })
+        Ok(CompletionResult { content, tool_calls, finish_reason, usage })
     }
 }
 
@@ -270,7 +323,10 @@ fn parse_complete_response(
         .as_str()
         .unwrap_or(if tool_calls.is_empty() { "stop" } else { "tool_calls" })
         .to_string();
-    Ok(CompletionResult { content, tool_calls, finish_reason })
+    let usage = serde_json::from_value::<UsageJson>(v["usage"].clone())
+        .ok()
+        .map(UsageJson::into_usage);
+    Ok(CompletionResult { content, tool_calls, finish_reason, usage })
 }
 
 fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {

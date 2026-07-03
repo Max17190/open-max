@@ -66,6 +66,8 @@ pub struct App {
     tool_meta: HashMap<String, (String, String)>,
     last_tool_output: Option<String>,
     budget: Option<(usize, usize)>,
+    /// Prompt-cache hit rate of the last completion, from server usage.
+    cache_pct: Option<u8>,
     quit_armed: bool,
     spinner_i: usize,
     tick_i: u64,
@@ -87,6 +89,7 @@ pub struct App {
     status_approvals: String,
     status_ready: bool,
     status_budget: Option<(usize, usize)>,
+    status_cache: Option<u8>,
     status_scrolled: bool,
     status_quit_armed: bool,
     status_line: Line<'static>,
@@ -127,6 +130,7 @@ pub async fn run(
         tool_meta: HashMap::new(),
         last_tool_output: None,
         budget: None,
+        cache_pct: None,
         quit_armed: false,
         spinner_i: 0,
         tick_i: 0,
@@ -146,6 +150,7 @@ pub async fn run(
         status_approvals: String::new(),
         status_ready: false,
         status_budget: None,
+        status_cache: None,
         status_scrolled: false,
         status_quit_armed: false,
         status_line: Line::default(),
@@ -193,10 +198,14 @@ fn ram_bytes() -> u64 {
 
 impl App {
     async fn startup(&mut self, args: &Args) {
-        // Adopt a still-running server from a previous launch.
-        if mlx::reattach(&self.core).await {
-            self.models.status = Some(mlx::status(&self.core).await);
-        }
+        // Adopt a still-running server from a previous launch — in the
+        // background: reattach spawns `ps` and probes HTTP with a 2s timeout,
+        // and the first frame must never wait on that. ServerReady flips the
+        // status dot when it resolves.
+        let core = self.core.clone();
+        tokio::spawn(async move {
+            mlx::reattach(&core).await;
+        });
 
         if args.continue_session {
             let project = self.project.display().to_string();
@@ -670,7 +679,15 @@ impl App {
                 }
                 self.on_agent_event(env.event);
             }
-            CoreEvent::Mlx(ev) => self.on_mlx_event(ev).await,
+            CoreEvent::Mlx(ev) => {
+                // Log lines are pull-only (/logs). Repainting per line would
+                // turn the server's own logging into a render load while the
+                // model generates.
+                if matches!(ev, MlxEvent::ServerLog { .. } | MlxEvent::SetupLog { .. }) {
+                    return;
+                }
+                self.on_mlx_event(ev).await
+            }
             CoreEvent::Download(ev) => match ev {
                 DownloadEvent::Progress { repo, done_bytes, total_bytes } => {
                     self.models.download = Some((repo, done_bytes, total_bytes));
@@ -724,6 +741,14 @@ impl App {
             }
             AgentEvent::Budget { used_tokens, context_tokens } => {
                 self.budget = Some((used_tokens, context_tokens));
+            }
+            AgentEvent::Usage { prompt_tokens, cached_tokens, .. } => {
+                self.cache_pct = match cached_tokens {
+                    Some(c) if prompt_tokens > 0 => {
+                        Some(((c as f64 / prompt_tokens as f64) * 100.0).round() as u8)
+                    }
+                    _ => None,
+                };
             }
             AgentEvent::ToolStart { call_id, name, args } => {
                 let summary = tools::summarize_call(&name, &args);
@@ -1048,6 +1073,7 @@ impl App {
             || approvals != self.status_approvals
             || ready != self.status_ready
             || self.status_budget != self.budget
+            || self.status_cache != self.cache_pct
             || self.status_scrolled != scrolled
             || self.status_quit_armed != self.quit_armed;
 
@@ -1056,14 +1082,20 @@ impl App {
             self.status_approvals = approvals;
             self.status_ready = ready;
             self.status_budget = self.budget;
+            self.status_cache = self.cache_pct;
             self.status_scrolled = scrolled;
             self.status_quit_armed = self.quit_armed;
 
             let dot_color = if ready { theme::OK } else { theme::DIM };
-            let ctx = self
+            let mut ctx = self
                 .budget
                 .map(|(u, t)| format!(" · ctx {}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                 .unwrap_or_default();
+            // Prompt-cache hit rate from server usage: the canary for prefix
+            // stability. Near zero on a long session means full re-prefills.
+            if let Some(pct) = self.cache_pct {
+                ctx.push_str(&format!(" · cache {pct}%"));
+            }
             let short_model = self
                 .status_model
                 .rsplit('/')
