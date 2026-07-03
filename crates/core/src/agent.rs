@@ -149,10 +149,23 @@ async fn run_loop(
             }
         };
 
+        if let Some(u) = result.usage {
+            core.send_agent(session_id, AgentEvent::Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                cached_tokens: u.cached_tokens,
+            });
+        }
+
         // Prefer structured calls from the server; when there are none,
         // recover calls from raw markup in the content (see fallback.rs).
         let mut content = result.content.clone();
         let mut tool_calls = result.tool_calls.clone();
+        // Reasoning leaked into content is display-only: persisting it would
+        // re-prefill dead tokens on every later turn.
+        if let Some(clean) = fallback::strip_leading_think(&content) {
+            content = clean;
+        }
         if tool_calls.is_empty() {
             if let Some((clean, calls)) = fallback::extract_tool_calls(&content, known_tools) {
                 content = clean;
@@ -316,17 +329,27 @@ async fn request_approval(
 /// Keep the transcript inside the model's context window: first truncate old
 /// tool outputs, then drop the oldest exchanges (always preserving the system
 /// prompt and the original user request). Returns true when messages changed.
+///
+/// Prunes with hysteresis: once the budget is crossed, compact well below it
+/// (PRUNE_TARGET_PCT) in a single pass. The server-side prompt cache re-prefills
+/// from the first byte that diverges, so mutating early messages every
+/// iteration would force a near-full prefill per agent step; pruning hard and
+/// then leaving history untouched keeps the transcript append-only (and the
+/// cache warm) until the budget is crossed again.
+const PRUNE_TARGET_PCT: usize = 70;
+
 fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
     let mut total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
     if total <= budget {
         return false;
     }
+    let target = budget * PRUNE_TARGET_PCT / 100;
     let keep_tail = messages.len().saturating_sub(6);
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
-                    let mut cut = 400;
+                    let mut cut = 160;
                     while !c.is_char_boundary(cut) {
                         cut -= 1;
                     }
@@ -336,13 +359,13 @@ fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
                 }
             }
         }
-        if total <= budget {
+        if total <= target {
             return true;
         }
     }
     // Drop whole exchanges starting after [system, first user]. Keep tool
     // replies consistent with the assistant message that requested them.
-    while total > budget && messages.len() > 6 {
+    while total > target && messages.len() > 6 {
         let removed = messages.remove(2);
         total = total.saturating_sub(removed.estimated_tokens());
         if removed.role == "assistant" && removed.tool_calls.is_some() {
@@ -393,5 +416,30 @@ mod tests {
         assert_eq!(messages.len(), 10, "nothing should be dropped, only truncated");
         let tool_len = messages[2].content.as_deref().unwrap().len();
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");
+    }
+
+    /// One prune must buy headroom: after compaction the transcript sits at or
+    /// below the prune target, and re-running enforce_budget mutates nothing,
+    /// so the token prefix (and the server's prompt cache) stays stable while
+    /// the next iterations append.
+    #[test]
+    fn budget_prunes_once_with_hysteresis() {
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..8 {
+            messages.push(msg("assistant", 100));
+            messages.push(msg("tool", 3000));
+        }
+        let budget = 4000;
+        assert!(enforce_budget(&mut messages, budget));
+        let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        assert!(
+            total <= budget * PRUNE_TARGET_PCT / 100,
+            "prune should reach the target, got {total} of {budget}"
+        );
+
+        let snapshot: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
+        assert!(!enforce_budget(&mut messages, budget), "second pass must be a no-op");
+        let after: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(snapshot, after, "no message may change between prunes");
     }
 }

@@ -98,15 +98,28 @@ fn find_uv() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// A working python3 cannot disappear mid-session, so a successful probe is
+/// cached: status() runs on a ~2s tick while the models panel is open, and
+/// spawning `python3 --version` each tick is pure waste. Failures re-probe,
+/// so installing Python mid-session is still picked up.
 async fn python3_ok() -> bool {
-    tokio::process::Command::new("python3")
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PYTHON_OK: AtomicBool = AtomicBool::new(false);
+    if PYTHON_OK.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ok = tokio::process::Command::new("python3")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if ok {
+        PYTHON_OK.store(true, Ordering::Relaxed);
+    }
+    ok
 }
 
 /// True if `pid` is alive and its command line looks like our server.
@@ -288,7 +301,16 @@ pub fn start(core: Arc<Core>, model: String, port: u16) -> Result<(), String> {
     stop(&core);
 
     let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(["--model", &model, "--port", &port.to_string(), "--host", "127.0.0.1"])
+    // WARNING log level: at INFO the server logs prompt-cache stats and
+    // prompt-processing progress during every generation, and each line costs
+    // a pipe read, a deque push, an event, and a TUI wakeup. Readiness is
+    // probed over HTTP, not parsed from logs, so nothing needed is lost.
+    cmd.args([
+        "--model", &model,
+        "--port", &port.to_string(),
+        "--host", "127.0.0.1",
+        "--log-level", "WARNING",
+    ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())

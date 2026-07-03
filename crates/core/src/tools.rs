@@ -8,6 +8,10 @@ use similar::{ChangeTag, TextDiff};
 use crate::client::truncate;
 
 const MAX_RESULTS: usize = 200;
+/// Grep lines run up to ~300 chars: 200 results could inject ~60KB (≈15k
+/// tokens) into a 16k window in one call, and every one of those tokens is
+/// re-prefilled on every subsequent turn. 50 is plenty to act on.
+const MAX_GREP_RESULTS: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 30_000;
 const MAX_READ_LINES: usize = 1500;
 const MAX_LINE_CHARS: usize = 500;
@@ -221,7 +225,10 @@ pub async fn execute(name: &str, args: &Value, root: &Path) -> ToolOutcome {
         "glob" => glob_tool(root, args),
         "grep" => grep_tool(root, args),
         "bash" => bash_tool(root, args).await,
-        other => ToolOutcome::err(format!("unknown tool: {other}")),
+        other => ToolOutcome::err(format!(
+            "unknown tool: {other}; the available tools are {}",
+            TOOL_NAMES.join(", ")
+        )),
     }
 }
 
@@ -395,6 +402,32 @@ fn project_walk(root: &Path) -> ignore::Walk {
         .build()
 }
 
+/// The subtree a glob can possibly match: its literal prefix up to the last
+/// '/' before the first metacharacter (`src/**/*.rs` → `src/`). Agent-issued
+/// globs are almost always prefix-scoped, and walking only that subtree
+/// instead of the whole project dominates the tool's latency.
+///
+/// Only plain relative prefixes narrow the walk; absolute or `..`-carrying
+/// prefixes fall back to the full project walk, where the matcher (which only
+/// ever sees root-relative paths) filters exactly as before. Deliberately no
+/// canonicalization here: it would resolve symlinks and break relative
+/// display against the un-canonicalized root.
+fn glob_walk_root(root: &Path, pattern: &str) -> PathBuf {
+    let literal_end = pattern.find(['*', '?', '[', '{']).unwrap_or(pattern.len());
+    let prefix = match pattern[..literal_end].rfind('/') {
+        Some(i) => &pattern[..i],
+        None => return root.to_path_buf(),
+    };
+    let p = Path::new(prefix);
+    let plain_relative =
+        !p.is_absolute() && p.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    if plain_relative {
+        root.join(p)
+    } else {
+        root.to_path_buf()
+    }
+}
+
 fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
     let Some(pattern) = args["pattern"].as_str() else {
         return ToolOutcome::err("missing required argument: pattern");
@@ -403,8 +436,9 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
         Ok(g) => g.compile_matcher(),
         Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
     };
+    let walk_root = glob_walk_root(root, pattern);
     let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for entry in project_walk(root).flatten() {
+    for entry in project_walk(&walk_root).flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -447,39 +481,112 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         },
         None => None,
     };
-    let mut out = String::new();
-    let mut count = 0usize;
-    'files: for entry in project_walk(&search_root).flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(m) = &file_matcher {
-            let name_match = path.file_name().map(|n| m.is_match(n.as_ref() as &Path)).unwrap_or(false);
-            if !name_match && !m.is_match(rel_display(root, path)) {
-                continue;
-            }
-        }
-        if entry.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
-        for (i, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                let rel = rel_display(root, path);
-                out.push_str(&format!("{rel}:{}: {}\n", i + 1, truncate(line.trim(), 300)));
-                count += 1;
-                if count >= MAX_RESULTS {
-                    out.push_str("… result limit reached; refine the pattern\n");
-                    break 'files;
+    // Full-corpus scans (rare or no matches) dominate this tool's latency, so
+    // walk and scan in parallel. Hits are collected per file and sorted before
+    // the cap so the output order is deterministic across runs.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let hits: std::sync::Mutex<Vec<(String, usize, String)>> = std::sync::Mutex::new(Vec::new());
+    let enough = AtomicBool::new(false);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(12);
+    ignore::WalkBuilder::new(&search_root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .max_depth(Some(24))
+        .threads(threads)
+        .build_parallel()
+        .run(|| {
+            Box::new(|entry| {
+                use ignore::WalkState;
+                if enough.load(Ordering::Relaxed) {
+                    return WalkState::Quit;
                 }
-            }
-        }
-    }
-    if count == 0 {
+                let Ok(entry) = entry else { return WalkState::Continue };
+                let path = entry.path();
+                if !path.is_file() {
+                    return WalkState::Continue;
+                }
+                if let Some(m) = &file_matcher {
+                    let name_match =
+                        path.file_name().map(|n| m.is_match(n.as_ref() as &Path)).unwrap_or(false);
+                    if !name_match && !m.is_match(rel_display(root, path)) {
+                        return WalkState::Continue;
+                    }
+                }
+                if entry.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+                    return WalkState::Continue;
+                }
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    return WalkState::Continue;
+                };
+                let rel = rel_display(root, path);
+                let mut file_hits = Vec::new();
+                for (i, line) in text.lines().enumerate() {
+                    if re.is_match(line) {
+                        file_hits.push((rel.clone(), i + 1, truncate(line.trim(), 300)));
+                    }
+                }
+                if !file_hits.is_empty() {
+                    let mut all = hits.lock().unwrap();
+                    all.extend(file_hits);
+                    if all.len() >= MAX_GREP_RESULTS {
+                        enough.store(true, Ordering::Relaxed);
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+
+    let mut hits = hits.into_inner().unwrap();
+    if hits.is_empty() {
         return ToolOutcome::ok("no matches".into());
     }
+    hits.sort();
+    let capped = hits.len() >= MAX_GREP_RESULTS;
+    hits.truncate(MAX_GREP_RESULTS);
+    let mut out = String::new();
+    for (rel, line_no, line) in hits {
+        out.push_str(&format!("{rel}:{line_no}: {line}\n"));
+    }
+    if capped {
+        out.push_str("… result limit reached; refine the pattern\n");
+    }
     ToolOutcome::ok(out)
+}
+
+/// Truncate oversized command output keeping the TAIL: build and test failures
+/// live at the end, and losing them forces the model to re-run the command.
+/// The full output is spilled to a log file the model can grep or tail.
+fn truncate_command_output(text: &str) -> String {
+    let spilled = spill_command_output(text);
+    let mut start = text.len() - MAX_OUTPUT_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    // Start the kept tail at a line boundary when one is close by.
+    if let Some(nl) = text[start..].find('\n') {
+        if nl < 200 {
+            start += nl + 1;
+        }
+    }
+    let note = match spilled {
+        Some(path) => format!(
+            "[start of output truncated; full output saved to {} — tail or grep it with bash]",
+            path.display()
+        ),
+        None => "[start of output truncated]".to_string(),
+    };
+    format!("{note}\n…{}", &text[start..])
+}
+
+/// Write the complete output of an oversized command to the data dir so it
+/// stays inspectable after truncation. Best effort: None if it cannot be saved.
+fn spill_command_output(text: &str) -> Option<PathBuf> {
+    let dir = crate::state::default_data_dir().join("cmd-logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("cmd-{}.log", uuid::Uuid::new_v4()));
+    std::fs::write(&path, text).ok()?;
+    Some(path)
 }
 
 async fn bash_tool(root: &Path, args: &Value) -> ToolOutcome {
@@ -514,8 +621,7 @@ async fn bash_tool(root: &Path, args: &Value) -> ToolOutcome {
                 text.push_str(&stderr);
             }
             if text.len() > MAX_OUTPUT_BYTES {
-                let cut = floor_char(&text, MAX_OUTPUT_BYTES);
-                text = format!("{}\n… output truncated", &text[..cut]);
+                text = truncate_command_output(&text);
             }
             if text.trim().is_empty() {
                 text = "(no output)".into();
@@ -527,5 +633,107 @@ async fn bash_tool(root: &Path, args: &Value) -> ToolOutcome {
                 ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_project() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openmax-tools-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // macOS temp dirs live behind a symlink; the tools compare walked
+        // paths against the root, so hand them the physical path.
+        let dir = dir.canonicalize().unwrap();
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn alpha() {}\nfn alpha_two() {}\n").unwrap();
+        std::fs::write(dir.join("src/deep/b.rs"), "fn alpha_three() {}\n").unwrap();
+        std::fs::write(dir.join("docs/c.md"), "alpha in prose\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn glob_walk_root_uses_literal_prefix() {
+        let root = temp_project();
+        assert_eq!(glob_walk_root(&root, "src/**/*.rs"), root.join("src"));
+        assert_eq!(glob_walk_root(&root, "src/deep/*.rs"), root.join("src/deep"));
+        // No literal directory prefix: the whole project.
+        assert_eq!(glob_walk_root(&root, "**/*.rs"), root);
+        assert_eq!(glob_walk_root(&root, "README.md"), root);
+        // Escaping or absolute prefixes fall back to the full (safe) walk.
+        assert_eq!(glob_walk_root(&root, "../elsewhere/*.rs"), root);
+        assert_eq!(glob_walk_root(&root, "/etc/*.conf"), root);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn glob_scoped_pattern_finds_nested_files() {
+        let root = temp_project();
+        let out = glob_tool(&root, &json!({"pattern": "src/**/*.rs"}));
+        assert!(out.ok);
+        assert!(out.output.contains("src/a.rs"), "{}", out.output);
+        assert!(out.output.contains("src/deep/b.rs"), "{}", out.output);
+        assert!(!out.output.contains("docs/c.md"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn grep_output_is_sorted_and_complete() {
+        let root = temp_project();
+        let out = grep_tool(&root, &json!({"pattern": "alpha"}));
+        assert!(out.ok);
+        let lines: Vec<&str> = out.output.lines().collect();
+        assert_eq!(lines.len(), 4, "{}", out.output);
+        let mut sorted = lines.clone();
+        sorted.sort();
+        assert_eq!(lines, sorted, "results must be deterministic (path, line) order");
+        assert!(lines[0].starts_with("docs/c.md:1:"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn grep_caps_results_with_notice() {
+        let root = temp_project();
+        let mut big = String::new();
+        for i in 0..(MAX_GREP_RESULTS + 20) {
+            big.push_str(&format!("alpha line {i}\n"));
+        }
+        std::fs::write(root.join("big.txt"), big).unwrap();
+        let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "*.txt"}));
+        assert!(out.ok);
+        assert!(out.output.contains("result limit reached"), "{}", out.output);
+        let hits = out.output.lines().filter(|l| l.contains("big.txt")).count();
+        assert_eq!(hits, MAX_GREP_RESULTS, "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_truncation_keeps_the_tail() {
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!("line number {i} with some padding text\n"));
+        }
+        assert!(text.len() > MAX_OUTPUT_BYTES);
+        let kept = truncate_command_output(&text);
+        assert!(kept.len() < text.len());
+        assert!(kept.contains("line number 3999"), "the end of the output must survive");
+        assert!(!kept.contains("line number 0 "), "the head is what gets dropped");
+        assert!(kept.starts_with("[start of output truncated"), "{}", &kept[..120]);
+    }
+
+    #[tokio::test]
+    async fn bash_failure_preserves_tail_of_output() {
+        let root = temp_project();
+        // 40k+ bytes of output with the failure marker at the very end.
+        let cmd = "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done; echo THE_REAL_FAILURE; exit 3";
+        let out = bash_tool(&root, &json!({"command": cmd})).await;
+        assert!(!out.ok);
+        assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
+        assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");
+        assert!(!out.output.contains("noise line 1 "), "head should be dropped");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
