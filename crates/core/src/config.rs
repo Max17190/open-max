@@ -20,6 +20,15 @@ pub struct Settings {
     /// HuggingFace repo id served by the managed MLX server.
     pub mlx_model: String,
     pub mlx_port: u16,
+    /// Draft model repo id for speculative decoding. Opt-in: payoff is
+    /// hardware-dependent (and negative on MoE models), and setting it
+    /// disables the server's continuous batching.
+    pub draft_model: Option<String>,
+    /// Tokens drafted per speculative step; only sent alongside draft_model.
+    pub num_draft_tokens: Option<u32>,
+    /// JSON object passed to the chat template, e.g. {"enable_thinking": false}
+    /// to cut reasoning tokens on Qwen3-family models.
+    pub chat_template_args: Option<String>,
 }
 
 impl Default for Settings {
@@ -34,6 +43,9 @@ impl Default for Settings {
             temperature: 0.2,
             mlx_model: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
             mlx_port: DEFAULT_MLX_PORT,
+            draft_model: None,
+            num_draft_tokens: None,
+            chat_template_args: None,
         }
     }
 }
