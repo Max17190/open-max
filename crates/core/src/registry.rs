@@ -125,14 +125,6 @@ impl Registry {
         &self.schemas
     }
 
-    /// One-line human summary of a call, for approval prompts and tool cards.
-    pub fn summarize_call(&self, name: &str, args: &Value) -> String {
-        match self.get(name).map(|s| &s.kind) {
-            Some(ToolKind::Builtin) | None => tools::summarize_call(name, args),
-            Some(ToolKind::External(_)) => summarize_external(args),
-        }
-    }
-
     pub async fn execute(&self, name: &str, args: &Value, root: &Path) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
             Some(ToolKind::Builtin) => tools::execute(name, args, root).await,
@@ -142,6 +134,24 @@ impl Registry {
                 self.tool_names().join(", ")
             )),
         }
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::builtin_only()
+    }
+}
+
+/// One-line human summary of a call, for approval prompts and tool cards.
+/// Registry-free on purpose: built-in names summarize by their known argument
+/// shapes, every other name by the external heuristic — exactly what a
+/// registry lookup would produce, without threading session state into the UI.
+pub fn summarize_call(name: &str, args: &Value) -> String {
+    if tools::TOOL_NAMES.contains(&name) {
+        tools::summarize_call(name, args)
+    } else {
+        summarize_external(args)
     }
 }
 

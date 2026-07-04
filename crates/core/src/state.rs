@@ -8,12 +8,16 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::Settings;
 use crate::hf::DownloadProc;
 use crate::mlx::{MlxEvent, MlxProc};
+use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
 /// In-memory state of one agent session.
 #[derive(Default, Clone)]
 pub struct SessionData {
     pub messages: Vec<ChatMessage>,
+    /// The tool registry frozen at session creation; its serialized schemas
+    /// are part of the prompt-cache prefix and must never change mid-session.
+    pub registry: Arc<Registry>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,
     /// File content captured on first touch by a mutating tool, so the UI can

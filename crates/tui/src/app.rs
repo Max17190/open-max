@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use open_max_core::mlx::MlxEvent;
 use open_max_core::state::{Core, CoreEvent, DownloadEvent};
 use open_max_core::types::AgentEvent;
-use open_max_core::{agent, config, hf, mlx, sessions, tools};
+use open_max_core::{agent, config, hf, mlx, registry, sessions};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -241,7 +241,7 @@ impl App {
                         for call in calls {
                             let args: serde_json::Value =
                                 serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-                            let summary = tools::summarize_call(&call.function.name, &args);
+                            let summary = registry::summarize_call(&call.function.name, &args);
                             self.transcript.push(vec![Line::from(vec![
                                 Span::styled("· ", Style::default().fg(theme::DIM)),
                                 Span::styled(call.function.name.clone(), Style::default().fg(theme::ACCENT)),
@@ -751,7 +751,7 @@ impl App {
                 };
             }
             AgentEvent::ToolStart { call_id, name, args } => {
-                let summary = tools::summarize_call(&name, &args);
+                let summary = registry::summarize_call(&name, &args);
                 self.tool_meta.insert(call_id, (name.clone(), summary.clone()));
                 self.running_tool = Some((name, summary));
             }
