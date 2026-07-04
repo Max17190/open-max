@@ -29,6 +29,9 @@ pub struct Settings {
     /// JSON object passed to the chat template, e.g. {"enable_thinking": false}
     /// to cut reasoning tokens on Qwen3-family models.
     pub chat_template_args: Option<String>,
+    /// Byte cap for bash/external tool output before tail-truncation with
+    /// spill-to-file. Unset means the tuned built-in default.
+    pub max_output_bytes: Option<usize>,
 }
 
 impl Default for Settings {
@@ -46,6 +49,7 @@ impl Default for Settings {
             draft_model: None,
             num_draft_tokens: None,
             chat_template_args: None,
+            max_output_bytes: None,
         }
     }
 }

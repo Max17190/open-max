@@ -132,6 +132,7 @@ async fn run_loop(
     );
     let schemas = registry.tool_schemas_json();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
+    let caps = tools::OutputCaps::from_settings(&settings);
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
@@ -243,7 +244,7 @@ async fn run_loop(
             } else if registry.is_mutating(name) && approval_mode == "ask" {
                 let approved = request_approval(core, session_id, name, &args, &cancelled).await;
                 if approved {
-                    registry.execute(name, &args, project_root).await
+                    registry.execute(name, &args, project_root, caps).await
                 } else {
                     tools::ToolOutcome {
                         ok: false,
@@ -252,7 +253,7 @@ async fn run_loop(
                     }
                 }
             } else {
-                registry.execute(name, &args, project_root).await
+                registry.execute(name, &args, project_root, caps).await
             };
 
             if let Some(diff) = &outcome.diff {

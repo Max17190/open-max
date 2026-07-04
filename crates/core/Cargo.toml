@@ -21,3 +21,4 @@ ignore.workspace = true
 globset.workspace = true
 similar.workspace = true
 uuid.workspace = true
+toml.workspace = true

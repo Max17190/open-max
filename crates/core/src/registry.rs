@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -125,10 +126,10 @@ impl Registry {
         &self.schemas
     }
 
-    pub async fn execute(&self, name: &str, args: &Value, root: &Path) -> ToolOutcome {
+    pub async fn execute(&self, name: &str, args: &Value, root: &Path, caps: tools::OutputCaps) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
-            Some(ToolKind::Builtin) => tools::execute(name, args, root).await,
-            Some(ToolKind::External(tool)) => spawn_external(name, &tool, args, root).await,
+            Some(ToolKind::Builtin) => tools::execute(name, args, root, caps).await,
+            Some(ToolKind::External(tool)) => spawn_external(name, &tool, args, root, caps).await,
             None => ToolOutcome::err(format!(
                 "unknown tool: {name}; the available tools are {}",
                 self.tool_names().join(", ")
@@ -191,19 +192,162 @@ fn summarize_external(args: &Value) -> String {
         .to_string()
 }
 
-/// Discover `.openmax/tools/*.toml` definitions. Placeholder until the
-/// external-tools step lands: no discovery, zero external tools.
-fn discover_external(_project_root: &Path) -> Vec<ToolSpec> {
-    Vec::new()
+/// The TOML shape of one tool definition file.
+#[derive(serde::Deserialize)]
+struct ExternalToolFile {
+    name: String,
+    description: String,
+    /// JSON-schema object for the parameters; defaults to "no parameters".
+    #[serde(default)]
+    params: Option<Value>,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_timeout")]
+    timeout_secs: u64,
+    #[serde(default)]
+    mutating: bool,
 }
 
-async fn spawn_external(name: &str, tool: &ExternalTool, _args: &Value, _root: &Path) -> ToolOutcome {
-    // Filled in by the external-tools step; unreachable until discovery
-    // can produce ToolKind::External entries.
-    ToolOutcome::err(format!(
-        "external tool '{name}' ({}) is not runnable yet",
-        tool.command
-    ))
+fn default_timeout() -> u64 {
+    60
+}
+
+/// Discover external tool definitions: global `~/.openmax/tools/*.toml`
+/// first, then the project's `.openmax/tools/*.toml`, which wins on name
+/// collision. Malformed files are skipped, never fatal.
+fn discover_external(project_root: &Path) -> Vec<ToolSpec> {
+    discover_external_in(&[
+        crate::state::default_data_dir().join("tools"),
+        project_root.join(".openmax").join("tools"),
+    ])
+}
+
+fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
+    let mut by_name: HashMap<String, ToolSpec> = HashMap::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        // Deterministic within a dir; later dirs (the project) win overall.
+        paths.sort();
+        for path in paths {
+            if let Some(spec) = parse_tool_file(&path) {
+                by_name.insert(spec.name.clone(), spec);
+            }
+        }
+    }
+    by_name.into_values().collect()
+}
+
+fn parse_tool_file(path: &Path) -> Option<ToolSpec> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let file: ExternalToolFile = toml::from_str(&text).ok()?;
+    let name = file.name.trim().to_string();
+    // Boring, model-friendly names only; anything else is a config mistake.
+    let name_ok = !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !name_ok || file.command.trim().is_empty() {
+        return None;
+    }
+    let mut description = file.description.trim().replace(['\n', '\r'], " ");
+    if description.chars().count() > MAX_EXTERNAL_DESC_CHARS {
+        description = description.chars().take(MAX_EXTERNAL_DESC_CHARS).collect::<String>() + "…";
+    }
+    let parameters = match file.params {
+        Some(p) if p.is_object() => p,
+        Some(_) => return None,
+        None => serde_json::json!({ "type": "object", "properties": {} }),
+    };
+    Some(ToolSpec {
+        name,
+        description,
+        parameters,
+        mutating: file.mutating,
+        kind: ToolKind::External(ExternalTool {
+            command: file.command.trim().to_string(),
+            args: file.args,
+            timeout_secs: file.timeout_secs.clamp(1, 300),
+            source_path: path.to_path_buf(),
+        }),
+    })
+}
+
+/// Run one external tool: spawn the command in the project root, hand it the
+/// call's JSON arguments on stdin, and treat stdout as the result. Same
+/// output caps and spill-to-file behavior as bash. One process per call,
+/// nothing stays resident.
+async fn spawn_external(
+    name: &str,
+    tool: &ExternalTool,
+    args: &Value,
+    root: &Path,
+    caps: tools::OutputCaps,
+) -> ToolOutcome {
+    let stdin_json = args.to_string();
+    let mut cmd = tokio::process::Command::new(&tool.command);
+    cmd.args(&tool.args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let fut = async {
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "failed to start external tool '{name}' (command '{}', defined in {}): {e}",
+                tool.command,
+                tool.source_path.display()
+            )
+        })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            // A tool that exits without reading stdin closes the pipe; that
+            // is fine, not an error.
+            let _ = stdin.write_all(stdin_json.as_bytes()).await;
+            // Dropped here: the child sees EOF.
+        }
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("external tool '{name}' failed: {e}"))
+    };
+
+    match tokio::time::timeout(Duration::from_secs(tool.timeout_secs), fut).await {
+        Err(_) => ToolOutcome::err(format!(
+            "external tool '{name}' timed out after {}s",
+            tool.timeout_secs
+        )),
+        Ok(Err(e)) => ToolOutcome::err(e),
+        Ok(Ok(output)) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("[stderr]\n");
+                text.push_str(&stderr);
+            }
+            if text.len() > caps.command_bytes {
+                text = tools::truncate_command_output(&text, caps.command_bytes);
+            }
+            if text.trim().is_empty() {
+                text = "(no output)".into();
+            }
+            let code = output.status.code().unwrap_or(-1);
+            if output.status.success() {
+                ToolOutcome::ok(text)
+            } else {
+                ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,9 +403,158 @@ mod tests {
     async fn unknown_tool_error_lists_names() {
         let registry = Registry::builtin_only();
         let out = registry
-            .execute("nope", &serde_json::json!({}), Path::new("."))
+            .execute("nope", &serde_json::json!({}), Path::new("."), tools::OutputCaps::default())
             .await;
         assert!(!out.ok);
         assert!(out.output.contains("bash"), "should list valid tools: {}", out.output);
+    }
+
+    // ---------- external tools ----------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("omx-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_tool(dir: &Path, file: &str, body: &str) {
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+
+    fn write_script(dir: &Path, file: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(file);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn registry_from(global: &Path, project: &Path) -> Registry {
+        Registry::assemble(
+            discover_external_in(&[global.to_path_buf(), project.to_path_buf()]),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn project_tool_wins_over_global_on_collision() {
+        let global = temp_dir("glob");
+        let project = temp_dir("proj");
+        write_tool(&global, "hello.toml", "name = \"hello\"\ndescription = \"global\"\ncommand = \"/bin/false\"\n");
+        write_tool(&project, "hello.toml", "name = \"hello\"\ndescription = \"project\"\ncommand = \"/bin/true\"\n");
+        let registry = registry_from(&global, &project);
+        let spec = registry.get("hello").expect("hello discovered");
+        assert_eq!(spec.description, "project");
+        match &spec.kind {
+            ToolKind::External(t) => assert_eq!(t.command, "/bin/true"),
+            _ => panic!("expected external"),
+        }
+        let _ = std::fs::remove_dir_all(global);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn externals_sort_after_builtins_and_schemas_stay_deterministic() {
+        let global = temp_dir("glob");
+        let project = temp_dir("proj");
+        write_tool(&project, "zz.toml", "name = \"zz_tool\"\ndescription = \"z\"\ncommand = \"/bin/true\"\n");
+        write_tool(&project, "aa.toml", "name = \"aa_tool\"\ndescription = \"a\"\ncommand = \"/bin/true\"\n");
+        let a = registry_from(&global, &project);
+        let b = registry_from(&global, &project);
+        let names = a.tool_names();
+        let builtin_count = tools::TOOL_NAMES.len();
+        assert_eq!(&names[..builtin_count], tools::TOOL_NAMES);
+        assert_eq!(&names[builtin_count..], &["aa_tool", "zz_tool"]);
+        assert_eq!(
+            a.tool_schemas_json().to_string(),
+            b.tool_schemas_json().to_string(),
+            "schema serialization must be deterministic"
+        );
+        let _ = std::fs::remove_dir_all(global);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn external_description_capped_and_builtin_shadowing_rejected() {
+        let global = temp_dir("glob");
+        let project = temp_dir("proj");
+        let long_desc = "d".repeat(500);
+        write_tool(&project, "long.toml", &format!("name = \"long_tool\"\ndescription = \"{long_desc}\"\ncommand = \"/bin/true\"\n"));
+        // Shadowing a built-in would silently change core behavior: dropped.
+        write_tool(&project, "bash.toml", "name = \"bash\"\ndescription = \"evil\"\ncommand = \"/bin/true\"\n");
+        // Malformed files are skipped, never fatal.
+        write_tool(&project, "broken.toml", "name = \"broken\ncommand=");
+        let registry = registry_from(&global, &project);
+        let spec = registry.get("long_tool").unwrap();
+        assert!(spec.description.chars().count() <= MAX_EXTERNAL_DESC_CHARS + 1);
+        match &registry.get("bash").unwrap().kind {
+            ToolKind::Builtin => {}
+            _ => panic!("built-in bash must not be shadowed"),
+        }
+        assert!(registry.get("broken").is_none());
+        let _ = std::fs::remove_dir_all(global);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn external_tool_round_trips_args_over_stdin() {
+        let project = temp_dir("proj");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let script = write_script(&project, "echo_args.sh", "#!/bin/sh\nread -r line\necho \"got: $line\"\n");
+        write_tool(
+            &tools_dir,
+            "echo.toml",
+            &format!(
+                "name = \"echo_args\"\ndescription = \"echoes\"\ncommand = \"{}\"\n\n[params]\ntype = \"object\"\n[params.properties.message]\ntype = \"string\"\n",
+                script.display()
+            ),
+        );
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let out = registry
+            .execute("echo_args", &serde_json::json!({"message": "hi"}), &project, tools::OutputCaps::default())
+            .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("got: {\"message\":\"hi\"}"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn external_tool_timeout_and_failure_shape() {
+        let project = temp_dir("proj");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let slow = write_script(&project, "slow.sh", "#!/bin/sh\nsleep 5\n");
+        let fail = write_script(&project, "fail.sh", "#!/bin/sh\necho oops >&2\nexit 3\n");
+        write_tool(&tools_dir, "slow.toml", &format!("name = \"slow\"\ndescription = \"s\"\ncommand = \"{}\"\ntimeout_secs = 1\n", slow.display()));
+        write_tool(&tools_dir, "fail.toml", &format!("name = \"fail\"\ndescription = \"f\"\ncommand = \"{}\"\n", fail.display()));
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+
+        let out = registry.execute("slow", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        assert!(!out.ok);
+        assert!(out.output.contains("timed out after 1s"), "{}", out.output);
+
+        let out = registry.execute("fail", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        assert!(!out.ok);
+        assert!(out.output.starts_with("exit code 3"), "{}", out.output);
+        assert!(out.output.contains("[stderr]") && out.output.contains("oops"), "{}", out.output);
+
+        let out = registry.execute("missing_binary", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        assert!(!out.ok && out.output.contains("unknown tool"));
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn external_tool_spawn_failure_is_actionable() {
+        let project = temp_dir("proj");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        write_tool(&tools_dir, "ghost.toml", "name = \"ghost\"\ndescription = \"g\"\ncommand = \"/nonexistent/binary\"\n");
+        let registry = Registry::assemble(discover_external_in(&[tools_dir.clone()]), Vec::new());
+        let out = registry.execute("ghost", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        assert!(!out.ok);
+        assert!(out.output.contains("ghost") && out.output.contains("/nonexistent/binary"), "{}", out.output);
+        assert!(out.output.contains("ghost.toml"), "must point at the defining file: {}", out.output);
+        let _ = std::fs::remove_dir_all(project);
     }
 }

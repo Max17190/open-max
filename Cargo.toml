@@ -21,6 +21,8 @@ ignore = "0.4"
 globset = "0.4"
 similar = "2"
 uuid = { version = "1", features = ["v4"] }
+# Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 # Lean, fast binaries: thin LTO and symbol stripping keep the harness tiny so
 # the model gets the machine.
