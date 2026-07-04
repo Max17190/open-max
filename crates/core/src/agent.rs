@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use crate::client::{ChatClient, StreamDelta};
 use crate::config::Settings;
 use crate::fallback;
-use crate::prompt::system_prompt;
+use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
 use crate::registry::Registry;
 use crate::sessions;
 use crate::state::{Core, SessionData};
@@ -109,9 +109,17 @@ async fn run_loop(
                     Some(manifest) => Registry::from_manifest(manifest),
                     None => Registry::builtin_only(),
                 };
+                let system_chars = messages
+                    .first()
+                    .filter(|m| m.role == "system")
+                    .and_then(|m| m.content.as_deref())
+                    .map(str::len)
+                    .unwrap_or(0);
+                let breakdown = PromptBreakdown::from_persisted(system_chars, &registry);
                 SessionData {
                     messages,
                     registry: Arc::new(registry),
+                    prompt_breakdown: Arc::new(breakdown),
                     persisted_count: count,
                     snapshots: Default::default(),
                 }
@@ -120,9 +128,12 @@ async fn run_loop(
                 if registry.has_extensions() {
                     sessions::save_manifest(core, session_id, &registry.to_manifest());
                 }
+                let (prompt, breakdown) =
+                    system_prompt_with_breakdown(project_root, &registry);
                 SessionData {
-                    messages: vec![ChatMessage::system(system_prompt(project_root, &registry))],
+                    messages: vec![ChatMessage::system(prompt)],
                     registry,
+                    prompt_breakdown: Arc::new(breakdown),
                     persisted_count: 0,
                     snapshots: Default::default(),
                 }

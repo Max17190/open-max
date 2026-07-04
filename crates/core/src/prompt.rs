@@ -25,7 +25,52 @@ const MAX_SKILLS_BYTES: usize = 3_000;
 /// with two or three list_dir/glob calls just to learn the layout, and each
 /// of those is a full prefill+decode round trip.
 pub fn system_prompt(project_root: &Path, registry: &Registry) -> String {
+    system_prompt_with_breakdown(project_root, registry).0
+}
+
+/// What one session's frozen prompt prefix is spent on, measured at the only
+/// moment the components are individually known: creation. Char counts;
+/// display divides by ~4 for tokens, the same heuristic the budget uses.
+#[derive(Clone, Debug, Default)]
+pub struct PromptBreakdown {
+    /// Labeled prompt text components, in prompt order.
+    pub components: Vec<(String, usize)>,
+    /// (name, serialized schema chars, is_external) per tool.
+    pub tools: Vec<(String, usize, bool)>,
+    /// (name, index line chars) per skill.
+    pub skills: Vec<(String, usize)>,
+}
+
+impl PromptBreakdown {
+    /// For resumed sessions the persisted prompt is one opaque string; the
+    /// per-tool/skill split still comes from the frozen registry.
+    pub fn from_persisted(system_chars: usize, registry: &Registry) -> Self {
+        let mut breakdown = Self {
+            components: vec![("system prompt (persisted)".into(), system_chars)],
+            ..Default::default()
+        };
+        breakdown.add_registry(registry);
+        breakdown
+    }
+
+    fn add_registry(&mut self, registry: &Registry) {
+        if let Some(entries) = registry.tool_schemas_json().as_array() {
+            for (entry, spec) in entries.iter().zip(&registry.tools) {
+                let external = !matches!(spec.kind, crate::registry::ToolKind::Builtin);
+                self.tools.push((spec.name.clone(), entry.to_string().len(), external));
+            }
+        }
+        for skill in &registry.skills {
+            // The per-skill cost is its index line; the body loads on demand.
+            let line = format!("- {}: {} — {}\n", skill.name, skill.description, skill.path.display());
+            self.skills.push((skill.name.clone(), line.len()));
+        }
+    }
+}
+
+pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
     let root = project_root.to_string_lossy();
+    let mut breakdown = PromptBreakdown::default();
     let mut prompt = format!(
         "You are Open Max, a coding agent. You work on the project at {root} using tools.\n\
         \n\
@@ -41,19 +86,27 @@ pub fn system_prompt(project_root: &Path, registry: &Registry) -> String {
         \n\
         Keep replies brief. No filler, no apologies, no repeating file contents the user can already see."
     );
+    breakdown.components.push(("base rules".into(), prompt.len()));
     if let Some(instructions) = agents_md(project_root) {
+        let before = prompt.len();
         prompt.push_str("\n\nProject instructions (AGENTS.md):\n");
         prompt.push_str(&instructions);
+        breakdown.components.push(("AGENTS.md".into(), prompt.len() - before));
     }
     if let Some(map) = project_map(project_root) {
+        let before = prompt.len();
         prompt.push_str("\n\nProject layout (top levels; explore deeper with tools):\n");
         prompt.push_str(&map);
+        breakdown.components.push(("project layout map".into(), prompt.len() - before));
     }
     if let Some(skills) = skills_section(project_root, &registry.skills) {
+        let before = prompt.len();
         prompt.push_str("\n\nSkills (before using one, read its SKILL.md for the full instructions; use bash cat for absolute paths):\n");
         prompt.push_str(&skills);
+        breakdown.components.push(("skills index".into(), prompt.len() - before));
     }
-    prompt
+    breakdown.add_registry(registry);
+    (prompt, breakdown)
 }
 
 /// One line per skill: name, description, and the SKILL.md path the model

@@ -18,6 +18,8 @@ pub struct SessionData {
     /// The tool registry frozen at session creation; its serialized schemas
     /// are part of the prompt-cache prefix and must never change mid-session.
     pub registry: Arc<Registry>,
+    /// Where the frozen prompt prefix's tokens go, for /context.
+    pub prompt_breakdown: Arc<crate::prompt::PromptBreakdown>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,
     /// File content captured on first touch by a mutating tool, so the UI can
