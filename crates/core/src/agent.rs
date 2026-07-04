@@ -112,7 +112,7 @@ async fn run_loop(
             } else {
                 let registry = Arc::new(Registry::build(project_root));
                 SessionData {
-                    messages: vec![ChatMessage::system(system_prompt(project_root))],
+                    messages: vec![ChatMessage::system(system_prompt(project_root, &registry))],
                     registry,
                     persisted_count: 0,
                     snapshots: Default::default(),

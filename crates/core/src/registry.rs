@@ -76,7 +76,7 @@ impl Registry {
         Self::assemble(Vec::new(), Vec::new())
     }
 
-    fn assemble(mut external: Vec<ToolSpec>, skills: Vec<SkillSpec>) -> Self {
+    pub(crate) fn assemble(mut external: Vec<ToolSpec>, skills: Vec<SkillSpec>) -> Self {
         // Built-ins come straight from the canonical schema literals so the
         // registry can never drift from what tools.rs implements.
         let mut tools_list = builtin_specs();
