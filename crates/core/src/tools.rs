@@ -32,10 +32,10 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn ok(output: String) -> Self {
+    pub(crate) fn ok(output: String) -> Self {
         Self { ok: true, output, diff: None }
     }
-    fn err(output: impl Into<String>) -> Self {
+    pub(crate) fn err(output: impl Into<String>) -> Self {
         Self { ok: false, output: output.into(), diff: None }
     }
 }
