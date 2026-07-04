@@ -237,19 +237,28 @@ fn rel_display(root: &Path, path: &Path) -> String {
 }
 
 pub async fn execute(name: &str, args: &Value, root: &Path, caps: OutputCaps) -> ToolOutcome {
-    match name {
-        "list_dir" => list_dir(root, args),
-        "read_file" => read_file(root, args),
-        "write_file" => write_file(root, args),
-        "edit_file" => edit_file(root, args),
-        "glob" => glob_tool(root, args),
-        "grep" => grep_tool(root, args),
-        "bash" => bash_tool(root, args, caps).await,
+    if name == "bash" {
+        return bash_tool(root, args, caps).await;
+    }
+    // The file tools are synchronous fs/walk work; run them off the async
+    // workers so a big grep or read never stalls streaming and the UI.
+    let name = name.to_string();
+    let args = args.clone();
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || match name.as_str() {
+        "list_dir" => list_dir(&root, &args),
+        "read_file" => read_file(&root, &args),
+        "write_file" => write_file(&root, &args),
+        "edit_file" => edit_file(&root, &args),
+        "glob" => glob_tool(&root, &args),
+        "grep" => grep_tool(&root, &args),
         other => ToolOutcome::err(format!(
             "unknown tool: {other}; the available tools are {}",
             TOOL_NAMES.join(", ")
         )),
-    }
+    })
+    .await
+    .unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}")))
 }
 
 fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
