@@ -101,16 +101,25 @@ async fn run_loop(
         let data = sessions_map.entry(session_id.to_string()).or_insert_with(|| {
             if let Some(messages) = sessions::load_messages(core, session_id) {
                 let count = messages.len();
+                // Resume with the registry frozen at creation (from the
+                // manifest), never today's config: the persisted prompt and
+                // the schema set must keep matching each other byte for
+                // byte. No manifest means the session was builtin-only.
+                let registry = match sessions::load_manifest(core, session_id) {
+                    Some(manifest) => Registry::from_manifest(manifest),
+                    None => Registry::builtin_only(),
+                };
                 SessionData {
                     messages,
-                    // Sessions that predate the registry behave exactly as
-                    // they always did; the manifest step upgrades this.
-                    registry: Arc::new(Registry::builtin_only()),
+                    registry: Arc::new(registry),
                     persisted_count: count,
                     snapshots: Default::default(),
                 }
             } else {
                 let registry = Arc::new(Registry::build(project_root));
+                if registry.has_extensions() {
+                    sessions::save_manifest(core, session_id, &registry.to_manifest());
+                }
                 SessionData {
                     messages: vec![ChatMessage::system(system_prompt(project_root, &registry))],
                     registry,

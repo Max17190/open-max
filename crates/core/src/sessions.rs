@@ -37,6 +37,25 @@ fn messages_path(core: &Core, id: &str) -> PathBuf {
     sessions_dir(core).join(format!("{id}.messages.json"))
 }
 
+fn manifest_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.manifest.json"))
+}
+
+/// Persist the registry frozen at session creation. Written once; skipped
+/// entirely for builtin-only sessions (absence means built-ins, which also
+/// covers every session that predates the extensibility layer).
+pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::RegistryManifest) {
+    if let Ok(json) = serde_json::to_string_pretty(manifest) {
+        let _ = std::fs::write(manifest_path(core, id), json);
+    }
+}
+
+pub fn load_manifest(core: &Core, id: &str) -> Option<crate::registry::RegistryManifest> {
+    std::fs::read_to_string(manifest_path(core, id))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
 fn load_index(core: &Core) -> Vec<SessionMeta> {
     std::fs::read_to_string(index_path(core))
         .ok()
@@ -122,6 +141,7 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     with_index(core, |metas| metas.retain(|m| m.id != id))?;
     let _ = std::fs::remove_file(messages_path(core, id));
+    let _ = std::fs::remove_file(manifest_path(core, id));
     Ok(())
 }
 
@@ -242,6 +262,49 @@ mod tests {
         assert!(!uses_legacy_array_format(&path));
         assert_eq!(load_messages(&core, id).unwrap().len(), 1);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The manifest must reconstruct the exact frozen registry with no config
+    /// on disk at all: the fixture tool files are deleted before reload.
+    #[test]
+    fn manifest_round_trips_without_rediscovery() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "with-tools";
+
+        let project = dir.join("project");
+        let tools_dir = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(
+            tools_dir.join("deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+        )
+        .unwrap();
+
+        let original = crate::registry::Registry::build(&project);
+        assert!(original.has_extensions());
+        save_manifest(&core, id, &original.to_manifest());
+
+        // Config disappears; the frozen session must not notice.
+        std::fs::remove_dir_all(&tools_dir).unwrap();
+        let reloaded = crate::registry::Registry::from_manifest(load_manifest(&core, id).unwrap());
+        assert_eq!(reloaded.tool_names(), original.tool_names());
+        assert!(reloaded.is_mutating("deploy"));
+        assert_eq!(
+            reloaded.tool_schemas_json().to_string(),
+            original.tool_schemas_json().to_string(),
+            "schemas must be byte-identical across resume"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_manifest_means_builtins_only() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        assert!(load_manifest(&core, "pre-feature-session").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -144,6 +144,78 @@ impl Default for Registry {
     }
 }
 
+/// The persisted record of what a session's registry froze at creation:
+/// enough to rebuild the exact same schemas on resume without re-reading
+/// any config from disk, so a session never changes shape retroactively.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RegistryManifest {
+    pub version: u32,
+    pub external_tools: Vec<ExternalToolManifest>,
+    pub skills: Vec<SkillSpec>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ExternalToolManifest {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    pub mutating: bool,
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_secs: u64,
+    pub source_path: PathBuf,
+}
+
+impl Registry {
+    pub fn to_manifest(&self) -> RegistryManifest {
+        let external_tools = self
+            .tools
+            .iter()
+            .filter_map(|spec| match &spec.kind {
+                ToolKind::Builtin => None,
+                ToolKind::External(t) => Some(ExternalToolManifest {
+                    name: spec.name.clone(),
+                    description: spec.description.clone(),
+                    parameters: spec.parameters.clone(),
+                    mutating: spec.mutating,
+                    command: t.command.clone(),
+                    args: t.args.clone(),
+                    timeout_secs: t.timeout_secs,
+                    source_path: t.source_path.clone(),
+                }),
+            })
+            .collect();
+        RegistryManifest { version: 1, external_tools, skills: self.skills.clone() }
+    }
+
+    pub fn from_manifest(manifest: RegistryManifest) -> Self {
+        let external = manifest
+            .external_tools
+            .into_iter()
+            .map(|t| ToolSpec {
+                name: t.name,
+                description: t.description,
+                parameters: t.parameters,
+                mutating: t.mutating,
+                kind: ToolKind::External(ExternalTool {
+                    command: t.command,
+                    args: t.args,
+                    timeout_secs: t.timeout_secs,
+                    source_path: t.source_path,
+                }),
+            })
+            .collect();
+        Self::assemble(external, manifest.skills)
+    }
+
+    /// True when the registry carries anything beyond the built-ins; an
+    /// all-builtin session needs no manifest file at all.
+    pub fn has_extensions(&self) -> bool {
+        !self.skills.is_empty()
+            || self.tools.iter().any(|s| !matches!(s.kind, ToolKind::Builtin))
+    }
+}
+
 /// One-line human summary of a call, for approval prompts and tool cards.
 /// Registry-free on purpose: built-in names summarize by their known argument
 /// shapes, every other name by the external heuristic — exactly what a
