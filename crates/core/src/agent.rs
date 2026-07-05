@@ -100,6 +100,174 @@ fn canonicalize_args(v: &Value) -> String {
     }
 }
 
+/// One consecutive run of tool calls: `[start, end)`; `concurrent` when length >= 2
+/// and every call in the run is batchable.
+struct ToolCallSegment {
+    start: usize,
+    end: usize,
+    concurrent: bool,
+}
+
+/// Split tool calls into maximal consecutive runs that are eligible for concurrent
+/// read-only execution. Single-call runs and non-batchable calls use the serial path.
+fn partition_concurrent_runs<F>(tool_calls: &[ToolCall], is_batchable: F) -> Vec<ToolCallSegment>
+where
+    F: Fn(&ToolCall) -> bool,
+{
+    let mut segments = Vec::new();
+    let mut i = 0;
+    while i < tool_calls.len() {
+        if !is_batchable(&tool_calls[i]) {
+            segments.push(ToolCallSegment { start: i, end: i + 1, concurrent: false });
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < tool_calls.len() && is_batchable(&tool_calls[i]) {
+            i += 1;
+        }
+        let end = i;
+        segments.push(ToolCallSegment {
+            start,
+            end,
+            concurrent: end - start >= 2,
+        });
+    }
+    segments
+}
+
+fn batchable_call(call: &ToolCall, registry: &Registry, repeat_tracker: &RepeatCallTracker) -> bool {
+    let name = call.function.name.as_str();
+    if name.is_empty() {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) else {
+        return false;
+    };
+    if registry.get(name).is_none() || registry.is_mutating(name) {
+        return false;
+    }
+    let args_key = canonicalize_args(&args);
+    !repeat_tracker.would_block(name, &args_key)
+}
+
+fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> SessionData {
+    if let Some(messages) = sessions::load_messages(core, session_id) {
+        let count = messages.len();
+        // Resume with the registry frozen at creation (from the
+        // manifest), never today's config: the persisted prompt and
+        // the schema set must keep matching each other byte for
+        // byte. No manifest means the session was builtin-only.
+        let registry = match sessions::load_manifest(core, session_id) {
+            Some(manifest) => Registry::from_manifest(manifest),
+            None => Registry::builtin_only(),
+        };
+        let system_chars = messages
+            .first()
+            .filter(|m| m.role == "system")
+            .and_then(|m| m.content.as_deref())
+            .map(str::len)
+            .unwrap_or(0);
+        let breakdown = PromptBreakdown::from_persisted(system_chars, &registry);
+        SessionData {
+            messages,
+            registry: Arc::new(registry),
+            prompt_breakdown: Arc::new(breakdown),
+            persisted_count: count,
+            snapshots: Default::default(),
+        }
+    } else {
+        let registry = Arc::new(Registry::build(project_root));
+        if registry.has_extensions() {
+            sessions::save_manifest(core, session_id, &registry.to_manifest());
+        }
+        let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+        SessionData {
+            messages: vec![ChatMessage::system(prompt)],
+            registry,
+            prompt_breakdown: Arc::new(breakdown),
+            persisted_count: 0,
+            snapshots: Default::default(),
+        }
+    }
+}
+
+fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
+    if outcome.ok || outcome.output.starts_with("Approval request timed out") {
+        outcome.output.clone()
+    } else {
+        format!("Error: {}", outcome.output)
+    }
+}
+
+struct ReadonlyBatchCtx<'a> {
+    core: &'a Arc<Core>,
+    session_id: &'a str,
+    registry: &'a Arc<Registry>,
+    project_root: &'a Path,
+    caps: tools::OutputCaps,
+    cancelled: Arc<CancelToken>,
+}
+
+async fn execute_readonly_batch(
+    ctx: &ReadonlyBatchCtx<'_>,
+    calls: &[ToolCall],
+    messages: &mut Vec<ChatMessage>,
+    repeat_tracker: &mut RepeatCallTracker,
+) {
+    let mut parsed: Vec<(Value, String)> = Vec::with_capacity(calls.len());
+    for call in calls {
+        let name = call.function.name.as_str();
+        // batchable_call already validated the JSON; Null (impossible) would
+        // just surface as a missing-argument tool error.
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        let args_key = canonicalize_args(&args);
+        parsed.push((args.clone(), args_key));
+        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
+            call_id: call.id.clone(),
+            name: name.into(),
+            args,
+        });
+    }
+
+    let futures: Vec<_> = calls
+        .iter()
+        .zip(parsed.iter())
+        .map(|(call, (args, _))| {
+            let name = call.function.name.clone();
+            let args = args.clone();
+            let root = ctx.project_root.to_path_buf();
+            let cancel = ctx.cancelled.clone();
+            let registry = ctx.registry.clone();
+            async move { registry.execute(&name, &args, &root, ctx.caps, cancel).await }
+        })
+        .collect();
+    let outcomes = futures_util::future::join_all(futures).await;
+
+    for (i, call) in calls.iter().enumerate() {
+        let outcome = &outcomes[i];
+        let name = call.function.name.as_str();
+        let args_key = &parsed[i].1;
+        if let Some(diff) = &outcome.diff {
+            ctx.core.send_agent(ctx.session_id, AgentEvent::Diff {
+                call_id: call.id.clone(),
+                path: diff.path.clone(),
+                diff: diff.diff.clone(),
+                added: diff.added,
+                removed: diff.removed,
+            });
+        }
+        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
+            call_id: call.id.clone(),
+            ok: outcome.ok,
+            output: outcome.output.clone(),
+        });
+        messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(outcome)));
+        repeat_tracker.record_executed(name, args_key);
+    }
+}
+
 struct CompactionDigest {
     message_count: usize,
     tools: BTreeSet<String>,
@@ -227,50 +395,27 @@ async fn run_loop(
     cancelled: Arc<CancelToken>,
 ) {
     let (mut messages, registry) = {
-        let mut sessions_map = core.sessions.lock().await;
-        let data = sessions_map.entry(session_id.to_string()).or_insert_with(|| {
-            if let Some(messages) = sessions::load_messages(core, session_id) {
-                let count = messages.len();
-                // Resume with the registry frozen at creation (from the
-                // manifest), never today's config: the persisted prompt and
-                // the schema set must keep matching each other byte for
-                // byte. No manifest means the session was builtin-only.
-                let registry = match sessions::load_manifest(core, session_id) {
-                    Some(manifest) => Registry::from_manifest(manifest),
-                    None => Registry::builtin_only(),
-                };
-                let system_chars = messages
-                    .first()
-                    .filter(|m| m.role == "system")
-                    .and_then(|m| m.content.as_deref())
-                    .map(str::len)
-                    .unwrap_or(0);
-                let breakdown = PromptBreakdown::from_persisted(system_chars, &registry);
-                SessionData {
-                    messages,
-                    registry: Arc::new(registry),
-                    prompt_breakdown: Arc::new(breakdown),
-                    persisted_count: count,
-                    snapshots: Default::default(),
-                }
+        {
+            let mut sessions_map = core.sessions.lock().await;
+            if let Some(data) = sessions_map.get_mut(session_id) {
+                data.messages.push(ChatMessage::user(user_text));
+                (data.messages.clone(), data.registry.clone())
             } else {
-                let registry = Arc::new(Registry::build(project_root));
-                if registry.has_extensions() {
-                    sessions::save_manifest(core, session_id, &registry.to_manifest());
-                }
-                let (prompt, breakdown) =
-                    system_prompt_with_breakdown(project_root, &registry);
-                SessionData {
-                    messages: vec![ChatMessage::system(prompt)],
-                    registry,
-                    prompt_breakdown: Arc::new(breakdown),
-                    persisted_count: 0,
-                    snapshots: Default::default(),
-                }
+                drop(sessions_map);
+                let core_clone = core.clone();
+                let session_id_owned = session_id.to_string();
+                let project_root_owned = project_root.to_path_buf();
+                let built = tokio::task::spawn_blocking(move || {
+                    build_session_data(&core_clone, &session_id_owned, &project_root_owned)
+                })
+                .await
+                .expect("session hydration task panicked");
+                let mut sessions_map = core.sessions.lock().await;
+                let data = sessions_map.entry(session_id.to_string()).or_insert(built);
+                data.messages.push(ChatMessage::user(user_text));
+                (data.messages.clone(), data.registry.clone())
             }
-        });
-        data.messages.push(ChatMessage::user(user_text));
-        (data.messages.clone(), data.registry.clone())
+        }
     };
 
     let client = ChatClient::new(
@@ -350,122 +495,147 @@ async fn run_loop(
             break 'turns;
         }
 
-        for call in &tool_calls {
+        let segments = partition_concurrent_runs(&tool_calls, |call| {
+            batchable_call(call, &registry, &repeat_tracker)
+        });
+
+        'calls: for segment in segments {
             if cancelled.is_cancelled() {
                 stop_reason = "cancelled".into();
                 break 'turns;
             }
-            let name = call.function.name.as_str();
-            if name.is_empty() {
-                let msg = "tool call has an empty function name; use a known tool name from the schema";
-                core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
-                core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                messages.push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
-                continue;
+
+            if segment.concurrent {
+                let batch_ctx = ReadonlyBatchCtx {
+                    core,
+                    session_id,
+                    registry: &registry,
+                    project_root,
+                    caps,
+                    cancelled: cancelled.clone(),
+                };
+                execute_readonly_batch(
+                    &batch_ctx,
+                    &tool_calls[segment.start..segment.end],
+                    &mut messages,
+                    &mut repeat_tracker,
+                )
+                .await;
+                continue 'calls;
             }
-            let args: Value = match serde_json::from_str(&call.function.arguments) {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format!("invalid JSON in tool arguments: {e}");
-                    core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
-                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
+
+            for call in &tool_calls[segment.start..segment.end] {
+                if cancelled.is_cancelled() {
+                    stop_reason = "cancelled".into();
+                    break 'turns;
+                }
+                let name = call.function.name.as_str();
+                if name.is_empty() {
+                    let msg = "tool call has an empty function name; use a known tool name from the schema";
+                    core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
+                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
                     messages.push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
                     continue;
                 }
-            };
-
-            let args_key = canonicalize_args(&args);
-            if repeat_tracker.would_block(name, &args_key) {
-                let msg = "You have repeated this exact call 3 times. The result will not change. Try a different approach, or explain what you are blocked on.";
-                core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: args.clone() });
-                core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                messages.push(ChatMessage::tool(call.id.clone(), msg.to_string()));
-                continue;
-            }
-
-            core.send_agent(session_id, AgentEvent::ToolStart {
-                call_id: call.id.clone(),
-                name: name.into(),
-                args: args.clone(),
-            });
-
-            if registry.is_mutating(name) {
-                snapshot_file(core, session_id, project_root, &args).await;
-            }
-
-            // Read live so "[a]lways" during an approval prompt takes effect
-            // for the rest of this turn, not just the next one.
-            let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
-            let mut executed = false;
-            let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == "readonly" {
-                (tools::ToolOutcome {
-                    ok: false,
-                    output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
-                    diff: None,
-                }, false)
-            } else if registry.is_mutating(name) && approval_mode == "ask" {
-                match request_approval(core, session_id, name, &args, &cancelled).await {
-                    ApprovalOutcome::Approved => {
-                        executed = true;
-                        (registry.execute(name, &args, project_root, caps).await, false)
+                let args: Value = match serde_json::from_str(&call.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let msg = format!("invalid JSON in tool arguments: {e}");
+                        core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
+                        core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
+                        messages.push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                        continue;
                     }
-                    ApprovalOutcome::Declined => (tools::ToolOutcome {
+                };
+
+                let args_key = canonicalize_args(&args);
+                if repeat_tracker.would_block(name, &args_key) {
+                    let msg = "You have repeated this exact call 3 times. The result will not change. Try a different approach, or explain what you are blocked on.";
+                    core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: args.clone() });
+                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
+                    messages.push(ChatMessage::tool(call.id.clone(), msg.to_string()));
+                    continue;
+                }
+
+                core.send_agent(session_id, AgentEvent::ToolStart {
+                    call_id: call.id.clone(),
+                    name: name.into(),
+                    args: args.clone(),
+                });
+
+                if registry.is_mutating(name) {
+                    snapshot_file(core, session_id, project_root, &args).await;
+                }
+
+                // Read live so "[a]lways" during an approval prompt takes effect
+                // for the rest of this turn, not just the next one.
+                let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
+                let mut executed = false;
+                let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == "readonly" {
+                    (tools::ToolOutcome {
                         ok: false,
-                        output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
+                        output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None,
-                    }, false),
-                    ApprovalOutcome::TimedOut => (tools::ToolOutcome {
-                        ok: false,
-                        output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
-                        diff: None,
-                    }, false),
-                    ApprovalOutcome::Cancelled => (tools::ToolOutcome {
+                    }, false)
+                } else if registry.is_mutating(name) && approval_mode == "ask" {
+                    match request_approval(core, session_id, name, &args, &cancelled).await {
+                        ApprovalOutcome::Approved => {
+                            executed = true;
+                            (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                        }
+                        ApprovalOutcome::Declined => (tools::ToolOutcome {
+                            ok: false,
+                            output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
+                            diff: None,
+                        }, false),
+                        ApprovalOutcome::TimedOut => (tools::ToolOutcome {
+                            ok: false,
+                            output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
+                            diff: None,
+                        }, false),
+                        ApprovalOutcome::Cancelled => (tools::ToolOutcome {
+                            ok: false,
+                            output: "The user cancelled this turn.".into(),
+                            diff: None,
+                        }, true),
+                    }
+                } else {
+                    executed = true;
+                    (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                };
+
+                if turn_cancelled {
+                    core.send_agent(session_id, AgentEvent::ToolEnd {
+                        call_id: call.id.clone(),
                         ok: false,
                         output: "The user cancelled this turn.".into(),
-                        diff: None,
-                    }, true),
+                    });
+                    messages.push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
+                    stop_reason = "cancelled".into();
+                    break 'turns;
                 }
-            } else {
-                executed = true;
-                (registry.execute(name, &args, project_root, caps).await, false)
-            };
 
-            if turn_cancelled {
+                if let Some(diff) = &outcome.diff {
+                    core.send_agent(session_id, AgentEvent::Diff {
+                        call_id: call.id.clone(),
+                        path: diff.path.clone(),
+                        diff: diff.diff.clone(),
+                        added: diff.added,
+                        removed: diff.removed,
+                    });
+                }
                 core.send_agent(session_id, AgentEvent::ToolEnd {
                     call_id: call.id.clone(),
-                    ok: false,
-                    output: "The user cancelled this turn.".into(),
+                    ok: outcome.ok,
+                    output: outcome.output.clone(),
                 });
-                messages.push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
-                stop_reason = "cancelled".into();
-                break 'turns;
-            }
 
-            if let Some(diff) = &outcome.diff {
-                core.send_agent(session_id, AgentEvent::Diff {
-                    call_id: call.id.clone(),
-                    path: diff.path.clone(),
-                    diff: diff.diff.clone(),
-                    added: diff.added,
-                    removed: diff.removed,
-                });
-            }
-            core.send_agent(session_id, AgentEvent::ToolEnd {
-                call_id: call.id.clone(),
-                ok: outcome.ok,
-                output: outcome.output.clone(),
-            });
-
-            // Approval timeouts are not model errors; the "Error:" prefix
-            // would push small models into pointless retry loops.
-            let content = if outcome.ok || outcome.output.starts_with("Approval request timed out") {
-                outcome.output
-            } else {
-                format!("Error: {}", outcome.output)
-            };
-            messages.push(ChatMessage::tool(call.id.clone(), content));
-            if executed {
-                repeat_tracker.record_executed(name, &args_key);
+                // Approval timeouts are not model errors; the "Error:" prefix
+                // would push small models into pointless retry loops.
+                messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
+                if executed {
+                    repeat_tracker.record_executed(name, &args_key);
+                }
             }
         }
         save_messages(core, session_id, &messages, false).await;
@@ -672,6 +842,65 @@ mod tests {
         assert!(!t.would_block("read_file", r#"{"path":"a.rs"}"#));
         t.record_executed("read_file", r#"{"path":"a.rs"}"#);
         assert!(!t.would_block("read_file", r#"{"path":"a.rs"}"#));
+    }
+
+    fn tool_call(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call_{name}"),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn partition_splits_readonly_runs_and_breaks_on_mutating() {
+        let registry = Registry::builtin_only();
+        let tracker = RepeatCallTracker::new();
+        let calls = vec![
+            tool_call("read_file", r#"{"path":"a.rs"}"#),
+            tool_call("read_file", r#"{"path":"b.rs"}"#),
+            tool_call("write_file", r#"{"path":"c.rs","content":"x"}"#),
+            tool_call("glob", r#"{"pattern":"**/*.rs"}"#),
+            tool_call("grep", r#"{"pattern":"fn"}"#),
+        ];
+        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &registry, &tracker));
+        assert_eq!(segments.len(), 3);
+        assert!(segments[0].concurrent && segments[0].start == 0 && segments[0].end == 2);
+        assert!(!segments[1].concurrent && segments[1].start == 2 && segments[1].end == 3);
+        assert!(segments[2].concurrent && segments[2].start == 3 && segments[2].end == 5);
+    }
+
+    #[test]
+    fn partition_single_readonly_call_is_serial() {
+        let registry = Registry::builtin_only();
+        let tracker = RepeatCallTracker::new();
+        let calls = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
+        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &registry, &tracker));
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].concurrent);
+    }
+
+    #[test]
+    fn partition_breaks_on_invalid_json_and_unknown_tools() {
+        let registry = Registry::builtin_only();
+        let tracker = RepeatCallTracker::new();
+        let calls = vec![
+            tool_call("read_file", r#"{"path":"a.rs"}"#),
+            ToolCall {
+                id: "bad_json".into(),
+                kind: "function".into(),
+                function: ToolCallFunction { name: "read_file".into(), arguments: "not json".into() },
+            },
+            tool_call("nope", r#"{"x":1}"#),
+        ];
+        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &registry, &tracker));
+        assert_eq!(segments.len(), 3);
+        assert!(!segments[0].concurrent);
+        assert!(!segments[1].concurrent);
+        assert!(!segments[2].concurrent);
     }
 
     #[test]

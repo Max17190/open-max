@@ -13,11 +13,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::skills::{self, SkillSpec};
+use crate::state::CancelToken;
 use crate::tools::{self, ToolOutcome};
 
 /// External tool descriptions ride in the prompt prefix of every request, so
@@ -126,10 +128,17 @@ impl Registry {
         &self.schemas
     }
 
-    pub async fn execute(&self, name: &str, args: &Value, root: &Path, caps: tools::OutputCaps) -> ToolOutcome {
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: &Value,
+        root: &Path,
+        caps: tools::OutputCaps,
+        cancel: Arc<CancelToken>,
+    ) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
-            Some(ToolKind::Builtin) => tools::execute(name, args, root, caps).await,
-            Some(ToolKind::External(tool)) => spawn_external(name, &tool, args, root, caps).await,
+            Some(ToolKind::Builtin) => tools::execute(name, args, root, caps, cancel).await,
+            Some(ToolKind::External(tool)) => spawn_external(name, &tool, args, root, caps, cancel).await,
             None => ToolOutcome::err(format!(
                 "unknown tool: {name}; the available tools are {}",
                 self.tool_names().join(", ")
@@ -359,6 +368,7 @@ async fn spawn_external(
     args: &Value,
     root: &Path,
     caps: tools::OutputCaps,
+    cancel: Arc<CancelToken>,
 ) -> ToolOutcome {
     let stdin_json = args.to_string();
     let mut cmd = tokio::process::Command::new(&tool.command);
@@ -369,54 +379,67 @@ async fn spawn_external(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
-    let fut = async {
-        let mut child = cmd.spawn().map_err(|e| {
-            format!(
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ToolOutcome::err(format!(
                 "failed to start external tool '{name}' (command '{}', defined in {}): {e}",
                 tool.command,
                 tool.source_path.display()
-            )
-        })?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            // A tool that exits without reading stdin closes the pipe; that
-            // is fine, not an error.
-            let _ = stdin.write_all(stdin_json.as_bytes()).await;
-            // Dropped here: the child sees EOF.
+            ));
         }
-        child
-            .wait_with_output()
-            .await
-            .map_err(|e| format!("external tool '{name}' failed: {e}"))
     };
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        // A tool that exits without reading stdin closes the pipe; that is fine, not an error.
+        let _ = stdin.write_all(stdin_json.as_bytes()).await;
+    }
 
-    match tokio::time::timeout(Duration::from_secs(tool.timeout_secs), fut).await {
-        Err(_) => ToolOutcome::err(format!(
-            "external tool '{name}' timed out after {}s",
-            tool.timeout_secs
-        )),
-        Ok(Err(e)) => ToolOutcome::err(e),
-        Ok(Ok(output)) => {
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
+    let mut child_slot = Some(child);
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            if let Some(mut c) = child_slot.take() {
+                let _ = c.kill().await;
+            }
+            ToolOutcome::err(format!("external tool '{name}' cancelled by user"))
+        }
+        _ = tokio::time::sleep(Duration::from_secs(tool.timeout_secs)) => {
+            if let Some(mut c) = child_slot.take() {
+                let _ = c.kill().await;
+            }
+            ToolOutcome::err(format!(
+                "external tool '{name}' timed out after {}s",
+                tool.timeout_secs
+            ))
+        }
+        output = async {
+            child_slot.take().expect("child taken twice").wait_with_output().await
+        } => {
+            match output {
+                Err(e) => ToolOutcome::err(format!("external tool '{name}' failed: {e}")),
+                Ok(output) => {
+                    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str("[stderr]\n");
+                        text.push_str(&stderr);
+                    }
+                    if text.len() > caps.command_bytes {
+                        text = tools::truncate_command_output(&text, caps.command_bytes);
+                    }
+                    if text.trim().is_empty() {
+                        text = "(no output)".into();
+                    }
+                    let code = output.status.code().unwrap_or(-1);
+                    if output.status.success() {
+                        ToolOutcome::ok(text)
+                    } else {
+                        ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
+                    }
                 }
-                text.push_str("[stderr]\n");
-                text.push_str(&stderr);
-            }
-            if text.len() > caps.command_bytes {
-                text = tools::truncate_command_output(&text, caps.command_bytes);
-            }
-            if text.trim().is_empty() {
-                text = "(no output)".into();
-            }
-            let code = output.status.code().unwrap_or(-1);
-            if output.status.success() {
-                ToolOutcome::ok(text)
-            } else {
-                ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
             }
         }
     }
@@ -425,6 +448,11 @@ async fn spawn_external(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::CancelToken;
+
+    fn no_cancel() -> Arc<CancelToken> {
+        Arc::new(CancelToken::default())
+    }
 
     #[test]
     fn builtin_only_schemas_are_byte_identical_to_static() {
@@ -475,7 +503,7 @@ mod tests {
     async fn unknown_tool_error_lists_names() {
         let registry = Registry::builtin_only();
         let out = registry
-            .execute("nope", &serde_json::json!({}), Path::new("."), tools::OutputCaps::default())
+            .execute("nope", &serde_json::json!({}), Path::new("."), tools::OutputCaps::default(), no_cancel())
             .await;
         assert!(!out.ok);
         assert!(out.output.contains("bash"), "should list valid tools: {}", out.output);
@@ -584,7 +612,7 @@ mod tests {
         );
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
         let out = registry
-            .execute("echo_args", &serde_json::json!({"message": "hi"}), &project, tools::OutputCaps::default())
+            .execute("echo_args", &serde_json::json!({"message": "hi"}), &project, tools::OutputCaps::default(), no_cancel())
             .await;
         assert!(out.ok, "{}", out.output);
         assert!(out.output.contains("got: {\"message\":\"hi\"}"), "{}", out.output);
@@ -602,16 +630,16 @@ mod tests {
         write_tool(&tools_dir, "fail.toml", &format!("name = \"fail\"\ndescription = \"f\"\ncommand = \"{}\"\n", fail.display()));
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
 
-        let out = registry.execute("slow", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        let out = registry.execute("slow", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.contains("timed out after 1s"), "{}", out.output);
 
-        let out = registry.execute("fail", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        let out = registry.execute("fail", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.starts_with("exit code 3"), "{}", out.output);
         assert!(out.output.contains("[stderr]") && out.output.contains("oops"), "{}", out.output);
 
-        let out = registry.execute("missing_binary", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        let out = registry.execute("missing_binary", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok && out.output.contains("unknown tool"));
         let _ = std::fs::remove_dir_all(project);
     }
@@ -623,7 +651,7 @@ mod tests {
         std::fs::create_dir_all(&tools_dir).unwrap();
         write_tool(&tools_dir, "ghost.toml", "name = \"ghost\"\ndescription = \"g\"\ncommand = \"/nonexistent/binary\"\n");
         let registry = Registry::assemble(discover_external_in(&[tools_dir.clone()]), Vec::new());
-        let out = registry.execute("ghost", &serde_json::json!({}), &project, tools::OutputCaps::default()).await;
+        let out = registry.execute("ghost", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.contains("ghost") && out.output.contains("/nonexistent/binary"), "{}", out.output);
         assert!(out.output.contains("ghost.toml"), "must point at the defining file: {}", out.output);

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use crate::state::CancelToken;
 
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
@@ -238,9 +240,15 @@ fn rel_display(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-pub async fn execute(name: &str, args: &Value, root: &Path, caps: OutputCaps) -> ToolOutcome {
+pub async fn execute(
+    name: &str,
+    args: &Value,
+    root: &Path,
+    caps: OutputCaps,
+    cancel: Arc<CancelToken>,
+) -> ToolOutcome {
     if name == "bash" {
-        return bash_tool(root, args, caps).await;
+        return bash_tool(root, args, caps, cancel).await;
     }
     // The file tools are synchronous fs/walk work; run them off the async
     // workers so a big grep or read never stalls streaming and the UI.
@@ -765,7 +773,7 @@ fn spill_command_output(text: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps) -> ToolOutcome {
+async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<CancelToken>) -> ToolOutcome {
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
     };
@@ -778,35 +786,53 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps) -> ToolOutcome {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let fut = async {
-        let child = cmd.spawn().map_err(|e| format!("failed to spawn shell: {e}"))?;
-        child.wait_with_output().await.map_err(|e| format!("command failed: {e}"))
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return ToolOutcome::err(format!("failed to spawn shell: {e}")),
     };
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
-        Err(_) => ToolOutcome::err(format!("command timed out after {timeout_secs}s")),
-        Ok(Err(e)) => ToolOutcome::err(e),
-        Ok(Ok(output)) => {
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
+    let mut child_slot = Some(child);
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            if let Some(mut c) = child_slot.take() {
+                let _ = c.kill().await;
+            }
+            ToolOutcome::err("command cancelled by user")
+        }
+        _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+            if let Some(mut c) = child_slot.take() {
+                let _ = c.kill().await;
+            }
+            ToolOutcome::err(format!("command timed out after {timeout_secs}s"))
+        }
+        output = async {
+            child_slot.take().expect("child taken twice").wait_with_output().await
+        } => {
+            match output {
+                Err(e) => ToolOutcome::err(format!("command failed: {e}")),
+                Ok(output) => {
+                    let mut text = String::new();
+                    text.push_str(&String::from_utf8_lossy(&output.stdout));
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str("[stderr]\n");
+                        text.push_str(&stderr);
+                    }
+                    if text.len() > caps.command_bytes {
+                        text = truncate_command_output(&text, caps.command_bytes);
+                    }
+                    if text.trim().is_empty() {
+                        text = "(no output)".into();
+                    }
+                    let code = output.status.code().unwrap_or(-1);
+                    if output.status.success() {
+                        ToolOutcome::ok(text)
+                    } else {
+                        ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
+                    }
                 }
-                text.push_str("[stderr]\n");
-                text.push_str(&stderr);
-            }
-            if text.len() > caps.command_bytes {
-                text = truncate_command_output(&text, caps.command_bytes);
-            }
-            if text.trim().is_empty() {
-                text = "(no output)".into();
-            }
-            let code = output.status.code().unwrap_or(-1);
-            if output.status.success() {
-                ToolOutcome::ok(text)
-            } else {
-                ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
             }
         }
     }
@@ -905,7 +931,13 @@ mod tests {
         let root = temp_project();
         // 40k+ bytes of output with the failure marker at the very end.
         let cmd = "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done; echo THE_REAL_FAILURE; exit 3";
-        let out = bash_tool(&root, &json!({"command": cmd}), OutputCaps::default()).await;
+        let out = bash_tool(
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
         assert!(!out.ok);
         assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
         assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");
