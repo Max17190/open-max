@@ -170,24 +170,29 @@ pub fn touch(core: &Core, id: &str) {
 }
 
 /// Load persisted messages. Corrupt JSONL lines are skipped silently so a
-/// partially damaged file still yields whatever could be parsed; callers get
-/// `None` only when the file is missing or the legacy array payload is invalid.
+/// partially damaged file still yields whatever could be parsed. Returns
+/// `None` when the file is missing, empty, wholly unparseable, or the legacy
+/// array payload is invalid — callers treat that as "no transcript on disk".
 pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
     let path = messages_path(core, id);
     let text = std::fs::read_to_string(&path).ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Some(Vec::new());
+        return None;
     }
     if trimmed.starts_with('[') {
         serde_json::from_str(&text).ok()
     } else {
-        Some(
-            text.lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-        )
+        let parsed: Vec<ChatMessage> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if parsed.is_empty() {
+            None
+        } else {
+            Some(parsed)
+        }
     }
 }
 
@@ -224,6 +229,21 @@ mod tests {
     use super::*;
     use crate::state::Core;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn empty_or_corrupt_messages_file_loads_as_none() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "empty";
+
+        std::fs::write(messages_path(&core, id), "").unwrap();
+        assert!(load_messages(&core, id).is_none());
+
+        std::fs::write(messages_path(&core, id), "not valid json\n{broken\n").unwrap();
+        assert!(load_messages(&core, id).is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn jsonl_append_only_writes_new_tail() {

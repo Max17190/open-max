@@ -153,33 +153,44 @@ fn batchable_call(call: &ToolCall, registry: &Registry, repeat_tracker: &RepeatC
 }
 
 fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> SessionData {
-    if let Some(messages) = sessions::load_messages(core, session_id) {
-        let count = messages.len();
-        // Resume with the registry frozen at creation (from the
-        // manifest), never today's config: the persisted prompt and
-        // the schema set must keep matching each other byte for
-        // byte. No manifest means the session was builtin-only.
-        let registry = match sessions::load_manifest(core, session_id) {
-            Some(manifest) => Registry::from_manifest(manifest),
-            None => Registry::builtin_only(),
+    if let Some(mut messages) = sessions::load_messages(core, session_id) {
+        // Resume: registry frozen at creation — manifest if present, else built-ins only.
+        let registry = if let Some(manifest) = sessions::load_manifest(core, session_id) {
+            Arc::new(Registry::from_manifest(manifest))
+        } else {
+            Arc::new(Registry::builtin_only())
         };
-        let system_chars = messages
-            .first()
-            .filter(|m| m.role == "system")
-            .and_then(|m| m.content.as_deref())
-            .map(str::len)
-            .unwrap_or(0);
-        let breakdown = PromptBreakdown::from_persisted(system_chars, &registry);
+        let count = messages.len();
+        let needs_system = messages.first().map(|m| m.role.as_str()) != Some("system");
+        let (prompt_breakdown, persisted_count) = if needs_system {
+            let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+            messages.insert(0, ChatMessage::system(prompt));
+            // In-memory prefix no longer matches what's on disk; rewrite on next save.
+            (Arc::new(breakdown), 0usize)
+        } else {
+            let system_chars = messages
+                .first()
+                .and_then(|m| m.content.as_deref())
+                .map(str::len)
+                .unwrap_or(0);
+            (Arc::new(PromptBreakdown::from_persisted(system_chars, &registry)), count)
+        };
         SessionData {
             messages,
-            registry: Arc::new(registry),
-            prompt_breakdown: Arc::new(breakdown),
-            persisted_count: count,
+            registry,
+            prompt_breakdown,
+            persisted_count,
             snapshots: Default::default(),
         }
     } else {
-        let registry = Arc::new(Registry::build(project_root));
-        if registry.has_extensions() {
+        // No transcript on disk: start fresh, but honor a saved manifest if the
+        // messages file was lost or emptied without wiping the registry snapshot.
+        let (registry, had_manifest) = if let Some(manifest) = sessions::load_manifest(core, session_id) {
+            (Arc::new(Registry::from_manifest(manifest)), true)
+        } else {
+            (Arc::new(Registry::build(project_root)), false)
+        };
+        if !had_manifest && registry.has_extensions() {
             sessions::save_manifest(core, session_id, &registry.to_manifest());
         }
         let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
@@ -240,7 +251,8 @@ async fn execute_readonly_batch(
             let root = ctx.project_root.to_path_buf();
             let cancel = ctx.cancelled.clone();
             let registry = ctx.registry.clone();
-            async move { registry.execute(&name, &args, &root, ctx.caps, cancel).await }
+            let caps = ctx.caps;
+            async move { registry.execute(&name, &args, &root, caps, cancel).await }
         })
         .collect();
     let outcomes = futures_util::future::join_all(futures).await;
@@ -901,6 +913,53 @@ mod tests {
         assert!(!segments[0].concurrent);
         assert!(!segments[1].concurrent);
         assert!(!segments[2].concurrent);
+    }
+
+    #[test]
+    fn build_session_data_honors_manifest_without_messages() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "manifest-only";
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+        )
+        .unwrap();
+        let original = crate::registry::Registry::build(&project);
+        sessions::save_manifest(&core, id, &original.to_manifest());
+        std::fs::remove_dir_all(project.join(".openmax/tools")).unwrap();
+
+        let data = build_session_data(&core, id, &project);
+        assert_eq!(data.messages[0].role, "system");
+        assert!(data.registry.is_mutating("deploy"));
+        assert_eq!(
+            data.registry.tool_schemas_json().to_string(),
+            original.tool_schemas_json().to_string()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn build_session_data_injects_system_when_resume_lacks_one() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "legacy-no-system";
+        let mut persisted = 0usize;
+        sessions::save_messages(&core, id, &[ChatMessage::user("hello")], &mut persisted, false);
+
+        let data = build_session_data(&core, id, Path::new("."));
+        assert_eq!(data.messages[0].role, "system");
+        assert_eq!(data.messages[1].role, "user");
+        assert_eq!(data.persisted_count, 0, "must rewrite on next save after injecting system");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

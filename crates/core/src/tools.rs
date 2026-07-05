@@ -250,25 +250,30 @@ pub async fn execute(
     if name == "bash" {
         return bash_tool(root, args, caps, cancel).await;
     }
+    if cancel.is_cancelled() {
+        return ToolOutcome::err("tool cancelled by user");
+    }
     // The file tools are synchronous fs/walk work; run them off the async
     // workers so a big grep or read never stalls streaming and the UI.
+    // Esc stops waiting immediately; the blocking task may finish in the pool.
     let name = name.to_string();
     let args = args.clone();
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || match name.as_str() {
-        "list_dir" => list_dir(&root, &args),
-        "read_file" => read_file(&root, &args),
-        "write_file" => write_file(&root, &args),
-        "edit_file" => edit_file(&root, &args),
-        "glob" => glob_tool(&root, &args),
-        "grep" => grep_tool(&root, &args),
-        other => ToolOutcome::err(format!(
-            "unknown tool: {other}; the available tools are {}",
-            TOOL_NAMES.join(", ")
-        )),
-    })
-    .await
-    .unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}")))
+    tokio::select! {
+        _ = cancel.cancelled() => ToolOutcome::err("tool cancelled by user"),
+        result = tokio::task::spawn_blocking(move || match name.as_str() {
+            "list_dir" => list_dir(&root, &args),
+            "read_file" => read_file(&root, &args),
+            "write_file" => write_file(&root, &args),
+            "edit_file" => edit_file(&root, &args),
+            "glob" => glob_tool(&root, &args),
+            "grep" => grep_tool(&root, &args),
+            other => ToolOutcome::err(format!(
+                "unknown tool: {other}; the available tools are {}",
+                TOOL_NAMES.join(", ")
+            )),
+        }) => result.unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}"))),
+    }
 }
 
 fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
@@ -1046,6 +1051,21 @@ mod tests {
         assert!(out.output.contains("Closest match is at line 1"), "{}", out.output);
         assert!(out.output.contains("almost_match"), "{}", out.output);
         assert!(out.output.contains("Read the file around that line"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn readonly_execute_returns_immediately_when_cancelled() {
+        use std::sync::Arc;
+
+        use crate::state::CancelToken;
+
+        let cancel = Arc::new(CancelToken::default());
+        cancel.cancel();
+        let root = temp_project();
+        let out = execute("glob", &json!({"pattern": "**/*.rs"}), &root, OutputCaps::default(), cancel).await;
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("cancelled"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 }
