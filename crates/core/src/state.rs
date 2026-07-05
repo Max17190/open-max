@@ -42,6 +42,43 @@ pub enum CoreEvent {
     Download(DownloadEvent),
 }
 
+/// Cooperative cancellation for one agent turn: a flag for cheap synchronous
+/// checks plus a Notify so waiters wake immediately instead of polling.
+/// notify_waiters only reaches tasks already registered, so `cancelled()`
+/// re-checks the flag after registering — a cancel can never slip between
+/// the check and the wait.
+#[derive(Default)]
+pub struct CancelToken {
+    flag: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelToken {
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the token is cancelled; immediate if it already is.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Shared core state. The frontend owns an `Arc<Core>` plus the receiving half
 /// of the event channel; background tasks clone the `Arc`.
 pub struct Core {
@@ -51,7 +88,7 @@ pub struct Core {
     pub sessions: tokio::sync::Mutex<HashMap<String, SessionData>>,
     /// Sessions with an agent turn currently in flight.
     pub running: Mutex<HashSet<String>>,
-    pub cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    pub cancel_flags: Mutex<HashMap<String, Arc<CancelToken>>>,
     /// Pending tool-approval prompts awaiting a user decision.
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Serializes read-modify-write cycles on the session index file.
@@ -105,13 +142,36 @@ impl Core {
 
     /// Ask the running turn in `session_id` to stop at the next safe point.
     pub fn cancel(&self, session_id: &str) {
-        if let Some(flag) = self.cancel_flags.lock().unwrap().get(session_id) {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(token) = self.cancel_flags.lock().unwrap().get(session_id) {
+            token.cancel();
         }
     }
 
     pub fn is_running(&self, session_id: &str) -> bool {
         self.running.lock().unwrap().contains(session_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancel_token_wakes_waiters_immediately() {
+        let token = Arc::new(CancelToken::default());
+        let waiter_token = token.clone();
+        let waiter = tokio::spawn(async move { waiter_token.cancelled().await });
+        tokio::task::yield_now().await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter must wake without polling delay")
+            .unwrap();
+        // An already-cancelled token resolves without waiting at all.
+        tokio::time::timeout(std::time::Duration::from_millis(10), token.cancelled())
+            .await
+            .expect("immediate resolution");
+        assert!(token.is_cancelled());
     }
 }
 

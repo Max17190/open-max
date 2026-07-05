@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -12,7 +11,7 @@ use crate::fallback;
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
 use crate::registry::Registry;
 use crate::sessions;
-use crate::state::{Core, SessionData};
+use crate::state::{CancelToken, Core, SessionData};
 use crate::tools;
 use crate::types::{AgentEvent, ChatMessage};
 
@@ -36,7 +35,7 @@ pub fn start_turn(
         }
         running.insert(session_id.clone());
     }
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(CancelToken::default());
     core.cancel_flags
         .lock()
         .unwrap()
@@ -94,7 +93,7 @@ async fn run_loop(
     project_root: &Path,
     user_text: String,
     settings: Settings,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<CancelToken>,
 ) {
     let (mut messages, registry) = {
         let mut sessions_map = core.sessions.lock().await;
@@ -215,7 +214,7 @@ async fn run_loop(
             save_messages(core, session_id, &messages, budget_changed).await;
         }
 
-        if cancelled.load(Ordering::Relaxed) {
+        if cancelled.is_cancelled() {
             stop_reason = "cancelled".into();
             break 'turns;
         }
@@ -225,7 +224,7 @@ async fn run_loop(
         }
 
         for call in &tool_calls {
-            if cancelled.load(Ordering::Relaxed) {
+            if cancelled.is_cancelled() {
                 stop_reason = "cancelled".into();
                 break 'turns;
             }
@@ -326,7 +325,7 @@ async fn request_approval(
     session_id: &str,
     name: &str,
     args: &Value,
-    cancelled: &Arc<AtomicBool>,
+    cancelled: &Arc<CancelToken>,
 ) -> bool {
     let approval_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
@@ -337,19 +336,9 @@ async fn request_approval(
         summary: crate::registry::summarize_call(name, args),
     });
 
-    let cancelled = cancelled.clone();
-    let wait_cancel = async move {
-        loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    };
-
     let approved = tokio::select! {
         r = rx => r.unwrap_or(false),
-        _ = wait_cancel => false,
+        _ = cancelled.cancelled() => false,
         _ = tokio::time::sleep(APPROVAL_TIMEOUT) => false,
     };
 

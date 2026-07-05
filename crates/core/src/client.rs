@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -137,7 +136,7 @@ impl ChatClient {
         &self,
         messages: &[ChatMessage],
         tools: &Value,
-        cancelled: Arc<AtomicBool>,
+        cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
         let mut body = json!({
@@ -165,7 +164,7 @@ impl ChatClient {
         // first byte arrives; keep cancellation responsive throughout.
         let resp = tokio::select! {
             r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
-            _ = wait_for(&cancelled) => {
+            _ = cancelled.cancelled() => {
                 return Ok(CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into(), usage: None });
             }
         };
@@ -200,7 +199,7 @@ impl ChatClient {
         'outer: loop {
             let next = tokio::select! {
                 c = stream.next() => c,
-                _ = wait_for(&cancelled) => {
+                _ = cancelled.cancelled() => {
                     finish_reason = "cancelled".into();
                     break;
                 }
@@ -341,16 +340,6 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
             function: ToolCallFunction { name: p.name, arguments: p.arguments },
         })
         .collect()
-}
-
-/// Resolves once `cancelled` becomes true; polled at 100ms.
-async fn wait_for(cancelled: &AtomicBool) {
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
