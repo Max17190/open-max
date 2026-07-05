@@ -9,7 +9,8 @@ use tokio::sync::oneshot;
 use crate::client::{ChatClient, StreamDelta};
 use crate::config::Settings;
 use crate::fallback;
-use crate::prompt::system_prompt;
+use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
+use crate::registry::Registry;
 use crate::sessions;
 use crate::state::{Core, SessionData};
 use crate::tools;
@@ -95,22 +96,51 @@ async fn run_loop(
     settings: Settings,
     cancelled: Arc<AtomicBool>,
 ) {
-    let mut messages = {
+    let (mut messages, registry) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map.entry(session_id.to_string()).or_insert_with(|| {
             if let Some(messages) = sessions::load_messages(core, session_id) {
                 let count = messages.len();
-                SessionData { messages, persisted_count: count, snapshots: Default::default() }
-            } else {
+                // Resume with the registry frozen at creation (from the
+                // manifest), never today's config: the persisted prompt and
+                // the schema set must keep matching each other byte for
+                // byte. No manifest means the session was builtin-only.
+                let registry = match sessions::load_manifest(core, session_id) {
+                    Some(manifest) => Registry::from_manifest(manifest),
+                    None => Registry::builtin_only(),
+                };
+                let system_chars = messages
+                    .first()
+                    .filter(|m| m.role == "system")
+                    .and_then(|m| m.content.as_deref())
+                    .map(str::len)
+                    .unwrap_or(0);
+                let breakdown = PromptBreakdown::from_persisted(system_chars, &registry);
                 SessionData {
-                    messages: vec![ChatMessage::system(system_prompt(project_root))],
+                    messages,
+                    registry: Arc::new(registry),
+                    prompt_breakdown: Arc::new(breakdown),
+                    persisted_count: count,
+                    snapshots: Default::default(),
+                }
+            } else {
+                let registry = Arc::new(Registry::build(project_root));
+                if registry.has_extensions() {
+                    sessions::save_manifest(core, session_id, &registry.to_manifest());
+                }
+                let (prompt, breakdown) =
+                    system_prompt_with_breakdown(project_root, &registry);
+                SessionData {
+                    messages: vec![ChatMessage::system(prompt)],
+                    registry,
+                    prompt_breakdown: Arc::new(breakdown),
                     persisted_count: 0,
                     snapshots: Default::default(),
                 }
             }
         });
         data.messages.push(ChatMessage::user(user_text));
-        data.messages.clone()
+        (data.messages.clone(), data.registry.clone())
     };
 
     let client = ChatClient::new(
@@ -120,8 +150,9 @@ async fn run_loop(
         settings.temperature,
         settings.max_tokens,
     );
-    let schemas = tools::tool_schemas();
-    let known_tools = tools::TOOL_NAMES;
+    let schemas = registry.tool_schemas_json();
+    let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
+    let caps = tools::OutputCaps::from_settings(&settings);
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
@@ -167,7 +198,7 @@ async fn run_loop(
             content = clean;
         }
         if tool_calls.is_empty() {
-            if let Some((clean, calls)) = fallback::extract_tool_calls(&content, known_tools) {
+            if let Some((clean, calls)) = fallback::extract_tool_calls(&content, &known_tools) {
                 content = clean;
                 tool_calls = calls;
             }
@@ -217,23 +248,23 @@ async fn run_loop(
                 args: args.clone(),
             });
 
-            if tools::is_mutating(name) {
+            if registry.is_mutating(name) {
                 snapshot_file(core, session_id, project_root, &args).await;
             }
 
             // Read live so "[a]lways" during an approval prompt takes effect
             // for the rest of this turn, not just the next one.
             let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
-            let outcome = if tools::is_mutating(name) && approval_mode == "readonly" {
+            let outcome = if registry.is_mutating(name) && approval_mode == "readonly" {
                 tools::ToolOutcome {
                     ok: false,
                     output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                     diff: None,
                 }
-            } else if tools::is_mutating(name) && approval_mode == "ask" {
+            } else if registry.is_mutating(name) && approval_mode == "ask" {
                 let approved = request_approval(core, session_id, name, &args, &cancelled).await;
                 if approved {
-                    tools::execute(name, &args, project_root).await
+                    registry.execute(name, &args, project_root, caps).await
                 } else {
                     tools::ToolOutcome {
                         ok: false,
@@ -242,7 +273,7 @@ async fn run_loop(
                     }
                 }
             } else {
-                tools::execute(name, &args, project_root).await
+                registry.execute(name, &args, project_root, caps).await
             };
 
             if let Some(diff) = &outcome.diff {
@@ -303,7 +334,7 @@ async fn request_approval(
     core.send_agent(session_id, AgentEvent::ApprovalRequest {
         approval_id: approval_id.clone(),
         name: name.to_string(),
-        summary: tools::summarize_call(name, args),
+        summary: crate::registry::summarize_call(name, args),
     });
 
     let cancelled = cancelled.clone();

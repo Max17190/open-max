@@ -14,6 +14,26 @@ const MAX_RESULTS: usize = 200;
 const MAX_GREP_RESULTS: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 30_000;
 const MAX_READ_LINES: usize = 1500;
+
+/// Output limits threaded into command-running tools (bash and external
+/// tools). Settings can widen or tighten the command cap; everything else
+/// keeps the tuned constants above.
+#[derive(Clone, Copy)]
+pub struct OutputCaps {
+    pub command_bytes: usize,
+}
+
+impl Default for OutputCaps {
+    fn default() -> Self {
+        Self { command_bytes: MAX_OUTPUT_BYTES }
+    }
+}
+
+impl OutputCaps {
+    pub fn from_settings(settings: &crate::config::Settings) -> Self {
+        Self { command_bytes: settings.max_output_bytes.unwrap_or(MAX_OUTPUT_BYTES).max(1_000) }
+    }
+}
 const MAX_LINE_CHARS: usize = 500;
 const MAX_FILE_BYTES: u64 = 1_500_000;
 
@@ -32,10 +52,10 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn ok(output: String) -> Self {
+    pub(crate) fn ok(output: String) -> Self {
         Self { ok: true, output, diff: None }
     }
-    fn err(output: impl Into<String>) -> Self {
+    pub(crate) fn err(output: impl Into<String>) -> Self {
         Self { ok: false, output: output.into(), diff: None }
     }
 }
@@ -216,7 +236,7 @@ fn rel_display(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-pub async fn execute(name: &str, args: &Value, root: &Path) -> ToolOutcome {
+pub async fn execute(name: &str, args: &Value, root: &Path, caps: OutputCaps) -> ToolOutcome {
     match name {
         "list_dir" => list_dir(root, args),
         "read_file" => read_file(root, args),
@@ -224,7 +244,7 @@ pub async fn execute(name: &str, args: &Value, root: &Path) -> ToolOutcome {
         "edit_file" => edit_file(root, args),
         "glob" => glob_tool(root, args),
         "grep" => grep_tool(root, args),
-        "bash" => bash_tool(root, args).await,
+        "bash" => bash_tool(root, args, caps).await,
         other => ToolOutcome::err(format!(
             "unknown tool: {other}; the available tools are {}",
             TOOL_NAMES.join(", ")
@@ -557,9 +577,9 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
 /// Truncate oversized command output keeping the TAIL: build and test failures
 /// live at the end, and losing them forces the model to re-run the command.
 /// The full output is spilled to a log file the model can grep or tail.
-fn truncate_command_output(text: &str) -> String {
+pub(crate) fn truncate_command_output(text: &str, max_bytes: usize) -> String {
     let spilled = spill_command_output(text);
-    let mut start = text.len() - MAX_OUTPUT_BYTES;
+    let mut start = text.len() - max_bytes;
     while !text.is_char_boundary(start) {
         start += 1;
     }
@@ -589,7 +609,7 @@ fn spill_command_output(text: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-async fn bash_tool(root: &Path, args: &Value) -> ToolOutcome {
+async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps) -> ToolOutcome {
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
     };
@@ -620,8 +640,8 @@ async fn bash_tool(root: &Path, args: &Value) -> ToolOutcome {
                 text.push_str("[stderr]\n");
                 text.push_str(&stderr);
             }
-            if text.len() > MAX_OUTPUT_BYTES {
-                text = truncate_command_output(&text);
+            if text.len() > caps.command_bytes {
+                text = truncate_command_output(&text, caps.command_bytes);
             }
             if text.trim().is_empty() {
                 text = "(no output)".into();
@@ -717,7 +737,7 @@ mod tests {
             text.push_str(&format!("line number {i} with some padding text\n"));
         }
         assert!(text.len() > MAX_OUTPUT_BYTES);
-        let kept = truncate_command_output(&text);
+        let kept = truncate_command_output(&text, MAX_OUTPUT_BYTES);
         assert!(kept.len() < text.len());
         assert!(kept.contains("line number 3999"), "the end of the output must survive");
         assert!(!kept.contains("line number 0 "), "the head is what gets dropped");
@@ -729,7 +749,7 @@ mod tests {
         let root = temp_project();
         // 40k+ bytes of output with the failure marker at the very end.
         let cmd = "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done; echo THE_REAL_FAILURE; exit 3";
-        let out = bash_tool(&root, &json!({"command": cmd})).await;
+        let out = bash_tool(&root, &json!({"command": cmd}), OutputCaps::default()).await;
         assert!(!out.ok);
         assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
         assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");

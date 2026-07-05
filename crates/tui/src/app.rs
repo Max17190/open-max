@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use open_max_core::mlx::MlxEvent;
 use open_max_core::state::{Core, CoreEvent, DownloadEvent};
 use open_max_core::types::AgentEvent;
-use open_max_core::{agent, config, hf, mlx, sessions, tools};
+use open_max_core::{agent, config, hf, mlx, prompt, registry, sessions};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,7 +26,7 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{wrap_lines, StreamingWrap, Term, Transcript};
-use crate::ui::{markdown, models};
+use crate::ui::{context, markdown, models};
 
 const TICK: Duration = Duration::from_millis(120);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -241,7 +241,7 @@ impl App {
                         for call in calls {
                             let args: serde_json::Value =
                                 serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-                            let summary = tools::summarize_call(&call.function.name, &args);
+                            let summary = registry::summarize_call(&call.function.name, &args);
                             self.transcript.push(vec![Line::from(vec![
                                 Span::styled("· ", Style::default().fg(theme::DIM)),
                                 Span::styled(call.function.name.clone(), Style::default().fg(theme::ACCENT)),
@@ -555,6 +555,7 @@ impl App {
                     ("/model <repo>", "use a specific model id"),
                     ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
                     ("/new", "start a fresh session"),
+                    ("/context", "prompt token costs, cache hits, and budget"),
                     ("/status", "session and server state"),
                     ("/logs", "recent model server logs"),
                     ("/quit", "exit"),
@@ -607,6 +608,35 @@ impl App {
                     format!("── new session {}", "─".repeat(24)),
                     Style::default().fg(theme::DIM),
                 ))]);
+            }
+            "context" => {
+                // A hydrated session shows its frozen breakdown; before any
+                // turn runs (or with no session), preview what the next new
+                // session would freeze from today's config.
+                let frozen = match &self.session_id {
+                    Some(id) => self
+                        .core
+                        .sessions
+                        .lock()
+                        .await
+                        .get(id)
+                        .map(|data| data.prompt_breakdown.as_ref().clone()),
+                    None => None,
+                };
+                let (breakdown, is_frozen) = match frozen {
+                    Some(b) => (b, true),
+                    None => {
+                        let registry = registry::Registry::build(&self.project);
+                        let (_, b) = prompt::system_prompt_with_breakdown(&self.project, &registry);
+                        (b, false)
+                    }
+                };
+                self.transcript.push(context::context_block(
+                    &breakdown,
+                    is_frozen,
+                    self.budget,
+                    self.cache_pct,
+                ));
             }
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
@@ -751,7 +781,7 @@ impl App {
                 };
             }
             AgentEvent::ToolStart { call_id, name, args } => {
-                let summary = tools::summarize_call(&name, &args);
+                let summary = registry::summarize_call(&name, &args);
                 self.tool_meta.insert(call_id, (name.clone(), summary.clone()));
                 self.running_tool = Some((name, summary));
             }
