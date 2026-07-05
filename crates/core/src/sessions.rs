@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::state::Core;
-use crate::types::ChatMessage;
+use crate::types::{AgentEvent, ChatMessage};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -169,22 +169,30 @@ pub fn touch(core: &Core, id: &str) {
     });
 }
 
+/// Load persisted messages. Corrupt JSONL lines are skipped silently so a
+/// partially damaged file still yields whatever could be parsed. Returns
+/// `None` when the file is missing, empty, wholly unparseable, or the legacy
+/// array payload is invalid — callers treat that as "no transcript on disk".
 pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
     let path = messages_path(core, id);
     let text = std::fs::read_to_string(&path).ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Some(Vec::new());
+        return None;
     }
     if trimmed.starts_with('[') {
         serde_json::from_str(&text).ok()
     } else {
-        Some(
-            text.lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-        )
+        let parsed: Vec<ChatMessage> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if parsed.is_empty() {
+            None
+        } else {
+            Some(parsed)
+        }
     }
 }
 
@@ -203,8 +211,16 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         Ok(())
     };
 
-    if result.is_ok() {
-        *persisted = messages.len();
+    match result {
+        Ok(()) => *persisted = messages.len(),
+        Err(e) => {
+            core.send_agent(
+                id,
+                AgentEvent::Error {
+                    message: format!("warning: failed to persist session to disk: {e}"),
+                },
+            );
+        }
     }
 }
 
@@ -213,6 +229,21 @@ mod tests {
     use super::*;
     use crate::state::Core;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn empty_or_corrupt_messages_file_loads_as_none() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "empty";
+
+        std::fs::write(messages_path(&core, id), "").unwrap();
+        assert!(load_messages(&core, id).is_none());
+
+        std::fs::write(messages_path(&core, id), "not valid json\n{broken\n").unwrap();
+        assert!(load_messages(&core, id).is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn jsonl_append_only_writes_new_tail() {
@@ -296,6 +327,28 @@ mod tests {
             original.tool_schemas_json().to_string(),
             "schemas must be byte-identical across resume"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_failure_does_not_advance_persisted_count() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "fail-save";
+        let mut persisted = 0usize;
+
+        let initial = vec![ChatMessage::user("hello")];
+        save_messages(&core, id, &initial, &mut persisted, false);
+        assert_eq!(persisted, 1);
+
+        let path = messages_path(&core, id);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+
+        let extended = vec![ChatMessage::user("hello"), ChatMessage::assistant(Some("hi".into()), None)];
+        save_messages(&core, id, &extended, &mut persisted, false);
+        assert_eq!(persisted, 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

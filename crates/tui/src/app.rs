@@ -224,7 +224,7 @@ impl App {
         let Some(messages) = sessions::load_messages(&self.core, session_id) else {
             return;
         };
-        for m in &messages {
+        for (i, m) in messages.iter().enumerate() {
             match m.role.as_str() {
                 "user" => {
                     if let Some(text) = &m.content {
@@ -238,16 +238,29 @@ impl App {
                         }
                     }
                     if let Some(calls) = &m.tool_calls {
-                        for call in calls {
-                            let args: serde_json::Value =
-                                serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
+                        // Tool results directly follow their assistant message;
+                        // stop at the first non-tool message so a short turn
+                        // (e.g. cancelled) never borrows a later turn's output.
+                        let tool_results: Vec<_> = messages[i + 1..]
+                            .iter()
+                            .take_while(|tm| tm.role == "tool")
+                            .take(calls.len())
+                            .collect();
+                        for (call, tool_msg) in calls.iter().zip(tool_results) {
+                            let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                                .unwrap_or(serde_json::Value::Null);
                             let summary = registry::summarize_call(&call.function.name, &args);
-                            self.transcript.push(vec![Line::from(vec![
-                                Span::styled("· ", Style::default().fg(theme::DIM)),
-                                Span::styled(call.function.name.clone(), Style::default().fg(theme::ACCENT)),
-                                Span::raw(" "),
-                                Span::styled(summary, Style::default().fg(theme::DIM)),
-                            ])]);
+                            let content = tool_msg.content.as_deref().unwrap_or("");
+                            let ok = !content.starts_with("Error:");
+                            let output = truncate_replay_output(content);
+                            self.transcript.push(tool_card::tool_block(
+                                &call.function.name,
+                                &summary,
+                                ok,
+                                &output,
+                                None,
+                            ));
+                            self.last_tool_output = Some(content.to_string());
                         }
                     }
                 }
@@ -255,6 +268,39 @@ impl App {
             }
         }
         self.note("continuing previous session");
+    }
+
+    /// Clear transcript and per-session UI state for `/new`.
+    fn reset_for_new_session(&mut self) {
+        if self.running {
+            if let Some(id) = &self.session_id {
+                self.core.cancel(id);
+            }
+        }
+        self.session_id = None;
+        self.transcript = Transcript::new();
+        self.running = false;
+        self.stream_text.clear();
+        self.thinking_chars = 0;
+        self.thinking_tail.clear();
+        self.turn_started = None;
+        self.first_token = None;
+        self.stream_chars = 0;
+        self.running_tool = None;
+        self.pending_approval = None;
+        self.pending_diffs.clear();
+        self.tool_meta.clear();
+        self.last_tool_output = None;
+        self.budget = None;
+        self.cache_pct = None;
+        self.stream_wrap.clear();
+        self.thinking_wrapped.clear();
+        self.thinking_source.clear();
+        self.tail_width = 0;
+        self.tail_content_len = 0;
+        self.tail_stream_len = 0;
+        self.tail_buf.clear();
+        self.transcript.follow();
     }
 
     // ---------- terminal events ----------
@@ -603,11 +649,14 @@ impl App {
                 _ => self.note("usage: /approvals auto|ask|readonly"),
             },
             "new" => {
-                self.session_id = None;
-                self.transcript.push(vec![Line::from(Span::styled(
-                    format!("── new session {}", "─".repeat(24)),
-                    Style::default().fg(theme::DIM),
-                ))]);
+                let old_id = self.session_id.clone();
+                self.reset_for_new_session();
+                if let Some(id) = old_id {
+                    if let Ok(mut sessions) = self.core.sessions.try_lock() {
+                        sessions.remove(&id);
+                    }
+                }
+                self.note("new session");
             }
             "context" => {
                 // A hydrated session shows its frozen breakdown; before any
@@ -1159,5 +1208,16 @@ fn clip(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max.max(8)).collect::<String>())
+    }
+}
+
+/// Replay shows a short tool-output preview, not the full persisted payload.
+fn truncate_replay_output(output: &str) -> String {
+    const MAX_LINES: usize = 10;
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= MAX_LINES {
+        output.to_string()
+    } else {
+        format!("{}\n…", lines[..MAX_LINES].join("\n"))
     }
 }

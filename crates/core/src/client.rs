@@ -151,6 +151,7 @@ impl ChatClient {
         });
         if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
             body["tools"] = tools.clone();
+            body["tool_choice"] = json!("auto");
         }
 
         let mut req = self.http.post(self.endpoint()).json(&body);

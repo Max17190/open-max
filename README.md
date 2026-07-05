@@ -175,7 +175,8 @@ Design choices worth knowing:
 
 - **The harness is the product.** Fewer, stricter tools measurably help small local models. Tool results stream as events so nothing happens off screen.
 - **Safety by default.** Tools are sandboxed to the project root. `write_file`, `edit_file`, and `bash` require approval in the default `ask` mode; `readonly` blocks mutating tools entirely.
-- **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped. The system prompt and your original request survive.
+- **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped — leaving a one-line digest of which tools ran and which files were touched so the model keeps its bearings. The system prompt and your original request survive.
+- **Edits that land.** `edit_file` matches exactly first, then retries with whitespace-normalized matching (re-indented to the file), and on a miss points the model at the closest line. Consecutive read-only tool calls run concurrently; Esc kills in-flight commands, not just the stream.
 - **MLX stays decoupled.** The harness talks to `mlx_lm.server` over plain HTTP like any other backend. The sidecar manager makes running it a one step affair inside `/models`.
 
 State lives in `~/.openmax/` (settings, sessions, MLX venv, server metadata).

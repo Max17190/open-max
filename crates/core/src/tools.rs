@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use crate::state::CancelToken;
 
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
@@ -14,6 +16,8 @@ const MAX_RESULTS: usize = 200;
 const MAX_GREP_RESULTS: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 30_000;
 const MAX_READ_LINES: usize = 1500;
+const MAX_READ_BYTES: usize = 24_000;
+const MAX_DIR_ENTRIES: usize = 200;
 
 /// Output limits threaded into command-running tools (bash and external
 /// tools). Settings can widen or tighten the command cap; everything else
@@ -140,7 +144,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace an exact string in a file. old_string must match the file exactly (including whitespace) and must be unique unless replace_all is true. Read the file first.",
+                "description": "Replace an exact string in a file. old_string must match the file exactly (including whitespace) and must be unique unless replace_all is true. Read the file first. If the exact text is not found, near matches differing only in whitespace are accepted.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -175,7 +179,7 @@ pub fn tool_schemas() -> &'static Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Rust-flavored regex" },
+                        "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax: no lookahead/backreferences). Example: \"fn (get|set)_\\w+\"" },
                         "path": { "type": "string", "description": "Directory to search, relative to project root (optional, default \".\")" },
                         "glob": { "type": "string", "description": "Only search files matching this glob, e.g. \"*.rs\" (optional)" }
                     },
@@ -236,29 +240,40 @@ fn rel_display(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-pub async fn execute(name: &str, args: &Value, root: &Path, caps: OutputCaps) -> ToolOutcome {
+pub async fn execute(
+    name: &str,
+    args: &Value,
+    root: &Path,
+    caps: OutputCaps,
+    cancel: Arc<CancelToken>,
+) -> ToolOutcome {
     if name == "bash" {
-        return bash_tool(root, args, caps).await;
+        return bash_tool(root, args, caps, cancel).await;
+    }
+    if cancel.is_cancelled() {
+        return ToolOutcome::err("tool cancelled by user");
     }
     // The file tools are synchronous fs/walk work; run them off the async
     // workers so a big grep or read never stalls streaming and the UI.
+    // Esc stops waiting immediately; the blocking task may finish in the pool.
     let name = name.to_string();
     let args = args.clone();
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || match name.as_str() {
-        "list_dir" => list_dir(&root, &args),
-        "read_file" => read_file(&root, &args),
-        "write_file" => write_file(&root, &args),
-        "edit_file" => edit_file(&root, &args),
-        "glob" => glob_tool(&root, &args),
-        "grep" => grep_tool(&root, &args),
-        other => ToolOutcome::err(format!(
-            "unknown tool: {other}; the available tools are {}",
-            TOOL_NAMES.join(", ")
-        )),
-    })
-    .await
-    .unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}")))
+    tokio::select! {
+        _ = cancel.cancelled() => ToolOutcome::err("tool cancelled by user"),
+        result = tokio::task::spawn_blocking(move || match name.as_str() {
+            "list_dir" => list_dir(&root, &args),
+            "read_file" => read_file(&root, &args),
+            "write_file" => write_file(&root, &args),
+            "edit_file" => edit_file(&root, &args),
+            "glob" => glob_tool(&root, &args),
+            "grep" => grep_tool(&root, &args),
+            other => ToolOutcome::err(format!(
+                "unknown tool: {other}; the available tools are {}",
+                TOOL_NAMES.join(", ")
+            )),
+        }) => result.unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}"))),
+    }
 }
 
 fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
@@ -290,7 +305,16 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
     if dirs.is_empty() {
         return ToolOutcome::ok("(empty directory)".into());
     }
-    ToolOutcome::ok(dirs.join("\n"))
+    let total = dirs.len();
+    let shown: Vec<String> = dirs.into_iter().take(MAX_DIR_ENTRIES).collect();
+    let mut output = shown.join("\n");
+    if total > MAX_DIR_ENTRIES {
+        output.push_str(&format!(
+            "\n… {} more entries not shown (use glob to find specific files)",
+            total - MAX_DIR_ENTRIES
+        ));
+    }
+    ToolOutcome::ok(output)
 }
 
 fn read_file(root: &Path, args: &Value) -> ToolOutcome {
@@ -315,11 +339,24 @@ fn read_file(root: &Path, args: &Value) -> ToolOutcome {
     let limit = limit.min(MAX_READ_LINES);
     let total = text.lines().count();
     let mut out = String::new();
+    let mut stopped_by_bytes = false;
+    let mut byte_cap_line = 0usize;
     for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
         let line = if line.len() > MAX_LINE_CHARS { &line[..floor_char(line, MAX_LINE_CHARS)] } else { line };
-        out.push_str(&format!("{:>5} {}\n", i + 1, line));
+        let formatted = format!("{:>5} {}\n", i + 1, line);
+        if out.len() + formatted.len() > MAX_READ_BYTES {
+            stopped_by_bytes = true;
+            byte_cap_line = i + 1;
+            break;
+        }
+        out.push_str(&formatted);
     }
-    if total > offset - 1 + limit {
+    if stopped_by_bytes {
+        out.push_str(&format!(
+            "… output limit reached at line {byte_cap_line} (file has {total} lines; continue with offset={})\n",
+            byte_cap_line + 1
+        ));
+    } else if total > offset - 1 + limit {
         out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - (offset - 1 + limit), offset + limit));
     }
     if out.is_empty() {
@@ -383,6 +420,106 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome { ok: true, output: summary, diff: Some(diff) }
 }
 
+fn leading_whitespace(s: &str) -> &str {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if matches!(c, ' ' | '\t') {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    &s[..end]
+}
+
+fn line_similarity(a: &str, b: &str) -> f64 {
+    let a = a.trim();
+    let b = b.trim();
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let diff = TextDiff::from_chars(a, b);
+    let mut equal = 0usize;
+    for change in diff.iter_all_changes() {
+        if change.tag() == ChangeTag::Equal {
+            equal += change.value().chars().count();
+        }
+    }
+    let total = a.chars().count() + b.chars().count();
+    if total == 0 {
+        0.0
+    } else {
+        2.0 * equal as f64 / total as f64
+    }
+}
+
+fn closest_line_hint(content: &str, old_string: &str) -> String {
+    let needle = old_string.lines().next().unwrap_or(old_string);
+    let mut best_idx = 0usize;
+    let mut best_score = 0.0f64;
+    for (i, line) in content.lines().enumerate() {
+        let score = line_similarity(line, needle);
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    let closest = content.lines().nth(best_idx).unwrap_or("");
+    format!(
+        "old_string not found. Closest match is at line {}: '{}'. Read the file around that line and retry with the exact text.",
+        best_idx + 1,
+        truncate(closest, 120)
+    )
+}
+
+fn find_trimmed_runs(file_lines: &[&str], old_lines: &[&str]) -> Vec<(usize, usize)> {
+    if old_lines.is_empty() {
+        return Vec::new();
+    }
+    let n = old_lines.len();
+    if file_lines.len() < n {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    for start in 0..=file_lines.len() - n {
+        if (0..n).all(|i| file_lines[start + i].trim() == old_lines[i].trim()) {
+            runs.push((start, start + n));
+        }
+    }
+    runs
+}
+
+fn reindent_new_string(new_string: &str, old_string: &str, file_first_matched_line: &str) -> String {
+    let old_base = leading_whitespace(old_string.lines().next().unwrap_or(""));
+    let file_base = leading_whitespace(file_first_matched_line);
+    new_string
+        .lines()
+        .map(|line| {
+            let content = line.trim_start();
+            if content.is_empty() && line.is_empty() {
+                return String::new();
+            }
+            let new_ws = leading_whitespace(line);
+            let rel = if new_ws.len() >= old_base.len() { &new_ws[old_base.len()..] } else { "" };
+            format!("{file_base}{rel}{content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn replace_line_range(content: &str, start: usize, count: usize, replacement: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let had_trailing_nl = content.ends_with('\n');
+    let mut out: Vec<&str> = lines[..start].to_vec();
+    out.extend(replacement.lines());
+    out.extend_from_slice(&lines[start + count..]);
+    let mut result = out.join("\n");
+    if had_trailing_nl && !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let rel = args["path"].as_str().unwrap_or_default();
     let (Some(old_string), Some(new_string)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
@@ -400,25 +537,48 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         Ok(t) => t,
         Err(e) => return ToolOutcome::err(format!("cannot read {rel}: {e}")),
     };
-    let count = old.matches(old_string).count();
-    if count == 0 {
-        return ToolOutcome::err("old_string not found in file. Read the file and retry with the exact text, including whitespace.");
-    }
-    if count > 1 && !replace_all {
-        return ToolOutcome::err(format!(
-            "old_string matches {count} times; provide a longer unique string or set replace_all to true"
-        ));
-    }
-    let new = if replace_all {
-        old.replace(old_string, new_string)
+
+    let mut fuzzy_match = false;
+    let new = if old.contains(old_string) {
+        let count = old.matches(old_string).count();
+        if count > 1 && !replace_all {
+            return ToolOutcome::err(format!(
+                "old_string matches {count} times; provide a longer unique string or set replace_all to true"
+            ));
+        }
+        if replace_all {
+            old.replace(old_string, new_string)
+        } else {
+            old.replacen(old_string, new_string, 1)
+        }
     } else {
-        old.replacen(old_string, new_string, 1)
+        let old_lines: Vec<&str> = old_string.lines().collect();
+        let file_lines: Vec<&str> = old.lines().collect();
+        let runs = find_trimmed_runs(&file_lines, &old_lines);
+        if runs.is_empty() {
+            return ToolOutcome::err(closest_line_hint(&old, old_string));
+        }
+        if runs.len() > 1 && !replace_all {
+            return ToolOutcome::err(format!(
+                "old_string matches {} locations with whitespace normalization; provide a longer unique string or set replace_all to true",
+                runs.len()
+            ));
+        }
+        fuzzy_match = true;
+        let mut updated = old.clone();
+        for (start, end) in runs.iter().rev() {
+            let reindented = reindent_new_string(new_string, old_string, file_lines[*start]);
+            updated = replace_line_range(&updated, *start, end - start, &reindented);
+        }
+        updated
     };
+
     if let Err(e) = std::fs::write(&path, &new) {
         return ToolOutcome::err(format!("cannot write {rel}: {e}"));
     }
     let diff = make_diff(root, &path, &old, &new);
-    let summary = format!("edited {} (+{} −{})", diff.path, diff.added, diff.removed);
+    let suffix = if fuzzy_match { " [matched with whitespace normalization]" } else { "" };
+    let summary = format!("edited {} (+{} −{}){}", diff.path, diff.added, diff.removed, suffix);
     ToolOutcome { ok: true, output: summary, diff: Some(diff) }
 }
 
@@ -618,7 +778,7 @@ fn spill_command_output(text: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps) -> ToolOutcome {
+async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<CancelToken>) -> ToolOutcome {
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
     };
@@ -631,35 +791,53 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps) -> ToolOutcome {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let fut = async {
-        let child = cmd.spawn().map_err(|e| format!("failed to spawn shell: {e}"))?;
-        child.wait_with_output().await.map_err(|e| format!("command failed: {e}"))
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return ToolOutcome::err(format!("failed to spawn shell: {e}")),
     };
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
-        Err(_) => ToolOutcome::err(format!("command timed out after {timeout_secs}s")),
-        Ok(Err(e)) => ToolOutcome::err(e),
-        Ok(Ok(output)) => {
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
+    let mut child_slot = Some(child);
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            if let Some(mut c) = child_slot.take() {
+                let _ = c.kill().await;
+            }
+            ToolOutcome::err("command cancelled by user")
+        }
+        _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+            if let Some(mut c) = child_slot.take() {
+                let _ = c.kill().await;
+            }
+            ToolOutcome::err(format!("command timed out after {timeout_secs}s"))
+        }
+        output = async {
+            child_slot.take().expect("child taken twice").wait_with_output().await
+        } => {
+            match output {
+                Err(e) => ToolOutcome::err(format!("command failed: {e}")),
+                Ok(output) => {
+                    let mut text = String::new();
+                    text.push_str(&String::from_utf8_lossy(&output.stdout));
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str("[stderr]\n");
+                        text.push_str(&stderr);
+                    }
+                    if text.len() > caps.command_bytes {
+                        text = truncate_command_output(&text, caps.command_bytes);
+                    }
+                    if text.trim().is_empty() {
+                        text = "(no output)".into();
+                    }
+                    let code = output.status.code().unwrap_or(-1);
+                    if output.status.success() {
+                        ToolOutcome::ok(text)
+                    } else {
+                        ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
+                    }
                 }
-                text.push_str("[stderr]\n");
-                text.push_str(&stderr);
-            }
-            if text.len() > caps.command_bytes {
-                text = truncate_command_output(&text, caps.command_bytes);
-            }
-            if text.trim().is_empty() {
-                text = "(no output)".into();
-            }
-            let code = output.status.code().unwrap_or(-1);
-            if output.status.success() {
-                ToolOutcome::ok(text)
-            } else {
-                ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
             }
         }
     }
@@ -758,11 +936,136 @@ mod tests {
         let root = temp_project();
         // 40k+ bytes of output with the failure marker at the very end.
         let cmd = "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done; echo THE_REAL_FAILURE; exit 3";
-        let out = bash_tool(&root, &json!({"command": cmd}), OutputCaps::default()).await;
+        let out = bash_tool(
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
         assert!(!out.ok);
         assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
         assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");
         assert!(!out.output.contains("noise line 1 "), "head should be dropped");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_file_stops_at_byte_cap() {
+        let root = std::env::temp_dir().join(format!("openmax-read-bytes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let long_line = "x".repeat(400);
+        let mut content = String::new();
+        for _ in 0..100 {
+            content.push_str(&long_line);
+            content.push('\n');
+        }
+        std::fs::write(root.join("big.txt"), &content).unwrap();
+        let out = read_file(&root, &json!({"path": "big.txt"}));
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("output limit reached at line"), "{}", out.output);
+        assert!(out.output.contains("continue with offset="), "{}", out.output);
+        assert!(out.output.len() <= MAX_READ_BYTES + 200, "{}", out.output.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_dir_caps_entries() {
+        let root = std::env::temp_dir().join(format!("openmax-listdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        for i in 0..MAX_DIR_ENTRIES + 50 {
+            std::fs::write(root.join(format!("file{i:03}.txt")), "x").unwrap();
+        }
+        let out = list_dir(&root, &json!({"path": "."}));
+        assert!(out.ok, "{}", out.output);
+        let lines: Vec<&str> = out.output.lines().collect();
+        assert_eq!(lines.len(), MAX_DIR_ENTRIES + 1, "{}", out.output);
+        assert!(out.output.contains("more entries not shown"), "{}", out.output);
+        assert!(out.output.contains("use glob to find specific files"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_file_tier2_whitespace_match_preserves_indent() {
+        let root = std::env::temp_dir().join(format!("openmax-edit-fuzzy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("src.rs"), "fn outer() {\n    fn inner() {\n        old_value\n    }\n}\n").unwrap();
+        let out = edit_file(
+            &root,
+            &json!({
+                "path": "src.rs",
+                "old_string": "fn inner() {\n    old_value\n}",
+                "new_string": "fn inner() {\n    new_value\n}"
+            }),
+        );
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("[matched with whitespace normalization]"), "{}", out.output);
+        let content = std::fs::read_to_string(root.join("src.rs")).unwrap();
+        assert!(content.contains("        new_value\n"), "indent must be preserved: {content:?}");
+        assert!(!content.contains("old_value"), "{}", content);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_file_tier2_ambiguity_error() {
+        let root = std::env::temp_dir().join(format!("openmax-edit-ambig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(
+            root.join("dup.rs"),
+            "    fn foo() {\n        a\n    }\nfn bar() {}\n    fn foo() {\n        a\n    }\n",
+        )
+        .unwrap();
+        let out = edit_file(
+            &root,
+            &json!({
+                "path": "dup.rs",
+                "old_string": "fn foo() {\n    a\n}",
+                "new_string": "fn foo() {\n    b\n}"
+            }),
+        );
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("whitespace normalization"), "{}", out.output);
+        assert!(out.output.contains("2 locations"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_file_closest_match_hint_in_error() {
+        let root = std::env::temp_dir().join(format!("openmax-edit-hint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("hint.rs"), "fn almost_match() {}\nfn unrelated() {}\n").unwrap();
+        let out = edit_file(
+            &root,
+            &json!({
+                "path": "hint.rs",
+                "old_string": "fn almost_matched() {}",
+                "new_string": "fn almost_matched() { /* x */ }"
+            }),
+        );
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("Closest match is at line 1"), "{}", out.output);
+        assert!(out.output.contains("almost_match"), "{}", out.output);
+        assert!(out.output.contains("Read the file around that line"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn readonly_execute_returns_immediately_when_cancelled() {
+        use std::sync::Arc;
+
+        use crate::state::CancelToken;
+
+        let cancel = Arc::new(CancelToken::default());
+        cancel.cancel();
+        let root = temp_project();
+        let out = execute("glob", &json!({"pattern": "**/*.rs"}), &root, OutputCaps::default(), cancel).await;
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("cancelled"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 }
