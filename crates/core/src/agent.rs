@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -13,13 +14,143 @@ use crate::registry::Registry;
 use crate::sessions;
 use crate::state::{CancelToken, Core, SessionData};
 use crate::tools;
-use crate::types::{AgentEvent, ChatMessage};
+use crate::types::{AgentEvent, ChatMessage, ToolCall};
 
 const MAX_ITERATIONS: usize = 50;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
 /// with no perceptible latency.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const DIGEST_PREFIX: &str = "[context note:";
+
+/// Outcome of a mutating-tool approval prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalOutcome {
+    Approved,
+    Declined,
+    Cancelled,
+    TimedOut,
+}
+
+/// True when a native server tool call cannot be executed as-is.
+fn is_native_call_broken(call: &ToolCall) -> bool {
+    call.function.name.is_empty()
+        || serde_json::from_str::<Value>(&call.function.arguments).is_err()
+}
+
+/// When every native call is broken, try to recover calls from content markup.
+/// Broken natives are only discarded if the markup actually yields calls;
+/// otherwise they are kept so each one gets its per-call error (which tells
+/// the model to retry) instead of vanishing silently.
+fn resolve_tool_calls(
+    mut content: String,
+    mut tool_calls: Vec<ToolCall>,
+    known_tools: &[&str],
+) -> (String, Vec<ToolCall>) {
+    let all_broken = !tool_calls.is_empty() && tool_calls.iter().all(is_native_call_broken);
+    if tool_calls.is_empty() || all_broken {
+        if let Some((clean, calls)) = fallback::extract_tool_calls(&content, known_tools) {
+            content = clean;
+            tool_calls = calls;
+        }
+    }
+    (content, tool_calls)
+}
+
+/// Detects identical tool calls repeated consecutively within one turn loop.
+struct RepeatCallTracker {
+    last_name: Option<String>,
+    last_args: Option<String>,
+    consecutive: u8,
+}
+
+impl RepeatCallTracker {
+    fn new() -> Self {
+        Self { last_name: None, last_args: None, consecutive: 0 }
+    }
+
+    /// Returns true when this would be the 3rd consecutive identical execution.
+    fn would_block(&self, name: &str, args_key: &str) -> bool {
+        self.last_name.as_deref() == Some(name)
+            && self.last_args.as_deref() == Some(args_key)
+            && self.consecutive >= 2
+    }
+
+    fn record_executed(&mut self, name: &str, args_key: &str) {
+        if self.last_name.as_deref() == Some(name) && self.last_args.as_deref() == Some(args_key) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last_name = Some(name.to_string());
+            self.last_args = Some(args_key.to_string());
+            self.consecutive = 1;
+        }
+    }
+}
+
+fn canonicalize_args(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut pairs: Vec<_> = map.iter().collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            let sorted: serde_json::Map<String, Value> =
+                pairs.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            serde_json::to_string(&Value::Object(sorted)).unwrap_or_default()
+        }
+        other => other.to_string(),
+    }
+}
+
+struct CompactionDigest {
+    message_count: usize,
+    tools: BTreeSet<String>,
+    paths: Vec<String>,
+}
+
+impl CompactionDigest {
+    fn new() -> Self {
+        Self { message_count: 0, tools: BTreeSet::new(), paths: Vec::new() }
+    }
+
+    fn record_message(&mut self, msg: &ChatMessage) {
+        self.message_count += 1;
+        if msg.role != "assistant" {
+            return;
+        }
+        let Some(calls) = &msg.tool_calls else { return };
+        for call in calls {
+            if !call.function.name.is_empty() {
+                self.tools.insert(call.function.name.clone());
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&call.function.arguments) {
+                if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                    if self.paths.len() < 8 && !self.paths.iter().any(|p| p == path) {
+                        self.paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn format(&self) -> String {
+        let mut parts = vec![format!(
+            "{DIGEST_PREFIX} {} earlier messages were compacted.",
+            self.message_count
+        )];
+        if !self.tools.is_empty() {
+            parts.push(format!("Tools used: {}.", self.tools.iter().cloned().collect::<Vec<_>>().join(", ")));
+        }
+        if !self.paths.is_empty() {
+            parts.push(format!("Files touched: {}.", self.paths.join(", ")));
+        }
+        parts.push("Re-read files if you need the details.".into());
+        parts.join(" ")
+    }
+}
+
+fn is_digest_message(msg: &ChatMessage) -> bool {
+    msg.role == "user"
+        && msg.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX))
+}
 
 /// Kick off one agent turn in a session. Errors if that session is already running.
 pub fn start_turn(
@@ -155,6 +286,7 @@ async fn run_loop(
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
+    let mut repeat_tracker = RepeatCallTracker::new();
 
     'turns: for _ in 0..MAX_ITERATIONS {
         let budget_changed = enforce_budget(&mut messages, settings.context_tokens.saturating_sub(settings.max_tokens + 1024));
@@ -187,8 +319,8 @@ async fn run_loop(
             });
         }
 
-        // Prefer structured calls from the server; when there are none,
-        // recover calls from raw markup in the content (see fallback.rs).
+        // Prefer structured calls from the server; when there are none (or all
+        // are broken), recover calls from raw markup in the content (see fallback.rs).
         let mut content = result.content.clone();
         let mut tool_calls = result.tool_calls.clone();
         // Reasoning leaked into content is display-only: persisting it would
@@ -196,12 +328,7 @@ async fn run_loop(
         if let Some(clean) = fallback::strip_leading_think(&content) {
             content = clean;
         }
-        if tool_calls.is_empty() {
-            if let Some((clean, calls)) = fallback::extract_tool_calls(&content, &known_tools) {
-                content = clean;
-                tool_calls = calls;
-            }
-        }
+        (content, tool_calls) = resolve_tool_calls(content, tool_calls, &known_tools);
         core.send_agent(session_id, AgentEvent::MessageDone { text: content.clone() });
 
         // Never persist a fully empty assistant message (e.g. a turn cancelled
@@ -229,10 +356,16 @@ async fn run_loop(
                 break 'turns;
             }
             let name = call.function.name.as_str();
+            if name.is_empty() {
+                let msg = "tool call has an empty function name; use a known tool name from the schema";
+                core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
+                core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
+                messages.push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                continue;
+            }
             let args: Value = match serde_json::from_str(&call.function.arguments) {
                 Ok(v) => v,
                 Err(e) => {
-                    // Malformed JSON from a small model: surface it so the model retries.
                     let msg = format!("invalid JSON in tool arguments: {e}");
                     core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
                     core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
@@ -240,6 +373,15 @@ async fn run_loop(
                     continue;
                 }
             };
+
+            let args_key = canonicalize_args(&args);
+            if repeat_tracker.would_block(name, &args_key) {
+                let msg = "You have repeated this exact call 3 times. The result will not change. Try a different approach, or explain what you are blocked on.";
+                core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: args.clone() });
+                core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
+                messages.push(ChatMessage::tool(call.id.clone(), msg.to_string()));
+                continue;
+            }
 
             core.send_agent(session_id, AgentEvent::ToolStart {
                 call_id: call.id.clone(),
@@ -254,26 +396,50 @@ async fn run_loop(
             // Read live so "[a]lways" during an approval prompt takes effect
             // for the rest of this turn, not just the next one.
             let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
-            let outcome = if registry.is_mutating(name) && approval_mode == "readonly" {
-                tools::ToolOutcome {
+            let mut executed = false;
+            let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == "readonly" {
+                (tools::ToolOutcome {
                     ok: false,
                     output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                     diff: None,
-                }
+                }, false)
             } else if registry.is_mutating(name) && approval_mode == "ask" {
-                let approved = request_approval(core, session_id, name, &args, &cancelled).await;
-                if approved {
-                    registry.execute(name, &args, project_root, caps).await
-                } else {
-                    tools::ToolOutcome {
+                match request_approval(core, session_id, name, &args, &cancelled).await {
+                    ApprovalOutcome::Approved => {
+                        executed = true;
+                        (registry.execute(name, &args, project_root, caps).await, false)
+                    }
+                    ApprovalOutcome::Declined => (tools::ToolOutcome {
                         ok: false,
                         output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
                         diff: None,
-                    }
+                    }, false),
+                    ApprovalOutcome::TimedOut => (tools::ToolOutcome {
+                        ok: false,
+                        output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
+                        diff: None,
+                    }, false),
+                    ApprovalOutcome::Cancelled => (tools::ToolOutcome {
+                        ok: false,
+                        output: "The user cancelled this turn.".into(),
+                        diff: None,
+                    }, true),
                 }
             } else {
-                registry.execute(name, &args, project_root, caps).await
+                executed = true;
+                (registry.execute(name, &args, project_root, caps).await, false)
             };
+
+            if turn_cancelled {
+                core.send_agent(session_id, AgentEvent::ToolEnd {
+                    call_id: call.id.clone(),
+                    ok: false,
+                    output: "The user cancelled this turn.".into(),
+                });
+                messages.push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
+                stop_reason = "cancelled".into();
+                break 'turns;
+            }
 
             if let Some(diff) = &outcome.diff {
                 core.send_agent(session_id, AgentEvent::Diff {
@@ -290,8 +456,17 @@ async fn run_loop(
                 output: outcome.output.clone(),
             });
 
-            let content = if outcome.ok { outcome.output } else { format!("Error: {}", outcome.output) };
+            // Approval timeouts are not model errors; the "Error:" prefix
+            // would push small models into pointless retry loops.
+            let content = if outcome.ok || outcome.output.starts_with("Approval request timed out") {
+                outcome.output
+            } else {
+                format!("Error: {}", outcome.output)
+            };
             messages.push(ChatMessage::tool(call.id.clone(), content));
+            if executed {
+                repeat_tracker.record_executed(name, &args_key);
+            }
         }
         save_messages(core, session_id, &messages, false).await;
     }
@@ -326,7 +501,7 @@ async fn request_approval(
     name: &str,
     args: &Value,
     cancelled: &Arc<CancelToken>,
-) -> bool {
+) -> ApprovalOutcome {
     let approval_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
     core.approvals.lock().unwrap().insert(approval_id.clone(), tx);
@@ -336,14 +511,18 @@ async fn request_approval(
         summary: crate::registry::summarize_call(name, args),
     });
 
-    let approved = tokio::select! {
-        r = rx => r.unwrap_or(false),
-        _ = cancelled.cancelled() => false,
-        _ = tokio::time::sleep(APPROVAL_TIMEOUT) => false,
+    let outcome = tokio::select! {
+        r = rx => match r {
+            Ok(true) => ApprovalOutcome::Approved,
+            Ok(false) => ApprovalOutcome::Declined,
+            Err(_) => ApprovalOutcome::Declined,
+        },
+        _ = cancelled.cancelled() => ApprovalOutcome::Cancelled,
+        _ = tokio::time::sleep(APPROVAL_TIMEOUT) => ApprovalOutcome::TimedOut,
     };
 
     core.approvals.lock().unwrap().remove(&approval_id);
-    approved
+    outcome
 }
 
 /// Keep the transcript inside the model's context window: first truncate old
@@ -385,14 +564,25 @@ fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
     }
     // Drop whole exchanges starting after [system, first user]. Keep tool
     // replies consistent with the assistant message that requested them.
+    let mut digest = CompactionDigest::new();
     while total > target && messages.len() > 6 {
         let removed = messages.remove(2);
+        digest.record_message(&removed);
         total = total.saturating_sub(removed.estimated_tokens());
         if removed.role == "assistant" && removed.tool_calls.is_some() {
             while messages.len() > 2 && messages[2].role == "tool" {
                 let tool = messages.remove(2);
+                digest.record_message(&tool);
                 total = total.saturating_sub(tool.estimated_tokens());
             }
+        }
+    }
+    if digest.message_count > 0 {
+        let note = ChatMessage::user(digest.format());
+        if messages.len() > 2 && is_digest_message(&messages[2]) {
+            messages[2] = note;
+        } else {
+            messages.insert(2, note);
         }
     }
     true
@@ -401,9 +591,87 @@ fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ToolCall, ToolCallFunction};
 
     fn msg(role: &str, len: usize) -> ChatMessage {
         ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None }
+    }
+
+    fn assistant_with_tools(name: &str, args: &str) -> ChatMessage {
+        ChatMessage::assistant(
+            None,
+            Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: ToolCallFunction {
+                    name: name.into(),
+                    arguments: args.into(),
+                },
+            }]),
+        )
+    }
+
+    #[test]
+    fn broken_native_calls_fall_back_to_markup() {
+        let known = ["read_file", "bash"];
+        let content = "I'll read it.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>";
+        let broken = vec![ToolCall {
+            id: "call_0".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: String::new(),
+                arguments: "{not json".into(),
+            },
+        }];
+        let (clean, calls) = resolve_tool_calls(content.into(), broken, &known);
+        assert_eq!(clean, "I'll read it.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn partial_broken_native_calls_keep_native() {
+        let known = ["read_file", "bash"];
+        let good = ToolCall {
+            id: "call_0".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "bash".into(),
+                arguments: r#"{"command":"echo hi"}"#.into(),
+            },
+        };
+        let bad = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: String::new(),
+                arguments: "nope".into(),
+            },
+        };
+        let (clean, calls) = resolve_tool_calls("run".into(), vec![good, bad], &known);
+        assert_eq!(clean, "run");
+        assert_eq!(calls.len(), 2);
+        assert!(is_native_call_broken(&calls[1]));
+    }
+
+    #[test]
+    fn repeat_tracker_blocks_third_identical_call() {
+        let mut t = RepeatCallTracker::new();
+        assert!(!t.would_block("bash", r#"{"command":"ls"}"#));
+        t.record_executed("bash", r#"{"command":"ls"}"#);
+        assert!(!t.would_block("bash", r#"{"command":"ls"}"#));
+        t.record_executed("bash", r#"{"command":"ls"}"#);
+        assert!(t.would_block("bash", r#"{"command":"ls"}"#));
+    }
+
+    #[test]
+    fn repeat_tracker_resets_on_different_call() {
+        let mut t = RepeatCallTracker::new();
+        t.record_executed("bash", r#"{"command":"ls"}"#);
+        t.record_executed("bash", r#"{"command":"ls"}"#);
+        assert!(!t.would_block("read_file", r#"{"path":"a.rs"}"#));
+        t.record_executed("read_file", r#"{"path":"a.rs"}"#);
+        assert!(!t.would_block("read_file", r#"{"path":"a.rs"}"#));
     }
 
     #[test]
@@ -415,11 +683,12 @@ mod tests {
         }
         enforce_budget(&mut messages, 2000);
         // Old exchanges are dropped down to the guaranteed floor: the system
-        // prompt, the original request, and the most recent tail.
-        assert_eq!(messages.len(), 6);
+        // prompt, the original request, a compaction digest, and the most recent tail.
+        assert_eq!(messages.len(), 7);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].content.as_deref(), Some("x".repeat(400).as_str()));
+        assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
     }
 
     #[test]
@@ -461,5 +730,32 @@ mod tests {
         assert!(!enforce_budget(&mut messages, budget), "second pass must be a no-op");
         let after: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
         assert_eq!(snapshot, after, "no message may change between prunes");
+    }
+
+    #[test]
+    fn budget_digest_replaced_not_stacked() {
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        for i in 0..12 {
+            messages.push(assistant_with_tools("read_file", &format!(r#"{{"path":"src/{i}.rs"}}"#)));
+            messages.push(msg("tool", 2500));
+        }
+        let budget = 3000;
+        assert!(enforce_budget(&mut messages, budget));
+        assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
+        let first_digest = messages[2].content.clone();
+        assert!(!enforce_budget(&mut messages, budget), "second pass must be a no-op");
+        assert_eq!(messages[2].content, first_digest, "digest must not be replaced on no-op");
+
+        for _ in 0..6 {
+            messages.push(assistant_with_tools("edit_file", r#"{"path":"src/new.rs"}"#));
+            messages.push(msg("tool", 2500));
+        }
+        assert!(enforce_budget(&mut messages, budget));
+        let digest_count = messages
+            .iter()
+            .filter(|m| m.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX)))
+            .count();
+        assert_eq!(digest_count, 1, "only one digest note may exist");
+        assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
     }
 }

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::state::Core;
-use crate::types::ChatMessage;
+use crate::types::{AgentEvent, ChatMessage};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -169,6 +169,9 @@ pub fn touch(core: &Core, id: &str) {
     });
 }
 
+/// Load persisted messages. Corrupt JSONL lines are skipped silently so a
+/// partially damaged file still yields whatever could be parsed; callers get
+/// `None` only when the file is missing or the legacy array payload is invalid.
 pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
     let path = messages_path(core, id);
     let text = std::fs::read_to_string(&path).ok()?;
@@ -203,8 +206,16 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         Ok(())
     };
 
-    if result.is_ok() {
-        *persisted = messages.len();
+    match result {
+        Ok(()) => *persisted = messages.len(),
+        Err(e) => {
+            core.send_agent(
+                id,
+                AgentEvent::Error {
+                    message: format!("warning: failed to persist session to disk: {e}"),
+                },
+            );
+        }
     }
 }
 
@@ -296,6 +307,28 @@ mod tests {
             original.tool_schemas_json().to_string(),
             "schemas must be byte-identical across resume"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_failure_does_not_advance_persisted_count() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "fail-save";
+        let mut persisted = 0usize;
+
+        let initial = vec![ChatMessage::user("hello")];
+        save_messages(&core, id, &initial, &mut persisted, false);
+        assert_eq!(persisted, 1);
+
+        let path = messages_path(&core, id);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+
+        let extended = vec![ChatMessage::user("hello"), ChatMessage::assistant(Some("hi".into()), None)];
+        save_messages(&core, id, &extended, &mut persisted, false);
+        assert_eq!(persisted, 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

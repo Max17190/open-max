@@ -1,4 +1,4 @@
-//! Skills: pi-style progressive disclosure. Only a skill's name and one-line
+//! Skills: progressive disclosure. Only a skill's name and one-line
 //! description are ever resident in the system prompt (~15 tokens each); the
 //! model reads the full SKILL.md body on demand with read_file. This is the
 //! structural answer to adding capability without taxing every prefill.

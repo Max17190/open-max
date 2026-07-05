@@ -83,6 +83,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         - After making changes, verify them when possible (compile, run tests, or re-read the file).\n\
         - When the task is done, stop calling tools and reply with a short plain-text summary of what you changed and how you verified it.\n\
         - If a tool returns an error, read it carefully and correct your next call; do not repeat the same failing call.\n\
+        - Call tools through the API tool-calling mechanism. Do not print tool-call JSON or XML in your reply text.\n\
         \n\
         Keep replies brief. No filler, no apologies, no repeating file contents the user can already see."
     );
@@ -101,7 +102,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     }
     if let Some(skills) = skills_section(project_root, &registry.skills) {
         let before = prompt.len();
-        prompt.push_str("\n\nSkills (before using one, read its SKILL.md for the full instructions; use bash cat for absolute paths):\n");
+        prompt.push_str("\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n");
         prompt.push_str(&skills);
         breakdown.components.push(("skills index".into(), prompt.len() - before));
     }

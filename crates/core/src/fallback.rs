@@ -11,6 +11,8 @@
 //! - fenced ```tool_call / ```tool_code / ```tool blocks with a JSON body
 //! - fenced ```json blocks, accepted only when `name` matches a known tool,
 //!   because models legitimately write JSON code blocks in prose
+//! - `<function=...>{json}</function>` tags (and the `<function name="...">` form)
+//! - bare `<invoke name="..."><parameter>...</parameter></invoke>` blocks
 //!
 //! Only consulted when a completion carries no native tool calls.
 
@@ -49,6 +51,8 @@ pub fn extract_tool_calls(content: &str, known_tools: &[&str]) -> Option<(String
     let mut spans: Vec<(usize, usize, ToolCallFunction)> = Vec::new();
     collect_tagged(content, &mut spans);
     collect_fenced(content, known_tools, &mut spans);
+    collect_function_tags(content, known_tools, &mut spans);
+    collect_invoke(content, known_tools, &mut spans);
     if spans.is_empty() {
         return None;
     }
@@ -127,6 +131,155 @@ fn collect_fenced(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, u
         }
         from = end;
     }
+}
+
+/// Function-style tags: `<function=name>{json}</function>` or
+/// `<function name="name">{json}</function>`. The JSON body is the arguments
+/// object directly (not wrapped in a name/arguments envelope).
+fn collect_function_tags(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, usize, ToolCallFunction)>) {
+    const OPEN: &str = "<function";
+    const CLOSE: &str = "</function>";
+    let mut from = 0;
+    while let Some(rel) = content[from..].find(OPEN) {
+        let start = from + rel;
+        let after_open = start + OPEN.len();
+        let Some((name, body_start)) = function_tag_name_and_body(content, after_open) else {
+            from = after_open;
+            continue;
+        };
+        if !known_tools.contains(&name) {
+            from = content[body_start..]
+                .find(CLOSE)
+                .map(|i| body_start + i + CLOSE.len())
+                .unwrap_or(start + 1);
+            continue;
+        }
+        let (body_end, end) = match content[body_start..].find(CLOSE) {
+            Some(rel_close) => (body_start + rel_close, body_start + rel_close + CLOSE.len()),
+            None => (content.len(), content.len()),
+        };
+        if let Ok(v) = serde_json::from_str::<Value>(content[body_start..body_end].trim()) {
+            spans.push((
+                start,
+                end,
+                ToolCallFunction {
+                    name: name.to_string(),
+                    arguments: v.to_string(),
+                },
+            ));
+        }
+        from = end.max(body_start);
+        if from >= content.len() {
+            break;
+        }
+    }
+}
+
+/// `<invoke name="tool"><parameter name="k">v</parameter></invoke>` blocks.
+/// Parameter values are collected as strings into a JSON object.
+fn collect_invoke(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, usize, ToolCallFunction)>) {
+    const OPEN: &str = "<invoke";
+    const CLOSE: &str = "</invoke>";
+    let mut from = 0;
+    while let Some(rel) = content[from..].find(OPEN) {
+        let start = from + rel;
+        let after_open = start + OPEN.len();
+        let tail = &content[after_open..];
+        let Some(name) = extract_name_attribute(tail) else {
+            from = after_open;
+            continue;
+        };
+        if !known_tools.contains(&name) {
+            let Some(gt) = tail.find('>') else {
+                from = after_open;
+                continue;
+            };
+            let body_start = after_open + gt + 1;
+            from = content[body_start..]
+                .find(CLOSE)
+                .map(|i| body_start + i + CLOSE.len())
+                .unwrap_or(start + 1);
+            continue;
+        }
+        let Some(gt) = tail.find('>') else {
+            from = after_open;
+            continue;
+        };
+        let body_start = after_open + gt + 1;
+        let (body_end, end) = match content[body_start..].find(CLOSE) {
+            Some(rel_close) => (body_start + rel_close, body_start + rel_close + CLOSE.len()),
+            None => (content.len(), content.len()),
+        };
+        let arguments = parse_invoke_parameters(&content[body_start..body_end]).to_string();
+        spans.push((
+            start,
+            end,
+            ToolCallFunction {
+                name: name.to_string(),
+                arguments,
+            },
+        ));
+        from = end.max(body_start);
+        if from >= content.len() {
+            break;
+        }
+    }
+}
+
+fn function_tag_name_and_body(content: &str, after_open: usize) -> Option<(&str, usize)> {
+    let tail = &content[after_open..];
+    if let Some(rest) = tail.strip_prefix('=') {
+        let gt = rest.find('>')?;
+        let name = rest[..gt].trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some((name, after_open + 1 + gt + 1));
+    }
+    let name = extract_name_attribute(tail)?;
+    let gt = tail.find('>')?;
+    Some((name, after_open + gt + 1))
+}
+
+fn extract_name_attribute(s: &str) -> Option<&str> {
+    let lower = s.to_ascii_lowercase();
+    let idx = lower.find("name=")?;
+    let rest = s[idx + 5..].trim_start();
+    if let Some(unquoted) = rest.strip_prefix('"') {
+        let end = unquoted.find('"')?;
+        return Some(&unquoted[..end]);
+    }
+    if let Some(unquoted) = rest.strip_prefix('\'') {
+        let end = unquoted.find('\'')?;
+        return Some(&unquoted[..end]);
+    }
+    None
+}
+
+fn parse_invoke_parameters(body: &str) -> Value {
+    let mut obj = serde_json::Map::new();
+    let mut from = 0;
+    while let Some(rel) = body[from..].find("<parameter") {
+        let param_start = from + rel;
+        let after = param_start + "<parameter".len();
+        let tail = &body[after..];
+        let Some(name) = extract_name_attribute(tail) else {
+            from = param_start + 1;
+            continue;
+        };
+        let Some(gt) = tail.find('>') else {
+            break;
+        };
+        let value_start = after + gt + 1;
+        let close = "</parameter>";
+        let Some(close_rel) = body[value_start..].find(close) else {
+            break;
+        };
+        let value = body[value_start..value_start + close_rel].trim();
+        obj.insert(name.to_string(), Value::String(value.to_string()));
+        from = value_start + close_rel + close.len();
+    }
+    Value::Object(obj)
 }
 
 /// Parse one candidate JSON body into a call. `required_names`, when given,
@@ -294,5 +447,65 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert!(clean.is_empty());
+    }
+
+    #[test]
+    fn function_equals_tag() {
+        let text = "Checking.\n<function=grep>{\"pattern\": \"todo\"}</function>";
+        let (clean, calls) = extract_tool_calls(text, known()).unwrap();
+        assert_eq!(clean, "Checking.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "grep");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["pattern"],
+            "todo"
+        );
+    }
+
+    #[test]
+    fn function_name_attr_tag() {
+        let text = "<function name=\"read_file\">{\"path\": \"src/main.rs\"}</function>";
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["path"],
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn function_tag_unknown_tool_is_not_extracted() {
+        let text = "<function=unknown_tool>{\"x\": 1}</function>";
+        assert!(extract_tool_calls(text, known()).is_none());
+    }
+
+    #[test]
+    fn fenced_tool_code_block() {
+        let text = "```tool_code\n{\"name\": \"bash\", \"parameters\": {\"command\": \"ls\"}}\n```";
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["command"],
+            "ls"
+        );
+    }
+
+    #[test]
+    fn invoke_xml_parameters() {
+        let text = "I'll search.\n<invoke name=\"grep\"><parameter name=\"pattern\">fn main</parameter></invoke>";
+        let (clean, calls) = extract_tool_calls(text, known()).unwrap();
+        assert_eq!(clean, "I'll search.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "grep");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["pattern"],
+            "fn main"
+        );
+    }
+
+    #[test]
+    fn invoke_unknown_tool_is_not_extracted() {
+        let text = "<invoke name=\"not_a_tool\"><parameter name=\"x\">y</parameter></invoke>";
+        assert!(extract_tool_calls(text, known()).is_none());
     }
 }

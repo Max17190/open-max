@@ -1,5 +1,5 @@
 //! The /context block: where the session's frozen prompt prefix spends its
-//! tokens (pi-token-burden style), plus the live cache-hit and budget state.
+//! tokens, plus the live cache-hit and budget state.
 //! Every line here is a token the model re-prefills on every single turn,
 //! so the point is to make the cost of each component visible.
 
