@@ -310,7 +310,24 @@ pub fn start(core: Arc<Core>, model: String, port: u16) -> Result<(), String> {
         "--port", &port.to_string(),
         "--host", "127.0.0.1",
         "--log-level", "WARNING",
-    ])
+    ]);
+    // Optional performance flags, present only when configured: an absent
+    // flag must stay absent (never an empty string the server would reject).
+    let (draft_model, num_draft_tokens, chat_template_args) = {
+        let s = core.settings.lock().unwrap();
+        (s.draft_model.clone(), s.num_draft_tokens, s.chat_template_args.clone())
+    };
+    if let Some(draft) = draft_model.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        cmd.args(["--draft-model", draft]);
+        // Only meaningful with a draft model; the server errors on it alone.
+        if let Some(n) = num_draft_tokens {
+            cmd.args(["--num-draft-tokens", &n.to_string()]);
+        }
+    }
+    if let Some(args) = chat_template_args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        cmd.args(["--chat-template-args", args]);
+    }
+    cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
