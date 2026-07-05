@@ -76,6 +76,7 @@ openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 | `/model <repo>` | Set the active Hugging Face repo id |
 | `/approvals auto\|ask\|readonly` | Control mutating tool gates |
 | `/new` | Start a fresh session |
+| `/context` | Prompt token costs per component, cache hits, budget |
 | `/status` | Session, endpoint, and server state |
 | `/logs` | Tail recent MLX server logs |
 | `/quit` | Exit |
@@ -114,6 +115,42 @@ By default Open Max talks to the managed server at `http://127.0.0.1:8989/v1`. T
 
 Set `base_url` and `model` to match your provider. When `base_url` is not the managed MLX port, Open Max skips the serve a model first gate and talks to your endpoint directly.
 
+## Extending Open Max
+
+Open Max stays bare-bones on purpose; you extend it per workflow, and every extension's token cost is visible in `/context`. With nothing installed, the prompt is exactly the built-in one — extensibility costs zero tokens by default.
+
+**External tools.** Drop a TOML file in `.openmax/tools/` (project) or `~/.openmax/tools/` (global; project wins on name collision). Any language works: the harness runs `command`, writes the call's JSON arguments to stdin, and returns stdout to the model, with the same output cap and spill-to-file behavior as `bash`.
+
+```toml
+# .openmax/tools/todo_scan.toml
+name = "todo_scan"
+description = "List TODO/FIXME comments with file and line"   # keep it short: it rides in every prompt
+command = "./scripts/todo-scan.sh"
+timeout_secs = 30
+mutating = false          # true routes the tool through approvals
+
+[params]
+type = "object"
+[params.properties.path]
+type = "string"
+description = "Directory to scan"
+```
+
+**Skills.** A directory with a `SKILL.md` under `.agents/skills/` (project) or `~/.openmax/skills/` (global). Frontmatter `name:` and `description:` are the only lines that live in the prompt (~15 tokens per skill); the model reads the full file on demand when a task matches. This is how you add large, rarely used capability without taxing every request.
+
+```
+.agents/skills/release/SKILL.md
+---
+name: release
+description: How to cut a release of this project
+---
+Full instructions, checklists, commands...
+```
+
+**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session — the serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/context` tells you which state you are looking at.
+
+**Why no MCP?** A typical MCP server dumps 10k+ tokens of tool descriptions into every request — most of a small model's whole window. The external-tool + skills design gives the same reach with per-call processes and on-demand documentation instead: write a CLI, give it a README (or a skill), and let the model read it when needed.
+
 ## Architecture
 
 ```
@@ -122,6 +159,8 @@ crates/
     agent.rs                  Turn loop: stream → tools → approvals → repeat
     client.rs                 OpenAI compatible streaming client (SSE + JSON fallback)
     tools.rs                  list_dir · read_file · write_file · edit_file · glob · grep · bash
+    registry.rs               Session-frozen tool registry: built-ins + external TOML tools
+    skills.rs                 SKILL.md discovery; name+description only in the prompt
     prompt.rs                 Short system prompt tuned for small local models
     fallback.rs               Parses tool markup when the server omits native tool_calls
     mlx.rs                    mlx-lm venv provisioning and server lifecycle
