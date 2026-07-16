@@ -156,6 +156,15 @@ impl Core {
     }
 }
 
+/// `~/.openmax`, the single place Open Max keeps its state (settings, sessions,
+/// the managed Python environment, logs).
+pub fn default_data_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".openmax"),
+        None => PathBuf::from(".openmax"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,14 +185,5 @@ mod tests {
             .await
             .expect("immediate resolution");
         assert!(token.is_cancelled());
-    }
-}
-
-/// `~/.openmax`, the single place Open Max keeps its state (settings, sessions,
-/// the managed Python environment, logs).
-pub fn default_data_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".openmax"),
-        None => PathBuf::from(".openmax"),
     }
 }

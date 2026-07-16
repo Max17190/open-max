@@ -223,6 +223,9 @@ impl ChatClient {
         )
     }
 
+    // One argument per endpoint option; the call sites build it straight from
+    // a resolved Endpoint, so a builder would add ceremony without clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         base_url: String,
         api_key: Option<String>,
