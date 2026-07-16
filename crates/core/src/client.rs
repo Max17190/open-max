@@ -39,6 +39,9 @@ pub struct ChatClient {
     pub model: String,
     pub temperature: f32,
     pub max_tokens: usize,
+    pub headers: Vec<(String, String)>,
+    pub use_max_completion_tokens: bool,
+    pub send_stream_options: bool,
     http: reqwest::Client,
 }
 
@@ -109,6 +112,42 @@ struct ToolCallFnDelta {
 
 impl ChatClient {
     pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: f32, max_tokens: usize) -> Self {
+        Self::with_options(
+            base_url,
+            api_key,
+            model,
+            temperature,
+            max_tokens,
+            Vec::new(),
+            false,
+            true,
+        )
+    }
+
+    /// Build a client from a resolved multi-provider endpoint.
+    pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
+        Self::with_options(
+            ep.base_url.clone(),
+            ep.api_key.clone(),
+            ep.model.clone(),
+            ep.temperature,
+            ep.max_tokens,
+            ep.headers.clone(),
+            ep.compat.use_max_completion_tokens,
+            ep.compat.send_stream_options,
+        )
+    }
+
+    pub fn with_options(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        temperature: f32,
+        max_tokens: usize,
+        headers: Vec<(String, String)>,
+        use_max_completion_tokens: bool,
+        send_stream_options: bool,
+    ) -> Self {
         // One client (and connection pool) for the process lifetime: ChatClient
         // is rebuilt every turn, and rebuilding the pool with it would redo the
         // TCP/TLS handshake per turn on remote endpoints.
@@ -122,7 +161,17 @@ impl ChatClient {
                     .expect("failed to build http client")
             })
             .clone();
-        Self { base_url, api_key, model, temperature, max_tokens, http }
+        Self {
+            base_url,
+            api_key,
+            model,
+            temperature,
+            max_tokens,
+            headers,
+            use_max_completion_tokens,
+            send_stream_options,
+            http,
+        }
     }
 
     fn endpoint(&self) -> String {
@@ -143,12 +192,17 @@ impl ChatClient {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
             "stream": true,
-            // Ask for ground-truth token usage (including prompt-cache hits)
-            // on the final chunk; servers that don't know the option ignore it.
-            "stream_options": { "include_usage": true },
         });
+        if self.use_max_completion_tokens {
+            body["max_completion_tokens"] = json!(self.max_tokens);
+        } else {
+            body["max_tokens"] = json!(self.max_tokens);
+        }
+        // Ask for ground-truth token usage on the final chunk when supported.
+        if self.send_stream_options {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
             body["tools"] = tools.clone();
             body["tool_choice"] = json!("auto");
@@ -168,6 +222,9 @@ impl ChatClient {
                 if !key.is_empty() {
                     req = req.bearer_auth(key);
                 }
+            }
+            for (name, value) in &self.headers {
+                req = req.header(name.as_str(), value.as_str());
             }
             // Local models can spend a long time in prompt processing before the
             // first byte arrives; keep cancellation responsive throughout.

@@ -22,7 +22,8 @@ const MAX_FILES: usize = 20_000;
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("help", "", "keybindings and commands"),
     ("models", "", "manage and serve local models"),
-    ("model", "<repo>", "use a specific model id"),
+    ("model", "<id>", "use a specific model id"),
+    ("provider", "[name]", "list or select a named provider"),
     ("approvals", "auto|ask|readonly", "how mutating tools are gated"),
     ("new", "", "start a fresh session"),
     ("resume", "", "pick an earlier session in this project"),

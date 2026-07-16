@@ -516,13 +516,10 @@ async fn run_loop(
         }
     };
 
-    let client = ChatClient::new(
-        settings.base_url.clone(),
-        settings.api_key.clone(),
-        settings.model.clone(),
-        settings.temperature,
-        settings.max_tokens,
-    );
+    // Resolve named provider (or flat base_url) once per turn so settings edits
+    // apply without restarting the process.
+    let endpoint = crate::providers::resolve(&settings, &core.data_dir);
+    let client = ChatClient::from_endpoint(&endpoint);
     let schemas = registry.tool_schemas_json();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
@@ -533,17 +530,19 @@ async fn run_loop(
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
     let mut repeat_tracker = RepeatCallTracker::new();
+    let context_tokens = endpoint.context_tokens;
+    let max_tokens = endpoint.max_tokens;
 
     'turns: for _ in 0..MAX_ITERATIONS {
         let (budget_changed, compaction) = enforce_budget(
             &mut messages,
-            settings.context_tokens.saturating_sub(settings.max_tokens + 1024),
+            context_tokens.saturating_sub(max_tokens + 1024),
         );
         if let Some(digest) = compaction {
             sessions::append_compaction(core, session_id, &digest.to_record());
         }
         let used = messages.iter().map(|m| m.estimated_tokens()).sum();
-        core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens: settings.context_tokens });
+        core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
@@ -865,14 +864,13 @@ async fn run_task_subagent(
         ChatMessage::system(system),
         ChatMessage::user(prompt.to_string()),
     ];
-    let client = ChatClient::new(
-        settings.base_url.clone(),
-        settings.api_key.clone(),
-        settings.model.clone(),
-        settings.temperature,
-        settings.max_tokens.min(2048),
-    );
-    let child_budget = settings.context_tokens.saturating_sub(settings.max_tokens + 512).min(12_000);
+    let mut endpoint = crate::providers::resolve(settings, &core.data_dir);
+    endpoint.max_tokens = endpoint.max_tokens.min(2048);
+    let client = ChatClient::from_endpoint(&endpoint);
+    let child_budget = endpoint
+        .context_tokens
+        .saturating_sub(endpoint.max_tokens + 512)
+        .min(12_000);
     let mut last_text = String::new();
     let mut step = 0usize;
 

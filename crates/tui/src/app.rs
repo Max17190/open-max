@@ -1017,11 +1017,12 @@ impl App {
             return Ok(());
         }
 
-        // Friendly gate: when pointed at the managed local server and it is
-        // not serving yet, guide to /models instead of erroring.
+        // Friendly gate: when the resolved endpoint is the managed local MLX
+        // server and it is not serving yet, guide to /models instead of erroring.
         let (managed, ready) = {
             let s = self.core.settings.lock().unwrap();
-            let managed = s.base_url.contains(&format!("127.0.0.1:{}", s.mlx_port));
+            let ep = open_max_core::providers::resolve(&s, &self.core.data_dir);
+            let managed = open_max_core::providers::is_managed_mlx(&ep, s.mlx_port);
             (managed, self.core.mlx.lock().unwrap().ready)
         };
         if managed && !ready {
@@ -1112,10 +1113,71 @@ impl App {
                         s.mlx_model = repo.clone();
                         let _ = config::save(&self.core.data_dir, &s);
                     }
-                    self.note(&format!("model set to {repo} (serve it via /models if needed)"));
+                    self.note(&format!("model set to {repo}"));
                 }
-                None => self.note("usage: /model <huggingface repo id>"),
+                None => self.note("usage: /model <id>"),
             },
+            "provider" => {
+                let names = open_max_core::providers::list_provider_names(&self.core.data_dir);
+                match rest.first() {
+                    None => {
+                        if names.is_empty() {
+                            self.note(
+                                "no providers in ~/.openmax/providers.json (flat base_url still works)",
+                            );
+                        } else {
+                            let active = self
+                                .core
+                                .settings
+                                .lock()
+                                .unwrap()
+                                .provider
+                                .clone()
+                                .unwrap_or_default();
+                            let mut lines = vec![Line::from(Span::styled(
+                                "  providers".to_string(),
+                                Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
+                            ))];
+                            for name in &names {
+                                let mark = if *name == active { "*" } else { " " };
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {mark} {name}"),
+                                    Style::default().fg(theme::DIM()),
+                                )));
+                            }
+                            lines.push(Line::from(Span::styled(
+                                "  use /provider <name> to switch".to_string(),
+                                Style::default().fg(theme::DIM()),
+                            )));
+                            self.transcript.push(lines);
+                        }
+                    }
+                    Some(name) => {
+                        let name = name.to_string();
+                        if !names.iter().any(|n| n == &name) {
+                            self.note(&format!(
+                                "unknown provider '{name}'; define it in ~/.openmax/providers.json"
+                            ));
+                        } else {
+                            {
+                                let mut s = self.core.settings.lock().unwrap();
+                                s.provider = Some(name.clone());
+                                // If the catalog has models and current model is empty-ish, leave model as-is.
+                                let _ = config::save(&self.core.data_dir, &s);
+                            }
+                            let ep = {
+                                let s = self.core.settings.lock().unwrap();
+                                open_max_core::providers::resolve(&s, &self.core.data_dir)
+                            };
+                            self.note(&format!(
+                                "provider {name} → {} ({})",
+                                extensions::display_base_url(&ep.base_url),
+                                ep.model
+                            ));
+                        }
+                    }
+                }
+            }
             "approvals" => match rest.first() {
                 Some(&m @ ("auto" | "ask" | "readonly")) => {
                     {
@@ -1226,6 +1288,7 @@ impl App {
             }
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
+                let ep = open_max_core::providers::resolve(&s, &self.core.data_dir);
                 let status = mlx::status(&self.core).await;
                 let server = if status.server_ready {
                     format!("serving {} on :{}", status.model.as_deref().unwrap_or("?"), status.port)
@@ -1238,16 +1301,18 @@ impl App {
                     .budget
                     .map(|(u, t)| format!("{}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                     .unwrap_or_else(|| "0%".into());
-                let endpoint = extensions::display_base_url(&s.base_url);
-                let host = extensions::endpoint_host(&s.base_url)
+                let endpoint = extensions::display_base_url(&ep.base_url);
+                let host = extensions::endpoint_host(&ep.base_url)
                     .unwrap_or_else(|| endpoint.clone());
+                let provider = ep.provider.as_deref().unwrap_or("(flat base_url)");
                 let block = vec![
-                    kv("model", &s.model),
+                    kv("provider", provider),
+                    kv("model", &ep.model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
                     kv("server", &server),
                     kv("approvals", &s.approval_mode),
-                    kv("context", &format!("{ctx} of {} tokens", s.context_tokens)),
+                    kv("context", &format!("{ctx} of {} tokens", ep.context_tokens)),
                     kv("session", self.session_id.as_deref().unwrap_or("none yet")),
                     kv("project", &self.project.display().to_string()),
                     kv("data", &self.core.data_dir.display().to_string()),
@@ -1806,13 +1871,23 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let version = env!("CARGO_PKG_VERSION");
-        let (model, base_url, approvals) = {
+        let (model, base_url, approvals, provider) = {
             let s = self.core.settings.lock().unwrap();
-            (s.model.clone(), s.base_url.clone(), s.approval_mode.clone())
+            let ep = open_max_core::providers::resolve(&s, &self.core.data_dir);
+            (
+                ep.model,
+                ep.base_url,
+                s.approval_mode.clone(),
+                ep.provider,
+            )
         };
         let model = extensions::short_model(&model);
         let host = extensions::endpoint_host(&base_url).unwrap_or_else(|| "endpoint".into());
-        let endpoint = format!("{model}@{host}");
+        let endpoint = if let Some(p) = provider {
+            format!("{p}:{model}@{host}")
+        } else {
+            format!("{model}@{host}")
+        };
         let max_ep = (area.width as usize / 3).clamp(12, 36);
         let endpoint = clip(&endpoint, max_ep);
         let line = Line::from(vec![
@@ -2097,7 +2172,8 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("ctrl+t", "show or hide model thinking"),
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
     ("/models", "manage and serve local models"),
-    ("/model <repo>", "use a specific model id"),
+    ("/model <id>", "use a specific model id"),
+    ("/provider [name]", "list or select a named OpenAI-compatible provider"),
     ("/theme dark|light|mono|catppuccin", "switch appearance"),
     ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
     ("/new", "start a fresh session"),

@@ -19,24 +19,28 @@ const HELP: &str = "openmax: a barebones high-performance agent harness
 usage: openmax [options] [prompt...]
 
 options:
-  -c, --continue      resume the latest session in this directory
-  -m, --model <id>    use this model id for the run
-  -p, --print         headless: run one turn and exit (prompt required)
-      --json          with --print, emit AgentEvent envelopes as JSONL
-  -V, --version       print the version
-  -h, --help          this help
+  -c, --continue         resume the latest session in this directory
+  -m, --model <id>       use this model id for the run
+      --provider <name>  use a named provider from ~/.openmax/providers.json
+  -p, --print            headless: run one turn and exit (prompt required)
+      --json             with --print, emit AgentEvent envelopes as JSONL
+  -V, --version          print the version
+  -h, --help             this help
 
-run it inside a project directory; point base_url at any OpenAI-compatible
-endpoint in ~/.openmax/settings.json. /help lists in-session commands.
+point at any OpenAI-compatible endpoint via settings.json base_url, or register
+named providers in ~/.openmax/providers.json and switch with --provider.
+run inside a project directory; /help lists in-session commands.
 
 examples:
   openmax
+  openmax --provider ollama -m qwen2.5-coder:7b
   openmax -p \"summarize this repo\"
   openmax -p --json \"list top-level files\"";
 
 struct CliArgs {
     continue_session: bool,
     model: Option<String>,
+    provider: Option<String>,
     print: bool,
     json: bool,
     /// Free-form prompt tokens (joined with spaces) for --print.
@@ -48,6 +52,7 @@ fn parse_args() -> Result<CliArgs, lexopt::Error> {
     let mut args = CliArgs {
         continue_session: false,
         model: None,
+        provider: None,
         print: false,
         json: false,
         prompt: Vec::new(),
@@ -57,6 +62,7 @@ fn parse_args() -> Result<CliArgs, lexopt::Error> {
         match arg {
             Short('c') | Long("continue") => args.continue_session = true,
             Short('m') | Long("model") => args.model = Some(parser.value()?.string()?),
+            Long("provider") => args.provider = Some(parser.value()?.string()?),
             Short('p') | Long("print") => args.print = true,
             Long("json") => args.json = true,
             Short('V') | Long("version") => {
@@ -90,10 +96,15 @@ async fn main() -> std::io::Result<()> {
     }
 
     let (core, core_rx) = Core::new(default_data_dir());
-    if let Some(model) = &cli.model {
+    {
         let mut s = core.settings.lock().unwrap();
-        s.model = model.clone();
-        s.mlx_model = model.clone();
+        if let Some(provider) = &cli.provider {
+            s.provider = Some(provider.clone());
+        }
+        if let Some(model) = &cli.model {
+            s.model = model.clone();
+            s.mlx_model = model.clone();
+        }
     }
 
     if cli.print {
