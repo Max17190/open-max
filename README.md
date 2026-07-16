@@ -2,7 +2,7 @@
 
 **A small Rust agent harness for coding in the terminal.**
 
-Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at any OpenAI compatible endpoint. No desktop shell, no heavyweight runtime, no telemetry.
+Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at the model server you choose: local, cloud, or a private proxy. No desktop shell, no heavyweight runtime, no telemetry.
 
 You own the endpoints, the tools, the skills, and the context.
 
@@ -12,7 +12,7 @@ You own the endpoints, the tools, the skills, and the context.
 ## Features
 
 - **Small by default.** Eight built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`, and a read only `task` for context isolation. Short system prompt; old tool output is dropped before your task is.
-- **Any OpenAI compatible server.** Set `base_url` in settings, or name several endpoints in `providers.json` and switch with `/provider` or `--provider`.
+- **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch with `/provider` or `--provider`. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, and process hooks under project or home config. No fork required.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
@@ -47,9 +47,9 @@ Edit `~/.openmax/settings.json`:
 }
 ```
 
-`base_url` and `model` must match your server's `/v1/chat/completions` API. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
 
-For several servers, define them in `~/.openmax/providers.json` and select with `"provider"` in settings, `--provider`, or `/provider`.
+For several servers, define them in `~/.openmax/providers.json` and select with `"provider"` in settings, `--provider`, or `/provider`. Optional `compat` flags cover picky gateways (for example `max_completion_tokens` vs `max_tokens`).
 
 On Apple Silicon, when `base_url` is the managed local port, Open Max can optionally provision and serve MLX models via `/models`.
 
