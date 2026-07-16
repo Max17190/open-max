@@ -114,13 +114,35 @@ pub fn providers_path(data_dir: &Path) -> PathBuf {
     data_dir.join("providers.json")
 }
 
-/// Load named providers; empty map if missing or invalid.
-pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
-    let path = providers_path(data_dir);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return BTreeMap::new();
-    };
-    let Ok(file) = serde_json::from_str::<ProvidersFile>(&text) else {
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
+
+struct ProvidersCache {
+    data_dir: PathBuf,
+    /// None when the file was missing or unreadable at last load.
+    mtime: Option<SystemTime>,
+    map: BTreeMap<String, ProviderConfig>,
+}
+
+static PROVIDERS_CACHE: OnceLock<Mutex<ProvidersCache>> = OnceLock::new();
+
+/// Drop cached providers so the next load re-reads disk (settings/provider edits).
+pub fn invalidate_providers_cache() {
+    if let Some(lock) = PROVIDERS_CACHE.get() {
+        if let Ok(mut cache) = lock.lock() {
+            cache.data_dir.clear();
+            cache.mtime = None;
+            cache.map.clear();
+        }
+    }
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
+    let Ok(file) = serde_json::from_str::<ProvidersFile>(text) else {
         return BTreeMap::new();
     };
     file.providers
@@ -155,6 +177,32 @@ pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
             ))
         })
         .collect()
+}
+
+/// Load named providers; empty map if missing or invalid.
+/// Cached by data_dir + file mtime so multi-turn sessions do not re-parse disk.
+pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
+    let path = providers_path(data_dir);
+    let mtime = file_mtime(&path);
+    let lock = PROVIDERS_CACHE.get_or_init(|| {
+        Mutex::new(ProvidersCache {
+            data_dir: PathBuf::new(),
+            mtime: None,
+            map: BTreeMap::new(),
+        })
+    });
+    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.data_dir == data_dir && cache.mtime == mtime {
+        return cache.map.clone();
+    }
+    let map = match std::fs::read_to_string(&path) {
+        Ok(text) => parse_providers_file(&text),
+        Err(_) => BTreeMap::new(),
+    };
+    cache.data_dir = data_dir.to_path_buf();
+    cache.mtime = mtime;
+    cache.map = map.clone();
+    map
 }
 
 /// List provider names sorted for display.
@@ -346,6 +394,7 @@ mod tests {
     fn missing_providers_file_uses_flat_settings() {
         let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        invalidate_providers_cache();
         let mut s = Settings::default();
         s.base_url = "http://127.0.0.1:11434/v1".into();
         s.model = "qwen".into();
@@ -356,6 +405,26 @@ mod tests {
         assert_eq!(ep.api_key.as_deref(), Some("k"));
         assert!(ep.provider.is_none());
         assert!(ep.compat.send_stream_options);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_providers_cache_hits_second_call() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(
+            &dir,
+            r#"{"providers":{"x":{"base_url":"http://x/v1","models":[{"id":"m"}]}}}"#,
+        );
+        invalidate_providers_cache();
+        let a = load_providers(&dir);
+        let b = load_providers(&dir);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert!(a.contains_key("x") && b.contains_key("x"));
+        // After invalidate, still correct.
+        invalidate_providers_cache();
+        let c = load_providers(&dir);
+        assert!(c.contains_key("x"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

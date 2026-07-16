@@ -492,12 +492,16 @@ async fn run_loop(
     settings: Settings,
     cancelled: Arc<CancelToken>,
 ) {
-    let (mut messages, registry) = {
+    // Take ownership of the in-memory transcript for this turn (no full clone).
+    // MessageGuard restores it on drop so panic/abort cannot empty the session.
+    let (messages, registry) = {
         {
             let mut sessions_map = core.sessions.lock().await;
             if let Some(data) = sessions_map.get_mut(session_id) {
                 data.messages.push(ChatMessage::user(user_text));
-                (data.messages.clone(), data.registry.clone())
+                let messages = std::mem::take(&mut data.messages);
+                let registry = data.registry.clone();
+                (messages, registry)
             } else {
                 drop(sessions_map);
                 let core_clone = core.clone();
@@ -511,10 +515,13 @@ async fn run_loop(
                 let mut sessions_map = core.sessions.lock().await;
                 let data = sessions_map.entry(session_id.to_string()).or_insert(built);
                 data.messages.push(ChatMessage::user(user_text));
-                (data.messages.clone(), data.registry.clone())
+                let messages = std::mem::take(&mut data.messages);
+                let registry = data.registry.clone();
+                (messages, registry)
             }
         }
     };
+    let mut guard = MessageGuard::new(core.clone(), session_id, messages);
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
@@ -524,6 +531,8 @@ async fn run_loop(
         Err(e) => {
             core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
             core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
+            // User message was already appended; restore so the next turn sees it.
+            guard.commit().await;
             return;
         }
     };
@@ -543,19 +552,19 @@ async fn run_loop(
 
     'turns: for _ in 0..MAX_ITERATIONS {
         let (budget_changed, compaction) = enforce_budget(
-            &mut messages,
+            guard.messages(),
             context_tokens.saturating_sub(max_tokens + 1024),
         );
         if let Some(digest) = compaction {
             sessions::append_compaction(core, session_id, &digest.to_record());
         }
-        let used = messages.iter().map(|m| m.estimated_tokens()).sum();
+        let used = guard.messages().iter().map(|m| m.estimated_tokens()).sum();
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let result = client
-            .stream_chat(&messages, schemas, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), schemas, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -593,11 +602,11 @@ async fn run_loop(
         // Never persist a fully empty assistant message (e.g. a turn cancelled
         // before the first token): chat templates can reject it on replay.
         if !content.is_empty() || !tool_calls.is_empty() {
-            messages.push(ChatMessage::assistant(
+            guard.messages().push(ChatMessage::assistant(
                 if content.is_empty() { None } else { Some(content.clone()) },
                 if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
             ));
-            save_messages(core, session_id, &messages, budget_changed).await;
+            save_messages(core, session_id, guard.messages(), budget_changed).await;
         }
 
         if cancelled.is_cancelled() {
@@ -632,7 +641,7 @@ async fn run_loop(
                 execute_readonly_batch(
                     &batch_ctx,
                     &tool_calls[segment.start..segment.end],
-                    &mut messages,
+                    guard.messages(),
                     &mut repeat_tracker,
                 )
                 .await;
@@ -649,7 +658,7 @@ async fn run_loop(
                     let msg = "tool call has an empty function name; use a known tool name from the schema";
                     core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
                     core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                    messages.push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                    guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
                     continue;
                 }
                 let args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -658,7 +667,7 @@ async fn run_loop(
                         let msg = format!("invalid JSON in tool arguments: {e}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
                         core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
-                        messages.push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                        guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
                         continue;
                     }
                 };
@@ -668,7 +677,7 @@ async fn run_loop(
                     let msg = "You have repeated this exact call 3 times. The result will not change. Try a different approach, or explain what you are blocked on.";
                     core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: args.clone() });
                     core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                    messages.push(ChatMessage::tool(call.id.clone(), msg.to_string()));
+                    guard.messages().push(ChatMessage::tool(call.id.clone(), msg.to_string()));
                     continue;
                 }
 
@@ -688,7 +697,7 @@ async fn run_loop(
                         ok: false,
                         output: reason.clone(),
                     });
-                    messages.push(ChatMessage::tool(
+                    guard.messages().push(ChatMessage::tool(
                         call.id.clone(),
                         tool_message_content(&tools::ToolOutcome {
                             ok: false,
@@ -764,7 +773,7 @@ async fn run_loop(
                         ok: false,
                         output: "The user cancelled this turn.".into(),
                     });
-                    messages.push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
+                    guard.messages().push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
                     stop_reason = "cancelled".into();
                     break 'turns;
                 }
@@ -799,16 +808,18 @@ async fn run_loop(
 
                 // Approval timeouts are not model errors; the "Error:" prefix
                 // would push small models into pointless retry loops.
-                messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
+                guard.messages().push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
                 if executed {
                     repeat_tracker.record_executed(name, &args_key);
                 }
             }
         }
-        save_messages(core, session_id, &messages, false).await;
+        save_messages(core, session_id, guard.messages(), false).await;
     }
 
-    save_messages(core, session_id, &messages, false).await;
+    save_messages(core, session_id, guard.messages(), false).await;
+    // Restore in-memory transcript under the async lock (Drop is try_lock only).
+    guard.commit().await;
     sessions::touch(core, session_id);
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
 }
@@ -1025,11 +1036,63 @@ async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, 
     }
 }
 
+/// Persist transcript to disk without cloning it back into SessionData.
+/// The turn owns `messages` until `MessageGuard` commits on drop/finish.
 async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) {
     let mut sessions_map = core.sessions.lock().await;
     if let Some(data) = sessions_map.get_mut(session_id) {
-        data.messages = messages.to_vec();
         sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite);
+    }
+}
+
+/// Holds the turn-local transcript and restores it to SessionData on drop so a
+/// panic or early exit cannot leave the session empty after `mem::take`.
+///
+/// Normal exits call [`MessageGuard::commit`] (async lock). `Drop` only
+/// `try_lock`s: `blocking_lock` panics inside a Tokio async context, and a
+/// failed try during unwind still leaves mid-turn disk saves intact.
+struct MessageGuard {
+    core: Arc<Core>,
+    session_id: String,
+    messages: Option<Vec<ChatMessage>>,
+}
+
+impl MessageGuard {
+    fn new(core: Arc<Core>, session_id: &str, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            core,
+            session_id: session_id.to_string(),
+            messages: Some(messages),
+        }
+    }
+
+    fn messages(&mut self) -> &mut Vec<ChatMessage> {
+        self.messages.as_mut().expect("messages already committed")
+    }
+
+    /// Move the working transcript back into SessionData. Consumes the guard
+    /// so `Drop` becomes a no-op.
+    async fn commit(mut self) {
+        if let Some(messages) = self.messages.take() {
+            let mut map = self.core.sessions.lock().await;
+            if let Some(data) = map.get_mut(&self.session_id) {
+                data.messages = messages;
+            }
+        }
+    }
+}
+
+impl Drop for MessageGuard {
+    fn drop(&mut self) {
+        if let Some(messages) = self.messages.take() {
+            if let Ok(mut map) = self.core.sessions.try_lock() {
+                if let Some(data) = map.get_mut(&self.session_id) {
+                    data.messages = messages;
+                }
+            }
+            // If the lock is held, prefer not to deadlock/panic on Drop.
+            // Disk already has the latest `save_messages` writes for this turn.
+        }
     }
 }
 
