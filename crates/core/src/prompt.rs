@@ -296,12 +296,15 @@ mod tests {
     }
 
     /// Budget gate for the frozen prompt prefix: base system prompt plus the
-    /// serialized builtin tool schemas must stay within ~800 tokens. The cap
-    /// is in chars (the core stays tokenizer-free): 3452 chars measured
-    /// 794 tokens on o200k_base and 775 on cl100k_base (2026-07-16), so 3500
-    /// chars is the line. If this fails, re-measure with a real tokenizer
-    /// before raising anything. Grounding sections (AGENTS.md, layout map,
-    /// skills) are project content with their own caps and are not counted.
+    /// serialized builtin tool array must stay within ~800 tokens. The cap is
+    /// in chars (the core stays tokenizer-free): 3452 chars including a
+    /// 52-char project root measured 794 tokens on o200k_base and 775 on
+    /// cl100k_base (2026-07-16). The interpolated root varies per machine, so
+    /// it is excluded here and the cap (3450) leaves room for a typical
+    /// checkout path. If this fails, re-measure with a real tokenizer before
+    /// raising anything. Only builtins count: external tools are the user's
+    /// own budget, and grounding sections (AGENTS.md, layout map, skills)
+    /// have their own caps.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -313,11 +316,23 @@ mod tests {
             .find(|(name, _)| name == "base rules")
             .map(|(_, c)| *c)
             .expect("base rules component present");
-        let tool_chars: usize = breakdown.tools.iter().map(|(_, c, _)| c).sum();
-        let total = base_chars + tool_chars;
+        let path_free = base_chars - dir.to_string_lossy().len();
+        // Serialize the builtin entries as one array so brackets and commas
+        // count, exactly as the wire payload does.
+        let builtins: Vec<&serde_json::Value> = registry
+            .tool_schemas_json()
+            .as_array()
+            .expect("schemas are an array")
+            .iter()
+            .zip(&registry.tools)
+            .filter(|(_, spec)| matches!(spec.kind, crate::registry::ToolKind::Builtin))
+            .map(|(entry, _)| entry)
+            .collect();
+        let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
+        let total = path_free + tool_chars;
         assert!(
-            total <= 3_500,
-            "frozen prompt budget exceeded: base rules {base_chars} + tools {tool_chars} = {total} chars (cap 3500 ≈ 800 tokens)",
+            total <= 3_450,
+            "frozen prompt budget exceeded: base rules (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 3450 ≈ 800 tokens with a typical checkout path)",
         );
         let _ = std::fs::remove_dir_all(dir);
     }
