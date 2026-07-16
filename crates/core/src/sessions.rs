@@ -95,8 +95,16 @@ pub fn load_compaction(core: &Core, id: &str) -> Vec<CompactionRecord> {
 /// entirely for builtin-only sessions (absence means built-ins, which also
 /// covers every session that predates the extensibility layer).
 pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::RegistryManifest) {
-    if let Ok(json) = serde_json::to_string_pretty(manifest) {
-        let _ = std::fs::write(manifest_path(core, id), json);
+    let Ok(json) = serde_json::to_string_pretty(manifest) else {
+        return;
+    };
+    if let Err(e) = write_atomic(&manifest_path(core, id), json) {
+        core.send_agent(
+            id,
+            AgentEvent::Error {
+                message: format!("warning: failed to persist registry manifest: {e}"),
+            },
+        );
     }
 }
 
@@ -115,7 +123,7 @@ fn load_index(core: &Core) -> Vec<SessionMeta> {
 
 fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
     let json = serde_json::to_string_pretty(metas).map_err(|e| e.to_string())?;
-    std::fs::write(index_path(core), json).map_err(|e| e.to_string())
+    write_atomic(&index_path(core), json)
 }
 
 /// Read-modify-write the index under the state lock so concurrent agent
@@ -138,24 +146,57 @@ fn uses_legacy_array_format(path: &PathBuf) -> bool {
     head[..n].iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| *b == b'[')
 }
 
+/// Write `bytes` via a same-directory temp file + rename so readers never see
+/// a partial target. On rename failure the temp file is cleaned up.
+fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+    let tmp = {
+        let mut p = path.clone();
+        let name = format!(
+            "{}.tmp",
+            path.file_name()
+                .ok_or_else(|| "path has no file name".to_string())?
+                .to_string_lossy()
+        );
+        p.set_file_name(name);
+        p
+    };
+    if let Err(e) = std::fs::write(&tmp, bytes.as_ref()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
     let mut out = String::new();
     for msg in messages {
         out.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
         out.push('\n');
     }
-    std::fs::write(path, out).map_err(|e| e.to_string())
+    write_atomic(path, out)
 }
 
 fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+    // Serialize the whole tail first, then one write. On partial write failure
+    // truncate back to the pre-append length so a later retry does not dupe.
+    let mut buf = String::new();
+    for msg in messages {
+        buf.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
+        buf.push('\n');
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    for msg in messages {
-        let line = serde_json::to_string(msg).map_err(|e| e.to_string())?;
-        writeln!(file, "{line}").map_err(|e| e.to_string())?;
+    use std::io::{Seek, SeekFrom};
+    let start = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    if let Err(e) = file.write_all(buf.as_bytes()).and_then(|_| file.flush()) {
+        let _ = file.set_len(start);
+        return Err(e.to_string());
     }
     Ok(())
 }
@@ -438,6 +479,115 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone());
         assert!(load_manifest(&core, "pre-feature-session").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multi_message_append_is_all_or_nothing_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "multi-append";
+        let mut persisted = 0usize;
+
+        let seed = vec![ChatMessage::system("sys")];
+        save_messages(&core, id, &seed, &mut persisted, false);
+        assert_eq!(persisted, 1);
+
+        // Append several messages in one save (single write_all of the tail).
+        let batch = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("one"),
+            ChatMessage::assistant(Some("two".into()), None),
+            ChatMessage::user("three"),
+        ];
+        save_messages(&core, id, &batch, &mut persisted, false);
+        assert_eq!(persisted, 4);
+
+        let path = messages_path(&core, id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches('\n').count(), 4);
+        assert!(text.ends_with('\n'));
+
+        let loaded = load_messages(&core, id).unwrap();
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded[1].content.as_deref(), Some("one"));
+        assert_eq!(loaded[2].content.as_deref(), Some("two"));
+        assert_eq!(loaded[3].content.as_deref(), Some("three"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewrite_leaves_complete_file_without_tmp() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "atomic-rewrite";
+        let mut persisted = 0usize;
+
+        let initial = vec![
+            ChatMessage::user("a"),
+            ChatMessage::assistant(Some("b".into()), None),
+            ChatMessage::user("c"),
+        ];
+        save_messages(&core, id, &initial, &mut persisted, false);
+        assert_eq!(persisted, 3);
+
+        // Force full rewrite (budget trim / drop path): shorter list than persisted.
+        let trimmed = vec![ChatMessage::user("kept")];
+        save_messages(&core, id, &trimmed, &mut persisted, true);
+        assert_eq!(persisted, 1);
+
+        let path = messages_path(&core, id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.ends_with('\n'));
+        let loaded = load_messages(&core, id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content.as_deref(), Some("kept"));
+
+        // Atomic replace must not leave a sibling .tmp behind.
+        let tmp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!tmp.exists(), "temp file left behind: {}", tmp.display());
+
+        let sessions = sessions_dir(&core);
+        let leftovers: Vec<_> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected .tmp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_manifest_writes_parseable_file_atomically() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "manifest-atomic";
+
+        let manifest = crate::registry::Registry::builtin_only().to_manifest();
+        save_manifest(&core, id, &manifest);
+
+        let path = manifest_path(&core, id);
+        assert!(path.exists());
+        let loaded = load_manifest(&core, id).expect("manifest should parse");
+        assert_eq!(loaded.version, manifest.version);
+        assert!(loaded.external_tools.is_empty());
+
+        let tmp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!tmp.exists());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

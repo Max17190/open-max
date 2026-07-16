@@ -1,10 +1,78 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
+
+/// OpenAI-compatible `/chat/completions` request body. Built once per
+/// `stream_chat` call and serialized to bytes before the retry loop so retries
+/// do not re-walk the transcript into a `serde_json::Value`.
+///
+/// Token limit and stream_options fields follow provider compat flags so
+/// gateways that reject `max_tokens` or unknown `stream_options` stay happy.
+#[derive(Serialize)]
+struct ChatCompletionRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<usize>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+/// Serialize the chat-completion request body once. Honors multi-provider
+/// compat: `max_completion_tokens` vs `max_tokens`, optional `stream_options`,
+/// and tools/`tool_choice` only when `tools` is a non-empty JSON array.
+fn serialize_chat_request_body(
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: usize,
+    use_max_completion_tokens: bool,
+    send_stream_options: bool,
+    tools: &Value,
+) -> Result<Vec<u8>, String> {
+    let include_tools = tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    let req = ChatCompletionRequest {
+        model,
+        messages,
+        temperature,
+        max_tokens: if use_max_completion_tokens {
+            None
+        } else {
+            Some(max_tokens)
+        },
+        max_completion_tokens: if use_max_completion_tokens {
+            Some(max_tokens)
+        } else {
+            None
+        },
+        stream: true,
+        stream_options: if send_stream_options {
+            Some(StreamOptions { include_usage: true })
+        } else {
+            None
+        },
+        tools: if include_tools { Some(tools) } else { None },
+        tool_choice: if include_tools { Some("auto") } else { None },
+    };
+    serde_json::to_vec(&req).map_err(|e| format!("failed to serialize chat request: {e}"))
+}
 
 /// Incremental output from a streaming completion.
 pub enum StreamDelta {
@@ -188,25 +256,18 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stream": true,
-        });
-        if self.use_max_completion_tokens {
-            body["max_completion_tokens"] = json!(self.max_tokens);
-        } else {
-            body["max_tokens"] = json!(self.max_tokens);
-        }
-        // Ask for ground-truth token usage on the final chunk when supported.
-        if self.send_stream_options {
-            body["stream_options"] = json!({ "include_usage": true });
-        }
-        if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-            body["tools"] = tools.clone();
-            body["tool_choice"] = json!("auto");
-        }
+        // Serialize once before retries: cloning bytes is cheap; re-walking a
+        // long transcript into Value (and re-serializing) on every attempt is not.
+        // Compat flags (max_completion_tokens / stream_options) are baked in.
+        let body = serialize_chat_request_body(
+            &self.model,
+            messages,
+            self.temperature,
+            self.max_tokens,
+            self.use_max_completion_tokens,
+            self.send_stream_options,
+            tools,
+        )?;
 
         // Retry only pre-stream transport failures (connect/timeout) and 429
         // (request rejected before work starts). Do not retry 502/503/504: a
@@ -217,7 +278,11 @@ impl ChatClient {
         let mut attempt = 0u32;
         let resp = loop {
             attempt += 1;
-            let mut req = self.http.post(self.endpoint()).json(&body);
+            let mut req = self
+                .http
+                .post(self.endpoint())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone());
             if let Some(key) = &self.api_key {
                 if !key.is_empty() {
                     req = req.bearer_auth(key);
@@ -478,6 +543,7 @@ async fn backoff_sleep(attempt: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn trim_bytes_strips_whitespace() {
@@ -509,5 +575,107 @@ mod tests {
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));
         assert!(!is_retryable_status(500));
+    }
+
+    #[test]
+    fn serialize_chat_request_body_includes_expected_fields_and_messages() {
+        let messages = vec![
+            ChatMessage::system("you are helpful"),
+            ChatMessage::user("list files"),
+            ChatMessage::assistant(Some("calling a tool".into()), None),
+        ];
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }
+            }
+        }]);
+        // Default compat: max_tokens + stream_options (local OpenAI-compatible).
+        let bytes = serialize_chat_request_body(
+            "test-model",
+            &messages,
+            0.2,
+            1024,
+            false,
+            true,
+            &tools,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(v["model"], "test-model");
+        assert!((v["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-5);
+        assert_eq!(v["max_tokens"], 1024);
+        assert!(v.get("max_completion_tokens").is_none());
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert_eq!(v["tool_choice"], "auto");
+        assert!(v["tools"].as_array().is_some_and(|a| a.len() == 1));
+        assert_eq!(v["tools"][0]["function"]["name"], "read_file");
+
+        let msgs = v["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "you are helpful");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "list files");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "calling a tool");
+    }
+
+    #[test]
+    fn serialize_chat_request_body_omits_tools_when_empty() {
+        let messages = vec![ChatMessage::user("hi")];
+        for tools in [json!([]), Value::Null, json!({"not": "array"})] {
+            let bytes =
+                serialize_chat_request_body("m", &messages, 0.0, 64, false, true, &tools).unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(v.get("tools").is_none(), "tools should be omitted for {tools:?}");
+            assert!(v.get("tool_choice").is_none(), "tool_choice should be omitted for {tools:?}");
+            assert_eq!(v["messages"][0]["content"], "hi");
+            assert_eq!(v["stream"], true);
+            assert_eq!(v["stream_options"]["include_usage"], true);
+        }
+    }
+
+    #[test]
+    fn serialize_chat_request_body_is_byte_stable_for_retries() {
+        let messages = vec![ChatMessage::user("stable body")];
+        let tools = json!([{
+            "type": "function",
+            "function": { "name": "bash", "parameters": { "type": "object" } }
+        }]);
+        let a =
+            serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools).unwrap();
+        let b =
+            serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn serialize_respects_max_completion_tokens_and_omits_stream_options() {
+        let messages = vec![ChatMessage::user("compat")];
+        let tools = Value::Null;
+        let bytes = serialize_chat_request_body(
+            "gpt-style",
+            &messages,
+            0.1,
+            512,
+            true,  // use_max_completion_tokens
+            false, // send_stream_options
+            &tools,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["max_completion_tokens"], 512);
+        assert!(v.get("max_tokens").is_none());
+        assert!(v.get("stream_options").is_none());
+        assert_eq!(v["stream"], true);
+        assert!(v.get("tools").is_none());
     }
 }
