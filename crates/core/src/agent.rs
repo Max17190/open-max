@@ -599,7 +599,9 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint);
-    let schemas = registry.tool_schemas_json();
+    // Frozen wire form once per turn: every iteration injects the same tool
+    // schema bytes without re-serializing the Value array.
+    let schemas_wire = registry.tool_schemas_wire();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
     // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
@@ -627,7 +629,7 @@ async fn run_loop(
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let result = client
-            .stream_chat(guard.messages(), schemas, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -975,7 +977,8 @@ async fn run_task_subagent(
         return tools::ToolOutcome::err("task has no read-only tools available in this session");
     }
     let known_tools: Vec<&str> = child_registry.tools.iter().map(|s| s.name.as_str()).collect();
-    let schemas = child_registry.tool_schemas_json().clone();
+    // Scoped freeze wire: same bytes every subagent iteration.
+    let schemas_wire = child_registry.tool_schemas_wire();
     let root = project_root.to_string_lossy();
     let system = match kind {
         "search" => format!(
@@ -1018,7 +1021,7 @@ async fn run_task_subagent(
         }
         let _ = enforce_budget(&mut messages, child_budget);
         let result = client
-            .stream_chat(&messages, &schemas, cancelled.clone(), |_| {})
+            .stream_chat(&messages, schemas_wire, cancelled.clone(), |_| {})
             .await;
         let result = match result {
             Ok(r) => r,
