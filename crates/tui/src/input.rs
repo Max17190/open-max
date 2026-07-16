@@ -49,6 +49,49 @@ impl Composer {
         self.lines.join("\n")
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+
+    /// Snapshot of prompt history (oldest first) for Ctrl+R search.
+    pub fn history_entries(&self) -> Vec<String> {
+        self.history.clone()
+    }
+
+    /// Cursor as (row, char column) plus the current row's text, for the
+    /// completion popup to inspect the token being typed.
+    pub fn cursor_context(&self) -> (usize, usize, &str) {
+        (self.row, self.col, &self.lines[self.row])
+    }
+
+    /// Replace `len` chars starting at char index `start` in the current row
+    /// and leave the cursor after the replacement. Used to accept completions.
+    pub fn replace_token(&mut self, start: usize, len: usize, replacement: &str) {
+        let line = &mut self.lines[self.row];
+        let from = char_to_byte(line, start);
+        let to = char_to_byte(line, start + len);
+        line.replace_range(from..to, replacement);
+        self.col = start + replacement.chars().count();
+    }
+
+    /// Load text into the composer (e.g. queued messages handed back after a
+    /// cancel), leaving the cursor at the end.
+    pub fn load(&mut self, text: &str) {
+        self.set_text(text);
+        self.hist_idx = None;
+    }
+
+    /// Take the trimmed text and clear, remembering it in history. Used when
+    /// a completion accept submits a command directly.
+    pub fn take(&mut self) -> String {
+        let text = self.text().trim().to_string();
+        if !text.is_empty() {
+            self.remember(&text);
+        }
+        self.clear();
+        text
+    }
+
     pub fn height(&self) -> u16 {
         self.lines.len().min(6) as u16
     }
@@ -261,11 +304,21 @@ impl Composer {
         let first = self.lines.len().saturating_sub(visible).min(self.row);
         for (i, line) in self.lines.iter().enumerate().skip(first).take(visible) {
             let prefix = if i == 0 {
-                Span::styled("❯ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+                Span::styled("❯ ", Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD))
             } else {
-                Span::styled("… ", Style::default().fg(theme::DIM))
+                Span::styled("… ", Style::default().fg(theme::DIM()))
             };
-            out.push(Line::from(vec![prefix, Span::raw(line.clone())]));
+            if i == 0 && self.is_empty() {
+                out.push(Line::from(vec![
+                    prefix,
+                    Span::styled(
+                        "describe a task · / for commands · @ to mention a file",
+                        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            } else {
+                out.push(Line::from(vec![prefix, Span::raw(line.clone())]));
+            }
         }
         let cursor_y = (self.row - first) as u16;
         let cursor_x = 2 + self.lines[self.row]

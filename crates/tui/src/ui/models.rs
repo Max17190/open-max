@@ -134,15 +134,15 @@ pub fn human_bytes(bytes: u64) -> String {
 /// Green under 70% of RAM, yellow under 85%, red above.
 fn fit_dot(bytes: Option<u64>, ram: u64) -> Span<'static> {
     let Some(b) = bytes else {
-        return Span::styled("· ", Style::default().fg(theme::DIM));
+        return Span::styled("· ", Style::default().fg(theme::DIM()));
     };
     let ratio = b as f64 / ram.max(1) as f64;
     let color = if ratio <= 0.70 {
-        theme::OK
+        theme::OK()
     } else if ratio <= 0.85 {
-        theme::WARN
+        theme::WARN()
     } else {
-        theme::ERR
+        theme::ERR()
     };
     Span::styled("● ", Style::default().fg(color))
 }
@@ -163,23 +163,23 @@ fn render_download_line(state: &ModelsState, repo: &str, done: u64, total: u64) 
         let pct = (done as f64 / total as f64 * 100.0).min(100.0);
         let filled = (pct / 100.0 * width as f64) as usize;
         Line::from(vec![
-            Span::styled("pulling ", Style::default().fg(theme::ACCENT)),
+            Span::styled("pulling ", Style::default().fg(theme::ACCENT())),
             Span::raw(format!("{label}  ")),
             Span::styled(
                 format!("▕{}{}▏", "█".repeat(filled), "░".repeat(width.saturating_sub(filled))),
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::ACCENT()),
             ),
             Span::styled(
                 format!("  {pct:>3.0}%  {} / {}", human_bytes(done), human_bytes(total)),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::DIM()),
             ),
         ])
     } else {
         Line::from(vec![
-            Span::styled("pulling ", Style::default().fg(theme::ACCENT)),
+            Span::styled("pulling ", Style::default().fg(theme::ACCENT())),
             Span::raw(format!("{label}  ")),
-            Span::styled(format!("▕{}▏", "░".repeat(width)), Style::default().fg(theme::ACCENT)),
-            Span::styled(format!("  …  {}", human_bytes(done)), Style::default().fg(theme::DIM)),
+            Span::styled(format!("▕{}▏", "░".repeat(width)), Style::default().fg(theme::ACCENT())),
+            Span::styled(format!("  …  {}", human_bytes(done)), Style::default().fg(theme::DIM())),
         ])
     }
 }
@@ -199,10 +199,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
         _ => "server stopped".into(),
     };
     lines.push(Line::from(vec![
-        Span::styled("models", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("models", Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("  ram {}  ·  {}", human_bytes(state.ram_bytes), server),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM()),
         ),
     ]));
 
@@ -211,7 +211,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
     let first = state.selected.saturating_sub(rows_budget.saturating_sub(1));
     for (i, item) in state.items.iter().enumerate().skip(first).take(rows_budget) {
         let marker = if i == state.selected {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT))
+            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
         } else {
             Span::raw("  ")
         };
@@ -236,14 +236,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
                     Style::default()
                 },
             ),
-            Span::styled(format!("{size:>9}  "), Style::default().fg(theme::DIM)),
+            Span::styled(format!("{size:>9}  "), Style::default().fg(theme::DIM())),
         ];
         if serving {
-            spans.push(Span::styled("serving  ", Style::default().fg(theme::OK)));
+            spans.push(Span::styled("serving  ", Style::default().fg(theme::OK())));
         } else if item.installed {
-            spans.push(Span::styled("installed  ", Style::default().fg(theme::DIM)));
+            spans.push(Span::styled("installed  ", Style::default().fg(theme::DIM())));
         }
-        spans.push(Span::styled(clip(&item.note, 46), Style::default().fg(theme::DIM)));
+        spans.push(Span::styled(clip(&item.note, 46), Style::default().fg(theme::DIM())));
         lines.push(Line::from(spans));
     }
 
@@ -252,15 +252,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
         lines.push(render_download_line(state, repo, *done, *total));
     } else if let Some(repo) = &state.confirm_delete {
         lines.push(Line::from(vec![
-            Span::styled("delete ", Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD)),
+            Span::styled("delete ", Style::default().fg(theme::ERR()).add_modifier(Modifier::BOLD)),
             Span::raw(format!("{repo} from disk?  ")),
-            Span::styled("[y] yes  [n] no", Style::default().fg(theme::DIM)),
+            Span::styled("[y] yes  [n] no", Style::default().fg(theme::DIM())),
         ]));
     } else if let Some((msg, is_err)) = &state.footer {
         let style = if *is_err {
-            Style::default().fg(theme::ERR)
+            Style::default().fg(theme::ERR())
         } else {
-            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)
+            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)
         };
         lines.push(Line::from(Span::styled(msg.clone(), style)));
     } else {
@@ -275,7 +275,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
         } else {
             "↑/↓ navigate · enter download or serve · x delete · s stop · u setup · esc close".to_string()
         };
-        lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::DIM))));
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::DIM()))));
     }
 
     Paragraph::new(lines).render(area, frame.buffer_mut());

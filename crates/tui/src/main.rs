@@ -1,5 +1,7 @@
 mod app;
 mod catalog;
+mod clipboard;
+mod completion;
 mod input;
 mod theme;
 mod ui;
@@ -66,6 +68,8 @@ async fn main() -> std::io::Result<()> {
         s.model = model.clone();
         s.mlx_model = model.clone();
     }
+
+    theme::init();
 
     // Fullscreen session on the alternate screen: openmax owns the whole
     // terminal while it runs, and your shell (prompt, history, scrollback)

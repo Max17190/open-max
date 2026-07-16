@@ -16,11 +16,11 @@ fn tok(chars: usize) -> usize {
 
 fn row(label: &str, tokens: usize, detail: &str) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(format!("  {label:<22}"), Style::default().fg(theme::ACCENT)),
+        Span::styled(format!("  {label:<22}"), Style::default().fg(theme::ACCENT())),
         Span::raw(format!("~{tokens:>5} tok")),
     ];
     if !detail.is_empty() {
-        spans.push(Span::styled(format!("   {detail}"), Style::default().fg(theme::DIM)));
+        spans.push(Span::styled(format!("   {detail}"), Style::default().fg(theme::DIM())));
     }
     Line::from(spans)
 }
@@ -39,7 +39,7 @@ pub fn context_block(
     };
     lines.push(Line::from(Span::styled(
         header.to_string(),
-        Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
     )));
 
     let mut total_chars = 0usize;
@@ -79,23 +79,23 @@ pub fn context_block(
 
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(34)),
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::DIM()),
     )));
     lines.push(row("total prompt prefix", tok(total_chars), ""));
 
     if let Some(pct) = cache_pct {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<22}", "cache hit (last turn)"), Style::default().fg(theme::ACCENT)),
+            Span::styled(format!("  {:<22}", "cache hit (last turn)"), Style::default().fg(theme::ACCENT())),
             Span::raw(format!("{pct:>6} %")),
         ]));
     }
     if let Some((used, total)) = budget {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<22}", "context used"), Style::default().fg(theme::ACCENT)),
+            Span::styled(format!("  {:<22}", "context used"), Style::default().fg(theme::ACCENT())),
             Span::raw(format!("~{used:>5} tok")),
             Span::styled(
                 format!("   of {total} ({}%)", (used as f64 / total.max(1) as f64 * 100.0) as u32),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::DIM()),
             ),
         ]));
     }
