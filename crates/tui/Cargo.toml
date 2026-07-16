@@ -1,6 +1,6 @@
 [package]
 name = "open-max-tui"
-description = "Open Max: a minimal terminal harness for local models on Apple Silicon"
+description = "Open Max: barebones high-performance agent harness TUI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -597,8 +597,8 @@ impl App {
                     ("ctrl+o", "expand the last tool output"),
                     ("ctrl+t", "show or hide model thinking"),
                     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
-                    ("/models", "manage and serve local models"),
-                    ("/model <repo>", "use a specific model id"),
+                    ("/models", "manage optional local MLX models"),
+                    ("/model <id>", "use a specific model id"),
                     ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
                     ("/new", "start a fresh session"),
                     ("/context", "prompt token costs, cache hits, and budget"),
@@ -828,6 +828,15 @@ impl App {
                     }
                     _ => None,
                 };
+            }
+            AgentEvent::SubagentProgress { call_id: _, kind, tool, step } => {
+                // Update the running tool card breadcrumb without adding transcript weight.
+                if let Some((name, summary)) = self.running_tool.as_mut() {
+                    if name == "task" {
+                        *summary = format!("{kind} · step {step}: {tool}");
+                        self.needs_redraw = true;
+                    }
+                }
             }
             AgentEvent::ToolStart { call_id, name, args } => {
                 let summary = registry::summarize_call(&name, &args);

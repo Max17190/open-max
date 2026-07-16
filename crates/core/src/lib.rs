@@ -1,6 +1,6 @@
-//! Open Max core: a deliberately small agent harness for local models,
-//! plus management of a local MLX inference server. UI-free; frontends
-//! consume a single event channel.
+//! Open Max core: a deliberately small, high-performance agent harness.
+//! Talks to any OpenAI-compatible endpoint; optionally manages a local MLX
+//! inference server. UI-free; frontends consume a single event channel.
 
 pub mod agent;
 pub mod client;

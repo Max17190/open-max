@@ -75,6 +75,11 @@ pub enum AgentEvent {
     Usage { prompt_tokens: u64, completion_tokens: u64, cached_tokens: Option<u64> },
     ToolStart { call_id: String, name: String, args: serde_json::Value },
     ToolEnd { call_id: String, ok: bool, output: String },
+    /// A `task` subagent's live breadcrumb: which read-only tool it is running,
+    /// tagged with the parent `task` call so the UI can update that card in
+    /// place. Carries no transcript weight — only the final summary (a ToolEnd)
+    /// re-enters the parent's context.
+    SubagentProgress { call_id: String, kind: String, tool: String, step: usize },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     ApprovalRequest { approval_id: String, name: String, summary: String },
     Done { stop_reason: String },

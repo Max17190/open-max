@@ -1,20 +1,23 @@
 # Open Max
 
-**A minimal terminal harness for local coding models on Apple Silicon.**
+**A barebones, high-performance agent harness. Extremely configurable. Full control.**
 
-Open Max is a single Rust binary that runs a focused agent loop in your project directory, streams every tool call to the terminal, and manages an on device [MLX](https://github.com/ml-explore/mlx) server when you want one. No desktop shell, no cloud account, no heavyweight runtime. Just a ~5 MB harness that stays out of the way so your Mac can spend its RAM on the model.
+Open Max is a single Rust binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at any OpenAI-compatible endpoint (cloud or local). No desktop shell, no heavyweight runtime, no telemetry. Just a ~5 MB harness that stays out of the way.
+
+You own the endpoint, the tools, the skills, and the context.
 
 ## Why Open Max
 
-- **Built for MLX MacBooks.** Provisions a private `mlx-lm` environment, downloads Hugging Face weights, and serves models over a local OpenAI compatible API.
-- **A real session.** Open Max takes over the terminal while it runs: a pinned header, the conversation anchored above the composer, wheel scrolling through history. Quit and your shell is exactly as you left it.
-- **Small on purpose.** Seven strict tools, a short system prompt tuned for 7B to 30B models, and context budgeting that drops old tool output before it drops your task.
+- **Barebones by default.** A small fixed tool set (file/shell tools plus a read-only `task` for context isolation), a short system prompt, and context budgeting that drops old tool output before it drops your task. With nothing installed beyond built-ins, the prompt stays minimal.
+- **Extremely configurable.** External tools, skills, and project instructions live in local files. Shape the harness without forking it. Every extension's token cost is visible in `/context`.
+- **Full control.** Settings, sessions, and secrets stay on your machine. Network traffic goes only to the model endpoint you configure (plus optional Hugging Face downloads when you ask). No silent upload, no telemetry.
+- **Any OpenAI-compatible backend.** Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, or a managed on-device [MLX](https://github.com/ml-explore/mlx) server on Apple Silicon when you want one.
 - **Visible by default.** Reads, greps, diffs, and shell commands stream as they happen. Writes and `bash` wait for approval unless you say otherwise.
-- **Bring any backend.** Point `~/.openmax/settings.json` at Ollama, LM Studio, vLLM, llama.cpp, or any other OpenAI compatible endpoint.
+- **A real session.** Fullscreen TUI: pinned header, conversation above the composer, wheel scrolling. Quit and your shell is exactly as you left it.
 
 ## Quick start
 
-**Requirements:** macOS on Apple Silicon, [Rust](https://rustup.rs), and either [uv](https://docs.astral.sh/uv/) or Python 3.9+ (for the managed MLX server).
+**Requirements:** [Rust](https://rustup.rs). For the optional managed MLX server on Apple Silicon, either [uv](https://docs.astral.sh/uv/) or Python 3.9+.
 
 ```sh
 git clone https://github.com/Max17190/open-max.git
@@ -28,19 +31,26 @@ Or run from source:
 cargo run --release -p open-max-tui
 ```
 
-Then, inside a project directory:
+Configure an endpoint (or use the defaults and the optional MLX path below), then inside a project:
 
 ```sh
 cd ~/code/my-app
 openmax
 ```
 
-### First run with MLX
+### Point at your backend
 
-1. Type `/models` to open the model panel.
-2. Press **`u`** once to install `mlx-lm` into `~/.openmax/mlx-venv` (watch progress with `/logs`).
-3. Highlight a model and press **`Enter`**: downloads weights if needed, or starts the server if already cached.
-4. Describe a task. The agent reads your codebase, proposes edits, and asks before mutating files or running shell commands.
+Edit `~/.openmax/settings.json`:
+
+```json
+{
+  "base_url": "http://127.0.0.1:11434/v1",
+  "model": "qwen2.5-coder:7b",
+  "approval_mode": "ask"
+}
+```
+
+Set `base_url` and `model` to match your provider. Any OpenAI-compatible `/v1/chat/completions` endpoint works.
 
 Resume the latest session in the current directory:
 
@@ -53,8 +63,30 @@ openmax -c
 Pick a model for the run:
 
 ```sh
-openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+openmax --model your-model-id
 ```
+
+### Headless (print mode)
+
+Drive the same agent core without taking over the terminal. Useful for scripting and CI:
+
+```sh
+openmax -p "summarize the top-level layout of this repo"
+openmax -p --json "list the public modules in crates/core"
+```
+
+Text tokens go to stdout; tool progress goes to stderr. With `--json`, each `AgentEvent` envelope is one JSON line on stdout. Mutating tools still honor `approval_mode`: for unattended runs set `"approval_mode": "auto"` in settings (otherwise approvals are declined so the process never hangs).
+
+### Optional: first run with managed MLX (Apple Silicon)
+
+When `base_url` is the managed local port (`http://127.0.0.1:8989/v1`, the default), Open Max can provision and serve MLX models:
+
+1. Type `/models` to open the model panel.
+2. Press **`u`** once to install `mlx-lm` into `~/.openmax/mlx-venv` (watch progress with `/logs`).
+3. Highlight a model and press **`Enter`**: downloads weights if needed, or starts the server if already cached.
+4. Describe a task. The agent reads your codebase, proposes edits, and asks before mutating files or running shell commands.
+
+When `base_url` is not the managed MLX port, Open Max talks to your endpoint directly and skips the "serve a model first" gate.
 
 ## Commands
 
@@ -67,13 +99,13 @@ openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 | **Ctrl+O** | Expand last tool output |
 | **Ctrl+T** | Toggle model thinking stream |
 | **Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U / Ctrl+W** | Line editing in the composer |
-| **Ctrl+C** twice | Quit (model server keeps running) |
+| **Ctrl+C** twice | Quit (model server keeps running if you started one) |
 
 | Slash command | Action |
 | --- | --- |
 | `/help` | Show keybindings and commands |
-| `/models` | Download, serve, and manage local models |
-| `/model <repo>` | Set the active Hugging Face repo id |
+| `/models` | Download, serve, and manage local MLX models (Apple Silicon) |
+| `/model <id>` | Set the active model id |
 | `/approvals auto\|ask\|readonly` | Control mutating tool gates |
 | `/new` | Start a fresh session |
 | `/context` | Prompt token costs per component, cache hits, budget |
@@ -83,9 +115,9 @@ openmax --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 
 Inside `/models`: **↑/↓** or **j/k** to move, **Enter** to download or serve, **u** set up MLX, **s** stop server, **x** delete cached weights.
 
-## Recommended models
+## Recommended local models (MLX)
 
-Curated MLX community quantizations that work well as coding agents. RAM fit indicators appear in `/models` based on your machine.
+Curated MLX community quantizations that work well as coding agents. RAM fit indicators appear in `/models` based on your machine. Any other Hugging Face repo id works with `/model <repo>` when using the managed server.
 
 | Model | Approx. RAM | Notes |
 | --- | --- | --- |
@@ -99,25 +131,9 @@ Curated MLX community quantizations that work well as coding agents. RAM fit ind
 | Gemma 4 E4B (4-bit) | ~5.5 GB | Efficient small Gemma 4 |
 | Qwen2.5 Coder 7B (4-bit) | ~4.5 GB | Light starter model |
 
-Any other Hugging Face repo id works with `/model <repo>`.
-
-## Custom endpoints
-
-By default Open Max talks to the managed server at `http://127.0.0.1:8989/v1`. To use another backend, edit `~/.openmax/settings.json`:
-
-```json
-{
-  "base_url": "http://127.0.0.1:11434/v1",
-  "model": "qwen2.5-coder:7b",
-  "approval_mode": "ask"
-}
-```
-
-Set `base_url` and `model` to match your provider. When `base_url` is not the managed MLX port, Open Max skips the serve a model first gate and talks to your endpoint directly.
-
 ## Extending Open Max
 
-Open Max stays bare-bones on purpose; you extend it per workflow, and every extension's token cost is visible in `/context`. With nothing installed, the prompt is exactly the built-in one — extensibility costs zero tokens by default.
+Open Max stays barebones on purpose; you extend it per workflow. With nothing installed, extensibility costs zero tokens by default.
 
 **External tools.** Drop a TOML file in `.openmax/tools/` (project) or `~/.openmax/tools/` (global; project wins on name collision). Any language works: the harness runs `command`, writes the call's JSON arguments to stdin, and returns stdout to the model, with the same output cap and spill-to-file behavior as `bash`.
 
@@ -147,23 +163,32 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
-**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session — the serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/context` tells you which state you are looking at.
+**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/context` tells you which state you are looking at.
 
-**Why no MCP?** A typical MCP server dumps 10k+ tokens of tool descriptions into every request — most of a small model's whole window. The external-tool + skills design gives the same reach with per-call processes and on-demand documentation instead: write a CLI, give it a README (or a skill), and let the model read it when needed.
+**Why no MCP?** A typical MCP server dumps 10k+ tokens of tool descriptions into every request, most of a small model's whole window. External tools plus skills give the same reach with per-call processes and on-demand documentation: write a CLI, give it a README (or a skill), and let the model read it when needed.
+
+## Privacy
+
+Open Max does not phone home. The only network destinations are:
+
+1. The model endpoint in `base_url` (your choice).
+2. Hugging Face, only when you explicitly download or serve a model through `/models`.
+
+Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory.
 
 ## Architecture
 
 ```
 crates/
-  core/                     UI free agent harness + MLX/Hugging Face helpers
+  core/                     UI-free agent harness (+ optional MLX/Hugging Face helpers)
     agent.rs                  Turn loop: stream → tools → approvals → repeat
-    client.rs                 OpenAI compatible streaming client (SSE + JSON fallback)
-    tools.rs                  list_dir · read_file · write_file · edit_file · glob · grep · bash
+    client.rs                 OpenAI-compatible streaming client (SSE + JSON fallback)
+    tools.rs                  list_dir · read_file · write_file · edit_file · glob · grep · bash · task
     registry.rs               Session-frozen tool registry: built-ins + external TOML tools
     skills.rs                 SKILL.md discovery; name+description only in the prompt
-    prompt.rs                 Short system prompt tuned for small local models
+    prompt.rs                 Short system prompt tuned for coding agents
     fallback.rs               Parses tool markup when the server omits native tool_calls
-    mlx.rs                    mlx-lm venv provisioning and server lifecycle
+    mlx.rs                    Optional mlx-lm venv provisioning and server lifecycle
     hf.rs                     Hub cache inspection, downloads, and sizing
     sessions.rs               Persisted sessions under ~/.openmax/sessions/
   tui/                      ratatui + crossterm terminal frontend (`openmax` binary)
@@ -173,13 +198,13 @@ crates/
 
 Design choices worth knowing:
 
-- **The harness is the product.** Fewer, stricter tools measurably help small local models. Tool results stream as events so nothing happens off screen.
+- **The harness is the product.** Fewer, stricter tools keep small models reliable. Tool results stream as events so nothing happens off screen.
 - **Safety by default.** Tools are sandboxed to the project root. `write_file`, `edit_file`, and `bash` require approval in the default `ask` mode; `readonly` blocks mutating tools entirely.
-- **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped — leaving a one-line digest of which tools ran and which files were touched so the model keeps its bearings. The system prompt and your original request survive.
+- **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped, leaving a digest of which tools ran and which files were touched. The system prompt and your original request survive.
 - **Edits that land.** `edit_file` matches exactly first, then retries with whitespace-normalized matching (re-indented to the file), and on a miss points the model at the closest line. Consecutive read-only tool calls run concurrently; Esc kills in-flight commands, not just the stream.
-- **MLX stays decoupled.** The harness talks to `mlx_lm.server` over plain HTTP like any other backend. The sidecar manager makes running it a one step affair inside `/models`.
+- **Local serve stays decoupled.** The harness talks to any OpenAI-compatible HTTP API. The MLX sidecar is optional convenience on Apple Silicon, not the identity of the product.
 
-State lives in `~/.openmax/` (settings, sessions, MLX venv, server metadata).
+State lives in `~/.openmax/` (settings, sessions, optional MLX venv, server metadata).
 
 ## Development
 
@@ -193,7 +218,7 @@ The release profile uses thin LTO and symbol stripping to keep the binary small.
 
 ## Status
 
-Open Max is early software (v0.2.0): the agent loop, MLX integration, session persistence, and TUI are in place, but there is no install script, CI, or published release channel yet. Expect rough edges. File an issue or send a PR if something breaks.
+Open Max is early software (v0.2.0): the agent loop, session persistence, extensibility, and TUI are in place, but there is no install script, CI, or published release channel yet. Expect rough edges. File an issue or send a PR if something breaks.
 
 ## License
 
