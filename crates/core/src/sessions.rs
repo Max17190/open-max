@@ -197,14 +197,20 @@ fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            // Prior content is still in `backup`; put it back before failing.
-            // If restore also fails, leave the `.bak` path in the error so the
-            // previous transcript/index/manifest stays recoverable by path.
+            // Prior content is still in `backup`; put it back at the canonical
+            // path before failing so loaders keep working. Prefer rename; if
+            // that fails (e.g. path recreated/locked), fall back to copy.
             let _ = std::fs::remove_file(&tmp);
-            match std::fs::rename(&backup, path) {
-                Ok(()) => Err(e.to_string()),
-                Err(re) => Err(format!(
-                    "install failed ({e}); restore also failed ({re}); prior data at {}",
+            if std::fs::rename(&backup, path).is_ok() {
+                return Err(e.to_string());
+            }
+            match std::fs::copy(&backup, path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&backup);
+                    Err(e.to_string())
+                }
+                Err(ce) => Err(format!(
+                    "install failed ({e}); restore rename/copy failed ({ce}); prior data at {}",
                     backup.display()
                 )),
             }
