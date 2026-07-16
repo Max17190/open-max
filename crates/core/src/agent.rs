@@ -1209,14 +1209,38 @@ impl MessageGuard {
 
 impl Drop for MessageGuard {
     fn drop(&mut self) {
-        if let Some(messages) = self.messages.take() {
-            if let Ok(mut map) = self.core.sessions.try_lock() {
+        let Some(messages) = self.messages.take() else {
+            return;
+        };
+        match self.core.sessions.try_lock() {
+            Ok(mut map) => {
                 if let Some(data) = map.get_mut(&self.session_id) {
-                    data.messages = messages;
+                    // Only fill the hole this turn's take left; never clobber
+                    // state a newer turn may have installed meanwhile.
+                    if data.messages.is_empty() {
+                        data.messages = messages;
+                    }
                 }
             }
-            // If the lock is held, prefer not to deadlock/panic on Drop.
-            // Disk already has the latest `save_messages` writes for this turn.
+            Err(_) => {
+                // Lock contended mid-unwind. Discarding here would leave the
+                // session entry present-but-empty for the process lifetime
+                // (it never rehydrates from disk once the entry exists), so
+                // hand the restore to the runtime instead.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let core = self.core.clone();
+                    let session_id = std::mem::take(&mut self.session_id);
+                    handle.spawn(async move {
+                        let mut map = core.sessions.lock().await;
+                        if let Some(data) = map.get_mut(&session_id) {
+                            if data.messages.is_empty() {
+                                data.messages = messages;
+                            }
+                        }
+                    });
+                }
+                // No runtime means process teardown; disk saves bound the loss.
+            }
         }
     }
 }
@@ -1637,6 +1661,51 @@ mod tests {
         assert!(!segments[0].concurrent);
         assert!(!segments[1].concurrent);
         assert!(!segments[2].concurrent);
+    }
+
+    #[tokio::test]
+    async fn message_guard_restores_after_contended_drop() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "guard-contended";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let data = build_session_data(&core, id, &project);
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        // Mirror a turn: take the transcript, then drop the guard while
+        // another task holds the sessions lock (abort/unwind under contention).
+        let taken = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            data.messages.push(ChatMessage::user("hello"));
+            std::mem::take(&mut data.messages)
+        };
+        let expected = taken.len();
+        assert!(expected > 0);
+        let guard = MessageGuard::new(core.clone(), id, taken);
+
+        let held = core.sessions.lock().await;
+        drop(guard);
+        drop(held);
+
+        // The restore is handed to a spawned task; give it time to run.
+        let mut restored = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let map = core.sessions.lock().await;
+            restored = map.get(id).unwrap().messages.len();
+            if restored == expected {
+                break;
+            }
+        }
+        assert_eq!(restored, expected, "contended drop must not lose the transcript");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
