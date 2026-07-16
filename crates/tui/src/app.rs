@@ -43,6 +43,9 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const WHEEL_LINES: usize = 3;
 /// Paint-rate cap: coalesce redraw triggers into at most ~60 frames/s.
 const MIN_DRAW_INTERVAL: Duration = Duration::from_millis(16);
+/// Full markdown re-highlight of the live stream is O(n); refresh at this
+/// cadence (and on newlines / width change) so long replies stay smooth.
+const STREAM_MD_INTERVAL: Duration = Duration::from_millis(100);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
@@ -109,6 +112,9 @@ pub struct App {
 
     /// Live assistant stream, markdown-rendered and wrapped (matches final block).
     stream_wrapped: Vec<Line<'static>>,
+    /// Last full markdown render of `stream_text` (throttle re-highlight work).
+    stream_md_at: Instant,
+    stream_md_len: usize,
     thinking_wrapped: Vec<Line<'static>>,
     thinking_source: String,
     tail_width: u16,
@@ -180,6 +186,8 @@ pub async fn run(
         should_quit: false,
         needs_redraw: true,
         stream_wrapped: Vec::new(),
+        stream_md_at: Instant::now(),
+        stream_md_len: 0,
         thinking_wrapped: Vec::new(),
         thinking_source: String::new(),
         tail_width: 0,
@@ -417,6 +425,7 @@ impl App {
         self.queued.clear();
         self.flush_queue = false;
         self.stream_wrapped.clear();
+        self.stream_md_len = 0;
         self.thinking_wrapped.clear();
         self.thinking_source.clear();
         self.tail_width = 0;
@@ -1052,6 +1061,7 @@ impl App {
                 self.stream_chars = 0;
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
+                self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 self.thinking_chars = 0;
                 self.thinking_tail.clear();
@@ -1514,6 +1524,7 @@ impl App {
                 }
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
+                self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
@@ -2077,10 +2088,22 @@ impl App {
             self.tail_stream_len = self.stream_text.len();
             if self.stream_text.is_empty() {
                 self.stream_wrapped.clear();
+                self.stream_md_len = 0;
             } else {
-                // Same renderer as MessageDone so live tokens do not "pop" style.
-                let md = markdown::render(&self.stream_text, markdown::highlighter());
-                self.stream_wrapped = wrap_lines(&md, width);
+                // Throttle full re-highlight: every STREAM_MD_INTERVAL, on
+                // newline, on width change, or first paint of this stream.
+                let due = self.stream_md_at.elapsed() >= STREAM_MD_INTERVAL;
+                let boundary = self.stream_text.ends_with('\n');
+                let first = self.stream_md_len == 0;
+                if width_changed || due || boundary || first {
+                    let md = markdown::render(&self.stream_text, markdown::highlighter());
+                    self.stream_wrapped = wrap_lines(&md, width);
+                    self.stream_md_at = Instant::now();
+                    self.stream_md_len = self.stream_text.len();
+                }
+                // Between throttled highlights, leave prior styled lines; the
+                // next due/newline pass catches up. MessageDone still finalizes
+                // with a full render into the transcript.
             }
         }
 
