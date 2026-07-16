@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build --release -p open-max-tui --locked
+
+      # Soft gate: warn via workflow annotation, but do not fail the job.
+      - name: Check binary size
+        run: |
+          BIN=target/release/openmax
+          MAX_BYTES=$((8 * 1024 * 1024))
+          SIZE=$(stat -c%s "$BIN")
+          SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $SIZE / 1024 / 1024}")
+          echo "Binary size: ${SIZE_MB} MB ($SIZE bytes); soft limit: 8 MB"
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            echo "::warning::openmax binary is ${SIZE_MB} MB (soft limit: 8 MB)"
+          else
+            echo "Binary size is within the 8 MB soft limit."
+          fi
