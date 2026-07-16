@@ -60,8 +60,11 @@ pub struct Registry {
     /// name — deterministic so two builds serialize identically.
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<SkillSpec>,
-    /// Schema array serialized once at freeze time.
+    /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
+    /// Schema array wire form: frozen once so chat request bodies inject the
+    /// exact same tool bytes every iteration without re-serializing Value.
+    schemas_wire: Arc<str>,
     by_name: HashMap<String, usize>,
 }
 
@@ -107,7 +110,14 @@ impl Registry {
             .enumerate()
             .map(|(i, s)| (s.name.clone(), i))
             .collect();
-        Self { tools: tools_list, skills, schemas, by_name }
+        let schemas_wire: Arc<str> = schemas.to_string().into();
+        Self {
+            tools: tools_list,
+            skills,
+            schemas,
+            schemas_wire,
+            by_name,
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
@@ -123,9 +133,16 @@ impl Registry {
         self.tools.iter().map(|s| s.name.clone()).collect()
     }
 
-    /// The OpenAI-format tool schema array, serialized once at freeze time.
+    /// The OpenAI-format tool schema array, frozen once at assemble time.
     pub fn tool_schemas_json(&self) -> &Value {
         &self.schemas
+    }
+
+    /// Pre-serialized OpenAI tool schema array bytes, frozen with the registry.
+    /// Injected into chat request bodies via `RawValue` so multi-iteration turns
+    /// never re-walk the tools array.
+    pub fn tool_schemas_wire(&self) -> &str {
+        &self.schemas_wire
     }
 
     /// Ephemeral read-only registry for a `task` subagent. Mutating tools and
@@ -140,8 +157,15 @@ impl Registry {
             .cloned()
             .collect();
         let schemas = serialize_specs(&tools);
+        let schemas_wire: Arc<str> = schemas.to_string().into();
         let by_name = tools.iter().enumerate().map(|(i, s)| (s.name.clone(), i)).collect();
-        Registry { tools, skills: Vec::new(), schemas, by_name }
+        Registry {
+            tools,
+            skills: Vec::new(),
+            schemas,
+            schemas_wire,
+            by_name,
+        }
     }
 
     pub async fn execute(
@@ -500,6 +524,20 @@ mod tests {
         assert_eq!(
             registry.tool_schemas_json().to_string(),
             tools::tool_schemas().to_string()
+        );
+    }
+
+    #[test]
+    fn tool_schemas_wire_matches_json_string() {
+        let registry = Registry::builtin_only();
+        assert_eq!(
+            registry.tool_schemas_wire(),
+            registry.tool_schemas_json().to_string()
+        );
+        let scoped = registry.scoped(&["list_dir", "read_file", "glob", "grep"]);
+        assert_eq!(
+            scoped.tool_schemas_wire(),
+            scoped.tool_schemas_json().to_string()
         );
     }
 

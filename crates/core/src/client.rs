@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
@@ -12,6 +13,8 @@ use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
 ///
 /// Token limit and stream_options fields follow provider compat flags so
 /// gateways that reject `max_tokens` or unknown `stream_options` stay happy.
+/// Tools are injected as `RawValue` so a frozen registry wire form is embedded
+/// byte-for-byte without re-serializing the tools array.
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
@@ -25,7 +28,7 @@ struct ChatCompletionRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a Value>,
+    tools: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
 }
@@ -37,7 +40,11 @@ struct StreamOptions {
 
 /// Serialize the chat-completion request body once. Honors multi-provider
 /// compat: `max_completion_tokens` vs `max_tokens`, optional `stream_options`,
-/// and tools/`tool_choice` only when `tools` is a non-empty JSON array.
+/// and tools/`tool_choice` only when `tools_wire` is a non-empty JSON array.
+///
+/// `tools_wire` is the frozen registry schema string (exact bytes). It is
+/// injected via `RawValue` so multi-iteration turns keep schema identity for
+/// the server's KV cache without re-walking a `Value` tree.
 fn serialize_chat_request_body(
     model: &str,
     messages: &[ChatMessage],
@@ -45,9 +52,19 @@ fn serialize_chat_request_body(
     max_tokens: usize,
     use_max_completion_tokens: bool,
     send_stream_options: bool,
-    tools: &Value,
+    tools_wire: &str,
 ) -> Result<Vec<u8>, String> {
-    let include_tools = tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    let include_tools = !tools_wire.is_empty() && tools_wire != "[]";
+    // Borrow the frozen wire as RawValue: validation only, no Value rebuild.
+    // Serialize writes these exact bytes into the body.
+    let tools_raw: Option<&RawValue> = if include_tools {
+        Some(
+            serde_json::from_str(tools_wire)
+                .map_err(|e| format!("invalid tools wire JSON: {e}"))?,
+        )
+    } else {
+        None
+    };
     let req = ChatCompletionRequest {
         model,
         messages,
@@ -68,7 +85,7 @@ fn serialize_chat_request_body(
         } else {
             None
         },
-        tools: if include_tools { Some(tools) } else { None },
+        tools: tools_raw,
         tool_choice: if include_tools { Some("auto") } else { None },
     };
     serde_json::to_vec(&req).map_err(|e| format!("failed to serialize chat request: {e}"))
@@ -249,15 +266,20 @@ impl ChatClient {
     /// Stream a chat completion, invoking `on_delta` for each token. Returns the
     /// fully accumulated message. If the server replies with plain JSON instead
     /// of an SSE stream, the response is parsed in one shot.
+    ///
+    /// `tools_wire` is the registry's frozen schema array JSON (`tool_schemas_wire`).
+    /// Pass the same slice every iteration of a turn so the tools field stays
+    /// byte-identical for prompt-cache stability.
     pub async fn stream_chat(
         &self,
         messages: &[ChatMessage],
-        tools: &Value,
+        tools_wire: &str,
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
         // Serialize once before retries: cloning bytes is cheap; re-walking a
         // long transcript into Value (and re-serializing) on every attempt is not.
+        // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
         let body = serialize_chat_request_body(
             &self.model,
@@ -266,7 +288,7 @@ impl ChatClient {
             self.max_tokens,
             self.use_max_completion_tokens,
             self.send_stream_options,
-            tools,
+            tools_wire,
         )?;
 
         // Retry only pre-stream transport failures (connect/timeout) and 429
@@ -584,7 +606,7 @@ mod tests {
             ChatMessage::user("list files"),
             ChatMessage::assistant(Some("calling a tool".into()), None),
         ];
-        let tools = json!([{
+        let tools_wire = json!([{
             "type": "function",
             "function": {
                 "name": "read_file",
@@ -594,7 +616,8 @@ mod tests {
                     "properties": { "path": { "type": "string" } }
                 }
             }
-        }]);
+        }])
+        .to_string();
         // Default compat: max_tokens + stream_options (local OpenAI-compatible).
         let bytes = serialize_chat_request_body(
             "test-model",
@@ -603,7 +626,7 @@ mod tests {
             1024,
             false,
             true,
-            &tools,
+            &tools_wire,
         )
         .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
@@ -617,6 +640,12 @@ mod tests {
         assert_eq!(v["tool_choice"], "auto");
         assert!(v["tools"].as_array().is_some_and(|a| a.len() == 1));
         assert_eq!(v["tools"][0]["function"]["name"], "read_file");
+        // RawValue must embed the frozen wire bytes exactly.
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body.contains(&tools_wire),
+            "body must contain exact tools wire substring"
+        );
 
         let msgs = v["messages"].as_array().expect("messages array");
         assert_eq!(msgs.len(), 3);
@@ -631,12 +660,19 @@ mod tests {
     #[test]
     fn serialize_chat_request_body_omits_tools_when_empty() {
         let messages = vec![ChatMessage::user("hi")];
-        for tools in [json!([]), Value::Null, json!({"not": "array"})] {
+        for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body("m", &messages, 0.0, 64, false, true, &tools).unwrap();
+                serialize_chat_request_body("m", &messages, 0.0, 64, false, true, tools_wire)
+                    .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(v.get("tools").is_none(), "tools should be omitted for {tools:?}");
-            assert!(v.get("tool_choice").is_none(), "tool_choice should be omitted for {tools:?}");
+            assert!(
+                v.get("tools").is_none(),
+                "tools should be omitted for {tools_wire:?}"
+            );
+            assert!(
+                v.get("tool_choice").is_none(),
+                "tool_choice should be omitted for {tools_wire:?}"
+            );
             assert_eq!(v["messages"][0]["content"], "hi");
             assert_eq!(v["stream"], true);
             assert_eq!(v["stream_options"]["include_usage"], true);
@@ -646,21 +682,21 @@ mod tests {
     #[test]
     fn serialize_chat_request_body_is_byte_stable_for_retries() {
         let messages = vec![ChatMessage::user("stable body")];
-        let tools = json!([{
+        let tools_wire = json!([{
             "type": "function",
             "function": { "name": "bash", "parameters": { "type": "object" } }
-        }]);
-        let a =
-            serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools).unwrap();
-        let b =
-            serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools).unwrap();
+        }])
+        .to_string();
+        let a = serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools_wire)
+            .unwrap();
+        let b = serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools_wire)
+            .unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn serialize_respects_max_completion_tokens_and_omits_stream_options() {
         let messages = vec![ChatMessage::user("compat")];
-        let tools = Value::Null;
         let bytes = serialize_chat_request_body(
             "gpt-style",
             &messages,
@@ -668,7 +704,7 @@ mod tests {
             512,
             true,  // use_max_completion_tokens
             false, // send_stream_options
-            &tools,
+            "",    // no tools
         )
         .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
@@ -677,5 +713,26 @@ mod tests {
         assert!(v.get("stream_options").is_none());
         assert_eq!(v["stream"], true);
         assert!(v.get("tools").is_none());
+    }
+
+    #[test]
+    fn registry_tools_wire_embeds_exact_substring_in_body() {
+        let registry = crate::registry::Registry::builtin_only();
+        assert_eq!(
+            registry.tool_schemas_wire(),
+            registry.tool_schemas_json().to_string()
+        );
+        let messages = vec![ChatMessage::user("hi")];
+        let wire = registry.tool_schemas_wire();
+        let bytes =
+            serialize_chat_request_body("m", &messages, 0.0, 64, false, true, wire).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body.contains(wire),
+            "HTTP body must embed the frozen tools wire bytes exactly"
+        );
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["tool_choice"], "auto");
+        assert!(v["tools"].as_array().is_some_and(|a| !a.is_empty()));
     }
 }
