@@ -1368,12 +1368,10 @@ fn enforce_budget(
         // Record dropped messages into the same digest so the note stays a
         // faithful summary of everything removed (not only the first pass).
         total = messages.iter().map(|m| m.estimated_tokens()).sum();
-        let mut extra_drops = false;
         while total > target && messages.len() > 6 {
             let removed = messages.remove(3);
             digest.record_message(&removed);
             total = total.saturating_sub(removed.estimated_tokens());
-            extra_drops = true;
             if removed.role == "assistant" && removed.tool_calls.is_some() {
                 while messages.len() > 3 && messages[3].role == "tool" {
                     let tool = messages.remove(3);
@@ -1382,10 +1380,10 @@ fn enforce_budget(
                 }
             }
         }
-        if extra_drops {
-            if messages.len() > 2 && is_digest_message(&messages[2]) {
-                messages[2] = ChatMessage::user(digest.format());
-            }
+        // Always refresh the note after the drop loop so extra removals are
+        // reflected even when the first-pass note was already inserted above.
+        if messages.len() > 2 && is_digest_message(&messages[2]) {
+            messages[2] = ChatMessage::user(digest.format());
         }
         (true, Some(digest))
     } else {

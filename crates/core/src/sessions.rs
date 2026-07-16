@@ -148,8 +148,15 @@ fn uses_legacy_array_format(path: &PathBuf) -> bool {
 
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
-/// the same `*.tmp`. On Windows, remove the destination first because rename
-/// does not replace an existing path there.
+/// the same `*.tmp`.
+///
+/// Replacement strategy:
+/// 1. Try `rename(tmp → path)` (atomic replace on Unix; works when missing
+///    on every platform).
+/// 2. If that fails and `path` exists (Windows), move `path` aside to a unique
+///    `.bak`, rename `tmp → path`, then drop the backup. If the install rename
+///    fails, restore the backup so a transient error never erases the prior
+///    transcript/index/manifest.
 fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     let parent = path
         .parent()
@@ -160,30 +167,32 @@ fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
         .file_name()
         .ok_or_else(|| "path has no file name".to_string())?
         .to_string_lossy();
-    // Unique per call so concurrent processes cannot share one temp path.
-    let tmp = parent.join(format!(
-        "{base}.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let id = uuid::Uuid::new_v4().simple();
+    let tmp = parent.join(format!("{base}.{id}.tmp"));
     if let Err(e) = std::fs::write(&tmp, bytes.as_ref()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
-    // Unix rename replaces an existing destination. Windows does not: if the
-    // first rename fails and the target exists, remove it and retry once.
+    if std::fs::rename(&tmp, path).is_ok() {
+        return Ok(());
+    }
+    if !path.exists() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("failed to install {}", path.display()));
+    }
+    let backup = parent.join(format!("{base}.{id}.bak"));
+    if let Err(e) = std::fs::rename(path, &backup) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup);
+            Ok(())
+        }
         Err(e) => {
-            if path.exists() {
-                if let Err(re) = std::fs::remove_file(path) {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(re.to_string());
-                }
-                return std::fs::rename(&tmp, path).map_err(|e2| {
-                    let _ = std::fs::remove_file(&tmp);
-                    e2.to_string()
-                });
-            }
+            // Prior content is still in `backup`; put it back before failing.
+            let _ = std::fs::rename(&backup, path);
             let _ = std::fs::remove_file(&tmp);
             Err(e.to_string())
         }
