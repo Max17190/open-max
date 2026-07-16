@@ -1818,15 +1818,6 @@ impl App {
                 };
                 self.dirty.mark_chrome();
             }
-            AgentEvent::SubagentProgress { call_id: _, kind, tool, step } => {
-                // Update the running tool card breadcrumb without adding transcript weight.
-                if let Some((name, summary)) = self.running_tool.as_mut() {
-                    if name == "task" {
-                        *summary = format!("{kind} · step {step}: {tool}");
-                        self.dirty.mark_tail();
-                    }
-                }
-            }
             AgentEvent::ToolStart { call_id, name, args } => {
                 let summary = registry::summarize_call(&name, &args);
                 self.tool_meta.insert(call_id, (name.clone(), summary.clone()));

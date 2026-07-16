@@ -11,7 +11,7 @@ You own the endpoints, the tools, the skills, and the context.
 
 ## Features
 
-- **Small by default.** Eight built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`, and a read only `task` for context isolation. Short system prompt; old tool output is dropped before your task is.
+- **Small by default.** Seven built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and `bash`. Short system prompt; old tool output is dropped before your task is.
 - **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch with `/provider` or `--provider`. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, and process hooks under project or home config. No fork required.
@@ -146,7 +146,7 @@ Core logic is in `open-max-core` (`crates/core/src/agent.rs`). The TUI is `crate
 
 ## Status
 
-Open Max is early software (v0.2.0). The agent loop, session persistence, extensibility, and TUI are in place, but there is no install script, CI, or published release channel yet. Expect rough edges. File an issue or send a PR if something breaks.
+Open Max is early software (v0.2.0). The agent loop, session persistence, extensibility, TUI, and GitHub Actions CI (test + release build + soft size gate) are in place, but there is no install script or published release channel yet. Expect rough edges. File an issue or send a PR if something breaks.
 
 ## License
 
