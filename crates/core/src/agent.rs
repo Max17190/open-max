@@ -10,6 +10,7 @@ use crate::client::{ChatClient, StreamDelta};
 use crate::config::Settings;
 use crate::fallback;
 use crate::hooks::{Hooks, PreToolResult};
+use crate::permissions::{PermissionDecision, Permissions};
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
 use crate::registry::Registry;
 use crate::sessions;
@@ -17,10 +18,6 @@ use crate::state::{CancelToken, Core, SessionData};
 use crate::tools;
 use crate::types::{AgentEvent, ChatMessage, ToolCall};
 
-const MAX_ITERATIONS: usize = 50;
-/// Cap for a `task` child loop: enough for focused exploration without
-/// burning the parent turn's latency budget.
-const MAX_TASK_ITERATIONS: usize = 12;
 /// Read-only tools available to a `task` child. No bash, no writes, no nesting.
 const TASK_TOOLS: &[&str] = &["list_dir", "read_file", "glob", "grep"];
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -143,7 +140,12 @@ where
     segments
 }
 
-fn batchable_call(call: &ToolCall, registry: &Registry, repeat_tracker: &RepeatCallTracker) -> bool {
+fn batchable_call(
+    call: &ToolCall,
+    registry: &Registry,
+    repeat_tracker: &RepeatCallTracker,
+    permissions: &Permissions,
+) -> bool {
     let name = call.function.name.as_str();
     if name.is_empty() || name == tools::TASK_TOOL {
         // `task` spawns a nested model loop; never concurrent with siblings.
@@ -154,6 +156,12 @@ fn batchable_call(call: &ToolCall, registry: &Registry, repeat_tracker: &RepeatC
     };
     if registry.get(name).is_none() || registry.is_mutating(name) {
         return false;
+    }
+    // Ask needs the serial path so the approval UI runs; Deny stays serial for
+    // a single clear error path (batch still handles Deny if it ever arrives).
+    match permissions.evaluate(name, &args) {
+        PermissionDecision::Ask | PermissionDecision::Deny { .. } => return false,
+        PermissionDecision::Allow | PermissionDecision::Default => {}
     }
     let args_key = canonicalize_args(&args);
     !repeat_tracker.would_block(name, &args_key)
@@ -261,6 +269,7 @@ struct ReadonlyBatchCtx<'a> {
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
     hooks: &'a Hooks,
+    permissions: &'a Permissions,
 }
 
 async fn execute_readonly_batch(
@@ -283,17 +292,34 @@ async fn execute_readonly_batch(
             name: name.into(),
             args: args.clone(),
         });
+        // hooks pre → permissions → (readonly tools skip approval_mode)
         let block = match ctx
             .hooks
             .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
             .await
         {
-            PreToolResult::Allow => None,
             PreToolResult::Block { reason } => Some(tools::ToolOutcome {
                 ok: false,
                 output: reason,
                 diff: None,
             }),
+            PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
+                PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
+                    ok: false,
+                    output: reason,
+                    diff: None,
+                }),
+                // Ask is excluded from batching (see batchable_call); if it
+                // still lands here, block rather than silently auto-run.
+                PermissionDecision::Ask => Some(tools::ToolOutcome {
+                    ok: false,
+                    output: "permission rule requires approval; re-run outside a concurrent batch"
+                        .into(),
+                    diff: None,
+                }),
+                // Allow/Default: readonly batch tools are non-mutating.
+                PermissionDecision::Allow | PermissionDecision::Default => None,
+            },
         };
         blocked.push(block);
     }
@@ -571,20 +597,24 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint);
-    let schemas = registry.tool_schemas_json();
+    // Frozen wire form once per turn: every iteration injects the same tool
+    // schema bytes without re-serializing the Value array.
+    let schemas_wire = registry.tool_schemas_wire();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
-    // Discover once per turn start; empty dir is a cheap no-op. Hooks never
-    // enter the prompt, so reloading on the next user turn is fine.
+    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
+    // and permissions never enter the prompt, so reloading next turn is fine.
     let hooks = Hooks::discover(project_root);
+    let permissions = Permissions::discover(project_root);
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
     let mut repeat_tracker = RepeatCallTracker::new();
     let context_tokens = endpoint.context_tokens;
     let max_tokens = endpoint.max_tokens;
+    let max_iterations = settings.max_agent_iterations.max(1);
 
-    'turns: for _ in 0..MAX_ITERATIONS {
+    'turns: for _ in 0..max_iterations {
         let (budget_changed, compaction) = enforce_budget(
             guard.messages(),
             context_tokens.saturating_sub(max_tokens + 1024),
@@ -598,7 +628,7 @@ async fn run_loop(
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let result = client
-            .stream_chat(guard.messages(), schemas, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -653,7 +683,7 @@ async fn run_loop(
         }
 
         let segments = partition_concurrent_runs(&tool_calls, |call| {
-            batchable_call(call, &registry, &repeat_tracker)
+            batchable_call(call, &registry, &repeat_tracker, &permissions)
         });
 
         'calls: for segment in segments {
@@ -671,6 +701,7 @@ async fn run_loop(
                     caps,
                     cancelled: cancelled.clone(),
                     hooks: &hooks,
+                    permissions: &permissions,
                 };
                 execute_readonly_batch(
                     &batch_ctx,
@@ -721,7 +752,8 @@ async fn run_loop(
                     args: args.clone(),
                 });
 
-                // Hooks run before approval so a deny never prompts the user.
+                // Order: hooks pre → permissions → approval_mode → execute.
+                // Denies never prompt the user.
                 if let PreToolResult::Block { reason } = hooks
                     .pre_tool_use(session_id, name, &args, project_root, &cancelled)
                     .await
@@ -742,6 +774,24 @@ async fn run_loop(
                     continue;
                 }
 
+                let perm = permissions.evaluate(name, &args);
+                if let PermissionDecision::Deny { reason } = &perm {
+                    core.send_agent(session_id, AgentEvent::ToolEnd {
+                        call_id: call.id.clone(),
+                        ok: false,
+                        output: reason.clone(),
+                    });
+                    guard.messages().push(ChatMessage::tool(
+                        call.id.clone(),
+                        tool_message_content(&tools::ToolOutcome {
+                            ok: false,
+                            output: reason.clone(),
+                            diff: None,
+                        }),
+                    ));
+                    continue;
+                }
+
                 if registry.is_mutating(name) {
                     snapshot_file(core, session_id, project_root, &args).await;
                 }
@@ -749,6 +799,10 @@ async fn run_loop(
                 // Read live so "[a]lways" during an approval prompt takes effect
                 // for the rest of this turn, not just the next one.
                 let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
+                // Allow skips the approval prompt; Ask forces it (even in auto).
+                // Readonly still blocks mutating tools regardless of Allow.
+                let force_allow = matches!(perm, PermissionDecision::Allow);
+                let force_ask = matches!(perm, PermissionDecision::Ask);
                 let mut executed = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == "readonly" {
                     (tools::ToolOutcome {
@@ -756,11 +810,32 @@ async fn run_loop(
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None,
                     }, false)
-                } else if registry.is_mutating(name) && approval_mode == "ask" {
+                } else if !force_allow
+                    && (force_ask || (registry.is_mutating(name) && approval_mode == "ask"))
+                {
                     match request_approval(core, session_id, name, &args, &cancelled).await {
                         ApprovalOutcome::Approved => {
                             executed = true;
-                            (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                            if name == tools::TASK_TOOL {
+                                let outcome = run_task_subagent(
+                                    core,
+                                    session_id,
+                                    &call.id,
+                                    project_root,
+                                    &registry,
+                                    &args,
+                                    &settings,
+                                    caps,
+                                    cancelled.clone(),
+                                    &hooks,
+                                    &permissions,
+                                )
+                                .await;
+                                // Nested Ask cancel must stop the parent turn too.
+                                (outcome, cancelled.is_cancelled())
+                            } else {
+                                (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                            }
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
@@ -780,22 +855,22 @@ async fn run_loop(
                     }
                 } else if name == tools::TASK_TOOL {
                     executed = true;
-                    (
-                        run_task_subagent(
-                            core,
-                            session_id,
-                            &call.id,
-                            project_root,
-                            &registry,
-                            &args,
-                            &settings,
-                            caps,
-                            cancelled.clone(),
-                            &hooks,
-                        )
-                        .await,
-                        false,
+                    let outcome = run_task_subagent(
+                        core,
+                        session_id,
+                        &call.id,
+                        project_root,
+                        &registry,
+                        &args,
+                        &settings,
+                        caps,
+                        cancelled.clone(),
+                        &hooks,
+                        &permissions,
                     )
+                    .await;
+                    // Nested Ask cancel (or Esc during child tools) stops the parent turn.
+                    (outcome, cancelled.is_cancelled())
                 } else {
                     executed = true;
                     (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
@@ -867,8 +942,8 @@ async fn run_loop(
 
 /// Run a read-only `task` child agent. The parent context receives only the
 /// final summary (via ToolEnd); child tool churn stays out of the parent window.
-/// Child tool calls go through the same lifecycle hooks as the parent loop so
-/// project policy cannot be bypassed via delegation.
+/// Child tool calls go through the same lifecycle hooks and permission rules as
+/// the parent loop so project policy cannot be bypassed via delegation.
 async fn run_task_subagent(
     core: &Arc<Core>,
     parent_session_id: &str,
@@ -880,6 +955,7 @@ async fn run_task_subagent(
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
     hooks: &Hooks,
+    permissions: &Permissions,
 ) -> tools::ToolOutcome {
     let kind = args["subagent"].as_str().unwrap_or("explore");
     let prompt = args["prompt"].as_str().unwrap_or("").trim();
@@ -900,7 +976,8 @@ async fn run_task_subagent(
         return tools::ToolOutcome::err("task has no read-only tools available in this session");
     }
     let known_tools: Vec<&str> = child_registry.tools.iter().map(|s| s.name.as_str()).collect();
-    let schemas = child_registry.tool_schemas_json().clone();
+    // Scoped freeze wire: same bytes every subagent iteration.
+    let schemas_wire = child_registry.tool_schemas_wire();
     let root = project_root.to_string_lossy();
     let system = match kind {
         "search" => format!(
@@ -936,14 +1013,15 @@ async fn run_task_subagent(
         .min(12_000);
     let mut last_text = String::new();
     let mut step = 0usize;
+    let max_task_iterations = settings.max_task_iterations.max(1);
 
-    for _ in 0..MAX_TASK_ITERATIONS {
+    for _ in 0..max_task_iterations {
         if cancelled.is_cancelled() {
             return tools::ToolOutcome::err("The user cancelled this turn.");
         }
         let _ = enforce_budget(&mut messages, child_budget);
         let result = client
-            .stream_chat(&messages, &schemas, cancelled.clone(), |_| {})
+            .stream_chat(&messages, schemas_wire, cancelled.clone(), |_| {})
             .await;
         let result = match result {
             Ok(r) => r,
@@ -973,8 +1051,10 @@ async fn run_task_subagent(
 
         // Same concurrent read-only batching as the parent loop: child tools are
         // all non-mutating, so multi-call steps (list_dir+grep+read) run in parallel.
+        // Ask/Deny permission rules force the serial path (batchable_call).
+        let empty_tracker = RepeatCallTracker::new();
         let segments = partition_concurrent_runs(&tool_calls, |call| {
-            batchable_call(call, &child_registry, &RepeatCallTracker::new())
+            batchable_call(call, &child_registry, &empty_tracker, permissions)
         });
 
         for segment in segments {
@@ -1004,12 +1084,26 @@ async fn run_task_subagent(
                         .pre_tool_use(parent_session_id, name, &args, project_root, &cancelled)
                         .await
                     {
-                        PreToolResult::Allow => None,
                         PreToolResult::Block { reason } => Some(tools::ToolOutcome {
                             ok: false,
                             output: reason,
                             diff: None,
                         }),
+                        PreToolResult::Allow => match permissions.evaluate(name, &args) {
+                            PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
+                                ok: false,
+                                output: reason,
+                                diff: None,
+                            }),
+                            // Ask is excluded from batching; fail closed if it appears.
+                            PermissionDecision::Ask => Some(tools::ToolOutcome {
+                                ok: false,
+                                output: "permission rule requires approval; re-run outside a concurrent batch"
+                                    .into(),
+                                diff: None,
+                            }),
+                            PermissionDecision::Allow | PermissionDecision::Default => None,
+                        },
                     };
                     parsed.push((args, block));
                 }
@@ -1088,7 +1182,7 @@ async fn run_task_subagent(
                         continue;
                     }
                 };
-                // Same pre/post hooks as the outer loop: lifecycle gates apply to
+                // Same pre hooks + permissions as the outer loop: policy applies to
                 // delegated tools, not only direct parent calls.
                 if let PreToolResult::Block { reason } = hooks
                     .pre_tool_use(parent_session_id, name, &call_args, project_root, &cancelled)
@@ -1103,6 +1197,54 @@ async fn run_task_subagent(
                         }),
                     ));
                     continue;
+                }
+                match permissions.evaluate(name, &call_args) {
+                    PermissionDecision::Deny { reason } => {
+                        messages.push(ChatMessage::tool(
+                            call.id.clone(),
+                            tool_message_content(&tools::ToolOutcome {
+                                ok: false,
+                                output: reason,
+                                diff: None,
+                            }),
+                        ));
+                        continue;
+                    }
+                    PermissionDecision::Ask => {
+                        // Same approval channel as the parent loop so Ask cannot be
+                        // bypassed by wrapping the call in task.
+                        match request_approval(core, parent_session_id, name, &call_args, &cancelled)
+                            .await
+                        {
+                            ApprovalOutcome::Approved => {}
+                            ApprovalOutcome::Declined => {
+                                messages.push(ChatMessage::tool(
+                                    call.id.clone(),
+                                    tool_message_content(&tools::ToolOutcome {
+                                        ok: false,
+                                        output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
+                                        diff: None,
+                                    }),
+                                ));
+                                continue;
+                            }
+                            ApprovalOutcome::TimedOut => {
+                                messages.push(ChatMessage::tool(
+                                    call.id.clone(),
+                                    tool_message_content(&tools::ToolOutcome {
+                                        ok: false,
+                                        output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
+                                        diff: None,
+                                    }),
+                                ));
+                                continue;
+                            }
+                            ApprovalOutcome::Cancelled => {
+                                return tools::ToolOutcome::err("The user cancelled this turn.");
+                            }
+                        }
+                    }
+                    PermissionDecision::Allow | PermissionDecision::Default => {}
                 }
                 let outcome = child_registry
                     .execute(name, &call_args, project_root, caps, cancelled.clone())
@@ -1618,7 +1760,10 @@ mod tests {
             tool_call("glob", r#"{"pattern":"**/*.rs"}"#),
             tool_call("grep", r#"{"pattern":"fn"}"#),
         ];
-        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &registry, &tracker));
+        let empty_perms = Permissions::default();
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &empty_perms)
+        });
         assert_eq!(segments.len(), 3);
         assert!(segments[0].concurrent && segments[0].start == 0 && segments[0].end == 2);
         assert!(!segments[1].concurrent && segments[1].start == 2 && segments[1].end == 3);
@@ -1630,13 +1775,16 @@ mod tests {
         let parent = Registry::builtin_only();
         let child = parent.scoped(TASK_TOOLS);
         let tracker = RepeatCallTracker::new();
+        let empty_perms = Permissions::default();
         let calls = vec![
             tool_call("list_dir", r#"{"path":"."}"#),
             tool_call("read_file", r#"{"path":"a.rs"}"#),
             tool_call("glob", r#"{"pattern":"**/*.rs"}"#),
             tool_call("grep", r#"{"pattern":"fn"}"#),
         ];
-        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &child, &tracker));
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &child, &tracker, &empty_perms)
+        });
         assert_eq!(segments.len(), 1);
         assert!(segments[0].concurrent);
         assert_eq!((segments[0].start, segments[0].end), (0, 4));
@@ -1645,12 +1793,14 @@ mod tests {
         assert!(!batchable_call(
             &tool_call("write_file", r#"{"path":"x","content":"y"}"#),
             &child,
-            &tracker
+            &tracker,
+            &empty_perms,
         ));
         assert!(!batchable_call(
             &tool_call(tools::TASK_TOOL, r#"{"prompt":"x","subagent":"explore"}"#),
             &child,
-            &tracker
+            &tracker,
+            &empty_perms,
         ));
     }
 
@@ -1659,7 +1809,10 @@ mod tests {
         let registry = Registry::builtin_only();
         let tracker = RepeatCallTracker::new();
         let calls = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
-        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &registry, &tracker));
+        let empty_perms = Permissions::default();
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &empty_perms)
+        });
         assert_eq!(segments.len(), 1);
         assert!(!segments[0].concurrent);
     }
@@ -1677,7 +1830,10 @@ mod tests {
             },
             tool_call("nope", r#"{"x":1}"#),
         ];
-        let segments = partition_concurrent_runs(&calls, |c| batchable_call(c, &registry, &tracker));
+        let empty_perms = Permissions::default();
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &empty_perms)
+        });
         assert_eq!(segments.len(), 3);
         assert!(!segments[0].concurrent);
         assert!(!segments[1].concurrent);

@@ -115,9 +115,13 @@ Drive the same agent core without taking over the terminal. Useful for scripting
 ```sh
 openmax -p "summarize the top-level layout of this repo"
 openmax -p --json "list the public modules in crates/core"
+# multi-turn on one session (repeat -p):
+openmax -p "list the crates" -p "summarize the first one"
 ```
 
-Text tokens go to stdout; tool progress goes to stderr. With `--json`, each `AgentEvent` envelope is one JSON line on stdout. Mutating tools still honor `approval_mode`: for unattended runs set `"approval_mode": "auto"` in settings (otherwise approvals are declined so the process never hangs).
+Text tokens go to stdout; tool progress goes to stderr. With `--json`, each `AgentEvent` envelope is one JSON line on stdout (multiple turns run sequentially). Mutating tools still honor `approval_mode`: for unattended runs set `"approval_mode": "auto"` in settings (otherwise approvals are declined so the process never hangs).
+
+Agent loop caps are configurable in `settings.json` (defaults match prior hard-coded values): `"max_agent_iterations": 50` for the main turn loop, `"max_task_iterations": 12` for `task` subagents. Values are clamped to at least 1 when used.
 
 ### Optional: first run with managed MLX (Apple Silicon)
 
@@ -237,7 +241,26 @@ tool = "bash"          # optional filter; omit to run for every tool
 timeout_secs = 5
 ```
 
-**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/tools`, `/skills`, and `/context` show the frozen set and its token cost. Hooks are re-discovered each turn and do not affect schemas.
+**Permissions.** Optional declarative rules in `.openmax/permissions.toml` (project) or `~/.openmax/permissions.toml` (global). Missing files change nothing. Project rules are evaluated before global; the first match wins. Rules refine ask/auto without forking: deny dangerous calls, auto-allow safe ones, or force an approval prompt on specific tools. Evaluation order per tool call is hooks pre → permissions → `approval_mode` → execute → hooks post. `allow` still cannot override `readonly` for mutating tools. Rules also apply inside a `task` subagent (including `ask`, which reuses the same approval UI). A malformed permissions file fails closed (all tools denied) rather than dropping the policy.
+
+```toml
+# .openmax/permissions.toml
+[[rules]]
+effect = "deny"          # allow | deny | ask
+tool = "bash"
+arg_regex = "rm\\s+-rf"  # optional; omit to match any args for the tool
+
+[[rules]]
+effect = "allow"
+tool = "bash"
+arg_regex = "^cargo (test|check|build)"
+
+[[rules]]
+effect = "ask"
+tool = "write_file"
+```
+
+**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/tools`, `/skills`, and `/context` show the frozen set and its token cost. Hooks and permissions are re-discovered each turn and do not affect schemas.
 
 **Why no MCP?** A typical MCP server dumps 10k+ tokens of tool descriptions into every request, most of a small model's whole window. External tools plus skills give the same reach with per-call processes and on-demand documentation: write a CLI, give it a README (or a skill), and let the model read it when needed.
 
@@ -261,6 +284,7 @@ crates/
     tools.rs                  list_dir · read_file · write_file · edit_file · glob · grep · bash · task
     registry.rs               Session-frozen tool registry: built-ins + external TOML tools
     hooks.rs                  Optional pre/post tool process hooks
+    permissions.rs            Optional permissions.toml allow/deny/ask rules
     skills.rs                 SKILL.md discovery; name+description only in the prompt
     prompt.rs                 Short system prompt tuned for coding agents
     fallback.rs               Parses tool markup when the server omits native tool_calls

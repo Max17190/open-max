@@ -8,6 +8,7 @@ pub mod config;
 pub mod fallback;
 pub mod hf;
 pub mod hooks;
+pub mod permissions;
 pub mod mlx;
 pub mod prompt;
 pub mod providers;

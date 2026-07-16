@@ -51,6 +51,60 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
 const CORE_DRAIN_MAX: usize = 32;
 
+/// Fine-grained redraw reasons so spinner ticks can skip history rebuilds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Dirty {
+    /// Finished transcript (blocks, scroll, selection, fold).
+    chat: bool,
+    /// Live stream / thinking / running-tool / spinner meta.
+    tail: bool,
+    /// Header, composer, status, popups, approval, models/sessions chrome.
+    chrome: bool,
+}
+
+impl Dirty {
+    fn all() -> Self {
+        Self {
+            chat: true,
+            tail: true,
+            chrome: true,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.chat || self.tail || self.chrome
+    }
+
+    fn mark_chat(&mut self) {
+        self.chat = true;
+        self.tail = true;
+    }
+
+    fn mark_tail(&mut self) {
+        self.tail = true;
+    }
+
+    fn mark_chrome(&mut self) {
+        self.chrome = true;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Viewport fingerprint for reusing the history portion of `chat_buf`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistReuseKey {
+    hist_len: usize,
+    start: usize,
+    hist_view_end: usize,
+    sticky: bool,
+    focus_scroll: bool,
+    selected: Option<usize>,
+    width: u16,
+}
+
 pub struct Args {
     pub continue_session: bool,
 }
@@ -112,7 +166,7 @@ pub struct App {
     hf_tx: mpsc::UnboundedSender<(String, u64)>,
     files_tx: mpsc::UnboundedSender<Vec<String>>,
     should_quit: bool,
-    needs_redraw: bool,
+    dirty: Dirty,
 
     /// Live assistant stream, markdown-rendered and wrapped (matches final block).
     stream_wrapped: Vec<Line<'static>>,
@@ -126,6 +180,9 @@ pub struct App {
     tail_stream_len: usize,
     tail_buf: Vec<Line<'static>>,
     chat_buf: Vec<Line<'static>>,
+    /// Lines in `chat_buf` that are sticky + history (before live tail).
+    hist_prefix_len: usize,
+    hist_reuse_key: Option<HistReuseKey>,
     status_model: String,
     status_approvals: String,
     status_ready: bool,
@@ -190,7 +247,7 @@ pub async fn run(
         hf_tx,
         files_tx,
         should_quit: false,
-        needs_redraw: true,
+        dirty: Dirty::all(),
         stream_wrapped: Vec::new(),
         stream_md_at: Instant::now(),
         stream_md_len: 0,
@@ -201,6 +258,8 @@ pub async fn run(
         tail_stream_len: 0,
         tail_buf: Vec::new(),
         chat_buf: Vec::new(),
+        hist_prefix_len: 0,
+        hist_reuse_key: None,
         status_model: String::new(),
         status_approvals: String::new(),
         status_ready: false,
@@ -260,7 +319,7 @@ pub async fn run(
                     Some(TermEvent::Resize(_, _)) => {
                         // Terminals emit resize storms mid-drag; rewrapping
                         // the transcript on each one is wasted layout work.
-                        app.needs_redraw = true;
+                        app.dirty = Dirty::all();
                         draw_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
                     }
                     Some(e) => app.on_term_event(e).await?,
@@ -269,13 +328,13 @@ pub async fn run(
             }
             Some((repo, bytes)) = hf_rx.recv() => {
                 app.models.set_remote_size(&repo, bytes);
-                app.needs_redraw = true;
+                app.dirty.mark_chrome();
             }
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
                 app.sync_completion();
-                app.needs_redraw = true;
+                app.dirty.mark_chrome();
             }
             _ = tick.tick(), if app.tick_armed() => app.on_tick().await,
             _ = tokio::time::sleep_until(
@@ -285,14 +344,14 @@ pub async fn run(
         if app.should_quit {
             break;
         }
-        if app.needs_redraw {
+        if app.dirty.any() {
             let now = Instant::now();
             let deferred = draw_deadline.is_some_and(|d| now < d);
             if !deferred && now.duration_since(last_draw) >= MIN_DRAW_INTERVAL {
                 draw_frame(&mut terminal, &mut app)?;
                 last_draw = now;
                 draw_deadline = None;
-                app.needs_redraw = false;
+                app.dirty.clear();
             } else if draw_deadline.is_none() {
                 draw_deadline = Some(last_draw + MIN_DRAW_INTERVAL);
             }
@@ -440,7 +499,11 @@ impl App {
         self.tail_content_len = 0;
         self.tail_stream_len = 0;
         self.tail_buf.clear();
+        self.hist_prefix_len = 0;
+        self.hist_reuse_key = None;
         self.transcript.follow();
+        self.dirty.mark_chat();
+        self.dirty.mark_chrome();
     }
 
     // ---------- terminal events ----------
@@ -449,13 +512,17 @@ impl App {
         match event {
             TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
                 self.on_key(key).await?;
-                self.needs_redraw = true;
+                // Keys can mutate many regions; mark specifically in handlers
+                // when possible, otherwise fall back to a full redraw.
+                if !self.dirty.any() {
+                    self.dirty = Dirty::all();
+                }
             }
             TermEvent::Paste(text) => {
                 if self.mode == Mode::Chat && self.pending_approval.is_none() {
                     self.composer.insert_str(&text);
                     self.sync_completion();
-                    self.needs_redraw = true;
+                    self.dirty.mark_chrome();
                 }
             }
             TermEvent::Mouse(m) => {
@@ -463,17 +530,17 @@ impl App {
                     match m.kind {
                         MouseEventKind::ScrollUp => {
                             self.transcript.scroll_up(WHEEL_LINES);
-                            self.needs_redraw = true;
+                            self.dirty.mark_chat();
                         }
                         MouseEventKind::ScrollDown => {
                             self.transcript.scroll_down(WHEEL_LINES);
-                            self.needs_redraw = true;
+                            self.dirty.mark_chat();
                         }
                         _ => {}
                     }
                 }
             }
-            TermEvent::Resize(_, _) => self.needs_redraw = true,
+            TermEvent::Resize(_, _) => self.dirty = Dirty::all(),
             _ => {}
         }
         Ok(())
@@ -1212,6 +1279,8 @@ impl App {
             // queue back to the composer.
             self.queued.push(text);
             self.transcript.follow();
+            self.dirty.mark_chat();
+            self.dirty.mark_chrome();
             return Ok(());
         }
 
@@ -1256,6 +1325,8 @@ impl App {
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
                 self.thinking_wrapped.clear();
+                self.dirty.mark_chat();
+                self.dirty.mark_chrome();
             }
             Err(e) => self.error(&e),
         }
@@ -1278,6 +1349,7 @@ impl App {
                     })
                     .collect();
                 self.transcript.push(block);
+                self.dirty.mark_chat();
             }
             "theme" => match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
                 Some("light" | "day") => {
@@ -1304,6 +1376,7 @@ impl App {
                 self.models.refresh();
                 self.models.status = Some(mlx::status(&self.core).await);
                 self.fetch_missing_sizes();
+                self.dirty.mark_chrome();
             }
             "model" => match rest.first() {
                 Some(repo) => {
@@ -1616,10 +1689,12 @@ impl App {
             CoreEvent::Download(ev) => match ev {
                 DownloadEvent::Progress { repo, done_bytes, total_bytes } => {
                     self.models.download = Some((repo, done_bytes, total_bytes));
+                    self.dirty.mark_chrome();
                 }
                 DownloadEvent::Done { ok, message, .. } => {
                     self.models.download = None;
                     self.models.refresh();
+                    self.dirty.mark_chrome();
                     if ok {
                         self.note(&message);
                     } else {
@@ -1642,7 +1717,6 @@ impl App {
                 }
             }
         }
-        self.needs_redraw = true;
     }
 
     /// Move queued messages into the composer (in front of any draft) so
@@ -1658,6 +1732,7 @@ impl App {
             text.push_str(&self.composer.text());
         }
         self.composer.load(&text);
+        self.dirty.mark_chrome();
         self.note("queued input returned to the composer");
     }
 
@@ -1681,6 +1756,7 @@ impl App {
             meta,
             Style::default().fg(theme::DIM()),
         ))]);
+        self.dirty.mark_chat();
     }
 
     fn on_agent_event(&mut self, event: AgentEvent) {
@@ -1689,6 +1765,7 @@ impl App {
                 self.first_token.get_or_insert_with(Instant::now);
                 self.stream_chars += text.len();
                 self.stream_text.push_str(&text);
+                self.dirty.mark_tail();
             }
             AgentEvent::Thinking { text } => {
                 self.first_token.get_or_insert_with(Instant::now);
@@ -1703,6 +1780,7 @@ impl App {
                     }
                     self.thinking_tail.drain(..cut);
                 }
+                self.dirty.mark_tail();
             }
             AgentEvent::MessageDone { text } => {
                 if !text.trim().is_empty() {
@@ -1720,9 +1798,16 @@ impl App {
                 self.thinking_source.clear();
                 self.thinking_wrapped.clear();
                 self.thinking_chars = 0;
+                // Caches above are already empty, so rebuild_tail would not see a
+                // stream_changed edge; drop the stitched tail content here so the
+                // finished assistant body is not still painted under the spinner.
+                self.tail_content_len = 0;
+                self.tail_buf.clear();
+                self.dirty.mark_chat();
             }
             AgentEvent::Budget { used_tokens, context_tokens } => {
                 self.budget = Some((used_tokens, context_tokens));
+                self.dirty.mark_chrome();
             }
             AgentEvent::Usage { prompt_tokens, cached_tokens, .. } => {
                 self.cache_pct = match cached_tokens {
@@ -1731,13 +1816,14 @@ impl App {
                     }
                     _ => None,
                 };
+                self.dirty.mark_chrome();
             }
             AgentEvent::SubagentProgress { call_id: _, kind, tool, step } => {
                 // Update the running tool card breadcrumb without adding transcript weight.
                 if let Some((name, summary)) = self.running_tool.as_mut() {
                     if name == "task" {
                         *summary = format!("{kind} · step {step}: {tool}");
-                        self.needs_redraw = true;
+                        self.dirty.mark_tail();
                     }
                 }
             }
@@ -1745,6 +1831,7 @@ impl App {
                 let summary = registry::summarize_call(&name, &args);
                 self.tool_meta.insert(call_id, (name.clone(), summary.clone()));
                 self.running_tool = Some((name, summary));
+                self.dirty.mark_tail();
             }
             AgentEvent::Diff { call_id, path, diff, added, removed } => {
                 self.pending_diffs.insert(call_id, DiffText { path, diff, added, removed });
@@ -1761,6 +1848,7 @@ impl App {
                 self.last_tool_output = Some(output);
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
+                self.dirty.mark_chat();
             }
             AgentEvent::ApprovalRequest {
                 approval_id,
@@ -1770,6 +1858,7 @@ impl App {
             } => {
                 self.pending_approval = Some((approval_id, name, summary, detail));
                 self.completion = None;
+                self.dirty.mark_chrome();
             }
             AgentEvent::ApprovalSettled {
                 approval_id,
@@ -1781,6 +1870,7 @@ impl App {
                     .is_some_and(|(id, _, _, _)| id == &approval_id)
                 {
                     self.pending_approval = None;
+                    self.dirty.mark_chrome();
                     match outcome.as_str() {
                         "timed_out" => self.note("approval timed out · declined"),
                         "cancelled" => self.note("approval cancelled"),
@@ -1792,6 +1882,9 @@ impl App {
                 self.running = false;
                 self.running_tool = None;
                 self.pending_approval = None;
+                // Spinner/status clear plus any transcript note/stats.
+                self.dirty.mark_chat();
+                self.dirty.mark_chrome();
                 match stop_reason.as_str() {
                     "stop" | "tool_calls" => self.push_turn_stats(),
                     "cancelled" => self.note("cancelled"),
@@ -1812,6 +1905,7 @@ impl App {
             }
             AgentEvent::Error { message } => {
                 self.pending_approval = None;
+                self.dirty.mark_chrome();
                 self.error(&message);
             }
         }
@@ -1836,6 +1930,7 @@ impl App {
         }
         if self.mode == Mode::Models {
             self.models.status = Some(mlx::status(&self.core).await);
+            self.dirty.mark_chrome();
         }
     }
 
@@ -1845,14 +1940,18 @@ impl App {
 
     async fn on_tick(&mut self) {
         self.tick_i += 1;
-        if self.running || self.models.download.is_some() {
+        if self.running {
             self.spinner_i = (self.spinner_i + 1) % SPINNER.len();
-            self.needs_redraw = true;
+            // Spinner lives in the live tail; history stays reusable.
+            self.dirty.mark_tail();
+        } else if self.models.download.is_some() {
+            self.spinner_i = (self.spinner_i + 1) % SPINNER.len();
+            self.dirty.mark_chrome();
         }
         // Refresh server status occasionally while the panel is open.
         if self.mode == Mode::Models && self.tick_i.is_multiple_of(16) {
             self.models.status = Some(mlx::status(&self.core).await);
-            self.needs_redraw = true;
+            self.dirty.mark_chrome();
         }
     }
 
@@ -1872,22 +1971,26 @@ impl App {
             ]));
         }
         self.transcript.push_user(lines);
+        self.dirty.mark_chat();
     }
 
     fn note(&mut self, text: &str) {
         if self.mode == Mode::Models {
             self.models.footer = Some((text.to_string(), false));
+            self.dirty.mark_chrome();
         } else {
             self.transcript.push(vec![Line::from(Span::styled(
                 text.to_string(),
                 Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
             ))]);
+            self.dirty.mark_chat();
         }
     }
 
     fn error(&mut self, text: &str) {
         if self.mode == Mode::Models {
             self.models.footer = Some((text.to_string(), true));
+            self.dirty.mark_chrome();
         } else {
             let mut lines = Vec::new();
             for (i, l) in text.lines().enumerate() {
@@ -1898,6 +2001,7 @@ impl App {
                 )));
             }
             self.transcript.push(lines);
+            self.dirty.mark_chat();
         }
     }
 
@@ -2194,8 +2298,13 @@ impl App {
 
     /// Finished transcript plus the live tail, bottom anchored, honoring the
     /// scroll offset (0 follows the latest output).
+    ///
+    /// When only the live tail is dirty (spinner / tokens), the history prefix
+    /// of `chat_buf` is reused and the tail is re-stitched.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let content_w = area.width.saturating_sub(1).max(8);
+        let chat_dirty = self.dirty.chat;
+
         self.transcript.set_width(content_w);
         let tail_len = self.rebuild_tail(content_w);
 
@@ -2208,37 +2317,55 @@ impl App {
         let end = total - offset;
         let start = end.saturating_sub(visible);
 
-        let sticky = if offset > 0 {
-            self.transcript.sticky_user_line(start)
-        } else {
-            None
-        };
+        // Fingerprint sticky presence without cloning spans; clone only if we rebuild.
+        let has_sticky = offset > 0 && self.transcript.has_sticky_user(start);
         let focus_scroll = self.focus == Focus::Scrollback;
+        let selected = self.transcript.selected();
+        let hist_view_end = end.min(hist_len);
+        let reuse_key = HistReuseKey {
+            hist_len,
+            start,
+            hist_view_end,
+            sticky: has_sticky,
+            focus_scroll,
+            selected,
+            width: content_w,
+        };
 
-        // Collect indices first, then clone lines (avoids borrow fights).
-        self.chat_buf.clear();
-        if let Some(s) = sticky {
-            let mut spans = vec![Span::styled("┊ ", Style::default().fg(theme::DIM()))];
-            spans.extend(s.spans.iter().cloned());
-            self.chat_buf.push(Line::from(spans));
+        let rebuild_hist = chat_dirty
+            || self.hist_reuse_key != Some(reuse_key)
+            || self.hist_prefix_len > self.chat_buf.len();
+
+        if rebuild_hist {
+            self.chat_buf.clear();
+            // One clone of sticky spans: take ownership and insert the gutter.
+            if has_sticky {
+                if let Some(mut s) = self.transcript.sticky_user_line(start) {
+                    s.spans
+                        .insert(0, Span::styled("┊ ", Style::default().fg(theme::DIM())));
+                    self.chat_buf.push(s);
+                }
+            }
+            let budget = visible.saturating_sub(self.chat_buf.len());
+            let view_end = start.saturating_add(budget).min(hist_view_end);
+            let selected_bi = if focus_scroll { selected } else { None };
+            // Single clone per viewport history line (reuse path skips this).
+            self.transcript
+                .fill_viewport(&mut self.chat_buf, start, view_end, selected_bi);
+            self.hist_prefix_len = self.chat_buf.len();
+            self.hist_reuse_key = Some(reuse_key);
+        } else {
+            self.chat_buf.truncate(self.hist_prefix_len);
         }
+
+        // Stitch visible tail after the history prefix.
         let budget = visible.saturating_sub(self.chat_buf.len());
-        let mut idx = start;
+        let mut idx = start.max(hist_len);
         let mut taken = 0usize;
         while taken < budget && idx < end {
-            if idx < hist_len {
-                let selected = focus_scroll && self.transcript.is_selected_block_for_line(idx);
-                let mut line = self.transcript.lines()[idx].clone();
-                if selected {
-                    line.spans
-                        .insert(0, Span::styled("▌", Style::default().fg(theme::ACCENT())));
-                }
-                self.chat_buf.push(line);
-            } else {
-                let ti = idx - hist_len;
-                if ti < self.tail_buf.len() {
-                    self.chat_buf.push(self.tail_buf[ti].clone());
-                }
+            let ti = idx - hist_len;
+            if ti < self.tail_buf.len() {
+                self.chat_buf.push(self.tail_buf[ti].clone());
             }
             idx += 1;
             taken += 1;
@@ -2295,14 +2422,21 @@ impl App {
         let md_pending =
             !self.stream_text.is_empty() && self.stream_md_len != self.stream_text.len();
         let md_due = self.stream_md_at.elapsed() >= STREAM_MD_INTERVAL;
-        let stream_changed = width_changed || self.stream_text.len() != self.tail_stream_len;
+        let mut stream_changed = width_changed || self.stream_text.len() != self.tail_stream_len;
         if self.stream_text.is_empty() {
             if self.tail_stream_len != 0 || !self.stream_wrapped.is_empty() {
                 self.stream_wrapped.clear();
                 self.stream_md_len = 0;
                 self.tail_stream_len = 0;
+                stream_changed = true;
             }
         } else if stream_changed || (md_pending && md_due) || width_changed {
+            // Throttled markdown refresh can rewrite wraps without stream_text
+            // growing; still treat that as a content change so tail_buf copies
+            // the new wraps (not only the spinner line).
+            if md_pending && md_due {
+                stream_changed = true;
+            }
             self.tail_stream_len = self.stream_text.len();
             let boundary = self.stream_text.ends_with('\n');
             let first = self.stream_md_len == 0;
@@ -2643,5 +2777,73 @@ fn truncate_replay_output(output: &str) -> String {
         output.to_string()
     } else {
         format!("{}\n…", lines[..MAX_LINES].join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dirty;
+
+    #[test]
+    fn dirty_default_is_clean() {
+        let d = Dirty::default();
+        assert!(!d.any());
+        assert!(!d.chat && !d.tail && !d.chrome);
+    }
+
+    #[test]
+    fn dirty_all_sets_every_region() {
+        let d = Dirty::all();
+        assert!(d.any());
+        assert!(d.chat && d.tail && d.chrome);
+    }
+
+    #[test]
+    fn mark_chat_also_marks_tail() {
+        let mut d = Dirty::default();
+        d.mark_chat();
+        assert!(d.chat);
+        assert!(d.tail);
+        assert!(!d.chrome);
+        assert!(d.any());
+    }
+
+    #[test]
+    fn mark_tail_is_isolated() {
+        let mut d = Dirty::default();
+        d.mark_tail();
+        assert!(!d.chat);
+        assert!(d.tail);
+        assert!(!d.chrome);
+    }
+
+    #[test]
+    fn mark_chrome_is_isolated() {
+        let mut d = Dirty::default();
+        d.mark_chrome();
+        assert!(!d.chat);
+        assert!(!d.tail);
+        assert!(d.chrome);
+    }
+
+    #[test]
+    fn clear_resets_all_flags() {
+        let mut d = Dirty::all();
+        d.clear();
+        assert!(!d.any());
+        assert_eq!(d, Dirty::default());
+    }
+
+    #[test]
+    fn any_true_when_only_one_region_set() {
+        let mut d = Dirty::default();
+        d.mark_tail();
+        assert!(d.any());
+        d.clear();
+        d.mark_chrome();
+        assert!(d.any());
+        d.clear();
+        d.mark_chat();
+        assert!(d.any());
     }
 }
