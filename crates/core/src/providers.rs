@@ -162,8 +162,28 @@ pub fn list_provider_names(data_dir: &Path) -> Vec<String> {
     load_providers(data_dir).into_keys().collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    /// Settings named a provider that is not in providers.json (or the file is bad).
+    UnknownProvider(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::UnknownProvider(name) => write!(
+                f,
+                "unknown provider '{name}': add it to ~/.openmax/providers.json or clear settings.provider"
+            ),
+        }
+    }
+}
+
 /// Resolve the active OpenAI-compatible endpoint from settings + providers.json.
-pub fn resolve(settings: &Settings, data_dir: &Path) -> ActiveEndpoint {
+///
+/// When `settings.provider` is set, that name must exist. Silent fallback to
+/// flat `base_url` would send traffic to the wrong endpoint.
+pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
     let providers = load_providers(data_dir);
     let provider_name = settings
         .provider
@@ -172,53 +192,69 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> ActiveEndpoint {
         .filter(|s| !s.is_empty());
 
     if let Some(ref name) = provider_name {
-        if let Some(p) = providers.get(name) {
-            let model_entry = p.models.iter().find(|m| m.id == settings.model);
-            let context_tokens = model_entry
-                .and_then(|m| m.context_tokens)
-                .unwrap_or(settings.context_tokens);
-            let max_tokens = model_entry
-                .and_then(|m| m.max_tokens)
-                .unwrap_or(settings.max_tokens);
-            let api_key = resolve_api_key(
-                p.api_key.as_deref(),
-                &p.api_key_env,
-                settings.api_key.as_deref(),
-            );
-            let headers = expand_headers(&p.headers);
-            return ActiveEndpoint {
-                provider: Some(name.clone()),
-                base_url: p.base_url.clone(),
-                api_key,
-                headers,
-                model: settings.model.clone(),
-                context_tokens,
-                max_tokens,
-                temperature: settings.temperature,
-                compat: p.compat.clone(),
-            };
-        }
+        let Some(p) = providers.get(name) else {
+            return Err(ResolveError::UnknownProvider(name.clone()));
+        };
+        let model_entry = p.models.iter().find(|m| m.id == settings.model);
+        let context_tokens = model_entry
+            .and_then(|m| m.context_tokens)
+            .unwrap_or(settings.context_tokens)
+            .max(1);
+        let mut max_tokens = model_entry
+            .and_then(|m| m.max_tokens)
+            .unwrap_or(settings.max_tokens)
+            .max(1);
+        // Keep room for system + task history; never let max_tokens eat the window.
+        let max_allowed = context_tokens.saturating_sub(2048).max(1);
+        max_tokens = max_tokens.min(max_allowed);
+        let api_key = resolve_api_key(
+            p.api_key.as_deref(),
+            &p.api_key_env,
+            settings.api_key.as_deref(),
+        );
+        let headers = expand_headers(&p.headers);
+        return Ok(ActiveEndpoint {
+            provider: Some(name.clone()),
+            base_url: p.base_url.clone(),
+            api_key,
+            headers,
+            model: settings.model.clone(),
+            context_tokens,
+            max_tokens,
+            temperature: settings.temperature,
+            compat: p.compat.clone(),
+        });
     }
 
-    // Flat settings path (and unknown provider name fallback).
-    ActiveEndpoint {
-        provider: provider_name.filter(|n| providers.contains_key(n)),
+    // Flat settings path when no provider is selected.
+    let context_tokens = settings.context_tokens.max(1);
+    let max_allowed = context_tokens.saturating_sub(2048).max(1);
+    let max_tokens = settings.max_tokens.max(1).min(max_allowed);
+    Ok(ActiveEndpoint {
+        provider: None,
         base_url: settings.base_url.clone(),
         api_key: resolve_api_key(None, &[], settings.api_key.as_deref()),
         headers: Vec::new(),
         model: settings.model.clone(),
-        context_tokens: settings.context_tokens,
-        max_tokens: settings.max_tokens,
+        context_tokens,
+        max_tokens,
         temperature: settings.temperature,
         compat: CompatFlags::defaults_for_missing(),
-    }
+    })
 }
 
-/// True when the resolved URL is the managed local MLX port.
+/// True when the resolved URL is the managed local MLX port (host is loopback).
 pub fn is_managed_mlx(endpoint: &ActiveEndpoint, mlx_port: u16) -> bool {
     let port = if mlx_port == 0 { DEFAULT_MLX_PORT } else { mlx_port };
-    endpoint.base_url.contains(&format!("127.0.0.1:{port}"))
-        || endpoint.base_url.contains(&format!("localhost:{port}"))
+    let s = endpoint.base_url.trim();
+    let rest = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let authority = rest.split('/').next().unwrap_or("").split('@').next_back().unwrap_or("");
+    authority.eq_ignore_ascii_case(&format!("127.0.0.1:{port}"))
+        || authority.eq_ignore_ascii_case(&format!("localhost:{port}"))
+        || authority.eq_ignore_ascii_case(&format!("[::1]:{port}"))
 }
 
 fn resolve_api_key(
@@ -257,11 +293,17 @@ fn resolve_api_key(
     None
 }
 
-/// Expand `$ENV_VAR` or return the literal (trimmed). Empty → None.
+/// Expand secrets:
+/// - `$$...` → literal starting with `$` (escape)
+/// - `$ENV_VAR` → environment value
+/// - otherwise literal (trimmed). Empty → None.
 fn expand_secret(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
         return None;
+    }
+    if let Some(rest) = s.strip_prefix("$$") {
+        return Some(format!("${rest}"));
     }
     if let Some(rest) = s.strip_prefix('$') {
         let name = rest.trim();
@@ -280,7 +322,11 @@ fn expand_headers(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
             if key.is_empty() {
                 return None;
             }
-            let val = expand_secret(v).unwrap_or_default();
+            // Skip headers whose secret env is unset rather than sending empty values.
+            let val = expand_secret(v)?;
+            if val.is_empty() {
+                return None;
+            }
             Some((key.to_string(), val))
         })
         .collect()
@@ -304,7 +350,7 @@ mod tests {
         s.base_url = "http://127.0.0.1:11434/v1".into();
         s.model = "qwen".into();
         s.api_key = Some("k".into());
-        let ep = resolve(&s, &dir);
+        let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.base_url, "http://127.0.0.1:11434/v1");
         assert_eq!(ep.model, "qwen");
         assert_eq!(ep.api_key.as_deref(), Some("k"));
@@ -333,7 +379,7 @@ mod tests {
         s.provider = Some("or".into());
         s.model = "m1".into();
         s.base_url = "http://ignored".into();
-        let ep = resolve(&s, &dir);
+        let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.provider.as_deref(), Some("or"));
         assert_eq!(ep.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(ep.api_key.as_deref(), Some("sk-test"));
@@ -367,26 +413,35 @@ mod tests {
         );
         let mut s = Settings::default();
         s.provider = Some("a".into());
-        let ep = resolve(&s, &dir);
+        let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.api_key.as_deref(), Some("from-env"));
         s.provider = Some("b".into());
-        let ep = resolve(&s, &dir);
+        let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.api_key.as_deref(), Some("from-env"));
         std::env::remove_var(&var);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn unknown_provider_falls_back_to_flat_base_url() {
+    fn unknown_provider_errors() {
         let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
         write_providers(&dir, r#"{"providers":{}}"#);
         let mut s = Settings::default();
         s.provider = Some("missing".into());
         s.base_url = "http://flat/v1".into();
-        let ep = resolve(&s, &dir);
-        assert_eq!(ep.base_url, "http://flat/v1");
-        assert!(ep.provider.is_none());
+        let err = resolve(&s, &dir).unwrap_err();
+        assert!(matches!(err, ResolveError::UnknownProvider(_)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dollar_escape_and_skip_empty_header_env() {
+        assert_eq!(expand_secret("$$secret").as_deref(), Some("$secret"));
+        let mut map = BTreeMap::new();
+        map.insert("X-A".into(), "$NO_SUCH_OPENMAX_ENV_VAR_ZZZ".into());
+        map.insert("X-B".into(), "ok".into());
+        let headers = expand_headers(&map);
+        assert_eq!(headers, vec![("X-B".into(), "ok".into())]);
     }
 
     #[test]
@@ -406,5 +461,31 @@ mod tests {
         let mut remote = ep.clone();
         remote.base_url = "https://api.example.com/v1".into();
         assert!(!is_managed_mlx(&remote, DEFAULT_MLX_PORT));
+        // Path must not trigger false positive.
+        remote.base_url = "https://api.example.com/v1/127.0.0.1:8989".into();
+        assert!(!is_managed_mlx(&remote, DEFAULT_MLX_PORT));
+    }
+
+    #[test]
+    fn clamps_max_tokens_below_context() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(
+            &dir,
+            r#"{
+              "providers": {
+                "tiny": {
+                  "base_url": "http://t/v1",
+                  "models": [{ "id": "m", "context_tokens": 2048, "max_tokens": 100000 }]
+                }
+              }
+            }"#,
+        );
+        let mut s = Settings::default();
+        s.provider = Some("tiny".into());
+        s.model = "m".into();
+        let ep = resolve(&s, &dir).unwrap();
+        assert!(ep.max_tokens + 1024 < ep.context_tokens || ep.context_tokens <= 2048);
+        assert!(ep.max_tokens <= ep.context_tokens.saturating_sub(2048).max(1));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

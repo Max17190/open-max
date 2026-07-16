@@ -91,7 +91,7 @@ Set `base_url` and `model` to match your server. Any OpenAI-compatible `/v1/chat
 }
 ```
 
-Then in `settings.json` set `"provider": "ollama"` (or switch later with `/provider openrouter`). Credential resolution per provider: `api_key` (literal or `$ENV`) → `api_key_env` → settings `api_key` → `OPENMAX_API_KEY`.
+Then in `settings.json` set `"provider": "ollama"` (or switch later with `/provider openrouter`). Credential resolution per provider: `api_key` (literal or `$ENV`; use `$$` for a literal leading `$`) → `api_key_env` → settings `api_key` → `OPENMAX_API_KEY`. An unknown `provider` name fails the request instead of falling back to flat `base_url`.
 
 Resume the latest session in the current directory:
 

@@ -517,8 +517,16 @@ async fn run_loop(
     };
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
-    // apply without restarting the process.
-    let endpoint = crate::providers::resolve(&settings, &core.data_dir);
+    // apply without restarting the process. An explicit but unknown provider
+    // fails closed rather than silently hitting flat base_url.
+    let endpoint = match crate::providers::resolve(&settings, &core.data_dir) {
+        Ok(ep) => ep,
+        Err(e) => {
+            core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
+            core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
+            return;
+        }
+    };
     let client = ChatClient::from_endpoint(&endpoint);
     let schemas = registry.tool_schemas_json();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
@@ -864,7 +872,10 @@ async fn run_task_subagent(
         ChatMessage::system(system),
         ChatMessage::user(prompt.to_string()),
     ];
-    let mut endpoint = crate::providers::resolve(settings, &core.data_dir);
+    let mut endpoint = match crate::providers::resolve(settings, &core.data_dir) {
+        Ok(ep) => ep,
+        Err(e) => return tools::ToolOutcome::err(e.to_string()),
+    };
     endpoint.max_tokens = endpoint.max_tokens.min(2048);
     let client = ChatClient::from_endpoint(&endpoint);
     let child_budget = endpoint

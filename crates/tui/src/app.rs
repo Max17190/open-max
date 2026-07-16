@@ -1021,8 +1021,10 @@ impl App {
         // server and it is not serving yet, guide to /models instead of erroring.
         let (managed, ready) = {
             let s = self.core.settings.lock().unwrap();
-            let ep = open_max_core::providers::resolve(&s, &self.core.data_dir);
-            let managed = open_max_core::providers::is_managed_mlx(&ep, s.mlx_port);
+            let managed = match open_max_core::providers::resolve(&s, &self.core.data_dir) {
+                Ok(ep) => open_max_core::providers::is_managed_mlx(&ep, s.mlx_port),
+                Err(_) => false,
+            };
             (managed, self.core.mlx.lock().unwrap().ready)
         };
         if managed && !ready {
@@ -1154,26 +1156,35 @@ impl App {
                     }
                     Some(name) => {
                         let name = name.to_string();
-                        if !names.iter().any(|n| n == &name) {
+                        let providers = open_max_core::providers::load_providers(&self.core.data_dir);
+                        let Some(p) = providers.get(&name) else {
                             self.note(&format!(
                                 "unknown provider '{name}'; define it in ~/.openmax/providers.json"
                             ));
-                        } else {
-                            {
-                                let mut s = self.core.settings.lock().unwrap();
-                                s.provider = Some(name.clone());
-                                // If the catalog has models and current model is empty-ish, leave model as-is.
-                                let _ = config::save(&self.core.data_dir, &s);
+                            return;
+                        };
+                        {
+                            let mut s = self.core.settings.lock().unwrap();
+                            s.provider = Some(name.clone());
+                            // Keep the model only if it is still in this catalog;
+                            // otherwise switch to the first listed model.
+                            if !p.models.is_empty() && !p.models.iter().any(|m| m.id == s.model) {
+                                s.model = p.models[0].id.clone();
+                                s.mlx_model = s.model.clone();
                             }
-                            let ep = {
-                                let s = self.core.settings.lock().unwrap();
-                                open_max_core::providers::resolve(&s, &self.core.data_dir)
-                            };
-                            self.note(&format!(
+                            let _ = config::save(&self.core.data_dir, &s);
+                        }
+                        let ep = {
+                            let s = self.core.settings.lock().unwrap();
+                            open_max_core::providers::resolve(&s, &self.core.data_dir)
+                        };
+                        match ep {
+                            Ok(ep) => self.note(&format!(
                                 "provider {name} → {} ({})",
                                 extensions::display_base_url(&ep.base_url),
                                 ep.model
-                            ));
+                            )),
+                            Err(e) => self.note(&e.to_string()),
                         }
                     }
                 }
@@ -1301,18 +1312,35 @@ impl App {
                     .budget
                     .map(|(u, t)| format!("{}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                     .unwrap_or_else(|| "0%".into());
-                let endpoint = extensions::display_base_url(&ep.base_url);
-                let host = extensions::endpoint_host(&ep.base_url)
-                    .unwrap_or_else(|| endpoint.clone());
-                let provider = ep.provider.as_deref().unwrap_or("(flat base_url)");
+                let (provider, model, endpoint, host, context_tokens) = match &ep {
+                    Ok(ep) => {
+                        let endpoint = extensions::display_base_url(&ep.base_url);
+                        let host = extensions::endpoint_host(&ep.base_url)
+                            .unwrap_or_else(|| endpoint.clone());
+                        (
+                            ep.provider.as_deref().unwrap_or("(flat base_url)").to_string(),
+                            ep.model.clone(),
+                            endpoint,
+                            host,
+                            ep.context_tokens,
+                        )
+                    }
+                    Err(e) => (
+                        format!("error: {e}"),
+                        s.model.clone(),
+                        extensions::display_base_url(&s.base_url),
+                        extensions::endpoint_host(&s.base_url).unwrap_or_else(|| s.base_url.clone()),
+                        s.context_tokens,
+                    ),
+                };
                 let block = vec![
-                    kv("provider", provider),
-                    kv("model", &ep.model),
+                    kv("provider", &provider),
+                    kv("model", &model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
                     kv("server", &server),
                     kv("approvals", &s.approval_mode),
-                    kv("context", &format!("{ctx} of {} tokens", ep.context_tokens)),
+                    kv("context", &format!("{ctx} of {} tokens", context_tokens)),
                     kv("session", self.session_id.as_deref().unwrap_or("none yet")),
                     kv("project", &self.project.display().to_string()),
                     kv("data", &self.core.data_dir.display().to_string()),
@@ -1871,20 +1899,20 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let version = env!("CARGO_PKG_VERSION");
+        // Avoid reading providers.json on every redraw; header uses settings only.
         let (model, base_url, approvals, provider) = {
             let s = self.core.settings.lock().unwrap();
-            let ep = open_max_core::providers::resolve(&s, &self.core.data_dir);
             (
-                ep.model,
-                ep.base_url,
+                s.model.clone(),
+                s.base_url.clone(),
                 s.approval_mode.clone(),
-                ep.provider,
+                s.provider.clone(),
             )
         };
         let model = extensions::short_model(&model);
         let host = extensions::endpoint_host(&base_url).unwrap_or_else(|| "endpoint".into());
         let endpoint = if let Some(p) = provider {
-            format!("{p}:{model}@{host}")
+            format!("{p}:{model}")
         } else {
             format!("{model}@{host}")
         };

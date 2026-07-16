@@ -105,6 +105,11 @@ async fn main() -> std::io::Result<()> {
             s.model = model.clone();
             s.mlx_model = model.clone();
         }
+        // Fail fast on an explicit but unknown --provider (no silent flat fallback).
+        if let Err(e) = open_max_core::providers::resolve(&s, &core.data_dir) {
+            eprintln!("openmax: {e}");
+            std::process::exit(2);
+        }
     }
 
     if cli.print {
