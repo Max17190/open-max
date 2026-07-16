@@ -885,16 +885,36 @@ impl App {
     }
 
     fn refilter_scroll_search(&mut self) {
+        self.refilter_scroll_search_inner(true);
+    }
+
+    /// Refresh matches when the transcript grows under an open find bar.
+    /// Keeps the current block selected if it still matches.
+    fn refilter_scroll_search_live(&mut self) {
+        if self.scroll_search.is_none() {
+            return;
+        }
+        self.refilter_scroll_search_inner(false);
+    }
+
+    fn refilter_scroll_search_inner(&mut self, prefer_latest: bool) {
         let texts = self.transcript.all_block_search_texts();
         {
             let Some((query, selected, matches)) = &mut self.scroll_search else {
                 return;
             };
+            let prev_bi = matches.get(*selected).copied();
             *matches = filter_matching_indices(&texts, query);
             if matches.is_empty() {
                 *selected = 0;
+            } else if prefer_latest {
+                *selected = matches.len() - 1;
+            } else if let Some(bi) = prev_bi {
+                *selected = matches
+                    .iter()
+                    .position(|&m| m == bi)
+                    .unwrap_or(matches.len() - 1);
             } else {
-                // Prefer the latest match when the query changes.
                 *selected = matches.len() - 1;
             }
         }
@@ -1690,6 +1710,7 @@ impl App {
                         &text,
                         markdown::highlighter(),
                     ));
+                    self.refilter_scroll_search_live();
                 }
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
@@ -1739,6 +1760,7 @@ impl App {
                 self.transcript.push_tool(compact, output.clone());
                 self.last_tool_output = Some(output);
                 self.running_tool = None;
+                self.refilter_scroll_search_live();
             }
             AgentEvent::ApprovalRequest {
                 approval_id,

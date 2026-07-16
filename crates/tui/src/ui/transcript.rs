@@ -456,8 +456,8 @@ impl Transcript {
         let text = self.block_search_text(i)?;
         let q = query.trim();
         if !q.is_empty() {
-            let q_low = q.to_ascii_lowercase();
-            if let Some(line) = text.lines().find(|l| l.to_ascii_lowercase().contains(&q_low)) {
+            let q_low = q.to_lowercase();
+            if let Some(line) = text.lines().find(|l| l.to_lowercase().contains(&q_low)) {
                 return Some(line.trim().to_string());
             }
         }
@@ -565,11 +565,11 @@ pub fn filter_matching_indices(texts: &[String], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..texts.len()).collect();
     }
-    let q = query.to_ascii_lowercase();
+    let q = query.to_lowercase();
     texts
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.to_ascii_lowercase().contains(&q))
+        .filter(|(_, t)| t.to_lowercase().contains(&q))
         .map(|(i, _)| i)
         .collect()
 }
