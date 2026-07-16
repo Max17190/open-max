@@ -45,7 +45,7 @@ fn split_base_url(base_url: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a, &rest[a.len()..]), // keeps leading '/'
+        Some((a, _)) => (a, &rest[a.len()..]), // keeps leading '/'
         None => (rest, ""),
     };
     Some((scheme, authority, path))
