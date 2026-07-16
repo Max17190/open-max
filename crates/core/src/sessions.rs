@@ -146,28 +146,46 @@ fn uses_legacy_array_format(path: &PathBuf) -> bool {
     head[..n].iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| *b == b'[')
 }
 
-/// Write `bytes` via a same-directory temp file + rename so readers never see
-/// a partial target. On rename failure the temp file is cleaned up.
+/// Write `bytes` via a unique same-directory temp file + rename so readers
+/// never see a partial target. Unique names avoid two processes clobbering
+/// the same `*.tmp`. On Windows, remove the destination first because rename
+/// does not replace an existing path there.
 fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
-    let tmp = {
-        let mut p = path.clone();
-        let name = format!(
-            "{}.tmp",
-            path.file_name()
-                .ok_or_else(|| "path has no file name".to_string())?
-                .to_string_lossy()
-        );
-        p.set_file_name(name);
-        p
-    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base = path
+        .file_name()
+        .ok_or_else(|| "path has no file name".to_string())?
+        .to_string_lossy();
+    // Unique per call so concurrent processes cannot share one temp path.
+    let tmp = parent.join(format!(
+        "{base}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
     if let Err(e) = std::fs::write(&tmp, bytes.as_ref()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })
+    // Unix rename replaces; Windows requires the destination absent first.
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.to_string());
+            }
+        }
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.to_string())
+        }
+    }
 }
 
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
@@ -180,8 +198,11 @@ fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
 }
 
 fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
-    // Serialize the whole tail first, then one write. On partial write failure
-    // truncate back to the pre-append length so a later retry does not dupe.
+    // Serialize the whole tail first, then one write under exclusive ownership
+    // of the file handle. We never truncate on failure: another process could
+    // have appended past our start, and set_len would erase their lines. A
+    // partial write leaves a corrupt tail that load_messages skips; the caller
+    // does not advance `persisted`, and the next rewrite path heals the file.
     let mut buf = String::new();
     for msg in messages {
         buf.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
@@ -192,12 +213,8 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> 
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    use std::io::{Seek, SeekFrom};
-    let start = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
-    if let Err(e) = file.write_all(buf.as_bytes()).and_then(|_| file.flush()) {
-        let _ = file.set_len(start);
-        return Err(e.to_string());
-    }
+    file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -290,8 +307,12 @@ pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
 
 /// Persist messages. Appends only new tail lines when possible; rewrites the
 /// whole file after budget trimming, legacy migration, or message drops.
+///
+/// Serializes disk access with `sessions_lock` so concurrent turns in the same
+/// process cannot interleave appends or rewrites of the same file.
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
     let path = messages_path(core, id);
+    let _guard = core.sessions_lock.lock().unwrap();
     let migrate = path.exists() && uses_legacy_array_format(&path);
     let needs_rewrite = rewrite || migrate || messages.len() < *persisted;
 
