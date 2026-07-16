@@ -290,6 +290,61 @@ impl Transcript {
         self.scroll_to_block(prev);
     }
 
+    /// Jump to the next user-turn block after the current selection.
+    pub fn select_next_user(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let start = self.selected.map(|i| i + 1).unwrap_or(0);
+        if let Some(i) = (start..self.blocks.len()).find(|&i| self.blocks[i].kind == BlockKind::User)
+        {
+            self.selected = Some(i);
+            self.scroll_to_block(i);
+        }
+    }
+
+    /// Jump to the previous user-turn block before the current selection.
+    pub fn select_prev_user(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let end = self
+            .selected
+            .unwrap_or_else(|| self.blocks.len().saturating_sub(1));
+        if let Some(i) = (0..=end)
+            .rev()
+            .find(|&i| self.blocks[i].kind == BlockKind::User && Some(i) != self.selected)
+        {
+            self.selected = Some(i);
+            self.scroll_to_block(i);
+            return;
+        }
+        // If nothing before selection, land on the nearest user at or before end.
+        if let Some(i) = (0..=end)
+            .rev()
+            .find(|&i| self.blocks[i].kind == BlockKind::User)
+        {
+            self.selected = Some(i);
+            self.scroll_to_block(i);
+        }
+    }
+
+    /// Select the first block and scroll toward the top of history.
+    /// Offset is lines-from-bottom; a large value is clamped to the top in draw.
+    pub fn select_first(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        self.selected = Some(0);
+        self.ensure_flat();
+        self.offset = self.wrapped.len();
+    }
+
+    /// Follow the latest output and clear selection (bottom of scrollback).
+    pub fn select_last_follow(&mut self) {
+        self.follow();
+    }
+
     fn scroll_to_block(&mut self, bi: usize) {
         self.ensure_flat();
         let Some(&start) = self.block_starts.get(bi) else {

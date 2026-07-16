@@ -1,5 +1,6 @@
 //! Theme tokens for the TUI. One accent identity; everything else stays
-//! neutral. `/theme dark|light|mono` switches at runtime; `NO_COLOR` forces mono.
+//! neutral. `/theme dark|light|mono|catppuccin` switches at runtime;
+//! `NO_COLOR` forces mono.
 
 use ratatui::style::Color;
 use std::sync::RwLock;
@@ -16,6 +17,7 @@ pub enum ColorLevel {
 pub enum ThemeId {
     Dark,
     Light,
+    Catppuccin,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +60,21 @@ impl Tokens {
             border: Color::Gray,
             user: Color::Rgb(0x0b, 0x7a, 0x62),
             select: Color::Rgb(0xd0, 0xec, 0xe4),
+        }
+    }
+
+    /// Catppuccin Mocha-inspired palette for a softer dark session.
+    pub fn catppuccin() -> Self {
+        Self {
+            accent: Color::Rgb(0x89, 0xb4, 0xfa), // blue
+            dim: Color::Rgb(0x6c, 0x70, 0x86),   // overlay0
+            code: Color::Rgb(0xf9, 0xe2, 0xaf),  // yellow
+            ok: Color::Rgb(0xa6, 0xe3, 0xa1),    // green
+            err: Color::Rgb(0xf3, 0x8b, 0xa8),   // red
+            warn: Color::Rgb(0xfa, 0xb3, 0x87),  // peach
+            border: Color::Rgb(0x58, 0x5b, 0x70), // surface2
+            user: Color::Rgb(0x89, 0xb4, 0xfa),
+            select: Color::Rgb(0x31, 0x32, 0x44), // surface0
         }
     }
 
@@ -132,6 +149,7 @@ pub fn apply(id: ThemeId) {
     set_tokens(match id {
         ThemeId::Dark => Tokens::dark(),
         ThemeId::Light => Tokens::light(),
+        ThemeId::Catppuccin => Tokens::catppuccin(),
     });
 }
 
