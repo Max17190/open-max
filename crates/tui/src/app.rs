@@ -906,8 +906,12 @@ impl App {
         let Some((_, sel, matches)) = &self.scroll_search else {
             return;
         };
+        if matches.is_empty() {
+            self.transcript.clear_selection();
+            return;
+        }
         if let Some(&bi) = matches.get(*sel) {
-            self.transcript.select_block(bi);
+            self.transcript.select_find_match(bi);
             self.focus = Focus::Scrollback;
         }
     }
@@ -954,7 +958,7 @@ impl App {
                 .rposition(|&bi| current.is_none_or(|c| bi <= c))
                 .unwrap_or(matches.len() - 1),
         };
-        self.transcript.select_block(matches[next]);
+        self.transcript.select_find_match(matches[next]);
         self.focus = Focus::Scrollback;
     }
 
@@ -2583,7 +2587,7 @@ fn scroll_search_lines(
             Style::default().fg(theme::DIM())
         };
         let preview = transcript
-            .block_preview(bi)
+            .block_preview(bi, query)
             .unwrap_or_else(|| format!("block {bi}"));
         let one_line = preview.replace('\n', " ");
         lines.push(Line::from(vec![

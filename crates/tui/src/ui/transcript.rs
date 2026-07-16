@@ -432,9 +432,35 @@ impl Transcript {
         self.scroll_to_block(bi);
     }
 
-    /// One-line preview for find UI (first non-empty line, clipped later by caller).
-    pub fn block_preview(&self, i: usize) -> Option<String> {
+    /// Select a find match: expand folded tools so full output is visible,
+    /// then scroll into view.
+    pub fn select_find_match(&mut self, bi: usize) {
+        if bi >= self.blocks.len() {
+            return;
+        }
+        if self.blocks[bi].kind == BlockKind::Tool
+            && self.blocks[bi].folded
+            && self.blocks[bi].compact.is_some()
+        {
+            self.blocks[bi].folded = false;
+            self.blocks[bi].invalidate();
+            self.dirty = true;
+            self.ensure_flat();
+        }
+        self.selected = Some(bi);
+        self.scroll_to_block(bi);
+    }
+
+    /// One-line preview for find UI. Prefer a line containing `query` when set.
+    pub fn block_preview(&self, i: usize, query: &str) -> Option<String> {
         let text = self.block_search_text(i)?;
+        let q = query.trim();
+        if !q.is_empty() {
+            let q_low = q.to_ascii_lowercase();
+            if let Some(line) = text.lines().find(|l| l.to_ascii_lowercase().contains(&q_low)) {
+                return Some(line.trim().to_string());
+            }
+        }
         let line = text
             .lines()
             .map(str::trim)
