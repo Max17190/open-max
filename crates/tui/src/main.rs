@@ -80,8 +80,8 @@ where
             Long("provider") => out.provider = Some(parser.value()?.string()?),
             Short('p') | Long("print") => {
                 if out.print {
-                    // Subsequent -p starts a new turn's prompt bucket.
-                    flush_prompt_tokens(&mut out.prompts, &mut current);
+                    // Subsequent -p closes the previous prompt; empty is an error.
+                    flush_prompt_tokens(&mut out.prompts, &mut current)?;
                 }
                 out.print = true;
             }
@@ -98,21 +98,33 @@ where
             _ => return Err(arg.unexpected()),
         }
     }
-    if out.print || !current.is_empty() {
-        flush_prompt_tokens(&mut out.prompts, &mut current);
+    if out.print {
+        flush_prompt_tokens(&mut out.prompts, &mut current)?;
+    } else if !current.is_empty() {
+        // Freeform args without --print are rejected in main; still clear cleanly.
+        flush_prompt_tokens(&mut out.prompts, &mut current)?;
     }
     Ok(out)
 }
 
-fn flush_prompt_tokens(prompts: &mut Vec<String>, current: &mut Vec<String>) {
+fn flush_prompt_tokens(
+    prompts: &mut Vec<String>,
+    current: &mut Vec<String>,
+) -> Result<(), lexopt::Error> {
     if current.is_empty() {
-        return;
+        return Err(lexopt::Error::from(
+            "each --print requires a non-empty prompt".to_string(),
+        ));
     }
     let joined = current.join(" ");
     current.clear();
-    if !joined.trim().is_empty() {
-        prompts.push(joined);
+    if joined.trim().is_empty() {
+        return Err(lexopt::Error::from(
+            "each --print requires a non-empty prompt".to_string(),
+        ));
     }
+    prompts.push(joined);
+    Ok(())
 }
 
 #[tokio::main]
@@ -256,5 +268,11 @@ mod tests {
         let cli = parse_args_from(["-p", "--json", "one", "-p", "two"]).unwrap();
         assert!(cli.json);
         assert_eq!(cli.prompts, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn empty_print_group_is_rejected() {
+        assert!(parse_args_from(["-p", "-p", "second"]).is_err());
+        assert!(parse_args_from(["-p"]).is_err());
     }
 }
