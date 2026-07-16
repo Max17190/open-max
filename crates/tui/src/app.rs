@@ -618,6 +618,16 @@ impl App {
         if self.focus == Focus::Scrollback {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
+                // Turn jumps: `[`/`]` work on every terminal; Shift+arrows when
+                // the terminal reports modifiers (many do not).
+                KeyCode::Char('[') => {
+                    self.transcript.select_prev_user();
+                    return Ok(());
+                }
+                KeyCode::Char(']') => {
+                    self.transcript.select_next_user();
+                    return Ok(());
+                }
                 KeyCode::Up if shift => {
                     self.transcript.select_prev_user();
                     return Ok(());
@@ -1154,8 +1164,14 @@ impl App {
                 let (breakdown, is_frozen) = match frozen {
                     Some(b) => (b, true),
                     None => {
-                        let registry = registry::Registry::build(&self.project);
-                        let (_, b) = prompt::system_prompt_with_breakdown(&self.project, &registry);
+                        let project = self.project.clone();
+                        let registry = tokio::task::spawn_blocking({
+                            let project = project.clone();
+                            move || registry::Registry::build(&project)
+                        })
+                        .await
+                        .unwrap_or_else(|_| registry::Registry::builtin_only());
+                        let (_, b) = prompt::system_prompt_with_breakdown(&project, &registry);
                         (b, false)
                     }
                 };
@@ -1167,38 +1183,44 @@ impl App {
                 ));
             }
             "tools" => {
-                let lines = {
+                // Hold the sessions lock only long enough to format a frozen
+                // registry. Disk preview runs after the lock is released so a
+                // slow tools/skills tree cannot stall other session access.
+                let frozen = {
                     let sessions = self.core.sessions.lock().await;
-                    match self
-                        .session_id
+                    self.session_id
                         .as_ref()
                         .and_then(|id| sessions.get(id))
-                    {
-                        Some(data) => extensions::tools_block(&data.registry, true),
-                        None => {
-                            let reg = registry::Registry::build(&self.project);
-                            extensions::tools_block(&reg, false)
-                        }
-                    }
+                        .map(|data| extensions::tools_block(&data.registry, true))
+                };
+                let lines = if let Some(lines) = frozen {
+                    lines
+                } else {
+                    let project = self.project.clone();
+                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&project))
+                        .await
+                        .unwrap_or_else(|_| registry::Registry::builtin_only());
+                    extensions::tools_block(&reg, false)
                 };
                 self.transcript.push(lines);
             }
             "skills" => {
-                let lines = {
+                let frozen = {
                     let sessions = self.core.sessions.lock().await;
-                    match self
-                        .session_id
-                        .as_ref()
-                        .and_then(|id| sessions.get(id))
-                    {
-                        Some(data) => {
+                    self.session_id.as_ref().and_then(|id| {
+                        sessions.get(id).map(|data| {
                             extensions::skills_block(&data.registry.skills, &self.project, true)
-                        }
-                        None => {
-                            let reg = registry::Registry::build(&self.project);
-                            extensions::skills_block(&reg.skills, &self.project, false)
-                        }
-                    }
+                        })
+                    })
+                };
+                let lines = if let Some(lines) = frozen {
+                    lines
+                } else {
+                    let project = self.project.clone();
+                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&project))
+                        .await
+                        .unwrap_or_else(|_| registry::Registry::builtin_only());
+                    extensions::skills_block(&reg.skills, &self.project, false)
                 };
                 self.transcript.push(lines);
             }
@@ -1216,10 +1238,12 @@ impl App {
                     .budget
                     .map(|(u, t)| format!("{}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                     .unwrap_or_else(|| "0%".into());
-                let host = extensions::endpoint_host(&s.base_url).unwrap_or_else(|| s.base_url.clone());
+                let endpoint = extensions::display_base_url(&s.base_url);
+                let host = extensions::endpoint_host(&s.base_url)
+                    .unwrap_or_else(|| endpoint.clone());
                 let block = vec![
                     kv("model", &s.model),
-                    kv("endpoint", &s.base_url),
+                    kv("endpoint", &endpoint),
                     kv("host", &host),
                     kv("server", &server),
                     kv("approvals", &s.approval_mode),
@@ -1231,12 +1255,15 @@ impl App {
                         "  network".to_string(),
                         Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
                     )),
-                    kv("  dest", &s.base_url),
+                    kv("  dest", &endpoint),
                     kv(
                         "  also",
                         "Hugging Face only when you use /models to download or serve",
                     ),
-                    kv("  privacy", "no telemetry · endpoint-only · sessions stay local"),
+                    kv(
+                        "  privacy",
+                        "no telemetry · sessions stay local · external tools may use the network",
+                    ),
                 ];
                 self.transcript.push(block);
             }
@@ -1763,7 +1790,7 @@ impl App {
         } else if self.completion.is_some() {
             "↑↓ select · tab/enter accept · esc close"
         } else if self.focus == Focus::Scrollback {
-            "j/k block · shift+↑↓ turn · g/G top/end · enter fold · y copy"
+            "j/k block · [/] turn · g/G top/end · enter fold · y copy"
         } else if self.running {
             "enter queues · esc cancel · tab history · ctrl+r search"
         } else if self.transcript.offset() > 0 {
@@ -2026,10 +2053,11 @@ impl App {
                 ""
             };
             let scrolled_suffix = if scrolled { " · ↑" } else { "" };
+            // Harness does not phone home; external tools may still use the network.
             let privacy = if self.running || self.quit_armed {
                 ""
             } else {
-                " · endpoint-only"
+                " · no telemetry"
             };
             let right = if self.quit_armed {
                 " · ctrl+c again to quit"
@@ -2058,7 +2086,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter while working", "queue the message for after this turn"),
     ("tab", "focus conversation ↔ composer"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
-    ("shift+↑↓ in history", "jump to previous or next user turn"),
+    ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
     ("/ at the start", "command menu · tab or enter completes"),
     ("@", "mention a project file (fuzzy search)"),

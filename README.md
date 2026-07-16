@@ -99,7 +99,7 @@ When `base_url` is not the managed MLX port, Open Max talks to your endpoint dir
 | **@** anywhere | Fuzzy-search project files and mention one |
 | **Tab** | Toggle focus between composer and conversation |
 | **↑↓** / **j k** (history focused) | Select a block · **Enter** fold tool · **y** copy |
-| **Shift+↑↓** (history focused) | Jump to previous or next user turn |
+| **[** / **]** (history focused) | Jump to previous or next user turn (also **Shift+↑↓** when the terminal reports it) |
 | **g** / **G** (history focused) | Top of scrollback · follow latest |
 | **Esc** | Close menu · cancel turn · follow latest · return to composer |
 | **Mouse wheel** / **PgUp PgDn** | Scroll the conversation |
@@ -188,7 +188,7 @@ Open Max does not phone home. The only network destinations are:
 1. The model endpoint in `base_url` (your choice).
 2. Hugging Face, only when you explicitly download or serve a model through `/models`.
 
-Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. Inside a session, `/status` lists those destinations; the status bar shows `endpoint-only` when idle.
+Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. Inside a session, `/status` lists those destinations; the status bar shows `no telemetry` when idle. External tools you install may still open their own network connections.
 
 ## Architecture
 

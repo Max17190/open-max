@@ -20,8 +20,8 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Host portion of an OpenAI-compatible base URL for compact chrome.
-/// Returns `None` when the URL has no usable host.
+/// Authority host[:port] from a base URL, with userinfo stripped so credentials
+/// never appear in the header or status chrome.
 pub fn endpoint_host(base_url: &str) -> Option<String> {
     let s = base_url.trim();
     if s.is_empty() {
@@ -31,8 +31,16 @@ pub fn endpoint_host(base_url: &str) -> Option<String> {
         .strip_prefix("https://")
         .or_else(|| s.strip_prefix("http://"))
         .unwrap_or(s);
-    let hostport = rest.split('/').next().unwrap_or("").trim();
-    if hostport.is_empty() || hostport.contains(' ') {
+    let authority = rest.split('/').next().unwrap_or("").trim();
+    if authority.is_empty() || authority.contains(' ') {
+        return None;
+    }
+    // Drop user:pass@ so chrome never renders endpoint secrets.
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if hostport.is_empty() {
         return None;
     }
     // Prefer host without default ports noise; keep non-default ports.
@@ -51,6 +59,30 @@ pub fn endpoint_host(base_url: &str) -> Option<String> {
     } else {
         Some(host.to_string())
     }
+}
+
+/// Full base URL with userinfo redacted for `/status` and similar listings.
+pub fn display_base_url(base_url: &str) -> String {
+    let s = base_url.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let (scheme, rest) = if let Some(r) = s.strip_prefix("https://") {
+        ("https://", r)
+    } else if let Some(r) = s.strip_prefix("http://") {
+        ("http://", r)
+    } else {
+        ("", s)
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, String::new()),
+    };
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    format!("{scheme}{hostport}{path}")
 }
 
 /// Short model id for header/status (last path segment of a HF-style id).
@@ -190,8 +222,24 @@ mod tests {
             endpoint_host("https://api.example.com:443/v1/chat").as_deref(),
             Some("api.example.com")
         );
+        assert_eq!(
+            endpoint_host("https://user:secret@api.example.com:8443/v1").as_deref(),
+            Some("api.example.com:8443")
+        );
         assert_eq!(endpoint_host("not a url"), None);
         assert_eq!(endpoint_host(""), None);
+    }
+
+    #[test]
+    fn display_base_url_strips_userinfo() {
+        assert_eq!(
+            display_base_url("https://user:secret@api.example.com/v1"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            display_base_url("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1"
+        );
     }
 
     #[test]
