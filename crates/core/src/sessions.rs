@@ -41,6 +41,56 @@ fn manifest_path(core: &Core, id: &str) -> PathBuf {
     sessions_dir(core).join(format!("{id}.manifest.json"))
 }
 
+fn compaction_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.compaction.jsonl"))
+}
+
+/// One exchange-drop compaction event, append-only for recoverability.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactionRecord {
+    pub ts: u64,
+    pub message_count: usize,
+    pub tools: Vec<String>,
+    pub paths: Vec<String>,
+    pub user_snippets: Vec<String>,
+    pub digest: String,
+}
+
+/// Wall-clock seconds for compaction records (and session meta).
+pub fn unix_now() -> u64 {
+    now()
+}
+
+/// Append a compaction event. Best-effort: failures surface as an agent warning.
+pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
+    let path = compaction_path(core, id);
+    let Ok(line) = serde_json::to_string(record) else { return };
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = result {
+        core.send_agent(
+            id,
+            AgentEvent::Error {
+                message: format!("warning: failed to persist compaction record: {e}"),
+            },
+        );
+    }
+}
+
+/// Load compaction history for a session (corrupt lines skipped).
+pub fn load_compaction(core: &Core, id: &str) -> Vec<CompactionRecord> {
+    let Ok(text) = std::fs::read_to_string(compaction_path(core, id)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
 /// Persist the registry frozen at session creation. Written once; skipped
 /// entirely for builtin-only sessions (absence means built-ins, which also
 /// covers every session that predates the extensibility layer).
@@ -142,6 +192,7 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     with_index(core, |metas| metas.retain(|m| m.id != id))?;
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
+    let _ = std::fs::remove_file(compaction_path(core, id));
     Ok(())
 }
 
@@ -229,6 +280,35 @@ mod tests {
     use super::*;
     use crate::state::Core;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn compaction_records_append_and_load() {
+        let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "c1";
+        let rec = CompactionRecord {
+            ts: 1,
+            message_count: 3,
+            tools: vec!["read_file".into()],
+            paths: vec!["a.rs".into()],
+            user_snippets: vec!["do the thing".into()],
+            digest: "[context note: test]".into(),
+        };
+        append_compaction(&core, id, &rec);
+        append_compaction(&core, id, &CompactionRecord {
+            ts: 2,
+            message_count: 2,
+            tools: vec![],
+            paths: vec![],
+            user_snippets: vec![],
+            digest: "[context note: second]".into(),
+        });
+        let loaded = load_compaction(&core, id);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].message_count, 3);
+        assert_eq!(loaded[1].ts, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn empty_or_corrupt_messages_file_loads_as_none() {

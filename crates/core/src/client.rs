@@ -154,32 +154,76 @@ impl ChatClient {
             body["tool_choice"] = json!("auto");
         }
 
-        let mut req = self.http.post(self.endpoint()).json(&body);
-        if let Some(key) = &self.api_key {
-            if !key.is_empty() {
-                req = req.bearer_auth(key);
+        // Retry only the pre-stream request path (connect + HTTP status). Once
+        // SSE bytes start, failures fail cleanly without a second full prefill.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0u32;
+        let resp = loop {
+            attempt += 1;
+            let mut req = self.http.post(self.endpoint()).json(&body);
+            if let Some(key) = &self.api_key {
+                if !key.is_empty() {
+                    req = req.bearer_auth(key);
+                }
             }
-        }
-
-        // Local models can spend a long time in prompt processing before the
-        // first byte arrives; keep cancellation responsive throughout.
-        let resp = tokio::select! {
-            r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
-            _ = cancelled.cancelled() => {
-                return Ok(CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into(), usage: None });
+            // Local models can spend a long time in prompt processing before the
+            // first byte arrives; keep cancellation responsive throughout.
+            let send_result = tokio::select! {
+                r = req.send() => r,
+                _ = cancelled.cancelled() => {
+                    return Ok(CompletionResult {
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                        finish_reason: "cancelled".into(),
+                        usage: None,
+                    });
+                }
+            };
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("request failed: {e}");
+                    if attempt < MAX_ATTEMPTS && is_transient_transport(&e) {
+                        backoff_sleep(attempt).await;
+                        if cancelled.is_cancelled() {
+                            return Ok(CompletionResult {
+                                content: String::new(),
+                                tool_calls: Vec::new(),
+                                finish_reason: "cancelled".into(),
+                                usage: None,
+                            });
+                        }
+                        continue;
+                    }
+                    return Err(msg);
+                }
+            };
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
             }
+            let code = status.as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let err = format!("backend returned {status}: {}", truncate(&text, 600));
+            if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
+                backoff_sleep(attempt).await;
+                if cancelled.is_cancelled() {
+                    return Ok(CompletionResult {
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                        finish_reason: "cancelled".into(),
+                        usage: None,
+                    });
+                }
+                continue;
+            }
+            return Err(err);
         };
-        let status = resp.status();
         let is_json = resp
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("application/json"));
-
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("backend returned {status}: {}", truncate(&text, 600)));
-        }
 
         // Some servers ignore `stream` and return a complete JSON body.
         if is_json {
@@ -355,6 +399,20 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 429 | 502 | 503 | 504)
+}
+
+fn is_transient_transport(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_request()
+}
+
+async fn backoff_sleep(attempt: u32) {
+    // ~100ms, ~200ms (capped); keep total retry budget small for local UX.
+    let ms = 100u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(2)));
+    tokio::time::sleep(std::time::Duration::from_millis(ms.min(400))).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +434,15 @@ mod tests {
         let data = super::strip_data_prefix(trim_bytes(line));
         let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn retryable_status_codes() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(500));
     }
 }
