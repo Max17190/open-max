@@ -398,10 +398,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         invalidate_providers_cache();
-        let mut s = Settings::default();
-        s.base_url = "http://127.0.0.1:11434/v1".into();
-        s.model = "qwen".into();
-        s.api_key = Some("k".into());
+        let s = Settings {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "qwen".into(),
+            api_key: Some("k".into()),
+            ..Default::default()
+        };
         let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.base_url, "http://127.0.0.1:11434/v1");
         assert_eq!(ep.model, "qwen");
@@ -476,10 +478,12 @@ mod tests {
               }
             }"#,
         );
-        let mut s = Settings::default();
-        s.provider = Some("or".into());
-        s.model = "m1".into();
-        s.base_url = "http://ignored".into();
+        let s = Settings {
+            provider: Some("or".into()),
+            model: "m1".into(),
+            base_url: "http://ignored".into(),
+            ..Default::default()
+        };
         let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.provider.as_deref(), Some("or"));
         assert_eq!(ep.base_url, "https://openrouter.ai/api/v1");
@@ -512,8 +516,10 @@ mod tests {
             }}"#
             ),
         );
-        let mut s = Settings::default();
-        s.provider = Some("a".into());
+        let mut s = Settings {
+            provider: Some("a".into()),
+            ..Default::default()
+        };
         let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.api_key.as_deref(), Some("from-env"));
         s.provider = Some("b".into());
@@ -527,9 +533,11 @@ mod tests {
     fn unknown_provider_errors() {
         let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
         write_providers(&dir, r#"{"providers":{}}"#);
-        let mut s = Settings::default();
-        s.provider = Some("missing".into());
-        s.base_url = "http://flat/v1".into();
+        let s = Settings {
+            provider: Some("missing".into()),
+            base_url: "http://flat/v1".into(),
+            ..Default::default()
+        };
         let err = resolve(&s, &dir).unwrap_err();
         assert!(matches!(err, ResolveError::UnknownProvider(_)));
         let _ = std::fs::remove_dir_all(dir);
@@ -581,9 +589,11 @@ mod tests {
               }
             }"#,
         );
-        let mut s = Settings::default();
-        s.provider = Some("tiny".into());
-        s.model = "m".into();
+        let s = Settings {
+            provider: Some("tiny".into()),
+            model: "m".into(),
+            ..Default::default()
+        };
         let ep = resolve(&s, &dir).unwrap();
         assert!(ep.max_tokens + 1024 < ep.context_tokens || ep.context_tokens <= 2048);
         assert!(ep.max_tokens <= ep.context_tokens.saturating_sub(2048).max(1));

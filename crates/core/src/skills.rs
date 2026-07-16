@@ -102,7 +102,7 @@ mod tests {
     fn parses_minimal_frontmatter() {
         let root = temp_dir("min");
         write_skill(&root, "review", "name: code-review\ndescription: reviews a diff");
-        let skills = discover_in(&[root.clone()]);
+        let skills = discover_in(std::slice::from_ref(&root));
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "code-review");
         assert_eq!(skills[0].description, "reviews a diff");
@@ -133,7 +133,7 @@ mod tests {
         for i in 0..(MAX_SKILLS + 5) {
             write_skill(&root, &format!("s{i:03}"), &format!("name: skill-{i:03}\ndescription: {}", "x".repeat(400)));
         }
-        let skills = discover_in(&[root.clone()]);
+        let skills = discover_in(std::slice::from_ref(&root));
         assert_eq!(skills.len(), MAX_SKILLS);
         let names: Vec<_> = skills.iter().map(|s| s.name.clone()).collect();
         let mut sorted = names.clone();

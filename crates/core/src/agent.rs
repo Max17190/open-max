@@ -944,6 +944,9 @@ async fn run_loop(
 /// final summary (via ToolEnd); child tool churn stays out of the parent window.
 /// Child tool calls go through the same lifecycle hooks and permission rules as
 /// the parent loop so project policy cannot be bypassed via delegation.
+// The parameter list mirrors the parent turn's context one-to-one; bundling
+// it into a struct would just move the same fields behind a name.
+#[allow(clippy::too_many_arguments)]
 async fn run_task_subagent(
     core: &Arc<Core>,
     parent_session_id: &str,

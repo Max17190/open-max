@@ -300,7 +300,6 @@ fn serialize_specs(tools: &[ToolSpec]) -> Value {
 
 /// Built-in tool specs derived from the canonical `tools::tool_schemas()`
 /// literals, so name/description/parameters have a single source of truth.
-
 fn builtin_specs() -> Vec<ToolSpec> {
     let schemas = tools::tool_schemas();
     schemas
@@ -737,7 +736,7 @@ mod tests {
         let tools_dir = project.join(".openmax").join("tools");
         std::fs::create_dir_all(&tools_dir).unwrap();
         write_tool(&tools_dir, "ghost.toml", "name = \"ghost\"\ndescription = \"g\"\ncommand = \"/nonexistent/binary\"\n");
-        let registry = Registry::assemble(discover_external_in(&[tools_dir.clone()]), Vec::new());
+        let registry = Registry::assemble(discover_external_in(std::slice::from_ref(&tools_dir)), Vec::new());
         let out = registry.execute("ghost", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.contains("ghost") && out.output.contains("/nonexistent/binary"), "{}", out.output);

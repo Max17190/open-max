@@ -243,12 +243,16 @@ impl Transcript {
         }
     }
 
+    /// Test-support oracle access: `draw_chat` paints via `fill_viewport`.
+    #[cfg(test)]
     pub fn lines(&mut self) -> &[Line<'static>] {
         self.ensure_flat();
         &self.wrapped
     }
 
     /// Borrow a single wrapped history line without cloning the full buffer.
+    /// Test-support oracle access.
+    #[cfg(test)]
     pub fn line_at(&mut self, idx: usize) -> Option<&Line<'static>> {
         self.ensure_flat();
         self.wrapped.get(idx)
@@ -473,7 +477,9 @@ impl Transcript {
         self.blocks.iter().map(block_search_text).collect()
     }
 
-    /// Select a block by index and scroll it into view.
+    /// Select a block by index and scroll it into view. Test-support only:
+    /// the app drives selection through the focus/scroll key handlers.
+    #[cfg(test)]
     pub fn select_block(&mut self, bi: usize) {
         if bi >= self.blocks.len() {
             return;
@@ -550,6 +556,8 @@ impl Transcript {
         self.blocks[i].source_lines().first().cloned()
     }
 
+    /// Test-support oracle for the selection marker `fill_viewport` paints.
+    #[cfg(test)]
     pub fn is_selected_block_for_line(&self, line_idx: usize) -> bool {
         let Some(sel) = self.selected else {
             return false;
