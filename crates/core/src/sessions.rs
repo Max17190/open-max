@@ -173,6 +173,12 @@ fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
+    // Never treat a directory as a replaceable destination (would move the dir
+    // aside as `.bak` and leave an orphaned tree).
+    if path.is_dir() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{} is a directory", path.display()));
+    }
     if std::fs::rename(&tmp, path).is_ok() {
         return Ok(());
     }
@@ -192,9 +198,16 @@ fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
         }
         Err(e) => {
             // Prior content is still in `backup`; put it back before failing.
-            let _ = std::fs::rename(&backup, path);
+            // If restore also fails, leave the `.bak` path in the error so the
+            // previous transcript/index/manifest stays recoverable by path.
             let _ = std::fs::remove_file(&tmp);
-            Err(e.to_string())
+            match std::fs::rename(&backup, path) {
+                Ok(()) => Err(e.to_string()),
+                Err(re) => Err(format!(
+                    "install failed ({e}); restore also failed ({re}); prior data at {}",
+                    backup.display()
+                )),
+            }
         }
     }
 }
@@ -209,11 +222,9 @@ fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
 }
 
 fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
-    // Serialize the whole tail first, then one write under exclusive ownership
-    // of the file handle. We never truncate on failure: another process could
-    // have appended past our start, and set_len would erase their lines. A
-    // partial write leaves a corrupt tail that load_messages skips; the caller
-    // does not advance `persisted`, and the next rewrite path heals the file.
+    // Serialize the whole tail first, then one write. Callers must heal on
+    // failure (rewrite the full file) so a partial write cannot be re-appended
+    // and duplicate complete lines when `persisted` is left unchanged.
     let mut buf = String::new();
     for msg in messages {
         buf.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
@@ -330,7 +341,15 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
     let result = if needs_rewrite {
         write_jsonl(&path, messages)
     } else if messages.len() > *persisted {
-        append_jsonl(&path, &messages[*persisted..])
+        // Append is best-effort for the common path. On any failure (including
+        // partial write_all), rewrite the full transcript atomically so a
+        // later append cannot duplicate complete lines that already landed.
+        match append_jsonl(&path, &messages[*persisted..]) {
+            Ok(()) => Ok(()),
+            Err(append_err) => write_jsonl(&path, messages).map_err(|rewrite_err| {
+                format!("append failed ({append_err}); rewrite also failed: {rewrite_err}")
+            }),
+        }
     } else {
         Ok(())
     };
