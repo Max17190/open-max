@@ -49,6 +49,7 @@ pub struct DiffInfo {
     pub removed: usize,
 }
 
+#[derive(Clone)]
 pub struct ToolOutcome {
     pub ok: bool,
     pub output: String,

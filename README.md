@@ -173,7 +173,24 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
-**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/context` tells you which state you are looking at.
+**Hooks.** Optional process lifecycle gates under `.openmax/hooks/` (project) or `~/.openmax/hooks/` (global). Hooks never enter the model prompt: empty discovery is free. Each TOML file defines one event and a command. The harness writes a JSON payload to stdin (`event`, `session_id`, `tool`, `args`, `cwd`, and for post hooks `tool_ok`).
+
+| Event | Behavior |
+| --- | --- |
+| `pre_tool_use` | Non-zero exit blocks the tool; stdout (or stderr) becomes the error returned to the model |
+| `post_tool_use` | Observe only; failures are ignored |
+
+Hooks also apply to tools run inside a `task` subagent, so lifecycle policy cannot be bypassed by delegation.
+
+```toml
+# .openmax/hooks/block_rm.toml
+event = "pre_tool_use"
+command = "./scripts/block-rm.sh"
+tool = "bash"          # optional filter; omit to run for every tool
+timeout_secs = 5
+```
+
+**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/context` tells you which state you are looking at. Hooks are re-discovered each turn and do not affect schemas.
 
 **Why no MCP?** A typical MCP server dumps 10k+ tokens of tool descriptions into every request, most of a small model's whole window. External tools plus skills give the same reach with per-call processes and on-demand documentation: write a CLI, give it a README (or a skill), and let the model read it when needed.
 
@@ -195,12 +212,13 @@ crates/
     client.rs                 OpenAI-compatible streaming client (SSE + JSON fallback)
     tools.rs                  list_dir · read_file · write_file · edit_file · glob · grep · bash · task
     registry.rs               Session-frozen tool registry: built-ins + external TOML tools
+    hooks.rs                  Optional pre/post tool process hooks
     skills.rs                 SKILL.md discovery; name+description only in the prompt
     prompt.rs                 Short system prompt tuned for coding agents
     fallback.rs               Parses tool markup when the server omits native tool_calls
     mlx.rs                    Optional mlx-lm venv provisioning and server lifecycle
     hf.rs                     Hub cache inspection, downloads, and sizing
-    sessions.rs               Persisted sessions under ~/.openmax/sessions/
+    sessions.rs               Persisted sessions + compaction records under ~/.openmax/sessions/
   tui/                      ratatui + crossterm terminal frontend (`openmax` binary)
     app.rs                    Event loop, slash commands, approvals, model panel
     ui/                       Markdown rendering, tool cards, transcript layout
@@ -210,7 +228,7 @@ Design choices worth knowing:
 
 - **The harness is the product.** Fewer, stricter tools keep small models reliable. Tool results stream as events so nothing happens off screen.
 - **Safety by default.** Tools are sandboxed to the project root. `write_file`, `edit_file`, and `bash` require approval in the default `ask` mode; `readonly` blocks mutating tools entirely.
-- **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped, leaving a digest of which tools ran and which files were touched. The system prompt and your original request survive.
+- **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped, leaving a digest of tools used, files touched, and earlier goals. The system prompt and your original request survive. Each exchange drop is also appended to `~/.openmax/sessions/<id>.compaction.jsonl` for recoverability.
 - **Edits that land.** `edit_file` matches exactly first, then retries with whitespace-normalized matching (re-indented to the file), and on a miss points the model at the closest line. Consecutive read-only tool calls run concurrently; Esc kills in-flight commands, not just the stream.
 - **Local serve stays decoupled.** The harness talks to any OpenAI-compatible HTTP API. The MLX sidecar is optional convenience on Apple Silicon, not the identity of the product.
 
