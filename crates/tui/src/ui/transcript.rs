@@ -555,7 +555,9 @@ fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
 
 /// Incrementally wraps growing streaming text. Only the current incomplete
 /// line is re-wrapped on each token; completed lines are wrapped once.
+/// Kept for unit tests and a plain-wrap fallback path.
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct StreamingWrap {
     width: u16,
     text_len: usize,
@@ -565,6 +567,7 @@ pub struct StreamingWrap {
     partial_wrapped: Vec<Line<'static>>,
 }
 
+#[allow(dead_code)]
 impl StreamingWrap {
     pub fn clear(&mut self) {
         *self = Self::default();

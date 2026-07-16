@@ -2083,27 +2083,36 @@ impl App {
             self.tail_width = width;
             self.thinking_source.clear();
         }
+        // Catch up markdown after a stream pause: throttle may leave
+        // stream_md_len behind stream_text; interim plain wrap keeps text
+        // visible, and the next due tick upgrades to full highlight.
+        let md_pending =
+            !self.stream_text.is_empty() && self.stream_md_len != self.stream_text.len();
+        let md_due = self.stream_md_at.elapsed() >= STREAM_MD_INTERVAL;
         let stream_changed = width_changed || self.stream_text.len() != self.tail_stream_len;
-        if stream_changed {
-            self.tail_stream_len = self.stream_text.len();
-            if self.stream_text.is_empty() {
+        if self.stream_text.is_empty() {
+            if self.tail_stream_len != 0 || !self.stream_wrapped.is_empty() {
                 self.stream_wrapped.clear();
                 self.stream_md_len = 0;
+                self.tail_stream_len = 0;
+            }
+        } else if stream_changed || (md_pending && md_due) || width_changed {
+            self.tail_stream_len = self.stream_text.len();
+            let boundary = self.stream_text.ends_with('\n');
+            let first = self.stream_md_len == 0;
+            if width_changed || md_due || boundary || first {
+                let md = markdown::render(&self.stream_text, markdown::highlighter());
+                self.stream_wrapped = wrap_lines(&md, width);
+                self.stream_md_at = Instant::now();
+                self.stream_md_len = self.stream_text.len();
             } else {
-                // Throttle full re-highlight: every STREAM_MD_INTERVAL, on
-                // newline, on width change, or first paint of this stream.
-                let due = self.stream_md_at.elapsed() >= STREAM_MD_INTERVAL;
-                let boundary = self.stream_text.ends_with('\n');
-                let first = self.stream_md_len == 0;
-                if width_changed || due || boundary || first {
-                    let md = markdown::render(&self.stream_text, markdown::highlighter());
-                    self.stream_wrapped = wrap_lines(&md, width);
-                    self.stream_md_at = Instant::now();
-                    self.stream_md_len = self.stream_text.len();
-                }
-                // Between throttled highlights, leave prior styled lines; the
-                // next due/newline pass catches up. MessageDone still finalizes
-                // with a full render into the transcript.
+                // Cheap interim wrap: every token is visible immediately.
+                let raw: Vec<Line<'static>> = self
+                    .stream_text
+                    .lines()
+                    .map(|l| Line::from(l.to_string()))
+                    .collect();
+                self.stream_wrapped = wrap_lines(&raw, width);
             }
         }
 
