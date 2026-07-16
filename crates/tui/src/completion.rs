@@ -26,10 +26,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("approvals", "auto|ask|readonly", "how mutating tools are gated"),
     ("new", "", "start a fresh session"),
     ("resume", "", "pick an earlier session in this project"),
+    ("tools", "", "list tools frozen for this session"),
+    ("skills", "", "list skills frozen for this session"),
     ("context", "", "prompt token costs, cache hits, and budget"),
-    ("status", "", "session and server state"),
+    ("status", "", "session, endpoint, and network destinations"),
     ("logs", "", "recent model server logs"),
-    ("theme", "dark|light|mono", "switch appearance"),
+    ("theme", "dark|light|mono|catppuccin", "switch appearance"),
     ("quit", "", "exit"),
 ];
 

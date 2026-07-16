@@ -29,7 +29,7 @@ use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{wrap_lines, StreamingWrap, Term, Transcript};
-use crate::ui::{context, markdown, models};
+use crate::ui::{context, extensions, markdown, models};
 
 /// Where keyboard focus lives in chat mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,7 +326,9 @@ impl App {
                 None => self.note("no previous session here; starting fresh"),
             }
         } else {
-            self.note("/ commands · @ mentions a file · type while the agent works to queue · /resume reopens a session");
+            self.note(
+                "your endpoint · /tools · /skills · /context · type while the agent works to queue",
+            );
         }
     }
 
@@ -614,7 +616,16 @@ impl App {
 
         // Scrollback-focused navigation.
         if self.focus == Focus::Scrollback {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
+                KeyCode::Up if shift => {
+                    self.transcript.select_prev_user();
+                    return Ok(());
+                }
+                KeyCode::Down if shift => {
+                    self.transcript.select_next_user();
+                    return Ok(());
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.transcript.select_prev();
                     return Ok(());
@@ -623,8 +634,20 @@ impl App {
                     self.transcript.select_next();
                     return Ok(());
                 }
+                KeyCode::Char('g') => {
+                    self.transcript.select_first();
+                    return Ok(());
+                }
+                KeyCode::Char('G') => {
+                    self.transcript.select_last_follow();
+                    return Ok(());
+                }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     let _ = self.transcript.toggle_fold_selected();
+                    return Ok(());
+                }
+                KeyCode::Char('o') => {
+                    let _ = self.transcript.expand_last_tool();
                     return Ok(());
                 }
                 KeyCode::Char('y') => {
@@ -1053,11 +1076,15 @@ impl App {
                     theme::apply(theme::ThemeId::Dark);
                     self.note("theme: dark");
                 }
+                Some("catppuccin" | "mocha" | "cat") => {
+                    theme::apply(theme::ThemeId::Catppuccin);
+                    self.note("theme: catppuccin");
+                }
                 Some("mono" | "bw") => {
                     theme::set_tokens(theme::Tokens::mono());
                     self.note("theme: mono");
                 }
-                _ => self.note("usage: /theme dark|light|mono"),
+                _ => self.note("usage: /theme dark|light|mono|catppuccin"),
             },
             "models" => {
                 self.mode = Mode::Models;
@@ -1139,6 +1166,42 @@ impl App {
                     self.cache_pct,
                 ));
             }
+            "tools" => {
+                let lines = {
+                    let sessions = self.core.sessions.lock().await;
+                    match self
+                        .session_id
+                        .as_ref()
+                        .and_then(|id| sessions.get(id))
+                    {
+                        Some(data) => extensions::tools_block(&data.registry, true),
+                        None => {
+                            let reg = registry::Registry::build(&self.project);
+                            extensions::tools_block(&reg, false)
+                        }
+                    }
+                };
+                self.transcript.push(lines);
+            }
+            "skills" => {
+                let lines = {
+                    let sessions = self.core.sessions.lock().await;
+                    match self
+                        .session_id
+                        .as_ref()
+                        .and_then(|id| sessions.get(id))
+                    {
+                        Some(data) => {
+                            extensions::skills_block(&data.registry.skills, &self.project, true)
+                        }
+                        None => {
+                            let reg = registry::Registry::build(&self.project);
+                            extensions::skills_block(&reg.skills, &self.project, false)
+                        }
+                    }
+                };
+                self.transcript.push(lines);
+            }
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
                 let status = mlx::status(&self.core).await;
@@ -1153,15 +1216,27 @@ impl App {
                     .budget
                     .map(|(u, t)| format!("{}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                     .unwrap_or_else(|| "0%".into());
+                let host = extensions::endpoint_host(&s.base_url).unwrap_or_else(|| s.base_url.clone());
                 let block = vec![
                     kv("model", &s.model),
                     kv("endpoint", &s.base_url),
+                    kv("host", &host),
                     kv("server", &server),
                     kv("approvals", &s.approval_mode),
                     kv("context", &format!("{ctx} of {} tokens", s.context_tokens)),
                     kv("session", self.session_id.as_deref().unwrap_or("none yet")),
                     kv("project", &self.project.display().to_string()),
                     kv("data", &self.core.data_dir.display().to_string()),
+                    Line::from(Span::styled(
+                        "  network".to_string(),
+                        Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
+                    )),
+                    kv("  dest", &s.base_url),
+                    kv(
+                        "  also",
+                        "Hugging Face only when you use /models to download or serve",
+                    ),
+                    kv("  privacy", "no telemetry · endpoint-only · sessions stay local"),
                 ];
                 self.transcript.push(block);
             }
@@ -1611,6 +1686,7 @@ impl App {
             self.draw_chat(frame, chat_area);
         }
         if let Some((_, name, summary)) = &self.pending_approval {
+            let budget = area.width.saturating_sub(36) as usize;
             Paragraph::new(Line::from(vec![
                 Span::styled("▎", Style::default().fg(theme::WARN())),
                 Span::styled(
@@ -1620,14 +1696,11 @@ impl App {
                 Span::styled(
                     name.clone(),
                     Style::default()
-                        .fg(theme::ACCENT())
+                        .fg(theme::WARN())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    clip(summary, area.width.saturating_sub(42) as usize),
-                    Style::default(),
-                ),
+                Span::styled(clip(summary, budget), Style::default().fg(theme::DIM())),
                 Span::styled("  [y]es [n]o [a]lways", Style::default().fg(theme::DIM())),
             ]))
             .render(approval_area, frame.buffer_mut());
@@ -1690,13 +1763,13 @@ impl App {
         } else if self.completion.is_some() {
             "↑↓ select · tab/enter accept · esc close"
         } else if self.focus == Focus::Scrollback {
-            "↑↓ block · enter fold · y copy · tab/esc composer"
+            "j/k block · shift+↑↓ turn · g/G top/end · enter fold · y copy"
         } else if self.running {
             "enter queues · esc cancel · tab history · ctrl+r search"
         } else if self.transcript.offset() > 0 {
             "esc follow · tab browse · pgup/pgdn scroll"
         } else {
-            "enter send · / commands · @ file · tab history · ctrl+r"
+            "enter send · /tools · /skills · @ file · tab history"
         };
         Line::from(Span::styled(
             format!(" {text}"),
@@ -1706,6 +1779,15 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let version = env!("CARGO_PKG_VERSION");
+        let (model, base_url, approvals) = {
+            let s = self.core.settings.lock().unwrap();
+            (s.model.clone(), s.base_url.clone(), s.approval_mode.clone())
+        };
+        let model = extensions::short_model(&model);
+        let host = extensions::endpoint_host(&base_url).unwrap_or_else(|| "endpoint".into());
+        let endpoint = format!("{model}@{host}");
+        let max_ep = (area.width as usize / 3).clamp(12, 36);
+        let endpoint = clip(&endpoint, max_ep);
         let line = Line::from(vec![
             Span::styled(
                 "◆ openmax",
@@ -1714,7 +1796,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  v{version} · {} · /help", self.dir_label),
+                format!("  v{version} · {} · {endpoint} · {approvals}", self.dir_label),
                 Style::default().fg(theme::DIM()),
             ),
         ]);
@@ -1910,7 +1992,13 @@ impl App {
             self.status_scrolled = scrolled;
             self.status_quit_armed = self.quit_armed;
 
-            let dot_color = if ready { theme::OK() } else { theme::DIM() };
+            let dot_color = if self.running {
+                theme::WARN()
+            } else if ready {
+                theme::OK()
+            } else {
+                theme::DIM()
+            };
             let mut ctx = self
                 .budget
                 .map(|(u, t)| format!(" · ctx {}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
@@ -1918,18 +2006,31 @@ impl App {
             if let Some(pct) = self.cache_pct {
                 ctx.push_str(&format!(" · cache {pct}%"));
             }
-            let short_model = self
-                .status_model
-                .rsplit('/')
-                .next()
-                .unwrap_or(&self.status_model)
-                .to_string();
+            if !self.queued.is_empty() {
+                ctx.push_str(&format!(" · q:{}", self.queued.len()));
+            }
+            if self.running {
+                if let Some(started) = self.turn_started {
+                    let secs = started.elapsed().as_secs();
+                    ctx.push_str(&format!(" · {secs}s"));
+                }
+                if let (Some(started), Some(first)) = (self.turn_started, self.first_token) {
+                    let ttft = first.saturating_duration_since(started).as_millis();
+                    ctx.push_str(&format!(" · ttft {ttft}ms"));
+                }
+            }
+            let short_model = extensions::short_model(&self.status_model).to_string();
             let focus = if self.focus == Focus::Scrollback {
                 " · hist"
             } else {
                 ""
             };
             let scrolled_suffix = if scrolled { " · ↑" } else { "" };
+            let privacy = if self.running || self.quit_armed {
+                ""
+            } else {
+                " · endpoint-only"
+            };
             let right = if self.quit_armed {
                 " · ctrl+c again to quit"
             } else {
@@ -1940,7 +2041,7 @@ impl App {
                 Span::styled(short_model, Style::default().fg(theme::DIM())),
                 Span::styled(
                     format!(
-                        "{ctx} · {}{scrolled_suffix}{focus}{right}",
+                        "{ctx} · {}{scrolled_suffix}{focus}{privacy}{right}",
                         self.status_approvals
                     ),
                     Style::default().fg(theme::DIM()),
@@ -1956,23 +2057,27 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "queue the message for after this turn"),
     ("tab", "focus conversation ↔ composer"),
-    ("↑↓ in history", "select a block · enter fold tool · y copy"),
+    ("↑↓ / j k in history", "select a block · enter fold · y copy"),
+    ("shift+↑↓ in history", "jump to previous or next user turn"),
+    ("g / G in history", "top of scrollback · follow latest"),
     ("/ at the start", "command menu · tab or enter completes"),
     ("@", "mention a project file (fuzzy search)"),
     ("ctrl+r", "search prompt history"),
     ("esc", "cancel turn · follow latest · return to composer"),
     ("wheel · pgup/pgdn", "scroll the conversation"),
-    ("ctrl+o", "expand the last tool block"),
+    ("ctrl+o / o", "expand the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
     ("/models", "manage and serve local models"),
     ("/model <repo>", "use a specific model id"),
-    ("/theme dark|light|mono", "switch appearance"),
+    ("/theme dark|light|mono|catppuccin", "switch appearance"),
     ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
     ("/new", "start a fresh session"),
     ("/resume", "pick an earlier session in this project"),
+    ("/tools", "list tools frozen for this session"),
+    ("/skills", "list skills frozen for this session"),
     ("/context", "prompt token costs, cache hits, and budget"),
-    ("/status", "session and server state"),
+    ("/status", "session, endpoint, and network destinations"),
     ("/logs", "recent model server logs"),
     ("/quit", "exit"),
 ];

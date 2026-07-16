@@ -98,11 +98,13 @@ When `base_url` is not the managed MLX port, Open Max talks to your endpoint dir
 | **/** at the start of a message | Command menu; **Tab** or **Enter** completes |
 | **@** anywhere | Fuzzy-search project files and mention one |
 | **Tab** | Toggle focus between composer and conversation |
-| **↑↓** (history focused) | Select a block · **Enter** fold tool · **y** copy |
+| **↑↓** / **j k** (history focused) | Select a block · **Enter** fold tool · **y** copy |
+| **Shift+↑↓** (history focused) | Jump to previous or next user turn |
+| **g** / **G** (history focused) | Top of scrollback · follow latest |
 | **Esc** | Close menu · cancel turn · follow latest · return to composer |
 | **Mouse wheel** / **PgUp PgDn** | Scroll the conversation |
 | **Ctrl+R** | Search prompt history |
-| **Ctrl+O** | Expand last tool block |
+| **Ctrl+O** / **o** | Expand last tool block |
 | **Ctrl+T** | Toggle model thinking stream |
 | **Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U / Ctrl+W** | Line editing in the composer |
 | **Ctrl+C** twice | Quit (model server keeps running if you started one) |
@@ -117,9 +119,11 @@ Cancelling a turn hands any queued messages back to the composer, so nothing typ
 | `/approvals auto\|ask\|readonly` | Control mutating tool gates |
 | `/new` | Start a fresh session |
 | `/resume` | Pick an earlier session in this project |
-| `/theme dark\|light\|mono` | Switch appearance (respects `NO_COLOR`) |
+| `/tools` | List tools frozen for this session (or preview the next) |
+| `/skills` | List skills frozen for this session (or preview the next) |
+| `/theme dark\|light\|mono\|catppuccin` | Switch appearance (respects `NO_COLOR`) |
 | `/context` | Prompt token costs per component, cache hits, budget |
-| `/status` | Session, endpoint, and server state |
+| `/status` | Session, endpoint, and network destinations |
 | `/logs` | Tail recent MLX server logs |
 | `/quit` | Exit |
 
@@ -173,7 +177,7 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
-**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/context` tells you which state you are looking at.
+**Freeze semantics.** Tools and skills are discovered once, at session creation, and frozen for the session. The serialized schemas are part of the prompt prefix the server's KV cache keys on, so they must stay byte-stable. Config changes apply to the next `/new` session; `/tools`, `/skills`, and `/context` show the frozen set and its token cost.
 
 **Why no MCP?** A typical MCP server dumps 10k+ tokens of tool descriptions into every request, most of a small model's whole window. External tools plus skills give the same reach with per-call processes and on-demand documentation: write a CLI, give it a README (or a skill), and let the model read it when needed.
 
@@ -184,7 +188,7 @@ Open Max does not phone home. The only network destinations are:
 1. The model endpoint in `base_url` (your choice).
 2. Hugging Face, only when you explicitly download or serve a model through `/models`.
 
-Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory.
+Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. Inside a session, `/status` lists those destinations; the status bar shows `endpoint-only` when idle.
 
 ## Architecture
 

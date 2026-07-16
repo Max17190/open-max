@@ -1,4 +1,5 @@
 pub mod context;
+pub mod extensions;
 pub mod markdown;
 pub mod models;
 pub mod sessions;
