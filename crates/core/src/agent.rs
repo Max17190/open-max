@@ -171,6 +171,38 @@ fn batchable_call(
     !repeat_tracker.would_block(name, &args_key)
 }
 
+/// Append cancel/error tool messages for any tool_call_ids on the last assistant
+/// message that still lack a following tool reply. Returns true if messages grew.
+///
+/// Assistant messages with `tool_calls` are persisted before tools run; a cancel
+/// mid-turn can leave orphan call ids that break chat-template replay on resume.
+fn complete_pending_tool_replies(messages: &mut Vec<ChatMessage>, note: &str) -> bool {
+    let Some(asst_idx) = messages.iter().rposition(|m| {
+        m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+    }) else {
+        return false;
+    };
+    let ids: Vec<String> = messages[asst_idx]
+        .tool_calls
+        .as_ref()
+        .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
+        .unwrap_or_default();
+    // Own the answered set so we can push stubs without fighting the borrow checker.
+    let answered: BTreeSet<String> = messages[asst_idx + 1..]
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    let missing: Vec<String> = ids.into_iter().filter(|id| !answered.contains(id)).collect();
+    if missing.is_empty() {
+        return false;
+    }
+    for id in missing {
+        messages.push(ChatMessage::tool(id, note));
+    }
+    true
+}
+
 fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> SessionData {
     if let Some(mut messages) = sessions::load_messages(core, session_id) {
         // Resume: registry frozen at creation — manifest if present, else built-ins only.
@@ -893,6 +925,13 @@ async fn run_loop(
         save_messages(core, session_id, guard.messages(), false).await;
     }
 
+    // Cancel mid-turn may leave the last assistant's tool_calls without tool
+    // role replies (siblings after an approval cancel, or cancel before tools
+    // ran). Stub them so resume templates stay well-formed.
+    if stop_reason == "cancelled" || cancelled.is_cancelled() {
+        let _ = complete_pending_tool_replies(guard.messages(), "The user cancelled this turn.");
+    }
+
     save_messages(core, session_id, guard.messages(), false).await;
     // Restore in-memory transcript under the async lock (Drop is try_lock only).
     guard.commit().await;
@@ -931,7 +970,7 @@ async fn run_task_subagent(
         }
     };
 
-    let child_registry = parent_registry.scoped(TASK_TOOLS);
+    let child_registry = Arc::new(parent_registry.scoped(TASK_TOOLS));
     if child_registry.tools.is_empty() {
         return tools::ToolOutcome::err("task has no read-only tools available in this session");
     }
@@ -1007,56 +1046,145 @@ async fn run_task_subagent(
             break;
         }
 
-        for call in &tool_calls {
+        // Same concurrent read-only batching as the parent loop: child tools are
+        // all non-mutating, so multi-call steps (list_dir+grep+read) run in parallel.
+        // Ask/Deny permission rules force the serial path (batchable_call).
+        let empty_tracker = RepeatCallTracker::new();
+        let segments = partition_concurrent_runs(&tool_calls, |call| {
+            batchable_call(call, &child_registry, &empty_tracker, permissions)
+        });
+
+        for segment in segments {
             if cancelled.is_cancelled() {
                 return tools::ToolOutcome::err("The user cancelled this turn.");
             }
-            let name = call.function.name.as_str();
-            step += 1;
-            core.send_agent(
-                parent_session_id,
-                AgentEvent::SubagentProgress {
-                    call_id: parent_call_id.to_string(),
-                    kind: kind.to_string(),
-                    tool: name.to_string(),
-                    step,
-                },
-            );
-            if name.is_empty() {
-                messages.push(ChatMessage::tool(
-                    call.id.clone(),
-                    "Error: empty tool name".to_string(),
-                ));
+
+            if segment.concurrent {
+                let batch = &tool_calls[segment.start..segment.end];
+                let mut parsed: Vec<(Value, Option<tools::ToolOutcome>)> =
+                    Vec::with_capacity(batch.len());
+                for call in batch {
+                    let name = call.function.name.as_str();
+                    step += 1;
+                    core.send_agent(
+                        parent_session_id,
+                        AgentEvent::SubagentProgress {
+                            call_id: parent_call_id.to_string(),
+                            kind: kind.to_string(),
+                            tool: name.to_string(),
+                            step,
+                        },
+                    );
+                    let args: Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                    let block = match hooks
+                        .pre_tool_use(parent_session_id, name, &args, project_root, &cancelled)
+                        .await
+                    {
+                        PreToolResult::Block { reason } => Some(tools::ToolOutcome {
+                            ok: false,
+                            output: reason,
+                            diff: None,
+                        }),
+                        PreToolResult::Allow => match permissions.evaluate(name, &args) {
+                            PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
+                                ok: false,
+                                output: reason,
+                                diff: None,
+                            }),
+                            // Ask is excluded from batching; fail closed if it appears.
+                            PermissionDecision::Ask => Some(tools::ToolOutcome {
+                                ok: false,
+                                output: "permission rule requires approval; re-run outside a concurrent batch"
+                                    .into(),
+                                diff: None,
+                            }),
+                            PermissionDecision::Allow | PermissionDecision::Default => None,
+                        },
+                    };
+                    parsed.push((args, block));
+                }
+
+                let futures: Vec<_> = batch
+                    .iter()
+                    .zip(parsed.iter())
+                    .map(|(call, (args, block))| {
+                        let name = call.function.name.clone();
+                        let args = args.clone();
+                        let root = project_root.to_path_buf();
+                        let cancel = cancelled.clone();
+                        let registry = child_registry.clone();
+                        let blocked = block.clone();
+                        async move {
+                            if let Some(outcome) = blocked {
+                                return outcome;
+                            }
+                            registry.execute(&name, &args, &root, caps, cancel).await
+                        }
+                    })
+                    .collect();
+                let outcomes = futures_util::future::join_all(futures).await;
+
+                for (i, call) in batch.iter().enumerate() {
+                    let outcome = &outcomes[i];
+                    let name = call.function.name.as_str();
+                    let args = &parsed[i].0;
+                    if parsed[i].1.is_none() {
+                        hooks
+                            .post_tool_use(
+                                parent_session_id,
+                                name,
+                                args,
+                                project_root,
+                                outcome.ok,
+                                &cancelled,
+                            )
+                            .await;
+                    }
+                    messages
+                        .push(ChatMessage::tool(call.id.clone(), tool_message_content(outcome)));
+                }
                 continue;
             }
-            let call_args: Value = match serde_json::from_str(&call.function.arguments) {
-                Ok(v) => v,
-                Err(e) => {
+
+            for call in &tool_calls[segment.start..segment.end] {
+                if cancelled.is_cancelled() {
+                    return tools::ToolOutcome::err("The user cancelled this turn.");
+                }
+                let name = call.function.name.as_str();
+                step += 1;
+                core.send_agent(
+                    parent_session_id,
+                    AgentEvent::SubagentProgress {
+                        call_id: parent_call_id.to_string(),
+                        kind: kind.to_string(),
+                        tool: name.to_string(),
+                        step,
+                    },
+                );
+                if name.is_empty() {
                     messages.push(ChatMessage::tool(
                         call.id.clone(),
-                        format!("Error: invalid JSON in tool arguments: {e}"),
+                        "Error: empty tool name".to_string(),
                     ));
                     continue;
                 }
-            };
-            // Same pre hooks + permissions as the outer loop: policy applies to
-            // delegated tools, not only direct parent calls.
-            if let PreToolResult::Block { reason } = hooks
-                .pre_tool_use(parent_session_id, name, &call_args, project_root, &cancelled)
-                .await
-            {
-                messages.push(ChatMessage::tool(
-                    call.id.clone(),
-                    tool_message_content(&tools::ToolOutcome {
-                        ok: false,
-                        output: reason,
-                        diff: None,
-                    }),
-                ));
-                continue;
-            }
-            match permissions.evaluate(name, &call_args) {
-                PermissionDecision::Deny { reason } => {
+                let call_args: Value = match serde_json::from_str(&call.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        messages.push(ChatMessage::tool(
+                            call.id.clone(),
+                            format!("Error: invalid JSON in tool arguments: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+                // Same pre hooks + permissions as the outer loop: policy applies to
+                // delegated tools, not only direct parent calls.
+                if let PreToolResult::Block { reason } = hooks
+                    .pre_tool_use(parent_session_id, name, &call_args, project_root, &cancelled)
+                    .await
+                {
                     messages.push(ChatMessage::tool(
                         call.id.clone(),
                         tool_message_content(&tools::ToolOutcome {
@@ -1067,56 +1195,69 @@ async fn run_task_subagent(
                     ));
                     continue;
                 }
-                PermissionDecision::Ask => {
-                    // Same approval channel as the parent loop so Ask cannot be
-                    // bypassed by wrapping the call in task.
-                    match request_approval(core, parent_session_id, name, &call_args, &cancelled)
-                        .await
-                    {
-                        ApprovalOutcome::Approved => {}
-                        ApprovalOutcome::Declined => {
-                            messages.push(ChatMessage::tool(
-                                call.id.clone(),
-                                tool_message_content(&tools::ToolOutcome {
-                                    ok: false,
-                                    output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
-                                    diff: None,
-                                }),
-                            ));
-                            continue;
-                        }
-                        ApprovalOutcome::TimedOut => {
-                            messages.push(ChatMessage::tool(
-                                call.id.clone(),
-                                tool_message_content(&tools::ToolOutcome {
-                                    ok: false,
-                                    output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
-                                    diff: None,
-                                }),
-                            ));
-                            continue;
-                        }
-                        ApprovalOutcome::Cancelled => {
-                            return tools::ToolOutcome::err("The user cancelled this turn.");
+                match permissions.evaluate(name, &call_args) {
+                    PermissionDecision::Deny { reason } => {
+                        messages.push(ChatMessage::tool(
+                            call.id.clone(),
+                            tool_message_content(&tools::ToolOutcome {
+                                ok: false,
+                                output: reason,
+                                diff: None,
+                            }),
+                        ));
+                        continue;
+                    }
+                    PermissionDecision::Ask => {
+                        // Same approval channel as the parent loop so Ask cannot be
+                        // bypassed by wrapping the call in task.
+                        match request_approval(core, parent_session_id, name, &call_args, &cancelled)
+                            .await
+                        {
+                            ApprovalOutcome::Approved => {}
+                            ApprovalOutcome::Declined => {
+                                messages.push(ChatMessage::tool(
+                                    call.id.clone(),
+                                    tool_message_content(&tools::ToolOutcome {
+                                        ok: false,
+                                        output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
+                                        diff: None,
+                                    }),
+                                ));
+                                continue;
+                            }
+                            ApprovalOutcome::TimedOut => {
+                                messages.push(ChatMessage::tool(
+                                    call.id.clone(),
+                                    tool_message_content(&tools::ToolOutcome {
+                                        ok: false,
+                                        output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
+                                        diff: None,
+                                    }),
+                                ));
+                                continue;
+                            }
+                            ApprovalOutcome::Cancelled => {
+                                return tools::ToolOutcome::err("The user cancelled this turn.");
+                            }
                         }
                     }
+                    PermissionDecision::Allow | PermissionDecision::Default => {}
                 }
-                PermissionDecision::Allow | PermissionDecision::Default => {}
+                let outcome = child_registry
+                    .execute(name, &call_args, project_root, caps, cancelled.clone())
+                    .await;
+                hooks
+                    .post_tool_use(
+                        parent_session_id,
+                        name,
+                        &call_args,
+                        project_root,
+                        outcome.ok,
+                        &cancelled,
+                    )
+                    .await;
+                messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
             }
-            let outcome = child_registry
-                .execute(name, &call_args, project_root, caps, cancelled.clone())
-                .await;
-            hooks
-                .post_tool_use(
-                    parent_session_id,
-                    name,
-                    &call_args,
-                    project_root,
-                    outcome.ok,
-                    &cancelled,
-                )
-                .await;
-            messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
         }
     }
 
@@ -1231,10 +1372,13 @@ async fn request_approval(
     let approval_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
     core.approvals.lock().unwrap().insert(approval_id.clone(), tx);
+    let summary = crate::registry::summarize_call(name, args);
+    let detail = approval_detail(args);
     core.send_agent(session_id, AgentEvent::ApprovalRequest {
         approval_id: approval_id.clone(),
         name: name.to_string(),
-        summary: crate::registry::summarize_call(name, args),
+        summary,
+        detail,
     });
 
     let outcome = tokio::select! {
@@ -1248,7 +1392,49 @@ async fn request_approval(
     };
 
     core.approvals.lock().unwrap().remove(&approval_id);
+    let outcome_label = match outcome {
+        ApprovalOutcome::Approved => "approved",
+        ApprovalOutcome::Declined => "declined",
+        ApprovalOutcome::TimedOut => "timed_out",
+        ApprovalOutcome::Cancelled => "cancelled",
+    };
+    core.send_agent(
+        session_id,
+        AgentEvent::ApprovalSettled {
+            approval_id,
+            outcome: outcome_label.into(),
+        },
+    );
     outcome
+}
+
+/// Compact args preview for the approval card (paths, command head, etc.).
+fn approval_detail(args: &Value) -> String {
+    if let Some(obj) = args.as_object() {
+        let mut parts = Vec::new();
+        for key in ["path", "command", "old_string", "new_string", "content", "pattern", "glob"] {
+            if let Some(v) = obj.get(key) {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let one = s.replace(['\n', '\r'], " ");
+                let clipped: String = one.chars().take(120).collect();
+                if !clipped.is_empty() {
+                    parts.push(format!("{key}={clipped}"));
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join(" · ");
+        }
+    }
+    let raw = args.to_string();
+    if raw == "null" || raw == "{}" {
+        String::new()
+    } else {
+        raw.chars().take(160).collect()
+    }
 }
 
 /// Keep the transcript inside the model's context window: first truncate old
@@ -1316,6 +1502,29 @@ fn enforce_budget(
             messages[2] = note;
         } else {
             messages.insert(2, note);
+        }
+        // Digest insert can push total slightly over target; keep dropping
+        // exchanges after the digest (index 3) so the next turn stays
+        // append-only and does not re-mutate history for another prune.
+        // Record dropped messages into the same digest so the note stays a
+        // faithful summary of everything removed (not only the first pass).
+        total = messages.iter().map(|m| m.estimated_tokens()).sum();
+        while total > target && messages.len() > 6 {
+            let removed = messages.remove(3);
+            digest.record_message(&removed);
+            total = total.saturating_sub(removed.estimated_tokens());
+            if removed.role == "assistant" && removed.tool_calls.is_some() {
+                while messages.len() > 3 && messages[3].role == "tool" {
+                    let tool = messages.remove(3);
+                    digest.record_message(&tool);
+                    total = total.saturating_sub(tool.estimated_tokens());
+                }
+            }
+        }
+        // Always refresh the note after the drop loop so extra removals are
+        // reflected even when the first-pass note was already inserted above.
+        if messages.len() > 2 && is_digest_message(&messages[2]) {
+            messages[2] = ChatMessage::user(digest.format());
         }
         (true, Some(digest))
     } else {
@@ -1421,6 +1630,80 @@ mod tests {
     }
 
     #[test]
+    fn complete_pending_stubs_missing_tool_replies() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                None,
+                Some(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        kind: "function".into(),
+                        function: ToolCallFunction {
+                            name: "read_file".into(),
+                            arguments: r#"{"path":"a"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        kind: "function".into(),
+                        function: ToolCallFunction {
+                            name: "read_file".into(),
+                            arguments: r#"{"path":"b"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        kind: "function".into(),
+                        function: ToolCallFunction {
+                            name: "grep".into(),
+                            arguments: r#"{"pattern":"x"}"#.into(),
+                        },
+                    },
+                ]),
+            ),
+            // Only the first call was answered before cancel.
+            ChatMessage::tool("c1", "ok"),
+        ];
+        let note = "The user cancelled this turn.";
+        assert!(complete_pending_tool_replies(&mut messages, note));
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(messages[4].content.as_deref(), Some(note));
+        assert_eq!(messages[5].tool_call_id.as_deref(), Some("c3"));
+        assert_eq!(messages[5].content.as_deref(), Some(note));
+        // Idempotent once every id has a reply.
+        assert!(!complete_pending_tool_replies(&mut messages, note));
+    }
+
+    #[test]
+    fn complete_pending_noop_when_all_replied_or_no_tool_calls() {
+        let note = "The user cancelled this turn.";
+        let mut plain = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(Some("hi".into()), None),
+        ];
+        assert!(!complete_pending_tool_replies(&mut plain, note));
+
+        let mut done = vec![
+            ChatMessage::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "only".into(),
+                    kind: "function".into(),
+                    function: ToolCallFunction {
+                        name: "list_dir".into(),
+                        arguments: r#"{"path":"."}"#.into(),
+                    },
+                }]),
+            ),
+            ChatMessage::tool("only", "files"),
+        ];
+        assert!(!complete_pending_tool_replies(&mut done, note));
+    }
+
+    #[test]
     fn partition_splits_readonly_runs_and_breaks_on_mutating() {
         let registry = Registry::builtin_only();
         let tracker = RepeatCallTracker::new();
@@ -1439,6 +1722,40 @@ mod tests {
         assert!(segments[0].concurrent && segments[0].start == 0 && segments[0].end == 2);
         assert!(!segments[1].concurrent && segments[1].start == 2 && segments[1].end == 3);
         assert!(segments[2].concurrent && segments[2].start == 3 && segments[2].end == 5);
+    }
+
+    #[test]
+    fn partition_task_scoped_readonly_tools_batch_concurrently() {
+        let parent = Registry::builtin_only();
+        let child = parent.scoped(TASK_TOOLS);
+        let tracker = RepeatCallTracker::new();
+        let empty_perms = Permissions::default();
+        let calls = vec![
+            tool_call("list_dir", r#"{"path":"."}"#),
+            tool_call("read_file", r#"{"path":"a.rs"}"#),
+            tool_call("glob", r#"{"pattern":"**/*.rs"}"#),
+            tool_call("grep", r#"{"pattern":"fn"}"#),
+        ];
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &child, &tracker, &empty_perms)
+        });
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].concurrent);
+        assert_eq!((segments[0].start, segments[0].end), (0, 4));
+        // Mutating / task names are not present in the scoped registry, so even
+        // if the model hallucinated one it would fall out of the concurrent run.
+        assert!(!batchable_call(
+            &tool_call("write_file", r#"{"path":"x","content":"y"}"#),
+            &child,
+            &tracker,
+            &empty_perms,
+        ));
+        assert!(!batchable_call(
+            &tool_call(tools::TASK_TOOL, r#"{"prompt":"x","subagent":"explore"}"#),
+            &child,
+            &tracker,
+            &empty_perms,
+        ));
     }
 
     #[test]
@@ -1532,9 +1849,9 @@ mod tests {
             messages.push(msg("user", 2000));
         }
         let _ = enforce_budget(&mut messages, 2000);
-        // Old exchanges are dropped down to the guaranteed floor: the system
-        // prompt, the original request, a compaction digest, and the most recent tail.
-        assert_eq!(messages.len(), 7);
+        // Floor is system + first user + digest + a short tail (post-digest
+        // drops may trim one more exchange when the digest itself overshoots).
+        assert!(messages.len() >= 6 && messages.len() <= 7, "len={}", messages.len());
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].content.as_deref(), Some("x".repeat(400).as_str()));
@@ -1629,5 +1946,31 @@ mod tests {
         assert!(text.contains("read_file"), "{text}");
         assert!(text.contains("src/auth.rs"), "{text}");
         assert!(text.contains("Earlier goals"), "{text}");
+    }
+
+    /// After a prune that inserts a digest, token total must sit at or below
+    /// the hysteresis target so the next iteration does not re-mutate history.
+    #[test]
+    fn budget_post_digest_stays_at_or_below_target() {
+        let mut messages = vec![msg("system", 200), msg("user", 200)];
+        for i in 0..16 {
+            messages.push(assistant_with_tools(
+                "read_file",
+                &format!(r#"{{"path":"src/module_{i}.rs"}}"#),
+            ));
+            messages.push(msg("tool", 1800));
+        }
+        let budget = 3500;
+        let target = budget * PRUNE_TARGET_PCT / 100;
+        let (changed, digest) = enforce_budget(&mut messages, budget);
+        assert!(changed);
+        assert!(digest.is_some());
+        let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        assert!(
+            total <= target,
+            "post-digest total {total} must be <= target {target} (budget {budget})"
+        );
+        assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
+        assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
     }
 }
