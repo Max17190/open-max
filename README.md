@@ -1,6 +1,6 @@
 # Open Max
 
-**A barebones, high-performance agent harness. Extremely configurable. Full control.**
+**A lightweight, high-performance agent harness. Extremely configurable. Full control.**
 
 Open Max is a single Rust binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. No desktop shell, no heavyweight runtime, no telemetry. Just a ~5 MB harness that stays out of the way.
 
