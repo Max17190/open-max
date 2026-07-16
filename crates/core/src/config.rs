@@ -36,6 +36,20 @@ pub struct Settings {
     /// Byte cap for bash/external tool output before tail-truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
+    /// Cap on agent tool/model iterations per turn (main loop).
+    #[serde(default = "default_max_agent_iterations")]
+    pub max_agent_iterations: usize,
+    /// Cap on iterations inside a `task` subagent child loop.
+    #[serde(default = "default_max_task_iterations")]
+    pub max_task_iterations: usize,
+}
+
+fn default_max_agent_iterations() -> usize {
+    50
+}
+
+fn default_max_task_iterations() -> usize {
+    12
 }
 
 impl Default for Settings {
@@ -55,6 +69,8 @@ impl Default for Settings {
             num_draft_tokens: None,
             chat_template_args: None,
             max_output_bytes: None,
+            max_agent_iterations: default_max_agent_iterations(),
+            max_task_iterations: default_max_task_iterations(),
         }
     }
 }
@@ -76,4 +92,49 @@ pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
     // Endpoint resolution is cached; force a re-read after settings change.
     crate::providers::invalidate_providers_cache();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_iteration_caps_default_to_50_and_12() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_task_iterations, 12);
+    }
+
+    #[test]
+    fn default_settings_use_iteration_caps() {
+        let s = Settings::default();
+        assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_task_iterations, 12);
+    }
+
+    #[test]
+    fn iteration_caps_round_trip_when_present() {
+        let s: Settings = serde_json::from_str(
+            r#"{"max_agent_iterations":3,"max_task_iterations":2}"#,
+        )
+        .unwrap();
+        assert_eq!(s.max_agent_iterations, 3);
+        assert_eq!(s.max_task_iterations, 2);
+    }
+
+    #[test]
+    fn load_missing_file_uses_iteration_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-settings-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = load(&dir);
+        assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_task_iterations, 12);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

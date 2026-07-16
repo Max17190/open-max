@@ -18,10 +18,6 @@ use crate::state::{CancelToken, Core, SessionData};
 use crate::tools;
 use crate::types::{AgentEvent, ChatMessage, ToolCall};
 
-const MAX_ITERATIONS: usize = 50;
-/// Cap for a `task` child loop: enough for focused exploration without
-/// burning the parent turn's latency budget.
-const MAX_TASK_ITERATIONS: usize = 12;
 /// Read-only tools available to a `task` child. No bash, no writes, no nesting.
 const TASK_TOOLS: &[&str] = &["list_dir", "read_file", "glob", "grep"];
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -614,8 +610,9 @@ async fn run_loop(
     let mut repeat_tracker = RepeatCallTracker::new();
     let context_tokens = endpoint.context_tokens;
     let max_tokens = endpoint.max_tokens;
+    let max_iterations = settings.max_agent_iterations.max(1);
 
-    'turns: for _ in 0..MAX_ITERATIONS {
+    'turns: for _ in 0..max_iterations {
         let (budget_changed, compaction) = enforce_budget(
             guard.messages(),
             context_tokens.saturating_sub(max_tokens + 1024),
@@ -1014,8 +1011,9 @@ async fn run_task_subagent(
         .min(12_000);
     let mut last_text = String::new();
     let mut step = 0usize;
+    let max_task_iterations = settings.max_task_iterations.max(1);
 
-    for _ in 0..MAX_TASK_ITERATIONS {
+    for _ in 0..max_task_iterations {
         if cancelled.is_cancelled() {
             return tools::ToolOutcome::err("The user cancelled this turn.");
         }

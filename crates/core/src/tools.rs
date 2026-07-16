@@ -819,7 +819,12 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<Canc
         return ToolOutcome::err("missing required argument: command");
     };
     let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60).clamp(1, 300);
-    let mut cmd = tokio::process::Command::new("/bin/zsh");
+    // Prefer zsh (macOS default), then bash, then sh for portable Linux CI/hosts.
+    let shell = ["/bin/zsh", "/bin/bash", "/bin/sh"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap_or("/bin/sh");
+    let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-lc")
         .arg(command)
         .current_dir(root)

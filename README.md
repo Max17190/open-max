@@ -115,9 +115,13 @@ Drive the same agent core without taking over the terminal. Useful for scripting
 ```sh
 openmax -p "summarize the top-level layout of this repo"
 openmax -p --json "list the public modules in crates/core"
+# multi-turn on one session (repeat -p):
+openmax -p "list the crates" -p "summarize the first one"
 ```
 
-Text tokens go to stdout; tool progress goes to stderr. With `--json`, each `AgentEvent` envelope is one JSON line on stdout. Mutating tools still honor `approval_mode`: for unattended runs set `"approval_mode": "auto"` in settings (otherwise approvals are declined so the process never hangs).
+Text tokens go to stdout; tool progress goes to stderr. With `--json`, each `AgentEvent` envelope is one JSON line on stdout (multiple turns run sequentially). Mutating tools still honor `approval_mode`: for unattended runs set `"approval_mode": "auto"` in settings (otherwise approvals are declined so the process never hangs).
+
+Agent loop caps are configurable in `settings.json` (defaults match prior hard-coded values): `"max_agent_iterations": 50` for the main turn loop, `"max_task_iterations": 12` for `task` subagents. Values are clamped to at least 1 when used.
 
 ### Optional: first run with managed MLX (Apple Silicon)
 
