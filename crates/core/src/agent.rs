@@ -1106,10 +1106,13 @@ async fn request_approval(
     let approval_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
     core.approvals.lock().unwrap().insert(approval_id.clone(), tx);
+    let summary = crate::registry::summarize_call(name, args);
+    let detail = approval_detail(args);
     core.send_agent(session_id, AgentEvent::ApprovalRequest {
         approval_id: approval_id.clone(),
         name: name.to_string(),
-        summary: crate::registry::summarize_call(name, args),
+        summary,
+        detail,
     });
 
     let outcome = tokio::select! {
@@ -1123,7 +1126,49 @@ async fn request_approval(
     };
 
     core.approvals.lock().unwrap().remove(&approval_id);
+    let outcome_label = match outcome {
+        ApprovalOutcome::Approved => "approved",
+        ApprovalOutcome::Declined => "declined",
+        ApprovalOutcome::TimedOut => "timed_out",
+        ApprovalOutcome::Cancelled => "cancelled",
+    };
+    core.send_agent(
+        session_id,
+        AgentEvent::ApprovalSettled {
+            approval_id,
+            outcome: outcome_label.into(),
+        },
+    );
     outcome
+}
+
+/// Compact args preview for the approval card (paths, command head, etc.).
+fn approval_detail(args: &Value) -> String {
+    if let Some(obj) = args.as_object() {
+        let mut parts = Vec::new();
+        for key in ["path", "command", "old_string", "new_string", "content", "pattern", "glob"] {
+            if let Some(v) = obj.get(key) {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let one = s.replace(['\n', '\r'], " ");
+                let clipped: String = one.chars().take(120).collect();
+                if !clipped.is_empty() {
+                    parts.push(format!("{key}={clipped}"));
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join(" · ");
+        }
+    }
+    let raw = args.to_string();
+    if raw == "null" || raw == "{}" {
+        String::new()
+    } else {
+        raw.chars().take(160).collect()
+    }
 }
 
 /// Keep the transcript inside the model's context window: first truncate old
