@@ -71,22 +71,23 @@ impl PromptBreakdown {
 pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
+    // Tool-specific guidance lives in each tool's schema description (which
+    // rides in every request anyway); rules here are only the cross-cutting
+    // ones. Both sides count against the frozen prompt budget in
+    // `frozen_prompt_fits_token_budget`.
     let mut prompt = format!(
-        "You are Open Max, a coding agent. You work on the project at {root} using tools.\n\
+        "You are Open Max, a coding agent working on the project at {root}.\n\
         \n\
         Rules:\n\
-        - Inspect before you act: use list_dir, glob, grep and read_file to ground every answer in the real code. Never invent file contents or paths.\n\
-        - For broad exploration (\"where is X\", \"how does Y work\", \"map the flow\"), prefer the task tool so search churn stays out of your context; it returns a summary only.\n\
-        - Before editing a file, read_file it first. Then use edit_file with an old_string copied exactly from the file.\n\
-        - Prefer edit_file for changes to existing files; use write_file only for new files or full rewrites.\n\
-        - Use bash to run builds, tests and git. Commands run in the project root.\n\
-        - Make small, focused changes that match the existing code style.\n\
-        - After making changes, verify them when possible (compile, run tests, or re-read the file).\n\
-        - When the task is done, stop calling tools and reply with a short plain-text summary of what you changed and how you verified it.\n\
-        - If a tool returns an error, read it carefully and correct your next call; do not repeat the same failing call.\n\
-        - Call tools through the API tool-calling mechanism. Do not print tool-call JSON or XML in your reply text.\n\
+        - All tool paths are project-relative.\n\
+        - Never invent paths or file contents; read the real code first.\n\
+        - Prefer edit_file for existing files; write_file only for new files or full rewrites.\n\
+        - Make small, focused changes in the existing style; verify by compile, test, or re-read.\n\
+        - On a tool error, correct the next call; never repeat a failing call.\n\
+        - Never print tool-call JSON or XML as reply text; call tools only via the API.\n\
+        - When done, stop calling tools; reply with a short summary of changes and verification.\n\
         \n\
-        Keep replies brief. No filler, no apologies, no repeating file contents the user can already see."
+        Keep replies brief: no filler, no repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
     if let Some(instructions) = agents_md(project_root) {
@@ -291,6 +292,48 @@ mod tests {
         let dir = temp_project();
         let prompt = builtin_prompt(&dir);
         assert!(!prompt.contains("AGENTS.md"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Budget gate for the frozen prompt prefix: base system prompt plus the
+    /// serialized builtin tool array must stay within ~800 tokens. The cap is
+    /// in chars (the core stays tokenizer-free): 3452 chars including a
+    /// 52-char project root measured 794 tokens on o200k_base and 775 on
+    /// cl100k_base (2026-07-16). The interpolated root varies per machine, so
+    /// it is excluded here and the cap (3450) leaves room for a typical
+    /// checkout path. If this fails, re-measure with a real tokenizer before
+    /// raising anything. Only builtins count: external tools are the user's
+    /// own budget, and grounding sections (AGENTS.md, layout map, skills)
+    /// have their own caps.
+    #[test]
+    fn frozen_prompt_fits_token_budget() {
+        let dir = temp_project();
+        let registry = crate::registry::Registry::build(&dir);
+        let (_, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let base_chars = breakdown
+            .components
+            .iter()
+            .find(|(name, _)| name == "base rules")
+            .map(|(_, c)| *c)
+            .expect("base rules component present");
+        let path_free = base_chars - dir.to_string_lossy().len();
+        // Serialize the builtin entries as one array so brackets and commas
+        // count, exactly as the wire payload does.
+        let builtins: Vec<&serde_json::Value> = registry
+            .tool_schemas_json()
+            .as_array()
+            .expect("schemas are an array")
+            .iter()
+            .zip(&registry.tools)
+            .filter(|(_, spec)| matches!(spec.kind, crate::registry::ToolKind::Builtin))
+            .map(|(entry, _)| entry)
+            .collect();
+        let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
+        let total = path_free + tool_chars;
+        assert!(
+            total <= 3_450,
+            "frozen prompt budget exceeded: base rules (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 3450 ≈ 800 tokens with a typical checkout path)",
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
