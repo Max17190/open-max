@@ -128,6 +128,22 @@ impl Registry {
         &self.schemas
     }
 
+    /// Ephemeral read-only registry for a `task` subagent. Mutating tools and
+    /// the `task` meta-tool are always excluded so a child cannot change the
+    /// workspace or recurse.
+    pub fn scoped(&self, allowed: &[&str]) -> Registry {
+        let tools: Vec<ToolSpec> = self
+            .tools
+            .iter()
+            .filter(|s| allowed.contains(&s.name.as_str()))
+            .filter(|s| !s.mutating && s.name != tools::TASK_TOOL)
+            .cloned()
+            .collect();
+        let schemas = serialize_specs(&tools);
+        let by_name = tools.iter().enumerate().map(|(i, s)| (s.name.clone(), i)).collect();
+        Registry { tools, skills: Vec::new(), schemas, by_name }
+    }
+
     pub async fn execute(
         &self,
         name: &str,
@@ -237,8 +253,30 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
     }
 }
 
+/// Serialize tool specs into the OpenAI schema array. Used for ephemeral
+/// (subagent) registries via `scoped`, which do not need byte-identity with
+/// the built-in schema literals.
+fn serialize_specs(tools: &[ToolSpec]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Built-in tool specs derived from the canonical `tools::tool_schemas()`
 /// literals, so name/description/parameters have a single source of truth.
+
 fn builtin_specs() -> Vec<ToolSpec> {
     let schemas = tools::tool_schemas();
     schemas
@@ -484,6 +522,17 @@ mod tests {
         let b = Registry::builtin_only();
         assert_eq!(a.tool_schemas_json().to_string(), b.tool_schemas_json().to_string());
         assert_eq!(a.tool_names(), b.tool_names());
+    }
+
+    #[test]
+    fn scoped_excludes_mutating_and_task() {
+        let reg = Registry::builtin_only();
+        let scoped = reg.scoped(&["list_dir", "read_file", "glob", "grep", "bash", "task"]);
+        let names: Vec<_> = scoped.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["list_dir", "read_file", "glob", "grep"]);
+        assert!(scoped.get("bash").is_none());
+        assert!(scoped.get(tools::TASK_TOOL).is_none());
+        assert!(scoped.get("write_file").is_none());
     }
 
     #[test]

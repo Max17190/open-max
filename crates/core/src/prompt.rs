@@ -76,6 +76,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         \n\
         Rules:\n\
         - Inspect before you act: use list_dir, glob, grep and read_file to ground every answer in the real code. Never invent file contents or paths.\n\
+        - For broad exploration (\"where is X\", \"how does Y work\", \"map the flow\"), prefer the task tool so search churn stays out of your context; it returns a summary only.\n\
         - Before editing a file, read_file it first. Then use edit_file with an old_string copied exactly from the file.\n\
         - Prefer edit_file for changes to existing files; use write_file only for new files or full rewrites.\n\
         - Use bash to run builds, tests and git. Commands run in the project root.\n\
