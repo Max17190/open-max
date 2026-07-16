@@ -28,7 +28,7 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
-use crate::ui::transcript::{wrap_lines, Term, Transcript};
+use crate::ui::transcript::{filter_matching_indices, wrap_lines, Term, Transcript};
 use crate::ui::{context, extensions, markdown, models};
 
 /// Where keyboard focus lives in chat mode.
@@ -76,6 +76,10 @@ pub struct App {
     completion: Option<completion::Popup>,
     /// Ctrl+R history search: filter text + selected index into matches.
     history_search: Option<(String, usize, Vec<String>)>,
+    /// Ctrl+F scrollback find: query + selected match index + matching block indices.
+    scroll_search: Option<(String, usize, Vec<usize>)>,
+    /// Last find query so n/N can step matches after the popup closes.
+    scroll_search_last: Option<String>,
     /// Project files for @-mentions; rescanned when a fresh `@` opens.
     file_index: Option<Arc<Vec<String>>>,
     file_index_pending: bool,
@@ -158,6 +162,8 @@ pub async fn run(
         focus: Focus::Composer,
         completion: None,
         history_search: None,
+        scroll_search: None,
+        scroll_search_last: None,
         file_index: None,
         file_index_pending: false,
         queued: Vec::new(),
@@ -421,6 +427,8 @@ impl App {
         self.cache_pct = None;
         self.completion = None;
         self.history_search = None;
+        self.scroll_search = None;
+        self.scroll_search_last = None;
         self.focus = Focus::Composer;
         self.queued.clear();
         self.flush_queue = false;
@@ -517,7 +525,17 @@ impl App {
             return Ok(());
         }
         if ctrl && key.code == KeyCode::Char('r') && self.mode == Mode::Chat {
+            self.scroll_search = None;
             self.open_history_search();
+            return Ok(());
+        }
+        if ctrl && key.code == KeyCode::Char('f') && self.mode == Mode::Chat {
+            // Find in conversation (not prompt history). Skip while approval /
+            // completion menus own the keyboard so those flows stay intact.
+            if self.pending_approval.is_none() && self.completion.is_none() {
+                self.history_search = None;
+                self.open_scroll_search();
+            }
             return Ok(());
         }
 
@@ -533,6 +551,12 @@ impl App {
         // History search overlay owns keys until Esc/Enter.
         if self.history_search.is_some() {
             self.on_history_search_key(key);
+            return Ok(());
+        }
+
+        // Scrollback find overlay owns keys until Esc/Enter.
+        if self.scroll_search.is_some() {
+            self.on_scroll_search_key(key);
             return Ok(());
         }
 
@@ -679,6 +703,15 @@ impl App {
                     }
                     return Ok(());
                 }
+                // Continue last Ctrl+F query without reopening the find bar.
+                KeyCode::Char('n') => {
+                    self.step_last_scroll_search(1);
+                    return Ok(());
+                }
+                KeyCode::Char('N') => {
+                    self.step_last_scroll_search(-1);
+                    return Ok(());
+                }
                 KeyCode::Esc | KeyCode::Char(' ') => {
                     self.focus = Focus::Composer;
                     self.transcript.clear_selection();
@@ -791,6 +824,162 @@ impl App {
         } else {
             *selected = (*selected).min(matches.len() - 1);
         }
+    }
+
+    fn open_scroll_search(&mut self) {
+        if self.transcript.block_count() == 0 {
+            self.note("no conversation yet");
+            return;
+        }
+        let n = self.transcript.block_count();
+        let matches: Vec<usize> = (0..n).collect();
+        let selected = matches.len().saturating_sub(1);
+        self.scroll_search = Some((String::new(), selected, matches));
+        self.completion = None;
+        self.focus_scroll_match();
+    }
+
+    fn on_scroll_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some((q, _, _)) = &self.scroll_search {
+                    if !q.is_empty() {
+                        self.scroll_search_last = Some(q.clone());
+                    }
+                }
+                self.scroll_search = None;
+            }
+            KeyCode::Enter => {
+                if let Some((q, _, _)) = &self.scroll_search {
+                    if !q.is_empty() {
+                        self.scroll_search_last = Some(q.clone());
+                    }
+                }
+                self.focus_scroll_match();
+                self.scroll_search = None;
+                self.focus = Focus::Scrollback;
+            }
+            // Next / previous match while the find bar is open.
+            // (n/N step the last query after Enter, from scrollback focus, so
+            // the letter n stays typeable in the query.)
+            KeyCode::Up => {
+                self.step_scroll_match(-1);
+            }
+            KeyCode::Down => {
+                self.step_scroll_match(1);
+            }
+            KeyCode::Backspace => {
+                if let Some((query, _, _)) = &mut self.scroll_search {
+                    query.pop();
+                }
+                self.refilter_scroll_search();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some((query, _, _)) = &mut self.scroll_search {
+                    query.push(c);
+                }
+                self.refilter_scroll_search();
+            }
+            _ => {}
+        }
+    }
+
+    fn refilter_scroll_search(&mut self) {
+        self.refilter_scroll_search_inner(true);
+    }
+
+    /// Refresh matches when the transcript grows under an open find bar.
+    /// Keeps the current block selected if it still matches.
+    fn refilter_scroll_search_live(&mut self) {
+        if self.scroll_search.is_none() {
+            return;
+        }
+        self.refilter_scroll_search_inner(false);
+    }
+
+    fn refilter_scroll_search_inner(&mut self, prefer_latest: bool) {
+        let texts = self.transcript.all_block_search_texts();
+        {
+            let Some((query, selected, matches)) = &mut self.scroll_search else {
+                return;
+            };
+            let prev_bi = matches.get(*selected).copied();
+            *matches = filter_matching_indices(&texts, query);
+            if matches.is_empty() {
+                *selected = 0;
+            } else if prefer_latest {
+                *selected = matches.len() - 1;
+            } else if let Some(bi) = prev_bi {
+                *selected = matches
+                    .iter()
+                    .position(|&m| m == bi)
+                    .unwrap_or(matches.len() - 1);
+            } else {
+                *selected = matches.len() - 1;
+            }
+        }
+        self.focus_scroll_match();
+    }
+
+    /// Scroll the currently highlighted scroll-search match into view.
+    fn focus_scroll_match(&mut self) {
+        let Some((_, sel, matches)) = &self.scroll_search else {
+            return;
+        };
+        if matches.is_empty() {
+            self.transcript.clear_selection();
+            return;
+        }
+        if let Some(&bi) = matches.get(*sel) {
+            self.transcript.select_find_match(bi);
+            self.focus = Focus::Scrollback;
+        }
+    }
+
+    /// Step match selection by `delta` (-1 prev, +1 next), wrapping.
+    fn step_scroll_match(&mut self, delta: i32) {
+        {
+            let Some((_, sel, matches)) = &mut self.scroll_search else {
+                return;
+            };
+            if matches.is_empty() {
+                return;
+            }
+            let n = matches.len() as i32;
+            *sel = (*sel as i32 + delta).rem_euclid(n) as usize;
+        }
+        self.focus_scroll_match();
+    }
+
+    /// n/N after find closed: jump using the last query from scrollback focus.
+    fn step_last_scroll_search(&mut self, delta: i32) {
+        let Some(query) = self.scroll_search_last.clone() else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+        let texts = self.transcript.all_block_search_texts();
+        let matches = filter_matching_indices(&texts, &query);
+        if matches.is_empty() {
+            self.note("no matches");
+            return;
+        }
+        let current = self.transcript.selected();
+        let n = matches.len() as i32;
+        let next = match current.and_then(|c| matches.iter().position(|&bi| bi == c)) {
+            Some(pos) => (pos as i32 + delta).rem_euclid(n) as usize,
+            None if delta > 0 => matches
+                .iter()
+                .position(|&bi| current.is_none_or(|c| bi >= c))
+                .unwrap_or(0),
+            None => matches
+                .iter()
+                .rposition(|&bi| current.is_none_or(|c| bi <= c))
+                .unwrap_or(matches.len() - 1),
+        };
+        self.transcript.select_find_match(matches[next]);
+        self.focus = Focus::Scrollback;
     }
 
     /// Accept the selected completion into the composer. Returns a command to
@@ -1521,6 +1710,7 @@ impl App {
                         &text,
                         markdown::highlighter(),
                     ));
+                    self.refilter_scroll_search_live();
                 }
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
@@ -1570,6 +1760,7 @@ impl App {
                 self.transcript.push_tool(compact, output.clone());
                 self.last_tool_output = Some(output);
                 self.running_tool = None;
+                self.refilter_scroll_search_live();
             }
             AgentEvent::ApprovalRequest {
                 approval_id,
@@ -1750,7 +1941,14 @@ impl App {
         let hist_lines = self.history_search.as_ref().map(|(q, sel, items)| {
             history_search_lines(q, *sel, items, area.width)
         });
-        let popup_lines = if hist_lines.is_some() {
+        let find_lines = if hist_lines.is_some() {
+            None
+        } else {
+            self.scroll_search.as_ref().map(|(q, sel, matches)| {
+                scroll_search_lines(q, *sel, matches, &self.transcript, area.width)
+            })
+        };
+        let popup_lines = if hist_lines.is_some() || find_lines.is_some() {
             None
         } else {
             self.completion.as_ref().map(|p| {
@@ -1760,6 +1958,7 @@ impl App {
         };
         let popup_h = hist_lines
             .as_ref()
+            .or(find_lines.as_ref())
             .or(popup_lines.as_ref())
             .map(|l| l.len() as u16)
             .unwrap_or(0)
@@ -1906,7 +2105,7 @@ impl App {
             Paragraph::new(qlines).render(queue_area, frame.buffer_mut());
         }
 
-        if let Some(lines) = hist_lines.or(popup_lines) {
+        if let Some(lines) = hist_lines.or(find_lines).or(popup_lines) {
             if popup_h > 0 {
                 Paragraph::new(lines).render(popup_area, frame.buffer_mut());
             }
@@ -1917,6 +2116,7 @@ impl App {
         if self.pending_approval.is_none()
             && self.focus == Focus::Composer
             && self.history_search.is_none()
+            && self.scroll_search.is_none()
         {
             frame.set_cursor_position(Position::new(composer_area.x + cx, composer_area.y + cy));
         }
@@ -1933,16 +2133,22 @@ impl App {
             "y approve · n deny · a always"
         } else if self.history_search.is_some() {
             "↑↓ pick · enter insert · esc cancel"
+        } else if self.scroll_search.is_some() {
+            "↑↓ match · enter jump · esc close"
         } else if self.completion.is_some() {
             "↑↓ select · tab/enter accept · esc close"
         } else if self.focus == Focus::Scrollback {
-            "j/k block · [/] turn · g/G top/end · enter fold · y copy"
+            if self.scroll_search_last.is_some() {
+                "j/k block · n/N find · enter fold · y copy"
+            } else {
+                "j/k block · [/] turn · g/G top/end · enter fold · y copy"
+            }
         } else if self.running {
-            "enter queues · esc cancel · tab history · ctrl+r search"
+            "enter queues · esc cancel · tab history · ctrl+f find"
         } else if self.transcript.offset() > 0 {
             "esc follow · tab browse · pgup/pgdn scroll"
         } else {
-            "enter send · /tools · /skills · @ file · tab history"
+            "enter send · /tools · /skills · @ file · ctrl+f find"
         };
         Line::from(Span::styled(
             format!(" {text}"),
@@ -2275,6 +2481,8 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("/ at the start", "command menu · tab or enter completes"),
     ("@", "mention a project file (fuzzy search)"),
     ("ctrl+r", "search prompt history"),
+    ("ctrl+f", "find in conversation"),
+    ("n / N after find", "next or previous match in scrollback"),
     ("esc", "cancel turn · follow latest · return to composer"),
     ("wheel · pgup/pgdn", "scroll the conversation"),
     ("ctrl+o / o", "expand the last tool block"),
@@ -2339,6 +2547,71 @@ fn history_search_lines(
             Style::default().fg(theme::DIM())
         };
         let one_line = item.replace('\n', " ");
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(clip(&one_line, width.saturating_sub(4)), style),
+        ]));
+    }
+    lines
+}
+
+fn scroll_search_lines(
+    query: &str,
+    selected: usize,
+    matches: &[usize],
+    transcript: &Transcript,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let count = if matches.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", selected + 1, matches.len())
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
+        Span::styled(
+            if query.is_empty() {
+                "find in conversation…".to_string()
+            } else {
+                query.to_string()
+            },
+            if query.is_empty() {
+                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::raw("  "),
+        Span::styled(count, Style::default().fg(theme::DIM())),
+    ])];
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches",
+            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+        )));
+        return lines;
+    }
+    let visible = matches.len().min(6);
+    let first = selected
+        .saturating_sub(visible - 1)
+        .min(matches.len() - visible);
+    for (i, &bi) in matches.iter().enumerate().skip(first).take(visible) {
+        let on = i == selected;
+        let marker = if on {
+            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
+        } else {
+            Span::raw("  ")
+        };
+        let style = if on {
+            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::DIM())
+        };
+        let preview = transcript
+            .block_preview(bi, query)
+            .unwrap_or_else(|| format!("block {bi}"));
+        let one_line = preview.replace('\n', " ");
         lines.push(Line::from(vec![
             marker,
             Span::styled(clip(&one_line, width.saturating_sub(4)), style),

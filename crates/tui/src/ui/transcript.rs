@@ -411,6 +411,65 @@ impl Transcript {
         Some(lines_to_plain(&b.raw))
     }
 
+    /// Plain text for scrollback find (user/assistant/tool/system).
+    /// Tool blocks include the compact header and full output.
+    pub fn block_search_text(&self, i: usize) -> Option<String> {
+        let b = self.blocks.get(i)?;
+        Some(block_search_text(b))
+    }
+
+    /// Plain search text for every block, in order.
+    pub fn all_block_search_texts(&self) -> Vec<String> {
+        self.blocks.iter().map(block_search_text).collect()
+    }
+
+    /// Select a block by index and scroll it into view.
+    pub fn select_block(&mut self, bi: usize) {
+        if bi >= self.blocks.len() {
+            return;
+        }
+        self.selected = Some(bi);
+        self.scroll_to_block(bi);
+    }
+
+    /// Select a find match: expand folded tools so full output is visible,
+    /// then scroll into view.
+    pub fn select_find_match(&mut self, bi: usize) {
+        if bi >= self.blocks.len() {
+            return;
+        }
+        if self.blocks[bi].kind == BlockKind::Tool
+            && self.blocks[bi].folded
+            && self.blocks[bi].compact.is_some()
+        {
+            self.blocks[bi].folded = false;
+            self.blocks[bi].invalidate();
+            self.dirty = true;
+            self.ensure_flat();
+        }
+        self.selected = Some(bi);
+        self.scroll_to_block(bi);
+    }
+
+    /// One-line preview for find UI. Prefer a line containing `query` when set.
+    pub fn block_preview(&self, i: usize, query: &str) -> Option<String> {
+        let text = self.block_search_text(i)?;
+        let q = query.trim();
+        if !q.is_empty() {
+            let q_low = q.to_lowercase();
+            if let Some(line) = text.lines().find(|l| l.to_lowercase().contains(&q_low)) {
+                return Some(line.trim().to_string());
+            }
+        }
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        Some(line)
+    }
+
     pub fn last_tool_output(&self) -> Option<&str> {
         self.blocks
             .iter()
@@ -479,6 +538,40 @@ fn lines_to_plain(lines: &[Line<'static>]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn block_search_text(b: &Block) -> String {
+    match &b.full_output {
+        Some(out) => {
+            let header = b
+                .compact
+                .as_ref()
+                .map(|c| lines_to_plain(c))
+                .unwrap_or_default();
+            if header.is_empty() {
+                out.clone()
+            } else {
+                format!("{header}\n{out}")
+            }
+        }
+        None => lines_to_plain(&b.raw),
+    }
+}
+
+/// Case-insensitive substring filter over block plain texts.
+/// Returns indices into `texts` whose content matches `query`.
+/// An empty query matches every block (browse-all mode).
+pub fn filter_matching_indices(texts: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..texts.len()).collect();
+    }
+    let q = query.to_lowercase();
+    texts
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Span-preserving word wrap. Greedy, breaking at the last space that fits;
@@ -796,5 +889,56 @@ mod tests {
         let expanded = t.len();
         assert!(expanded >= folded);
         assert!(t.toggle_fold_selected());
+    }
+
+    #[test]
+    fn filter_matching_indices_empty_query_matches_all() {
+        let texts = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(filter_matching_indices(&texts, ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filter_matching_indices_case_insensitive_substring() {
+        let texts = vec![
+            "Error: file not found".into(),
+            "ok done".into(),
+            "ERROR in path /tmp/foo".into(),
+            "nothing here".into(),
+        ];
+        assert_eq!(filter_matching_indices(&texts, "error"), vec![0, 2]);
+        assert_eq!(filter_matching_indices(&texts, "PATH"), vec![2]);
+        assert_eq!(filter_matching_indices(&texts, "zzz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn block_search_text_includes_tool_full_output() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("you: check logs")]);
+        t.push_assistant(vec![Line::from("assistant: looking")]);
+        t.push_tool(
+            vec![Line::from("✓ read_file app.rs")],
+            "secret_token_xyz\nline2".into(),
+        );
+        let texts = t.all_block_search_texts();
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].contains("check logs"));
+        assert!(texts[1].contains("looking"));
+        assert!(texts[2].contains("read_file"));
+        assert!(texts[2].contains("secret_token_xyz"));
+        let hits = filter_matching_indices(&texts, "secret_token");
+        assert_eq!(hits, vec![2]);
+    }
+
+    #[test]
+    fn select_block_sets_selection() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("one")]);
+        t.push_assistant(vec![Line::from("two")]);
+        t.select_block(1);
+        assert_eq!(t.selected(), Some(1));
+        t.select_block(99);
+        assert_eq!(t.selected(), Some(1));
     }
 }
