@@ -45,7 +45,9 @@ pub struct Permissions {
     fail_closed_reason: Option<String>,
 }
 
+/// Reject unknown top-level keys so `[rule]` / `[[rule]]` typos cannot load as empty policy.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PermissionsFile {
     #[serde(default)]
     rules: Vec<RuleFile>,
@@ -153,6 +155,10 @@ fn load_file(path: &Path) -> FileLoad {
             ));
         }
     };
+    // Empty file is an intentional no-op, not a parse failure.
+    if text.trim().is_empty() {
+        return FileLoad::Ok(Vec::new());
+    }
     let file: PermissionsFile = match toml::from_str(&text) {
         Ok(f) => f,
         Err(e) => {
@@ -411,5 +417,30 @@ tool = "write_file"
             perms.evaluate("read_file", &json!({"path": "a.rs"})),
             PermissionDecision::Default
         );
+    }
+
+    #[test]
+    fn misspelled_top_level_rules_fails_closed() {
+        let tmp = tempfile_dir();
+        // `[[rule]]` instead of `[[rules]]` must not load as empty/default policy.
+        write_perms(
+            &tmp.join(".openmax").join("permissions.toml"),
+            r#"
+[[rule]]
+effect = "deny"
+tool = "bash"
+arg_regex = "rm"
+"#,
+        );
+        let perms = Permissions::discover(&tmp);
+        match perms.evaluate("bash", &json!({"command": "rm -rf /"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(
+                    reason.contains("failing closed") || reason.contains("malformed"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
     }
 }
