@@ -124,7 +124,12 @@ pub async fn run(
                     let _ = stderr.flush();
                 }
             }
-            AgentEvent::ApprovalRequest { approval_id, name, summary } => {
+            AgentEvent::ApprovalRequest {
+                approval_id,
+                name,
+                summary,
+                detail: _,
+            } => {
                 let mode = core.settings.lock().unwrap().approval_mode.clone();
                 let approve = mode == "auto";
                 if !approve {
@@ -162,7 +167,8 @@ pub async fn run(
             AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }
             | AgentEvent::Usage { .. }
-            | AgentEvent::Diff { .. } => {}
+            | AgentEvent::Diff { .. }
+            | AgentEvent::ApprovalSettled { .. } => {}
         }
     }
 

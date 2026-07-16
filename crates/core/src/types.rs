@@ -81,7 +81,21 @@ pub enum AgentEvent {
     /// re-enters the parent's context.
     SubagentProgress { call_id: String, kind: String, tool: String, step: usize },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
-    ApprovalRequest { approval_id: String, name: String, summary: String },
+    /// Mutating tool waiting on the user. `detail` is a short args preview
+    /// (paths, command head) for the TUI card; may be empty.
+    ApprovalRequest {
+        approval_id: String,
+        name: String,
+        summary: String,
+        detail: String,
+    },
+    /// The approval waiter closed (approve, deny, timeout, cancel, or drop).
+    /// Frontends must clear any pending approval UI matching `approval_id`.
+    ApprovalSettled {
+        approval_id: String,
+        /// `approved` | `declined` | `timed_out` | `cancelled`
+        outcome: String,
+    },
     Done { stop_reason: String },
     Error { message: String },
 }

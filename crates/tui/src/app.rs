@@ -28,7 +28,7 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
-use crate::ui::transcript::{wrap_lines, StreamingWrap, Term, Transcript};
+use crate::ui::transcript::{wrap_lines, Term, Transcript};
 use crate::ui::{context, extensions, markdown, models};
 
 /// Where keyboard focus lives in chat mode.
@@ -43,6 +43,9 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const WHEEL_LINES: usize = 3;
 /// Paint-rate cap: coalesce redraw triggers into at most ~60 frames/s.
 const MIN_DRAW_INTERVAL: Duration = Duration::from_millis(16);
+/// Full markdown re-highlight of the live stream is O(n); refresh at this
+/// cadence (and on newlines / width change) so long replies stay smooth.
+const STREAM_MD_INTERVAL: Duration = Duration::from_millis(100);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
@@ -89,7 +92,8 @@ pub struct App {
     first_token: Option<Instant>,
     stream_chars: usize,
     running_tool: Option<(String, String)>,
-    pending_approval: Option<(String, String, String)>,
+    /// Pending mutating-tool gate: id, tool name, summary, detail preview.
+    pending_approval: Option<(String, String, String, String)>,
     pending_diffs: HashMap<String, DiffText>,
     tool_meta: HashMap<String, (String, String)>,
     last_tool_output: Option<String>,
@@ -106,7 +110,11 @@ pub struct App {
     should_quit: bool,
     needs_redraw: bool,
 
-    stream_wrap: StreamingWrap,
+    /// Live assistant stream, markdown-rendered and wrapped (matches final block).
+    stream_wrapped: Vec<Line<'static>>,
+    /// Last full markdown render of `stream_text` (throttle re-highlight work).
+    stream_md_at: Instant,
+    stream_md_len: usize,
     thinking_wrapped: Vec<Line<'static>>,
     thinking_source: String,
     tail_width: u16,
@@ -177,7 +185,9 @@ pub async fn run(
         files_tx,
         should_quit: false,
         needs_redraw: true,
-        stream_wrap: StreamingWrap::default(),
+        stream_wrapped: Vec::new(),
+        stream_md_at: Instant::now(),
+        stream_md_len: 0,
         thinking_wrapped: Vec::new(),
         thinking_source: String::new(),
         tail_width: 0,
@@ -414,7 +424,8 @@ impl App {
         self.focus = Focus::Composer;
         self.queued.clear();
         self.flush_queue = false;
-        self.stream_wrap.clear();
+        self.stream_wrapped.clear();
+        self.stream_md_len = 0;
         self.thinking_wrapped.clear();
         self.thinking_source.clear();
         self.tail_width = 0;
@@ -539,20 +550,18 @@ impl App {
         }
 
         // Approval prompt swallows keys until answered.
-        if let Some((id, name, _)) = self.pending_approval.clone() {
+        if let Some((id, name, _, _)) = self.pending_approval.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.core.respond_approval(&id, true);
-                    self.pending_approval = None;
+                    // UI clears on ApprovalSettled from the agent.
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.core.respond_approval(&id, false);
-                    self.pending_approval = None;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     self.core.settings.lock().unwrap().approval_mode = "auto".into();
                     self.core.respond_approval(&id, true);
-                    self.pending_approval = None;
                     self.note("approvals set to auto for this run (change with /approvals)");
                 }
                 _ => {
@@ -1051,7 +1060,8 @@ impl App {
                 self.first_token = None;
                 self.stream_chars = 0;
                 self.stream_text.clear();
-                self.stream_wrap.clear();
+                self.stream_wrapped.clear();
+                self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 self.thinking_chars = 0;
                 self.thinking_tail.clear();
@@ -1513,7 +1523,8 @@ impl App {
                     ));
                 }
                 self.stream_text.clear();
-                self.stream_wrap.clear();
+                self.stream_wrapped.clear();
+                self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
@@ -1560,9 +1571,31 @@ impl App {
                 self.last_tool_output = Some(output);
                 self.running_tool = None;
             }
-            AgentEvent::ApprovalRequest { approval_id, name, summary } => {
-                self.pending_approval = Some((approval_id, name, summary));
+            AgentEvent::ApprovalRequest {
+                approval_id,
+                name,
+                summary,
+                detail,
+            } => {
+                self.pending_approval = Some((approval_id, name, summary, detail));
                 self.completion = None;
+            }
+            AgentEvent::ApprovalSettled {
+                approval_id,
+                outcome,
+            } => {
+                if self
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|(id, _, _, _)| id == &approval_id)
+                {
+                    self.pending_approval = None;
+                    match outcome.as_str() {
+                        "timed_out" => self.note("approval timed out · declined"),
+                        "cancelled" => self.note("approval cancelled"),
+                        _ => {}
+                    }
+                }
             }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
@@ -1587,6 +1620,7 @@ impl App {
                 }
             }
             AgentEvent::Error { message } => {
+                self.pending_approval = None;
                 self.error(&message);
             }
         }
@@ -1701,7 +1735,8 @@ impl App {
         let hints_h = 1u16.min(area.height.saturating_sub(status_h));
         let header_h = 1u16.min(area.height.saturating_sub(status_h + hints_h + 2));
         let approval_h = if self.pending_approval.is_some() {
-            1u16.min(area.height.saturating_sub(header_h + status_h + hints_h))
+            // Title + wrapped detail + key hints (clamped for tiny terminals).
+            3u16.min(area.height.saturating_sub(header_h + status_h + hints_h))
         } else {
             0
         };
@@ -1805,25 +1840,43 @@ impl App {
         if chat_h > 0 {
             self.draw_chat(frame, chat_area);
         }
-        if let Some((_, name, summary)) = &self.pending_approval {
-            let budget = area.width.saturating_sub(36) as usize;
-            Paragraph::new(Line::from(vec![
-                Span::styled("▎", Style::default().fg(theme::WARN())),
-                Span::styled(
-                    " approve ",
-                    Style::default().fg(theme::WARN()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    name.clone(),
-                    Style::default()
-                        .fg(theme::WARN())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(clip(summary, budget), Style::default().fg(theme::DIM())),
-                Span::styled("  [y]es [n]o [a]lways", Style::default().fg(theme::DIM())),
-            ]))
-            .render(approval_area, frame.buffer_mut());
+        if let Some((_, name, summary, detail)) = &self.pending_approval {
+            if approval_h > 0 {
+                let w = area.width.saturating_sub(2) as usize;
+                let mut lines = vec![Line::from(vec![
+                    Span::styled("▎", Style::default().fg(theme::WARN())),
+                    Span::styled(
+                        " approve ",
+                        Style::default().fg(theme::WARN()).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(theme::WARN())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(clip(summary, w.saturating_sub(name.len() + 12)), Style::default()),
+                ])];
+                if approval_h >= 2 {
+                    let body = if detail.is_empty() {
+                        summary.as_str()
+                    } else {
+                        detail.as_str()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(clip(body, w), Style::default().fg(theme::DIM())),
+                    ]));
+                }
+                if approval_h >= 3 {
+                    lines.push(Line::from(Span::styled(
+                        "  [y]es  [n]o  [a]lways this run  · esc declines",
+                        Style::default().fg(theme::DIM()),
+                    )));
+                }
+                Paragraph::new(lines).render(approval_area, frame.buffer_mut());
+            }
         }
 
         if queue_h > 0 {
@@ -2030,7 +2083,38 @@ impl App {
             self.tail_width = width;
             self.thinking_source.clear();
         }
-        self.stream_wrap.update(&self.stream_text, width);
+        // Catch up markdown after a stream pause: throttle may leave
+        // stream_md_len behind stream_text; interim plain wrap keeps text
+        // visible, and the next due tick upgrades to full highlight.
+        let md_pending =
+            !self.stream_text.is_empty() && self.stream_md_len != self.stream_text.len();
+        let md_due = self.stream_md_at.elapsed() >= STREAM_MD_INTERVAL;
+        let stream_changed = width_changed || self.stream_text.len() != self.tail_stream_len;
+        if self.stream_text.is_empty() {
+            if self.tail_stream_len != 0 || !self.stream_wrapped.is_empty() {
+                self.stream_wrapped.clear();
+                self.stream_md_len = 0;
+                self.tail_stream_len = 0;
+            }
+        } else if stream_changed || (md_pending && md_due) || width_changed {
+            self.tail_stream_len = self.stream_text.len();
+            let boundary = self.stream_text.ends_with('\n');
+            let first = self.stream_md_len == 0;
+            if width_changed || md_due || boundary || first {
+                let md = markdown::render(&self.stream_text, markdown::highlighter());
+                self.stream_wrapped = wrap_lines(&md, width);
+                self.stream_md_at = Instant::now();
+                self.stream_md_len = self.stream_text.len();
+            } else {
+                // Cheap interim wrap: every token is visible immediately.
+                let raw: Vec<Line<'static>> = self
+                    .stream_text
+                    .lines()
+                    .map(|l| Line::from(l.to_string()))
+                    .collect();
+                self.stream_wrapped = wrap_lines(&raw, width);
+            }
+        }
 
         let mut thinking_changed = false;
         if self.show_thinking && !self.thinking_tail.is_empty() {
@@ -2051,17 +2135,14 @@ impl App {
             self.thinking_source.clear();
         }
 
-        let content_changed = width_changed
-            || self.stream_text.len() != self.tail_stream_len
-            || thinking_changed;
+        let content_changed = stream_changed || thinking_changed;
 
         if content_changed {
-            self.tail_stream_len = self.stream_text.len();
             self.tail_buf.clear();
             self.tail_buf
                 .extend(self.thinking_wrapped.iter().cloned());
             self.tail_buf
-                .extend(self.stream_wrap.lines().cloned());
+                .extend(self.stream_wrapped.iter().cloned());
             self.tail_content_len = self.tail_buf.len();
         } else {
             self.tail_buf.truncate(self.tail_content_len);
