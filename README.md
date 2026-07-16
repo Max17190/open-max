@@ -180,6 +180,8 @@ Full instructions, checklists, commands...
 | `pre_tool_use` | Non-zero exit blocks the tool; stdout (or stderr) becomes the error returned to the model |
 | `post_tool_use` | Observe only; failures are ignored |
 
+Hooks also apply to tools run inside a `task` subagent, so lifecycle policy cannot be bypassed by delegation.
+
 ```toml
 # .openmax/hooks/block_rm.toml
 event = "pre_tool_use"

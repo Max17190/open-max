@@ -154,8 +154,11 @@ impl ChatClient {
             body["tool_choice"] = json!("auto");
         }
 
-        // Retry only the pre-stream request path (connect + HTTP status). Once
-        // SSE bytes start, failures fail cleanly without a second full prefill.
+        // Retry only pre-stream transport failures (connect/timeout) and 429
+        // (request rejected before work starts). Do not retry 502/503/504: a
+        // proxy may already have forwarded the POST and started a completion,
+        // so a second attempt can duplicate backend work with no idempotency key.
+        // Once SSE bytes start, failures fail cleanly without a second prefill.
         const MAX_ATTEMPTS: u32 = 3;
         let mut attempt = 0u32;
         let resp = loop {
@@ -399,8 +402,10 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Only statuses that mean the server rejected the request before doing work.
+/// 5xx from a proxy is not safe to retry without an idempotency key.
 fn is_retryable_status(code: u16) -> bool {
-    matches!(code, 429 | 502 | 503 | 504)
+    code == 429
 }
 
 fn is_transient_transport(err: &reqwest::Error) -> bool {
@@ -439,7 +444,10 @@ mod tests {
     #[test]
     fn retryable_status_codes() {
         assert!(is_retryable_status(429));
-        assert!(is_retryable_status(503));
+        // Proxy 5xx may have already started work; do not retry.
+        assert!(!is_retryable_status(502));
+        assert!(!is_retryable_status(503));
+        assert!(!is_retryable_status(504));
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));

@@ -741,6 +741,7 @@ async fn run_loop(
                             &settings,
                             caps,
                             cancelled.clone(),
+                            &hooks,
                         )
                         .await,
                         false,
@@ -807,6 +808,8 @@ async fn run_loop(
 
 /// Run a read-only `task` child agent. The parent context receives only the
 /// final summary (via ToolEnd); child tool churn stays out of the parent window.
+/// Child tool calls go through the same lifecycle hooks as the parent loop so
+/// project policy cannot be bypassed via delegation.
 async fn run_task_subagent(
     core: &Arc<Core>,
     parent_session_id: &str,
@@ -817,6 +820,7 @@ async fn run_task_subagent(
     settings: &Settings,
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
+    hooks: &Hooks,
 ) -> tools::ToolOutcome {
     let kind = args["subagent"].as_str().unwrap_or("explore");
     let prompt = args["prompt"].as_str().unwrap_or("").trim();
@@ -938,8 +942,34 @@ async fn run_task_subagent(
                     continue;
                 }
             };
+            // Same pre/post hooks as the outer loop: lifecycle gates apply to
+            // delegated tools, not only direct parent calls.
+            if let PreToolResult::Block { reason } = hooks
+                .pre_tool_use(parent_session_id, name, &call_args, project_root, &cancelled)
+                .await
+            {
+                messages.push(ChatMessage::tool(
+                    call.id.clone(),
+                    tool_message_content(&tools::ToolOutcome {
+                        ok: false,
+                        output: reason,
+                        diff: None,
+                    }),
+                ));
+                continue;
+            }
             let outcome = child_registry
                 .execute(name, &call_args, project_root, caps, cancelled.clone())
+                .await;
+            hooks
+                .post_tool_use(
+                    parent_session_id,
+                    name,
+                    &call_args,
+                    project_root,
+                    outcome.ok,
+                    &cancelled,
+                )
                 .await;
             messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
         }
