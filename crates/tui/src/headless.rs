@@ -13,14 +13,15 @@ use open_max_core::types::AgentEvent;
 use tokio::sync::mpsc;
 
 pub struct HeadlessArgs {
-    pub prompt: String,
+    /// One or more user prompts; each runs as a sequential turn on the same session.
+    pub prompts: Vec<String>,
     pub continue_session: bool,
     pub json: bool,
 }
 
-/// Run one agent turn and exit when it finishes. Approvals in `ask` mode are
-/// declined so unattended runs never hang; set `approval_mode` to `auto` for
-/// unattended mutations.
+/// Run one or more agent turns and exit when the last finishes. Approvals in
+/// `ask` mode are declined so unattended runs never hang; set `approval_mode`
+/// to `auto` for unattended mutations. Multiple prompts reuse one session_id.
 pub async fn run(
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<CoreEvent>,
@@ -47,29 +48,65 @@ pub async fn run(
         }
     };
 
-    if let Err(e) = agent::start_turn(core.clone(), session_id.clone(), project, args.prompt) {
-        eprintln!("openmax: {e}");
-        return 1;
-    }
-
     let mut exit_code = 0i32;
-    let mut saw_tokens = false;
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
+
+    for prompt in &args.prompts {
+        if let Err(e) = agent::start_turn(
+            core.clone(),
+            session_id.clone(),
+            project.clone(),
+            prompt.clone(),
+        ) {
+            eprintln!("openmax: {e}");
+            return 1;
+        }
+
+        let mut saw_tokens = false;
+        let turn_exit = run_turn_events(
+            &core,
+            &mut core_rx,
+            &session_id,
+            args.json,
+            &mut saw_tokens,
+            &mut stdout,
+            &mut stderr,
+        )
+        .await;
+        if turn_exit != 0 {
+            exit_code = turn_exit;
+            // Stop the multi-turn chain on hard failure so later prompts do not
+            // run against a broken or cancelled session mid-error.
+            break;
+        }
+    }
+
+    exit_code
+}
+
+async fn run_turn_events(
+    core: &Arc<Core>,
+    core_rx: &mut mpsc::UnboundedReceiver<CoreEvent>,
+    session_id: &str,
+    json: bool,
+    saw_tokens: &mut bool,
+    stdout: &mut io::Stdout,
+    stderr: &mut io::Stderr,
+) -> i32 {
+    let mut exit_code = 0i32;
 
     loop {
         let event = match tokio::time::timeout(Duration::from_secs(600), core_rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => {
                 let _ = writeln!(stderr, "openmax: event channel closed");
-                exit_code = 1;
-                break;
+                return 1;
             }
             Err(_) => {
                 let _ = writeln!(stderr, "openmax: timed out waiting for the agent");
-                core.cancel(&session_id);
-                exit_code = 1;
-                break;
+                core.cancel(session_id);
+                return 1;
             }
         };
 
@@ -81,7 +118,7 @@ pub async fn run(
             continue;
         }
 
-        if args.json {
+        if json {
             if let Ok(line) = serde_json::to_string(&env) {
                 let _ = writeln!(stdout, "{line}");
                 let _ = stdout.flush();
@@ -90,34 +127,34 @@ pub async fn run(
 
         match &env.event {
             AgentEvent::Token { text } => {
-                if !args.json {
-                    saw_tokens = true;
+                if !json {
+                    *saw_tokens = true;
                     let _ = write!(stdout, "{text}");
                     let _ = stdout.flush();
                 }
             }
             AgentEvent::MessageDone { text } => {
-                if !args.json && !text.is_empty() {
+                if !json && !text.is_empty() {
                     // Some backends only deliver the final message (no stream).
-                    if !saw_tokens {
+                    if !*saw_tokens {
                         let _ = write!(stdout, "{text}");
                     }
                     if !text.ends_with('\n') {
                         let _ = writeln!(stdout);
                     }
                     let _ = stdout.flush();
-                    saw_tokens = false;
+                    *saw_tokens = false;
                 }
             }
             AgentEvent::ToolStart { name, args: tool_args, .. } => {
-                if !args.json {
+                if !json {
                     let summary = open_max_core::registry::summarize_call(name, tool_args);
                     let _ = writeln!(stderr, "→ {name} {summary}");
                     let _ = stderr.flush();
                 }
             }
             AgentEvent::ToolEnd { ok, output, .. } => {
-                if !args.json {
+                if !json {
                     let status = if *ok { "ok" } else { "err" };
                     let preview = truncate_line(output, 120);
                     let _ = writeln!(stderr, "← {status}: {preview}");
@@ -141,13 +178,13 @@ pub async fn run(
                 core.respond_approval(approval_id, approve);
             }
             AgentEvent::Error { message } => {
-                if !args.json {
+                if !json {
                     let _ = writeln!(stderr, "openmax: error: {message}");
                 }
                 exit_code = 1;
             }
             AgentEvent::Done { stop_reason } => {
-                if !args.json {
+                if !json {
                     let _ = writeln!(stdout);
                     if stop_reason != "stop" && stop_reason != "tool_calls" {
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
@@ -156,10 +193,10 @@ pub async fn run(
                 if stop_reason == "error" {
                     exit_code = 1;
                 }
-                break;
+                return exit_code;
             }
             AgentEvent::SubagentProgress { kind, tool, step, .. } => {
-                if !args.json {
+                if !json {
                     let _ = writeln!(stderr, "  · task/{kind} step {step}: {tool}");
                     let _ = stderr.flush();
                 }
@@ -171,8 +208,6 @@ pub async fn run(
             | AgentEvent::ApprovalSettled { .. } => {}
         }
     }
-
-    exit_code
 }
 
 fn truncate_line(s: &str, max: usize) -> String {
