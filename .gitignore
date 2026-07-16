@@ -8,3 +8,6 @@ target
 # Editor and OS
 .idea
 .DS_Store
+
+# Local contributor/agent instructions (not shipped)
+AGENTS.md

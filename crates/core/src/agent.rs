@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use crate::client::{ChatClient, StreamDelta};
 use crate::config::Settings;
 use crate::fallback;
+use crate::hooks::{Hooks, PreToolResult};
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
 use crate::registry::Registry;
 use crate::sessions;
@@ -225,6 +226,7 @@ struct ReadonlyBatchCtx<'a> {
     project_root: &'a Path,
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
+    hooks: &'a Hooks,
 }
 
 async fn execute_readonly_batch(
@@ -234,6 +236,7 @@ async fn execute_readonly_batch(
     repeat_tracker: &mut RepeatCallTracker,
 ) {
     let mut parsed: Vec<(Value, String)> = Vec::with_capacity(calls.len());
+    let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
     for call in calls {
         let name = call.function.name.as_str();
         // batchable_call already validated the JSON; Null (impossible) would
@@ -244,21 +247,41 @@ async fn execute_readonly_batch(
         ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
             call_id: call.id.clone(),
             name: name.into(),
-            args,
+            args: args.clone(),
         });
+        let block = match ctx
+            .hooks
+            .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
+            .await
+        {
+            PreToolResult::Allow => None,
+            PreToolResult::Block { reason } => Some(tools::ToolOutcome {
+                ok: false,
+                output: reason,
+                diff: None,
+            }),
+        };
+        blocked.push(block);
     }
 
     let futures: Vec<_> = calls
         .iter()
         .zip(parsed.iter())
-        .map(|(call, (args, _))| {
+        .zip(blocked.iter())
+        .map(|((call, (args, _)), block)| {
             let name = call.function.name.clone();
             let args = args.clone();
             let root = ctx.project_root.to_path_buf();
             let cancel = ctx.cancelled.clone();
             let registry = ctx.registry.clone();
             let caps = ctx.caps;
-            async move { registry.execute(&name, &args, &root, caps, cancel).await }
+            let blocked_outcome = block.clone();
+            async move {
+                if let Some(outcome) = blocked_outcome {
+                    return outcome;
+                }
+                registry.execute(&name, &args, &root, caps, cancel).await
+            }
         })
         .collect();
     let outcomes = futures_util::future::join_all(futures).await;
@@ -267,6 +290,19 @@ async fn execute_readonly_batch(
         let outcome = &outcomes[i];
         let name = call.function.name.as_str();
         let args_key = &parsed[i].1;
+        let args = &parsed[i].0;
+        if blocked[i].is_none() {
+            ctx.hooks
+                .post_tool_use(
+                    ctx.session_id,
+                    name,
+                    args,
+                    ctx.project_root,
+                    outcome.ok,
+                    &ctx.cancelled,
+                )
+                .await;
+        }
         if let Some(diff) = &outcome.diff {
             ctx.core.send_agent(ctx.session_id, AgentEvent::Diff {
                 call_id: call.id.clone(),
@@ -282,7 +318,9 @@ async fn execute_readonly_batch(
             output: outcome.output.clone(),
         });
         messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(outcome)));
-        repeat_tracker.record_executed(name, args_key);
+        if blocked[i].is_none() {
+            repeat_tracker.record_executed(name, args_key);
+        }
     }
 }
 
@@ -290,15 +328,37 @@ struct CompactionDigest {
     message_count: usize,
     tools: BTreeSet<String>,
     paths: Vec<String>,
+    /// Short snippets of compacted user goals (not the original first request).
+    user_snippets: Vec<String>,
 }
 
 impl CompactionDigest {
     fn new() -> Self {
-        Self { message_count: 0, tools: BTreeSet::new(), paths: Vec::new() }
+        Self {
+            message_count: 0,
+            tools: BTreeSet::new(),
+            paths: Vec::new(),
+            user_snippets: Vec::new(),
+        }
     }
 
     fn record_message(&mut self, msg: &ChatMessage) {
         self.message_count += 1;
+        if msg.role == "user" {
+            if let Some(c) = msg.content.as_deref() {
+                let trimmed = c.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with(DIGEST_PREFIX)
+                    && self.user_snippets.len() < 4
+                {
+                    let snippet: String = trimmed.chars().take(120).collect();
+                    if !self.user_snippets.iter().any(|s| s == &snippet) {
+                        self.user_snippets.push(snippet);
+                    }
+                }
+            }
+            return;
+        }
         if msg.role != "assistant" {
             return;
         }
@@ -323,13 +383,33 @@ impl CompactionDigest {
             self.message_count
         )];
         if !self.tools.is_empty() {
-            parts.push(format!("Tools used: {}.", self.tools.iter().cloned().collect::<Vec<_>>().join(", ")));
+            parts.push(format!(
+                "Tools used: {}.",
+                self.tools.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
         }
         if !self.paths.is_empty() {
             parts.push(format!("Files touched: {}.", self.paths.join(", ")));
         }
+        if !self.user_snippets.is_empty() {
+            parts.push(format!(
+                "Earlier goals: {}.",
+                self.user_snippets.join(" | ")
+            ));
+        }
         parts.push("Re-read files if you need the details.".into());
         parts.join(" ")
+    }
+
+    fn to_record(&self) -> sessions::CompactionRecord {
+        sessions::CompactionRecord {
+            ts: sessions::unix_now(),
+            message_count: self.message_count,
+            tools: self.tools.iter().cloned().collect(),
+            paths: self.paths.clone(),
+            user_snippets: self.user_snippets.clone(),
+            digest: self.format(),
+        }
     }
 }
 
@@ -446,13 +526,22 @@ async fn run_loop(
     let schemas = registry.tool_schemas_json();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
+    // Discover once per turn start; empty dir is a cheap no-op. Hooks never
+    // enter the prompt, so reloading on the next user turn is fine.
+    let hooks = Hooks::discover(project_root);
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
     let mut repeat_tracker = RepeatCallTracker::new();
 
     'turns: for _ in 0..MAX_ITERATIONS {
-        let budget_changed = enforce_budget(&mut messages, settings.context_tokens.saturating_sub(settings.max_tokens + 1024));
+        let (budget_changed, compaction) = enforce_budget(
+            &mut messages,
+            settings.context_tokens.saturating_sub(settings.max_tokens + 1024),
+        );
+        if let Some(digest) = compaction {
+            sessions::append_compaction(core, session_id, &digest.to_record());
+        }
         let used = messages.iter().map(|m| m.estimated_tokens()).sum();
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens: settings.context_tokens });
 
@@ -531,6 +620,7 @@ async fn run_loop(
                     project_root,
                     caps,
                     cancelled: cancelled.clone(),
+                    hooks: &hooks,
                 };
                 execute_readonly_batch(
                     &batch_ctx,
@@ -581,6 +671,27 @@ async fn run_loop(
                     args: args.clone(),
                 });
 
+                // Hooks run before approval so a deny never prompts the user.
+                if let PreToolResult::Block { reason } = hooks
+                    .pre_tool_use(session_id, name, &args, project_root, &cancelled)
+                    .await
+                {
+                    core.send_agent(session_id, AgentEvent::ToolEnd {
+                        call_id: call.id.clone(),
+                        ok: false,
+                        output: reason.clone(),
+                    });
+                    messages.push(ChatMessage::tool(
+                        call.id.clone(),
+                        tool_message_content(&tools::ToolOutcome {
+                            ok: false,
+                            output: reason,
+                            diff: None,
+                        }),
+                    ));
+                    continue;
+                }
+
                 if registry.is_mutating(name) {
                     snapshot_file(core, session_id, project_root, &args).await;
                 }
@@ -630,6 +741,7 @@ async fn run_loop(
                             &settings,
                             caps,
                             cancelled.clone(),
+                            &hooks,
                         )
                         .await,
                         false,
@@ -648,6 +760,19 @@ async fn run_loop(
                     messages.push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
                     stop_reason = "cancelled".into();
                     break 'turns;
+                }
+
+                if executed {
+                    hooks
+                        .post_tool_use(
+                            session_id,
+                            name,
+                            &args,
+                            project_root,
+                            outcome.ok,
+                            &cancelled,
+                        )
+                        .await;
                 }
 
                 if let Some(diff) = &outcome.diff {
@@ -683,6 +808,8 @@ async fn run_loop(
 
 /// Run a read-only `task` child agent. The parent context receives only the
 /// final summary (via ToolEnd); child tool churn stays out of the parent window.
+/// Child tool calls go through the same lifecycle hooks as the parent loop so
+/// project policy cannot be bypassed via delegation.
 async fn run_task_subagent(
     core: &Arc<Core>,
     parent_session_id: &str,
@@ -693,6 +820,7 @@ async fn run_task_subagent(
     settings: &Settings,
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
+    hooks: &Hooks,
 ) -> tools::ToolOutcome {
     let kind = args["subagent"].as_str().unwrap_or("explore");
     let prompt = args["prompt"].as_str().unwrap_or("").trim();
@@ -814,8 +942,34 @@ async fn run_task_subagent(
                     continue;
                 }
             };
+            // Same pre/post hooks as the outer loop: lifecycle gates apply to
+            // delegated tools, not only direct parent calls.
+            if let PreToolResult::Block { reason } = hooks
+                .pre_tool_use(parent_session_id, name, &call_args, project_root, &cancelled)
+                .await
+            {
+                messages.push(ChatMessage::tool(
+                    call.id.clone(),
+                    tool_message_content(&tools::ToolOutcome {
+                        ok: false,
+                        output: reason,
+                        diff: None,
+                    }),
+                ));
+                continue;
+            }
             let outcome = child_registry
                 .execute(name, &call_args, project_root, caps, cancelled.clone())
+                .await;
+            hooks
+                .post_tool_use(
+                    parent_session_id,
+                    name,
+                    &call_args,
+                    project_root,
+                    outcome.ok,
+                    &cancelled,
+                )
                 .await;
             messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
         }
@@ -912,13 +1066,19 @@ async fn request_approval(
 /// cache warm) until the budget is crossed again.
 const PRUNE_TARGET_PCT: usize = 70;
 
-fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
+/// Returns `(changed, exchange_digest)` where `exchange_digest` is set only when
+/// whole exchanges were dropped (not when only tool outputs were truncated).
+fn enforce_budget(
+    messages: &mut Vec<ChatMessage>,
+    budget: usize,
+) -> (bool, Option<CompactionDigest>) {
     let mut total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
     if total <= budget {
-        return false;
+        return (false, None);
     }
     let target = budget * PRUNE_TARGET_PCT / 100;
     let keep_tail = messages.len().saturating_sub(6);
+    let mut truncated = false;
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
@@ -930,11 +1090,12 @@ fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
                     let old = msg.estimated_tokens();
                     msg.content = Some(format!("{}\n…[older tool output truncated]", &c[..cut]));
                     total = total.saturating_sub(old).saturating_add(msg.estimated_tokens());
+                    truncated = true;
                 }
             }
         }
         if total <= target {
-            return true;
+            return (true, None);
         }
     }
     // Drop whole exchanges starting after [system, first user]. Keep tool
@@ -959,8 +1120,10 @@ fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize) -> bool {
         } else {
             messages.insert(2, note);
         }
+        (true, Some(digest))
+    } else {
+        (truncated, None)
     }
-    true
 }
 
 #[cfg(test)]
@@ -1162,7 +1325,7 @@ mod tests {
             messages.push(msg("assistant", 2000));
             messages.push(msg("user", 2000));
         }
-        enforce_budget(&mut messages, 2000);
+        let _ = enforce_budget(&mut messages, 2000);
         // Old exchanges are dropped down to the guaranteed floor: the system
         // prompt, the original request, a compaction digest, and the most recent tail.
         assert_eq!(messages.len(), 7);
@@ -1182,7 +1345,9 @@ mod tests {
             messages.push(msg("user", 100));
             messages.push(msg("assistant", 100));
         }
-        enforce_budget(&mut messages, 700);
+        let (changed, digest) = enforce_budget(&mut messages, 700);
+        assert!(changed);
+        assert!(digest.is_none(), "truncate-only should not emit an exchange digest");
         assert_eq!(messages.len(), 10, "nothing should be dropped, only truncated");
         let tool_len = messages[2].content.as_deref().unwrap().len();
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");
@@ -1200,7 +1365,7 @@ mod tests {
             messages.push(msg("tool", 3000));
         }
         let budget = 4000;
-        assert!(enforce_budget(&mut messages, budget));
+        assert!(enforce_budget(&mut messages, budget).0);
         let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
         assert!(
             total <= budget * PRUNE_TARGET_PCT / 100,
@@ -1208,7 +1373,7 @@ mod tests {
         );
 
         let snapshot: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
-        assert!(!enforce_budget(&mut messages, budget), "second pass must be a no-op");
+        assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
         let after: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
         assert_eq!(snapshot, after, "no message may change between prunes");
     }
@@ -1221,22 +1386,42 @@ mod tests {
             messages.push(msg("tool", 2500));
         }
         let budget = 3000;
-        assert!(enforce_budget(&mut messages, budget));
+        let (changed, digest) = enforce_budget(&mut messages, budget);
+        assert!(changed);
+        assert!(digest.is_some());
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
         let first_digest = messages[2].content.clone();
-        assert!(!enforce_budget(&mut messages, budget), "second pass must be a no-op");
+        assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
         assert_eq!(messages[2].content, first_digest, "digest must not be replaced on no-op");
 
         for _ in 0..6 {
             messages.push(assistant_with_tools("edit_file", r#"{"path":"src/new.rs"}"#));
             messages.push(msg("tool", 2500));
         }
-        assert!(enforce_budget(&mut messages, budget));
+        assert!(enforce_budget(&mut messages, budget).0);
         let digest_count = messages
             .iter()
             .filter(|m| m.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX)))
             .count();
         assert_eq!(digest_count, 1, "only one digest note may exist");
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
+    }
+
+    #[test]
+    fn budget_digest_includes_tools_paths_and_goals() {
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        messages.push(ChatMessage::user("implement the auth flow carefully"));
+        messages.push(assistant_with_tools("read_file", r#"{"path":"src/auth.rs"}"#));
+        messages.push(msg("tool", 3000));
+        for _ in 0..10 {
+            messages.push(msg("assistant", 2000));
+            messages.push(msg("user", 2000));
+        }
+        let (_, digest) = enforce_budget(&mut messages, 2500);
+        let digest = digest.expect("exchange drop should produce a digest");
+        let text = digest.format();
+        assert!(text.contains("read_file"), "{text}");
+        assert!(text.contains("src/auth.rs"), "{text}");
+        assert!(text.contains("Earlier goals"), "{text}");
     }
 }
