@@ -22,15 +22,31 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
+use crate::clipboard;
+use crate::completion;
 use crate::input::{Composer, ComposerAction};
 use crate::theme;
+use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{wrap_lines, StreamingWrap, Term, Transcript};
 use crate::ui::{context, markdown, models};
 
+/// Where keyboard focus lives in chat mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Composer,
+    Scrollback,
+}
+
 const TICK: Duration = Duration::from_millis(120);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
+/// Paint-rate cap: coalesce redraw triggers into at most ~60 frames/s.
+const MIN_DRAW_INTERVAL: Duration = Duration::from_millis(16);
+/// A resize storm settles for this long before the transcript rewraps.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
+/// Core events drained per wake before painting once for the whole batch.
+const CORE_DRAIN_MAX: usize = 32;
 
 pub struct Args {
     pub continue_session: bool,
@@ -40,6 +56,7 @@ pub struct Args {
 enum Mode {
     Chat,
     Models,
+    Sessions,
 }
 
 pub struct App {
@@ -50,7 +67,18 @@ pub struct App {
     mode: Mode,
     composer: Composer,
     models: models::ModelsState,
+    sessions_panel: Option<sessions_ui::SessionsState>,
     transcript: Transcript,
+    focus: Focus,
+    completion: Option<completion::Popup>,
+    /// Ctrl+R history search: filter text + selected index into matches.
+    history_search: Option<(String, usize, Vec<String>)>,
+    /// Project files for @-mentions; rescanned when a fresh `@` opens.
+    file_index: Option<Arc<Vec<String>>>,
+    file_index_pending: bool,
+    /// Messages typed while the agent works, sent in order after the turn.
+    queued: Vec<String>,
+    flush_queue: bool,
 
     running: bool,
     stream_text: String,
@@ -74,6 +102,7 @@ pub struct App {
     page_h: u16,
 
     hf_tx: mpsc::UnboundedSender<(String, u64)>,
+    files_tx: mpsc::UnboundedSender<Vec<String>>,
     should_quit: bool,
     needs_redraw: bool,
 
@@ -102,6 +131,7 @@ pub async fn run(
     args: Args,
 ) -> std::io::Result<()> {
     let (hf_tx, mut hf_rx) = mpsc::unbounded_channel();
+    let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dir_label = project
         .file_name()
@@ -115,7 +145,15 @@ pub async fn run(
         mode: Mode::Chat,
         composer: Composer::new(&core.data_dir),
         models: models::ModelsState::empty(),
+        sessions_panel: None,
         transcript: Transcript::new(),
+        focus: Focus::Composer,
+        completion: None,
+        history_search: None,
+        file_index: None,
+        file_index_pending: false,
+        queued: Vec::new(),
+        flush_queue: false,
         running: false,
         stream_text: String::new(),
         thinking_chars: 0,
@@ -136,6 +174,7 @@ pub async fn run(
         tick_i: 0,
         page_h: 10,
         hf_tx,
+        files_tx,
         should_quit: false,
         needs_redraw: true,
         stream_wrap: StreamingWrap::default(),
@@ -158,32 +197,102 @@ pub async fn run(
 
     app.startup(&args).await;
 
-    let mut term_events = crossterm::event::EventStream::new();
+    // Terminal events are forwarded through a channel so the core-event arm
+    // can be gated on `input_rx.is_empty()` — a token firehose must never
+    // starve a keypress (crossterm's EventStream itself is not peekable).
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut term_events = crossterm::event::EventStream::new();
+        while let Some(ev) = term_events.next().await {
+            let Ok(e) = ev else { break };
+            if input_tx.send(e).is_err() {
+                break;
+            }
+        }
+        // Dropping input_tx closes the channel; the loop reads that as quit.
+    });
+
     let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Paint pacing: at most one frame per MIN_DRAW_INTERVAL. A redraw that
+    // arrives too early is deferred to `draw_deadline` and coalesced with
+    // everything else that lands before it (grok-build's cadence model).
+    let mut last_draw = Instant::now() - MIN_DRAW_INTERVAL;
+    let mut draw_deadline: Option<Instant> = None;
 
     loop {
         tokio::select! {
-            ev = term_events.next() => {
-                match ev {
-                    Some(Ok(e)) => app.on_term_event(e).await?,
-                    Some(Err(_)) | None => app.should_quit = true,
+            biased;
+            // Streaming sits above input but is gated on the input queue
+            // being empty: input-first would let held keys starve redraws,
+            // while the gate keeps cancel/quit ahead of the firehose.
+            Some(ce) = core_rx.recv(), if input_rx.is_empty() => {
+                app.on_core_event(ce).await;
+                for _ in 1..CORE_DRAIN_MAX {
+                    if !input_rx.is_empty() {
+                        break;
+                    }
+                    match core_rx.try_recv() {
+                        Ok(ce) => app.on_core_event(ce).await,
+                        Err(_) => break,
+                    }
                 }
             }
-            Some(ce) = core_rx.recv() => app.on_core_event(ce).await,
+            ev = input_rx.recv() => {
+                match ev {
+                    Some(TermEvent::Resize(_, _)) => {
+                        // Terminals emit resize storms mid-drag; rewrapping
+                        // the transcript on each one is wasted layout work.
+                        app.needs_redraw = true;
+                        draw_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+                    }
+                    Some(e) => app.on_term_event(e).await?,
+                    None => app.should_quit = true,
+                }
+            }
             Some((repo, bytes)) = hf_rx.recv() => {
                 app.models.set_remote_size(&repo, bytes);
                 app.needs_redraw = true;
             }
-            _ = tick.tick() => app.on_tick().await,
+            Some(files) = files_rx.recv() => {
+                app.file_index = Some(Arc::new(files));
+                app.file_index_pending = false;
+                app.sync_completion();
+                app.needs_redraw = true;
+            }
+            _ = tick.tick(), if app.tick_armed() => app.on_tick().await,
+            _ = tokio::time::sleep_until(
+                draw_deadline.unwrap_or_else(Instant::now).into()
+            ), if draw_deadline.is_some() => {}
         }
         if app.should_quit {
             break;
         }
         if app.needs_redraw {
-            terminal.draw(|f| app.draw(f))?;
-            app.needs_redraw = false;
+            let now = Instant::now();
+            let deferred = draw_deadline.is_some_and(|d| now < d);
+            if !deferred && now.duration_since(last_draw) >= MIN_DRAW_INTERVAL {
+                draw_frame(&mut terminal, &mut app)?;
+                last_draw = now;
+                draw_deadline = None;
+                app.needs_redraw = false;
+            } else if draw_deadline.is_none() {
+                draw_deadline = Some(last_draw + MIN_DRAW_INTERVAL);
+            }
         }
     }
+    Ok(())
+}
+
+/// One frame, wrapped in a synchronized update so the terminal applies it
+/// atomically — no half-painted frames under tmux or slow connections.
+fn draw_frame(terminal: &mut Term, app: &mut App) -> std::io::Result<()> {
+    use std::io::Write;
+    crossterm::queue!(terminal.backend_mut(), crossterm::terminal::BeginSynchronizedUpdate)?;
+    terminal.draw(|f| app.draw(f))?;
+    crossterm::queue!(terminal.backend_mut(), crossterm::terminal::EndSynchronizedUpdate)?;
+    terminal.backend_mut().flush()?;
     Ok(())
 }
 
@@ -216,6 +325,8 @@ impl App {
                 }
                 None => self.note("no previous session here; starting fresh"),
             }
+        } else {
+            self.note("/ commands · @ mentions a file · type while the agent works to queue · /resume reopens a session");
         }
     }
 
@@ -234,7 +345,10 @@ impl App {
                 "assistant" => {
                     if let Some(text) = &m.content {
                         if !text.trim().is_empty() {
-                            self.transcript.push(markdown::render(text, markdown::highlighter()));
+                            self.transcript.push_assistant(markdown::render(
+                                text,
+                                markdown::highlighter(),
+                            ));
                         }
                     }
                     if let Some(calls) = &m.tool_calls {
@@ -252,14 +366,14 @@ impl App {
                             let summary = registry::summarize_call(&call.function.name, &args);
                             let content = tool_msg.content.as_deref().unwrap_or("");
                             let ok = !content.starts_with("Error:");
-                            let output = truncate_replay_output(content);
-                            self.transcript.push(tool_card::tool_block(
+                            let compact = tool_card::tool_block(
                                 &call.function.name,
                                 &summary,
                                 ok,
-                                &output,
+                                &truncate_replay_output(content),
                                 None,
-                            ));
+                            );
+                            self.transcript.push_tool(compact, content.to_string());
                             self.last_tool_output = Some(content.to_string());
                         }
                     }
@@ -293,6 +407,11 @@ impl App {
         self.last_tool_output = None;
         self.budget = None;
         self.cache_pct = None;
+        self.completion = None;
+        self.history_search = None;
+        self.focus = Focus::Composer;
+        self.queued.clear();
+        self.flush_queue = false;
         self.stream_wrap.clear();
         self.thinking_wrapped.clear();
         self.thinking_source.clear();
@@ -314,6 +433,7 @@ impl App {
             TermEvent::Paste(text) => {
                 if self.mode == Mode::Chat && self.pending_approval.is_none() {
                     self.composer.insert_str(&text);
+                    self.sync_completion();
                     self.needs_redraw = true;
                 }
             }
@@ -358,10 +478,22 @@ impl App {
         self.quit_armed = false;
 
         if ctrl && key.code == KeyCode::Char('o') {
-            if let Some(output) = self.last_tool_output.clone() {
+            if self.transcript.expand_last_tool() {
+                self.focus = Focus::Scrollback;
+            } else if let Some(output) = self
+                .transcript
+                .last_tool_output()
+                .map(str::to_string)
+                .or_else(|| self.last_tool_output.clone())
+            {
                 let lines = output
                     .lines()
-                    .map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme::DIM))))
+                    .map(|l| {
+                        Line::from(Span::styled(
+                            format!("  {l}"),
+                            Style::default().fg(theme::DIM()),
+                        ))
+                    })
                     .collect();
                 self.transcript.push(lines);
             }
@@ -371,13 +503,27 @@ impl App {
             self.show_thinking = !self.show_thinking;
             return Ok(());
         }
+        if ctrl && key.code == KeyCode::Char('r') && self.mode == Mode::Chat {
+            self.open_history_search();
+            return Ok(());
+        }
 
         if self.mode == Mode::Models {
             self.on_models_key(key).await;
             return Ok(());
         }
+        if self.mode == Mode::Sessions {
+            self.on_sessions_key(key);
+            return Ok(());
+        }
 
-        // Transcript scrolling.
+        // History search overlay owns keys until Esc/Enter.
+        if self.history_search.is_some() {
+            self.on_history_search_key(key);
+            return Ok(());
+        }
+
+        // Transcript scrolling always available in chat.
         match key.code {
             KeyCode::PageUp => {
                 self.transcript.scroll_up(self.page_h.max(1) as usize);
@@ -414,6 +560,92 @@ impl App {
             return Ok(());
         }
 
+        // Completion popup: navigation and acceptance take priority over the
+        // composer; anything else falls through and refilters afterwards.
+        if self.completion.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => {
+                    if let Some(popup) = &mut self.completion {
+                        popup.prev();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(popup) = &mut self.completion {
+                        popup.next();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    let has_item = self
+                        .completion
+                        .as_ref()
+                        .is_some_and(|p| p.selected_item().is_some());
+                    if has_item {
+                        if let Some(command) = self.accept_completion() {
+                            self.handle_submit(command).await?;
+                        }
+                        return Ok(());
+                    }
+                    // "No matches": close and let Enter submit as typed.
+                    self.completion = None;
+                }
+                KeyCode::Esc => {
+                    self.completion = None;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // Dual focus: Tab toggles composer ↔ scrollback.
+        if key.code == KeyCode::Tab && self.completion.is_none() {
+            self.focus = match self.focus {
+                Focus::Composer => Focus::Scrollback,
+                Focus::Scrollback => Focus::Composer,
+            };
+            if self.focus == Focus::Composer {
+                self.transcript.clear_selection();
+            } else if self.transcript.selected().is_none() && self.transcript.block_count() > 0 {
+                self.transcript.select_prev();
+            }
+            return Ok(());
+        }
+
+        // Scrollback-focused navigation.
+        if self.focus == Focus::Scrollback {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.transcript.select_prev();
+                    return Ok(());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.transcript.select_next();
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    let _ = self.transcript.toggle_fold_selected();
+                    return Ok(());
+                }
+                KeyCode::Char('y') => {
+                    if let Some(text) = self.transcript.selected_copy_text() {
+                        if clipboard::copy_text(&text) {
+                            self.note("copied block");
+                        } else {
+                            self.note("copy failed (terminal may block OSC 52)");
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Esc | KeyCode::Char(' ') => {
+                    self.focus = Focus::Composer;
+                    self.transcript.clear_selection();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         if key.code == KeyCode::Esc {
             if self.running {
                 if let Some(id) = &self.session_id {
@@ -421,15 +653,158 @@ impl App {
                 }
             } else if self.transcript.offset() > 0 {
                 self.transcript.follow();
+                self.focus = Focus::Composer;
+            } else if self.focus == Focus::Scrollback {
+                self.focus = Focus::Composer;
+                self.transcript.clear_selection();
             }
             return Ok(());
         }
 
+        // Typing returns focus to the composer.
+        self.focus = Focus::Composer;
         match self.composer.handle_key(key) {
-            ComposerAction::Submit(text) => self.handle_submit(text).await?,
-            ComposerAction::None => {}
+            ComposerAction::Submit(text) => {
+                self.completion = None;
+                self.handle_submit(text).await?;
+            }
+            ComposerAction::None => self.sync_completion(),
         }
         Ok(())
+    }
+
+    fn open_history_search(&mut self) {
+        let entries = self.composer.history_entries();
+        if entries.is_empty() {
+            self.note("no prompt history yet");
+            return;
+        }
+        let matches = entries;
+        let selected = matches.len().saturating_sub(1);
+        self.history_search = Some((String::new(), selected, matches));
+        self.completion = None;
+    }
+
+    fn on_history_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.history_search = None;
+            }
+            KeyCode::Enter => {
+                let pick = self
+                    .history_search
+                    .as_ref()
+                    .and_then(|(q, sel, all)| {
+                        let _ = q;
+                        all.get(*sel).cloned()
+                    });
+                if let Some(text) = pick {
+                    self.composer.load(&text);
+                }
+                self.history_search = None;
+                self.focus = Focus::Composer;
+            }
+            KeyCode::Up => {
+                if let Some((_, sel, _)) = &mut self.history_search {
+                    if *sel > 0 {
+                        *sel -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some((_, sel, all)) = &mut self.history_search {
+                    if *sel + 1 < all.len() {
+                        *sel += 1;
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((query, _, _)) = &mut self.history_search {
+                    query.pop();
+                }
+                self.refilter_history_search();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some((query, _, _)) = &mut self.history_search {
+                    query.push(c);
+                }
+                self.refilter_history_search();
+            }
+            _ => {}
+        }
+    }
+
+    fn refilter_history_search(&mut self) {
+        let entries = self.composer.history_entries();
+        let Some((query, selected, matches)) = &mut self.history_search else {
+            return;
+        };
+        let q = query.to_ascii_lowercase();
+        *matches = entries
+            .into_iter()
+            .filter(|e| q.is_empty() || e.to_ascii_lowercase().contains(&q))
+            .collect();
+        if matches.is_empty() {
+            *selected = 0;
+        } else {
+            *selected = (*selected).min(matches.len() - 1);
+        }
+    }
+
+    /// Accept the selected completion into the composer. Returns a command to
+    /// submit immediately for no-argument slash commands.
+    fn accept_completion(&mut self) -> Option<String> {
+        let popup = self.completion.take()?;
+        let item = popup.selected_item()?.clone();
+        self.composer.replace_token(popup.token_start, popup.token_len, &item.insert);
+        self.sync_completion();
+        if item.submits {
+            Some(self.composer.take())
+        } else {
+            None
+        }
+    }
+
+    /// Open, refilter, or close the popup from the token under the cursor.
+    fn sync_completion(&mut self) {
+        if self.mode != Mode::Chat || self.pending_approval.is_some() {
+            self.completion = None;
+            return;
+        }
+        let (row, col, line) = self.composer.cursor_context();
+        let line = line.to_string();
+        match completion::trigger(&line, col, row == 0) {
+            None => self.completion = None,
+            Some((kind, token_start, query)) => {
+                let token_len = query.chars().count() + 1;
+                if kind == completion::Kind::File && self.completion.is_none() {
+                    // A fresh `@` rescans in the background so files the agent
+                    // just wrote show up; the old index serves meanwhile.
+                    self.refresh_file_index();
+                }
+                let items = match kind {
+                    completion::Kind::Slash => completion::slash_items(&query),
+                    completion::Kind::File => match &self.file_index {
+                        Some(files) => completion::file_items(files, &query),
+                        None => Vec::new(),
+                    },
+                };
+                self.completion =
+                    Some(completion::Popup { kind, items, selected: 0, token_start, token_len });
+            }
+        }
+    }
+
+    fn refresh_file_index(&mut self) {
+        if self.file_index_pending {
+            return;
+        }
+        self.file_index_pending = true;
+        let root = self.project.clone();
+        let tx = self.files_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(completion::scan_files(&root));
+        });
     }
 
     async fn on_models_key(&mut self, key: KeyEvent) {
@@ -502,6 +877,70 @@ impl App {
         }
     }
 
+    fn on_sessions_key(&mut self, key: KeyEvent) {
+        let Some(panel) = &mut self.sessions_panel else {
+            self.mode = Mode::Chat;
+            return;
+        };
+
+        // Delete confirmation intercepts.
+        if let Some(id) = panel.confirm_delete.clone() {
+            panel.confirm_delete = None;
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                match sessions::delete(&self.core, &id) {
+                    Ok(()) => {
+                        panel.items.retain(|s| s.id != id);
+                        panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
+                        if self.session_id.as_deref() == Some(id.as_str()) {
+                            self.session_id = None;
+                        }
+                        if panel.items.is_empty() {
+                            self.mode = Mode::Chat;
+                            self.sessions_panel = None;
+                            self.note("no sessions left in this project");
+                        }
+                    }
+                    Err(e) => self.error(&e),
+                }
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Chat;
+                self.sessions_panel = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                panel.selected = panel.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if panel.selected + 1 < panel.items.len() {
+                    panel.selected += 1;
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(item) = panel.selected_item() {
+                    panel.confirm_delete = Some(item.id.clone());
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(id) = panel.selected_item().map(|s| s.id.clone()) {
+                    self.sessions_panel = None;
+                    self.mode = Mode::Chat;
+                    if self.session_id.as_deref() == Some(id.as_str()) {
+                        self.note("already in this session");
+                        return;
+                    }
+                    self.reset_for_new_session();
+                    self.session_id = Some(id.clone());
+                    self.replay(&id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn begin_model_download(&mut self, item: &models::ModelItem) {
         let total = item.bytes.unwrap_or(0);
         match hf::start_download(self.core.clone(), item.repo.clone()) {
@@ -537,7 +976,11 @@ impl App {
             return Ok(());
         }
         if self.running {
-            self.note("the agent is still working; esc cancels");
+            // Queue instead of refusing: the message goes out, in order, as
+            // soon as the current turn finishes. Esc cancels and hands the
+            // queue back to the composer.
+            self.queued.push(text);
+            self.transcript.follow();
             return Ok(());
         }
 
@@ -590,33 +1033,32 @@ impl App {
         let rest: Vec<&str> = parts.collect();
         match head {
             "help" => {
-                let lines = [
-                    ("enter", "send · shift+enter or alt+enter for a newline"),
-                    ("esc", "cancel the running turn, or jump to the latest output"),
-                    ("wheel · pgup/pgdn", "scroll the conversation"),
-                    ("ctrl+o", "expand the last tool output"),
-                    ("ctrl+t", "show or hide model thinking"),
-                    ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
-                    ("/models", "manage optional local MLX models"),
-                    ("/model <id>", "use a specific model id"),
-                    ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
-                    ("/new", "start a fresh session"),
-                    ("/context", "prompt token costs, cache hits, and budget"),
-                    ("/status", "session and server state"),
-                    ("/logs", "recent model server logs"),
-                    ("/quit", "exit"),
-                ];
-                let block = lines
+                let block = HELP_KEYS
                     .iter()
                     .map(|(k, v)| {
                         Line::from(vec![
-                            Span::styled(format!("  {k:<32}"), Style::default().fg(theme::ACCENT)),
-                            Span::styled((*v).to_string(), Style::default().fg(theme::DIM)),
+                            Span::styled(format!("  {k:<32}"), Style::default().fg(theme::ACCENT())),
+                            Span::styled((*v).to_string(), Style::default().fg(theme::DIM())),
                         ])
                     })
                     .collect();
                 self.transcript.push(block);
             }
+            "theme" => match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("light" | "day") => {
+                    theme::apply(theme::ThemeId::Light);
+                    self.note("theme: light");
+                }
+                Some("dark" | "night") => {
+                    theme::apply(theme::ThemeId::Dark);
+                    self.note("theme: dark");
+                }
+                Some("mono" | "bw") => {
+                    theme::set_tokens(theme::Tokens::mono());
+                    self.note("theme: mono");
+                }
+                _ => self.note("usage: /theme dark|light|mono"),
+            },
             "models" => {
                 self.mode = Mode::Models;
                 self.models.ensure_loaded(ram_bytes());
@@ -648,6 +1090,16 @@ impl App {
                 }
                 _ => self.note("usage: /approvals auto|ask|readonly"),
             },
+            "resume" => {
+                let items = sessions::list(&self.core, &self.project.display().to_string());
+                if items.is_empty() {
+                    self.note("no sessions in this project yet");
+                } else {
+                    self.sessions_panel = Some(sessions_ui::SessionsState::new(items));
+                    self.completion = None;
+                    self.mode = Mode::Sessions;
+                }
+            }
             "new" => {
                 let old_id = self.session_id.clone();
                 self.reset_for_new_session();
@@ -720,7 +1172,7 @@ impl App {
                     .rev()
                     .take(30)
                     .rev()
-                    .map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme::DIM))))
+                    .map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme::DIM()))))
                     .collect();
                 if tail.is_empty() {
                     self.note("no server logs yet");
@@ -782,7 +1234,59 @@ impl App {
                 }
             },
         }
+        // Send the next queued message once the turn has fully settled.
+        if self.flush_queue {
+            self.flush_queue = false;
+            if !self.running && self.pending_approval.is_none() && !self.queued.is_empty() {
+                let text = self.queued.remove(0);
+                let _ = self.handle_submit(text.clone()).await;
+                if !self.running {
+                    // The turn never started (server stopped, start error):
+                    // nothing will drain the rest, so hand it all back.
+                    self.queued.insert(0, text);
+                    self.return_queue_to_composer();
+                }
+            }
+        }
         self.needs_redraw = true;
+    }
+
+    /// Move queued messages into the composer (in front of any draft) so
+    /// nothing typed during a turn is lost when the turn cannot continue.
+    fn return_queue_to_composer(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let mut text = self.queued.join("\n");
+        self.queued.clear();
+        if !self.composer.is_empty() {
+            text.push('\n');
+            text.push_str(&self.composer.text());
+        }
+        self.composer.load(&text);
+        self.note("queued input returned to the composer");
+    }
+
+    /// A dim one-line record of a finished turn, kept only when the turn was
+    /// long enough for the numbers to mean something.
+    fn push_turn_stats(&mut self) {
+        let Some(started) = self.turn_started else { return };
+        let secs = started.elapsed().as_secs();
+        if secs < 5 {
+            return;
+        }
+        let mut meta = format!("◦ {secs}s");
+        let toks = self.tok_per_sec();
+        if toks > 0.0 {
+            meta.push_str(&format!(" · {toks:.0} tok/s"));
+        }
+        if let Some(pct) = self.cache_pct {
+            meta.push_str(&format!(" · cache {pct}%"));
+        }
+        self.transcript.push(vec![Line::from(Span::styled(
+            meta,
+            Style::default().fg(theme::DIM()),
+        ))]);
     }
 
     fn on_agent_event(&mut self, event: AgentEvent) {
@@ -808,7 +1312,10 @@ impl App {
             }
             AgentEvent::MessageDone { text } => {
                 if !text.trim().is_empty() {
-                    self.transcript.push(markdown::render(&text, markdown::highlighter()));
+                    self.transcript.push_assistant(markdown::render(
+                        &text,
+                        markdown::highlighter(),
+                    ));
                 }
                 self.stream_text.clear();
                 self.stream_wrap.clear();
@@ -852,25 +1359,36 @@ impl App {
                     .remove(&call_id)
                     .unwrap_or_else(|| ("tool".into(), String::new()));
                 let diff = self.pending_diffs.remove(&call_id);
-                self.transcript
-                    .push(tool_card::tool_block(&name, &summary, ok, &output, diff.as_ref()));
+                let compact =
+                    tool_card::tool_block(&name, &summary, ok, &output, diff.as_ref());
+                self.transcript.push_tool(compact, output.clone());
                 self.last_tool_output = Some(output);
                 self.running_tool = None;
             }
             AgentEvent::ApprovalRequest { approval_id, name, summary } => {
                 self.pending_approval = Some((approval_id, name, summary));
+                self.completion = None;
             }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
                 self.running_tool = None;
                 self.pending_approval = None;
                 match stop_reason.as_str() {
-                    "stop" | "tool_calls" => {}
+                    "stop" | "tool_calls" => self.push_turn_stats(),
                     "cancelled" => self.note("cancelled"),
                     "length" => self.note("stopped: hit the response token limit"),
                     "max_iterations" => self.note("stopped: reached the tool-call limit for one turn (send a follow-up to continue)"),
                     "error" => {}
                     other => self.note(&format!("stopped: {other}")),
+                }
+                if !self.queued.is_empty() {
+                    // An interrupted or failed turn returns the queue to the
+                    // composer instead of firing blind into a broken state.
+                    if matches!(stop_reason.as_str(), "cancelled" | "error") {
+                        self.return_queue_to_composer();
+                    } else {
+                        self.flush_queue = true;
+                    }
                 }
             }
             AgentEvent::Error { message } => {
@@ -901,6 +1419,10 @@ impl App {
         }
     }
 
+    fn tick_armed(&self) -> bool {
+        self.running || self.models.download.is_some() || self.mode == Mode::Models
+    }
+
     async fn on_tick(&mut self) {
         self.tick_i += 1;
         if self.running || self.models.download.is_some() {
@@ -920,7 +1442,7 @@ impl App {
         let mut lines = Vec::new();
         for (i, l) in text.lines().enumerate() {
             let prefix = if i == 0 {
-                Span::styled("❯ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+                Span::styled("❯ ", Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD))
             } else {
                 Span::raw("  ")
             };
@@ -929,7 +1451,7 @@ impl App {
                 Span::styled(l.to_string(), Style::default().add_modifier(Modifier::BOLD)),
             ]));
         }
-        self.transcript.push(lines);
+        self.transcript.push_user(lines);
     }
 
     fn note(&mut self, text: &str) {
@@ -938,7 +1460,7 @@ impl App {
         } else {
             self.transcript.push(vec![Line::from(Span::styled(
                 text.to_string(),
-                Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
             ))]);
         }
     }
@@ -952,7 +1474,7 @@ impl App {
                 let prefix = if i == 0 { "✗ " } else { "  " };
                 lines.push(Line::from(Span::styled(
                     format!("{prefix}{l}"),
-                    Style::default().fg(theme::ERR),
+                    Style::default().fg(theme::ERR()),
                 )));
             }
             self.transcript.push(lines);
@@ -967,34 +1489,120 @@ impl App {
             models::render(frame, area, &self.models);
             return;
         }
+        if self.mode == Mode::Sessions {
+            if let Some(panel) = &self.sessions_panel {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                sessions_ui::render(frame, area, panel, now);
+            }
+            return;
+        }
 
         // Clamp every band so the chrome never exceeds the screen, even on
         // tiny terminals (rendering outside the buffer panics).
         let status_h = 1u16.min(area.height);
-        let header_h = 2u16.min(area.height.saturating_sub(status_h + 2));
+        let hints_h = 1u16.min(area.height.saturating_sub(status_h));
+        let header_h = 1u16.min(area.height.saturating_sub(status_h + hints_h + 2));
         let approval_h = if self.pending_approval.is_some() {
-            1u16.min(area.height.saturating_sub(header_h + status_h))
+            1u16.min(area.height.saturating_sub(header_h + status_h + hints_h))
         } else {
             0
         };
+        let queue_h = if self.queued.is_empty() {
+            0
+        } else {
+            (self.queued.len() as u16)
+                .min(3)
+                .min(area.height.saturating_sub(header_h + status_h + hints_h + approval_h + 2))
+        };
+        let hist_lines = self.history_search.as_ref().map(|(q, sel, items)| {
+            history_search_lines(q, *sel, items, area.width)
+        });
+        let popup_lines = if hist_lines.is_some() {
+            None
+        } else {
+            self.completion.as_ref().map(|p| {
+                let indexing = p.kind == completion::Kind::File && self.file_index.is_none();
+                completion::render_lines(p, area.width, indexing)
+            })
+        };
+        let popup_h = hist_lines
+            .as_ref()
+            .or(popup_lines.as_ref())
+            .map(|l| l.len() as u16)
+            .unwrap_or(0)
+            .min(area.height.saturating_sub(header_h + status_h + hints_h + approval_h + queue_h + 2));
         let composer_h = self
             .composer
             .height()
-            .min(area.height.saturating_sub(header_h + status_h + approval_h))
-            .max(u16::from(area.height > header_h + status_h + approval_h));
-        let chrome = header_h + approval_h + composer_h + status_h;
+            .min(area.height.saturating_sub(
+                header_h + status_h + hints_h + approval_h + queue_h + popup_h,
+            ))
+            .max(u16::from(
+                area.height > header_h + status_h + hints_h + approval_h + queue_h + popup_h,
+            ));
+        let chrome =
+            header_h + approval_h + queue_h + popup_h + composer_h + hints_h + status_h;
         let chat_h = area.height.saturating_sub(chrome);
         self.page_h = chat_h.saturating_sub(1).max(1);
 
-        // Top to bottom: [header][chat][approval][composer][status].
-        let header_area = Rect { x: area.x, y: area.y, width: area.width, height: header_h };
-        let chat_area = Rect { x: area.x, y: area.y + header_h, width: area.width, height: chat_h };
+        // Top→bottom: [header][chat][approval][queue][popup][composer][hints][status].
+        let header_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: header_h,
+        };
+        let chat_area = Rect {
+            x: area.x,
+            y: area.y + header_h,
+            width: area.width,
+            height: chat_h,
+        };
         let mut y = area.y + header_h + chat_h;
-        let approval_area = Rect { x: area.x, y, width: area.width, height: approval_h };
+        let approval_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: approval_h,
+        };
         y += approval_h;
-        let composer_area = Rect { x: area.x, y, width: area.width, height: composer_h };
+        let queue_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: queue_h,
+        };
+        y += queue_h;
+        let popup_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: popup_h,
+        };
+        y += popup_h;
+        let composer_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: composer_h,
+        };
         y += composer_h;
-        let status_area = Rect { x: area.x, y, width: area.width, height: status_h };
+        let hints_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: hints_h,
+        };
+        y += hints_h;
+        let status_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: status_h,
+        };
 
         if header_h > 0 {
             self.draw_header(frame, header_area);
@@ -1004,69 +1612,202 @@ impl App {
         }
         if let Some((_, name, summary)) = &self.pending_approval {
             Paragraph::new(Line::from(vec![
-                Span::styled("⚠ approve ", Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD)),
-                Span::styled(name.clone(), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("▎", Style::default().fg(theme::WARN())),
+                Span::styled(
+                    " approve ",
+                    Style::default().fg(theme::WARN()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    name.clone(),
+                    Style::default()
+                        .fg(theme::ACCENT())
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" "),
-                Span::styled(clip(summary, area.width.saturating_sub(40) as usize), Style::default()),
-                Span::styled("  [y]es [n]o [a]lways", Style::default().fg(theme::DIM)),
+                Span::styled(
+                    clip(summary, area.width.saturating_sub(42) as usize),
+                    Style::default(),
+                ),
+                Span::styled("  [y]es [n]o [a]lways", Style::default().fg(theme::DIM())),
             ]))
             .render(approval_area, frame.buffer_mut());
         }
 
+        if queue_h > 0 {
+            let mut qlines: Vec<Line> = self
+                .queued
+                .iter()
+                .take(queue_h as usize)
+                .map(|q| {
+                    Line::from(vec![
+                        Span::styled("↳ ", Style::default().fg(theme::ACCENT())),
+                        Span::styled(
+                            clip(&q.replace('\n', " "), area.width.saturating_sub(4) as usize),
+                            Style::default()
+                                .fg(theme::DIM())
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ])
+                })
+                .collect();
+            if self.queued.len() as u16 > queue_h {
+                qlines.pop();
+                qlines.push(Line::from(Span::styled(
+                    format!("↳ … {} more queued", self.queued.len() as u16 - queue_h + 1),
+                    Style::default().fg(theme::DIM()),
+                )));
+            }
+            Paragraph::new(qlines).render(queue_area, frame.buffer_mut());
+        }
+
+        if let Some(lines) = hist_lines.or(popup_lines) {
+            if popup_h > 0 {
+                Paragraph::new(lines).render(popup_area, frame.buffer_mut());
+            }
+        }
+
         let (composer_lines, cx, cy) = self.composer.render(composer_h);
         Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
-        if self.pending_approval.is_none() {
+        if self.pending_approval.is_none()
+            && self.focus == Focus::Composer
+            && self.history_search.is_none()
+        {
             frame.set_cursor_position(Position::new(composer_area.x + cx, composer_area.y + cy));
         }
 
+        if hints_h > 0 {
+            Paragraph::new(self.contextual_hints())
+                .render(hints_area, frame.buffer_mut());
+        }
         self.draw_status(frame, status_area);
+    }
+
+    fn contextual_hints(&self) -> Line<'static> {
+        let text = if self.pending_approval.is_some() {
+            "y approve · n deny · a always"
+        } else if self.history_search.is_some() {
+            "↑↓ pick · enter insert · esc cancel"
+        } else if self.completion.is_some() {
+            "↑↓ select · tab/enter accept · esc close"
+        } else if self.focus == Focus::Scrollback {
+            "↑↓ block · enter fold · y copy · tab/esc composer"
+        } else if self.running {
+            "enter queues · esc cancel · tab history · ctrl+r search"
+        } else if self.transcript.offset() > 0 {
+            "esc follow · tab browse · pgup/pgdn scroll"
+        } else {
+            "enter send · / commands · @ file · tab history · ctrl+r"
+        };
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(theme::DIM()),
+        ))
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let version = env!("CARGO_PKG_VERSION");
         let line = Line::from(vec![
-            Span::styled("◆ open max", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled(
-                " · the performance harness",
-                Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+                "◆ openmax",
+                Style::default()
+                    .fg(theme::ACCENT())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  v{version} · {} · /help", self.dir_label),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::DIM()),
             ),
         ]);
-        // Second header row stays blank as breathing room above the chat.
         Paragraph::new(line).render(area, frame.buffer_mut());
     }
 
     /// Finished transcript plus the live tail, bottom anchored, honoring the
     /// scroll offset (0 follows the latest output).
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
-        self.transcript.set_width(area.width);
-        let tail_len = self.rebuild_tail(area.width);
+        let content_w = area.width.saturating_sub(1).max(8);
+        self.transcript.set_width(content_w);
+        let tail_len = self.rebuild_tail(content_w);
 
-        let total = self.transcript.len() + tail_len;
+        let hist_len = self.transcript.len();
+        let total = hist_len + tail_len;
         let visible = area.height as usize;
         self.transcript.clamp_offset(total.saturating_sub(visible));
         let offset = self.transcript.offset();
 
         let end = total - offset;
         let start = end.saturating_sub(visible);
+
+        let sticky = if offset > 0 {
+            self.transcript.sticky_user_line(start)
+        } else {
+            None
+        };
+        let focus_scroll = self.focus == Focus::Scrollback;
+
+        // Collect indices first, then clone lines (avoids borrow fights).
         self.chat_buf.clear();
-        self.chat_buf.reserve(end.saturating_sub(start));
-        for i in start..end {
-            if i < self.transcript.len() {
-                self.chat_buf.push(self.transcript.lines()[i].clone());
+        if let Some(s) = sticky {
+            let mut spans = vec![Span::styled("┊ ", Style::default().fg(theme::DIM()))];
+            spans.extend(s.spans.iter().cloned());
+            self.chat_buf.push(Line::from(spans));
+        }
+        let budget = visible.saturating_sub(self.chat_buf.len());
+        let mut idx = start;
+        let mut taken = 0usize;
+        while taken < budget && idx < end {
+            if idx < hist_len {
+                let selected = focus_scroll && self.transcript.is_selected_block_for_line(idx);
+                let mut line = self.transcript.lines()[idx].clone();
+                if selected {
+                    line.spans
+                        .insert(0, Span::styled("▌", Style::default().fg(theme::ACCENT())));
+                }
+                self.chat_buf.push(line);
             } else {
-                self.chat_buf
-                    .push(self.tail_buf[i - self.transcript.len()].clone());
+                let ti = idx - hist_len;
+                if ti < self.tail_buf.len() {
+                    self.chat_buf.push(self.tail_buf[ti].clone());
+                }
             }
+            idx += 1;
+            taken += 1;
         }
 
-        // Bottom-align so the conversation grows upward from the composer.
         let pad = area.height.saturating_sub(self.chat_buf.len() as u16);
-        let draw_area = Rect { x: area.x, y: area.y + pad, width: area.width, height: area.height - pad };
+        let draw_area = Rect {
+            x: area.x,
+            y: area.y + pad,
+            width: content_w,
+            height: area.height - pad,
+        };
         Paragraph::new(self.chat_buf.as_slice()).render(draw_area, frame.buffer_mut());
+
+        // Thin scrollbar: thumb position from bottom-based offset.
+        if total > visible && area.width > 0 {
+            let track_h = area.height as usize;
+            let thumb_h = ((visible * track_h) / total).max(1);
+            let max_off = total - visible;
+            let from_top = max_off.saturating_sub(offset);
+            let thumb_y = if max_off == 0 {
+                0
+            } else {
+                (from_top * track_h.saturating_sub(thumb_h)) / max_off
+            };
+            for row_i in 0..track_h {
+                let on = row_i >= thumb_y && row_i < thumb_y + thumb_h;
+                if let Some(cell) = frame.buffer_mut().cell_mut((
+                    area.x + area.width.saturating_sub(1),
+                    area.y + row_i as u16,
+                )) {
+                    cell.set_symbol(if on { "▐" } else { " " });
+                    cell.set_style(if on {
+                        Style::default().fg(theme::DIM())
+                    } else {
+                        Style::default()
+                    });
+                }
+            }
+        }
     }
 
     /// Rebuild the live tail into `tail_buf`, reusing cached stream/thinking
@@ -1084,7 +1825,7 @@ impl App {
             if self.thinking_tail != self.thinking_source {
                 thinking_changed = true;
                 self.thinking_source = self.thinking_tail.clone();
-                let dim = Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC);
+                let dim = Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC);
                 let raw: Vec<Line<'static>> = self
                     .thinking_tail
                     .lines()
@@ -1129,10 +1870,11 @@ impl App {
             }
             meta.push_str(" · esc to cancel");
             self.tail_buf.push(Line::from(vec![
-                Span::styled(SPINNER[self.spinner_i].to_string(), Style::default().fg(theme::ACCENT)),
-                Span::styled(meta, Style::default().fg(theme::DIM)),
+                Span::styled(SPINNER[self.spinner_i].to_string(), Style::default().fg(theme::ACCENT())),
+                Span::styled(meta, Style::default().fg(theme::DIM())),
             ]));
         }
+        // Queued messages render in dedicated chrome above the composer.
         self.tail_buf.len()
     }
 
@@ -1157,15 +1899,9 @@ impl App {
             (s.model.clone(), s.approval_mode.clone())
         };
         let scrolled = self.transcript.offset() > 0;
-        let needs_rebuild = model != self.status_model
-            || approvals != self.status_approvals
-            || ready != self.status_ready
-            || self.status_budget != self.budget
-            || self.status_cache != self.cache_pct
-            || self.status_scrolled != scrolled
-            || self.status_quit_armed != self.quit_armed;
 
-        if needs_rebuild {
+        // Status is a single line; rebuild every paint (cheap).
+        {
             self.status_model = model;
             self.status_approvals = approvals;
             self.status_ready = ready;
@@ -1174,13 +1910,11 @@ impl App {
             self.status_scrolled = scrolled;
             self.status_quit_armed = self.quit_armed;
 
-            let dot_color = if ready { theme::OK } else { theme::DIM };
+            let dot_color = if ready { theme::OK() } else { theme::DIM() };
             let mut ctx = self
                 .budget
                 .map(|(u, t)| format!(" · ctx {}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                 .unwrap_or_default();
-            // Prompt-cache hit rate from server usage: the canary for prefix
-            // stability. Near zero on a long session means full re-prefills.
             if let Some(pct) = self.cache_pct {
                 ctx.push_str(&format!(" · cache {pct}%"));
             }
@@ -1190,14 +1924,26 @@ impl App {
                 .next()
                 .unwrap_or(&self.status_model)
                 .to_string();
-            let scrolled_suffix = if scrolled { " · ↑ scrolled (esc to follow)" } else { "" };
-            let right = if self.quit_armed { " · ctrl+c again to quit" } else { "" };
+            let focus = if self.focus == Focus::Scrollback {
+                " · hist"
+            } else {
+                ""
+            };
+            let scrolled_suffix = if scrolled { " · ↑" } else { "" };
+            let right = if self.quit_armed {
+                " · ctrl+c again to quit"
+            } else {
+                ""
+            };
             self.status_line = Line::from(vec![
                 Span::styled("● ", Style::default().fg(dot_color)),
-                Span::styled(short_model, Style::default().fg(theme::DIM)),
+                Span::styled(short_model, Style::default().fg(theme::DIM())),
                 Span::styled(
-                    format!("{ctx} · {}{scrolled_suffix}{right}", self.status_approvals),
-                    Style::default().fg(theme::DIM),
+                    format!(
+                        "{ctx} · {}{scrolled_suffix}{focus}{right}",
+                        self.status_approvals
+                    ),
+                    Style::default().fg(theme::DIM()),
                 ),
             ]);
         }
@@ -1205,9 +1951,87 @@ impl App {
     }
 }
 
+/// Single source of truth for `/help` and onboarding copy.
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("enter", "send · shift+enter or alt+enter for a newline"),
+    ("enter while working", "queue the message for after this turn"),
+    ("tab", "focus conversation ↔ composer"),
+    ("↑↓ in history", "select a block · enter fold tool · y copy"),
+    ("/ at the start", "command menu · tab or enter completes"),
+    ("@", "mention a project file (fuzzy search)"),
+    ("ctrl+r", "search prompt history"),
+    ("esc", "cancel turn · follow latest · return to composer"),
+    ("wheel · pgup/pgdn", "scroll the conversation"),
+    ("ctrl+o", "expand the last tool block"),
+    ("ctrl+t", "show or hide model thinking"),
+    ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
+    ("/models", "manage and serve local models"),
+    ("/model <repo>", "use a specific model id"),
+    ("/theme dark|light|mono", "switch appearance"),
+    ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
+    ("/new", "start a fresh session"),
+    ("/resume", "pick an earlier session in this project"),
+    ("/context", "prompt token costs, cache hits, and budget"),
+    ("/status", "session and server state"),
+    ("/logs", "recent model server logs"),
+    ("/quit", "exit"),
+];
+
+fn history_search_lines(
+    query: &str,
+    selected: usize,
+    items: &[String],
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let mut lines = vec![Line::from(vec![
+        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
+        Span::styled(
+            if query.is_empty() {
+                "history…".to_string()
+            } else {
+                query.to_string()
+            },
+            if query.is_empty() {
+                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default()
+            },
+        ),
+    ])];
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches",
+            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+        )));
+        return lines;
+    }
+    let visible = items.len().min(6);
+    let first = selected.saturating_sub(visible - 1).min(items.len() - visible);
+    for (i, item) in items.iter().enumerate().skip(first).take(visible) {
+        let on = i == selected;
+        let marker = if on {
+            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
+        } else {
+            Span::raw("  ")
+        };
+        let style = if on {
+            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::DIM())
+        };
+        let one_line = item.replace('\n', " ");
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(clip(&one_line, width.saturating_sub(4)), style),
+        ]));
+    }
+    lines
+}
+
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {k:<10}"), Style::default().fg(theme::ACCENT)),
+        Span::styled(format!("  {k:<10}"), Style::default().fg(theme::ACCENT())),
         Span::raw(v.to_string()),
     ])
 }

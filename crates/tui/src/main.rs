@@ -1,5 +1,7 @@
 mod app;
 mod catalog;
+mod clipboard;
+mod completion;
 mod headless;
 mod input;
 mod theme;
@@ -117,6 +119,8 @@ async fn main() -> std::io::Result<()> {
         eprintln!("openmax: unexpected arguments (use --print for headless)\n\n{HELP}");
         std::process::exit(2);
     }
+
+    theme::init();
 
     // Fullscreen session on the alternate screen: openmax owns the whole
     // terminal while it runs, and your shell (prompt, history, scrollback)

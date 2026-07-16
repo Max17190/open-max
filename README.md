@@ -93,13 +93,21 @@ When `base_url` is not the managed MLX port, Open Max talks to your endpoint dir
 | Input | Action |
 | --- | --- |
 | **Enter** | Send message |
+| **Enter** while the agent works | Queue the message; it goes out when the turn ends |
 | **Shift+Enter** / **Alt+Enter** | New line in the composer |
-| **Esc** | Cancel the running turn, or jump to the latest output |
+| **/** at the start of a message | Command menu; **Tab** or **Enter** completes |
+| **@** anywhere | Fuzzy-search project files and mention one |
+| **Tab** | Toggle focus between composer and conversation |
+| **↑↓** (history focused) | Select a block · **Enter** fold tool · **y** copy |
+| **Esc** | Close menu · cancel turn · follow latest · return to composer |
 | **Mouse wheel** / **PgUp PgDn** | Scroll the conversation |
-| **Ctrl+O** | Expand last tool output |
+| **Ctrl+R** | Search prompt history |
+| **Ctrl+O** | Expand last tool block |
 | **Ctrl+T** | Toggle model thinking stream |
 | **Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U / Ctrl+W** | Line editing in the composer |
 | **Ctrl+C** twice | Quit (model server keeps running if you started one) |
+
+Cancelling a turn hands any queued messages back to the composer, so nothing typed mid-turn is lost.
 
 | Slash command | Action |
 | --- | --- |
@@ -108,6 +116,8 @@ When `base_url` is not the managed MLX port, Open Max talks to your endpoint dir
 | `/model <id>` | Set the active model id |
 | `/approvals auto\|ask\|readonly` | Control mutating tool gates |
 | `/new` | Start a fresh session |
+| `/resume` | Pick an earlier session in this project |
+| `/theme dark\|light\|mono` | Switch appearance (respects `NO_COLOR`) |
 | `/context` | Prompt token costs per component, cache hits, budget |
 | `/status` | Session, endpoint, and server state |
 | `/logs` | Tail recent MLX server logs |

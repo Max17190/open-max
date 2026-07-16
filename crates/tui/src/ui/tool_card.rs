@@ -16,27 +16,27 @@ pub fn tool_block(
     diff: Option<&DiffText>,
 ) -> Vec<Line<'static>> {
     let (glyph, glyph_style) = if ok {
-        ("✓", Style::default().fg(theme::OK))
+        ("✓", Style::default().fg(theme::OK()))
     } else {
-        ("✗", Style::default().fg(theme::ERR))
+        ("✗", Style::default().fg(theme::ERR()))
     };
     let mut header = vec![
         Span::styled(glyph.to_string(), glyph_style),
         Span::raw(" "),
-        Span::styled(name.to_string(), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(name.to_string(), Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
     ];
     match diff {
         // For edits the path plus change counts say it all; the summary would
         // repeat the path.
         Some(d) => header.extend([
-            Span::styled(clip(&d.path, 90), Style::default().fg(theme::DIM)),
+            Span::styled(clip(&d.path, 90), Style::default().fg(theme::DIM())),
             Span::raw("  "),
-            Span::styled(format!("+{}", d.added), Style::default().fg(theme::OK)),
+            Span::styled(format!("+{}", d.added), Style::default().fg(theme::OK())),
             Span::raw(" "),
-            Span::styled(format!("−{}", d.removed), Style::default().fg(theme::ERR)),
+            Span::styled(format!("−{}", d.removed), Style::default().fg(theme::ERR())),
         ]),
-        None => header.push(Span::styled(clip(summary, 90), Style::default().fg(theme::DIM))),
+        None => header.push(Span::styled(clip(summary, 90), Style::default().fg(theme::DIM()))),
     }
     let mut lines = vec![Line::from(header)];
 
@@ -47,14 +47,14 @@ pub fn tool_block(
             for line in output.lines().take(preview_lines) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(clip(line, 110), Style::default().fg(theme::DIM)),
+                    Span::styled(clip(line, 110), Style::default().fg(theme::DIM())),
                 ]));
             }
             let total = output.lines().count();
             if total > preview_lines {
                 lines.push(Line::from(Span::styled(
                     format!("  … {} more lines (ctrl+o to expand)", total - preview_lines),
-                    Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
                 )));
             }
         }
@@ -65,10 +65,10 @@ pub fn tool_block(
 /// A running tool, shown in the live viewport while it executes.
 pub fn running_line(name: &str, summary: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("⚙ ", Style::default().fg(theme::WARN)),
-        Span::styled(name.to_string(), Style::default().fg(theme::ACCENT)),
+        Span::styled("⚙ ", Style::default().fg(theme::WARN())),
+        Span::styled(name.to_string(), Style::default().fg(theme::ACCENT())),
         Span::raw(" "),
-        Span::styled(clip(summary, 90), Style::default().fg(theme::DIM)),
+        Span::styled(clip(summary, 90), Style::default().fg(theme::DIM())),
     ])
 }
 
@@ -84,11 +84,11 @@ pub fn diff_lines(diff: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for raw in diff.lines() {
         let style = if raw.starts_with("+++") || raw.starts_with("---") || raw.starts_with("@@") {
-            Style::default().fg(theme::DIM)
+            Style::default().fg(theme::DIM())
         } else if raw.starts_with('+') {
-            Style::default().fg(theme::OK)
+            Style::default().fg(theme::OK())
         } else if raw.starts_with('-') {
-            Style::default().fg(theme::ERR)
+            Style::default().fg(theme::ERR())
         } else {
             Style::default()
         };

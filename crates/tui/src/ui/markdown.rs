@@ -63,7 +63,7 @@ pub fn render(text: &str, hl: &Highlighter) -> Vec<Line<'static>> {
         }
 
         if in_fence {
-            let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::DIM))];
+            let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::DIM()))];
             match highlighter.as_mut() {
                 Some(h) => match h.highlight_line(raw, &hl.syntaxes) {
                     Ok(ranges) => {
@@ -87,26 +87,26 @@ pub fn render(text: &str, hl: &Highlighter) -> Vec<Line<'static>> {
         if let Some(rest) = strip_heading(trimmed) {
             out.push(Line::from(Span::styled(
                 rest.to_string(),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         // Horizontal rule.
         if trimmed == "---" || trimmed == "***" {
-            out.push(Line::from(Span::styled("─".repeat(24), Style::default().fg(theme::DIM))));
+            out.push(Line::from(Span::styled("─".repeat(24), Style::default().fg(theme::DIM()))));
             continue;
         }
         // Blockquote.
         if let Some(rest) = trimmed.strip_prefix("> ") {
-            let mut spans = vec![Span::styled("▎", Style::default().fg(theme::DIM))];
-            spans.extend(inline(rest, Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)));
+            let mut spans = vec![Span::styled("▎", Style::default().fg(theme::DIM()))];
+            spans.extend(inline(rest, Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)));
             out.push(Line::from(spans));
             continue;
         }
         // Bullets keep their indent.
         let indent_len = raw.len() - trimmed.len();
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            let mut spans = vec![Span::raw(" ".repeat(indent_len)), Span::styled("• ", Style::default().fg(theme::ACCENT))];
+            let mut spans = vec![Span::raw(" ".repeat(indent_len)), Span::styled("• ", Style::default().fg(theme::ACCENT()))];
             spans.extend(inline(&trimmed[2..], Style::default()));
             out.push(Line::from(spans));
             continue;
@@ -150,7 +150,7 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(close) = find(&chars, i + 1, "`") {
                 flush(&mut buf, &mut spans);
                 let code: String = chars[i + 1..close].iter().collect();
-                spans.push(Span::styled(code, base.fg(theme::CODE)));
+                spans.push(Span::styled(code, base.fg(theme::CODE())));
                 i = close + 1;
                 continue;
             }

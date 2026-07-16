@@ -1212,6 +1212,7 @@ version = "0.2.0"
 dependencies = [
  "crossterm",
  "futures-util",
+ "ignore",
  "lexopt",
  "open-max-core",
  "ratatui",
