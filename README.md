@@ -237,7 +237,7 @@ tool = "bash"          # optional filter; omit to run for every tool
 timeout_secs = 5
 ```
 
-**Permissions.** Optional declarative rules in `.openmax/permissions.toml` (project) or `~/.openmax/permissions.toml` (global). Missing files change nothing. Project rules are evaluated before global; the first match wins. Rules refine ask/auto without forking: deny dangerous calls, auto-allow safe ones, or force an approval prompt on specific tools. Evaluation order per tool call is hooks pre → permissions → `approval_mode` → execute → hooks post. `allow` still cannot override `readonly` for mutating tools. Rules also apply inside a `task` subagent.
+**Permissions.** Optional declarative rules in `.openmax/permissions.toml` (project) or `~/.openmax/permissions.toml` (global). Missing files change nothing. Project rules are evaluated before global; the first match wins. Rules refine ask/auto without forking: deny dangerous calls, auto-allow safe ones, or force an approval prompt on specific tools. Evaluation order per tool call is hooks pre → permissions → `approval_mode` → execute → hooks post. `allow` still cannot override `readonly` for mutating tools. Rules also apply inside a `task` subagent (including `ask`, which reuses the same approval UI). A malformed permissions file fails closed (all tools denied) rather than dropping the policy.
 
 ```toml
 # .openmax/permissions.toml

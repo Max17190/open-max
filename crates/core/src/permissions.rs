@@ -39,6 +39,10 @@ struct Rule {
 #[derive(Clone, Debug, Default)]
 pub struct Permissions {
     rules: Vec<Rule>,
+    /// True when an existing permissions file could not be parsed. Evaluate
+    /// then denies every tool so a broken policy cannot fail open.
+    fail_closed: bool,
+    fail_closed_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -47,12 +51,21 @@ struct PermissionsFile {
     rules: Vec<RuleFile>,
 }
 
+/// Reject unknown keys so a misspelled `arg_regex` cannot silently widen an allow.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleFile {
     effect: String,
     tool: String,
     #[serde(default)]
     arg_regex: Option<String>,
+}
+
+enum FileLoad {
+    Missing,
+    Ok(Vec<Rule>),
+    /// File exists but is unusable; caller must fail closed.
+    Invalid(String),
 }
 
 impl Permissions {
@@ -65,19 +78,38 @@ impl Permissions {
     fn from_files(paths: &[PathBuf]) -> Self {
         let mut rules = Vec::new();
         for path in paths {
-            if let Some(mut loaded) = load_file(path) {
-                rules.append(&mut loaded);
+            match load_file(path) {
+                FileLoad::Missing => {}
+                FileLoad::Ok(mut loaded) => rules.append(&mut loaded),
+                FileLoad::Invalid(reason) => {
+                    return Self {
+                        rules: Vec::new(),
+                        fail_closed: true,
+                        fail_closed_reason: Some(reason),
+                    };
+                }
             }
         }
-        Self { rules }
+        Self {
+            rules,
+            fail_closed: false,
+            fail_closed_reason: None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.rules.is_empty() && !self.fail_closed
     }
 
     /// First matching rule wins. Missing rules → [`PermissionDecision::Default`].
     pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
+        if self.fail_closed {
+            return PermissionDecision::Deny {
+                reason: self.fail_closed_reason.clone().unwrap_or_else(|| {
+                    "permissions.toml is malformed; failing closed".into()
+                }),
+            };
+        }
         let haystack = arg_haystack(tool, args);
         for rule in &self.rules {
             if rule.tool != tool {
@@ -108,12 +140,28 @@ fn permission_files(project_root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn load_file(path: &Path) -> Option<Vec<Rule>> {
+fn load_file(path: &Path) -> FileLoad {
     if !path.is_file() {
-        return None;
+        return FileLoad::Missing;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    let file: PermissionsFile = toml::from_str(&text).ok()?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            return FileLoad::Invalid(format!(
+                "permissions file {} unreadable ({e}); failing closed",
+                path.display()
+            ));
+        }
+    };
+    let file: PermissionsFile = match toml::from_str(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            return FileLoad::Invalid(format!(
+                "permissions file {} is malformed ({e}); failing closed",
+                path.display()
+            ));
+        }
+    };
     let mut rules = Vec::with_capacity(file.rules.len());
     for raw in file.rules {
         let tool = raw.tool.trim().to_string();
@@ -124,14 +172,23 @@ fn load_file(path: &Path) -> Option<Vec<Rule>> {
             "allow" => Effect::Allow,
             "deny" => Effect::Deny,
             "ask" => Effect::Ask,
-            _ => continue,
+            other => {
+                return FileLoad::Invalid(format!(
+                    "permissions file {} has unknown effect {other:?}; failing closed",
+                    path.display()
+                ));
+            }
         };
         let arg_regex = match raw.arg_regex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
             Some(pat) => match Regex::new(pat) {
                 Ok(re) => Some(re),
-                // Invalid regex: skip the rule (do not panic; do not match).
-                Err(_) => continue,
+                Err(e) => {
+                    return FileLoad::Invalid(format!(
+                        "permissions file {} has invalid arg_regex ({e}); failing closed",
+                        path.display()
+                    ));
+                }
             },
         };
         rules.push(Rule {
@@ -140,7 +197,7 @@ fn load_file(path: &Path) -> Option<Vec<Rule>> {
             arg_regex,
         });
     }
-    Some(rules)
+    FileLoad::Ok(rules)
 }
 
 /// Primary argument string used for optional `arg_regex` matching.
@@ -266,7 +323,7 @@ arg_regex = "cargo"
     }
 
     #[test]
-    fn invalid_regex_skipped() {
+    fn invalid_regex_fails_closed() {
         let tmp = tempfile_dir();
         write_perms(
             &tmp.join(".openmax").join("permissions.toml"),
@@ -283,15 +340,51 @@ arg_regex = "^ls"
 "#,
         );
         let perms = Permissions::discover(&tmp);
-        assert_eq!(
-            perms.evaluate("bash", &json!({"command": "ls -la"})),
-            PermissionDecision::Allow
+        // Broken policy must not drop remaining rules and fail open.
+        match perms.evaluate("bash", &json!({"command": "ls -la"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(reason.contains("failing closed"), "{reason}");
+            }
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_toml_fails_closed() {
+        let tmp = tempfile_dir();
+        write_perms(
+            &tmp.join(".openmax").join("permissions.toml"),
+            "this is not valid toml [[[",
         );
-        // The invalid deny rule must not match everything.
-        assert_eq!(
-            perms.evaluate("bash", &json!({"command": "echo hi"})),
-            PermissionDecision::Default
+        let perms = Permissions::discover(&tmp);
+        match perms.evaluate("bash", &json!({"command": "echo hi"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(reason.contains("malformed") || reason.contains("failing closed"), "{reason}");
+            }
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_rule_field_fails_closed() {
+        let tmp = tempfile_dir();
+        // Misspelled filter key must not become an unconditional allow.
+        write_perms(
+            &tmp.join(".openmax").join("permissions.toml"),
+            r#"
+[[rules]]
+effect = "allow"
+tool = "bash"
+args_regex = "^cargo test"
+"#,
         );
+        let perms = Permissions::discover(&tmp);
+        match perms.evaluate("bash", &json!({"command": "rm -rf /"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(reason.contains("failing closed") || reason.contains("malformed"), "{reason}");
+            }
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
     }
 
     #[test]
