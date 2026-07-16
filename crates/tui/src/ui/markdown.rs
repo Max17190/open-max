@@ -2,12 +2,15 @@
 //! emphasis, inline code, lists, blockquotes, rules, and syntect-highlighted
 //! fenced code. Enough for model output without pulling in a full parser.
 
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::{
+    Color as SynColor, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
+};
 use syntect::parsing::SyntaxSet;
 
 use crate::theme;
@@ -17,8 +20,8 @@ pub struct Highlighter {
     theme: Theme,
 }
 
-/// Loading syntect's syntax and theme dumps costs tens of milliseconds, so it
-/// happens lazily on the first rendered code fence, not at startup.
+/// Loading syntect's syntax dump costs tens of milliseconds, so it happens
+/// lazily on the first rendered code fence, not at startup.
 pub fn highlighter() -> &'static Highlighter {
     static HL: OnceLock<Highlighter> = OnceLock::new();
     HL.get_or_init(Highlighter::default)
@@ -26,15 +29,66 @@ pub fn highlighter() -> &'static Highlighter {
 
 impl Default for Highlighter {
     fn default() -> Self {
+        // Keep default-syntaxes: we have no vendored language subset, so the
+        // full packdump is still the honest choice for fence language coverage.
+        // Theme is a single in-memory palette (no ThemeSet / default-themes dump).
         let syntaxes = SyntaxSet::load_defaults_newlines();
-        let mut themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .remove("base16-eighties.dark")
-            .or_else(|| themes.themes.values().next().cloned())
-            .expect("syntect ships default themes");
+        let theme = code_theme();
         Self { syntaxes, theme }
     }
+}
+
+/// Compact base16-eighties-inspired palette for fenced code only.
+/// Avoids embedding syntect's multi-theme `default.themedump` and the plist
+/// crate that a vendored `.tmTheme` would need.
+fn code_theme() -> Theme {
+    let fg = rgb(0xd3, 0xd0, 0xc8);
+    let comment = rgb(0x74, 0x73, 0x69);
+    let red = rgb(0xf2, 0x77, 0x7a);
+    let orange = rgb(0xf9, 0x91, 0x57);
+    let yellow = rgb(0xff, 0xcc, 0x66);
+    let green = rgb(0x99, 0xcc, 0x99);
+    let cyan = rgb(0x66, 0xcc, 0xcc);
+    let blue = rgb(0x66, 0x99, 0xcc);
+    let magenta = rgb(0xcc, 0x99, 0xcc);
+
+    let mut scopes = Vec::new();
+    let mut rule = |selector: &str, color: SynColor| {
+        scopes.push(ThemeItem {
+            scope: ScopeSelectors::from_str(selector).expect("static scope selector"),
+            style: StyleModifier {
+                foreground: Some(color),
+                background: None,
+                font_style: None,
+            },
+        });
+    };
+
+    rule("comment, punctuation.definition.comment", comment);
+    rule("string, punctuation.definition.string", green);
+    rule("constant.numeric, constant.language, constant.character", orange);
+    rule("keyword, storage, storage.type, storage.modifier", magenta);
+    rule("entity.name.function, support.function, meta.function-call", blue);
+    rule("entity.name.type, entity.name.class, support.type, support.class", yellow);
+    rule("variable, variable.language, variable.parameter", red);
+    rule("keyword.operator", cyan);
+    rule("entity.name.tag", red);
+    rule("entity.other.attribute-name", orange);
+
+    Theme {
+        name: Some("open-max-code".into()),
+        author: None,
+        settings: ThemeSettings {
+            foreground: Some(fg),
+            background: Some(rgb(0x2d, 0x2d, 0x2d)),
+            ..ThemeSettings::default()
+        },
+        scopes,
+    }
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> SynColor {
+    SynColor { r, g, b, a: 0xff }
 }
 
 /// Render markdown to styled lines. Code fences are highlighted and prefixed
@@ -237,5 +291,43 @@ mod tests {
         let hl = Highlighter::default();
         let lines = render("a * lone star and `tick", &hl);
         assert_eq!(plain(&lines)[0], "a * lone star and `tick");
+    }
+
+    #[test]
+    fn rust_fence_applies_syntect_colors() {
+        let hl = Highlighter::default();
+        let lines = render(
+            "```rust\nfn main() { let x = 1; println!(\"hi\"); }\n```",
+            &hl,
+        );
+        assert!(!lines.is_empty());
+        let code = &lines[0];
+        // Gutter bar + highlighted pieces; more than a single plain span.
+        assert!(
+            code.spans.len() > 2,
+            "expected multi-span highlight, got {}",
+            code.spans.len()
+        );
+        let texts: String = code.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(texts.contains("fn main()"));
+
+        let fg_colors: Vec<_> = code
+            .spans
+            .iter()
+            .skip(1) // skip gutter
+            .filter_map(|s| match s.style.fg {
+                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fg_colors.len() >= 2,
+            "expected RGB foregrounds from syntect theme, got {fg_colors:?}"
+        );
+        let distinct: std::collections::HashSet<_> = fg_colors.into_iter().collect();
+        assert!(
+            distinct.len() >= 2,
+            "expected more than one highlight color for keywords/idents, got {distinct:?}"
+        );
     }
 }
