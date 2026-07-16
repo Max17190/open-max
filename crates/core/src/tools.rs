@@ -111,11 +111,11 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "list_dir",
-                "description": "List files and directories at a path inside the project. Use path \".\" for the project root.",
+                "description": "List a directory. Path \".\" is the project root.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory path relative to the project root" }
+                        "path": { "type": "string" }
                     },
                     "required": ["path"]
                 }
@@ -125,13 +125,13 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file. Returns numbered lines. Large files are paginated via offset/limit.",
+                "description": "Read a file as numbered lines.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to the project root" },
-                        "offset": { "type": "integer", "description": "1-based line to start from (optional)" },
-                        "limit": { "type": "integer", "description": "Max lines to return (optional)" }
+                        "path": { "type": "string" },
+                        "offset": { "type": "integer", "description": "1-based start line" },
+                        "limit": { "type": "integer", "description": "Max lines" }
                     },
                     "required": ["path"]
                 }
@@ -141,12 +141,12 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file with the given content. Parent directories are created automatically.",
+                "description": "Create or overwrite a file; parent dirs are created.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to the project root" },
-                        "content": { "type": "string", "description": "Full new file content" }
+                        "path": { "type": "string" },
+                        "content": { "type": "string", "description": "Full file content" }
                     },
                     "required": ["path", "content"]
                 }
@@ -156,13 +156,13 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace an exact string in a file. old_string must match the file exactly (including whitespace) and must be unique unless replace_all is true. Read the file first. If the exact text is not found, near matches differing only in whitespace are accepted.",
+                "description": "Replace old_string with new_string in a file. Read it first; old_string must match exactly and be unique unless replace_all.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to the project root" },
-                        "old_string": { "type": "string", "description": "Exact text to replace" },
-                        "new_string": { "type": "string", "description": "Replacement text" },
+                        "path": { "type": "string" },
+                        "old_string": { "type": "string" },
+                        "new_string": { "type": "string" },
                         "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
                     },
                     "required": ["path", "old_string", "new_string"]
@@ -173,11 +173,11 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files by glob pattern, e.g. \"**/*.ts\" or \"src/**/test_*.py\". Returns paths sorted by modification time, newest first.",
+                "description": "Find files by glob pattern, e.g. \"**/*.rs\"; newest first.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Glob pattern matched against paths relative to the project root" }
+                        "pattern": { "type": "string" }
                     },
                     "required": ["pattern"]
                 }
@@ -187,13 +187,13 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents with a regular expression. Returns matching lines as path:line: text.",
+                "description": "Regex-search file contents; returns path:line: text.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax: no lookahead/backreferences). Example: \"fn (get|set)_\\w+\"" },
-                        "path": { "type": "string", "description": "Directory to search, relative to project root (optional, default \".\")" },
-                        "glob": { "type": "string", "description": "Only search files matching this glob, e.g. \"*.rs\" (optional)" }
+                        "pattern": { "type": "string", "description": "Rust regex; no lookahead/backrefs" },
+                        "path": { "type": "string", "description": "Directory to search (default \".\")" },
+                        "glob": { "type": "string", "description": "Only files matching, e.g. \"*.rs\"" }
                     },
                     "required": ["pattern"]
                 }
@@ -203,12 +203,12 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a shell command in the project root and return its output. Use for builds, tests, git, and anything the other tools can't do.",
+                "description": "Run a shell command in the project root (builds, tests, git).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "The shell command to run" },
-                        "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 60, max 300)" }
+                        "command": { "type": "string" },
+                        "timeout_secs": { "type": "integer", "description": "Default 60, max 300" }
                     },
                     "required": ["command"]
                 }
@@ -218,16 +218,16 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Delegate a focused, read-only investigation to a fresh subagent that has its own context window. Use this for broad codebase questions (\"where is X handled\", \"how does Y work\", \"map the auth flow\") so the search churn stays out of your context: the subagent runs its own list_dir/read_file/glob/grep loop and returns only a summary. It cannot edit files or run shell commands. Prefer it over doing many exploratory reads yourself.",
+                "description": "Delegate a read-only investigation to a subagent with its own context; it returns only a summary. Cannot edit or run commands. Use for broad questions like \"where is X handled\".",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "subagent": {
                             "type": "string",
                             "enum": ["explore", "search", "plan"],
-                            "description": "explore = investigate and report findings; search = quickly locate specific code; plan = read the code and propose a step-by-step plan"
+                            "description": "explore=investigate; search=locate code; plan=step-by-step plan"
                         },
-                        "prompt": { "type": "string", "description": "The self-contained task for the subagent: what to find or plan, and what to report back" }
+                        "prompt": { "type": "string", "description": "What to find and what to report back" }
                     },
                     "required": ["subagent", "prompt"]
                 }
