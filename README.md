@@ -2,16 +2,16 @@
 
 **A barebones, high-performance agent harness. Extremely configurable. Full control.**
 
-Open Max is a single Rust binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at any OpenAI-compatible endpoint (cloud or local). No desktop shell, no heavyweight runtime, no telemetry. Just a ~5 MB harness that stays out of the way.
+Open Max is a single Rust binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at any OpenAI-compatible endpoint (cloud or local), or register several named providers and switch between them. No desktop shell, no heavyweight runtime, no telemetry. Just a ~5 MB harness that stays out of the way.
 
-You own the endpoint, the tools, the skills, and the context.
+You own the endpoints, the tools, the skills, and the context.
 
 ## Why Open Max
 
 - **Barebones by default.** A small fixed tool set (file/shell tools plus a read-only `task` for context isolation), a short system prompt, and context budgeting that drops old tool output before it drops your task. With nothing installed beyond built-ins, the prompt stays minimal.
 - **Extremely configurable.** External tools, skills, and project instructions live in local files. Shape the harness without forking it. Every extension's token cost is visible in `/context`.
 - **Full control.** Settings, sessions, and secrets stay on your machine. Network traffic goes only to the model endpoint you configure (plus optional Hugging Face downloads when you ask). No silent upload, no telemetry.
-- **Any OpenAI-compatible backend.** Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, or a managed on-device [MLX](https://github.com/ml-explore/mlx) server on Apple Silicon when you want one.
+- **Any OpenAI-compatible backend.** One flat `base_url`, or a multi-provider catalog in `providers.json` (Ollama, LM Studio, vLLM, llama.cpp, OpenRouter-style gateways, corporate proxies). Optional managed [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 - **Visible by default.** Reads, greps, diffs, and shell commands stream as they happen. Writes and `bash` wait for approval unless you say otherwise.
 - **A real session.** Fullscreen TUI: pinned header, conversation above the composer, wheel scrolling. Quit and your shell is exactly as you left it.
 
@@ -40,17 +40,58 @@ openmax
 
 ### Point at your backend
 
-Edit `~/.openmax/settings.json`:
+**Single endpoint.** Edit `~/.openmax/settings.json`:
 
 ```json
 {
   "base_url": "http://127.0.0.1:11434/v1",
   "model": "qwen2.5-coder:7b",
+  "api_key": null,
   "approval_mode": "ask"
 }
 ```
 
-Set `base_url` and `model` to match your provider. Any OpenAI-compatible `/v1/chat/completions` endpoint works.
+Set `base_url` and `model` to match your server. Any OpenAI-compatible `/v1/chat/completions` endpoint works. You can also set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+
+**Multiple providers.** Register named endpoints in `~/.openmax/providers.json` and select one with `"provider"` in settings, `--provider`, or `/provider`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key": "ollama",
+      "models": [
+        { "id": "qwen2.5-coder:7b" },
+        { "id": "llama3.1:8b", "context_tokens": 32768 }
+      ]
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "headers": {
+        "HTTP-Referer": "https://github.com/Max17190/open-max",
+        "X-Title": "Open Max"
+      },
+      "models": [
+        { "id": "anthropic/claude-sonnet-4" },
+        { "id": "openai/gpt-4.1-mini" }
+      ]
+    },
+    "proxy": {
+      "base_url": "https://llm.example.com/v1",
+      "api_key": "$CORP_LLM_KEY",
+      "compat": {
+        "send_stream_options": false,
+        "use_max_completion_tokens": true
+      },
+      "models": [{ "id": "default" }]
+    }
+  }
+}
+```
+
+Then in `settings.json` set `"provider": "ollama"` (or switch later with `/provider openrouter`). Credential resolution per provider: `api_key` (literal or `$ENV`; use `$$` for a literal leading `$`) → `api_key_env` → settings `api_key` → `OPENMAX_API_KEY`. An unknown `provider` name fails the request instead of falling back to flat `base_url`.
 
 Resume the latest session in the current directory:
 
@@ -60,9 +101,10 @@ openmax --continue
 openmax -c
 ```
 
-Pick a model for the run:
+Pick a provider and model for the run:
 
 ```sh
+openmax --provider ollama --model qwen2.5-coder:7b
 openmax --model your-model-id
 ```
 
@@ -116,6 +158,7 @@ Cancelling a turn hands any queued messages back to the composer, so nothing typ
 | `/help` | Show keybindings and commands |
 | `/models` | Download, serve, and manage local MLX models (Apple Silicon) |
 | `/model <id>` | Set the active model id |
+| `/provider [name]` | List named providers, or select one from `providers.json` |
 | `/approvals auto\|ask\|readonly` | Control mutating tool gates |
 | `/new` | Start a fresh session |
 | `/resume` | Pick an earlier session in this project |
@@ -214,6 +257,7 @@ crates/
   core/                     UI-free agent harness (+ optional MLX/Hugging Face helpers)
     agent.rs                  Turn loop: stream → tools → approvals → repeat
     client.rs                 OpenAI-compatible streaming client (SSE + JSON fallback)
+    providers.rs              Named providers.json registry and endpoint resolution
     tools.rs                  list_dir · read_file · write_file · edit_file · glob · grep · bash · task
     registry.rs               Session-frozen tool registry: built-ins + external TOML tools
     hooks.rs                  Optional pre/post tool process hooks

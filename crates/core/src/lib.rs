@@ -10,6 +10,7 @@ pub mod hf;
 pub mod hooks;
 pub mod mlx;
 pub mod prompt;
+pub mod providers;
 pub mod registry;
 pub mod sessions;
 pub mod skills;

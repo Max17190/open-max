@@ -7,6 +7,10 @@ pub const DEFAULT_MLX_PORT: u16 = 8989;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Named provider from `providers.json`. When set and found, supplies
+    /// base_url, credentials, and headers; flat fields remain the fallback.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// OpenAI-compatible base URL. Defaults to the optional managed local MLX
     /// port; any other compatible endpoint can be configured instead.
     pub base_url: String,
@@ -37,6 +41,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            provider: None,
             base_url: format!("http://127.0.0.1:{DEFAULT_MLX_PORT}/v1"),
             api_key: None,
             model: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
