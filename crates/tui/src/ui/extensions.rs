@@ -20,26 +20,54 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Authority host[:port] from a base URL, with userinfo stripped so credentials
-/// never appear in the header or status chrome.
-pub fn endpoint_host(base_url: &str) -> Option<String> {
+/// Split an OpenAI-compatible base URL into (normalized scheme, authority, path).
+/// Scheme matching is case-insensitive (`HTTPS://` works). Userinfo is not
+/// stripped here; callers that render must drop it from `authority`.
+fn split_base_url(base_url: &str) -> Option<(&str, &str, &str)> {
     let s = base_url.trim();
     if s.is_empty() {
         return None;
     }
-    let rest = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-        .unwrap_or(s);
-    let authority = rest.split('/').next().unwrap_or("").trim();
+    let (scheme, rest) = if let Some(i) = s.find("://") {
+        let scheme_raw = &s[..i];
+        if scheme_raw.eq_ignore_ascii_case("https") {
+            ("https://", &s[i + 3..])
+        } else if scheme_raw.eq_ignore_ascii_case("http") {
+            ("http://", &s[i + 3..])
+        } else {
+            // Unknown scheme: treat whole string as opaque authority/path.
+            ("", s)
+        }
+    } else {
+        ("", s)
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, &rest[a.len()..]), // keeps leading '/'
+        None => (rest, ""),
+    };
+    Some((scheme, authority, path))
+}
+
+/// Drop `user:pass@` from an authority so chrome never renders secrets.
+fn strip_userinfo(authority: &str) -> &str {
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+}
+
+/// Authority host[:port] from a base URL, with userinfo stripped so credentials
+/// never appear in the header or status chrome.
+pub fn endpoint_host(base_url: &str) -> Option<String> {
+    let (_, authority, _) = split_base_url(base_url)?;
+    let authority = authority.trim();
     if authority.is_empty() || authority.contains(' ') {
         return None;
     }
-    // Drop user:pass@ so chrome never renders endpoint secrets.
-    let hostport = authority
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(authority);
+    let hostport = strip_userinfo(authority);
     if hostport.is_empty() {
         return None;
     }
@@ -63,25 +91,10 @@ pub fn endpoint_host(base_url: &str) -> Option<String> {
 
 /// Full base URL with userinfo redacted for `/status` and similar listings.
 pub fn display_base_url(base_url: &str) -> String {
-    let s = base_url.trim();
-    if s.is_empty() {
+    let Some((scheme, authority, path)) = split_base_url(base_url) else {
         return String::new();
-    }
-    let (scheme, rest) = if let Some(r) = s.strip_prefix("https://") {
-        ("https://", r)
-    } else if let Some(r) = s.strip_prefix("http://") {
-        ("http://", r)
-    } else {
-        ("", s)
     };
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        None => (rest, String::new()),
-    };
-    let hostport = authority
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(authority);
+    let hostport = strip_userinfo(authority);
     format!("{scheme}{hostport}{path}")
 }
 
@@ -239,6 +252,15 @@ mod tests {
         assert_eq!(
             display_base_url("http://127.0.0.1:11434/v1"),
             "http://127.0.0.1:11434/v1"
+        );
+        // Schemes are case-insensitive; mixed case must still redact.
+        assert_eq!(
+            display_base_url("HTTPS://alice:secret@api.example.com/v1"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            endpoint_host("HtTpS://alice:secret@api.example.com:8443/v1").as_deref(),
+            Some("api.example.com:8443")
         );
     }
 
