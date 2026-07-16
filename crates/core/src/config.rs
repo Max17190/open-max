@@ -7,8 +7,8 @@ pub const DEFAULT_MLX_PORT: u16 = 8989;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// OpenAI-compatible base URL. Defaults to the managed local MLX server;
-    /// any other compatible endpoint can be configured instead.
+    /// OpenAI-compatible base URL. Defaults to the optional managed local MLX
+    /// port; any other compatible endpoint can be configured instead.
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,

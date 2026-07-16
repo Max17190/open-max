@@ -1,6 +1,6 @@
 [package]
 name = "open-max-core"
-description = "Open Max core: agent harness, tool sandbox, and MLX server manager"
+description = "Open Max core: agent harness, tool sandbox, and optional local model serve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

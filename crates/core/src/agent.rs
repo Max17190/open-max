@@ -17,6 +17,11 @@ use crate::tools;
 use crate::types::{AgentEvent, ChatMessage, ToolCall};
 
 const MAX_ITERATIONS: usize = 50;
+/// Cap for a `task` child loop: enough for focused exploration without
+/// burning the parent turn's latency budget.
+const MAX_TASK_ITERATIONS: usize = 12;
+/// Read-only tools available to a `task` child. No bash, no writes, no nesting.
+const TASK_TOOLS: &[&str] = &["list_dir", "read_file", "glob", "grep"];
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
 /// with no perceptible latency.
@@ -139,7 +144,8 @@ where
 
 fn batchable_call(call: &ToolCall, registry: &Registry, repeat_tracker: &RepeatCallTracker) -> bool {
     let name = call.function.name.as_str();
-    if name.is_empty() {
+    if name.is_empty() || name == tools::TASK_TOOL {
+        // `task` spawns a nested model loop; never concurrent with siblings.
         return false;
     }
     let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) else {
@@ -611,6 +617,23 @@ async fn run_loop(
                             diff: None,
                         }, true),
                     }
+                } else if name == tools::TASK_TOOL {
+                    executed = true;
+                    (
+                        run_task_subagent(
+                            core,
+                            session_id,
+                            &call.id,
+                            project_root,
+                            &registry,
+                            &args,
+                            &settings,
+                            caps,
+                            cancelled.clone(),
+                        )
+                        .await,
+                        false,
+                    )
                 } else {
                     executed = true;
                     (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
@@ -656,6 +679,176 @@ async fn run_loop(
     save_messages(core, session_id, &messages, false).await;
     sessions::touch(core, session_id);
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
+}
+
+/// Run a read-only `task` child agent. The parent context receives only the
+/// final summary (via ToolEnd); child tool churn stays out of the parent window.
+async fn run_task_subagent(
+    core: &Arc<Core>,
+    parent_session_id: &str,
+    parent_call_id: &str,
+    project_root: &Path,
+    parent_registry: &Registry,
+    args: &Value,
+    settings: &Settings,
+    caps: tools::OutputCaps,
+    cancelled: Arc<CancelToken>,
+) -> tools::ToolOutcome {
+    let kind = args["subagent"].as_str().unwrap_or("explore");
+    let prompt = args["prompt"].as_str().unwrap_or("").trim();
+    if prompt.is_empty() {
+        return tools::ToolOutcome::err("task requires a non-empty prompt");
+    }
+    let kind = match kind {
+        "explore" | "search" | "plan" => kind,
+        other => {
+            return tools::ToolOutcome::err(format!(
+                "unknown subagent kind {other:?}; use explore, search, or plan"
+            ));
+        }
+    };
+
+    let child_registry = parent_registry.scoped(TASK_TOOLS);
+    if child_registry.tools.is_empty() {
+        return tools::ToolOutcome::err("task has no read-only tools available in this session");
+    }
+    let known_tools: Vec<&str> = child_registry.tools.iter().map(|s| s.name.as_str()).collect();
+    let schemas = child_registry.tool_schemas_json().clone();
+    let root = project_root.to_string_lossy();
+    let system = match kind {
+        "search" => format!(
+            "You are a read-only search subagent for the project at {root}. \
+             Use list_dir, glob, grep, and read_file only. Find what was asked and stop. \
+             Reply with a concise report: paths, line references, and the answer. No edits."
+        ),
+        "plan" => format!(
+            "You are a read-only planning subagent for the project at {root}. \
+             Use list_dir, glob, grep, and read_file only. Inspect enough to propose a plan. \
+             Reply with numbered steps, key files, and risks. Do not edit files."
+        ),
+        _ => format!(
+            "You are a read-only explore subagent for the project at {root}. \
+             Use list_dir, glob, grep, and read_file only. Investigate thoroughly but briefly. \
+             Reply with findings, relevant paths, and anything the parent agent should know. No edits."
+        ),
+    };
+
+    let mut messages = vec![
+        ChatMessage::system(system),
+        ChatMessage::user(prompt.to_string()),
+    ];
+    let client = ChatClient::new(
+        settings.base_url.clone(),
+        settings.api_key.clone(),
+        settings.model.clone(),
+        settings.temperature,
+        settings.max_tokens.min(2048),
+    );
+    let child_budget = settings.context_tokens.saturating_sub(settings.max_tokens + 512).min(12_000);
+    let mut last_text = String::new();
+    let mut step = 0usize;
+
+    for _ in 0..MAX_TASK_ITERATIONS {
+        if cancelled.is_cancelled() {
+            return tools::ToolOutcome::err("The user cancelled this turn.");
+        }
+        let _ = enforce_budget(&mut messages, child_budget);
+        let result = client
+            .stream_chat(&messages, &schemas, cancelled.clone(), |_| {})
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(message) => {
+                return tools::ToolOutcome::err(format!("task subagent failed: {message}"));
+            }
+        };
+
+        let mut content = result.content.clone();
+        let mut tool_calls = result.tool_calls.clone();
+        if let Some(clean) = fallback::strip_leading_think(&content) {
+            content = clean;
+        }
+        (content, tool_calls) = resolve_tool_calls(content, tool_calls, &known_tools);
+        if !content.is_empty() {
+            last_text = content.clone();
+        }
+        if !content.is_empty() || !tool_calls.is_empty() {
+            messages.push(ChatMessage::assistant(
+                if content.is_empty() { None } else { Some(content) },
+                if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
+            ));
+        }
+        if tool_calls.is_empty() {
+            break;
+        }
+
+        for call in &tool_calls {
+            if cancelled.is_cancelled() {
+                return tools::ToolOutcome::err("The user cancelled this turn.");
+            }
+            let name = call.function.name.as_str();
+            step += 1;
+            core.send_agent(
+                parent_session_id,
+                AgentEvent::SubagentProgress {
+                    call_id: parent_call_id.to_string(),
+                    kind: kind.to_string(),
+                    tool: name.to_string(),
+                    step,
+                },
+            );
+            if name.is_empty() {
+                messages.push(ChatMessage::tool(
+                    call.id.clone(),
+                    "Error: empty tool name".to_string(),
+                ));
+                continue;
+            }
+            let call_args: Value = match serde_json::from_str(&call.function.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    messages.push(ChatMessage::tool(
+                        call.id.clone(),
+                        format!("Error: invalid JSON in tool arguments: {e}"),
+                    ));
+                    continue;
+                }
+            };
+            let outcome = child_registry
+                .execute(name, &call_args, project_root, caps, cancelled.clone())
+                .await;
+            messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
+        }
+    }
+
+    if cancelled.is_cancelled() {
+        return tools::ToolOutcome::err("The user cancelled this turn.");
+    }
+    if last_text.trim().is_empty() {
+        last_text = format!(
+            "Subagent ({kind}) finished after {step} tool steps without a text summary. \
+             Re-run with a narrower prompt if you still need the answer."
+        );
+        return tools::ToolOutcome {
+            ok: false,
+            output: last_text,
+            diff: None,
+        };
+    }
+    // Cap what re-enters the parent context: the whole point of task isolation.
+    let summary = if last_text.len() > 6_000 {
+        let mut cut = 5_800;
+        while !last_text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!(
+            "{}\n…[task summary truncated; re-run task with a narrower prompt if you need more]",
+            &last_text[..cut]
+        )
+    } else {
+        last_text
+    };
+    tools::ToolOutcome::ok(summary)
 }
 
 /// Record a file's pre-edit content the first time this session touches it,
