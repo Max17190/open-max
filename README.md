@@ -2,7 +2,7 @@
 
 **A barebones, high-performance agent harness. Extremely configurable. Full control.**
 
-Open Max is a single Rust binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at any OpenAI-compatible endpoint (cloud or local), or register several named providers and switch between them. No desktop shell, no heavyweight runtime, no telemetry. Just a ~5 MB harness that stays out of the way.
+Open Max is a single Rust binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. No desktop shell, no heavyweight runtime, no telemetry. Just a ~5 MB harness that stays out of the way.
 
 You own the endpoints, the tools, the skills, and the context.
 
@@ -11,7 +11,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **Barebones by default.** A small fixed tool set (file/shell tools plus a read-only `task` for context isolation), a short system prompt, and context budgeting that drops old tool output before it drops your task. With nothing installed beyond built-ins, the prompt stays minimal.
 - **Extremely configurable.** External tools, skills, and project instructions live in local files. Shape the harness without forking it. Every extension's token cost is visible in `/context`.
 - **Full control.** Settings, sessions, and secrets stay on your machine. Network traffic goes only to the model endpoint you configure (plus optional Hugging Face downloads when you ask). No silent upload, no telemetry.
-- **Any OpenAI-compatible backend.** One flat `base_url`, or a multi-provider catalog in `providers.json` (Ollama, LM Studio, vLLM, llama.cpp, OpenRouter-style gateways, corporate proxies). Optional managed [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
+- **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch with `/provider` (Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, or a private proxy). Optional managed [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 - **Visible by default.** Reads, greps, diffs, and shell commands stream as they happen. Writes and `bash` wait for approval unless you say otherwise.
 - **A real session.** Fullscreen TUI: pinned header, conversation above the composer, wheel scrolling. Quit and your shell is exactly as you left it.
 
@@ -51,9 +51,9 @@ openmax
 }
 ```
 
-Set `base_url` and `model` to match your server. Any OpenAI-compatible `/v1/chat/completions` endpoint works. You can also set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+Set `base_url` and `model` to match your model server (`/v1/chat/completions`). You can also set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
 
-**Multiple providers.** Register named endpoints in `~/.openmax/providers.json` and select one with `"provider"` in settings, `--provider`, or `/provider`:
+**Several servers.** Name endpoints in `~/.openmax/providers.json`, then pick one with `"provider"` in settings, `--provider`, or `/provider`:
 
 ```json
 {
@@ -158,7 +158,7 @@ Cancelling a turn hands any queued messages back to the composer, so nothing typ
 | `/help` | Show keybindings and commands |
 | `/models` | Download, serve, and manage local MLX models (Apple Silicon) |
 | `/model <id>` | Set the active model id |
-| `/provider [name]` | List named providers, or select one from `providers.json` |
+| `/provider [name]` | List saved servers, or switch to one from `providers.json` |
 | `/approvals auto\|ask\|readonly` | Control mutating tool gates |
 | `/new` | Start a fresh session |
 | `/resume` | Pick an earlier session in this project |
@@ -278,7 +278,7 @@ Design choices worth knowing:
 - **Safety by default.** Tools are sandboxed to the project root. `write_file`, `edit_file`, and `bash` require approval in the default `ask` mode; `readonly` blocks mutating tools entirely.
 - **Context budgeting, not magic.** Old tool outputs are truncated first, then the oldest exchanges are dropped, leaving a digest of tools used, files touched, and earlier goals. The system prompt and your original request survive. Each exchange drop is also appended to `~/.openmax/sessions/<id>.compaction.jsonl` for recoverability.
 - **Edits that land.** `edit_file` matches exactly first, then retries with whitespace-normalized matching (re-indented to the file), and on a miss points the model at the closest line. Consecutive read-only tool calls run concurrently; Esc kills in-flight commands, not just the stream.
-- **Local serve stays decoupled.** The harness talks to any OpenAI-compatible HTTP API. The MLX sidecar is optional convenience on Apple Silicon, not the identity of the product.
+- **Local serve stays decoupled.** The harness talks to your model server over HTTP. The MLX sidecar is optional convenience on Apple Silicon, not the identity of the product.
 
 State lives in `~/.openmax/` (settings, sessions, optional MLX venv, server metadata).
 
