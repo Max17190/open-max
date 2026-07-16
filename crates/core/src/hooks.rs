@@ -81,24 +81,28 @@ pub fn invalidate_hooks_cache() {
     }
 }
 
+/// Hash the contents of every hook definition (`.toml`) file, in sorted path
+/// order. Hook files gate tool execution, so the cache key must reflect what
+/// the files say, not filesystem metadata: a same-length rewrite inside one
+/// timestamp tick would leave an mtime+len key unchanged and keep an obsolete
+/// policy live. Hook dirs hold a handful of small files; reading them per
+/// discovery is cheap.
 fn hooks_fingerprint(project_root: &Path) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     for dir in hook_dirs(project_root) {
         dir.hash(&mut h);
-        if let Ok(meta) = std::fs::metadata(&dir) {
-            meta.modified().ok().hash(&mut h);
-        }
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                path.hash(&mut h);
-                if let Ok(m) = entry.metadata() {
-                    m.modified().ok().hash(&mut h);
-                    m.len().hash(&mut h);
-                }
-            }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect();
+        files.sort();
+        for path in files {
+            path.hash(&mut h);
+            std::fs::read(&path).ok().hash(&mut h);
         }
     }
     h.finish()
@@ -421,6 +425,33 @@ mod tests {
         let tmp = tempfile_dir();
         let hooks = Hooks::discover(&tmp);
         assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn discover_detects_same_length_same_mtime_edit() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let body_a = "event = \"pre_tool_use\"\ncommand = \"/bin/aaaa\"\n";
+        let body_b = "event = \"pre_tool_use\"\ncommand = \"/bin/bbbb\"\n";
+        assert_eq!(body_a.len(), body_b.len());
+        write_hook_toml(&hooks_dir, "gate.toml", body_a);
+        let hooks = Hooks::discover(&tmp);
+        assert_eq!(hooks.pre.len(), 1);
+        assert_eq!(hooks.pre[0].command, "/bin/aaaa");
+
+        // Same byte length, pinned mtime: a metadata fingerprint would keep
+        // the obsolete policy live.
+        let path = hooks_dir.join("gate.toml");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_hook_toml(&hooks_dir, "gate.toml", body_b);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(mtime).unwrap();
+        drop(f);
+
+        let hooks = Hooks::discover(&tmp);
+        assert_eq!(hooks.pre.len(), 1);
+        assert_eq!(hooks.pre[0].command, "/bin/bbbb");
     }
 
     #[test]

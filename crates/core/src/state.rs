@@ -25,6 +25,10 @@ pub struct SessionData {
     /// File content captured on first touch by a mutating tool, so the UI can
     /// show a cumulative diff per file at any point in the session.
     pub snapshots: HashMap<String, String>,
+    /// Process-unique id of the turn that last took `messages`; a restore is
+    /// only valid while this still matches the taker (guards against a newer
+    /// turn or a recreated session reusing the id).
+    pub take_seq: u64,
 }
 
 /// Progress of a model download managed by `hf.rs`.

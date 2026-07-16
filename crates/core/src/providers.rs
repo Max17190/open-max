@@ -115,12 +115,10 @@ pub fn providers_path(data_dir: &Path) -> PathBuf {
 }
 
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
-
 struct ProvidersCache {
     data_dir: PathBuf,
     /// None when the file was missing or unreadable at last load.
-    mtime: Option<SystemTime>,
+    content_hash: Option<u64>,
     map: BTreeMap<String, ProviderConfig>,
 }
 
@@ -131,14 +129,17 @@ pub fn invalidate_providers_cache() {
     if let Some(lock) = PROVIDERS_CACHE.get() {
         if let Ok(mut cache) = lock.lock() {
             cache.data_dir.clear();
-            cache.mtime = None;
+            cache.content_hash = None;
             cache.map.clear();
         }
     }
 }
 
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+fn content_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
@@ -180,27 +181,29 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
 }
 
 /// Load named providers; empty map if missing or invalid.
-/// Cached by data_dir + file mtime so multi-turn sessions do not re-parse disk.
+/// Cached by data_dir + content hash so multi-turn sessions do not re-parse
+/// disk. Keying on content (not mtime) means edits within one filesystem
+/// timestamp tick still invalidate: endpoints and credentials must never be
+/// served stale. The read happens under the cache mutex so a slow reader
+/// holding older bytes can never publish over a newer snapshot.
 pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
     let path = providers_path(data_dir);
-    let mtime = file_mtime(&path);
     let lock = PROVIDERS_CACHE.get_or_init(|| {
         Mutex::new(ProvidersCache {
             data_dir: PathBuf::new(),
-            mtime: None,
+            content_hash: None,
             map: BTreeMap::new(),
         })
     });
     let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.data_dir == data_dir && cache.mtime == mtime {
+    let text = std::fs::read_to_string(&path).ok();
+    let hash = text.as_deref().map(content_hash);
+    if cache.data_dir == data_dir && cache.content_hash == hash {
         return cache.map.clone();
     }
-    let map = match std::fs::read_to_string(&path) {
-        Ok(text) => parse_providers_file(&text),
-        Err(_) => BTreeMap::new(),
-    };
+    let map = text.map(|t| parse_providers_file(&t)).unwrap_or_default();
     cache.data_dir = data_dir.to_path_buf();
-    cache.mtime = mtime;
+    cache.content_hash = hash;
     cache.map = map.clone();
     map
 }
@@ -425,6 +428,35 @@ mod tests {
         invalidate_providers_cache();
         let c = load_providers(&dir);
         assert!(c.contains_key("x"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_providers_detects_same_length_same_mtime_edit() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(
+            &dir,
+            r#"{"providers":{"aa":{"base_url":"http://a/v1","models":[{"id":"m"}]}}}"#,
+        );
+        invalidate_providers_cache();
+        let path = providers_path(&dir);
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let a = load_providers(&dir);
+        assert!(a.contains_key("aa"));
+
+        // Same byte length, pinned mtime: only the bytes differ. An
+        // mtime-keyed cache would keep serving the old endpoint map.
+        write_providers(
+            &dir,
+            r#"{"providers":{"bb":{"base_url":"http://b/v1","models":[{"id":"m"}]}}}"#,
+        );
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(mtime).unwrap();
+        drop(f);
+
+        let b = load_providers(&dir);
+        assert!(b.contains_key("bb"), "same-tick edit must invalidate the cache");
+        assert!(!b.contains_key("aa"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

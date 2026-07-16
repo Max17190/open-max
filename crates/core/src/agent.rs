@@ -228,6 +228,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             prompt_breakdown,
             persisted_count,
             snapshots: Default::default(),
+            take_seq: 0,
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -247,6 +248,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             prompt_breakdown: Arc::new(breakdown),
             persisted_count: 0,
             snapshots: Default::default(),
+            take_seq: 0,
         }
     }
 }
@@ -552,14 +554,14 @@ async fn run_loop(
 ) {
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
-    let (messages, registry) = {
+    let (messages, registry, take_seq) = {
         {
             let mut sessions_map = core.sessions.lock().await;
             if let Some(data) = sessions_map.get_mut(session_id) {
                 data.messages.push(ChatMessage::user(user_text));
-                let messages = std::mem::take(&mut data.messages);
+                let (messages, seq) = take_messages(data);
                 let registry = data.registry.clone();
-                (messages, registry)
+                (messages, registry, seq)
             } else {
                 drop(sessions_map);
                 let core_clone = core.clone();
@@ -573,13 +575,13 @@ async fn run_loop(
                 let mut sessions_map = core.sessions.lock().await;
                 let data = sessions_map.entry(session_id.to_string()).or_insert(built);
                 data.messages.push(ChatMessage::user(user_text));
-                let messages = std::mem::take(&mut data.messages);
+                let (messages, seq) = take_messages(data);
                 let registry = data.registry.clone();
-                (messages, registry)
+                (messages, registry, seq)
             }
         }
     };
-    let mut guard = MessageGuard::new(core.clone(), session_id, messages);
+    let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
@@ -1312,24 +1314,54 @@ async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessa
     }
 }
 
+/// Process-unique ids for transcript takes. Starts at 1 so a freshly built
+/// `SessionData` (`take_seq: 0`) can never match a live guard.
+static TAKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Take the transcript for a turn and stamp the session with a fresh take id.
+/// The paired [`MessageGuard`] may only write back while the stamp matches.
+fn take_messages(data: &mut SessionData) -> (Vec<ChatMessage>, u64) {
+    let seq = TAKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    data.take_seq = seq;
+    (std::mem::take(&mut data.messages), seq)
+}
+
 /// Holds the turn-local transcript and restores it to SessionData on drop so a
 /// panic or early exit cannot leave the session empty after `mem::take`.
 ///
-/// Normal exits call [`MessageGuard::commit`] (async lock). `Drop` only
-/// `try_lock`s: `blocking_lock` panics inside a Tokio async context, and a
-/// failed try during unwind still leaves mid-turn disk saves intact.
+/// Normal exits call [`MessageGuard::commit`] (async lock). `Drop` first
+/// `try_lock`s (`blocking_lock` panics inside a Tokio async context); if the
+/// lock is contended the restore is handed to a spawned task. Every write-back
+/// requires the session's `take_seq` to still equal this guard's — a newer
+/// turn or a recreated session re-stamps it, which turns a late restore into
+/// a no-op instead of installing stale context.
 struct MessageGuard {
     core: Arc<Core>,
     session_id: String,
     messages: Option<Vec<ChatMessage>>,
+    take_seq: u64,
+}
+
+fn restore_if_current(
+    map: &mut std::collections::HashMap<String, SessionData>,
+    session_id: &str,
+    take_seq: u64,
+    messages: Vec<ChatMessage>,
+) {
+    if let Some(data) = map.get_mut(session_id) {
+        if data.take_seq == take_seq && data.messages.is_empty() {
+            data.messages = messages;
+        }
+    }
 }
 
 impl MessageGuard {
-    fn new(core: Arc<Core>, session_id: &str, messages: Vec<ChatMessage>) -> Self {
+    fn new(core: Arc<Core>, session_id: &str, messages: Vec<ChatMessage>, take_seq: u64) -> Self {
         Self {
             core,
             session_id: session_id.to_string(),
             messages: Some(messages),
+            take_seq,
         }
     }
 
@@ -1342,23 +1374,36 @@ impl MessageGuard {
     async fn commit(mut self) {
         if let Some(messages) = self.messages.take() {
             let mut map = self.core.sessions.lock().await;
-            if let Some(data) = map.get_mut(&self.session_id) {
-                data.messages = messages;
-            }
+            restore_if_current(&mut map, &self.session_id, self.take_seq, messages);
         }
     }
 }
 
 impl Drop for MessageGuard {
     fn drop(&mut self) {
-        if let Some(messages) = self.messages.take() {
-            if let Ok(mut map) = self.core.sessions.try_lock() {
-                if let Some(data) = map.get_mut(&self.session_id) {
-                    data.messages = messages;
-                }
+        let Some(messages) = self.messages.take() else {
+            return;
+        };
+        match self.core.sessions.try_lock() {
+            Ok(mut map) => {
+                restore_if_current(&mut map, &self.session_id, self.take_seq, messages);
             }
-            // If the lock is held, prefer not to deadlock/panic on Drop.
-            // Disk already has the latest `save_messages` writes for this turn.
+            Err(_) => {
+                // Lock contended mid-unwind. Discarding here would leave the
+                // session entry present-but-empty for the process lifetime
+                // (it never rehydrates from disk once the entry exists), so
+                // hand the restore to the runtime instead.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let core = self.core.clone();
+                    let session_id = std::mem::take(&mut self.session_id);
+                    let take_seq = self.take_seq;
+                    handle.spawn(async move {
+                        let mut map = core.sessions.lock().await;
+                        restore_if_current(&mut map, &session_id, take_seq, messages);
+                    });
+                }
+                // No runtime means process teardown; disk saves bound the loss.
+            }
         }
     }
 }
@@ -1793,6 +1838,100 @@ mod tests {
         assert!(!segments[0].concurrent);
         assert!(!segments[1].concurrent);
         assert!(!segments[2].concurrent);
+    }
+
+    #[tokio::test]
+    async fn message_guard_restores_after_contended_drop() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "guard-contended";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let data = build_session_data(&core, id, &project);
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        // Mirror a turn: take the transcript, then drop the guard while
+        // another task holds the sessions lock (abort/unwind under contention).
+        let (taken, seq) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            data.messages.push(ChatMessage::user("hello"));
+            take_messages(data)
+        };
+        let expected = taken.len();
+        assert!(expected > 0);
+        let guard = MessageGuard::new(core.clone(), id, taken, seq);
+
+        let held = core.sessions.lock().await;
+        drop(guard);
+        drop(held);
+
+        // The restore is handed to a spawned task; give it time to run.
+        let mut restored = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let map = core.sessions.lock().await;
+            restored = map.get(id).unwrap().messages.len();
+            if restored == expected {
+                break;
+            }
+        }
+        assert_eq!(restored, expected, "contended drop must not lose the transcript");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn message_guard_skips_restore_after_newer_take() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "guard-stale";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let data = build_session_data(&core, id, &project);
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        let (taken_a, seq_a) = {
+            let mut map = core.sessions.lock().await;
+            take_messages(map.get_mut(id).unwrap())
+        };
+        assert!(!taken_a.is_empty());
+        let guard_a = MessageGuard::new(core.clone(), id, taken_a, seq_a);
+
+        // A newer turn takes the (empty) slot before guard A unwinds; guard
+        // A's restore must now be a no-op, or turn B would run against stale
+        // context that B's commit then silently drops.
+        let (taken_b, seq_b) = {
+            let mut map = core.sessions.lock().await;
+            take_messages(map.get_mut(id).unwrap())
+        };
+        drop(guard_a);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        {
+            let map = core.sessions.lock().await;
+            assert!(
+                map.get(id).unwrap().messages.is_empty(),
+                "stale guard must not fill a slot owned by a newer take"
+            );
+        }
+
+        // Turn B commits with its own (current) take id as usual.
+        let mut guard_b = MessageGuard::new(core.clone(), id, taken_b, seq_b);
+        guard_b.messages().push(ChatMessage::user("from b"));
+        guard_b.commit().await;
+        let map = core.sessions.lock().await;
+        assert_eq!(map.get(id).unwrap().messages.len(), 1);
+        drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
