@@ -784,23 +784,22 @@ async fn run_loop(
                         ApprovalOutcome::Approved => {
                             executed = true;
                             if name == tools::TASK_TOOL {
-                                (
-                                    run_task_subagent(
-                                        core,
-                                        session_id,
-                                        &call.id,
-                                        project_root,
-                                        &registry,
-                                        &args,
-                                        &settings,
-                                        caps,
-                                        cancelled.clone(),
-                                        &hooks,
-                                        &permissions,
-                                    )
-                                    .await,
-                                    false,
+                                let outcome = run_task_subagent(
+                                    core,
+                                    session_id,
+                                    &call.id,
+                                    project_root,
+                                    &registry,
+                                    &args,
+                                    &settings,
+                                    caps,
+                                    cancelled.clone(),
+                                    &hooks,
+                                    &permissions,
                                 )
+                                .await;
+                                // Nested Ask cancel must stop the parent turn too.
+                                (outcome, cancelled.is_cancelled())
                             } else {
                                 (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
                             }
@@ -823,23 +822,22 @@ async fn run_loop(
                     }
                 } else if name == tools::TASK_TOOL {
                     executed = true;
-                    (
-                        run_task_subagent(
-                            core,
-                            session_id,
-                            &call.id,
-                            project_root,
-                            &registry,
-                            &args,
-                            &settings,
-                            caps,
-                            cancelled.clone(),
-                            &hooks,
-                            &permissions,
-                        )
-                        .await,
-                        false,
+                    let outcome = run_task_subagent(
+                        core,
+                        session_id,
+                        &call.id,
+                        project_root,
+                        &registry,
+                        &args,
+                        &settings,
+                        caps,
+                        cancelled.clone(),
+                        &hooks,
+                        &permissions,
                     )
+                    .await;
+                    // Nested Ask cancel (or Esc during child tools) stops the parent turn.
+                    (outcome, cancelled.is_cancelled())
                 } else {
                     executed = true;
                     (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
