@@ -10,6 +10,7 @@ use crate::client::{ChatClient, StreamDelta};
 use crate::config::Settings;
 use crate::fallback;
 use crate::hooks::{Hooks, PreToolResult};
+use crate::permissions::{PermissionDecision, Permissions};
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
 use crate::registry::Registry;
 use crate::sessions;
@@ -227,6 +228,7 @@ struct ReadonlyBatchCtx<'a> {
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
     hooks: &'a Hooks,
+    permissions: &'a Permissions,
 }
 
 async fn execute_readonly_batch(
@@ -249,17 +251,29 @@ async fn execute_readonly_batch(
             name: name.into(),
             args: args.clone(),
         });
+        // hooks pre → permissions → (readonly tools skip approval_mode)
         let block = match ctx
             .hooks
             .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
             .await
         {
-            PreToolResult::Allow => None,
             PreToolResult::Block { reason } => Some(tools::ToolOutcome {
                 ok: false,
                 output: reason,
                 diff: None,
             }),
+            PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
+                PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
+                    ok: false,
+                    output: reason,
+                    diff: None,
+                }),
+                // Allow/Ask/Default: readonly batch tools are non-mutating, so
+                // approval_mode does not apply; execute after pre gates.
+                PermissionDecision::Allow
+                | PermissionDecision::Ask
+                | PermissionDecision::Default => None,
+            },
         };
         blocked.push(block);
     }
@@ -540,9 +554,10 @@ async fn run_loop(
     let schemas = registry.tool_schemas_json();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
-    // Discover once per turn start; empty dir is a cheap no-op. Hooks never
-    // enter the prompt, so reloading on the next user turn is fine.
+    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
+    // and permissions never enter the prompt, so reloading next turn is fine.
     let hooks = Hooks::discover(project_root);
+    let permissions = Permissions::discover(project_root);
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
@@ -637,6 +652,7 @@ async fn run_loop(
                     caps,
                     cancelled: cancelled.clone(),
                     hooks: &hooks,
+                    permissions: &permissions,
                 };
                 execute_readonly_batch(
                     &batch_ctx,
@@ -687,7 +703,8 @@ async fn run_loop(
                     args: args.clone(),
                 });
 
-                // Hooks run before approval so a deny never prompts the user.
+                // Order: hooks pre → permissions → approval_mode → execute.
+                // Denies never prompt the user.
                 if let PreToolResult::Block { reason } = hooks
                     .pre_tool_use(session_id, name, &args, project_root, &cancelled)
                     .await
@@ -708,6 +725,24 @@ async fn run_loop(
                     continue;
                 }
 
+                let perm = permissions.evaluate(name, &args);
+                if let PermissionDecision::Deny { reason } = &perm {
+                    core.send_agent(session_id, AgentEvent::ToolEnd {
+                        call_id: call.id.clone(),
+                        ok: false,
+                        output: reason.clone(),
+                    });
+                    guard.messages().push(ChatMessage::tool(
+                        call.id.clone(),
+                        tool_message_content(&tools::ToolOutcome {
+                            ok: false,
+                            output: reason.clone(),
+                            diff: None,
+                        }),
+                    ));
+                    continue;
+                }
+
                 if registry.is_mutating(name) {
                     snapshot_file(core, session_id, project_root, &args).await;
                 }
@@ -715,6 +750,10 @@ async fn run_loop(
                 // Read live so "[a]lways" during an approval prompt takes effect
                 // for the rest of this turn, not just the next one.
                 let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
+                // Allow skips the approval prompt; Ask forces it (even in auto).
+                // Readonly still blocks mutating tools regardless of Allow.
+                let force_allow = matches!(perm, PermissionDecision::Allow);
+                let force_ask = matches!(perm, PermissionDecision::Ask);
                 let mut executed = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == "readonly" {
                     (tools::ToolOutcome {
@@ -722,11 +761,33 @@ async fn run_loop(
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None,
                     }, false)
-                } else if registry.is_mutating(name) && approval_mode == "ask" {
+                } else if !force_allow
+                    && (force_ask || (registry.is_mutating(name) && approval_mode == "ask"))
+                {
                     match request_approval(core, session_id, name, &args, &cancelled).await {
                         ApprovalOutcome::Approved => {
                             executed = true;
-                            (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                            if name == tools::TASK_TOOL {
+                                (
+                                    run_task_subagent(
+                                        core,
+                                        session_id,
+                                        &call.id,
+                                        project_root,
+                                        &registry,
+                                        &args,
+                                        &settings,
+                                        caps,
+                                        cancelled.clone(),
+                                        &hooks,
+                                        &permissions,
+                                    )
+                                    .await,
+                                    false,
+                                )
+                            } else {
+                                (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                            }
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
@@ -758,6 +819,7 @@ async fn run_loop(
                             caps,
                             cancelled.clone(),
                             &hooks,
+                            &permissions,
                         )
                         .await,
                         false,
@@ -826,8 +888,8 @@ async fn run_loop(
 
 /// Run a read-only `task` child agent. The parent context receives only the
 /// final summary (via ToolEnd); child tool churn stays out of the parent window.
-/// Child tool calls go through the same lifecycle hooks as the parent loop so
-/// project policy cannot be bypassed via delegation.
+/// Child tool calls go through the same lifecycle hooks and permission rules as
+/// the parent loop so project policy cannot be bypassed via delegation.
 async fn run_task_subagent(
     core: &Arc<Core>,
     parent_session_id: &str,
@@ -839,6 +901,7 @@ async fn run_task_subagent(
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
     hooks: &Hooks,
+    permissions: &Permissions,
 ) -> tools::ToolOutcome {
     let kind = args["subagent"].as_str().unwrap_or("explore");
     let prompt = args["prompt"].as_str().unwrap_or("").trim();
@@ -962,12 +1025,23 @@ async fn run_task_subagent(
                     continue;
                 }
             };
-            // Same pre/post hooks as the outer loop: lifecycle gates apply to
+            // Same pre hooks + permissions as the outer loop: policy applies to
             // delegated tools, not only direct parent calls.
             if let PreToolResult::Block { reason } = hooks
                 .pre_tool_use(parent_session_id, name, &call_args, project_root, &cancelled)
                 .await
             {
+                messages.push(ChatMessage::tool(
+                    call.id.clone(),
+                    tool_message_content(&tools::ToolOutcome {
+                        ok: false,
+                        output: reason,
+                        diff: None,
+                    }),
+                ));
+                continue;
+            }
+            if let PermissionDecision::Deny { reason } = permissions.evaluate(name, &call_args) {
                 messages.push(ChatMessage::tool(
                     call.id.clone(),
                     tool_message_content(&tools::ToolOutcome {
