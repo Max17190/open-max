@@ -8,8 +8,6 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::tools;
-
 /// Result of evaluating permission rules against a tool call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -214,7 +212,6 @@ fn arg_haystack(tool: &str, args: &Value) -> String {
             args["path"].as_str().unwrap_or("").to_string()
         }
         "glob" | "grep" => args["pattern"].as_str().unwrap_or("").to_string(),
-        "task" => tools::summarize_call("task", args),
         _ => serde_json::to_string(args).unwrap_or_default(),
     }
 }

@@ -66,19 +66,14 @@ impl ToolOutcome {
 }
 
 /// True for tools that can change state and therefore go through approval.
-/// `task` is read-only (it spawns a read-only subagent), so it never gates.
 pub fn is_mutating(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "bash")
 }
 
-/// The meta-tool that spawns a read-only subagent. It is a built-in for schema
-/// purposes but is dispatched by the agent loop, never by `execute` below.
-pub const TASK_TOOL: &str = "task";
-
-/// Every tool name exposed by the harness. `task` comes last so the frozen
-/// schema array and `TOOL_NAMES` stay in the same order the registry builds.
+/// Every built-in tool name. Order matches `tool_schemas()` so the frozen
+/// schema array and registry stay in lockstep.
 pub const TOOL_NAMES: &[&str] =
-    &["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash", TASK_TOOL];
+    &["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"];
 
 pub fn tool_names() -> Vec<String> {
     TOOL_NAMES.iter().map(|s| s.to_string()).collect()
@@ -92,11 +87,6 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
             args["path"].as_str().unwrap_or("?").to_string()
         }
         "glob" | "grep" => args["pattern"].as_str().unwrap_or("?").to_string(),
-        "task" => {
-            let kind = args["subagent"].as_str().unwrap_or("explore");
-            let prompt = args["prompt"].as_str().unwrap_or("?");
-            format!("{kind}: {prompt}")
-        }
         _ => String::new(),
     }
 }
@@ -213,25 +203,6 @@ pub fn tool_schemas() -> &'static Value {
                     "required": ["command"]
                 }
             }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "task",
-                "description": "Delegate a read-only investigation to a subagent with its own context; it returns only a summary. Cannot edit or run commands. Use for broad questions like \"where is X handled\".",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "subagent": {
-                            "type": "string",
-                            "enum": ["explore", "search", "plan"],
-                            "description": "explore=investigate; search=locate code; plan=step-by-step plan"
-                        },
-                        "prompt": { "type": "string", "description": "What to find and what to report back" }
-                    },
-                    "required": ["subagent", "prompt"]
-                }
-            }
         }
     ])
     })
@@ -278,11 +249,6 @@ pub async fn execute(
     caps: OutputCaps,
     cancel: Arc<CancelToken>,
 ) -> ToolOutcome {
-    if name == TASK_TOOL {
-        // The subagent meta-tool is intercepted in the agent loop; it must never
-        // reach plain tool execution (and never appears in a subagent registry).
-        return ToolOutcome::err("task is dispatched by the agent loop, not executable here");
-    }
     if name == "bash" {
         return bash_tool(root, args, caps, cancel).await;
     }

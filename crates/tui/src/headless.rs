@@ -218,12 +218,6 @@ async fn run_turn_events(
                 }
                 return exit_code;
             }
-            AgentEvent::SubagentProgress { kind, tool, step, .. } => {
-                if !json {
-                    let _ = writeln!(stderr, "  · task/{kind} step {step}: {tool}");
-                    let _ = stderr.flush();
-                }
-            }
             AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }
             | AgentEvent::Usage { .. }
