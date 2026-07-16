@@ -184,11 +184,10 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
 /// Cached by data_dir + content hash so multi-turn sessions do not re-parse
 /// disk. Keying on content (not mtime) means edits within one filesystem
 /// timestamp tick still invalidate: endpoints and credentials must never be
-/// served stale.
+/// served stale. The read happens under the cache mutex so a slow reader
+/// holding older bytes can never publish over a newer snapshot.
 pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
     let path = providers_path(data_dir);
-    let text = std::fs::read_to_string(&path).ok();
-    let hash = text.as_deref().map(content_hash);
     let lock = PROVIDERS_CACHE.get_or_init(|| {
         Mutex::new(ProvidersCache {
             data_dir: PathBuf::new(),
@@ -197,6 +196,8 @@ pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
         })
     });
     let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let text = std::fs::read_to_string(&path).ok();
+    let hash = text.as_deref().map(content_hash);
     if cache.data_dir == data_dir && cache.content_hash == hash {
         return cache.map.clone();
     }
