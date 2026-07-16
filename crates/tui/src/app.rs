@@ -2317,11 +2317,8 @@ impl App {
         let end = total - offset;
         let start = end.saturating_sub(visible);
 
-        let sticky = if offset > 0 {
-            self.transcript.sticky_user_line(start)
-        } else {
-            None
-        };
+        // Fingerprint sticky presence without cloning spans; clone only if we rebuild.
+        let has_sticky = offset > 0 && self.transcript.has_sticky_user(start);
         let focus_scroll = self.focus == Focus::Scrollback;
         let selected = self.transcript.selected();
         let hist_view_end = end.min(hist_len);
@@ -2329,7 +2326,7 @@ impl App {
             hist_len,
             start,
             hist_view_end,
-            sticky: sticky.is_some(),
+            sticky: has_sticky,
             focus_scroll,
             selected,
             width: content_w,
@@ -2341,26 +2338,20 @@ impl App {
 
         if rebuild_hist {
             self.chat_buf.clear();
-            if let Some(s) = sticky {
-                let mut spans = vec![Span::styled("┊ ", Style::default().fg(theme::DIM()))];
-                spans.extend(s.spans.iter().cloned());
-                self.chat_buf.push(Line::from(spans));
+            // One clone of sticky spans: take ownership and insert the gutter.
+            if has_sticky {
+                if let Some(mut s) = self.transcript.sticky_user_line(start) {
+                    s.spans
+                        .insert(0, Span::styled("┊ ", Style::default().fg(theme::DIM())));
+                    self.chat_buf.push(s);
+                }
             }
             let budget = visible.saturating_sub(self.chat_buf.len());
-            let mut idx = start;
-            let mut taken = 0usize;
-            while taken < budget && idx < hist_view_end {
-                let selected_line =
-                    focus_scroll && self.transcript.is_selected_block_for_line(idx);
-                let mut line = self.transcript.lines()[idx].clone();
-                if selected_line {
-                    line.spans
-                        .insert(0, Span::styled("▌", Style::default().fg(theme::ACCENT())));
-                }
-                self.chat_buf.push(line);
-                idx += 1;
-                taken += 1;
-            }
+            let view_end = start.saturating_add(budget).min(hist_view_end);
+            let selected_bi = if focus_scroll { selected } else { None };
+            // Single clone per viewport history line (reuse path skips this).
+            self.transcript
+                .fill_viewport(&mut self.chat_buf, start, view_end, selected_bi);
             self.hist_prefix_len = self.chat_buf.len();
             self.hist_reuse_key = Some(reuse_key);
         } else {

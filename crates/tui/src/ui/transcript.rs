@@ -248,6 +248,37 @@ impl Transcript {
         &self.wrapped
     }
 
+    /// Borrow a single wrapped history line without cloning the full buffer.
+    pub fn line_at(&mut self, idx: usize) -> Option<&Line<'static>> {
+        self.ensure_flat();
+        self.wrapped.get(idx)
+    }
+
+    /// Clone history lines `[start, end)` into `out` once each.
+    ///
+    /// When `selected_bi` is `Some`, lines belonging to that block get a
+    /// leading selection marker (same glyph as `draw_chat`).
+    pub fn fill_viewport(
+        &mut self,
+        out: &mut Vec<Line<'static>>,
+        start: usize,
+        end: usize,
+        selected_bi: Option<usize>,
+    ) {
+        self.ensure_flat();
+        let end = end.min(self.wrapped.len());
+        let start = start.min(end);
+        out.reserve(end - start);
+        for idx in start..end {
+            let mut line = self.wrapped[idx].clone();
+            if selected_bi.is_some_and(|bi| self.line_block.get(idx) == Some(&bi)) {
+                line.spans
+                    .insert(0, Span::styled("▌", Style::default().fg(theme::ACCENT())));
+            }
+            out.push(line);
+        }
+    }
+
     pub fn len(&mut self) -> usize {
         self.ensure_flat();
         self.wrapped.len()
@@ -496,22 +527,27 @@ impl Transcript {
             .find_map(|b| b.full_output.as_deref())
     }
 
-    /// First line of the nearest user block above the viewport.
-    pub fn sticky_user_line(&mut self, view_start_line: usize) -> Option<Line<'static>> {
+    /// Index of the nearest user block whose start is above `view_start_line`.
+    fn sticky_user_block_idx(&mut self, view_start_line: usize) -> Option<usize> {
         self.ensure_flat();
         if view_start_line == 0 || self.blocks.is_empty() {
             return None;
         }
         let bi = self.line_block.get(view_start_line).copied().unwrap_or(0);
-        for i in (0..=bi).rev() {
-            if self.blocks[i].kind == BlockKind::User {
-                let start = self.block_starts[i];
-                if start < view_start_line {
-                    return self.blocks[i].source_lines().first().cloned();
-                }
-            }
-        }
-        None
+        (0..=bi).rev().find(|&i| {
+            self.blocks[i].kind == BlockKind::User && self.block_starts[i] < view_start_line
+        })
+    }
+
+    /// Whether a sticky user header should render for this viewport start.
+    pub fn has_sticky_user(&mut self, view_start_line: usize) -> bool {
+        self.sticky_user_block_idx(view_start_line).is_some()
+    }
+
+    /// First line of the nearest user block above the viewport.
+    pub fn sticky_user_line(&mut self, view_start_line: usize) -> Option<Line<'static>> {
+        let i = self.sticky_user_block_idx(view_start_line)?;
+        self.blocks[i].source_lines().first().cloned()
     }
 
     pub fn is_selected_block_for_line(&self, line_idx: usize) -> bool {
@@ -1014,5 +1050,96 @@ mod tests {
         oracle.set_width(W);
 
         assert_eq!(text(incremental.lines()), text(oracle.lines()));
+    }
+
+    #[test]
+    fn sticky_user_line_stable_after_many_appends() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        for i in 0..25 {
+            t.push_user(vec![Line::from(format!("user turn {i}"))]);
+            t.push_assistant(vec![Line::from(format!("assistant reply {i}"))]);
+        }
+        let total = t.len();
+        assert!(total > 10);
+        // Viewport starts past the first few blocks.
+        let view_start = total / 3;
+        assert!(t.has_sticky_user(view_start));
+        let sticky = t.sticky_user_line(view_start).expect("sticky above mid viewport");
+        let plain: String = sticky
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            plain.starts_with("user turn "),
+            "sticky should be a user line, got {plain:?}"
+        );
+
+        // More appends (with scroll offset so history stays put) must not break maps.
+        t.scroll_up(4);
+        for i in 25..40 {
+            t.push_user(vec![Line::from(format!("user turn {i}"))]);
+            t.push_assistant(vec![Line::from(format!("assistant reply {i}"))]);
+        }
+        assert!(t.has_sticky_user(view_start));
+        let sticky2 = t.sticky_user_line(view_start).expect("sticky after appends");
+        assert_eq!(text(&[sticky]), text(&[sticky2]));
+        // Absolute line maps for earlier history stay valid after appends.
+        let bi_at = t.line_block[view_start];
+        assert!(bi_at < t.block_count());
+        assert!(t.line_at(view_start).is_some());
+        let n = t.len();
+        assert!(t.line_at(n).is_none());
+    }
+
+    #[test]
+    fn selection_index_stable_after_many_appends() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("select me")]);
+        t.push_assistant(vec![Line::from("first answer")]);
+        t.selected = Some(0);
+        assert_eq!(t.selected(), Some(0));
+        assert!(t.is_selected_block_for_line(0));
+
+        for i in 0..30 {
+            t.push_user(vec![Line::from(format!("u{i}"))]);
+            t.push_assistant(vec![Line::from(format!("a{i}"))]);
+        }
+        assert_eq!(t.selected(), Some(0));
+        assert!(t.is_selected_block_for_line(0));
+        // Last history line belongs to a later block.
+        let last = t.len() - 1;
+        assert!(!t.is_selected_block_for_line(last));
+        assert_eq!(t.line_block[last], t.block_count() - 1);
+    }
+
+    #[test]
+    fn fill_viewport_clones_range_and_marks_selection() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("hello")]);
+        t.push_assistant(vec![Line::from("world")]);
+        let n = t.len();
+        assert!(n >= 2);
+
+        let mut out = Vec::new();
+        t.fill_viewport(&mut out, 0, n, None);
+        assert_eq!(out.len(), n);
+        assert_eq!(text(&out), text(t.lines()));
+
+        t.selected = Some(0);
+        let mut marked = Vec::new();
+        t.fill_viewport(&mut marked, 0, n, Some(0));
+        // User block lines carry the selection bar; assistant lines do not.
+        for (idx, line) in marked.iter().enumerate() {
+            let has_bar = line
+                .spans
+                .first()
+                .is_some_and(|s| s.content.as_ref() == "▌");
+            assert_eq!(has_bar, t.is_selected_block_for_line(idx));
+            assert_eq!(has_bar, t.line_block[idx] == 0);
+        }
     }
 }
