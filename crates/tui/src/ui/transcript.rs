@@ -148,15 +148,18 @@ impl Transcript {
         if lines.is_empty() {
             return;
         }
-        let prev_len = if self.width > 0 {
+        if self.width == 0 {
+            self.blocks.push(Block::new(kind, lines));
+            self.dirty = true;
+            return;
+        }
+        if self.dirty {
             self.ensure_flat();
-            self.wrapped.len()
-        } else {
-            0
-        };
+        }
+        let prev_len = self.wrapped.len();
         self.blocks.push(Block::new(kind, lines));
-        self.dirty = true;
-        self.ensure_flat();
+        let bi = self.blocks.len() - 1;
+        self.append_block_flat(bi);
         if self.offset > 0 {
             let added = self.wrapped.len().saturating_sub(prev_len);
             self.offset = self.offset.saturating_add(added);
@@ -172,15 +175,18 @@ impl Transcript {
     }
 
     pub fn push_tool(&mut self, compact: Vec<Line<'static>>, full_output: String) {
-        let prev_len = if self.width > 0 {
+        if self.width == 0 {
+            self.blocks.push(Block::tool(compact, full_output));
+            self.dirty = true;
+            return;
+        }
+        if self.dirty {
             self.ensure_flat();
-            self.wrapped.len()
-        } else {
-            0
-        };
+        }
+        let prev_len = self.wrapped.len();
         self.blocks.push(Block::tool(compact, full_output));
-        self.dirty = true;
-        self.ensure_flat();
+        let bi = self.blocks.len() - 1;
+        self.append_block_flat(bi);
         if self.offset > 0 {
             let added = self.wrapped.len().saturating_sub(prev_len);
             self.offset = self.offset.saturating_add(added);
@@ -216,6 +222,19 @@ impl Transcript {
             }
         }
         self.dirty = false;
+    }
+
+    /// Incrementally append one newly pushed block to the flat tables.
+    /// `bi` must be the last block; width is unchanged and tables are current.
+    fn append_block_flat(&mut self, bi: usize) {
+        self.blocks[bi].ensure_cache(self.width);
+        self.block_starts.push(self.wrapped.len());
+        // Clone out of the block cache so we can extend disjoint flat tables.
+        let lines = self.blocks[bi].cache.clone();
+        for line in lines {
+            self.wrapped.push(line);
+            self.line_block.push(bi);
+        }
     }
 
     fn ensure_flat(&mut self) {
@@ -940,5 +959,60 @@ mod tests {
         assert_eq!(t.selected(), Some(1));
         t.select_block(99);
         assert_eq!(t.selected(), Some(1));
+    }
+
+    #[test]
+    fn append_matches_rebuild_oracle() {
+        const W: u16 = 40;
+        let mut incremental = Transcript::new();
+        incremental.set_width(W);
+
+        let kind_pushes: Vec<(BlockKind, Vec<Line<'static>>)> = vec![
+            (BlockKind::User, vec![Line::from("hello from the user side")]),
+            (
+                BlockKind::Assistant,
+                vec![Line::from(
+                    "a longer assistant reply that will wrap at this width",
+                )],
+            ),
+            (BlockKind::System, vec![Line::from("notice")]),
+            (
+                BlockKind::User,
+                vec![Line::from("second question with more words than fit")],
+            ),
+            (BlockKind::Assistant, vec![Line::from("short ok")]),
+        ];
+
+        for (i, (kind, lines)) in kind_pushes.iter().enumerate() {
+            incremental.push_kind(*kind, lines.clone());
+
+            // Oracle: push with width 0 (blocks only), then set_width forces rebuild_flat.
+            let mut oracle = Transcript::new();
+            for (kind, lines) in kind_pushes.iter().take(i + 1) {
+                oracle.push_kind(*kind, lines.clone());
+            }
+            oracle.set_width(W);
+
+            assert_eq!(
+                text(incremental.lines()),
+                text(oracle.lines()),
+                "mismatch after {} kind blocks",
+                i + 1
+            );
+        }
+
+        // Also exercise push_tool against rebuild oracle.
+        let tool_compact = vec![Line::from("✓ tool"), Line::from("  preview line")];
+        let tool_out = "out1\nout2\nout3".to_string();
+        incremental.push_tool(tool_compact.clone(), tool_out.clone());
+
+        let mut oracle = Transcript::new();
+        for (kind, lines) in &kind_pushes {
+            oracle.push_kind(*kind, lines.clone());
+        }
+        oracle.push_tool(tool_compact, tool_out);
+        oracle.set_width(W);
+
+        assert_eq!(text(incremental.lines()), text(oracle.lines()));
     }
 }
