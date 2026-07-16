@@ -1365,15 +1365,26 @@ fn enforce_budget(
         // Digest insert can push total slightly over target; keep dropping
         // exchanges after the digest (index 3) so the next turn stays
         // append-only and does not re-mutate history for another prune.
+        // Record dropped messages into the same digest so the note stays a
+        // faithful summary of everything removed (not only the first pass).
         total = messages.iter().map(|m| m.estimated_tokens()).sum();
+        let mut extra_drops = false;
         while total > target && messages.len() > 6 {
             let removed = messages.remove(3);
+            digest.record_message(&removed);
             total = total.saturating_sub(removed.estimated_tokens());
+            extra_drops = true;
             if removed.role == "assistant" && removed.tool_calls.is_some() {
                 while messages.len() > 3 && messages[3].role == "tool" {
                     let tool = messages.remove(3);
+                    digest.record_message(&tool);
                     total = total.saturating_sub(tool.estimated_tokens());
                 }
+            }
+        }
+        if extra_drops {
+            if messages.len() > 2 && is_digest_message(&messages[2]) {
+                messages[2] = ChatMessage::user(digest.format());
             }
         }
         (true, Some(digest))

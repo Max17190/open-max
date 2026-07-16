@@ -169,19 +169,21 @@ fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
-    // Unix rename replaces; Windows requires the destination absent first.
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(path) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e.to_string());
-            }
-        }
-    }
+    // Unix rename replaces an existing destination. Windows does not: if the
+    // first rename fails and the target exists, remove it and retry once.
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
+            if path.exists() {
+                if let Err(re) = std::fs::remove_file(path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(re.to_string());
+                }
+                return std::fs::rename(&tmp, path).map_err(|e2| {
+                    let _ = std::fs::remove_file(&tmp);
+                    e2.to_string()
+                });
+            }
             let _ = std::fs::remove_file(&tmp);
             Err(e.to_string())
         }
