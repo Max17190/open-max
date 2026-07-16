@@ -492,12 +492,16 @@ async fn run_loop(
     settings: Settings,
     cancelled: Arc<CancelToken>,
 ) {
+    // Take ownership of the in-memory transcript for this turn (no full clone).
+    // Mid-turn saves write disk only; we move the vec back into SessionData at the end.
     let (mut messages, registry) = {
         {
             let mut sessions_map = core.sessions.lock().await;
             if let Some(data) = sessions_map.get_mut(session_id) {
                 data.messages.push(ChatMessage::user(user_text));
-                (data.messages.clone(), data.registry.clone())
+                let messages = std::mem::take(&mut data.messages);
+                let registry = data.registry.clone();
+                (messages, registry)
             } else {
                 drop(sessions_map);
                 let core_clone = core.clone();
@@ -511,7 +515,9 @@ async fn run_loop(
                 let mut sessions_map = core.sessions.lock().await;
                 let data = sessions_map.entry(session_id.to_string()).or_insert(built);
                 data.messages.push(ChatMessage::user(user_text));
-                (data.messages.clone(), data.registry.clone())
+                let messages = std::mem::take(&mut data.messages);
+                let registry = data.registry.clone();
+                (messages, registry)
             }
         }
     };
@@ -809,6 +815,7 @@ async fn run_loop(
     }
 
     save_messages(core, session_id, &messages, false).await;
+    commit_messages(core, session_id, messages).await;
     sessions::touch(core, session_id);
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
 }
@@ -1025,11 +1032,20 @@ async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, 
     }
 }
 
+/// Persist transcript to disk without cloning it back into SessionData.
+/// The turn owns `messages` until `commit_messages` at the end.
 async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) {
     let mut sessions_map = core.sessions.lock().await;
     if let Some(data) = sessions_map.get_mut(session_id) {
-        data.messages = messages.to_vec();
         sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite);
+    }
+}
+
+/// Move the working transcript back into SessionData after the turn finishes.
+async fn commit_messages(core: &Arc<Core>, session_id: &str, messages: Vec<ChatMessage>) {
+    let mut sessions_map = core.sessions.lock().await;
+    if let Some(data) = sessions_map.get_mut(session_id) {
+        data.messages = messages;
     }
 }
 

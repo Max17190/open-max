@@ -59,42 +59,108 @@ pub struct Hooks {
     post: Vec<HookSpec>,
 }
 
+use std::sync::{Mutex, OnceLock};
+
+struct HooksCache {
+    project_root: PathBuf,
+    /// Fingerprint of hook dirs/files; None means uncached.
+    fingerprint: Option<u64>,
+    hooks: Hooks,
+}
+
+static HOOKS_CACHE: OnceLock<Mutex<HooksCache>> = OnceLock::new();
+
+/// Drop cached hooks (tests or after external config install).
+pub fn invalidate_hooks_cache() {
+    if let Some(lock) = HOOKS_CACHE.get() {
+        if let Ok(mut cache) = lock.lock() {
+            cache.project_root.clear();
+            cache.fingerprint = None;
+            cache.hooks = Hooks::default();
+        }
+    }
+}
+
+fn hooks_fingerprint(project_root: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for dir in hook_dirs(project_root) {
+        dir.hash(&mut h);
+        if let Ok(meta) = std::fs::metadata(&dir) {
+            meta.modified().ok().hash(&mut h);
+        }
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                path.hash(&mut h);
+                if let Ok(m) = entry.metadata() {
+                    m.modified().ok().hash(&mut h);
+                    m.len().hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+fn discover_uncached(project_root: &Path) -> Hooks {
+    let mut by_stem: std::collections::BTreeMap<String, HookSpec> = std::collections::BTreeMap::new();
+    for dir in hook_dirs(project_root) {
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if stem.is_empty() {
+                continue;
+            }
+            if let Some(spec) = parse_hook_file(&path) {
+                // First wins: project dirs are listed before global.
+                by_stem.entry(stem).or_insert(spec);
+            }
+        }
+    }
+    let mut hooks = Hooks::default();
+    for spec in by_stem.into_values() {
+        match spec.event {
+            HookEvent::PreToolUse => hooks.pre.push(spec),
+            HookEvent::PostToolUse => hooks.post.push(spec),
+        }
+    }
+    hooks
+}
+
 impl Hooks {
     /// Discover hooks under project `.openmax/hooks/` then global
     /// `~/.openmax/hooks/`. Project entries with the same file stem win.
+    /// Results are cached by project root + directory fingerprint.
     pub fn discover(project_root: &Path) -> Self {
-        let mut by_stem: std::collections::BTreeMap<String, HookSpec> = std::collections::BTreeMap::new();
-        for dir in hook_dirs(project_root) {
-            if !dir.is_dir() {
-                continue;
-            }
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                    continue;
-                }
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if stem.is_empty() {
-                    continue;
-                }
-                if let Some(spec) = parse_hook_file(&path) {
-                    // First wins: project dirs are listed before global.
-                    by_stem.entry(stem).or_insert(spec);
-                }
-            }
+        let fp = hooks_fingerprint(project_root);
+        let lock = HOOKS_CACHE.get_or_init(|| {
+            Mutex::new(HooksCache {
+                project_root: PathBuf::new(),
+                fingerprint: None,
+                hooks: Hooks::default(),
+            })
+        });
+        let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.project_root == project_root && cache.fingerprint == Some(fp) {
+            return cache.hooks.clone();
         }
-        let mut hooks = Hooks::default();
-        for spec in by_stem.into_values() {
-            match spec.event {
-                HookEvent::PreToolUse => hooks.pre.push(spec),
-                HookEvent::PostToolUse => hooks.post.push(spec),
-            }
-        }
+        let hooks = discover_uncached(project_root);
+        cache.project_root = project_root.to_path_buf();
+        cache.fingerprint = Some(fp);
+        cache.hooks = hooks.clone();
         hooks
     }
 

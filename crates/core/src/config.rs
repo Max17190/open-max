@@ -72,5 +72,8 @@ pub fn load(data_dir: &Path) -> Settings {
 
 pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(data_dir), json).map_err(|e| e.to_string())
+    std::fs::write(settings_path(data_dir), json).map_err(|e| e.to_string())?;
+    // Endpoint resolution is cached; force a re-read after settings change.
+    crate::providers::invalidate_providers_cache();
+    Ok(())
 }
