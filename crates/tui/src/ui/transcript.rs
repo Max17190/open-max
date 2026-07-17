@@ -711,9 +711,8 @@ fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
 
 /// Incrementally wraps growing streaming text. Only the current incomplete
 /// line is re-wrapped on each token; completed lines are wrapped once.
-/// Kept for unit tests and a plain-wrap fallback path.
+/// This is the sole interim (pre-markdown) stream wrap path in the TUI.
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct StreamingWrap {
     width: u16,
     text_len: usize,
@@ -723,7 +722,6 @@ pub struct StreamingWrap {
     partial_wrapped: Vec<Line<'static>>,
 }
 
-#[allow(dead_code)]
 impl StreamingWrap {
     pub fn clear(&mut self) {
         *self = Self::default();
@@ -733,6 +731,14 @@ impl StreamingWrap {
         self.complete_wrapped
             .iter()
             .chain(self.partial_wrapped.iter())
+    }
+
+    /// Fill `out` with the current wrapped lines (clones).
+    pub fn copy_into(&self, out: &mut Vec<Line<'static>>) {
+        out.clear();
+        out.reserve(self.complete_wrapped.len() + self.partial_wrapped.len());
+        out.extend(self.complete_wrapped.iter().cloned());
+        out.extend(self.partial_wrapped.iter().cloned());
     }
 
     pub fn update(&mut self, text: &str, width: u16) {
@@ -745,7 +751,9 @@ impl StreamingWrap {
         }
 
         let delta = &text[self.text_len..];
-        if delta.matches('\n').count() > 1 {
+        // Multi-newline deltas are rare mid-token; rewrap once rather than
+        // special-case multi-complete commits.
+        if delta.bytes().filter(|&b| b == b'\n').count() > 1 {
             self.rewrap_all(text, width);
             return;
         }

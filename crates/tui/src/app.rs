@@ -28,7 +28,9 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
-use crate::ui::transcript::{filter_matching_indices, wrap_lines, Term, Transcript};
+use crate::ui::transcript::{
+    filter_matching_indices, wrap_lines, StreamingWrap, Term, Transcript,
+};
 use crate::ui::{context, extensions, markdown, models};
 
 /// Where keyboard focus lives in chat mode.
@@ -170,6 +172,8 @@ pub struct App {
 
     /// Live assistant stream, markdown-rendered and wrapped (matches final block).
     stream_wrapped: Vec<Line<'static>>,
+    /// Incremental plain wrap between markdown ticks (only incomplete line rewraps).
+    stream_plain_wrap: StreamingWrap,
     /// Last full markdown render of `stream_text` (throttle re-highlight work).
     stream_md_at: Instant,
     stream_md_len: usize,
@@ -249,6 +253,7 @@ pub async fn run(
         should_quit: false,
         dirty: Dirty::all(),
         stream_wrapped: Vec::new(),
+        stream_plain_wrap: StreamingWrap::default(),
         stream_md_at: Instant::now(),
         stream_md_len: 0,
         thinking_wrapped: Vec::new(),
@@ -364,10 +369,15 @@ pub async fn run(
 /// atomically — no half-painted frames under tmux or slow connections.
 fn draw_frame(terminal: &mut Term, app: &mut App) -> std::io::Result<()> {
     use std::io::Write;
+    let t0 = Instant::now();
     crossterm::queue!(terminal.backend_mut(), crossterm::terminal::BeginSynchronizedUpdate)?;
     terminal.draw(|f| app.draw(f))?;
     crossterm::queue!(terminal.backend_mut(), crossterm::terminal::EndSynchronizedUpdate)?;
     terminal.backend_mut().flush()?;
+    if std::env::var_os("OPENMAX_PERF").is_some() {
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("openmax_perf draw_frame_ms={ms:.3}");
+    }
     Ok(())
 }
 
@@ -492,6 +502,7 @@ impl App {
         self.queued.clear();
         self.flush_queue = false;
         self.stream_wrapped.clear();
+        self.stream_plain_wrap.clear();
         self.stream_md_len = 0;
         self.thinking_wrapped.clear();
         self.thinking_source.clear();
@@ -1319,6 +1330,7 @@ impl App {
                 self.stream_chars = 0;
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
+                self.stream_plain_wrap.clear();
                 self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 self.thinking_chars = 0;
@@ -1792,6 +1804,7 @@ impl App {
                 }
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
+                self.stream_plain_wrap.clear();
                 self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 self.thinking_tail.clear();
@@ -2417,6 +2430,7 @@ impl App {
         if self.stream_text.is_empty() {
             if self.tail_stream_len != 0 || !self.stream_wrapped.is_empty() {
                 self.stream_wrapped.clear();
+                self.stream_plain_wrap.clear();
                 self.stream_md_len = 0;
                 self.tail_stream_len = 0;
                 stream_changed = true;
@@ -2436,14 +2450,13 @@ impl App {
                 self.stream_wrapped = wrap_lines(&md, width);
                 self.stream_md_at = Instant::now();
                 self.stream_md_len = self.stream_text.len();
+                // Keep plain wrap state aligned so the next interim tokens
+                // continue incrementally from this length (not a full rewrap).
+                self.stream_plain_wrap.update(&self.stream_text, width);
             } else {
-                // Cheap interim wrap: every token is visible immediately.
-                let raw: Vec<Line<'static>> = self
-                    .stream_text
-                    .lines()
-                    .map(|l| Line::from(l.to_string()))
-                    .collect();
-                self.stream_wrapped = wrap_lines(&raw, width);
+                // Sole interim path: only the incomplete line rewraps.
+                self.stream_plain_wrap.update(&self.stream_text, width);
+                self.stream_plain_wrap.copy_into(&mut self.stream_wrapped);
             }
         }
 
