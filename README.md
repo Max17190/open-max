@@ -138,7 +138,7 @@ tool = "bash"
 arg_regex = "^cargo (test|check|build)"
 ```
 
-`effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional and matches the tool's primary argument (command for `bash`, path for file tools, pattern for `glob`/`grep`).
+`effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional: command for `bash`, path for file tools, pattern for `glob`/`grep`. For custom tools it matches the full serialized JSON arguments. Omit `arg_regex` (or leave it empty) to match every call of that tool.
 
 Tools and skills are discovered once at session start and frozen for that session. Changes apply on `/new`. Hooks and permissions re-discover each turn. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 
