@@ -136,6 +136,25 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
+/// True when an existing transcript file must not receive JSONL appends.
+/// Historical array-shaped blobs (first non-ws byte `[`) are not loaded as
+/// history, but the file may still sit on disk; append would create a mixed
+/// file. Force a full JSONL rewrite instead. Not a load dual-path.
+fn must_rewrite_non_jsonl(path: &PathBuf) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 64];
+    let Ok(n) = file.read(&mut head) else {
+        return false;
+    };
+    head[..n]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'[')
+}
+
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
 /// the same `*.tmp`.
@@ -326,7 +345,9 @@ pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
     let path = messages_path(core, id);
     let _guard = core.sessions_lock.lock().unwrap();
-    let needs_rewrite = rewrite || messages.len() < *persisted;
+    // Never append onto a non-JSONL blob left on disk after a failed load.
+    let needs_rewrite =
+        rewrite || messages.len() < *persisted || must_rewrite_non_jsonl(&path);
 
     let result = if needs_rewrite {
         write_jsonl(&path, messages)
@@ -446,6 +467,30 @@ mod tests {
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
         assert!(load_messages(&core, id).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_over_array_blob_rewrites_jsonl_not_append() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "array-then-save";
+        let path = messages_path(&core, id);
+        std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
+        assert!(load_messages(&core, id).is_none());
+
+        // Fresh session after empty load: persisted_count starts at 0.
+        let mut persisted = 0usize;
+        let messages = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        save_messages(&core, id, &messages, &mut persisted, false);
+        assert_eq!(persisted, 2);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.trim_start().starts_with('['), "must not leave array prefix:\n{text}");
+        assert_eq!(text.matches('\n').count(), 2);
+        let loaded = load_messages(&core, id).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1].content.as_deref(), Some("hello"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
