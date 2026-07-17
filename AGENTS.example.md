@@ -11,14 +11,14 @@ Native Rust coding-agent harness: one focused loop, small tools, fast TUI, exten
 | Not built in | Use instead |
 | --- | --- |
 | MCP | CLI tools + skills |
-| Nested agents | Focused search tools, or second `openmax` / `openmax -p` (tmux/terminal). Skill: `parallel-explore`. |
+| Nested agents (direction) | Prefer focused search or second `openmax` / `openmax -p` (tmux). Skill: `parallel-explore`. Stock may still register read-only `task`. |
 | Plan mode | Write `PLAN.md` |
 | Background bash product | tmux sessions |
 | Built-in TODOs | Write `TODO.md` |
 
 ## What ships
 
-Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
+Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`, currently `task` (prefer not to rely on nested explore).
 
 - Tools: `.openmax/tools/*.toml` or `~/.openmax/tools/`
 - Skills: `.agents/skills/*/SKILL.md` or `~/.openmax/skills/` (index only; read body on demand)

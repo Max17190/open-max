@@ -37,6 +37,6 @@ openmax -p "Map how auth middleware is registered; list key files and a short fl
 
 ## Do not
 
-- Invent nested-agent or "subagent" tools.
-- Assume a built-in `task` delegation tool exists.
+- Invent extra nested-agent products beyond what the stock registry already exposes.
+- Prefer this skill’s workflow over the built-in `task` tool when both are available (process isolation vs nested model loop).
 - Start background bash job control as a harness feature; use a second terminal or tmux pane instead.
