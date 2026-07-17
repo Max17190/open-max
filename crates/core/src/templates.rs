@@ -67,11 +67,28 @@ pub fn expand_invocation(project_root: &Path, input: &str) -> Option<String> {
     if head.is_empty() {
         return None;
     }
-    let spec = discover(project_root).into_iter().find(|t| t.name == head)?;
+    let spec = resolve(project_root, head)?;
     // Re-read at invocation time: templates are message content, not frozen
     // session state, so an edit applies to the very next use.
     let text = std::fs::read_to_string(&spec.path).ok()?;
     Some(substitute(body_of(&text), args))
+}
+
+/// Resolve one template by name with a direct path probe, project first.
+/// Never goes through the capped discovery list: MAX_TEMPLATES bounds the
+/// popup index, not which templates can be invoked.
+fn resolve(project_root: &Path, name: &str) -> Option<TemplateSpec> {
+    if !valid_name(name) {
+        return None;
+    }
+    let dirs = [
+        project_root.join(".agents").join("prompts"),
+        crate::state::default_data_dir().join("prompts"),
+    ];
+    dirs.iter()
+        .map(|dir| dir.join(format!("{name}.md")))
+        .filter(|path| path.is_file())
+        .find_map(|path| parse_template(&path))
 }
 
 /// Command-name discipline mirrors external tools: boring names only.
@@ -118,8 +135,9 @@ fn frontmatter_description(text: &str) -> Option<String> {
 }
 
 /// Substitute `$ARGUMENTS` (the raw argument string) and `$1`..`$9`
-/// (whitespace-split positionals; missing ones become empty). A template with
-/// no placeholders gets the arguments appended after a blank line, so plain
+/// (whitespace-split positionals; missing ones become empty). `$$` escapes a
+/// literal dollar (so `$$5` survives as `$5`). A template with no
+/// placeholders gets the arguments appended after a blank line, so plain
 /// prompt files still accept input.
 fn substitute(body: &str, args: &str) -> String {
     let positional: Vec<&str> = args.split_whitespace().collect();
@@ -132,6 +150,11 @@ fn substitute(body: &str, args: &str) -> String {
             continue;
         }
         let rest = &body[i + 1..];
+        if rest.starts_with('$') {
+            out.push('$');
+            chars.next();
+            continue;
+        }
         if rest.starts_with("ARGUMENTS") {
             out.push_str(args);
             used_placeholder = true;
@@ -235,6 +258,30 @@ mod tests {
         let expanded = expand_invocation(&root, "omx-test-issue 42").unwrap();
         assert_eq!(expanded, "Fix issue 42 now.\n");
         assert!(expand_invocation(&root, "omx-test-nosuch 42").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn double_dollar_escapes_a_literal() {
+        assert_eq!(substitute("The fee is $$5 for $1.", "alice"), "The fee is $5 for alice.");
+        assert_eq!(substitute("literal $$ARGUMENTS", "x"), "literal $ARGUMENTS\n\nx");
+    }
+
+    /// MAX_TEMPLATES bounds the popup index only; a template sorted past the
+    /// cap must still be invocable by name.
+    #[test]
+    fn invocation_is_independent_of_the_discovery_cap() {
+        let root = temp_dir("cap-inv");
+        let prompts = root.join(".agents").join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        for i in 0..MAX_TEMPLATES {
+            write_template(&prompts, &format!("aaa-{i:03}"), "filler body\n");
+        }
+        write_template(&prompts, "zzz-omx-tail", "Tail says $1.\n");
+        let discovered = discover_in(std::slice::from_ref(&prompts));
+        assert_eq!(discovered.len(), MAX_TEMPLATES);
+        assert!(!discovered.iter().any(|t| t.name == "zzz-omx-tail"), "sorted past the cap");
+        assert_eq!(expand_invocation(&root, "zzz-omx-tail hello").unwrap(), "Tail says hello.\n");
         let _ = std::fs::remove_dir_all(root);
     }
 

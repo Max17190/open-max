@@ -123,7 +123,7 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
-**Prompt templates.** A markdown file under `.agents/prompts/` or `~/.openmax/prompts/`; the file stem becomes a slash command. `$ARGUMENTS` expands to the raw argument string, `$1`..`$9` to positionals; a template without placeholders gets the arguments appended. Templates are message content: re-read on every use, zero prompt tax, never frozen.
+**Prompt templates.** A markdown file under `.agents/prompts/` or `~/.openmax/prompts/`; the file stem becomes a slash command. `$ARGUMENTS` expands to the raw argument string, `$1`..`$9` to positionals, and `$$` escapes a literal dollar; a template without placeholders gets the arguments appended. Templates are message content: re-read on every use, zero prompt tax, never frozen.
 
 ```
 .agents/prompts/fix-issue.md
