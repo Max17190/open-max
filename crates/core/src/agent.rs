@@ -709,6 +709,13 @@ async fn run_loop(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
+    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
+    // and permissions never enter the prompt, so reloading next turn is fine.
+    // Discovered before endpoint resolution so every exit path, including the
+    // early provider failure below, can still fire turn_end.
+    let hooks = Hooks::discover(project_root);
+    let permissions = Permissions::discover(project_root);
+
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
     // fails closed rather than silently hitting flat base_url.
@@ -716,9 +723,10 @@ async fn run_loop(
         Ok(ep) => ep,
         Err(e) => {
             core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
-            core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
             // User message was already appended; restore so the next turn sees it.
             guard.commit().await;
+            hooks.turn_end(session_id, project_root, "error").await;
+            core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
             return;
         }
     };
@@ -728,10 +736,6 @@ async fn run_loop(
     let schemas_wire = registry.tool_schemas_wire();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
-    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
-    // and permissions never enter the prompt, so reloading next turn is fine.
-    let hooks = Hooks::discover(project_root);
-    let permissions = Permissions::discover(project_root);
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
     if first_turn {
@@ -1811,6 +1815,60 @@ mod tests {
         let map = core.sessions.lock().await;
         assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &after), "must converge");
         drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every turn exit fires turn_end, including the early provider-failure
+    /// return that never reaches the main loop.
+    #[tokio::test]
+    async fn turn_end_hook_fires_on_provider_resolution_failure() {
+        use crate::state::{Core, CoreEvent};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone());
+        core.settings.lock().unwrap().provider = Some("no-such-provider".into());
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("end.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(format!("#!/bin/sh\ncat > {}/end.json\n", project.display()).as_bytes())
+                .unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        std::fs::write(
+            hooks_dir.join("end.toml"),
+            format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display()),
+        )
+        .unwrap();
+        crate::hooks::invalidate_hooks_cache();
+
+        start_turn(core.clone(), "sess-early".into(), project.clone(), "hi".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_done = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(CoreEvent::Agent(env))) => {
+                    if matches!(env.event, AgentEvent::Done { .. }) {
+                        saw_done = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_done, "early provider failure must still emit Done");
+        let end: Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join("end.json")).unwrap())
+                .unwrap();
+        assert_eq!(end["event"], "turn_end");
+        assert_eq!(end["stop_reason"], "error");
 
         let _ = std::fs::remove_dir_all(dir);
     }

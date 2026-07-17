@@ -19,9 +19,11 @@
 //!
 //! EOF on stdin behaves like quit: the in-flight turn drains, then the
 //! process exits, so `echo '{"cmd":"user",...}' | openmax --stdio` works as
-//! a one-shot. Unlike print mode, approvals are never auto-declined: the
-//! ApprovalRequest event goes to the client, which answers with approve (the
-//! agent's own timeout applies if it never does).
+//! a one-shot. Unlike print mode, approvals are never auto-declined while
+//! the client is live: the ApprovalRequest event goes to the client, which
+//! answers with approve. Once quit or EOF arrives, pending and subsequent
+//! approvals are declined so shutdown drains promptly instead of stalling
+//! on the approval timeout.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -111,6 +113,9 @@ pub async fn run(
     let mut running = false;
     let mut closing = false;
     let mut exit_code = 0i32;
+    // Approvals awaiting a client answer; declined in bulk when the client
+    // quits so the drain never sits out the approval timeout.
+    let mut open_approvals: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         if closing && !running {
@@ -119,11 +124,16 @@ pub async fn run(
         tokio::select! {
             cmd = stdin_rx.recv(), if !closing => {
                 match cmd {
-                    None => closing = true,
+                    None | Some(Ok(Command::Quit)) => {
+                        closing = true;
+                        for id in open_approvals.drain() {
+                            core.respond_approval(&id, false);
+                        }
+                    }
                     Some(Err(message)) => protocol_error(&mut stdout, &message),
-                    Some(Ok(Command::Quit)) => closing = true,
                     Some(Ok(Command::Cancel)) => core.cancel(&session_id),
                     Some(Ok(Command::Approve { approval_id, approved })) => {
+                        open_approvals.remove(&approval_id);
                         core.respond_approval(&approval_id, approved);
                     }
                     Some(Ok(Command::User { text })) => {
@@ -154,11 +164,25 @@ pub async fn run(
                 if let Ok(value) = serde_json::to_value(&env) {
                     emit(&mut stdout, &value);
                 }
-                if let AgentEvent::Done { stop_reason } = &env.event {
-                    running = false;
-                    if stop_reason == "error" {
-                        exit_code = 1;
+                match &env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        if closing {
+                            // Nobody is left to answer; decline immediately.
+                            core.respond_approval(approval_id, false);
+                        } else {
+                            open_approvals.insert(approval_id.clone());
+                        }
                     }
+                    AgentEvent::ApprovalSettled { approval_id, .. } => {
+                        open_approvals.remove(approval_id);
+                    }
+                    AgentEvent::Done { stop_reason } => {
+                        running = false;
+                        if stop_reason == "error" {
+                            exit_code = 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
