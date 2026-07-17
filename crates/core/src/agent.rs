@@ -235,7 +235,10 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         } else {
             (Arc::new(Registry::build(project_root)), false)
         };
-        if !had_manifest && registry.has_extensions() {
+        if !had_manifest {
+            // Always persisted (even builtin-only) so the extension
+            // fingerprint travels with the session; without it every resume
+            // would look like a self-modification and re-freeze for nothing.
             sessions::save_manifest(core, session_id, &registry.to_manifest());
         }
         let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
@@ -550,7 +553,22 @@ pub async fn reload_session(
     if data.messages.is_empty() {
         return Err("a turn is in flight; run /reload after it finishes".into());
     }
-    if data.messages[0].role == "system" {
+    apply_freeze(core, session_id, data, registry, prompt, breakdown);
+    Ok(counts)
+}
+
+/// Install a rebuilt registry + system prompt into a live session and persist
+/// the new shape (manifest plus a full transcript rewrite, since the prefix
+/// changed). Shared by /reload and the automatic turn-start re-freeze.
+fn apply_freeze(
+    core: &Arc<Core>,
+    session_id: &str,
+    data: &mut SessionData,
+    registry: Registry,
+    prompt: String,
+    breakdown: PromptBreakdown,
+) {
+    if data.messages.first().is_some_and(|m| m.role == "system") {
         data.messages[0] = ChatMessage::system(prompt);
     } else {
         data.messages.insert(0, ChatMessage::system(prompt));
@@ -558,10 +576,57 @@ pub async fn reload_session(
     data.registry = Arc::new(registry);
     data.prompt_breakdown = Arc::new(breakdown);
     sessions::save_manifest(core, session_id, &data.registry.to_manifest());
-    // The prefix changed: rewrite the whole transcript so disk matches memory.
     data.persisted_count = 0;
     sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
-    Ok(counts)
+}
+
+/// The self-modification loop closes here: at turn start, if the extension
+/// files on disk no longer match the fingerprint the session's registry froze
+/// from, rebuild registry + prompt in place. Costs one fingerprint read per
+/// turn (a handful of small files) and re-prefills the prompt cache only when
+/// something actually changed; a tool the agent wrote last turn is callable
+/// on this one, no /new and no human /reload required.
+async fn refreeze_if_extensions_changed(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+) {
+    let disk_fp = {
+        let root = project_root.to_path_buf();
+        match tokio::task::spawn_blocking(move || crate::registry::extensions_fingerprint(&root))
+            .await
+        {
+            Ok(fp) => fp,
+            Err(_) => return,
+        }
+    };
+    let stale = {
+        let sessions_map = core.sessions.lock().await;
+        sessions_map
+            .get(session_id)
+            .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+    };
+    if !stale {
+        return;
+    }
+    let root = project_root.to_path_buf();
+    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::build(&root)).await else {
+        return;
+    };
+    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+    let counts = (registry.tools.len(), registry.skills.len());
+    let mut sessions_map = core.sessions.lock().await;
+    if let Some(data) = sessions_map.get_mut(session_id) {
+        // Re-check under the lock: this turn owns `running`, so nothing else
+        // mutates the session, but stay defensive about empty (taken) state.
+        if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp {
+            apply_freeze(core, session_id, data, registry, prompt, breakdown);
+            core.send_agent(session_id, AgentEvent::Refrozen {
+                tools: counts.0,
+                skills: counts.1,
+            });
+        }
+    }
 }
 
 /// Buffers streamed deltas and flushes them as batched events.
@@ -607,6 +672,10 @@ async fn run_loop(
     settings: Settings,
     cancelled: Arc<CancelToken>,
 ) {
+    // Self-modification: pick up extension files written since the last
+    // freeze before this turn's schemas and prompt are locked in.
+    refreeze_if_extensions_changed(core, session_id, project_root).await;
+
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
     let (messages, registry, take_seq, first_turn) = {
@@ -640,6 +709,13 @@ async fn run_loop(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
+    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
+    // and permissions never enter the prompt, so reloading next turn is fine.
+    // Discovered before endpoint resolution so every exit path, including the
+    // early provider failure below, can still fire turn_end.
+    let hooks = Hooks::discover(project_root);
+    let permissions = Permissions::discover(project_root);
+
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
     // fails closed rather than silently hitting flat base_url.
@@ -647,9 +723,10 @@ async fn run_loop(
         Ok(ep) => ep,
         Err(e) => {
             core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
-            core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
             // User message was already appended; restore so the next turn sees it.
             guard.commit().await;
+            hooks.turn_end(session_id, project_root, "error").await;
+            core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
             return;
         }
     };
@@ -659,10 +736,6 @@ async fn run_loop(
     let schemas_wire = registry.tool_schemas_wire();
     let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
-    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
-    // and permissions never enter the prompt, so reloading next turn is fine.
-    let hooks = Hooks::discover(project_root);
-    let permissions = Permissions::discover(project_root);
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
     if first_turn {
@@ -966,6 +1039,7 @@ async fn run_loop(
     // Restore in-memory transcript under the async lock (Drop is try_lock only).
     guard.commit().await;
     sessions::touch(core, session_id);
+    hooks.turn_end(session_id, project_root, &stop_reason).await;
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
 }
 
@@ -1678,6 +1752,123 @@ mod tests {
         drop(map);
         let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
         assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The agent-native loop: a tool written mid-session is frozen in at the
+    /// next turn start with no human action, and an unchanged disk is a no-op
+    /// (prompt cache stays warm).
+    #[tokio::test]
+    async fn turn_start_refreezes_only_when_extension_files_changed() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone());
+        let id = "auto-refreeze";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let mut data = build_session_data(&core, id, &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        // Unchanged disk: no-op, no event, same registry Arc.
+        let before = core.sessions.lock().await.get(id).unwrap().registry.clone();
+        refreeze_if_extensions_changed(&core, id, &project).await;
+        {
+            let map = core.sessions.lock().await;
+            assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &before), "no-op must not rebuild");
+        }
+
+        // The agent writes a tool; the next turn start must freeze it in.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+        )
+        .unwrap();
+        refreeze_if_extensions_changed(&core, id, &project).await;
+        {
+            let map = core.sessions.lock().await;
+            let data = map.get(id).unwrap();
+            assert!(data.registry.is_mutating("deploy"));
+            assert_eq!(data.messages.len(), 2, "conversation survives the re-freeze");
+        }
+        let manifest = sessions::load_manifest(&core, id).expect("manifest rewritten");
+        assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
+        assert_ne!(manifest.ext_fingerprint, 0);
+        let mut saw_refrozen = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::state::CoreEvent::Agent(env) = ev {
+                if matches!(env.event, AgentEvent::Refrozen { tools, .. } if tools == tools::TOOL_NAMES.len() + 1) {
+                    saw_refrozen = true;
+                }
+            }
+        }
+        assert!(saw_refrozen, "UI must be told the session shape changed");
+
+        // Second check with no further writes: converged, no rebuild.
+        let after = core.sessions.lock().await.get(id).unwrap().registry.clone();
+        refreeze_if_extensions_changed(&core, id, &project).await;
+        let map = core.sessions.lock().await;
+        assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &after), "must converge");
+        drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every turn exit fires turn_end, including the early provider-failure
+    /// return that never reaches the main loop.
+    #[tokio::test]
+    async fn turn_end_hook_fires_on_provider_resolution_failure() {
+        use crate::state::{Core, CoreEvent};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone());
+        core.settings.lock().unwrap().provider = Some("no-such-provider".into());
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("end.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(format!("#!/bin/sh\ncat > {}/end.json\n", project.display()).as_bytes())
+                .unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        std::fs::write(
+            hooks_dir.join("end.toml"),
+            format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display()),
+        )
+        .unwrap();
+        crate::hooks::invalidate_hooks_cache();
+
+        start_turn(core.clone(), "sess-early".into(), project.clone(), "hi".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_done = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(CoreEvent::Agent(env))) => {
+                    if matches!(env.event, AgentEvent::Done { .. }) {
+                        saw_done = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_done, "early provider failure must still emit Done");
+        let end: Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join("end.json")).unwrap())
+                .unwrap();
+        assert_eq!(end["event"], "turn_end");
+        assert_eq!(end["stop_reason"], "error");
 
         let _ = std::fs::remove_dir_all(dir);
     }

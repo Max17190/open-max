@@ -4,6 +4,7 @@ mod clipboard;
 mod completion;
 mod headless;
 mod input;
+mod stdio;
 mod theme;
 mod ui;
 
@@ -27,6 +28,9 @@ options:
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
       --json             with --print, emit AgentEvent envelopes as JSONL
+      --stdio            bidirectional JSONL session: commands on stdin
+                         ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
+                         envelopes on stdout; the custom-frontend protocol
   -V, --version          print the version
   -h, --help             this help
 
@@ -47,6 +51,7 @@ struct CliArgs {
     provider: Option<String>,
     print: bool,
     json: bool,
+    stdio: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
     prompts: Vec<String>,
@@ -68,6 +73,7 @@ where
         provider: None,
         print: false,
         json: false,
+        stdio: false,
         prompts: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
@@ -86,6 +92,7 @@ where
                 out.print = true;
             }
             Long("json") => out.json = true,
+            Long("stdio") => out.stdio = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -141,6 +148,10 @@ async fn main() -> std::io::Result<()> {
         eprintln!("openmax: --json requires --print\n\n{HELP}");
         std::process::exit(2);
     }
+    if cli.stdio && (cli.print || !cli.prompts.is_empty()) {
+        eprintln!("openmax: --stdio takes commands on stdin, not flags or prompts\n\n{HELP}");
+        std::process::exit(2);
+    }
 
     let (core, core_rx) = Core::new(default_data_dir());
     {
@@ -157,6 +168,16 @@ async fn main() -> std::io::Result<()> {
             eprintln!("openmax: {e}");
             std::process::exit(2);
         }
+    }
+
+    if cli.stdio {
+        let code = stdio::run(
+            core,
+            core_rx,
+            stdio::StdioArgs { continue_session: cli.continue_session },
+        )
+        .await;
+        std::process::exit(code);
     }
 
     if cli.print {
@@ -268,6 +289,14 @@ mod tests {
         let cli = parse_args_from(["-p", "--json", "one", "-p", "two"]).unwrap();
         assert!(cli.json);
         assert_eq!(cli.prompts, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn stdio_flag_parses_alone_and_with_continue() {
+        let cli = parse_args_from(["--stdio"]).unwrap();
+        assert!(cli.stdio && !cli.print);
+        let cli = parse_args_from(["--stdio", "-c"]).unwrap();
+        assert!(cli.stdio && cli.continue_session);
     }
 
     #[test]

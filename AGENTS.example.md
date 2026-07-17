@@ -11,7 +11,7 @@ Native Rust coding-agent harness: one focused loop, small tools, fast TUI, exten
 | Not built in | Use instead |
 | --- | --- |
 | MCP | CLI tools + skills |
-| Nested agents | Focused tools, or second `openmax` / `openmax -p` (tmux). Skill: `parallel-explore`. |
+| Nested agents | Focused tools, or a child `openmax -p` / `openmax --stdio` (tmux). Skills: `parallel-explore`, `delegate`. |
 | Plan mode | Write `PLAN.md` |
 | Background bash product | tmux sessions |
 | Built-in TODOs | Write `TODO.md` |
@@ -23,12 +23,12 @@ Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash
 - Tools: `.openmax/tools/*.toml` or `~/.openmax/tools/`
 - Skills: `.agents/skills/*/SKILL.md` or `~/.openmax/skills/` (index only; read body on demand)
 - Prompt templates: `.agents/prompts/<name>.md` or `~/.openmax/prompts/` (`$ARGUMENTS`, `$1`..`$9`; user runs `/<name>`)
-- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` gates; `post_tool_use` / `session_start` / `compaction` observe; not in prompt)
+- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` gates; `post_tool_use` / `session_start` / `compaction` / `turn_end` observe; not in prompt)
 - Permissions: `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (allow/deny/ask; not in prompt)
 - Providers: `~/.openmax/providers.json`; `/theme` for built-in palettes
-- Built-in context compaction; tools/skills freeze at session create (`/reload` to re-freeze in place, `/new` for clean)
+- Built-in context compaction; tools/skills re-freeze automatically when their files change (`/reload` forces now, `/new` for clean)
 
-Not shipped: user keybindings, theme file hot reload, pluggable compactors, drop-in custom TUI.
+Not shipped: user keybindings, theme file hot reload, pluggable compactors, TUI plugin ABI (custom frontends speak `--stdio` JSONL).
 
 ## Repo
 

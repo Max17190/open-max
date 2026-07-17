@@ -26,6 +26,7 @@ pub enum HookEvent {
     PostToolUse,
     SessionStart,
     Compaction,
+    TurnEnd,
 }
 
 impl HookEvent {
@@ -35,6 +36,7 @@ impl HookEvent {
             HookEvent::PostToolUse => "post_tool_use",
             HookEvent::SessionStart => "session_start",
             HookEvent::Compaction => "compaction",
+            HookEvent::TurnEnd => "turn_end",
         }
     }
 
@@ -44,6 +46,7 @@ impl HookEvent {
             "post_tool_use" => Some(HookEvent::PostToolUse),
             "session_start" => Some(HookEvent::SessionStart),
             "compaction" => Some(HookEvent::Compaction),
+            "turn_end" => Some(HookEvent::TurnEnd),
             _ => None,
         }
     }
@@ -67,6 +70,7 @@ pub struct Hooks {
     post: Vec<HookSpec>,
     session_start: Vec<HookSpec>,
     compaction: Vec<HookSpec>,
+    turn_end: Vec<HookSpec>,
 }
 
 use std::sync::{Mutex, OnceLock};
@@ -151,6 +155,7 @@ fn discover_uncached(project_root: &Path) -> Hooks {
             HookEvent::PostToolUse => hooks.post.push(spec),
             HookEvent::SessionStart => hooks.session_start.push(spec),
             HookEvent::Compaction => hooks.compaction.push(spec),
+            HookEvent::TurnEnd => hooks.turn_end.push(spec),
         }
     }
     hooks
@@ -185,6 +190,7 @@ impl Hooks {
             && self.post.is_empty()
             && self.session_start.is_empty()
             && self.compaction.is_empty()
+            && self.turn_end.is_empty()
     }
 
     pub fn pre_count(&self) -> usize {
@@ -271,6 +277,22 @@ impl Hooks {
                 "record": record,
             });
             let _ = run_hook(hook, payload, cwd, cancel).await;
+        }
+    }
+
+    /// Run `turn_end` hooks with the turn's stop reason. Observe only, and
+    /// deliberately run with a fresh cancel token: a cancelled turn is still
+    /// a finished turn worth observing.
+    pub async fn turn_end(&self, session_id: &str, cwd: &Path, stop_reason: &str) {
+        let cancel = Arc::new(CancelToken::default());
+        for hook in &self.turn_end {
+            let payload = serde_json::json!({
+                "event": hook.event.as_str(),
+                "session_id": session_id,
+                "cwd": cwd.display().to_string(),
+                "stop_reason": stop_reason,
+            });
+            let _ = run_hook(hook, payload, cwd, &cancel).await;
         }
     }
 }
@@ -611,6 +633,30 @@ tool = "bash"
                 .unwrap();
         assert_eq!(compact["event"], "compaction");
         assert_eq!(compact["record"]["message_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn turn_end_hook_runs_even_after_cancel() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = write_script(
+            &tmp,
+            "end.sh",
+            &format!("#!/bin/sh\ncat > {}/end.json\n", tmp.display()),
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "end.toml",
+            &format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display()),
+        );
+        let hooks = Hooks::discover(&tmp);
+        // turn_end uses its own fresh token, so a cancelled turn still fires.
+        hooks.turn_end("sess", &tmp, "cancelled").await;
+        let end: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("end.json")).unwrap()).unwrap();
+        assert_eq!(end["event"], "turn_end");
+        assert_eq!(end["stop_reason"], "cancelled");
     }
 
     #[tokio::test]

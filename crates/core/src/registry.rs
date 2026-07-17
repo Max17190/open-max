@@ -54,12 +54,18 @@ pub struct ToolSpec {
     pub kind: ToolKind,
 }
 
-/// Frozen at session creation; immutable afterwards.
+/// Frozen per freeze window: built at session creation and re-frozen only
+/// when extension files change on disk (checked by fingerprint at turn start)
+/// or the user forces /reload. Between freezes it is immutable, keeping the
+/// serialized schema bytes prompt-cache-stable.
 pub struct Registry {
     /// Built-ins first in their fixed order, then external tools sorted by
     /// name — deterministic so two builds serialize identically.
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<SkillSpec>,
+    /// Content hash of the extension files this registry was built from;
+    /// compared against disk at turn start to detect self-modification.
+    pub ext_fingerprint: u64,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
@@ -68,11 +74,62 @@ pub struct Registry {
     by_name: HashMap<String, usize>,
 }
 
+/// Content hash of every extension file the registry freezes: external tool
+/// TOMLs and skill SKILL.mds, project and global, sorted. Contents (not
+/// mtimes) so a same-length rewrite is detected. These dirs hold a handful of
+/// small files; reading them at turn start is cheap.
+pub fn extensions_fingerprint(project_root: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    let tool_dirs = [
+        crate::state::default_data_dir().join("tools"),
+        project_root.join(".openmax").join("tools"),
+    ];
+    for dir in &tool_dirs {
+        dir.hash(&mut h);
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        files.sort();
+        for path in files {
+            path.hash(&mut h);
+            std::fs::read(&path).ok().hash(&mut h);
+        }
+    }
+    let skill_dirs = [
+        crate::state::default_data_dir().join("skills"),
+        project_root.join(".agents").join("skills"),
+    ];
+    for dir in &skill_dirs {
+        dir.hash(&mut h);
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path().join("SKILL.md"))
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+        for path in files {
+            path.hash(&mut h);
+            std::fs::read(&path).ok().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 impl Registry {
     /// Discover external tools and skills for a project and freeze the
-    /// registry. Called once, at session creation.
+    /// registry, stamped with the fingerprint of what was read.
     pub fn build(project_root: &Path) -> Self {
-        Self::assemble(discover_external(project_root), skills::discover(project_root))
+        let fp = extensions_fingerprint(project_root);
+        let mut registry =
+            Self::assemble(discover_external(project_root), skills::discover(project_root));
+        registry.ext_fingerprint = fp;
+        registry
     }
 
     /// A registry with built-ins only: used for sessions that predate the
@@ -114,6 +171,7 @@ impl Registry {
         Self {
             tools: tools_list,
             skills,
+            ext_fingerprint: 0,
             schemas,
             schemas_wire,
             by_name,
@@ -178,6 +236,11 @@ pub struct RegistryManifest {
     pub version: u32,
     pub external_tools: Vec<ExternalToolManifest>,
     pub skills: Vec<SkillSpec>,
+    /// Fingerprint of the extension files at freeze time. Manifests written
+    /// before this field default to 0, which mismatches any real disk state
+    /// and triggers one re-freeze on the next turn (forward only).
+    #[serde(default)]
+    pub ext_fingerprint: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -211,7 +274,12 @@ impl Registry {
                 }),
             })
             .collect();
-        RegistryManifest { version: 1, external_tools, skills: self.skills.clone() }
+        RegistryManifest {
+            version: 2,
+            external_tools,
+            skills: self.skills.clone(),
+            ext_fingerprint: self.ext_fingerprint,
+        }
     }
 
     pub fn from_manifest(manifest: RegistryManifest) -> Self {
@@ -231,7 +299,9 @@ impl Registry {
                 }),
             })
             .collect();
-        Self::assemble(external, manifest.skills)
+        let mut registry = Self::assemble(external, manifest.skills);
+        registry.ext_fingerprint = manifest.ext_fingerprint;
+        registry
     }
 
     /// True when the registry carries anything beyond the built-ins; an

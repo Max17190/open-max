@@ -14,7 +14,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **Small by default.** Seven built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and `bash`. Short system prompt; old tool output is dropped before your task is.
 - **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch with `/provider` or `--provider`. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools.
-- **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; `/reload` picks them up without losing the conversation.
+- **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; the harness re-freezes automatically on the next turn, so a tool the agent writes is a tool the agent uses.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
 - **Local sessions.** Conversation state lives under `~/.openmax/`. Network goes only to the model endpoint you configure (plus Hugging Face if you use managed model download).
 
@@ -70,6 +70,8 @@ openmax -p --json "list public modules in crates/core"
 
 In print mode, text goes to stdout and tool progress to stderr. With `--json`, each `AgentEvent` is one JSON line on stdout. Mutating tools still honor `approval_mode`; for unattended runs set `"approval_mode": "auto"`.
 
+For a full interactive session over pipes, `openmax --stdio` speaks JSONL both ways: commands on stdin (`{"cmd":"user","text":...}`, `approve`, `cancel`, `quit`), `AgentEvent` envelopes on stdout, one hello line first. Approvals are forwarded to the client instead of auto-declined, and EOF drains the in-flight turn before exit. This is the contract for custom frontends, editor integrations, and one openmax driving another (see the `delegate` skill).
+
 | Input | Action |
 | --- | --- |
 | **Enter** | Send (queues if the agent is busy) |
@@ -85,7 +87,7 @@ In print mode, text goes to stdout and tool progress to stderr. With `--json`, e
 | `/provider [name]` | List or switch providers |
 | `/approvals auto\|ask\|readonly` | Mutating tool gates |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
-| `/reload` | Re-freeze tools, skills, and prompt from current config |
+| `/reload` | Force a re-freeze now (it also happens automatically when extension files change) |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint and network destinations |
@@ -135,7 +137,7 @@ Fetch issue $1 with `gh issue view $1`, reproduce it, fix it, and add a test.
 
 Run it as `/fix-issue 42`.
 
-**Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` can block a tool (nonzero exit); `post_tool_use`, `session_start` (a session's first turn), and `compaction` (context was pruned; receives the digest record) observe only. Each hook gets one JSON payload on stdin. Hooks never enter the model prompt.
+**Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` can block a tool (nonzero exit); `post_tool_use`, `session_start` (a session's first turn), `compaction` (context was pruned; receives the digest record), and `turn_end` (receives the stop reason, fires even on cancel) observe only. Each hook gets one JSON payload on stdin. Hooks never enter the model prompt.
 
 **Permissions.** Optional rules under `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty discovery is free. First match wins. Order: hooks pre → permissions → `approval_mode` → execute → hooks post. If a permissions file exists but is invalid, every tool is denied (fail closed).
 
@@ -154,7 +156,7 @@ arg_regex = "^cargo (test|check|build)"
 
 `effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional: command for `bash`, path for file tools, pattern for `glob`/`grep`. For custom tools it matches the full serialized JSON arguments. Omit `arg_regex` (or leave it empty) to match every call of that tool.
 
-Tools and skills are discovered once at session start and frozen for that session. `/reload` re-freezes them in place, keeping the conversation at the cost of one prompt-cache re-prefill; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
+Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically: at each turn start it fingerprints the extension files, and if anything changed it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). An unchanged disk costs nothing. `/reload` forces it immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 
 ## Privacy
 
