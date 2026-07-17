@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn seven_builtins_without_task() {
+    fn seven_builtins() {
         let names = Registry::builtin_only().tool_names();
         assert_eq!(
             names,

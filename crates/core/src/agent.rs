@@ -1400,7 +1400,7 @@ mod tests {
             &empty_perms,
         ));
         assert!(!batchable_call(
-            &tool_call("task", r#"{"prompt":"x","subagent":"explore"}"#),
+            &tool_call("nope", r#"{}"#),
             &registry,
             &tracker,
             &empty_perms,
