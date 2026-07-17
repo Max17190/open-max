@@ -272,12 +272,14 @@ struct ReadonlyBatchCtx<'a> {
     permissions: &'a Permissions,
 }
 
+/// Returns true when the user cancelled mid-gate so the turn should stop
+/// before more tools run (matches the serial tool path).
 async fn execute_readonly_batch(
     ctx: &ReadonlyBatchCtx<'_>,
     calls: &[ToolCall],
     messages: &mut Vec<ChatMessage>,
     repeat_tracker: &mut RepeatCallTracker,
-) {
+) -> bool {
     let mut parsed: Vec<(Value, String)> = Vec::with_capacity(calls.len());
     let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
     for call in calls {
@@ -303,11 +305,19 @@ async fn execute_readonly_batch(
                 output: reason,
                 diff: None,
             }),
-            PreToolResult::Cancelled => Some(tools::ToolOutcome {
-                ok: false,
-                output: "cancelled".into(),
-                diff: None,
-            }),
+            PreToolResult::Cancelled => {
+                // Close every ToolStart already emitted in this batch so the
+                // transcript stays well-formed, then stop the turn.
+                for prior in calls.iter().take(parsed.len()) {
+                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
+                        call_id: prior.id.clone(),
+                        ok: false,
+                        output: "cancelled".to_string(),
+                    });
+                    messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
+                }
+                return true;
+            }
             PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
                 PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
                     ok: false,
@@ -387,6 +397,7 @@ async fn execute_readonly_batch(
             repeat_tracker.record_executed(name, args_key);
         }
     }
+    false
 }
 
 /// Raw material for the model-written compaction summary: enough of each
@@ -969,13 +980,17 @@ async fn run_loop(
                     hooks: &hooks,
                     permissions: &permissions,
                 };
-                execute_readonly_batch(
+                if execute_readonly_batch(
                     &batch_ctx,
                     &tool_calls[segment.start..segment.end],
                     guard.messages(),
                     &mut repeat_tracker,
                 )
-                .await;
+                .await
+                {
+                    stop_reason = "cancelled".into();
+                    break 'turns;
+                }
                 continue 'calls;
             }
 
