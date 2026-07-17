@@ -16,5 +16,6 @@ pub mod registry;
 pub mod sessions;
 pub mod skills;
 pub mod state;
+pub mod templates;
 pub mod tools;
 pub mod types;

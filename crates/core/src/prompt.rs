@@ -90,6 +90,11 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         Keep replies brief: no filler, no repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
+    {
+        let before = prompt.len();
+        prompt.push_str(SELF_EXTENSION);
+        breakdown.components.push(("self-extension guide".into(), prompt.len() - before));
+    }
     if let Some(instructions) = agents_md(project_root) {
         let before = prompt.len();
         prompt.push_str("\n\nProject instructions (AGENTS.md):\n");
@@ -111,6 +116,19 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     breakdown.add_registry(registry);
     (prompt, breakdown)
 }
+
+/// The agent is responsible for its own extensibility: when the user asks for
+/// a recurring capability, workflow, or policy, the right move is usually to
+/// write one of these files rather than to improvise each time. Static text,
+/// so the zero-cost invariant (byte-identical prompt with nothing installed)
+/// still holds; ~170 tokens is the price of an agent that can grow itself.
+const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user asks for a reusable capability:\n\
+- New tool: .openmax/tools/<name>.toml with name, description, params (JSON schema), command, args, mutating.\n\
+- New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
+- Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
+- Hook: .openmax/hooks/<name>.toml with event pre_tool_use (exit nonzero blocks), post_tool_use, session_start, or compaction.\n\
+- Permission rules: .openmax/permissions.toml with allow/deny/ask entries.\n\
+Tools and skills freeze per session: after writing one, ask the user to run /reload (keeps this conversation) or /new. Hooks, permissions, and templates apply on their next use.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -234,6 +252,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The self-extension guide is part of every frozen prompt: the agent
+    /// must know the file surfaces it can grow through and that /reload or
+    /// /new activates frozen ones.
+    #[test]
+    fn prompt_carries_self_extension_guide() {
+        let dir = temp_project();
+        let prompt = builtin_prompt(&dir);
+        assert!(prompt.contains("Extend yourself by writing files"));
+        assert!(prompt.contains(".openmax/tools/<name>.toml"));
+        assert!(prompt.contains(".agents/prompts/<name>.md"));
+        assert!(prompt.contains("/reload"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn skills_section_shows_relative_and_absolute_paths() {
         let dir = temp_project();
@@ -295,16 +327,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Budget gate for the frozen prompt prefix: base system prompt plus the
-    /// serialized builtin tool array must stay within ~800 tokens. The cap is
-    /// in chars (the core stays tokenizer-free): 3452 chars including a
-    /// 52-char project root measured 794 tokens on o200k_base and 775 on
-    /// cl100k_base (2026-07-16). The interpolated root varies per machine, so
-    /// it is excluded here and the cap (3450) leaves room for a typical
-    /// checkout path. If this fails, re-measure with a real tokenizer before
-    /// raising anything. Only builtins count: external tools are the user's
-    /// own budget, and grounding sections (AGENTS.md, layout map, skills)
-    /// have their own caps.
+    /// Budget gate for the frozen prompt prefix: base system prompt, the
+    /// self-extension guide, and the serialized builtin tool array must stay
+    /// within ~1000 tokens. The cap is in chars (the core stays
+    /// tokenizer-free): the pre-guide 3452 chars including a 52-char project
+    /// root measured 794 tokens on o200k_base and 775 on cl100k_base
+    /// (2026-07-16); the guide adds ~180 tokens. The interpolated root varies
+    /// per machine, so it is excluded here and the cap (4300) leaves room for
+    /// a typical checkout path. If this fails, re-measure with a real
+    /// tokenizer before raising anything. Only builtins count: external tools
+    /// are the user's own budget, and grounding sections (AGENTS.md, layout
+    /// map, skills) have their own caps.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -313,9 +346,9 @@ mod tests {
         let base_chars = breakdown
             .components
             .iter()
-            .find(|(name, _)| name == "base rules")
+            .filter(|(name, _)| name == "base rules" || name == "self-extension guide")
             .map(|(_, c)| *c)
-            .expect("base rules component present");
+            .sum::<usize>();
         let path_free = base_chars - dir.to_string_lossy().len();
         // Serialize the builtin entries as one array so brackets and commas
         // count, exactly as the wire payload does.
@@ -331,8 +364,8 @@ mod tests {
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
         assert!(
-            total <= 3_450,
-            "frozen prompt budget exceeded: base rules (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 3450 ≈ 800 tokens with a typical checkout path)",
+            total <= 4_300,
+            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 4300 ≈ 1000 tokens with a typical checkout path)",
         );
         let _ = std::fs::remove_dir_all(dir);
     }

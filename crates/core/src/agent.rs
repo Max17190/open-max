@@ -506,6 +506,64 @@ pub fn start_turn(
     Ok(())
 }
 
+/// Re-freeze a live session's registry and system prompt from the current
+/// on-disk config. This is the deliberate, user-triggered cache break behind
+/// `/reload`: the agent authors a tool, skill, or prompt change mid-session
+/// and uses it in the same conversation instead of losing context to `/new`.
+/// Returns `(tool_count, skill_count)` of the newly frozen registry.
+pub async fn reload_session(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+) -> Result<(usize, usize), String> {
+    if core.is_running(session_id) {
+        return Err("a turn is in flight; run /reload after it finishes".into());
+    }
+    let root = project_root.to_path_buf();
+    let registry = tokio::task::spawn_blocking(move || Registry::build(&root))
+        .await
+        .map_err(|e| format!("reload discovery failed: {e}"))?;
+    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+    let counts = (registry.tools.len(), registry.skills.len());
+
+    // Hydrate first if the session was resumed but never ran a turn, so the
+    // reload applies to the real transcript rather than a fresh one.
+    let hydrated = core.sessions.lock().await.contains_key(session_id);
+    if !hydrated {
+        let core_clone = core.clone();
+        let session_id_owned = session_id.to_string();
+        let project_root_owned = project_root.to_path_buf();
+        let built = tokio::task::spawn_blocking(move || {
+            build_session_data(&core_clone, &session_id_owned, &project_root_owned)
+        })
+        .await
+        .map_err(|e| format!("reload hydration failed: {e}"))?;
+        core.sessions.lock().await.entry(session_id.to_string()).or_insert(built);
+    }
+
+    let mut sessions_map = core.sessions.lock().await;
+    let data = sessions_map
+        .get_mut(session_id)
+        .ok_or_else(|| "session state is unavailable; try /new".to_string())?;
+    // A turn that slipped past the running check owns the transcript
+    // (mem::take leaves it empty); refuse rather than clobber.
+    if data.messages.is_empty() {
+        return Err("a turn is in flight; run /reload after it finishes".into());
+    }
+    if data.messages[0].role == "system" {
+        data.messages[0] = ChatMessage::system(prompt);
+    } else {
+        data.messages.insert(0, ChatMessage::system(prompt));
+    }
+    data.registry = Arc::new(registry);
+    data.prompt_breakdown = Arc::new(breakdown);
+    sessions::save_manifest(core, session_id, &data.registry.to_manifest());
+    // The prefix changed: rewrite the whole transcript so disk matches memory.
+    data.persisted_count = 0;
+    sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
+    Ok(counts)
+}
+
 /// Buffers streamed deltas and flushes them as batched events.
 struct TokenBatcher {
     core: Arc<Core>,
@@ -551,14 +609,15 @@ async fn run_loop(
 ) {
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
-    let (messages, registry, take_seq) = {
+    let (messages, registry, take_seq, first_turn) = {
         {
             let mut sessions_map = core.sessions.lock().await;
             if let Some(data) = sessions_map.get_mut(session_id) {
+                let first_turn = data.messages.len() <= 1;
                 data.messages.push(ChatMessage::user(user_text));
                 let (messages, seq) = take_messages(data);
                 let registry = data.registry.clone();
-                (messages, registry, seq)
+                (messages, registry, seq, first_turn)
             } else {
                 drop(sessions_map);
                 let core_clone = core.clone();
@@ -571,10 +630,11 @@ async fn run_loop(
                 .expect("session hydration task panicked");
                 let mut sessions_map = core.sessions.lock().await;
                 let data = sessions_map.entry(session_id.to_string()).or_insert(built);
+                let first_turn = data.messages.len() <= 1;
                 data.messages.push(ChatMessage::user(user_text));
                 let (messages, seq) = take_messages(data);
                 let registry = data.registry.clone();
-                (messages, registry, seq)
+                (messages, registry, seq, first_turn)
             }
         }
     };
@@ -603,6 +663,11 @@ async fn run_loop(
     // and permissions never enter the prompt, so reloading next turn is fine.
     let hooks = Hooks::discover(project_root);
     let permissions = Permissions::discover(project_root);
+    // Fires exactly once per session, on the turn that first populates it
+    // (fresh session or a resume that only had its system prompt).
+    if first_turn {
+        hooks.session_start(session_id, project_root, &cancelled).await;
+    }
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
@@ -617,7 +682,11 @@ async fn run_loop(
             context_tokens.saturating_sub(max_tokens + 1024),
         );
         if let Some(digest) = compaction {
-            sessions::append_compaction(core, session_id, &digest.to_record());
+            let record = digest.to_record();
+            sessions::append_compaction(core, session_id, &record);
+            if let Ok(value) = serde_json::to_value(&record) {
+                hooks.compaction(session_id, project_root, &value, &cancelled).await;
+            }
         }
         let used = guard.messages().iter().map(|m| m.estimated_tokens()).sum();
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
@@ -1562,6 +1631,53 @@ mod tests {
             data.registry.tool_schemas_json().to_string(),
             original.tool_schemas_json().to_string()
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reload_session_refreezes_registry_prompt_and_manifest() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let id = "reload-live";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let mut data = build_session_data(&core, id, &project);
+            data.messages.push(ChatMessage::user("hi"));
+            data.messages.push(ChatMessage::assistant(Some("hello".into()), None));
+            assert!(data.registry.get("deploy").is_none());
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        // The agent writes a new tool mid-session; /reload must pick it up.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+        )
+        .unwrap();
+
+        // A running turn blocks the reload.
+        core.running.lock().unwrap().insert(id.to_string());
+        assert!(reload_session(&core, id, &project).await.is_err());
+        core.running.lock().unwrap().remove(id);
+
+        let (tools, skills) = reload_session(&core, id, &project).await.unwrap();
+        assert_eq!(tools, tools::TOOL_NAMES.len() + 1);
+        assert_eq!(skills, 0);
+
+        let map = core.sessions.lock().await;
+        let data = map.get(id).unwrap();
+        assert!(data.registry.is_mutating("deploy"));
+        assert_eq!(data.messages[0].role, "system");
+        assert_eq!(data.messages.len(), 3, "conversation must survive the reload");
+        assert_eq!(data.persisted_count, 3, "transcript must be rewritten to disk");
+        drop(map);
+        let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
+        assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

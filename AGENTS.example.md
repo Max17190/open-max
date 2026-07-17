@@ -22,12 +22,13 @@ Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash
 
 - Tools: `.openmax/tools/*.toml` or `~/.openmax/tools/`
 - Skills: `.agents/skills/*/SKILL.md` or `~/.openmax/skills/` (index only; read body on demand)
-- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` / `post_tool_use`; not in prompt)
+- Prompt templates: `.agents/prompts/<name>.md` or `~/.openmax/prompts/` (`$ARGUMENTS`, `$1`..`$9`; user runs `/<name>`)
+- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` gates; `post_tool_use` / `session_start` / `compaction` observe; not in prompt)
 - Permissions: `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (allow/deny/ask; not in prompt)
 - Providers: `~/.openmax/providers.json`; `/theme` for built-in palettes
-- Built-in context compaction; tools/skills freeze at session create (`/new` to refresh)
+- Built-in context compaction; tools/skills freeze at session create (`/reload` to re-freeze in place, `/new` for clean)
 
-Not shipped: prompt templates, user slash commands/keybindings, theme file hot reload, pluggable compactors, drop-in custom TUI.
+Not shipped: user keybindings, theme file hot reload, pluggable compactors, drop-in custom TUI.
 
 ## Repo
 
