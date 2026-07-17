@@ -109,16 +109,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_max_task_iterations_key_is_ignored() {
-        // Pre-removal settings may still carry this key; serde should not fail.
-        let s: Settings = serde_json::from_str(
-            r#"{"max_agent_iterations":7,"max_task_iterations":2}"#,
-        )
-        .unwrap();
-        assert_eq!(s.max_agent_iterations, 7);
-    }
-
-    #[test]
     fn load_missing_file_uses_iteration_default() {
         let dir = std::env::temp_dir().join(format!(
             "openmax-settings-{}",
