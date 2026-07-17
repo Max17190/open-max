@@ -133,7 +133,7 @@ A tool or skill you write is live on the next turn (the harness re-freezes autom
 Working files (there is no built-in plan mode, todo list, or memory):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
 - TODO.md: the running task list; check items off as you finish.\n\
-- AGENTS.md: durable project facts worth remembering across sessions; keep it short, it loads into every session.";
+- AGENTS.md: durable project facts worth remembering across sessions; keep it short (loads at session create and on /reload).";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -275,6 +275,7 @@ mod tests {
         assert!(prompt.contains("PLAN.md"));
         assert!(prompt.contains("TODO.md"));
         assert!(prompt.contains("AGENTS.md: durable project facts"));
+        assert!(prompt.contains("on /reload"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

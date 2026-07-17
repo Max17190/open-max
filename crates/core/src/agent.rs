@@ -303,6 +303,11 @@ async fn execute_readonly_batch(
                 output: reason,
                 diff: None,
             }),
+            PreToolResult::Cancelled => Some(tools::ToolOutcome {
+                ok: false,
+                output: "cancelled".into(),
+                diff: None,
+            }),
             PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
                 PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
                     ok: false,
@@ -413,7 +418,10 @@ impl CompactionDigest {
 
     fn record_message(&mut self, msg: &ChatMessage) {
         self.message_count += 1;
-        if self.dropped_text.len() < MAX_DROPPED_TEXT_CHARS {
+        // Cap by chars so a single tool-call-heavy assistant message cannot
+        // blow past the summary-request budget after the size check.
+        let remaining = MAX_DROPPED_TEXT_CHARS.saturating_sub(self.dropped_text.chars().count());
+        if remaining > 0 {
             let mut line = format!("{}: ", msg.role);
             if let Some(c) = msg.content.as_deref() {
                 line.extend(c.trim().chars().take(MAX_DROPPED_MSG_CHARS));
@@ -428,7 +436,7 @@ impl CompactionDigest {
                 }
             }
             line.push('\n');
-            self.dropped_text.push_str(&line);
+            self.dropped_text.extend(line.chars().take(remaining));
         }
         if msg.role == "user" {
             if let Some(c) = msg.content.as_deref() {
@@ -758,18 +766,26 @@ async fn run_loop(
     cancelled: Arc<CancelToken>,
 ) {
     // Discover hooks first: user_prompt_submit gates the input before it
-    // ever enters the transcript. A blocked submit is not a started turn
-    // (no title write, no session_start, no turn_end).
+    // ever enters the transcript. A blocked or cancelled submit is not a
+    // started turn (no title write, no session_start, no turn_end).
     let hooks = Hooks::discover(project_root);
-    if let PreToolResult::Block { reason } = hooks
+    match hooks
         .user_prompt_submit(session_id, &user_text, project_root, &cancelled)
         .await
     {
-        core.send_agent(session_id, AgentEvent::Error {
-            message: format!("input blocked: {reason}"),
-        });
-        core.send_agent(session_id, AgentEvent::Done { stop_reason: "blocked".into() });
-        return;
+        PreToolResult::Block { reason } => {
+            core.send_agent(session_id, AgentEvent::Error {
+                message: format!("input blocked: {reason}"),
+            });
+            core.send_agent(session_id, AgentEvent::Done { stop_reason: "blocked".into() });
+            return;
+        }
+        PreToolResult::Cancelled => {
+            // Esc while the gate runs is cancellation, not policy rejection.
+            core.send_agent(session_id, AgentEvent::Done { stop_reason: "cancelled".into() });
+            return;
+        }
+        PreToolResult::Allow => {}
     }
 
     // Accepted: title from the first real prompt, then self-modification.
@@ -1004,24 +1020,31 @@ async fn run_loop(
 
                 // Order: hooks pre → permissions → approval_mode → execute.
                 // Denies never prompt the user.
-                if let PreToolResult::Block { reason } = hooks
+                match hooks
                     .pre_tool_use(session_id, name, &args, project_root, &cancelled)
                     .await
                 {
-                    core.send_agent(session_id, AgentEvent::ToolEnd {
-                        call_id: call.id.clone(),
-                        ok: false,
-                        output: reason.clone(),
-                    });
-                    guard.messages().push(ChatMessage::tool(
-                        call.id.clone(),
-                        tool_message_content(&tools::ToolOutcome {
+                    PreToolResult::Block { reason } => {
+                        core.send_agent(session_id, AgentEvent::ToolEnd {
+                            call_id: call.id.clone(),
                             ok: false,
-                            output: reason,
-                            diff: None,
-                        }),
-                    ));
-                    continue;
+                            output: reason.clone(),
+                        });
+                        guard.messages().push(ChatMessage::tool(
+                            call.id.clone(),
+                            tool_message_content(&tools::ToolOutcome {
+                                ok: false,
+                                output: reason,
+                                diff: None,
+                            }),
+                        ));
+                        continue;
+                    }
+                    PreToolResult::Cancelled => {
+                        stop_reason = "cancelled".into();
+                        break 'turns;
+                    }
+                    PreToolResult::Allow => {}
                 }
 
                 let perm = permissions.evaluate(name, &args);
@@ -2173,12 +2196,39 @@ mod tests {
         let text = &digest.dropped_text;
         assert!(text.contains("user: implement the auth flow"), "{text}");
         assert!(text.contains("[called read_file"), "{text}");
-        // Per-message and total caps hold.
-        assert!(text.len() < MAX_DROPPED_TEXT_CHARS + 1000);
+        // Hard char cap: a tool-call-heavy message and many follow-ups stay in bound.
+        assert!(digest.dropped_text.chars().count() <= MAX_DROPPED_TEXT_CHARS);
         for _ in 0..100 {
             digest.record_message(&msg("assistant", 500));
         }
-        assert!(digest.dropped_text.len() < MAX_DROPPED_TEXT_CHARS + 1000, "total cap must hold");
+        assert!(
+            digest.dropped_text.chars().count() <= MAX_DROPPED_TEXT_CHARS,
+            "total cap must hold, got {}",
+            digest.dropped_text.chars().count()
+        );
+        // One assistant with many tool calls cannot overrun the cap either.
+        let many_calls = ChatMessage::assistant(
+            Some("x".repeat(200)),
+            Some(
+                (0..40)
+                    .map(|i| ToolCall {
+                        id: format!("c{i}"),
+                        kind: "function".into(),
+                        function: ToolCallFunction {
+                            name: "read_file".into(),
+                            arguments: format!(r#"{{"path":"src/file_{i}.rs","extra":"{}"}}"#, "y".repeat(200)),
+                        },
+                    })
+                    .collect(),
+            ),
+        );
+        let mut heavy = CompactionDigest::new();
+        heavy.record_message(&many_calls);
+        assert!(
+            heavy.dropped_text.chars().count() <= MAX_DROPPED_TEXT_CHARS,
+            "tool-call flood must respect cap, got {}",
+            heavy.dropped_text.chars().count()
+        );
 
         let note = digest.format_with_summary("Was wiring auth middleware; src/auth.rs half-edited.");
         assert!(note.starts_with(DIGEST_PREFIX));

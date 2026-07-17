@@ -226,11 +226,7 @@ impl Hooks {
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
                 HookRun::Block(reason) => return PreToolResult::Block { reason },
-                HookRun::Cancelled => {
-                    return PreToolResult::Block {
-                        reason: "hook cancelled by user".into(),
-                    };
-                }
+                HookRun::Cancelled => return PreToolResult::Cancelled,
             }
         }
         PreToolResult::Allow
@@ -276,9 +272,7 @@ impl Hooks {
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
                 HookRun::Block(reason) => return PreToolResult::Block { reason },
-                HookRun::Cancelled => {
-                    return PreToolResult::Block { reason: "hook cancelled by user".into() }
-                }
+                HookRun::Cancelled => return PreToolResult::Cancelled,
             }
         }
         PreToolResult::Allow
@@ -357,6 +351,8 @@ fn tool_payload(
 pub enum PreToolResult {
     Allow,
     Block { reason: String },
+    /// User cancelled while a gate hook was running; not a policy rejection.
+    Cancelled,
 }
 
 impl HookSpec {
@@ -623,7 +619,7 @@ tool = "bash"
             PreToolResult::Block { reason } => {
                 assert!(reason.contains("blocked by test hook"), "{reason}");
             }
-            PreToolResult::Allow => panic!("expected block"),
+            PreToolResult::Allow | PreToolResult::Cancelled => panic!("expected block"),
         }
         // Filtered tool should not run the hook path for other tools.
         let allow = hooks
@@ -701,10 +697,37 @@ tool = "bash"
             .await;
         match blocked {
             PreToolResult::Block { reason } => assert!(reason.contains("secret"), "{reason}"),
-            PreToolResult::Allow => panic!("expected block"),
+            PreToolResult::Allow | PreToolResult::Cancelled => panic!("expected block"),
         }
         let allowed = hooks.user_prompt_submit("sess", "plain request", &tmp, &cancel).await;
         assert_eq!(allowed, PreToolResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_cancel_is_not_a_block() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // Hang until killed so cancel is the only way out.
+        let script = write_script(&tmp, "slow.sh", "#!/bin/sh\nsleep 30\n");
+        write_hook_toml(
+            &hooks_dir,
+            "slow.toml",
+            &format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\ntimeout_secs = 30\n", script.display()),
+        );
+        let hooks = Hooks::discover(&tmp);
+        let cancel = Arc::new(CancelToken::default());
+        let cancel_flag = cancel.clone();
+        let task = tokio::spawn(async move {
+            hooks.user_prompt_submit("sess", "prompt", &tmp, &cancel_flag).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("join timed out")
+            .expect("task panicked");
+        assert_eq!(result, PreToolResult::Cancelled);
     }
 
     #[tokio::test]
