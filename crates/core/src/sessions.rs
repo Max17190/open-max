@@ -136,16 +136,6 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
-/// Reads only a small prefix: this runs on every save and must not scale
-/// with transcript size.
-fn uses_legacy_array_format(path: &PathBuf) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else { return false };
-    let mut head = [0u8; 64];
-    let Ok(n) = file.read(&mut head) else { return false };
-    head[..n].iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|b| *b == b'[')
-}
-
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
 /// the same `*.tmp`.
@@ -306,43 +296,37 @@ pub fn touch(core: &Core, id: &str) {
     });
 }
 
-/// Load persisted messages. Corrupt JSONL lines are skipped silently so a
-/// partially damaged file still yields whatever could be parsed. Returns
-/// `None` when the file is missing, empty, wholly unparseable, or the legacy
-/// array payload is invalid — callers treat that as "no transcript on disk".
+/// Load persisted messages as JSONL only. Corrupt lines are skipped silently
+/// so a partially damaged file still yields whatever could be parsed. Returns
+/// `None` when the file is missing, empty, or wholly unparseable — callers
+/// treat that as "no transcript on disk".
 pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
     let path = messages_path(core, id);
     let text = std::fs::read_to_string(&path).ok()?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if text.trim().is_empty() {
         return None;
     }
-    if trimmed.starts_with('[') {
-        serde_json::from_str(&text).ok()
+    let parsed: Vec<ChatMessage> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if parsed.is_empty() {
+        None
     } else {
-        let parsed: Vec<ChatMessage> = text
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        if parsed.is_empty() {
-            None
-        } else {
-            Some(parsed)
-        }
+        Some(parsed)
     }
 }
 
 /// Persist messages. Appends only new tail lines when possible; rewrites the
-/// whole file after budget trimming, legacy migration, or message drops.
+/// whole file after budget trimming or message drops.
 ///
 /// Serializes disk access with `sessions_lock` so concurrent turns in the same
 /// process cannot interleave appends or rewrites of the same file.
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
     let path = messages_path(core, id);
     let _guard = core.sessions_lock.lock().unwrap();
-    let migrate = path.exists() && uses_legacy_array_format(&path);
-    let needs_rewrite = rewrite || migrate || messages.len() < *persisted;
+    let needs_rewrite = rewrite || messages.len() < *persisted;
 
     let result = if needs_rewrite {
         write_jsonl(&path, messages)
@@ -455,22 +439,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_array_loads_and_rewrites_on_save() {
+    fn array_payload_is_not_loaded() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone());
-        let id = "legacy";
+        let id = "array-payload";
         let path = messages_path(&core, id);
-        let legacy = r#"[{"role":"user","content":"old"}]"#;
-        std::fs::write(&path, legacy).unwrap();
-
-        let loaded = load_messages(&core, id).unwrap();
-        assert_eq!(loaded.len(), 1);
-
-        let mut persisted = loaded.len();
-        save_messages(&core, id, &loaded, &mut persisted, false);
-        assert!(!uses_legacy_array_format(&path));
-        assert_eq!(load_messages(&core, id).unwrap().len(), 1);
-
+        std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
+        assert!(load_messages(&core, id).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
