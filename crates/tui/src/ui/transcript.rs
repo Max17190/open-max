@@ -170,6 +170,28 @@ impl Transcript {
         self.push_kind(BlockKind::User, lines);
     }
 
+    /// Drop the most recent user block (e.g. a submit that was blocked by
+    /// `user_prompt_submit` before it entered the core transcript). Returns
+    /// true when a user block was removed.
+    pub fn pop_last_user(&mut self) -> bool {
+        let Some(i) = self.blocks.iter().rposition(|b| b.kind == BlockKind::User) else {
+            return false;
+        };
+        self.blocks.remove(i);
+        // Selection / sticky indices past the removed block must retreat.
+        if let Some(sel) = self.selected {
+            if sel == i {
+                self.selected = None;
+            } else if sel > i {
+                self.selected = Some(sel - 1);
+            }
+        }
+        self.dirty = true;
+        self.ensure_flat();
+        self.offset = self.offset.min(self.wrapped.len());
+        true
+    }
+
     pub fn push_assistant(&mut self, lines: Vec<Line<'static>>) {
         self.push_kind(BlockKind::Assistant, lines);
     }
@@ -947,6 +969,24 @@ mod tests {
         assert!(t.offset() >= 2);
         t.follow();
         assert_eq!(t.offset(), 0);
+    }
+
+    #[test]
+    fn pop_last_user_removes_optimistic_bubble() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push_user(vec![Line::from("first")]);
+        t.push_assistant(vec![Line::from("reply")]);
+        t.push_user(vec![Line::from("blocked later")]);
+        assert!(t.pop_last_user());
+        assert_eq!(t.blocks.len(), 2);
+        assert_eq!(t.blocks[0].kind, BlockKind::User);
+        assert_eq!(t.blocks[1].kind, BlockKind::Assistant);
+        // No user left at the end: second pop still finds the first user.
+        assert!(t.pop_last_user());
+        assert_eq!(t.blocks.len(), 1);
+        assert_eq!(t.blocks[0].kind, BlockKind::Assistant);
+        assert!(!t.pop_last_user());
     }
 
     #[test]

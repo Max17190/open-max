@@ -583,7 +583,8 @@ pub fn start_turn(
         .insert(session_id.clone(), cancelled.clone());
 
     let settings = core.settings.lock().unwrap().clone();
-    sessions::set_title_if_new(&core, &session_id, &user_text);
+    // Title is set after user_prompt_submit accepts the text (see run_loop).
+    // Titling here would fail-open secret/PII gates into the session index.
 
     tokio::spawn(async move {
         run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await;
@@ -757,7 +758,8 @@ async fn run_loop(
     cancelled: Arc<CancelToken>,
 ) {
     // Discover hooks first: user_prompt_submit gates the input before it
-    // ever enters the transcript, and every later exit path fires turn_end.
+    // ever enters the transcript. A blocked submit is not a started turn
+    // (no title write, no session_start, no turn_end).
     let hooks = Hooks::discover(project_root);
     if let PreToolResult::Block { reason } = hooks
         .user_prompt_submit(session_id, &user_text, project_root, &cancelled)
@@ -766,10 +768,12 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::Error {
             message: format!("input blocked: {reason}"),
         });
-        hooks.turn_end(session_id, project_root, "blocked").await;
         core.send_agent(session_id, AgentEvent::Done { stop_reason: "blocked".into() });
         return;
     }
+
+    // Accepted: title from the first real prompt, then self-modification.
+    sessions::set_title_if_new(core, session_id, &user_text);
 
     // Self-modification: pick up extension files written since the last
     // freeze before this turn's schemas and prompt are locked in.
@@ -1954,15 +1958,17 @@ mod tests {
         .unwrap();
         crate::hooks::invalidate_hooks_cache();
 
-        let id = "sess-blocked";
+        let project_key = project.display().to_string();
+        let meta = sessions::create(&core, project_key.clone()).unwrap();
+        let id = meta.id.clone();
         // Pre-seed a system-only session so we can assert the blocked text
         // never lands in the transcript.
         {
-            let data = build_session_data(&core, id, &project);
-            core.sessions.lock().await.insert(id.to_string(), data);
+            let data = build_session_data(&core, &id, &project);
+            core.sessions.lock().await.insert(id.clone(), data);
         }
 
-        start_turn(core.clone(), id.into(), project.clone(), "should not land".into()).unwrap();
+        start_turn(core.clone(), id.clone(), project.clone(), "should not land".into()).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut stop = None;
         let mut saw_error = false;
@@ -1985,11 +1991,15 @@ mod tests {
         }
         assert!(saw_error, "must emit an Error with the block reason");
         assert_eq!(stop.as_deref(), Some("blocked"));
-        let messages = core.sessions.lock().await.get(id).unwrap().messages.clone();
+        let messages = core.sessions.lock().await.get(&id).unwrap().messages.clone();
         assert!(
             messages.iter().all(|m| m.content.as_deref() != Some("should not land")),
             "blocked text must not enter the transcript: {messages:?}"
         );
+        // Session index title must not absorb blocked text (secret fail-open).
+        let listed = sessions::list(&core, &project_key);
+        let title = listed.iter().find(|m| m.id == id).expect("session in index").title.clone();
+        assert_eq!(title, sessions::UNTITLED, "blocked prompt must not set the title");
 
         let _ = std::fs::remove_dir_all(dir);
     }
