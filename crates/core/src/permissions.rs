@@ -132,7 +132,18 @@ impl Permissions {
     }
 }
 
-fn permission_files(project_root: &Path) -> Vec<PathBuf> {
+/// Diagnose one permissions file for `openmax --check`: None when the file
+/// does not exist, Ok(rule count) when it loads, Err(reason) when the agent
+/// loop would fail closed because of it.
+pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
+    match load_file(path) {
+        FileLoad::Missing => None,
+        FileLoad::Ok(rules) => Some(Ok(rules.len())),
+        FileLoad::Invalid(reason) => Some(Err(reason)),
+    }
+}
+
+pub(crate) fn permission_files(project_root: &Path) -> Vec<PathBuf> {
     let mut files = vec![project_root.join(".openmax").join("permissions.toml")];
     if let Some(home) = std::env::var_os("HOME") {
         files.push(PathBuf::from(home).join(".openmax").join("permissions.toml"));

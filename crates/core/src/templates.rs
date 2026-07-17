@@ -27,10 +27,15 @@ pub struct TemplateSpec {
 /// Discover templates for a project: global first, project overwrites on
 /// name collision. Malformed or oddly named files are skipped, never fatal.
 pub fn discover(project_root: &Path) -> Vec<TemplateSpec> {
-    discover_in(&[
+    discover_in(&template_dirs(project_root))
+}
+
+/// Global then project template dirs; later dirs win on name collision.
+pub(crate) fn template_dirs(project_root: &Path) -> [PathBuf; 2] {
+    [
         crate::state::default_data_dir().join("prompts"),
         project_root.join(".agents").join("prompts"),
-    ])
+    ]
 }
 
 pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<TemplateSpec> {
@@ -44,7 +49,7 @@ pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<TemplateSpec> {
             .collect();
         paths.sort();
         for path in paths {
-            if let Some(spec) = parse_template(&path) {
+            if let Ok(spec) = parse_template(&path) {
                 by_name.insert(spec.name.clone(), spec);
             }
         }
@@ -88,7 +93,7 @@ fn resolve(project_root: &Path, name: &str) -> Option<TemplateSpec> {
     dirs.iter()
         .map(|dir| dir.join(format!("{name}.md")))
         .filter(|path| path.is_file())
-        .find_map(|path| parse_template(&path))
+        .find_map(|path| parse_template(&path).ok())
 }
 
 /// Command-name discipline mirrors external tools: boring names only.
@@ -98,21 +103,28 @@ fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn parse_template(path: &Path) -> Option<TemplateSpec> {
-    let name = path.file_stem()?.to_str()?.to_string();
+/// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
+pub(crate) fn parse_template(path: &Path) -> Result<TemplateSpec, String> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .ok_or("file stem is not valid UTF-8")?;
     if !valid_name(&name) {
-        return None;
+        return Err(format!(
+            "invalid template name '{name}': 1-64 chars of [a-zA-Z0-9_-] required (the stem becomes /{name})"
+        ));
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
     if body_of(&text).trim().is_empty() {
-        return None;
+        return Err("template body is empty".into());
     }
     let mut description = frontmatter_description(&text).unwrap_or_default();
     if description.chars().count() > MAX_TEMPLATE_DESC_CHARS {
         description =
             description.chars().take(MAX_TEMPLATE_DESC_CHARS).collect::<String>() + "…";
     }
-    Some(TemplateSpec { name, description, path: path.to_path_buf() })
+    Ok(TemplateSpec { name, description, path: path.to_path_buf() })
 }
 
 /// The template body: everything after an optional `---` frontmatter block.

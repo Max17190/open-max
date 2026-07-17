@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod client;
 pub mod config;
+pub mod doctor;
 pub mod fallback;
 pub mod hf;
 pub mod hooks;

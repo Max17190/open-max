@@ -727,6 +727,9 @@ impl StreamingWrap {
         *self = Self::default();
     }
 
+    /// Test helper: iterate wrapped lines without cloning. Production paint
+    /// paths use `copy_into` so they own the lines they draw.
+    #[cfg(test)]
     pub fn lines(&self) -> impl DoubleEndedIterator<Item = &Line<'static>> {
         self.complete_wrapped
             .iter()

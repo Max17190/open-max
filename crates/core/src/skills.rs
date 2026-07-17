@@ -30,10 +30,15 @@ pub struct SkillSpec {
 /// Discover skills for a project: global first, project overwrites on name
 /// collision. Malformed skill files are skipped, never fatal.
 pub fn discover(project_root: &Path) -> Vec<SkillSpec> {
-    discover_in(&[
+    discover_in(&skill_dirs(project_root))
+}
+
+/// Global then project skill dirs; later dirs win on name collision.
+pub(crate) fn skill_dirs(project_root: &Path) -> [PathBuf; 2] {
+    [
         crate::state::default_data_dir().join("skills"),
         project_root.join(".agents").join("skills"),
-    ])
+    ]
 }
 
 pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<SkillSpec> {
@@ -47,7 +52,7 @@ pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<SkillSpec> {
             .collect();
         skill_files.sort();
         for path in skill_files {
-            if let Some(spec) = parse_skill_md(&path) {
+            if let Ok(spec) = parse_skill_md(&path) {
                 by_name.insert(spec.name.clone(), spec);
             }
         }
@@ -60,10 +65,15 @@ pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<SkillSpec> {
 
 /// Pull `name:` and `description:` out of the frontmatter block. Values may
 /// be bare or double-quoted; anything more exotic belongs in the body.
-fn parse_skill_md(path: &Path) -> Option<SkillSpec> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let body = text.strip_prefix("---")?;
-    let end = body.find("\n---")?;
+/// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
+pub(crate) fn parse_skill_md(path: &Path) -> Result<SkillSpec, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    let body = text
+        .strip_prefix("---")
+        .ok_or("missing `---` frontmatter block at the top")?;
+    let end = body
+        .find("\n---")
+        .ok_or("frontmatter never closes with `---`")?;
     let mut name = None;
     let mut description = None;
     for line in body[..end].lines() {
@@ -74,12 +84,14 @@ fn parse_skill_md(path: &Path) -> Option<SkillSpec> {
             description = Some(v.trim().trim_matches('"').to_string());
         }
     }
-    let name = name.filter(|n| !n.is_empty())?;
+    let name = name
+        .filter(|n| !n.is_empty())
+        .ok_or("frontmatter has no non-empty `name:`")?;
     let mut description = description.unwrap_or_default().replace(['\n', '\r'], " ");
     if description.chars().count() > MAX_SKILL_DESC_CHARS {
         description = description.chars().take(MAX_SKILL_DESC_CHARS).collect::<String>() + "…";
     }
-    Some(SkillSpec { name, description, path: path.to_path_buf() })
+    Ok(SkillSpec { name, description, path: path.to_path_buf() })
 }
 
 #[cfg(test)]

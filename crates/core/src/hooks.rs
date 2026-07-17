@@ -1,8 +1,10 @@
 //! Process lifecycle hooks: optional external commands that gate or observe
-//! agent lifecycle events. `pre_tool_use` can block a tool; `post_tool_use`,
-//! `session_start` (a session's first turn), and `compaction` (context was
-//! pruned) observe only. Empty discovery costs almost nothing (one directory
-//! list). Hooks never change tool schemas and never inject text into the model.
+//! agent lifecycle events. `pre_tool_use` and `user_prompt_submit` can block
+//! (nonzero exit); `post_tool_use`, `session_start` (a session's first turn),
+//! `compaction` (context was pruned), and `turn_end` (stop reason; fires even
+//! on cancel) observe only. Empty discovery costs almost nothing (one
+//! directory list). Hooks never change tool schemas and never inject text
+//! into the model.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,16 +26,18 @@ const MAX_REASON_CHARS: usize = 500;
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    UserPromptSubmit,
     SessionStart,
     Compaction,
     TurnEnd,
 }
 
 impl HookEvent {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             HookEvent::PreToolUse => "pre_tool_use",
             HookEvent::PostToolUse => "post_tool_use",
+            HookEvent::UserPromptSubmit => "user_prompt_submit",
             HookEvent::SessionStart => "session_start",
             HookEvent::Compaction => "compaction",
             HookEvent::TurnEnd => "turn_end",
@@ -44,6 +48,7 @@ impl HookEvent {
         match s.trim() {
             "pre_tool_use" => Some(HookEvent::PreToolUse),
             "post_tool_use" => Some(HookEvent::PostToolUse),
+            "user_prompt_submit" => Some(HookEvent::UserPromptSubmit),
             "session_start" => Some(HookEvent::SessionStart),
             "compaction" => Some(HookEvent::Compaction),
             "turn_end" => Some(HookEvent::TurnEnd),
@@ -68,6 +73,7 @@ pub struct HookSpec {
 pub struct Hooks {
     pre: Vec<HookSpec>,
     post: Vec<HookSpec>,
+    user_prompt: Vec<HookSpec>,
     session_start: Vec<HookSpec>,
     compaction: Vec<HookSpec>,
     turn_end: Vec<HookSpec>,
@@ -142,7 +148,7 @@ fn discover_uncached(project_root: &Path) -> Hooks {
             if stem.is_empty() {
                 continue;
             }
-            if let Some(spec) = parse_hook_file(&path) {
+            if let Ok(spec) = parse_hook_file(&path) {
                 // First wins: project dirs are listed before global.
                 by_stem.entry(stem).or_insert(spec);
             }
@@ -153,6 +159,7 @@ fn discover_uncached(project_root: &Path) -> Hooks {
         match spec.event {
             HookEvent::PreToolUse => hooks.pre.push(spec),
             HookEvent::PostToolUse => hooks.post.push(spec),
+            HookEvent::UserPromptSubmit => hooks.user_prompt.push(spec),
             HookEvent::SessionStart => hooks.session_start.push(spec),
             HookEvent::Compaction => hooks.compaction.push(spec),
             HookEvent::TurnEnd => hooks.turn_end.push(spec),
@@ -188,6 +195,7 @@ impl Hooks {
     pub fn is_empty(&self) -> bool {
         self.pre.is_empty()
             && self.post.is_empty()
+            && self.user_prompt.is_empty()
             && self.session_start.is_empty()
             && self.compaction.is_empty()
             && self.turn_end.is_empty()
@@ -245,6 +253,35 @@ impl Hooks {
             let payload = tool_payload(hook, session_id, tool, args, cwd, Some(tool_ok));
             let _ = run_hook(hook, payload, cwd, cancel).await;
         }
+    }
+
+    /// Run all `user_prompt_submit` hooks against the text the user typed,
+    /// before it enters the transcript. First block wins (nonzero exit); the
+    /// blocked turn never starts and never reaches the model. Gate only:
+    /// hooks still never inject text into the context.
+    pub async fn user_prompt_submit(
+        &self,
+        session_id: &str,
+        text: &str,
+        cwd: &Path,
+        cancel: &Arc<CancelToken>,
+    ) -> PreToolResult {
+        for hook in &self.user_prompt {
+            let payload = serde_json::json!({
+                "event": hook.event.as_str(),
+                "session_id": session_id,
+                "cwd": cwd.display().to_string(),
+                "text": text,
+            });
+            match run_hook(hook, payload, cwd, cancel).await {
+                HookRun::Allow => {}
+                HookRun::Block(reason) => return PreToolResult::Block { reason },
+                HookRun::Cancelled => {
+                    return PreToolResult::Block { reason: "hook cancelled by user".into() }
+                }
+            }
+        }
+        PreToolResult::Allow
     }
 
     /// Run `session_start` hooks (a session's first turn). Observe only:
@@ -354,7 +391,7 @@ fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
+pub(crate) fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![project_root.join(".openmax").join("hooks")];
     if let Some(home) = std::env::var_os("HOME") {
         dirs.push(PathBuf::from(home).join(".openmax").join("hooks"));
@@ -362,19 +399,25 @@ fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn parse_hook_file(path: &Path) -> Option<HookSpec> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let file: HookFile = toml::from_str(&text).ok()?;
-    let event = HookEvent::parse(&file.event)?;
+/// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
+pub(crate) fn parse_hook_file(path: &Path) -> Result<HookSpec, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    let file: HookFile = toml::from_str(&text).map_err(|e| format!("invalid TOML: {e}"))?;
+    let event = HookEvent::parse(&file.event).ok_or_else(|| {
+        format!(
+            "unknown event '{}': expected pre_tool_use, post_tool_use, user_prompt_submit, session_start, compaction, or turn_end",
+            file.event
+        )
+    })?;
     let command = file.command.trim().to_string();
     if command.is_empty() {
-        return None;
+        return Err("command is empty".into());
     }
     let tool_filter = file
         .tool
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    Some(HookSpec {
+    Ok(HookSpec {
         event,
         command,
         args: file.args,
@@ -633,6 +676,35 @@ tool = "bash"
                 .unwrap();
         assert_eq!(compact["event"], "compaction");
         assert_eq!(compact["record"]["message_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_hook_blocks_with_reason() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // Block any prompt whose stdin payload mentions a secret marker.
+        let script = write_script(
+            &tmp,
+            "gate.sh",
+            "#!/bin/sh\nif grep -q SECRET; then echo 'input contains a secret'; exit 1; fi\nexit 0\n",
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "gate.toml",
+            &format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\n", script.display()),
+        );
+        let hooks = Hooks::discover(&tmp);
+        let cancel = Arc::new(CancelToken::default());
+        let blocked = hooks
+            .user_prompt_submit("sess", "here is a SECRET token", &tmp, &cancel)
+            .await;
+        match blocked {
+            PreToolResult::Block { reason } => assert!(reason.contains("secret"), "{reason}"),
+            PreToolResult::Allow => panic!("expected block"),
+        }
+        let allowed = hooks.user_prompt_submit("sess", "plain request", &tmp, &cancel).await;
+        assert_eq!(allowed, PreToolResult::Allow);
     }
 
     #[tokio::test]

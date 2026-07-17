@@ -31,6 +31,8 @@ options:
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
+      --check            validate extension files (tools, skills, templates,
+                         hooks, permissions) and exit; nonzero if any is broken
   -V, --version          print the version
   -h, --help             this help
 
@@ -52,6 +54,7 @@ struct CliArgs {
     print: bool,
     json: bool,
     stdio: bool,
+    check: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
     prompts: Vec<String>,
@@ -74,6 +77,7 @@ where
         print: false,
         json: false,
         stdio: false,
+        check: false,
         prompts: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
@@ -93,6 +97,7 @@ where
             }
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
+            Long("check") => out.check = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -151,6 +156,23 @@ async fn main() -> std::io::Result<()> {
     if cli.stdio && (cli.print || !cli.prompts.is_empty()) {
         eprintln!("openmax: --stdio takes commands on stdin, not flags or prompts\n\n{HELP}");
         std::process::exit(2);
+    }
+
+    if cli.check {
+        // Pure filesystem validation: no session, no endpoint, no state dir.
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let findings = open_max_core::doctor::check(&project);
+        if findings.is_empty() {
+            println!("no extension files found (tools, skills, templates, hooks, permissions)");
+            std::process::exit(0);
+        }
+        for f in &findings {
+            match &f.status {
+                Ok(summary) => println!("ok   {:<11} {}  ({summary})", f.kind, f.path.display()),
+                Err(reason) => println!("err  {:<11} {}  {reason}", f.kind, f.path.display()),
+            }
+        }
+        std::process::exit(if open_max_core::doctor::has_errors(&findings) { 1 } else { 0 });
     }
 
     let (core, core_rx) = Core::new(default_data_dir());
@@ -297,6 +319,12 @@ mod tests {
         assert!(cli.stdio && !cli.print);
         let cli = parse_args_from(["--stdio", "-c"]).unwrap();
         assert!(cli.stdio && cli.continue_session);
+    }
+
+    #[test]
+    fn check_flag_parses() {
+        let cli = parse_args_from(["--check"]).unwrap();
+        assert!(cli.check && !cli.print && !cli.stdio);
     }
 
     #[test]

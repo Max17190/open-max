@@ -384,12 +384,20 @@ async fn execute_readonly_batch(
     }
 }
 
+/// Raw material for the model-written compaction summary: enough of each
+/// dropped message to reconstruct the thread, hard-capped so the summary
+/// request itself stays small.
+const MAX_DROPPED_TEXT_CHARS: usize = 6_000;
+const MAX_DROPPED_MSG_CHARS: usize = 240;
+
 struct CompactionDigest {
     message_count: usize,
     tools: BTreeSet<String>,
     paths: Vec<String>,
     /// Short snippets of compacted user goals (not the original first request).
     user_snippets: Vec<String>,
+    /// Role-labeled excerpts of everything dropped, oldest first, capped.
+    dropped_text: String,
 }
 
 impl CompactionDigest {
@@ -399,11 +407,29 @@ impl CompactionDigest {
             tools: BTreeSet::new(),
             paths: Vec::new(),
             user_snippets: Vec::new(),
+            dropped_text: String::new(),
         }
     }
 
     fn record_message(&mut self, msg: &ChatMessage) {
         self.message_count += 1;
+        if self.dropped_text.len() < MAX_DROPPED_TEXT_CHARS {
+            let mut line = format!("{}: ", msg.role);
+            if let Some(c) = msg.content.as_deref() {
+                line.extend(c.trim().chars().take(MAX_DROPPED_MSG_CHARS));
+            }
+            if let Some(calls) = &msg.tool_calls {
+                for call in calls {
+                    line.push_str(&format!(
+                        " [called {} {}]",
+                        call.function.name,
+                        call.function.arguments.chars().take(120).collect::<String>()
+                    ));
+                }
+            }
+            line.push('\n');
+            self.dropped_text.push_str(&line);
+        }
         if msg.role == "user" {
             if let Some(c) = msg.content.as_deref() {
                 let trimmed = c.trim();
@@ -461,16 +487,74 @@ impl CompactionDigest {
         parts.join(" ")
     }
 
-    fn to_record(&self) -> sessions::CompactionRecord {
+    /// The note used when the model wrote a real summary of the dropped
+    /// context; exact paths stay listed because summaries paraphrase them.
+    fn format_with_summary(&self, summary: &str) -> String {
+        let mut parts = vec![format!(
+            "{DIGEST_PREFIX} {} earlier messages were compacted. Summary: {summary}",
+            self.message_count
+        )];
+        if !self.paths.is_empty() {
+            parts.push(format!("Files touched: {}.", self.paths.join(", ")));
+        }
+        parts.push("Re-read files if you need the details.".into());
+        parts.join(" ")
+    }
+
+    fn to_record(&self, digest: String) -> sessions::CompactionRecord {
         sessions::CompactionRecord {
             ts: sessions::unix_now(),
             message_count: self.message_count,
             tools: self.tools.iter().cloned().collect(),
             paths: self.paths.clone(),
             user_snippets: self.user_snippets.clone(),
-            digest: self.format(),
+            digest,
         }
     }
+}
+
+/// One small completion against the session's own endpoint turns the dropped
+/// exchanges into a real summary; the heuristic digest note is the fallback
+/// whenever this returns None (error, timeout, cancel, or empty reply). One
+/// request per compaction, which is rare by construction (hysteresis prune).
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
+const MAX_SUMMARY_CHARS: usize = 900;
+
+async fn summarize_compaction(
+    client: &ChatClient,
+    digest: &CompactionDigest,
+    cancelled: &Arc<CancelToken>,
+) -> Option<String> {
+    if digest.dropped_text.trim().is_empty() {
+        return None;
+    }
+    let messages = vec![
+        ChatMessage::system(
+            "You compress dropped context from a coding-agent session. Reply with only the \
+             summary, no preamble: at most 120 words covering what was being done, exact file \
+             paths involved, decisions made, and anything unresolved.",
+        ),
+        ChatMessage::user(digest.dropped_text.clone()),
+    ];
+    let result = tokio::time::timeout(
+        SUMMARY_TIMEOUT,
+        client.stream_chat(&messages, "[]", cancelled.clone(), |_| {}),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut summary = result.content;
+    if let Some(clean) = fallback::strip_leading_think(&summary) {
+        summary = clean;
+    }
+    let summary = summary.trim().replace(['\n', '\r'], " ");
+    if summary.is_empty() {
+        return None;
+    }
+    if summary.chars().count() > MAX_SUMMARY_CHARS {
+        return Some(summary.chars().take(MAX_SUMMARY_CHARS).collect::<String>() + "…");
+    }
+    Some(summary)
 }
 
 fn is_digest_message(msg: &ChatMessage) -> bool {
@@ -672,6 +756,21 @@ async fn run_loop(
     settings: Settings,
     cancelled: Arc<CancelToken>,
 ) {
+    // Discover hooks first: user_prompt_submit gates the input before it
+    // ever enters the transcript, and every later exit path fires turn_end.
+    let hooks = Hooks::discover(project_root);
+    if let PreToolResult::Block { reason } = hooks
+        .user_prompt_submit(session_id, &user_text, project_root, &cancelled)
+        .await
+    {
+        core.send_agent(session_id, AgentEvent::Error {
+            message: format!("input blocked: {reason}"),
+        });
+        hooks.turn_end(session_id, project_root, "blocked").await;
+        core.send_agent(session_id, AgentEvent::Done { stop_reason: "blocked".into() });
+        return;
+    }
+
     // Self-modification: pick up extension files written since the last
     // freeze before this turn's schemas and prompt are locked in.
     refreeze_if_extensions_changed(core, session_id, project_root).await;
@@ -709,11 +808,8 @@ async fn run_loop(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
-    // Discover once per turn start; empty dirs/files are a cheap no-op. Hooks
-    // and permissions never enter the prompt, so reloading next turn is fine.
-    // Discovered before endpoint resolution so every exit path, including the
-    // early provider failure below, can still fire turn_end.
-    let hooks = Hooks::discover(project_root);
+    // Discovered once per turn start; empty dirs/files are a cheap no-op.
+    // Permissions never enter the prompt, so reloading next turn is fine.
     let permissions = Permissions::discover(project_root);
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
@@ -755,7 +851,18 @@ async fn run_loop(
             context_tokens.saturating_sub(max_tokens + 1024),
         );
         if let Some(digest) = compaction {
-            let record = digest.to_record();
+            // Upgrade the heuristic note to a model-written summary when the
+            // endpoint cooperates; the note at index 2 was just inserted by
+            // enforce_budget, so replacing it here keeps one digest message.
+            let mut note = digest.format();
+            if let Some(summary) = summarize_compaction(&client, &digest, &cancelled).await {
+                note = digest.format_with_summary(&summary);
+                let messages = guard.messages();
+                if messages.len() > 2 && is_digest_message(&messages[2]) {
+                    messages[2] = ChatMessage::user(note.clone());
+                }
+            }
+            let record = digest.to_record(note);
             sessions::append_compaction(core, session_id, &record);
             if let Ok(value) = serde_json::to_value(&record) {
                 hooks.compaction(session_id, project_root, &value, &cancelled).await;
@@ -1819,6 +1926,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// user_prompt_submit blocks before the message enters the transcript,
+    /// and the turn ends with stop_reason "blocked" (no model call).
+    #[tokio::test]
+    async fn user_prompt_submit_blocks_before_transcript() {
+        use crate::state::{Core, CoreEvent};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone());
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("gate.sh");
+        {
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(b"#!/bin/sh\necho 'blocked by policy'; exit 1\n").unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        std::fs::write(
+            hooks_dir.join("gate.toml"),
+            format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\n", script.display()),
+        )
+        .unwrap();
+        crate::hooks::invalidate_hooks_cache();
+
+        let id = "sess-blocked";
+        // Pre-seed a system-only session so we can assert the blocked text
+        // never lands in the transcript.
+        {
+            let data = build_session_data(&core, id, &project);
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        start_turn(core.clone(), id.into(), project.clone(), "should not land".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut stop = None;
+        let mut saw_error = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(CoreEvent::Agent(env))) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Error { message } => {
+                        assert!(message.contains("input blocked"), "{message}");
+                        saw_error = true;
+                    }
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_error, "must emit an Error with the block reason");
+        assert_eq!(stop.as_deref(), Some("blocked"));
+        let messages = core.sessions.lock().await.get(id).unwrap().messages.clone();
+        assert!(
+            messages.iter().all(|m| m.content.as_deref() != Some("should not land")),
+            "blocked text must not enter the transcript: {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Every turn exit fires turn_end, including the early provider-failure
     /// return that never reaches the main loop.
     #[tokio::test]
@@ -1853,14 +2028,13 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut saw_done = false;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                Ok(Some(CoreEvent::Agent(env))) => {
-                    if matches!(env.event, AgentEvent::Done { .. }) {
-                        saw_done = true;
-                        break;
-                    }
+            if let Ok(Some(CoreEvent::Agent(env))) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                if matches!(env.event, AgentEvent::Done { .. }) {
+                    saw_done = true;
+                    break;
                 }
-                _ => {}
             }
         }
         assert!(saw_done, "early provider failure must still emit Done");
@@ -1978,6 +2152,28 @@ mod tests {
             .count();
         assert_eq!(digest_count, 1, "only one digest note may exist");
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
+    }
+
+    #[test]
+    fn digest_captures_dropped_text_for_summarization() {
+        let mut digest = CompactionDigest::new();
+        digest.record_message(&ChatMessage::user("implement the auth flow"));
+        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/auth.rs"}"#));
+        digest.record_message(&msg("tool", 5000));
+        let text = &digest.dropped_text;
+        assert!(text.contains("user: implement the auth flow"), "{text}");
+        assert!(text.contains("[called read_file"), "{text}");
+        // Per-message and total caps hold.
+        assert!(text.len() < MAX_DROPPED_TEXT_CHARS + 1000);
+        for _ in 0..100 {
+            digest.record_message(&msg("assistant", 500));
+        }
+        assert!(digest.dropped_text.len() < MAX_DROPPED_TEXT_CHARS + 1000, "total cap must hold");
+
+        let note = digest.format_with_summary("Was wiring auth middleware; src/auth.rs half-edited.");
+        assert!(note.starts_with(DIGEST_PREFIX));
+        assert!(note.contains("Summary: Was wiring auth middleware"));
+        assert!(note.contains("src/auth.rs"));
     }
 
     #[test]
