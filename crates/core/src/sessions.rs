@@ -91,9 +91,10 @@ pub fn load_compaction(core: &Core, id: &str) -> Vec<CompactionRecord> {
         .collect()
 }
 
-/// Persist the registry frozen at session creation. Written once; skipped
-/// entirely for builtin-only sessions (absence means built-ins, which also
-/// covers every session that predates the extensibility layer).
+/// Persist the frozen registry (including its extension fingerprint).
+/// Written at session creation and rewritten on every re-freeze; absence
+/// means a session that predates manifests and resolves to built-ins until
+/// its first turn re-freezes it from disk.
 pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::RegistryManifest) {
     let Ok(json) = serde_json::to_string_pretty(manifest) else {
         return;

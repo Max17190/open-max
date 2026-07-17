@@ -1924,6 +1924,11 @@ impl App {
                     }
                 }
             }
+            AgentEvent::Refrozen { tools, skills } => {
+                self.note(&format!(
+                    "extensions changed on disk: re-frozen with {tools} tools, {skills} skills"
+                ));
+            }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
                 self.running_tool = None;

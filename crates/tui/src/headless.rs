@@ -93,7 +93,7 @@ pub async fn run(
 }
 
 /// Spin until the session is not marked running (or time out).
-async fn wait_until_idle(core: &Arc<Core>, session_id: &str) -> bool {
+pub(crate) async fn wait_until_idle(core: &Arc<Core>, session_id: &str) -> bool {
     if !core.is_running(session_id) {
         return true;
     }
@@ -217,6 +217,11 @@ async fn run_turn_events(
                     exit_code = 1;
                 }
                 return exit_code;
+            }
+            AgentEvent::Refrozen { tools, skills } => {
+                if !json {
+                    let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills)");
+                }
             }
             AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }

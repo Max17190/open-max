@@ -126,9 +126,9 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - New tool: .openmax/tools/<name>.toml with name, description, params (JSON schema), command, args, mutating.\n\
 - New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
 - Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
-- Hook: .openmax/hooks/<name>.toml with event pre_tool_use (exit nonzero blocks), post_tool_use, session_start, or compaction.\n\
+- Hook: .openmax/hooks/<name>.toml with event pre_tool_use (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end.\n\
 - Permission rules: .openmax/permissions.toml with allow/deny/ask entries.\n\
-Tools and skills freeze per session: after writing one, ask the user to run /reload (keeps this conversation) or /new. Hooks, permissions, and templates apply on their next use.";
+A tool or skill you write is live on the next turn (the harness re-freezes automatically; /reload forces it now). Hooks, permissions, and templates apply on their next use.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file

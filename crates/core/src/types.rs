@@ -91,6 +91,9 @@ pub enum AgentEvent {
         /// `approved` | `declined` | `timed_out` | `cancelled`
         outcome: String,
     },
+    /// The session's tools, skills, and system prompt were re-frozen from
+    /// current config (extension files changed, or the user forced /reload).
+    Refrozen { tools: usize, skills: usize },
     Done { stop_reason: String },
     Error { message: String },
 }
