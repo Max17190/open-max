@@ -29,6 +29,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "", "pick an earlier session in this project"),
     ("tools", "", "list tools frozen for this session"),
     ("skills", "", "list skills frozen for this session"),
+    ("reload", "", "re-freeze tools, skills, and prompt from current config"),
     ("context", "", "prompt token costs, cache hits, and budget"),
     ("status", "", "session, endpoint, and network destinations"),
     ("logs", "", "recent model server logs"),
@@ -93,8 +94,9 @@ pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, 
     if first_row && start == 0 {
         if let Some(query) = token.strip_prefix('/') {
             // Past the command name (a space would end the token) argument
-            // hints take over; no completion inside arguments.
-            if query.chars().all(|c| c.is_ascii_alphanumeric()) {
+            // hints take over; no completion inside arguments. `-`/`_` cover
+            // prompt-template names like fix-issue.
+            if query.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                 return Some((Kind::Slash, start, query.to_string()));
             }
         }
@@ -105,9 +107,11 @@ pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, 
     None
 }
 
-/// Filtered slash-command items for `query` (text after the `/`).
-pub fn slash_items(query: &str) -> Vec<Item> {
-    COMMANDS
+/// Filtered slash-command items for `query` (text after the `/`): built-in
+/// commands first, then prompt templates (name, description). A template that
+/// shadows a built-in name is dropped; built-ins always win at dispatch too.
+pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
+    let mut items: Vec<Item> = COMMANDS
         .iter()
         .filter(|(name, _, _)| name.starts_with(query))
         .map(|(name, args, desc)| Item {
@@ -116,7 +120,24 @@ pub fn slash_items(query: &str) -> Vec<Item> {
             detail: if args.is_empty() { (*desc).to_string() } else { format!("{args} · {desc}") },
             submits: args.is_empty(),
         })
-        .collect()
+        .collect();
+    for (name, desc) in templates {
+        if !name.starts_with(query) || COMMANDS.iter().any(|(n, _, _)| n == name) {
+            continue;
+        }
+        items.push(Item {
+            // Templates may take arguments, so accepting never auto-submits.
+            insert: format!("/{name} "),
+            label: format!("/{name}"),
+            detail: if desc.is_empty() {
+                "prompt template".to_string()
+            } else {
+                format!("{desc} · template")
+            },
+            submits: false,
+        });
+    }
+    items
 }
 
 /// Fuzzy-filtered file items for `query` (text after the `@`).
@@ -282,13 +303,32 @@ mod tests {
 
     #[test]
     fn slash_items_filter_by_prefix() {
-        let items = slash_items("mo");
+        let items = slash_items("mo", &[]);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["/models", "/model"]);
         // Arg-taking commands insert a trailing space and do not submit.
         assert!(items[0].submits);
         assert_eq!(items[1].insert, "/model ");
         assert!(!items[1].submits);
+    }
+
+    #[test]
+    fn slash_items_append_templates_but_never_shadow_builtins() {
+        let templates = vec![
+            ("fix-issue".to_string(), "fix a GitHub issue".to_string()),
+            ("new".to_string(), "shadowed by the builtin".to_string()),
+        ];
+        let items = slash_items("", &templates);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"/fix-issue"));
+        assert_eq!(labels.iter().filter(|l| **l == "/new").count(), 1);
+        let tmpl = items.iter().find(|i| i.label == "/fix-issue").unwrap();
+        assert_eq!(tmpl.insert, "/fix-issue ");
+        assert!(!tmpl.submits);
+        assert!(tmpl.detail.contains("template"));
+        // Prefix filtering applies to templates too.
+        assert!(slash_items("fix", &templates).iter().any(|i| i.label == "/fix-issue"));
+        assert!(!slash_items("zz", &templates).iter().any(|i| i.label == "/fix-issue"));
     }
 
     #[test]
@@ -313,7 +353,7 @@ mod tests {
     fn popup_selection_wraps() {
         let mut p = Popup {
             kind: Kind::Slash,
-            items: slash_items(""),
+            items: slash_items("", &[]),
             selected: 0,
             token_start: 0,
             token_len: 1,
@@ -328,7 +368,7 @@ mod tests {
     fn render_windows_around_selection() {
         let mut p = Popup {
             kind: Kind::Slash,
-            items: slash_items(""),
+            items: slash_items("", &[]),
             selected: 0,
             token_start: 0,
             token_len: 1,

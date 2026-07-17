@@ -139,6 +139,8 @@ pub struct App {
     /// Project files for @-mentions; rescanned when a fresh `@` opens.
     file_index: Option<Arc<Vec<String>>>,
     file_index_pending: bool,
+    /// Prompt templates as (name, description); rescanned when a fresh `/` opens.
+    templates: Vec<(String, String)>,
     /// Messages typed while the agent works, sent in order after the turn.
     queued: Vec<String>,
     flush_queue: bool,
@@ -227,6 +229,7 @@ pub async fn run(
         scroll_search_last: None,
         file_index: None,
         file_index_pending: false,
+        templates: Vec::new(),
         queued: Vec::new(),
         flush_queue: false,
         running: false,
@@ -1091,8 +1094,16 @@ impl App {
                     // just wrote show up; the old index serves meanwhile.
                     self.refresh_file_index();
                 }
+                if kind == completion::Kind::Slash && self.completion.is_none() {
+                    // A fresh `/` rescans templates (two small dirs) so one
+                    // the agent just wrote shows up immediately.
+                    self.templates = open_max_core::templates::discover(&self.project)
+                        .into_iter()
+                        .map(|t| (t.name, t.description))
+                        .collect();
+                }
                 let items = match kind {
-                    completion::Kind::Slash => completion::slash_items(&query),
+                    completion::Kind::Slash => completion::slash_items(&query, &self.templates),
                     completion::Kind::File => match &self.file_index {
                         Some(files) => completion::file_items(files, &query),
                         None => Vec::new(),
@@ -1280,10 +1291,27 @@ impl App {
     // ---------- submission and slash commands ----------
 
     async fn handle_submit(&mut self, text: String) -> std::io::Result<()> {
-        if let Some(cmd) = text.strip_prefix('/') {
-            self.slash(cmd).await;
-            return Ok(());
-        }
+        let text = if let Some(cmd) = text.strip_prefix('/') {
+            let head = cmd.split_whitespace().next().unwrap_or("");
+            let builtin = head == "exit"
+                || completion::COMMANDS.iter().any(|(name, _, _)| *name == head);
+            // Built-ins win; anything else may be a prompt template, whose
+            // expansion submits as a normal user message.
+            let expanded = if builtin {
+                None
+            } else {
+                open_max_core::templates::expand_invocation(&self.project, cmd)
+            };
+            match expanded {
+                Some(expanded) => expanded,
+                None => {
+                    self.slash(cmd).await;
+                    return Ok(());
+                }
+            }
+        } else {
+            text
+        };
         if self.running {
             // Queue instead of refusing: the message goes out, in order, as
             // soon as the current turn finishes. Esc cancels and hands the
@@ -1494,6 +1522,18 @@ impl App {
                     self.mode = Mode::Sessions;
                 }
             }
+            "reload" => match &self.session_id {
+                None => self.note("no session yet; a new session always freezes the current config"),
+                Some(id) => {
+                    let id = id.clone();
+                    match agent::reload_session(&self.core, &id, &self.project).await {
+                        Ok((tools, skills)) => self.note(&format!(
+                            "re-frozen: {tools} tools, {skills} skills (prompt cache will re-prefill once)"
+                        )),
+                        Err(e) => self.error(&e),
+                    }
+                }
+            },
             "new" => {
                 let old_id = self.session_id.clone();
                 self.reset_for_new_session();
@@ -1660,7 +1700,9 @@ impl App {
                 }
             }
             "quit" | "exit" => self.should_quit = true,
-            other => self.note(&format!("unknown command: /{other} (see /help)")),
+            other => self.note(&format!(
+                "unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)"
+            )),
         }
     }
 
@@ -2635,6 +2677,8 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("/resume", "pick an earlier session in this project"),
     ("/tools", "list tools frozen for this session"),
     ("/skills", "list skills frozen for this session"),
+    ("/reload", "re-freeze tools, skills, and prompt from current config"),
+    ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),
     ("/context", "prompt token costs, cache hits, and budget"),
     ("/status", "session, endpoint, and network destinations"),
     ("/logs", "recent model server logs"),

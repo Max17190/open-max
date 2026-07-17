@@ -1,6 +1,8 @@
 //! Process lifecycle hooks: optional external commands that gate or observe
-//! tool calls. Empty discovery costs almost nothing (one directory list).
-//! Hooks never change tool schemas and never inject text into the model.
+//! agent lifecycle events. `pre_tool_use` can block a tool; `post_tool_use`,
+//! `session_start` (a session's first turn), and `compaction` (context was
+//! pruned) observe only. Empty discovery costs almost nothing (one directory
+//! list). Hooks never change tool schemas and never inject text into the model.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -22,6 +24,8 @@ const MAX_REASON_CHARS: usize = 500;
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    SessionStart,
+    Compaction,
 }
 
 impl HookEvent {
@@ -29,6 +33,8 @@ impl HookEvent {
         match self {
             HookEvent::PreToolUse => "pre_tool_use",
             HookEvent::PostToolUse => "post_tool_use",
+            HookEvent::SessionStart => "session_start",
+            HookEvent::Compaction => "compaction",
         }
     }
 
@@ -36,6 +42,8 @@ impl HookEvent {
         match s.trim() {
             "pre_tool_use" => Some(HookEvent::PreToolUse),
             "post_tool_use" => Some(HookEvent::PostToolUse),
+            "session_start" => Some(HookEvent::SessionStart),
+            "compaction" => Some(HookEvent::Compaction),
             _ => None,
         }
     }
@@ -57,6 +65,8 @@ pub struct HookSpec {
 pub struct Hooks {
     pre: Vec<HookSpec>,
     post: Vec<HookSpec>,
+    session_start: Vec<HookSpec>,
+    compaction: Vec<HookSpec>,
 }
 
 use std::sync::{Mutex, OnceLock};
@@ -139,6 +149,8 @@ fn discover_uncached(project_root: &Path) -> Hooks {
         match spec.event {
             HookEvent::PreToolUse => hooks.pre.push(spec),
             HookEvent::PostToolUse => hooks.post.push(spec),
+            HookEvent::SessionStart => hooks.session_start.push(spec),
+            HookEvent::Compaction => hooks.compaction.push(spec),
         }
     }
     hooks
@@ -169,7 +181,10 @@ impl Hooks {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pre.is_empty() && self.post.is_empty()
+        self.pre.is_empty()
+            && self.post.is_empty()
+            && self.session_start.is_empty()
+            && self.compaction.is_empty()
     }
 
     pub fn pre_count(&self) -> usize {
@@ -193,7 +208,8 @@ impl Hooks {
             if !hook.matches(tool) {
                 continue;
             }
-            match run_hook(hook, session_id, tool, args, cwd, None, cancel).await {
+            let payload = tool_payload(hook, session_id, tool, args, cwd, None);
+            match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
                 HookRun::Block(reason) => return PreToolResult::Block { reason },
                 HookRun::Cancelled => {
@@ -220,18 +236,62 @@ impl Hooks {
             if !hook.matches(tool) {
                 continue;
             }
-            let _ = run_hook(
-                hook,
-                session_id,
-                tool,
-                args,
-                cwd,
-                Some(tool_ok),
-                cancel,
-            )
-            .await;
+            let payload = tool_payload(hook, session_id, tool, args, cwd, Some(tool_ok));
+            let _ = run_hook(hook, payload, cwd, cancel).await;
         }
     }
+
+    /// Run `session_start` hooks (a session's first turn). Observe only:
+    /// failures are ignored and nothing enters the model context.
+    pub async fn session_start(&self, session_id: &str, cwd: &Path, cancel: &Arc<CancelToken>) {
+        for hook in &self.session_start {
+            let payload = serde_json::json!({
+                "event": hook.event.as_str(),
+                "session_id": session_id,
+                "cwd": cwd.display().to_string(),
+            });
+            let _ = run_hook(hook, payload, cwd, cancel).await;
+        }
+    }
+
+    /// Run `compaction` hooks after context was pruned, with the same digest
+    /// record that was persisted. Observe only.
+    pub async fn compaction(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        record: &Value,
+        cancel: &Arc<CancelToken>,
+    ) {
+        for hook in &self.compaction {
+            let payload = serde_json::json!({
+                "event": hook.event.as_str(),
+                "session_id": session_id,
+                "cwd": cwd.display().to_string(),
+                "record": record,
+            });
+            let _ = run_hook(hook, payload, cwd, cancel).await;
+        }
+    }
+}
+
+/// The stdin payload for tool-scoped events, shared by pre and post.
+fn tool_payload(
+    hook: &HookSpec,
+    session_id: &str,
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    tool_ok: Option<bool>,
+) -> Value {
+    serde_json::json!({
+        "event": hook.event.as_str(),
+        "session_id": session_id,
+        "tool": tool,
+        "args": args,
+        "cwd": cwd.display().to_string(),
+        "tool_ok": tool_ok,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -304,24 +364,13 @@ fn parse_hook_file(path: &Path) -> Option<HookSpec> {
 
 async fn run_hook(
     hook: &HookSpec,
-    session_id: &str,
-    tool: &str,
-    args: &Value,
+    payload: Value,
     cwd: &Path,
-    tool_ok: Option<bool>,
     cancel: &Arc<CancelToken>,
 ) -> HookRun {
     if cancel.is_cancelled() {
         return HookRun::Cancelled;
     }
-    let payload = serde_json::json!({
-        "event": hook.event.as_str(),
-        "session_id": session_id,
-        "tool": tool,
-        "args": args,
-        "cwd": cwd.display().to_string(),
-        "tool_ok": tool_ok,
-    });
     let stdin_json = payload.to_string();
 
     let mut cmd = Command::new(&hook.command);
@@ -516,6 +565,52 @@ tool = "bash"
             .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
             .await;
         assert_eq!(allow, PreToolResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn session_start_and_compaction_hooks_observe_via_stdin() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // Each hook copies its stdin payload to a marker file; observe-only
+        // means a nonzero exit must not disturb the caller either way.
+        let start_script = write_script(
+            &tmp,
+            "start.sh",
+            &format!("#!/bin/sh\ncat > {}/start.json\nexit 1\n", tmp.display()),
+        );
+        let compact_script = write_script(
+            &tmp,
+            "compact.sh",
+            &format!("#!/bin/sh\ncat > {}/compact.json\n", tmp.display()),
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "start.toml",
+            &format!("event = \"session_start\"\ncommand = \"{}\"\n", start_script.display()),
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "compact.toml",
+            &format!("event = \"compaction\"\ncommand = \"{}\"\n", compact_script.display()),
+        );
+        let hooks = Hooks::discover(&tmp);
+        assert!(!hooks.is_empty());
+        let cancel = Arc::new(CancelToken::default());
+
+        hooks.session_start("sess", &tmp, &cancel).await;
+        let start: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("start.json")).unwrap()).unwrap();
+        assert_eq!(start["event"], "session_start");
+        assert_eq!(start["session_id"], "sess");
+
+        let record = serde_json::json!({"message_count": 7, "digest": "d"});
+        hooks.compaction("sess", &tmp, &record, &cancel).await;
+        let compact: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("compact.json")).unwrap())
+                .unwrap();
+        assert_eq!(compact["event"], "compaction");
+        assert_eq!(compact["record"]["message_count"], 7);
     }
 
     #[tokio::test]
