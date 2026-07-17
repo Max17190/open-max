@@ -15,7 +15,7 @@ Use when a broad "where is X / how does Y work" search would flood the main sess
 
 ## When work is too large for one context
 
-Spawn a **second process**, not a nested agent tool:
+Spawn a **second process**, not a nested agent product:
 
 ```sh
 # interactive pane (tmux or second terminal)
@@ -37,6 +37,5 @@ openmax -p "Map how auth middleware is registered; list key files and a short fl
 
 ## Do not
 
-- Invent extra nested-agent products beyond what the stock registry already exposes.
-- Prefer this skill’s workflow over the built-in `task` tool when both are available (process isolation vs nested model loop).
+- Invent nested-agent products in the core or as stock tools.
 - Start background bash job control as a harness feature; use a second terminal or tmux pane instead.

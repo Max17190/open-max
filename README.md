@@ -123,7 +123,24 @@ Full instructions, checklists, commands...
 
 **Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` can block a tool; `post_tool_use` observes only. Hooks never enter the model prompt.
 
-Tools and skills are discovered once at session start and frozen for that session. Changes apply on `/new`. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
+**Permissions.** Optional rules under `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty discovery is free. First match wins. Order: hooks pre → permissions → `approval_mode` → execute → hooks post. If a permissions file exists but is invalid, every tool is denied (fail closed).
+
+```toml
+# .openmax/permissions.toml
+[[rules]]
+effect = "deny"
+tool = "bash"
+arg_regex = "rm\\s+-rf"
+
+[[rules]]
+effect = "allow"
+tool = "bash"
+arg_regex = "^cargo (test|check|build)"
+```
+
+`effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional: command for `bash`, path for file tools, pattern for `glob`/`grep`. For custom tools it matches the full serialized JSON arguments. Omit `arg_regex` (or leave it empty) to match every call of that tool.
+
+Tools and skills are discovered once at session start and frozen for that session. Changes apply on `/new`. Hooks and permissions re-discover each turn. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 
 ## Privacy
 
