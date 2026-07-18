@@ -13,7 +13,7 @@ repository = "https://github.com/Max17190/open-max"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Only the runtime pieces the harness uses; "full" would drag in the rest.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 regex = "1"
@@ -23,6 +23,7 @@ similar = "2"
 uuid = { version = "1", features = ["v4"] }
 # Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+libc = "0.2"
 
 # Lean, fast binaries: thin LTO and symbol stripping keep the harness tiny so
 # the model gets the machine.

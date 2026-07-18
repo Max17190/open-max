@@ -9,8 +9,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test-and-build:
-    runs-on: ubuntu-latest
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +26,18 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  release-build:
+    name: Release build (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
         run: cargo build --release -p open-max-tui --locked

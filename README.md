@@ -13,10 +13,10 @@ You own the endpoints, the tools, the skills, and the context.
 
 - **Small by default.** Seven built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and `bash`. Short system prompt; old tool output is dropped before your task is, and dropped context is summarized by your own model into a compact note (heuristic digest as fallback).
 - **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch model and provider together with `/model`. `/provider` and the provider CLI option remain available for direct provider changes. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
-- **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools.
+- **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; the harness re-freezes automatically on the next turn, so a tool the agent writes is a tool the agent uses.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
-- **Local sessions.** Conversation state lives under `~/.openmax/`. Network goes only to the model endpoint you configure (plus Hugging Face if you use managed model download).
+- **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure, plus Hugging Face if you use managed model download. Native child processes can make their own network connections with the host authority Open Max inherits.
 
 ## Install
 
@@ -124,7 +124,7 @@ For a full interactive session over pipes, `openmax --stdio` speaks JSONL both w
 
 With nothing installed, extensions cost zero tokens. Project paths win over global ones on name collision.
 
-**Tools.** A TOML file in `.openmax/tools/` or `~/.openmax/tools/`. The harness runs `command`, writes JSON args to stdin, and returns stdout.
+**Tools.** A TOML file in `.openmax/tools/` or `~/.openmax/tools/`. The harness runs `command`, writes JSON args to stdin, and returns stdout. These native processes inherit the host filesystem, environment, credentials, and network access of Open Max.
 
 ```toml
 # .openmax/tools/todo_scan.toml
@@ -140,6 +140,8 @@ type = "object"
 type = "string"
 description = "Directory to scan"
 ```
+
+`mutating` is trusted metadata for scheduling and approval behavior. It is not a security boundary and does not restrict what the command can do.
 
 **Skills.** A directory with `SKILL.md` under `.agents/skills/` or `~/.openmax/skills/`. Only `name` and `description` live in the prompt; the model reads the full file when needed.
 
@@ -164,7 +166,7 @@ Fetch issue $1 with `gh issue view $1`, reproduce it, fix it, and add a test.
 
 Run it as `/fix-issue 42`.
 
-**Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` and `user_prompt_submit` can block (nonzero exit; the blocked prompt never reaches the model); `post_tool_use`, `session_start` (a session's first turn), `compaction` (context was pruned; receives the digest record), and `turn_end` (receives the stop reason, fires even on cancel) observe only. Each hook gets one JSON payload on stdin. Hooks never enter the model prompt.
+**Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` and `user_prompt_submit` can block (nonzero exit; the blocked prompt never reaches the model); `post_tool_use`, `session_start` (a session's first turn), `compaction` (context was pruned; receives the digest record), and `turn_end` (receives the stop reason, fires even on cancel) observe only. Each hook gets one JSON payload on stdin. Hooks never enter the model prompt and, like external tools and `bash`, run as native host processes with inherited filesystem, environment, credentials, and network access.
 
 **Permissions.** Optional rules under `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty discovery is free. First match wins. Order: hooks pre → permissions → `approval_mode` → execute → hooks post. If a permissions file exists but is invalid, every tool is denied (fail closed).
 
@@ -187,14 +189,16 @@ arg_regex = "^cargo (test|check|build)"
 
 Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically: at each turn start it fingerprints the extension files, and if anything changed it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). An unchanged disk costs nothing. `/reload` forces it immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 
-## Privacy
+## Native execution and privacy
 
-Open Max does not phone home. The only network destinations are:
+The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
+
+Open Max itself does not phone home. Apart from native child processes, the harness only contacts:
 
 1. The model endpoint in `base_url` (your choice).
 2. Hugging Face, only when you download or serve a model through `/models`.
 
-Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists destinations and detailed runtime information. The persistent status line stays limited to model, context use, and approval mode so the transcript remains readable. External tools you install may open their own network connections.
+Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists the destinations configured by the harness and detailed runtime information; it does not enforce or enumerate child-process network access. The persistent status line stays limited to model, context use, and approval mode so the transcript remains readable. External tools you install may open their own network connections.
 
 ## stdio protocol (`openmax-stdio/1`)
 

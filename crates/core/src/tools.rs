@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
+use crate::execution::{
+    self, CaptureSpec, ProcessError, ProcessOutput, ProcessRequest, StdinMode, Termination,
+};
 use crate::state::CancelToken;
 
 use serde_json::{json, Value};
@@ -745,11 +747,9 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(out)
 }
 
-/// Truncate oversized command output keeping the TAIL: build and test failures
-/// live at the end, and losing them forces the model to re-run the command.
-/// The full output is spilled to a log file the model can grep or tail.
-pub(crate) fn truncate_command_output(text: &str, max_bytes: usize) -> String {
-    let spilled = spill_command_output(text);
+/// Truncate text for command rendering while keeping its tail. The process
+/// supervisor owns any bounded spill log; this helper never writes files.
+fn truncate_rendered_command_output(text: &str, max_bytes: usize, log_path: Option<&PathBuf>) -> String {
     let mut start = text.len() - max_bytes;
     while !text.is_char_boundary(start) {
         start += 1;
@@ -760,9 +760,9 @@ pub(crate) fn truncate_command_output(text: &str, max_bytes: usize) -> String {
             start += nl + 1;
         }
     }
-    let note = match spilled {
+    let note = match log_path {
         Some(path) => format!(
-            "[start of output truncated; full output saved to {} — tail or grep it with bash]",
+            "[start of output truncated; bounded output log saved to {}; tail or grep it with bash]",
             path.display()
         ),
         None => "[start of output truncated]".to_string(),
@@ -770,14 +770,48 @@ pub(crate) fn truncate_command_output(text: &str, max_bytes: usize) -> String {
     format!("{note}\n…{}", &text[start..])
 }
 
-/// Write the complete output of an oversized command to the data dir so it
-/// stays inspectable after truncation. Best effort: None if it cannot be saved.
-fn spill_command_output(text: &str) -> Option<PathBuf> {
-    let dir = crate::state::default_data_dir().join("cmd-logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("cmd-{}.log", uuid::Uuid::new_v4()));
-    std::fs::write(&path, text).ok()?;
-    Some(path)
+fn captured_text(stream: &execution::CapturedStream) -> String {
+    String::from_utf8_lossy(&stream.rendered_bytes()).into_owned()
+}
+
+fn stream_was_truncated(stream: &execution::CapturedStream) -> bool {
+    stream.total_bytes > stream.head.len().saturating_add(stream.tail.len()) as u64
+}
+
+/// Format native-process output identically for bash and external tools.
+/// The supervisor has already bounded each stream and owns any spill log.
+pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) -> String {
+    let mut text = captured_text(&output.stdout);
+    let stderr = captured_text(&output.stderr);
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr]\n");
+        text.push_str(&stderr);
+    }
+
+    let needs_notice = output.log_truncated
+        || stream_was_truncated(&output.stdout)
+        || stream_was_truncated(&output.stderr)
+        || text.len() > max_bytes;
+    if text.len() > max_bytes {
+        text = truncate_rendered_command_output(&text, max_bytes, output.log_path.as_ref());
+    } else if needs_notice {
+        if let Some(path) = &output.log_path {
+            text = format!(
+                "[start of output truncated; bounded output log saved to {}; tail or grep it with bash]\n…{text}",
+                path.display()
+            );
+        } else {
+            text = format!("[start of output truncated]\n…{text}");
+        }
+    }
+    if text.trim().is_empty() {
+        "(no output)".into()
+    } else {
+        text
+    }
 }
 
 async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<CancelToken>) -> ToolOutcome {
@@ -790,63 +824,35 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<Canc
         .into_iter()
         .find(|p| Path::new(p).exists())
         .unwrap_or("/bin/sh");
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg("-lc")
-        .arg(command)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return ToolOutcome::err(format!("failed to spawn shell: {e}")),
+    let request = ProcessRequest {
+        program: shell.into(),
+        args: vec!["-lc".into(), command.into()],
+        cwd: root.to_path_buf(),
+        stdin: StdinMode::Null,
+        timeout: std::time::Duration::from_secs(timeout_secs),
+        capture: CaptureSpec {
+            head_bytes: 0,
+            tail_bytes: caps.command_bytes,
+            spill_dir: Some(crate::state::default_data_dir().join("cmd-logs")),
+            spill_bytes_per_stream: 16 * 1024 * 1024,
+        },
     };
-    let mut child_slot = Some(child);
-    tokio::select! {
-        _ = cancel.cancelled() => {
-            if let Some(mut c) = child_slot.take() {
-                let _ = c.kill().await;
-            }
-            ToolOutcome::err("command cancelled by user")
-        }
-        _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
-            if let Some(mut c) = child_slot.take() {
-                let _ = c.kill().await;
-            }
-            ToolOutcome::err(format!("command timed out after {timeout_secs}s"))
-        }
-        output = async {
-            child_slot.take().expect("child taken twice").wait_with_output().await
-        } => {
-            match output {
-                Err(e) => ToolOutcome::err(format!("command failed: {e}")),
-                Ok(output) => {
-                    let mut text = String::new();
-                    text.push_str(&String::from_utf8_lossy(&output.stdout));
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.trim().is_empty() {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str("[stderr]\n");
-                        text.push_str(&stderr);
-                    }
-                    if text.len() > caps.command_bytes {
-                        text = truncate_command_output(&text, caps.command_bytes);
-                    }
-                    if text.trim().is_empty() {
-                        text = "(no output)".into();
-                    }
-                    let code = output.status.code().unwrap_or(-1);
-                    if output.status.success() {
-                        ToolOutcome::ok(text)
-                    } else {
-                        ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
-                    }
+    match execution::run_process(request, cancel).await {
+        Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
+        Err(ProcessError::Wait(e)) => ToolOutcome::err(format!("command failed: {e}")),
+        Ok(output) => match &output.termination {
+            Termination::Cancelled => ToolOutcome::err("command cancelled by user"),
+            Termination::TimedOut => ToolOutcome::err(format!("command timed out after {timeout_secs}s")),
+            Termination::Exited(status) => {
+                let text = render_process_output(&output, caps.command_bytes);
+                if status.success() {
+                    ToolOutcome::ok(text)
+                } else {
+                    let code = status.code().unwrap_or(-1);
+                    ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
                 }
             }
-        }
+        },
     }
 }
 
@@ -931,11 +937,80 @@ mod tests {
             text.push_str(&format!("line number {i} with some padding text\n"));
         }
         assert!(text.len() > MAX_OUTPUT_BYTES);
-        let kept = truncate_command_output(&text, MAX_OUTPUT_BYTES);
+        let kept = truncate_rendered_command_output(&text, MAX_OUTPUT_BYTES, None);
         assert!(kept.len() < text.len());
         assert!(kept.contains("line number 3999"), "the end of the output must survive");
         assert!(!kept.contains("line number 0 "), "the head is what gets dropped");
         assert!(kept.starts_with("[start of output truncated"), "{}", &kept[..120]);
+    }
+
+    fn rendered_output(
+        stdout: execution::CapturedStream,
+        stderr: execution::CapturedStream,
+        log_path: Option<PathBuf>,
+        log_truncated: bool,
+    ) -> ProcessOutput {
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .unwrap();
+        ProcessOutput {
+            termination: Termination::Exited(status),
+            stdout,
+            stderr,
+            log_path,
+            log_truncated,
+        }
+    }
+
+    fn stream(total_bytes: u64, head: &[u8], tail: &[u8]) -> execution::CapturedStream {
+        execution::CapturedStream {
+            total_bytes,
+            head: head.to_vec(),
+            tail: tail.to_vec(),
+        }
+    }
+
+    #[test]
+    fn process_renderer_does_not_duplicate_overlapping_head_and_tail() {
+        let output = rendered_output(stream(3, b"ab", b"abc"), stream(0, b"", b""), None, false);
+        assert_eq!(render_process_output(&output, 100), "abc");
+    }
+
+    #[test]
+    fn process_renderer_labels_stderr_after_stdout() {
+        let output = rendered_output(
+            stream(6, b"", b"stdout"),
+            stream(6, b"", b"stderr"),
+            None,
+            false,
+        );
+        assert_eq!(render_process_output(&output, 100), "stdout\n[stderr]\nstderr");
+    }
+
+    #[test]
+    fn process_renderer_marks_truncated_capture_without_log() {
+        let output = rendered_output(stream(100, b"", b"tail"), stream(0, b"", b""), None, false);
+        let text = render_process_output(&output, 100);
+        assert!(text.starts_with("[start of output truncated]"), "{text}");
+        assert!(text.ends_with("tail"), "{text}");
+    }
+
+    #[test]
+    fn process_renderer_points_to_bounded_log_when_available() {
+        let path = PathBuf::from("/tmp/openmax-command.log");
+        let output = rendered_output(
+            stream(100, b"", b"tail"),
+            stream(0, b"", b""),
+            Some(path),
+            false,
+        );
+        let text = render_process_output(&output, 100);
+        assert!(
+            text.contains("bounded output log saved to /tmp/openmax-command.log"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

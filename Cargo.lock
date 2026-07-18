@@ -1203,6 +1203,7 @@ dependencies = [
  "futures-util",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "serde",
