@@ -37,10 +37,38 @@ struct Block {
     cache_width: u16,
     cache_folded: bool,
     cache: Vec<Line<'static>>,
+    cache_maps: Vec<Option<CachedLineMap>>,
+    selectable: String,
+    selectable_chars: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedLineMap {
+    /// Character offsets into `Block::selectable_text`.
+    start: usize,
+    end: usize,
+    /// Terminal column where selectable content starts after UI gutters.
+    x_offset: usize,
+    text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPoint {
+    pub block: usize,
+    pub offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextSelection {
+    anchor: TextPoint,
+    head: TextPoint,
+    dragging: bool,
 }
 
 impl Block {
     fn new(kind: BlockKind, raw: Vec<Line<'static>>) -> Self {
+        let selectable = lines_to_plain(&raw);
+        let selectable_chars = selectable.chars().count();
         Self {
             kind,
             raw,
@@ -50,10 +78,15 @@ impl Block {
             cache_width: 0,
             cache_folded: false,
             cache: Vec::new(),
+            cache_maps: Vec::new(),
+            selectable,
+            selectable_chars,
         }
     }
 
     fn tool(compact: Vec<Line<'static>>, full_output: String) -> Self {
+        let selectable = lines_to_plain(&compact);
+        let selectable_chars = selectable.chars().count();
         let header = compact
             .first()
             .cloned()
@@ -69,7 +102,9 @@ impl Block {
         if total > 80 {
             full_lines.push(Line::from(Span::styled(
                 format!("  … {} more lines", total - 80),
-                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme::DIM())
+                    .add_modifier(Modifier::ITALIC),
             )));
         }
         Self {
@@ -81,6 +116,9 @@ impl Block {
             cache_width: 0,
             cache_folded: true,
             cache: Vec::new(),
+            cache_maps: Vec::new(),
+            selectable,
+            selectable_chars,
         }
     }
 
@@ -99,20 +137,49 @@ impl Block {
         }
         self.cache_width = width;
         self.cache_folded = self.folded;
-        let mut wrapped = wrap_lines(self.source_lines(), width);
-        if self.folded && self.compact.is_some() {
-            wrapped.push(Line::from(Span::styled(
-                "  ⋯ enter expand · y copy",
-                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-            )));
+        self.selectable = lines_to_plain(self.source_lines());
+        self.selectable_chars = self.selectable.chars().count();
+        let gutter = match self.kind {
+            BlockKind::User | BlockKind::Assistant | BlockKind::Tool => 2,
+            BlockKind::Thinking | BlockKind::System => 0,
+        };
+        let content_width = width.saturating_sub(gutter).max(8);
+        let (wrapped, maps) = wrap_lines_mapped(self.source_lines(), content_width);
+        self.cache.clear();
+        self.cache_maps.clear();
+        for (i, (line, map)) in wrapped.into_iter().zip(maps).enumerate() {
+            let (line, x_offset) = decorate_line(self.kind, line, i == 0, width);
+            self.cache.push(line);
+            self.cache_maps.push(map.map(|mut map| {
+                map.x_offset = x_offset;
+                map
+            }));
         }
-        wrapped.push(Line::default());
-        self.cache = wrapped;
+        if self.folded && self.compact.is_some() {
+            self.cache.push(surface_line(
+                Line::from(Span::styled(
+                    "  ⋯ enter expand · y copy",
+                    Style::default()
+                        .fg(theme::DIM())
+                        .add_modifier(Modifier::ITALIC),
+                )),
+                width,
+                theme::SURFACE(),
+            ));
+            self.cache_maps.push(None);
+        }
+        self.cache.push(Line::default());
+        self.cache_maps.push(None);
     }
 
     fn invalidate(&mut self) {
         self.cache_width = 0;
         self.cache.clear();
+        self.cache_maps.clear();
+    }
+
+    fn selectable_text(&self) -> &str {
+        &self.selectable
     }
 }
 
@@ -121,10 +188,12 @@ pub struct Transcript {
     blocks: Vec<Block>,
     wrapped: Vec<Line<'static>>,
     line_block: Vec<usize>,
+    line_maps: Vec<Option<CachedLineMap>>,
     block_starts: Vec<usize>,
     width: u16,
     offset: usize,
     selected: Option<usize>,
+    text_selection: Option<TextSelection>,
     dirty: bool,
 }
 
@@ -186,6 +255,22 @@ impl Transcript {
                 self.selected = Some(sel - 1);
             }
         }
+        if let Some(selection) = self.text_selection {
+            let (start, end) = normalized_selection(selection);
+            if i >= start.block && i <= end.block {
+                self.text_selection = None;
+            } else {
+                let retreat = |point: TextPoint| TextPoint {
+                    block: point.block.saturating_sub(usize::from(point.block > i)),
+                    offset: point.offset,
+                };
+                self.text_selection = Some(TextSelection {
+                    anchor: retreat(selection.anchor),
+                    head: retreat(selection.head),
+                    dragging: selection.dragging,
+                });
+            }
+        }
         self.dirty = true;
         self.ensure_flat();
         self.offset = self.offset.min(self.wrapped.len());
@@ -227,9 +312,19 @@ impl Transcript {
         }
     }
 
+    /// Theme changes affect cached line surfaces even when content and width
+    /// stay constant.
+    pub fn invalidate_styles(&mut self) {
+        for block in &mut self.blocks {
+            block.invalidate();
+        }
+        self.dirty = true;
+    }
+
     fn rebuild_flat(&mut self) {
         self.wrapped.clear();
         self.line_block.clear();
+        self.line_maps.clear();
         self.block_starts.clear();
         if self.width == 0 {
             self.dirty = false;
@@ -238,9 +333,10 @@ impl Transcript {
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             self.block_starts.push(self.wrapped.len());
             block.ensure_cache(self.width);
-            for line in &block.cache {
+            for (line, map) in block.cache.iter().zip(&block.cache_maps) {
                 self.wrapped.push(line.clone());
                 self.line_block.push(bi);
+                self.line_maps.push(map.clone());
             }
         }
         self.dirty = false;
@@ -253,9 +349,11 @@ impl Transcript {
         self.block_starts.push(self.wrapped.len());
         // Clone out of the block cache so we can extend disjoint flat tables.
         let lines = self.blocks[bi].cache.clone();
-        for line in lines {
+        let maps = self.blocks[bi].cache_maps.clone();
+        for (line, map) in lines.into_iter().zip(maps) {
             self.wrapped.push(line);
             self.line_block.push(bi);
+            self.line_maps.push(map);
         }
     }
 
@@ -282,8 +380,8 @@ impl Transcript {
 
     /// Clone history lines `[start, end)` into `out` once each.
     ///
-    /// When `selected_bi` is `Some`, lines belonging to that block get a
-    /// leading selection marker (same glyph as `draw_chat`).
+    /// When `selected_bi` is `Some`, lines belonging to that block receive a
+    /// quiet background. Text selection is painted later as a buffer overlay.
     pub fn fill_viewport(
         &mut self,
         out: &mut Vec<Line<'static>>,
@@ -298,8 +396,7 @@ impl Transcript {
         for idx in start..end {
             let mut line = self.wrapped[idx].clone();
             if selected_bi.is_some_and(|bi| self.line_block.get(idx) == Some(&bi)) {
-                line.spans
-                    .insert(0, Span::styled("▌", Style::default().fg(theme::ACCENT())));
+                line = surface_line(line, self.width, theme::BORDER());
             }
             out.push(line);
         }
@@ -372,7 +469,8 @@ impl Transcript {
             return;
         }
         let start = self.selected.map(|i| i + 1).unwrap_or(0);
-        if let Some(i) = (start..self.blocks.len()).find(|&i| self.blocks[i].kind == BlockKind::User)
+        if let Some(i) =
+            (start..self.blocks.len()).find(|&i| self.blocks[i].kind == BlockKind::User)
         {
             self.selected = Some(i);
             self.scroll_to_block(i);
@@ -456,6 +554,12 @@ impl Transcript {
         if self.blocks[i].folded {
             self.blocks[i].folded = false;
             self.blocks[i].invalidate();
+            if self
+                .text_selection
+                .is_some_and(|selection| selection_contains_block(selection, i))
+            {
+                self.text_selection = None;
+            }
             self.dirty = true;
             self.ensure_flat();
             true
@@ -473,6 +577,12 @@ impl Transcript {
         }
         block.folded = !block.folded;
         block.invalidate();
+        if self
+            .text_selection
+            .is_some_and(|selection| selection_contains_block(selection, i))
+        {
+            self.text_selection = None;
+        }
         self.dirty = true;
         self.ensure_flat();
         true
@@ -522,6 +632,12 @@ impl Transcript {
         {
             self.blocks[bi].folded = false;
             self.blocks[bi].invalidate();
+            if self
+                .text_selection
+                .is_some_and(|selection| selection_contains_block(selection, bi))
+            {
+                self.text_selection = None;
+            }
             self.dirty = true;
             self.ensure_flat();
         }
@@ -553,6 +669,129 @@ impl Transcript {
             .iter()
             .rev()
             .find_map(|b| b.full_output.as_deref())
+    }
+
+    pub fn last_assistant_text(&self) -> Option<String> {
+        self.blocks
+            .iter()
+            .rev()
+            .find(|block| block.kind == BlockKind::Assistant)
+            .map(|block| lines_to_plain(&block.raw))
+    }
+
+    pub fn has_text_selection(&self) -> bool {
+        self.text_selection
+            .is_some_and(|selection| selection.anchor != selection.head)
+    }
+
+    pub fn clear_text_selection(&mut self) -> bool {
+        self.text_selection.take().is_some()
+    }
+
+    pub fn begin_text_selection_at(&mut self, line_idx: usize, x: usize) -> bool {
+        let Some(point) = self.hit_test(line_idx, x) else {
+            return false;
+        };
+        self.text_selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+            dragging: true,
+        });
+        true
+    }
+
+    pub fn update_text_selection_at(&mut self, line_idx: usize, x: usize) -> bool {
+        let Some(point) = self.hit_test(line_idx, x) else {
+            return false;
+        };
+        let Some(selection) = &mut self.text_selection else {
+            return false;
+        };
+        selection.head = point;
+        true
+    }
+
+    pub fn finish_text_selection(&mut self) {
+        if let Some(selection) = &mut self.text_selection {
+            selection.dragging = false;
+            if selection.anchor == selection.head {
+                self.text_selection = None;
+            }
+        }
+    }
+
+    fn hit_test(&mut self, line_idx: usize, x: usize) -> Option<TextPoint> {
+        self.ensure_flat();
+        let block = *self.line_block.get(line_idx)?;
+        let map = self.line_maps.get(line_idx)?.as_ref()?;
+        let relative = x.saturating_sub(map.x_offset);
+        let offset = map.start + display_column_to_char_offset(&map.text, relative);
+        Some(TextPoint {
+            block,
+            offset: offset.min(map.end),
+        })
+    }
+
+    /// Highlight columns for an absolute wrapped history line.
+    pub fn selection_columns(&mut self, line_idx: usize) -> Option<(usize, usize)> {
+        self.ensure_flat();
+        let selection = self.text_selection?;
+        let (start, end) = normalized_selection(selection);
+        if start == end {
+            return None;
+        }
+        let block = *self.line_block.get(line_idx)?;
+        if block < start.block || block > end.block {
+            return None;
+        }
+        let map = self.line_maps.get(line_idx)?.as_ref()?;
+        let block_len = self.blocks.get(block)?.selectable_chars;
+        let range_start = if block == start.block {
+            start.offset
+        } else {
+            0
+        };
+        let range_end = if block == end.block {
+            end.offset
+        } else {
+            block_len
+        };
+        let local_start = range_start.max(map.start).min(map.end);
+        let local_end = range_end.min(map.end).max(map.start);
+        if local_start >= local_end {
+            return None;
+        }
+        let start_col =
+            map.x_offset + char_offset_to_display_column(&map.text, local_start - map.start);
+        let end_col =
+            map.x_offset + char_offset_to_display_column(&map.text, local_end - map.start);
+        Some((start_col, end_col.max(start_col + 1)))
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.text_selection?;
+        let (start, end) = normalized_selection(selection);
+        if start == end || start.block >= self.blocks.len() || end.block >= self.blocks.len() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for block_index in start.block..=end.block {
+            let block = &self.blocks[block_index];
+            let text = block.selectable_text();
+            let char_len = block.selectable_chars;
+            let from = if block_index == start.block {
+                start.offset.min(char_len)
+            } else {
+                0
+            };
+            let to = if block_index == end.block {
+                end.offset.min(char_len)
+            } else {
+                char_len
+            };
+            parts.push(slice_chars(text, from, to));
+        }
+        Some(parts.join("\n\n"))
     }
 
     /// Index of the nearest user block whose start is above `view_start_line`.
@@ -662,8 +901,17 @@ pub fn filter_matching_indices(texts: &[String], query: &str) -> Vec<usize> {
 /// Span-preserving word wrap. Greedy, breaking at the last space that fits;
 /// hard-breaks tokens longer than the width.
 pub fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    wrap_lines_mapped(lines, width).0
+}
+
+fn wrap_lines_mapped(
+    lines: &[Line<'static>],
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Option<CachedLineMap>>) {
     let width = width.max(8) as usize;
     let mut out = Vec::new();
+    let mut maps = Vec::new();
+    let mut logical_start = 0usize;
     for line in lines {
         let chars: Vec<(char, Style)> = line
             .spans
@@ -672,6 +920,13 @@ pub fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
             .collect();
         if chars.is_empty() {
             out.push(Line::default());
+            maps.push(Some(CachedLineMap {
+                start: logical_start,
+                end: logical_start,
+                x_offset: 0,
+                text: String::new(),
+            }));
+            logical_start += 1;
             continue;
         }
         let mut start = 0;
@@ -699,10 +954,115 @@ pub fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
                 }
             };
             out.push(rebuild(&chars[start..cut]));
+            maps.push(Some(CachedLineMap {
+                start: logical_start + start,
+                end: logical_start + cut,
+                x_offset: 0,
+                text: chars[start..cut].iter().map(|(ch, _)| ch).collect(),
+            }));
             start = cut;
         }
+        logical_start += chars.len() + 1;
     }
-    out
+    (out, maps)
+}
+
+fn decorate_line(
+    kind: BlockKind,
+    mut line: Line<'static>,
+    first: bool,
+    width: u16,
+) -> (Line<'static>, usize) {
+    match kind {
+        BlockKind::User => {
+            let prefix = if first { "❯ " } else { "  " };
+            line.spans.insert(
+                0,
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(theme::USER())
+                        .bg(theme::USER_BG())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+            (surface_line(line, width, theme::USER_BG()), 2)
+        }
+        BlockKind::Assistant => {
+            line.spans
+                .insert(0, Span::styled("│ ", Style::default().fg(theme::BORDER())));
+            (line, 2)
+        }
+        BlockKind::Tool => {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    "│ ",
+                    Style::default().fg(theme::ACCENT()).bg(theme::SURFACE()),
+                ),
+            );
+            (surface_line(line, width, theme::SURFACE()), 2)
+        }
+        BlockKind::Thinking | BlockKind::System => (line, 0),
+    }
+}
+
+fn surface_line(
+    mut line: Line<'static>,
+    width: u16,
+    background: ratatui::style::Color,
+) -> Line<'static> {
+    line.style = line.style.bg(background);
+    for span in &mut line.spans {
+        span.style = span.style.bg(background);
+    }
+    let used = line.width();
+    if used < width as usize {
+        line.spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().bg(background),
+        ));
+    }
+    line
+}
+
+fn normalized_selection(selection: TextSelection) -> (TextPoint, TextPoint) {
+    if selection.anchor <= selection.head {
+        (selection.anchor, selection.head)
+    } else {
+        (selection.head, selection.anchor)
+    }
+}
+
+fn selection_contains_block(selection: TextSelection, block: usize) -> bool {
+    let (start, end) = normalized_selection(selection);
+    block >= start.block && block <= end.block
+}
+
+fn display_column_to_char_offset(text: &str, column: usize) -> usize {
+    let mut used = 0usize;
+    for (index, ch) in text.chars().enumerate() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > column {
+            return index;
+        }
+        used += width;
+    }
+    text.chars().count()
+}
+
+fn char_offset_to_display_column(text: &str, offset: usize) -> usize {
+    text.chars()
+        .take(offset)
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum()
+}
+
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
@@ -897,7 +1257,10 @@ mod tests {
         incremental.set_width(W);
 
         let kind_pushes: Vec<(BlockKind, Vec<Line<'static>>)> = vec![
-            (BlockKind::User, vec![Line::from("hello from the user side")]),
+            (
+                BlockKind::User,
+                vec![Line::from("hello from the user side")],
+            ),
             (
                 BlockKind::Assistant,
                 vec![Line::from(
@@ -958,12 +1321,10 @@ mod tests {
         // Viewport starts past the first few blocks.
         let view_start = total / 3;
         assert!(t.has_sticky_user(view_start));
-        let sticky = t.sticky_user_line(view_start).expect("sticky above mid viewport");
-        let plain: String = sticky
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let sticky = t
+            .sticky_user_line(view_start)
+            .expect("sticky above mid viewport");
+        let plain: String = sticky.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             plain.starts_with("user turn "),
             "sticky should be a user line, got {plain:?}"
@@ -976,7 +1337,9 @@ mod tests {
             t.push_assistant(vec![Line::from(format!("assistant reply {i}"))]);
         }
         assert!(t.has_sticky_user(view_start));
-        let sticky2 = t.sticky_user_line(view_start).expect("sticky after appends");
+        let sticky2 = t
+            .sticky_user_line(view_start)
+            .expect("sticky after appends");
         assert_eq!(text(&[sticky]), text(&[sticky2]));
         // Absolute line maps for earlier history stay valid after appends.
         let bi_at = t.line_block[view_start];
@@ -1009,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_viewport_clones_range_and_marks_selection() {
+    fn fill_viewport_clones_range_and_styles_block_selection() {
         let mut t = Transcript::new();
         t.set_width(80);
         t.push_user(vec![Line::from("hello")]);
@@ -1025,14 +1388,96 @@ mod tests {
         t.selected = Some(0);
         let mut marked = Vec::new();
         t.fill_viewport(&mut marked, 0, n, Some(0));
-        // User block lines carry the selection bar; assistant lines do not.
+        // User block lines receive the block-selection surface without
+        // shifting text geometry.
         for (idx, line) in marked.iter().enumerate() {
-            let has_bar = line
-                .spans
-                .first()
-                .is_some_and(|s| s.content.as_ref() == "▌");
-            assert_eq!(has_bar, t.is_selected_block_for_line(idx));
-            assert_eq!(has_bar, t.line_block[idx] == 0);
+            let selected_surface = line.style.bg == Some(theme::BORDER());
+            assert_eq!(selected_surface, t.is_selected_block_for_line(idx));
+            assert_eq!(selected_surface, t.line_block[idx] == 0);
         }
+    }
+
+    #[test]
+    fn user_and_assistant_blocks_have_distinct_gutters_and_surfaces() {
+        let mut t = Transcript::new();
+        t.set_width(24);
+        t.push_user(vec![Line::from("hello")]);
+        t.push_assistant(vec![Line::from("world")]);
+        let rendered = text(t.lines());
+        assert!(rendered[0].starts_with("❯ hello"));
+        assert!(rendered[2].starts_with("│ world"));
+        assert_eq!(t.lines()[0].style.bg, Some(theme::USER_BG()));
+        assert_ne!(t.lines()[2].style.bg, Some(theme::USER_BG()));
+    }
+
+    #[test]
+    fn mouse_selection_uses_character_offsets_for_unicode() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push_user(vec![Line::from("héllo world")]);
+        assert!(t.begin_text_selection_at(0, 2));
+        assert!(t.update_text_selection_at(0, 7));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("héllo"));
+        assert_eq!(t.selection_columns(0), Some((2, 7)));
+    }
+
+    #[test]
+    fn text_selection_survives_rewrap_and_crosses_blocks() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push_user(vec![Line::from("alpha beta")]);
+        t.push_assistant(vec![Line::from("gamma delta")]);
+        assert!(t.begin_text_selection_at(0, 8));
+        assert!(t.update_text_selection_at(2, 7));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("beta\n\ngamma"));
+        t.set_width(10);
+        assert_eq!(t.selected_text().as_deref(), Some("beta\n\ngamma"));
+        assert!(t.has_text_selection());
+    }
+
+    #[test]
+    fn reverse_drag_normalizes_text_and_block_removal_clears_range() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push_user(vec![Line::from("alpha")]);
+        t.push_assistant(vec![Line::from("beta")]);
+        t.push_user(vec![Line::from("gamma")]);
+        t.push_assistant(vec![Line::from("delta")]);
+        assert!(t.begin_text_selection_at(6, 7));
+        assert!(t.update_text_selection_at(0, 2));
+        t.finish_text_selection();
+        assert_eq!(
+            t.selected_text().as_deref(),
+            Some("alpha\n\nbeta\n\ngamma\n\ndelta")
+        );
+        assert!(t.pop_last_user());
+        assert!(!t.has_text_selection());
+    }
+
+    #[test]
+    fn folding_a_selected_tool_clears_text_selection() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_tool(vec![Line::from("✓ Read file")], "line one\nline two".into());
+        assert!(t.begin_text_selection_at(0, 2));
+        assert!(t.update_text_selection_at(0, 5));
+        t.finish_text_selection();
+        assert!(t.has_text_selection());
+        t.selected = Some(0);
+        assert!(t.toggle_fold_selected());
+        assert!(!t.has_text_selection());
+    }
+
+    #[test]
+    fn latest_assistant_text_ignores_newer_system_and_tool_blocks() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(vec![Line::from("first")]);
+        t.push_assistant(vec![Line::from("latest"), Line::from("response")]);
+        t.push_tool(vec![Line::from("✓ Shell")], "done".into());
+        t.push(vec![Line::from("notice")]);
+        assert_eq!(t.last_assistant_text().as_deref(), Some("latest\nresponse"));
     }
 }
