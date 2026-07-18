@@ -21,7 +21,6 @@ pub enum ThemeId {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // border/user/select reserved for future chrome
 pub struct Tokens {
     pub accent: Color,
     pub dim: Color,
@@ -32,6 +31,9 @@ pub struct Tokens {
     pub border: Color,
     pub user: Color,
     pub select: Color,
+    pub surface: Color,
+    pub user_bg: Color,
+    pub composer_bg: Color,
 }
 
 impl Tokens {
@@ -46,6 +48,9 @@ impl Tokens {
             border: Color::DarkGray,
             user: Color::Rgb(0x63, 0xe0, 0xbd),
             select: Color::Rgb(0x3a, 0x5a, 0x52),
+            surface: Color::Rgb(0x20, 0x25, 0x29),
+            user_bg: Color::Rgb(0x24, 0x2d, 0x2c),
+            composer_bg: Color::Rgb(0x1d, 0x22, 0x25),
         }
     }
 
@@ -60,6 +65,9 @@ impl Tokens {
             border: Color::Gray,
             user: Color::Rgb(0x0b, 0x7a, 0x62),
             select: Color::Rgb(0xd0, 0xec, 0xe4),
+            surface: Color::Rgb(0xee, 0xf0, 0xf2),
+            user_bg: Color::Rgb(0xe3, 0xf2, 0xee),
+            composer_bg: Color::Rgb(0xf5, 0xf6, 0xf7),
         }
     }
 
@@ -67,14 +75,17 @@ impl Tokens {
     pub fn catppuccin() -> Self {
         Self {
             accent: Color::Rgb(0x89, 0xb4, 0xfa), // blue
-            dim: Color::Rgb(0x6c, 0x70, 0x86),   // overlay0
-            code: Color::Rgb(0xf9, 0xe2, 0xaf),  // yellow
-            ok: Color::Rgb(0xa6, 0xe3, 0xa1),    // green
-            err: Color::Rgb(0xf3, 0x8b, 0xa8),   // red
-            warn: Color::Rgb(0xfa, 0xb3, 0x87),  // peach
+            dim: Color::Rgb(0x6c, 0x70, 0x86),    // overlay0
+            code: Color::Rgb(0xf9, 0xe2, 0xaf),   // yellow
+            ok: Color::Rgb(0xa6, 0xe3, 0xa1),     // green
+            err: Color::Rgb(0xf3, 0x8b, 0xa8),    // red
+            warn: Color::Rgb(0xfa, 0xb3, 0x87),   // peach
             border: Color::Rgb(0x58, 0x5b, 0x70), // surface2
             user: Color::Rgb(0x89, 0xb4, 0xfa),
-            select: Color::Rgb(0x31, 0x32, 0x44), // surface0
+            select: Color::Rgb(0x45, 0x47, 0x5a),
+            surface: Color::Rgb(0x1e, 0x1e, 0x2e),
+            user_bg: Color::Rgb(0x25, 0x27, 0x3a),
+            composer_bg: Color::Rgb(0x18, 0x18, 0x25),
         }
     }
 
@@ -89,6 +100,9 @@ impl Tokens {
             border: Color::DarkGray,
             user: Color::White,
             select: Color::DarkGray,
+            surface: Color::Reset,
+            user_bg: Color::Reset,
+            composer_bg: Color::Reset,
         }
     }
 }
@@ -104,6 +118,9 @@ fn store() -> &'static RwLock<Tokens> {
         border: Color::DarkGray,
         user: Color::Rgb(0x63, 0xe0, 0xbd),
         select: Color::Rgb(0x3a, 0x5a, 0x52),
+        surface: Color::Rgb(0x20, 0x25, 0x29),
+        user_bg: Color::Rgb(0x24, 0x2d, 0x2c),
+        composer_bg: Color::Rgb(0x1d, 0x22, 0x25),
     });
     &STORE
 }
@@ -154,7 +171,10 @@ pub fn apply(id: ThemeId) {
 }
 
 fn t() -> Tokens {
-    store().read().map(|g| *g).unwrap_or_else(|_| Tokens::dark())
+    store()
+        .read()
+        .map(|g| *g)
+        .unwrap_or_else(|_| Tokens::dark())
 }
 
 // Call-site names match the old consts so a simple rename keeps working.
@@ -181,4 +201,28 @@ pub fn ERR() -> Color {
 #[allow(non_snake_case)]
 pub fn WARN() -> Color {
     t().warn
+}
+#[allow(non_snake_case)]
+pub fn BORDER() -> Color {
+    t().border
+}
+#[allow(non_snake_case)]
+pub fn USER() -> Color {
+    t().user
+}
+#[allow(non_snake_case)]
+pub fn SELECT() -> Color {
+    t().select
+}
+#[allow(non_snake_case)]
+pub fn SURFACE() -> Color {
+    t().surface
+}
+#[allow(non_snake_case)]
+pub fn USER_BG() -> Color {
+    t().user_bg
+}
+#[allow(non_snake_case)]
+pub fn COMPOSER_BG() -> Color {
+    t().composer_bg
 }
