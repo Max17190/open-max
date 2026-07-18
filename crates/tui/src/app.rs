@@ -579,6 +579,7 @@ impl App {
                             } else if let Some((line, x)) =
                                 self.transcript_position(m.column, m.row)
                             {
+                                self.focus = Focus::Scrollback;
                                 self.transcript.begin_text_selection_at(line, x);
                                 self.dirty.mark_selection();
                             } else {
@@ -751,7 +752,8 @@ impl App {
             return Ok(());
         }
 
-        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+        if self.focus == Focus::Scrollback
+            && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
             && self.copy_text_selection()
         {
             return Ok(());
@@ -2874,8 +2876,10 @@ impl App {
     }
 
     fn status_hint(&self) -> &'static str {
-        if self.transcript.has_text_selection() {
+        if self.transcript.has_text_selection() && self.focus == Focus::Scrollback {
             "y copy selection · esc clear"
+        } else if self.transcript.has_text_selection() {
+            "ctrl+shift+c copy selection · esc clear"
         } else if self.pending_approval.is_some() {
             "y allow once · a allow for run · n deny"
         } else if self.history_search.is_some() {
@@ -2916,7 +2920,14 @@ fn save_model_selection(
 ) -> Result<config::Settings, String> {
     let mut next = current.clone();
     next.provider = provider;
-    next.model = model;
+    next.model = model.clone();
+    let uses_managed_mlx = open_max_core::providers::resolve(&next, data_dir)
+        .is_ok_and(|endpoint| {
+            open_max_core::providers::is_managed_mlx(&endpoint, next.mlx_port)
+        });
+    if uses_managed_mlx {
+        next.mlx_model = model;
+    }
     config::save(data_dir, &next)?;
     Ok(next)
 }
@@ -3188,8 +3199,9 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, paint_text_selection,
-        rect_contains, save_model_selection, App, Dirty,
+        rect_contains, save_model_selection, App, Dirty, Focus,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
     use open_max_core::state::Core;
     use open_max_core::types::AgentEvent;
@@ -3342,6 +3354,25 @@ mod tests {
     }
 
     #[test]
+    fn managed_mlx_model_selection_updates_the_served_repo() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openmax-mlx-model-save-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let current = config::Settings::default();
+        let exact = "mlx-community/new-model".to_string();
+        let saved = save_model_selection(&dir, &current, None, exact.clone()).unwrap();
+        assert_eq!(saved.model, exact);
+        assert_eq!(saved.mlx_model, exact);
+        let disk = config::load(&dir);
+        assert_eq!(disk.model, exact);
+        assert_eq!(disk.mlx_model, exact);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn command_parser_preserves_the_complete_trimmed_model_id() {
         assert_eq!(
             command_parts("  model   openrouter/vendor/family/model  "),
@@ -3424,6 +3455,25 @@ mod tests {
         assert_eq!(buffer[(2, 0)].bg, theme::SELECT());
         assert_eq!(buffer[(6, 0)].bg, theme::SELECT());
         assert_eq!(buffer[(7, 0)].bg, theme::USER_BG());
+    }
+
+    #[tokio::test]
+    async fn retained_text_selection_does_not_swallow_composer_y() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(20);
+        app.transcript.push_user(vec![Line::from("selected text")]);
+        assert!(app.transcript.begin_text_selection_at(0, 2));
+        assert!(app.transcript.update_text_selection_at(0, 10));
+        app.transcript.finish_text_selection();
+        app.focus = Focus::Composer;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.composer.text(), "y");
+        assert!(app.transcript.has_text_selection());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
