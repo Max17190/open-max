@@ -32,7 +32,9 @@ options:
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
       --check            validate extension files (tools, skills, templates,
-                         hooks, permissions) and exit; nonzero if any is broken
+                         hooks, permissions) and exit; nonzero if any is broken.
+                         with --stdio, validate a JSONL protocol stream on
+                         stdin against the openmax-stdio contract instead
   -V, --version          print the version
   -h, --help             this help
 
@@ -159,6 +161,11 @@ async fn main() -> std::io::Result<()> {
     }
 
     if cli.check {
+        // With --stdio, validate a JSONL protocol stream on stdin instead of
+        // the filesystem: no session, no endpoint, no state dir either.
+        if cli.stdio {
+            std::process::exit(stdio::run_conformance());
+        }
         // Pure filesystem validation: no session, no endpoint, no state dir.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let findings = open_max_core::doctor::check(&project);
@@ -325,6 +332,14 @@ mod tests {
     fn check_flag_parses() {
         let cli = parse_args_from(["--check"]).unwrap();
         assert!(cli.check && !cli.print && !cli.stdio);
+    }
+
+    #[test]
+    fn check_stdio_flag_parses_conformance_mode() {
+        // --check --stdio selects protocol-stream validation; it is not the
+        // interactive stdio session and takes no prompt.
+        let cli = parse_args_from(["--check", "--stdio"]).unwrap();
+        assert!(cli.check && cli.stdio && !cli.print && cli.prompts.is_empty());
     }
 
     #[test]
