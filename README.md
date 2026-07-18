@@ -12,7 +12,7 @@ You own the endpoints, the tools, the skills, and the context.
 ## Features
 
 - **Small by default.** Seven built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and `bash`. Short system prompt; old tool output is dropped before your task is, and dropped context is summarized by your own model into a compact note (heuristic digest as fallback).
-- **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch with `/provider` or `--provider`. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
+- **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch model and provider together with `/model`. `/provider` and the provider CLI option remain available for direct provider changes. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; the harness re-freezes automatically on the next turn, so a tool the agent writes is a tool the agent uses.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
@@ -49,7 +49,30 @@ Edit `~/.openmax/settings.json`:
 
 `base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
 
-For several servers, define them in `~/.openmax/providers.json` and select with `"provider"` in settings, `--provider`, or `/provider`. Optional `compat` flags cover picky gateways (for example `max_completion_tokens` vs `max_tokens`).
+For several servers, define them in `~/.openmax/providers.json`. `/model` opens a searchable local catalog and selects the provider and model as one pair. Model names are optional, model ids are sent unchanged, and the configured order is preserved within each provider. Opening the picker makes no network requests.
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": [
+        { "id": "qwen2.5-coder:7b", "name": "Qwen Coder 7B" }
+      ]
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "models": [
+        { "id": "anthropic/claude-sonnet-4", "name": "Claude Sonnet 4" },
+        { "id": "google/gemini-2.5-pro", "name": "Gemini 2.5 Pro" }
+      ]
+    }
+  }
+}
+```
+
+Set `"provider"` in settings, use the provider CLI option, or use `/provider` when you only want to change the endpoint. Optional `compat` flags cover picky gateways (for example `max_completion_tokens` versus `max_tokens`).
 
 On Apple Silicon, when `base_url` is the managed local port, Open Max can optionally provision and serve MLX models via `/models`.
 
@@ -77,20 +100,24 @@ For a full interactive session over pipes, `openmax --stdio` speaks JSONL both w
 | **Enter** | Send (queues if the agent is busy) |
 | **/** | Slash commands · **Tab** or **Enter** completes |
 | **@** | Mention a project file |
-| **Esc** | Close menu · cancel turn · return to composer |
+| Mouse drag | Select transcript text |
+| **y** or **Ctrl+Shift+C** | Copy selected text |
+| **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** twice | Quit |
 
 | Slash command | Action |
 | --- | --- |
 | `/help` | Keybindings and commands |
-| `/model <id>` | Set the active model |
+| `/model` | Search configured providers and select a model |
+| `/model <id>` | Set an exact model id on the active endpoint |
+| `/copy` | Copy the latest assistant response |
 | `/provider [name]` | List or switch providers |
 | `/approvals auto\|ask\|readonly` | Mutating tool gates |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/reload` | Force a re-freeze now (it also happens automatically when extension files change) |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
-| `/status` | Endpoint and network destinations |
+| `/status` | Endpoint, cache, performance, privacy, and network details |
 | `/quit` | Exit |
 
 ## Extend
@@ -167,7 +194,7 @@ Open Max does not phone home. The only network destinations are:
 1. The model endpoint in `base_url` (your choice).
 2. Hugging Face, only when you download or serve a model through `/models`.
 
-Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists destinations; the status bar shows `no telemetry` when idle. External tools you install may open their own network connections.
+Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists destinations and detailed runtime information. The persistent status line stays limited to model, context use, and approval mode so the transcript remains readable. External tools you install may open their own network connections.
 
 ## stdio protocol (`openmax-stdio/1`)
 
@@ -246,6 +273,8 @@ cargo check
 cargo test
 cargo build --release -p open-max-tui
 ```
+
+Set `OPENMAX_PERF=1` while running the TUI to log frame, transcript-layout, and selection-overlay timings.
 
 Core logic is in `open-max-core` (`crates/core/src/agent.rs`). The TUI is `crates/tui/src/app.rs`.
 
