@@ -80,7 +80,8 @@ pub fn load(data_dir: &Path) -> Settings {
 
 pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(data_dir), json).map_err(|e| e.to_string())?;
+    let destination = settings_path(data_dir);
+    crate::sessions::write_atomic(&destination, json)?;
     // Endpoint resolution is cached; force a re-read after settings change.
     crate::providers::invalidate_providers_cache();
     Ok(())
@@ -121,5 +122,31 @@ mod tests {
         let s = load(&dir);
         assert_eq!(s.max_agent_iterations, 50);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_atomically_replaces_settings_without_leaving_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-settings-save-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = Settings::default();
+        first.model = "one".into();
+        save(&dir, &first).unwrap();
+        let mut second = first.clone();
+        second.model = "vendor/family/two".into();
+        save(&dir, &second).unwrap();
+        assert_eq!(load(&dir).model, "vendor/family/two");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

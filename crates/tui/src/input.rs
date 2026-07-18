@@ -304,7 +304,12 @@ impl Composer {
         let first = self.lines.len().saturating_sub(visible).min(self.row);
         for (i, line) in self.lines.iter().enumerate().skip(first).take(visible) {
             let prefix = if i == 0 {
-                Span::styled("❯ ", Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    "❯ ",
+                    Style::default()
+                        .fg(theme::ACCENT())
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled("… ", Style::default().fg(theme::DIM()))
             };
@@ -312,8 +317,10 @@ impl Composer {
                 out.push(Line::from(vec![
                     prefix,
                     Span::styled(
-                        "describe a task · / for commands · @ to mention a file",
-                        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+                        "Describe a task",
+                        Style::default()
+                            .fg(theme::DIM())
+                            .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
             } else {
@@ -331,5 +338,39 @@ impl Composer {
 }
 
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn empty_composer_uses_single_purposeful_placeholder() {
+        let composer = Composer::new(&std::env::temp_dir());
+        let (lines, cursor_x, cursor_y) = composer.render(3);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(plain(&lines[0]), "❯ Describe a task");
+        assert_eq!((cursor_x, cursor_y), (2, 0));
+    }
+
+    #[test]
+    fn multiline_composer_keeps_distinct_continuation_gutter() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("first\nsecond");
+        let (lines, cursor_x, cursor_y) = composer.render(3);
+        assert_eq!(plain(&lines[0]), "❯ first");
+        assert_eq!(plain(&lines[1]), "… second");
+        assert_eq!((cursor_x, cursor_y), (8, 1));
+    }
 }

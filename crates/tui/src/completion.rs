@@ -17,25 +17,99 @@ pub const MAX_VISIBLE: usize = 6;
 /// gitignore pruning keeps real projects far below it.
 const MAX_FILES: usize = 20_000;
 
-/// Slash commands: (name, argument hint, description). One source of truth
-/// for the popup; /help stays the narrative version.
-pub const COMMANDS: &[(&str, &str, &str)] = &[
-    ("help", "", "keybindings and commands"),
-    ("models", "", "manage and serve local models"),
-    ("model", "<id>", "use a specific model id"),
-    ("provider", "[name]", "list or select a named provider"),
-    ("approvals", "auto|ask|readonly", "how mutating tools are gated"),
-    ("new", "", "start a fresh session"),
-    ("resume", "", "pick an earlier session in this project"),
-    ("tools", "", "list tools frozen for this session"),
-    ("skills", "", "list skills frozen for this session"),
-    ("reload", "", "re-freeze tools, skills, and prompt from current config"),
-    ("context", "", "prompt token costs, cache hits, and budget"),
-    ("status", "", "session, endpoint, and network destinations"),
-    ("logs", "", "recent model server logs"),
-    ("theme", "dark|light|mono|catppuccin", "switch appearance"),
-    ("quit", "", "exit"),
+/// One command registry drives dispatch recognition, completion, and `/help`.
+/// Dispatch itself stays explicit in `App::slash`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub args: &'static str,
+    pub description: &'static str,
+    /// Accepting the completion immediately runs the command.
+    pub submits: bool,
+}
+
+const fn command(
+    name: &'static str,
+    args: &'static str,
+    description: &'static str,
+    submits: bool,
+) -> CommandSpec {
+    CommandSpec {
+        name,
+        args,
+        description,
+        submits,
+    }
+}
+
+pub const COMMANDS: &[CommandSpec] = &[
+    command("help", "", "keybindings and commands", true),
+    command("models", "", "manage and serve local models", true),
+    command(
+        "model",
+        "[id]",
+        "pick a configured model or use an exact id",
+        true,
+    ),
+    command(
+        "provider",
+        "[name]",
+        "list or select a named provider",
+        false,
+    ),
+    command(
+        "approvals",
+        "auto|ask|readonly",
+        "how mutating tools are gated",
+        false,
+    ),
+    command("new", "", "start a fresh session", true),
+    command(
+        "resume",
+        "",
+        "pick an earlier session in this project",
+        true,
+    ),
+    command("copy", "", "copy the latest assistant response", true),
+    command("tools", "", "list tools frozen for this session", true),
+    command("skills", "", "list skills frozen for this session", true),
+    command(
+        "reload",
+        "",
+        "re-freeze tools, skills, and prompt from current config",
+        true,
+    ),
+    command(
+        "context",
+        "",
+        "prompt token costs, cache hits, and budget",
+        true,
+    ),
+    command(
+        "status",
+        "",
+        "endpoint, cache, performance, privacy, and network details",
+        true,
+    ),
+    command("logs", "", "recent model server logs", true),
+    command(
+        "theme",
+        "dark|light|mono|catppuccin",
+        "switch appearance",
+        false,
+    ),
+    command("quit", "", "exit", true),
 ];
+
+impl CommandSpec {
+    pub fn usage(self) -> String {
+        if self.args.is_empty() {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} {}", self.name, self.args)
+        }
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub enum Kind {
@@ -96,7 +170,10 @@ pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, 
             // Past the command name (a space would end the token) argument
             // hints take over; no completion inside arguments. `-`/`_` cover
             // prompt-template names like fix-issue.
-            if query.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            if query
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
                 return Some((Kind::Slash, start, query.to_string()));
             }
         }
@@ -113,16 +190,24 @@ pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, 
 pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
     let mut items: Vec<Item> = COMMANDS
         .iter()
-        .filter(|(name, _, _)| name.starts_with(query))
-        .map(|(name, args, desc)| Item {
-            insert: if args.is_empty() { format!("/{name}") } else { format!("/{name} ") },
-            label: format!("/{name}"),
-            detail: if args.is_empty() { (*desc).to_string() } else { format!("{args} · {desc}") },
-            submits: args.is_empty(),
+        .filter(|spec| spec.name.starts_with(query))
+        .map(|spec| Item {
+            insert: if spec.submits {
+                format!("/{}", spec.name)
+            } else {
+                format!("/{} ", spec.name)
+            },
+            label: format!("/{}", spec.name),
+            detail: if spec.args.is_empty() {
+                spec.description.to_string()
+            } else {
+                format!("{} · {}", spec.args, spec.description)
+            },
+            submits: spec.submits,
         })
         .collect();
     for (name, desc) in templates {
-        if !name.starts_with(query) || COMMANDS.iter().any(|(n, _, _)| n == name) {
+        if !name.starts_with(query) || COMMANDS.iter().any(|spec| spec.name == name) {
             continue;
         }
         items.push(Item {
@@ -146,7 +231,11 @@ pub fn file_items(files: &Arc<Vec<String>>, query: &str) -> Vec<Item> {
         .iter()
         .filter_map(|path| fuzzy_score(path, query).map(|s| (s, path)))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())).then_with(|| a.1.cmp(b.1)));
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.len().cmp(&b.1.len()))
+            .then_with(|| a.1.cmp(b.1))
+    });
     scored
         .into_iter()
         .take(MAX_VISIBLE * 3)
@@ -168,7 +257,10 @@ pub fn fuzzy_score(path: &str, query: &str) -> Option<i32> {
     }
     let hay: Vec<char> = path.chars().map(|c| c.to_ascii_lowercase()).collect();
     let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let name_start = path.rfind('/').map(|i| path[..=i].chars().count()).unwrap_or(0);
+    let name_start = path
+        .rfind('/')
+        .map(|i| path[..=i].chars().count())
+        .unwrap_or(0);
 
     let mut score = 0i32;
     let mut hi = 0usize;
@@ -190,7 +282,12 @@ pub fn fuzzy_score(path: &str, query: &str) -> Option<i32> {
         if prev_hit == Some(at.wrapping_sub(1)) {
             score += 6;
         }
-        if at == 0 || matches!(hay.get(at.wrapping_sub(1)), Some('/') | Some('_') | Some('-') | Some('.')) {
+        if at == 0
+            || matches!(
+                hay.get(at.wrapping_sub(1)),
+                Some('/') | Some('_') | Some('-') | Some('.')
+            )
+        {
             score += 4;
         }
         prev_hit = Some(at);
@@ -203,7 +300,10 @@ pub fn fuzzy_score(path: &str, query: &str) -> Option<i32> {
 /// shallowest-first so the popup's empty-query view starts at the root.
 pub fn scan_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let walker = WalkBuilder::new(root).hidden(true).follow_links(false).build();
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .follow_links(false)
+        .build();
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -225,13 +325,17 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     if indexing {
         return vec![Line::from(Span::styled(
             "  indexing files…",
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme::DIM())
+                .add_modifier(Modifier::ITALIC),
         ))];
     }
     if popup.items.is_empty() {
         return vec![Line::from(Span::styled(
             "  no matches",
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme::DIM())
+                .add_modifier(Modifier::ITALIC),
         ))];
     }
     let visible = popup.items.len().min(MAX_VISIBLE);
@@ -249,23 +353,47 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
             Span::raw("  ")
         };
         let label_style = if selected {
-            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::ACCENT())
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let mut spans = vec![marker, Span::styled(clip(&item.label, width.saturating_sub(4)), label_style)];
+        let mut spans = vec![
+            marker,
+            Span::styled(clip(&item.label, width.saturating_sub(4)), label_style),
+        ];
         if !item.detail.is_empty() {
             let room = width.saturating_sub(item.label.chars().count() + 6);
             if room > 4 {
-                spans.push(Span::styled(format!("  {}", clip(&item.detail, room)), Style::default().fg(theme::DIM())));
+                spans.push(Span::styled(
+                    format!("  {}", clip(&item.detail, room)),
+                    Style::default().fg(theme::DIM()),
+                ));
             }
         }
-        lines.push(Line::from(spans));
+        let mut line = Line::from(spans);
+        if selected {
+            line.style = Style::default().bg(theme::SURFACE());
+            for span in &mut line.spans {
+                span.style = span.style.bg(theme::SURFACE());
+            }
+            let used = line.width();
+            if used < width {
+                line.spans.push(Span::styled(
+                    " ".repeat(width - used),
+                    Style::default().bg(theme::SURFACE()),
+                ));
+            }
+        }
+        lines.push(line);
     }
     if popup.items.len() > visible {
         lines.push(Line::from(Span::styled(
             format!("  … {} more (keep typing)", popup.items.len() - visible),
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme::DIM())
+                .add_modifier(Modifier::ITALIC),
         )));
     }
     lines
@@ -306,10 +434,11 @@ mod tests {
         let items = slash_items("mo", &[]);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["/models", "/model"]);
-        // Arg-taking commands insert a trailing space and do not submit.
+        // Bare /model is a real action that opens the picker. A user can type
+        // a space after it to use the raw-id escape hatch.
         assert!(items[0].submits);
-        assert_eq!(items[1].insert, "/model ");
-        assert!(!items[1].submits);
+        assert_eq!(items[1].insert, "/model");
+        assert!(items[1].submits);
     }
 
     #[test]
@@ -327,8 +456,12 @@ mod tests {
         assert!(!tmpl.submits);
         assert!(tmpl.detail.contains("template"));
         // Prefix filtering applies to templates too.
-        assert!(slash_items("fix", &templates).iter().any(|i| i.label == "/fix-issue"));
-        assert!(!slash_items("zz", &templates).iter().any(|i| i.label == "/fix-issue"));
+        assert!(slash_items("fix", &templates)
+            .iter()
+            .any(|i| i.label == "/fix-issue"));
+        assert!(!slash_items("zz", &templates)
+            .iter()
+            .any(|i| i.label == "/fix-issue"));
     }
 
     #[test]
@@ -383,5 +516,21 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("/quit"));
+        assert!(lines
+            .iter()
+            .any(|line| line.style.bg == Some(theme::SURFACE())));
+    }
+
+    #[test]
+    fn command_registry_is_unique_and_drives_copy_and_model_metadata() {
+        let mut names: Vec<_> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before);
+        let model = COMMANDS.iter().find(|spec| spec.name == "model").unwrap();
+        assert_eq!(model.usage(), "/model [id]");
+        assert!(model.submits);
+        assert!(COMMANDS.iter().any(|spec| spec.name == "copy"));
     }
 }

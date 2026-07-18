@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use futures_util::StreamExt;
 use open_max_core::mlx::MlxEvent;
@@ -18,7 +19,7 @@ use open_max_core::{agent, config, hf, mlx, prompt, registry, sessions};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
@@ -31,7 +32,7 @@ use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{
     filter_matching_indices, wrap_lines, Term, Transcript,
 };
-use crate::ui::{context, extensions, markdown, models};
+use crate::ui::{context, extensions, markdown, model_picker, models};
 
 /// Where keyboard focus lives in chat mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,8 @@ struct Dirty {
     tail: bool,
     /// Header, composer, status, popups, approval, models/sessions chrome.
     chrome: bool,
+    /// Mouse text selection overlay only. It never invalidates cached lines.
+    selection: bool,
 }
 
 impl Dirty {
@@ -67,11 +70,12 @@ impl Dirty {
             chat: true,
             tail: true,
             chrome: true,
+            selection: true,
         }
     }
 
     fn any(self) -> bool {
-        self.chat || self.tail || self.chrome
+        self.chat || self.tail || self.chrome || self.selection
     }
 
     fn mark_chat(&mut self) {
@@ -84,6 +88,11 @@ impl Dirty {
     }
 
     fn mark_chrome(&mut self) {
+        self.chrome = true;
+    }
+
+    fn mark_selection(&mut self) {
+        self.selection = true;
         self.chrome = true;
     }
 
@@ -111,8 +120,15 @@ pub struct Args {
 #[derive(PartialEq)]
 enum Mode {
     Chat,
+    ModelPicker,
     Models,
     Sessions,
+}
+
+struct ToolMeta {
+    name: String,
+    summary: String,
+    started: Instant,
 }
 
 pub struct App {
@@ -123,6 +139,7 @@ pub struct App {
     mode: Mode,
     composer: Composer,
     models: models::ModelsState,
+    model_picker: Option<model_picker::ModelPickerState>,
     sessions_panel: Option<sessions_ui::SessionsState>,
     transcript: Transcript,
     focus: Focus,
@@ -157,8 +174,9 @@ pub struct App {
     /// Pending mutating-tool gate: id, tool name, summary, detail preview.
     pending_approval: Option<(String, String, String, String)>,
     pending_diffs: HashMap<String, DiffText>,
-    tool_meta: HashMap<String, (String, String)>,
+    tool_meta: HashMap<String, ToolMeta>,
     last_tool_output: Option<String>,
+    last_assistant_response: Option<String>,
     budget: Option<(usize, usize)>,
     /// Prompt-cache hit rate of the last completion, from server usage.
     cache_pct: Option<u8>,
@@ -188,13 +206,12 @@ pub struct App {
     /// Lines in `chat_buf` that are sticky + history (before live tail).
     hist_prefix_len: usize,
     hist_reuse_key: Option<HistReuseKey>,
-    status_model: String,
-    status_approvals: String,
-    status_ready: bool,
-    status_budget: Option<(usize, usize)>,
-    status_cache: Option<u8>,
-    status_scrolled: bool,
-    status_quit_armed: bool,
+    /// Absolute transcript line for each rendered row in `chat_buf`.
+    chat_line_map: Vec<Option<usize>>,
+    chat_draw_area: Rect,
+    approval_hits: [Option<Rect>; 3],
+    perf_layout_ms: f64,
+    perf_selection_ms: f64,
     status_line: Line<'static>,
 }
 
@@ -211,69 +228,7 @@ pub async fn run(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| project.display().to_string());
-    let mut app = App {
-        core: core.clone(),
-        project,
-        dir_label,
-        session_id: None,
-        pending_submit: None,
-        mode: Mode::Chat,
-        composer: Composer::new(&core.data_dir),
-        models: models::ModelsState::empty(),
-        sessions_panel: None,
-        transcript: Transcript::new(),
-        focus: Focus::Composer,
-        completion: None,
-        history_search: None,
-        scroll_search: None,
-        scroll_search_last: None,
-        file_index: None,
-        file_index_pending: false,
-        templates: Vec::new(),
-        queued: Vec::new(),
-        flush_queue: false,
-        running: false,
-        stream_text: String::new(),
-        thinking_chars: 0,
-        thinking_tail: String::new(),
-        show_thinking: false,
-        turn_started: None,
-        first_token: None,
-        stream_chars: 0,
-        running_tool: None,
-        pending_approval: None,
-        pending_diffs: HashMap::new(),
-        tool_meta: HashMap::new(),
-        last_tool_output: None,
-        budget: None,
-        cache_pct: None,
-        quit_armed: false,
-        spinner_i: 0,
-        tick_i: 0,
-        page_h: 10,
-        hf_tx,
-        files_tx,
-        should_quit: false,
-        dirty: Dirty::all(),
-        stream_wrapped: Vec::new(),
-        stream_md: markdown::StreamingMarkdown::default(),
-        thinking_wrapped: Vec::new(),
-        thinking_source: String::new(),
-        tail_width: 0,
-        tail_content_len: 0,
-        tail_buf: Vec::new(),
-        chat_buf: Vec::new(),
-        hist_prefix_len: 0,
-        hist_reuse_key: None,
-        status_model: String::new(),
-        status_approvals: String::new(),
-        status_ready: false,
-        status_budget: None,
-        status_cache: None,
-        status_scrolled: false,
-        status_quit_armed: false,
-        status_line: Line::default(),
-    };
+    let mut app = App::new(core.clone(), project, dir_label, hf_tx, files_tx);
 
     app.startup(&args).await;
 
@@ -376,7 +331,10 @@ fn draw_frame(terminal: &mut Term, app: &mut App) -> std::io::Result<()> {
     terminal.backend_mut().flush()?;
     if std::env::var_os("OPENMAX_PERF").is_some() {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("openmax_perf draw_frame_ms={ms:.3}");
+        eprintln!(
+            "openmax_perf draw_frame_ms={ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
+            app.perf_layout_ms, app.perf_selection_ms
+        );
     }
     Ok(())
 }
@@ -391,6 +349,78 @@ fn ram_bytes() -> u64 {
 }
 
 impl App {
+    fn new(
+        core: Arc<Core>,
+        project: PathBuf,
+        dir_label: String,
+        hf_tx: mpsc::UnboundedSender<(String, u64)>,
+        files_tx: mpsc::UnboundedSender<Vec<String>>,
+    ) -> Self {
+        Self {
+            composer: Composer::new(&core.data_dir),
+            core,
+            project,
+            dir_label,
+            session_id: None,
+            pending_submit: None,
+            mode: Mode::Chat,
+            models: models::ModelsState::empty(),
+            model_picker: None,
+            sessions_panel: None,
+            transcript: Transcript::new(),
+            focus: Focus::Composer,
+            completion: None,
+            history_search: None,
+            scroll_search: None,
+            scroll_search_last: None,
+            file_index: None,
+            file_index_pending: false,
+            templates: Vec::new(),
+            queued: Vec::new(),
+            flush_queue: false,
+            running: false,
+            stream_text: String::new(),
+            thinking_chars: 0,
+            thinking_tail: String::new(),
+            show_thinking: false,
+            turn_started: None,
+            first_token: None,
+            stream_chars: 0,
+            running_tool: None,
+            pending_approval: None,
+            pending_diffs: HashMap::new(),
+            tool_meta: HashMap::new(),
+            last_tool_output: None,
+            last_assistant_response: None,
+            budget: None,
+            cache_pct: None,
+            quit_armed: false,
+            spinner_i: 0,
+            tick_i: 0,
+            page_h: 10,
+            hf_tx,
+            files_tx,
+            should_quit: false,
+            dirty: Dirty::all(),
+            stream_wrapped: Vec::new(),
+            stream_md: markdown::StreamingMarkdown::default(),
+            thinking_wrapped: Vec::new(),
+            thinking_source: String::new(),
+            tail_width: 0,
+            tail_content_len: 0,
+            tail_buf: Vec::new(),
+            chat_buf: Vec::new(),
+            hist_prefix_len: 0,
+            hist_reuse_key: None,
+            chat_line_map: Vec::new(),
+            chat_draw_area: Rect::default(),
+            approval_hits: [None; 3],
+            perf_layout_ms: 0.0,
+            perf_selection_ms: 0.0,
+            status_line: Line::default(),
+        }
+    }
+
     async fn startup(&mut self, args: &Args) {
         // Adopt a still-running server from a previous launch — in the
         // background: reattach spawns `ps` and probes HTTP with a 2s timeout,
@@ -410,10 +440,6 @@ impl App {
                 }
                 None => self.note("no previous session here; starting fresh"),
             }
-        } else {
-            self.note(
-                "your endpoint · /tools · /skills · /context · type while the agent works to queue",
-            );
         }
     }
 
@@ -432,6 +458,7 @@ impl App {
                 "assistant" => {
                     if let Some(text) = &m.content {
                         if !text.trim().is_empty() {
+                            self.last_assistant_response = Some(text.clone());
                             self.transcript.push_assistant(markdown::render(
                                 text,
                                 markdown::highlighter(),
@@ -489,9 +516,11 @@ impl App {
         self.stream_chars = 0;
         self.running_tool = None;
         self.pending_approval = None;
+        self.model_picker = None;
         self.pending_diffs.clear();
         self.tool_meta.clear();
         self.last_tool_output = None;
+        self.last_assistant_response = None;
         self.budget = None;
         self.cache_pct = None;
         self.completion = None;
@@ -510,6 +539,9 @@ impl App {
         self.tail_buf.clear();
         self.hist_prefix_len = 0;
         self.hist_reuse_key = None;
+        self.chat_line_map.clear();
+        self.chat_draw_area = Rect::default();
+        self.approval_hits = [None; 3];
         self.transcript.follow();
         self.dirty.mark_chat();
         self.dirty.mark_chrome();
@@ -537,6 +569,41 @@ impl App {
             TermEvent::Mouse(m) => {
                 if self.mode == Mode::Chat {
                     match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(choice) = self
+                                .approval_hits
+                                .iter()
+                                .position(|hit| hit.is_some_and(|rect| rect_contains(rect, m.column, m.row)))
+                            {
+                                self.respond_approval_choice(choice);
+                            } else if let Some((line, x)) =
+                                self.transcript_position(m.column, m.row)
+                            {
+                                self.focus = Focus::Scrollback;
+                                self.transcript.begin_text_selection_at(line, x);
+                                self.dirty.mark_selection();
+                            } else {
+                                self.transcript.clear_text_selection();
+                                self.dirty.mark_selection();
+                            }
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some((line, x)) =
+                                self.transcript_position(m.column, m.row)
+                            {
+                                self.transcript.update_text_selection_at(line, x);
+                                self.dirty.mark_selection();
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if let Some((line, x)) =
+                                self.transcript_position(m.column, m.row)
+                            {
+                                self.transcript.update_text_selection_at(line, x);
+                            }
+                            self.transcript.finish_text_selection();
+                            self.dirty.mark_selection();
+                        }
                         MouseEventKind::ScrollUp => {
                             self.transcript.scroll_up(WHEEL_LINES);
                             self.dirty.mark_chat();
@@ -557,9 +624,19 @@ impl App {
 
     async fn on_key(&mut self, key: KeyEvent) -> std::io::Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            let _ = self.copy_text_selection();
+            return Ok(());
+        }
+        if key.code == KeyCode::Esc && self.transcript.clear_text_selection() {
+            self.dirty.mark_selection();
+            return Ok(());
+        }
 
         // Ctrl+C: cancel a running turn, otherwise quit on the second press.
-        if ctrl && key.code == KeyCode::Char('c') {
+        if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
             if self.running {
                 if let Some(id) = &self.session_id {
                     self.core.cancel(id);
@@ -619,6 +696,10 @@ impl App {
             self.on_models_key(key).await;
             return Ok(());
         }
+        if self.mode == Mode::ModelPicker {
+            self.on_model_picker_key(key);
+            return Ok(());
+        }
         if self.mode == Mode::Sessions {
             self.on_sessions_key(key);
             return Ok(());
@@ -668,6 +749,13 @@ impl App {
                     let _ = name;
                 }
             }
+            return Ok(());
+        }
+
+        if self.focus == Focus::Scrollback
+            && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            && self.copy_text_selection()
+        {
             return Ok(());
         }
 
@@ -822,6 +910,108 @@ impl App {
             ComposerAction::None => self.sync_completion(),
         }
         Ok(())
+    }
+
+    fn transcript_position(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        if !rect_contains(self.chat_draw_area, column, row) {
+            return None;
+        }
+        let rendered_row = row.saturating_sub(self.chat_draw_area.y) as usize;
+        let line = self.chat_line_map.get(rendered_row).copied().flatten()?;
+        let x = column.saturating_sub(self.chat_draw_area.x) as usize;
+        Some((line, x))
+    }
+
+    fn copy_text_selection(&mut self) -> bool {
+        let Some(text) = self.transcript.selected_text() else {
+            return false;
+        };
+        if clipboard::copy_text(&text) {
+            self.note("copied selection");
+        } else {
+            self.note("copy failed (terminal may block OSC 52)");
+        }
+        true
+    }
+
+    /// Approval hit regions use the fixed order allow once, allow for run,
+    /// deny. Keyboard handling remains the authoritative path.
+    fn respond_approval_choice(&mut self, choice: usize) {
+        let Some((id, _, _, _)) = self.pending_approval.clone() else {
+            return;
+        };
+        match choice {
+            0 => self.core.respond_approval(&id, true),
+            1 => {
+                self.core.settings.lock().unwrap().approval_mode = "auto".into();
+                self.core.respond_approval(&id, true);
+                self.note("approvals set to auto for this run (change with /approvals)");
+            }
+            2 => self.core.respond_approval(&id, false),
+            _ => {}
+        }
+    }
+
+    fn on_model_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Chat;
+                self.model_picker = None;
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.prev();
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.next();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.backspace();
+                }
+            }
+            KeyCode::Enter => {
+                let choice = self
+                    .model_picker
+                    .as_ref()
+                    .and_then(model_picker::ModelPickerState::selected_choice)
+                    .cloned();
+                if let Some(choice) = choice {
+                    self.mode = Mode::Chat;
+                    self.model_picker = None;
+                    self.persist_model_selection(choice.provider, choice.id);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.push(c);
+                }
+            }
+            _ => {}
+        }
+        self.dirty.mark_chrome();
+    }
+
+    fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
+        let current = self.core.settings.lock().unwrap().clone();
+        match save_model_selection(
+            &self.core.data_dir,
+            &current,
+            provider.clone(),
+            model.clone(),
+        ) {
+            Ok(next) => {
+                *self.core.settings.lock().unwrap() = next;
+                let source = provider
+                    .map(|name| format!(" from {name}"))
+                    .unwrap_or_default();
+                self.note(&format!("model set to {model}{source}"));
+            }
+            Err(error) => self.error(&format!("could not save model selection: {error}")),
+        }
     }
 
     fn open_history_search(&mut self) {
@@ -1289,7 +1479,7 @@ impl App {
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
             let builtin = head == "exit"
-                || completion::COMMANDS.iter().any(|(name, _, _)| *name == head);
+                || completion::COMMANDS.iter().any(|spec| spec.name == head);
             // Built-ins win; anything else may be a prompt template, whose
             // expansion submits as a normal user message.
             let expanded = if builtin {
@@ -1378,12 +1568,11 @@ impl App {
     }
 
     async fn slash(&mut self, cmd: &str) {
-        let mut parts = cmd.split_whitespace();
-        let head = parts.next().unwrap_or("");
-        let rest: Vec<&str> = parts.collect();
+        let (head, raw_rest) = command_parts(cmd);
+        let rest: Vec<&str> = raw_rest.split_whitespace().collect();
         match head {
             "help" => {
-                let block = HELP_KEYS
+                let mut block: Vec<Line<'static>> = HELP_KEYS
                     .iter()
                     .map(|(k, v)| {
                         Line::from(vec![
@@ -1392,28 +1581,48 @@ impl App {
                         ])
                     })
                     .collect();
+                block.push(Line::default());
+                block.extend(completion::COMMANDS.iter().map(|spec| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {:<32}", spec.usage()),
+                            Style::default().fg(theme::ACCENT()),
+                        ),
+                        Span::styled(
+                            spec.description.to_string(),
+                            Style::default().fg(theme::DIM()),
+                        ),
+                    ])
+                }));
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
-            "theme" => match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-                Some("light" | "day") => {
-                    theme::apply(theme::ThemeId::Light);
-                    self.note("theme: light");
+            "theme" => {
+                match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("light" | "day") => {
+                        theme::apply(theme::ThemeId::Light);
+                        self.note("theme: light");
+                    }
+                    Some("dark" | "night") => {
+                        theme::apply(theme::ThemeId::Dark);
+                        self.note("theme: dark");
+                    }
+                    Some("catppuccin" | "mocha" | "cat") => {
+                        theme::apply(theme::ThemeId::Catppuccin);
+                        self.note("theme: catppuccin");
+                    }
+                    Some("mono" | "bw") => {
+                        theme::set_tokens(theme::Tokens::mono());
+                        self.note("theme: mono");
+                    }
+                    _ => self.note("usage: /theme dark|light|mono|catppuccin"),
                 }
-                Some("dark" | "night") => {
-                    theme::apply(theme::ThemeId::Dark);
-                    self.note("theme: dark");
-                }
-                Some("catppuccin" | "mocha" | "cat") => {
-                    theme::apply(theme::ThemeId::Catppuccin);
-                    self.note("theme: catppuccin");
-                }
-                Some("mono" | "bw") => {
-                    theme::set_tokens(theme::Tokens::mono());
-                    self.note("theme: mono");
-                }
-                _ => self.note("usage: /theme dark|light|mono|catppuccin"),
-            },
+                self.transcript.invalidate_styles();
+                self.hist_reuse_key = None;
+                self.tail_width = 0;
+                self.thinking_source.clear();
+                self.dirty = Dirty::all();
+            }
             "models" => {
                 self.mode = Mode::Models;
                 self.models.ensure_loaded(ram_bytes());
@@ -1422,19 +1631,37 @@ impl App {
                 self.fetch_missing_sizes();
                 self.dirty.mark_chrome();
             }
-            "model" => match rest.first() {
-                Some(repo) => {
-                    let repo = repo.to_string();
-                    {
-                        let mut s = self.core.settings.lock().unwrap();
-                        s.model = repo.clone();
-                        s.mlx_model = repo.clone();
-                        let _ = config::save(&self.core.data_dir, &s);
+            "model" if raw_rest.is_empty() => {
+                let settings = self.core.settings.lock().unwrap().clone();
+                self.model_picker = Some(model_picker::ModelPickerState::load(
+                    &self.core.data_dir,
+                    settings.provider.as_deref(),
+                    &settings.model,
+                ));
+                self.transcript.clear_text_selection();
+                self.completion = None;
+                self.mode = Mode::ModelPicker;
+                self.dirty.mark_chrome();
+            }
+            "model" => {
+                let provider = self.core.settings.lock().unwrap().provider.clone();
+                self.persist_model_selection(provider, raw_rest.to_string());
+            }
+            "copy" => {
+                if let Some(text) = self
+                    .last_assistant_response
+                    .clone()
+                    .or_else(|| self.transcript.last_assistant_text())
+                {
+                    if clipboard::copy_text(&text) {
+                        self.note("copied latest assistant response");
+                    } else {
+                        self.note("copy failed (terminal may block OSC 52)");
                     }
-                    self.note(&format!("model set to {repo}"));
+                } else {
+                    self.note("no assistant response to copy");
                 }
-                None => self.note("usage: /model <id>"),
-            },
+            }
             "provider" => {
                 let names = open_max_core::providers::list_provider_names(&self.core.data_dir);
                 match rest.first() {
@@ -1640,6 +1867,24 @@ impl App {
                     .budget
                     .map(|(u, t)| format!("{}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
                     .unwrap_or_else(|| "0%".into());
+                let cache = self
+                    .cache_pct
+                    .map(|percent| format!("{percent}% prompt tokens"))
+                    .unwrap_or_else(|| "not reported".into());
+                let ttft = match (self.turn_started, self.first_token) {
+                    (Some(started), Some(first)) => {
+                        format!("{} ms", first.saturating_duration_since(started).as_millis())
+                    }
+                    _ => "not available".into(),
+                };
+                let throughput = {
+                    let rate = self.tok_per_sec();
+                    if rate > 0.0 {
+                        format!("{rate:.1} tokens/s")
+                    } else {
+                        "not available".into()
+                    }
+                };
                 let (provider, model, endpoint, host, context_tokens) = match &ep {
                     Ok(ep) => {
                         let endpoint = extensions::display_base_url(&ep.base_url);
@@ -1669,6 +1914,9 @@ impl App {
                     kv("server", &server),
                     kv("approvals", &s.approval_mode),
                     kv("context", &format!("{ctx} of {} tokens", context_tokens)),
+                    kv("cache", &cache),
+                    kv("ttft", &ttft),
+                    kv("throughput", &throughput),
                     kv("session", self.session_id.as_deref().unwrap_or("none yet")),
                     kv("project", &self.project.display().to_string()),
                     kv("data", &self.core.data_dir.display().to_string()),
@@ -1842,6 +2090,7 @@ impl App {
             }
             AgentEvent::MessageDone { text } => {
                 if !text.trim().is_empty() {
+                    self.last_assistant_response = Some(text.clone());
                     self.transcript.push_assistant(markdown::render(
                         &text,
                         markdown::highlighter(),
@@ -1877,7 +2126,14 @@ impl App {
             }
             AgentEvent::ToolStart { call_id, name, args } => {
                 let summary = registry::summarize_call(&name, &args);
-                self.tool_meta.insert(call_id, (name.clone(), summary.clone()));
+                self.tool_meta.insert(
+                    call_id,
+                    ToolMeta {
+                        name: name.clone(),
+                        summary: summary.clone(),
+                        started: Instant::now(),
+                    },
+                );
                 self.running_tool = Some((name, summary));
                 self.dirty.mark_tail();
             }
@@ -1885,13 +2141,24 @@ impl App {
                 self.pending_diffs.insert(call_id, DiffText { path, diff, added, removed });
             }
             AgentEvent::ToolEnd { call_id, ok, output } => {
-                let (name, summary) = self
+                let meta = self
                     .tool_meta
                     .remove(&call_id)
-                    .unwrap_or_else(|| ("tool".into(), String::new()));
+                    .unwrap_or_else(|| ToolMeta {
+                        name: "tool".into(),
+                        summary: String::new(),
+                        started: Instant::now(),
+                    });
+                let duration = meta.started.elapsed();
                 let diff = self.pending_diffs.remove(&call_id);
-                let compact =
-                    tool_card::tool_block(&name, &summary, ok, &output, diff.as_ref());
+                let compact = tool_card::tool_block_timed(
+                    &meta.name,
+                    &meta.summary,
+                    ok,
+                    &output,
+                    diff.as_ref(),
+                    Some(duration),
+                );
                 self.transcript.push_tool(compact, output.clone());
                 self.last_tool_output = Some(output);
                 self.running_tool = None;
@@ -2049,18 +2316,15 @@ impl App {
     // ---------- blocks ----------
 
     fn insert_user_block(&mut self, text: &str) {
-        let mut lines = Vec::new();
-        for (i, l) in text.lines().enumerate() {
-            let prefix = if i == 0 {
-                Span::styled("❯ ", Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD))
-            } else {
-                Span::raw("  ")
-            };
-            lines.push(Line::from(vec![
-                prefix,
-                Span::styled(l.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-            ]));
-        }
+        let lines = text
+            .lines()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect();
         self.transcript.push_user(lines);
         self.dirty.mark_chat();
     }
@@ -2070,10 +2334,15 @@ impl App {
             self.models.footer = Some((text.to_string(), false));
             self.dirty.mark_chrome();
         } else {
-            self.transcript.push(vec![Line::from(Span::styled(
-                text.to_string(),
-                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-            ))]);
+            self.transcript.push(vec![Line::from(vec![
+                Span::styled("• ", Style::default().fg(theme::ACCENT())),
+                Span::styled(
+                    text.to_string(),
+                    Style::default()
+                        .fg(theme::DIM())
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ])]);
             self.dirty.mark_chat();
         }
     }
@@ -2100,6 +2369,13 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.approval_hits = [None; 3];
+        if self.mode == Mode::ModelPicker {
+            if let Some(picker) = &self.model_picker {
+                model_picker::render(frame, area, picker);
+            }
+            return;
+        }
         if self.mode == Mode::Models {
             models::render(frame, area, &self.models);
             return;
@@ -2115,23 +2391,22 @@ impl App {
             return;
         }
 
-        // Clamp every band so the chrome never exceeds the screen, even on
-        // tiny terminals (rendering outside the buffer panics).
+        // The composer and approval card share one input band. Approvals
+        // temporarily own that space instead of stacking more chrome.
         let status_h = 1u16.min(area.height);
-        let hints_h = 1u16.min(area.height.saturating_sub(status_h));
-        let header_h = 1u16.min(area.height.saturating_sub(status_h + hints_h + 2));
-        let approval_h = if self.pending_approval.is_some() {
-            // Title + wrapped detail + key hints (clamped for tiny terminals).
-            3u16.min(area.height.saturating_sub(header_h + status_h + hints_h))
+        let header_h = 1u16.min(area.height.saturating_sub(status_h + 2));
+        let input_h = if self.pending_approval.is_some() {
+            5
         } else {
-            0
-        };
+            self.composer.height().saturating_add(2).max(3)
+        }
+        .min(area.height.saturating_sub(header_h + status_h));
         let queue_h = if self.queued.is_empty() {
             0
         } else {
             (self.queued.len() as u16)
                 .min(3)
-                .min(area.height.saturating_sub(header_h + status_h + hints_h + approval_h + 2))
+                .min(area.height.saturating_sub(header_h + status_h + input_h))
         };
         let hist_lines = self.history_search.as_ref().map(|(q, sel, items)| {
             history_search_lines(q, *sel, items, area.width)
@@ -2157,22 +2432,12 @@ impl App {
             .or(popup_lines.as_ref())
             .map(|l| l.len() as u16)
             .unwrap_or(0)
-            .min(area.height.saturating_sub(header_h + status_h + hints_h + approval_h + queue_h + 2));
-        let composer_h = self
-            .composer
-            .height()
-            .min(area.height.saturating_sub(
-                header_h + status_h + hints_h + approval_h + queue_h + popup_h,
-            ))
-            .max(u16::from(
-                area.height > header_h + status_h + hints_h + approval_h + queue_h + popup_h,
-            ));
-        let chrome =
-            header_h + approval_h + queue_h + popup_h + composer_h + hints_h + status_h;
+            .min(area.height.saturating_sub(header_h + status_h + input_h + queue_h));
+        let chrome = header_h + queue_h + popup_h + input_h + status_h;
         let chat_h = area.height.saturating_sub(chrome);
         self.page_h = chat_h.saturating_sub(1).max(1);
 
-        // Top→bottom: [header][chat][approval][queue][popup][composer][hints][status].
+        // Top to bottom: header, transcript, queued input, popup, input, status.
         let header_area = Rect {
             x: area.x,
             y: area.y,
@@ -2186,13 +2451,6 @@ impl App {
             height: chat_h,
         };
         let mut y = area.y + header_h + chat_h;
-        let approval_area = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: approval_h,
-        };
-        y += approval_h;
         let queue_area = Rect {
             x: area.x,
             y,
@@ -2207,20 +2465,13 @@ impl App {
             height: popup_h,
         };
         y += popup_h;
-        let composer_area = Rect {
+        let input_area = Rect {
             x: area.x,
             y,
             width: area.width,
-            height: composer_h,
+            height: input_h,
         };
-        y += composer_h;
-        let hints_area = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: hints_h,
-        };
-        y += hints_h;
+        y += input_h;
         let status_area = Rect {
             x: area.x,
             y,
@@ -2233,44 +2484,6 @@ impl App {
         }
         if chat_h > 0 {
             self.draw_chat(frame, chat_area);
-        }
-        if let Some((_, name, summary, detail)) = &self.pending_approval {
-            if approval_h > 0 {
-                let w = area.width.saturating_sub(2) as usize;
-                let mut lines = vec![Line::from(vec![
-                    Span::styled("▎", Style::default().fg(theme::WARN())),
-                    Span::styled(
-                        " approve ",
-                        Style::default().fg(theme::WARN()).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        name.clone(),
-                        Style::default()
-                            .fg(theme::WARN())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(clip(summary, w.saturating_sub(name.len() + 12)), Style::default()),
-                ])];
-                if approval_h >= 2 {
-                    let body = if detail.is_empty() {
-                        summary.as_str()
-                    } else {
-                        detail.as_str()
-                    };
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(clip(body, w), Style::default().fg(theme::DIM())),
-                    ]));
-                }
-                if approval_h >= 3 {
-                    lines.push(Line::from(Span::styled(
-                        "  [y]es  [n]o  [a]lways this run  · esc declines",
-                        Style::default().fg(theme::DIM()),
-                    )));
-                }
-                Paragraph::new(lines).render(approval_area, frame.buffer_mut());
-            }
         }
 
         if queue_h > 0 {
@@ -2306,81 +2519,67 @@ impl App {
             }
         }
 
-        let (composer_lines, cx, cy) = self.composer.render(composer_h);
-        Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
-        if self.pending_approval.is_none()
-            && self.focus == Focus::Composer
-            && self.history_search.is_none()
-            && self.scroll_search.is_none()
-        {
-            frame.set_cursor_position(Position::new(composer_area.x + cx, composer_area.y + cy));
-        }
-
-        if hints_h > 0 {
-            Paragraph::new(self.contextual_hints())
-                .render(hints_area, frame.buffer_mut());
+        if self.pending_approval.is_some() {
+            self.draw_approval(frame, input_area);
+        } else if input_h > 0 {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::BORDER()))
+                .style(Style::default().bg(theme::COMPOSER_BG()));
+            let inner = block.inner(input_area);
+            block.render(input_area, frame.buffer_mut());
+            let (composer_lines, cx, cy) = self.composer.render(inner.height);
+            Paragraph::new(composer_lines)
+                .style(Style::default().bg(theme::COMPOSER_BG()))
+                .render(inner, frame.buffer_mut());
+            if self.focus == Focus::Composer
+                && self.history_search.is_none()
+                && self.scroll_search.is_none()
+            {
+                frame.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
+            }
         }
         self.draw_status(frame, status_area);
     }
 
-    fn contextual_hints(&self) -> Line<'static> {
-        let text = if self.pending_approval.is_some() {
-            "y approve · n deny · a always"
-        } else if self.history_search.is_some() {
-            "↑↓ pick · enter insert · esc cancel"
-        } else if self.scroll_search.is_some() {
-            "↑↓ match · enter jump · esc close"
-        } else if self.completion.is_some() {
-            "↑↓ select · tab/enter accept · esc close"
-        } else if self.focus == Focus::Scrollback {
-            if self.scroll_search_last.is_some() {
-                "j/k block · n/N find · enter fold · y copy"
-            } else {
-                "j/k block · [/] turn · g/G top/end · enter fold · y copy"
-            }
-        } else if self.running {
-            "enter queues · esc cancel · tab history · ctrl+f find"
-        } else if self.transcript.offset() > 0 {
-            "esc follow · tab browse · pgup/pgdn scroll"
-        } else {
-            "enter send · /tools · /skills · @ file · ctrl+f find"
+    fn draw_approval(&mut self, frame: &mut Frame, area: Rect) {
+        let Some((_, name, summary, detail)) = self.pending_approval.as_ref() else {
+            return;
         };
-        Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default().fg(theme::DIM()),
-        ))
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::WARN()))
+            .title(Span::styled(
+                " Approval ",
+                Style::default()
+                    .fg(theme::WARN())
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(theme::SURFACE()));
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+        let lines = approval_card_lines(name, summary, detail, inner.width);
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme::SURFACE()))
+            .render(inner, frame.buffer_mut());
+
+        if inner.height >= 3 {
+            self.approval_hits = approval_hit_regions(inner);
+        }
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let version = env!("CARGO_PKG_VERSION");
-        // Avoid reading providers.json on every redraw; header uses settings only.
-        let (model, base_url, approvals, provider) = {
-            let s = self.core.settings.lock().unwrap();
-            (
-                s.model.clone(),
-                s.base_url.clone(),
-                s.approval_mode.clone(),
-                s.provider.clone(),
-            )
-        };
-        let model = extensions::short_model(&model);
-        let host = extensions::endpoint_host(&base_url).unwrap_or_else(|| "endpoint".into());
-        let endpoint = if let Some(p) = provider {
-            format!("{p}:{model}")
-        } else {
-            format!("{model}@{host}")
-        };
-        let max_ep = (area.width as usize / 3).clamp(12, 36);
-        let endpoint = clip(&endpoint, max_ep);
         let line = Line::from(vec![
             Span::styled(
-                "◆ openmax",
+                "◆ Open Max",
                 Style::default()
                     .fg(theme::ACCENT())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  v{version} · {} · {endpoint} · {approvals}", self.dir_label),
+                format!("  {}", clip(&self.dir_label, area.width.saturating_sub(13) as usize)),
                 Style::default().fg(theme::DIM()),
             ),
         ]);
@@ -2393,7 +2592,15 @@ impl App {
     /// When only the live tail is dirty (spinner / tokens), the history prefix
     /// of `chat_buf` is reused and the tail is re-stitched.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
-        let content_w = area.width.saturating_sub(1).max(8);
+        let layout_started = Instant::now();
+        let content_w = area.width.saturating_sub(1);
+        if content_w == 0 || area.height == 0 {
+            self.chat_draw_area = Rect::default();
+            self.chat_line_map.clear();
+            self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
+            self.perf_selection_ms = 0.0;
+            return;
+        }
         let chat_dirty = self.dirty.chat;
 
         self.transcript.set_width(content_w);
@@ -2429,12 +2636,14 @@ impl App {
 
         if rebuild_hist {
             self.chat_buf.clear();
+            self.chat_line_map.clear();
             // One clone of sticky spans: take ownership and insert the gutter.
             if has_sticky {
                 if let Some(mut s) = self.transcript.sticky_user_line(start) {
                     s.spans
                         .insert(0, Span::styled("┊ ", Style::default().fg(theme::DIM())));
                     self.chat_buf.push(s);
+                    self.chat_line_map.push(None);
                 }
             }
             let budget = visible.saturating_sub(self.chat_buf.len());
@@ -2443,10 +2652,12 @@ impl App {
             // Single clone per viewport history line (reuse path skips this).
             self.transcript
                 .fill_viewport(&mut self.chat_buf, start, view_end, selected_bi);
+            self.chat_line_map.extend((start..view_end).map(Some));
             self.hist_prefix_len = self.chat_buf.len();
             self.hist_reuse_key = Some(reuse_key);
         } else {
             self.chat_buf.truncate(self.hist_prefix_len);
+            self.chat_line_map.truncate(self.hist_prefix_len);
         }
 
         // Stitch visible tail after the history prefix.
@@ -2457,6 +2668,7 @@ impl App {
             let ti = idx - hist_len;
             if ti < self.tail_buf.len() {
                 self.chat_buf.push(self.tail_buf[ti].clone());
+                self.chat_line_map.push(None);
             }
             idx += 1;
             taken += 1;
@@ -2469,7 +2681,18 @@ impl App {
             width: content_w,
             height: area.height - pad,
         };
+        self.chat_draw_area = draw_area;
         Paragraph::new(self.chat_buf.as_slice()).render(draw_area, frame.buffer_mut());
+        self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
+
+        let selection_started = Instant::now();
+        paint_text_selection(
+            frame.buffer_mut(),
+            &mut self.transcript,
+            &self.chat_line_map,
+            draw_area,
+        );
+        self.perf_selection_ms = selection_started.elapsed().as_secs_f64() * 1000.0;
 
         // Thin scrollbar: thumb position from bottom-based offset.
         if total > visible && area.width > 0 {
@@ -2503,6 +2726,7 @@ impl App {
     /// wraps when only the spinner meta line changes between ticks.
     fn rebuild_tail(&mut self, width: u16) -> usize {
         let width_changed = width != self.tail_width;
+        let prose_width = width.saturating_sub(2).max(8);
         if width_changed {
             self.tail_width = width;
             self.thinking_source.clear();
@@ -2519,7 +2743,7 @@ impl App {
                 stream_changed = true;
             }
         } else if width_changed || self.stream_md.text_len() != self.stream_text.len() {
-            self.stream_md.update(&self.stream_text, width);
+            self.stream_md.update(&self.stream_text, prose_width);
             self.stream_md.copy_into(&mut self.stream_wrapped);
             stream_changed = true;
         }
@@ -2535,7 +2759,7 @@ impl App {
                     .lines()
                     .map(|l| Line::from(Span::styled(l.to_string(), dim)))
                     .collect();
-                self.thinking_wrapped = wrap_lines(&raw, width);
+                self.thinking_wrapped = wrap_lines(&raw, prose_width);
             }
         } else if !self.thinking_wrapped.is_empty() || !self.thinking_source.is_empty() {
             thinking_changed = true;
@@ -2547,10 +2771,20 @@ impl App {
 
         if content_changed {
             self.tail_buf.clear();
-            self.tail_buf
-                .extend(self.thinking_wrapped.iter().cloned());
-            self.tail_buf
-                .extend(self.stream_wrapped.iter().cloned());
+            self.tail_buf.extend(self.thinking_wrapped.iter().cloned().map(|mut line| {
+                line.spans.insert(
+                    0,
+                    Span::styled("◌ ", Style::default().fg(theme::DIM())),
+                );
+                line
+            }));
+            self.tail_buf.extend(self.stream_wrapped.iter().cloned().map(|mut line| {
+                line.spans.insert(
+                    0,
+                    Span::styled("│ ", Style::default().fg(theme::BORDER())),
+                );
+                line
+            }));
             self.tail_content_len = self.tail_buf.len();
         } else {
             self.tail_buf.truncate(self.tail_content_len);
@@ -2594,82 +2828,108 @@ impl App {
     }
 
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
-        let ready = self.core.mlx.lock().unwrap().ready;
         let (model, approvals) = {
             let s = self.core.settings.lock().unwrap();
             (s.model.clone(), s.approval_mode.clone())
         };
-        let scrolled = self.transcript.offset() > 0;
-
-        // Status is a single line; rebuild every paint (cheap).
-        {
-            self.status_model = model;
-            self.status_approvals = approvals;
-            self.status_ready = ready;
-            self.status_budget = self.budget;
-            self.status_cache = self.cache_pct;
-            self.status_scrolled = scrolled;
-            self.status_quit_armed = self.quit_armed;
-
-            let dot_color = if self.running {
-                theme::WARN()
-            } else if ready {
-                theme::OK()
-            } else {
-                theme::DIM()
-            };
-            let mut ctx = self
-                .budget
-                .map(|(u, t)| format!(" · ctx {}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
-                .unwrap_or_default();
-            if let Some(pct) = self.cache_pct {
-                ctx.push_str(&format!(" · cache {pct}%"));
-            }
-            if !self.queued.is_empty() {
-                ctx.push_str(&format!(" · q:{}", self.queued.len()));
-            }
-            if self.running {
-                if let Some(started) = self.turn_started {
-                    let secs = started.elapsed().as_secs();
-                    ctx.push_str(&format!(" · {secs}s"));
-                }
-                if let (Some(started), Some(first)) = (self.turn_started, self.first_token) {
-                    let ttft = first.saturating_duration_since(started).as_millis();
-                    ctx.push_str(&format!(" · ttft {ttft}ms"));
-                }
-            }
-            let short_model = extensions::short_model(&self.status_model).to_string();
-            let focus = if self.focus == Focus::Scrollback {
-                " · hist"
-            } else {
-                ""
-            };
-            let scrolled_suffix = if scrolled { " · ↑" } else { "" };
-            // Harness does not phone home; external tools may still use the network.
-            let privacy = if self.running || self.quit_armed {
-                ""
-            } else {
-                " · no telemetry"
-            };
-            let right = if self.quit_armed {
-                " · ctrl+c again to quit"
-            } else {
-                ""
-            };
-            self.status_line = Line::from(vec![
-                Span::styled("● ", Style::default().fg(dot_color)),
-                Span::styled(short_model, Style::default().fg(theme::DIM())),
-                Span::styled(
-                    format!(
-                        "{ctx} · {}{scrolled_suffix}{focus}{privacy}{right}",
-                        self.status_approvals
-                    ),
-                    Style::default().fg(theme::DIM()),
-                ),
-            ]);
-        }
+        let width = area.width as usize;
+        let left = format!(" {}", self.status_hint());
+        let short_model = extensions::short_model(&model);
+        let context = self
+            .budget
+            .map(|(used, total)| {
+                format!(
+                    "ctx {}%",
+                    (used as f64 / total.max(1) as f64 * 100.0) as u32
+                )
+            })
+            .unwrap_or_else(|| "ctx 0%".into());
+        let right = if width >= 78 {
+            format!("● {short_model} · {context} · {approvals} ")
+        } else if width >= 54 {
+            format!("● {short_model} · {approvals} ")
+        } else if width < 4 {
+            "●".into()
+        } else {
+            let model_width = width
+                .saturating_sub(3)
+                .min(width.saturating_div(2).max(8));
+            format!("● {} ", clip(short_model, model_width))
+        };
+        let right_len = right.chars().count().min(width);
+        let left_max = width.saturating_sub(right_len + 1);
+        let left = clip(&left, left_max);
+        let padding = width.saturating_sub(left.chars().count() + right_len);
+        let dot_color = if self.running {
+            theme::WARN()
+        } else {
+            theme::OK()
+        };
+        let right_tail = right.strip_prefix('●').unwrap_or(&right).to_string();
+        self.status_line = Line::from(vec![
+            Span::styled(left, Style::default().fg(theme::DIM())),
+            Span::raw(" ".repeat(padding)),
+            Span::styled("●", Style::default().fg(dot_color)),
+            Span::styled(right_tail, Style::default().fg(theme::DIM())),
+        ]);
         Paragraph::new(self.status_line.clone()).render(area, frame.buffer_mut());
     }
+
+    fn status_hint(&self) -> &'static str {
+        if self.transcript.has_text_selection() && self.focus == Focus::Scrollback {
+            "y copy selection · esc clear"
+        } else if self.transcript.has_text_selection() {
+            "ctrl+shift+c copy selection · esc clear"
+        } else if self.pending_approval.is_some() {
+            "y allow once · a allow for run · n deny"
+        } else if self.history_search.is_some() {
+            "↑↓ pick · enter insert · esc close"
+        } else if self.scroll_search.is_some() {
+            "↑↓ match · enter jump · esc close"
+        } else if self.completion.is_some() {
+            "↑↓ select · tab accept · esc close"
+        } else if self.focus == Focus::Scrollback {
+            "j/k block · enter fold · y copy"
+        } else if self.running {
+            "enter queue · esc cancel"
+        } else if self.transcript.offset() > 0 {
+            "esc follow · pgup/pgdn scroll"
+        } else if self.quit_armed {
+            "ctrl+c again to quit"
+        } else {
+            "/ commands · @ files · drag to select"
+        }
+    }
+}
+
+fn command_parts(command: &str) -> (&str, &str) {
+    let command = command.trim();
+    let head_end = command
+        .find(char::is_whitespace)
+        .unwrap_or(command.len());
+    let head = &command[..head_end];
+    let rest = command[head_end..].trim();
+    (head, rest)
+}
+
+fn save_model_selection(
+    data_dir: &std::path::Path,
+    current: &config::Settings,
+    provider: Option<String>,
+    model: String,
+) -> Result<config::Settings, String> {
+    let mut next = current.clone();
+    next.provider = provider;
+    next.model = model.clone();
+    let uses_managed_mlx = open_max_core::providers::resolve(&next, data_dir)
+        .is_ok_and(|endpoint| {
+            open_max_core::providers::is_managed_mlx(&endpoint, next.mlx_port)
+        });
+    if uses_managed_mlx {
+        next.mlx_model = model;
+    }
+    config::save(data_dir, &next)?;
+    Ok(next)
 }
 
 /// Single source of truth for `/help` and onboarding copy.
@@ -2687,24 +2947,11 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("n / N after find", "next or previous match in scrollback"),
     ("esc", "cancel turn · follow latest · return to composer"),
     ("wheel · pgup/pgdn", "scroll the conversation"),
+    ("mouse drag", "select transcript text · y or ctrl+shift+c copies"),
     ("ctrl+o / o", "expand the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
-    ("/models", "manage and serve local models"),
-    ("/model <id>", "use a specific model id"),
-    ("/provider [name]", "list or select a named OpenAI-compatible provider"),
-    ("/theme dark|light|mono|catppuccin", "switch appearance"),
-    ("/approvals <auto|ask|readonly>", "how mutating tools are gated"),
-    ("/new", "start a fresh session"),
-    ("/resume", "pick an earlier session in this project"),
-    ("/tools", "list tools frozen for this session"),
-    ("/skills", "list skills frozen for this session"),
-    ("/reload", "re-freeze tools, skills, and prompt from current config"),
     ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),
-    ("/context", "prompt token costs, cache hits, and budget"),
-    ("/status", "session, endpoint, and network destinations"),
-    ("/logs", "recent model server logs"),
-    ("/quit", "exit"),
 ];
 
 fn history_search_lines(
@@ -2832,10 +3079,14 @@ fn kv(k: &str, v: &str) -> Line<'static> {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max.max(8) {
+    if max == 0 {
+        String::new()
+    } else if s.chars().count() <= max {
         s.to_string()
+    } else if max == 1 {
+        "…".into()
     } else {
-        format!("{}…", s.chars().take(max.max(8)).collect::<String>())
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
     }
 }
 
@@ -2850,22 +3101,170 @@ fn truncate_replay_output(output: &str) -> String {
     }
 }
 
+fn paint_text_selection(
+    buffer: &mut ratatui::buffer::Buffer,
+    transcript: &mut Transcript,
+    line_map: &[Option<usize>],
+    area: Rect,
+) {
+    for (row, line_idx) in line_map.iter().copied().enumerate() {
+        let Some(line_idx) = line_idx else {
+            continue;
+        };
+        let Some((start_col, end_col)) = transcript.selection_columns(line_idx) else {
+            continue;
+        };
+        let max_col = end_col.min(area.width as usize);
+        for column in start_col.min(max_col)..max_col {
+            if let Some(cell) =
+                buffer.cell_mut((area.x + column as u16, area.y + row as u16))
+            {
+                cell.set_bg(theme::SELECT());
+            }
+        }
+    }
+}
+
+const APPROVAL_LABELS: [&str; 3] =
+    ["▸ [y] Allow once", "   [a] Allow for run", "   [n] Deny"];
+
+fn approval_card_lines(
+    name: &str,
+    summary: &str,
+    detail: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let body = if detail.is_empty() { summary } else { detail };
+    vec![
+        Line::from(vec![
+            Span::styled(
+                tool_card::human_name(name),
+                Style::default()
+                    .fg(theme::WARN())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                clip(summary, width.saturating_sub(name.len() + 2)),
+                Style::default(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            clip(body, width),
+            Style::default().fg(theme::DIM()),
+        )),
+        Line::from(vec![
+            Span::styled(
+                APPROVAL_LABELS[0],
+                Style::default()
+                    .fg(theme::WARN())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM())),
+            Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM())),
+        ]),
+    ]
+}
+
+fn approval_hit_regions(inner: Rect) -> [Option<Rect>; 3] {
+    let mut hits = [None; 3];
+    if inner.height < 3 {
+        return hits;
+    }
+    let mut x = inner.x;
+    for (index, label) in APPROVAL_LABELS.iter().enumerate() {
+        let width = label
+            .chars()
+            .count()
+            .min(inner.right().saturating_sub(x) as usize);
+        if width > 0 {
+            hits[index] = Some(Rect {
+                x,
+                y: inner.y + 2,
+                width: width as u16,
+                height: 1,
+            });
+        }
+        x = x.saturating_add(width as u16);
+    }
+    hits
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Dirty;
+    use super::{
+        approval_card_lines, approval_hit_regions, command_parts, paint_text_selection,
+        rect_contains, save_model_selection, App, Dirty, Focus,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use open_max_core::config;
+    use open_max_core::state::Core;
+    use open_max_core::types::AgentEvent;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Widget};
+    use ratatui::Terminal;
+    use serde_json::json;
+    use std::fs;
+    use tokio::sync::mpsc;
+
+    use crate::theme;
+    use crate::ui::transcript::Transcript;
+
+    fn app_fixture() -> (App, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openmax-app-render-{nonce}"));
+        let (core, _rx) = Core::new(dir.clone());
+        let (hf_tx, _hf_rx) = mpsc::unbounded_channel();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let app = App::new(core, dir.clone(), "sample-project".into(), hf_tx, files_tx);
+        (app, dir)
+    }
+
+    fn render_app(app: &mut App, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn rows(buffer: &Buffer) -> Vec<String> {
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        rows(buffer).join("\n")
+    }
 
     #[test]
     fn dirty_default_is_clean() {
         let d = Dirty::default();
         assert!(!d.any());
-        assert!(!d.chat && !d.tail && !d.chrome);
+        assert!(!d.chat && !d.tail && !d.chrome && !d.selection);
     }
 
     #[test]
     fn dirty_all_sets_every_region() {
         let d = Dirty::all();
         assert!(d.any());
-        assert!(d.chat && d.tail && d.chrome);
+        assert!(d.chat && d.tail && d.chrome && d.selection);
     }
 
     #[test]
@@ -2897,6 +3296,17 @@ mod tests {
     }
 
     #[test]
+    fn mark_selection_redraws_overlay_and_status_without_rebuilding_chat() {
+        let mut d = Dirty::default();
+        d.mark_selection();
+        assert!(!d.chat);
+        assert!(!d.tail);
+        assert!(d.chrome);
+        assert!(d.selection);
+        assert!(d.any());
+    }
+
+    #[test]
     fn clear_resets_all_flags() {
         let mut d = Dirty::all();
         d.clear();
@@ -2915,5 +3325,266 @@ mod tests {
         d.clear();
         d.mark_chat();
         assert!(d.any());
+    }
+
+    #[test]
+    fn model_selection_persists_provider_and_complete_id() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openmax-model-save-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let current = config::Settings::default();
+        let exact = "openrouter/vendor/family/model".to_string();
+        let saved = save_model_selection(
+            &dir,
+            &current,
+            Some("openrouter".into()),
+            exact.clone(),
+        )
+        .unwrap();
+        assert_eq!(saved.provider.as_deref(), Some("openrouter"));
+        assert_eq!(saved.model, exact);
+        assert_eq!(saved.mlx_model, current.mlx_model);
+        let disk = config::load(&dir);
+        assert_eq!(disk.provider.as_deref(), Some("openrouter"));
+        assert_eq!(disk.model, exact);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_mlx_model_selection_updates_the_served_repo() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openmax-mlx-model-save-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let current = config::Settings::default();
+        let exact = "mlx-community/new-model".to_string();
+        let saved = save_model_selection(&dir, &current, None, exact.clone()).unwrap();
+        assert_eq!(saved.model, exact);
+        assert_eq!(saved.mlx_model, exact);
+        let disk = config::load(&dir);
+        assert_eq!(disk.model, exact);
+        assert_eq!(disk.mlx_model, exact);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn command_parser_preserves_the_complete_trimmed_model_id() {
+        assert_eq!(
+            command_parts("  model   openrouter/vendor/family/model  "),
+            ("model", "openrouter/vendor/family/model")
+        );
+        assert_eq!(command_parts("model"), ("model", ""));
+    }
+
+    #[test]
+    fn model_selection_failure_leaves_current_settings_unchanged() {
+        let current = config::Settings::default();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing = std::env::temp_dir()
+            .join(format!("openmax-model-save-missing-{nonce}"))
+            .join("nested");
+        let result = save_model_selection(
+            &missing,
+            &current,
+            Some("other".into()),
+            "other/model".into(),
+        );
+        assert!(result.is_err());
+        assert!(current.provider.is_none());
+        assert_eq!(current.model, config::Settings::default().model);
+    }
+
+    #[test]
+    fn approval_card_has_focused_default_and_clipped_detail() {
+        let lines = approval_card_lines(
+            "bash",
+            "run tests",
+            "cargo test with a deliberately long trailing argument",
+            24,
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "Shell");
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[2].spans[0].content.as_ref(), "▸ [y] Allow once");
+        let detail: String = lines[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(detail.chars().count() <= 25);
+    }
+
+    #[test]
+    fn approval_hit_regions_match_each_visible_choice_and_clip_narrowly() {
+        let wide = approval_hit_regions(Rect::new(2, 3, 60, 3));
+        for hit in wide.into_iter().flatten() {
+            assert!(rect_contains(hit, hit.x, hit.y));
+            assert!(!rect_contains(hit, hit.right(), hit.y));
+        }
+        let narrow = approval_hit_regions(Rect::new(0, 0, 12, 3));
+        assert!(narrow[0].is_some());
+        assert!(narrow[1].is_none());
+        assert!(narrow[2].is_none());
+    }
+
+    #[test]
+    fn selection_overlay_changes_only_selected_transcript_cells() {
+        let mut transcript = Transcript::new();
+        transcript.set_width(20);
+        transcript.push_user(vec![Line::from("hello")]);
+        assert!(transcript.begin_text_selection_at(0, 2));
+        assert!(transcript.update_text_selection_at(0, 7));
+        transcript.finish_text_selection();
+
+        let mut lines = Vec::new();
+        transcript.fill_viewport(&mut lines, 0, 1, None);
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines).render(area, &mut buffer);
+        paint_text_selection(&mut buffer, &mut transcript, &[Some(0)], area);
+
+        assert_eq!(buffer[(1, 0)].bg, theme::USER_BG());
+        assert_eq!(buffer[(2, 0)].bg, theme::SELECT());
+        assert_eq!(buffer[(6, 0)].bg, theme::SELECT());
+        assert_eq!(buffer[(7, 0)].bg, theme::USER_BG());
+    }
+
+    #[tokio::test]
+    async fn retained_text_selection_does_not_swallow_composer_y() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(20);
+        app.transcript.push_user(vec![Line::from("selected text")]);
+        assert!(app.transcript.begin_text_selection_at(0, 2));
+        assert!(app.transcript.update_text_selection_at(0, 10));
+        app.transcript.finish_text_selection();
+        app.focus = Focus::Composer;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.composer.text(), "y");
+        assert!(app.transcript.has_text_selection());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idle_layout_is_restrained_and_has_bordered_composer() {
+        let (mut app, dir) = app_fixture();
+        let buffer = render_app(&mut app, 96, 18);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("◆ Open Max  sample-project"));
+        assert!(text.contains("Describe a task"));
+        assert!(text.contains("╭"));
+        assert!(text.contains("/ commands · @ files · drag to select"));
+        assert!(!text.contains("no telemetry"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exchange_and_tool_states_have_separate_visual_planes() {
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("please test this");
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: "I will inspect it.".into(),
+        });
+        assert_eq!(
+            app.last_assistant_response.as_deref(),
+            Some("I will inspect it.")
+        );
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            args: json!({"command":"cargo test"}),
+        });
+        let running = render_app(&mut app, 96, 20);
+        let running_text = buffer_text(&running);
+        assert!(running_text.contains("❯ please test this"));
+        assert!(running_text.contains("│ I will inspect it."));
+        assert!(running_text.contains("Shell cargo test"));
+        let rendered_rows = rows(&running);
+        let user_y = rendered_rows
+            .iter()
+            .position(|row| row.contains("❯ please test this"))
+            .unwrap() as u16;
+        assert_eq!(running[(0, user_y)].bg, theme::USER_BG());
+
+        app.on_agent_event(AgentEvent::ToolEnd {
+            call_id: "call-1".into(),
+            ok: true,
+            output: "test one ok\ntest two ok\ntest three ok\ntest four ok".into(),
+        });
+        let complete = render_app(&mut app, 96, 22);
+        let complete_text = buffer_text(&complete);
+        assert!(complete_text.contains("✓ Shell"));
+        assert!(complete_text.contains("test three ok"));
+        assert!(complete_text.contains("1 more line"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn approval_replaces_composer_then_restores_its_draft() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("keep this draft");
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-1".into(),
+            name: "bash".into(),
+            summary: "install dependencies".into(),
+            detail: "cargo fetch".into(),
+        });
+        let pending = render_app(&mut app, 88, 16);
+        let pending_text = buffer_text(&pending);
+        assert!(pending_text.contains("Approval"));
+        assert!(pending_text.contains("[y] Allow once"));
+        assert!(pending_text.contains("[a] Allow for run"));
+        assert!(!pending_text.contains("keep this draft"));
+        assert!(app.approval_hits.iter().all(Option::is_some));
+
+        app.on_agent_event(AgentEvent::ApprovalSettled {
+            approval_id: "approval-1".into(),
+            outcome: "approved".into(),
+        });
+        let settled = render_app(&mut app, 88, 16);
+        assert!(buffer_text(&settled).contains("keep this draft"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_popup_and_narrow_layout_render_without_duplicate_hints() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("/");
+        app.sync_completion();
+        let wide = render_app(&mut app, 88, 18);
+        let text = buffer_text(&wide);
+        assert!(text.contains("/model"));
+        let wide_rows = rows(&wide);
+        let selected_y = wide_rows
+            .iter()
+            .position(|row| row.contains("/help"))
+            .unwrap() as u16;
+        assert_eq!(wide[(0, selected_y)].bg, theme::SURFACE());
+
+        app.composer.load("/co");
+        app.sync_completion();
+        let copy_popup = render_app(&mut app, 88, 18);
+        assert!(buffer_text(&copy_popup).contains("/copy"));
+
+        app.composer.load("");
+        app.sync_completion();
+        let narrow = render_app(&mut app, 34, 8);
+        let narrow_text = buffer_text(&narrow);
+        assert!(narrow_text.contains("Open Max"));
+        assert!(narrow_text.contains("Describe a task"));
+        let tiny = render_app(&mut app, 12, 5);
+        assert!(buffer_text(&tiny).contains("Open Max"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }
