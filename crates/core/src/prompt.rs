@@ -126,9 +126,14 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - New tool: .openmax/tools/<name>.toml with name, description, params (JSON schema), command, args, mutating.\n\
 - New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
 - Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
-- Hook: .openmax/hooks/<name>.toml with event pre_tool_use (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end.\n\
+- Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end.\n\
 - Permission rules: .openmax/permissions.toml with allow/deny/ask entries.\n\
-A tool or skill you write is live on the next turn (the harness re-freezes automatically; /reload forces it now). Hooks, permissions, and templates apply on their next use.";
+A tool or skill you write is live on the next turn (the harness re-freezes automatically; /reload forces it now). Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check.\n\
+\n\
+Working files (there is no built-in plan mode, todo list, or memory):\n\
+- PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
+- TODO.md: the running task list; check items off as you finish.\n\
+- AGENTS.md: durable project facts worth remembering across sessions; keep it short (loads at session create and on /reload).";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -263,6 +268,14 @@ mod tests {
         assert!(prompt.contains(".openmax/tools/<name>.toml"));
         assert!(prompt.contains(".agents/prompts/<name>.md"));
         assert!(prompt.contains("/reload"));
+        assert!(prompt.contains("openmax --check"));
+        assert!(prompt.contains("user_prompt_submit"));
+        // The design's "use instead" contract: PLAN.md over plan mode,
+        // TODO.md over a todo product, AGENTS.md as durable memory.
+        assert!(prompt.contains("PLAN.md"));
+        assert!(prompt.contains("TODO.md"));
+        assert!(prompt.contains("AGENTS.md: durable project facts"));
+        assert!(prompt.contains("on /reload"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -323,21 +336,24 @@ mod tests {
     fn missing_agents_md_adds_nothing() {
         let dir = temp_project();
         let prompt = builtin_prompt(&dir);
-        assert!(!prompt.contains("AGENTS.md"));
+        // The self-extension guide names AGENTS.md as a working file; the
+        // injected project-instructions section must stay absent when no
+        // AGENTS.md exists on disk.
+        assert!(!prompt.contains("Project instructions (AGENTS.md):"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Budget gate for the frozen prompt prefix: base system prompt, the
-    /// self-extension guide, and the serialized builtin tool array must stay
-    /// within ~1000 tokens. The cap is in chars (the core stays
-    /// tokenizer-free): the pre-guide 3452 chars including a 52-char project
-    /// root measured 794 tokens on o200k_base and 775 on cl100k_base
-    /// (2026-07-16); the guide adds ~180 tokens. The interpolated root varies
-    /// per machine, so it is excluded here and the cap (4300) leaves room for
-    /// a typical checkout path. If this fails, re-measure with a real
-    /// tokenizer before raising anything. Only builtins count: external tools
-    /// are the user's own budget, and grounding sections (AGENTS.md, layout
-    /// map, skills) have their own caps.
+    /// self-extension guide (now including the working-files contract), and
+    /// the serialized builtin tool array must stay within ~1150 tokens. The
+    /// cap is in chars (the core stays tokenizer-free): the pre-guide 3452
+    /// chars including a 52-char project root measured 794 tokens on
+    /// o200k_base and 775 on cl100k_base (2026-07-16); the guide adds ~300
+    /// tokens. The interpolated root varies per machine, so it is excluded
+    /// here and the cap (4900) leaves room for a typical checkout path. If
+    /// this fails, re-measure with a real tokenizer before raising anything.
+    /// Only builtins count: external tools are the user's own budget, and
+    /// grounding sections (AGENTS.md, layout map, skills) have their own caps.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -364,8 +380,8 @@ mod tests {
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
         assert!(
-            total <= 4_300,
-            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 4300 ≈ 1000 tokens with a typical checkout path)",
+            total <= 4_900,
+            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 4900 ≈ 1150 tokens with a typical checkout path)",
         );
         let _ = std::fs::remove_dir_all(dir);
     }

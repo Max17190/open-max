@@ -23,10 +23,11 @@ Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash
 - Tools: `.openmax/tools/*.toml` or `~/.openmax/tools/`
 - Skills: `.agents/skills/*/SKILL.md` or `~/.openmax/skills/` (index only; read body on demand)
 - Prompt templates: `.agents/prompts/<name>.md` or `~/.openmax/prompts/` (`$ARGUMENTS`, `$1`..`$9`; user runs `/<name>`)
-- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` gates; `post_tool_use` / `session_start` / `compaction` / `turn_end` observe; not in prompt)
+- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` / `user_prompt_submit` gate; `post_tool_use` / `session_start` / `compaction` / `turn_end` observe; not in prompt)
 - Permissions: `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (allow/deny/ask; not in prompt)
 - Providers: `~/.openmax/providers.json`; `/theme` for built-in palettes
-- Built-in context compaction; tools/skills re-freeze automatically when their files change (`/reload` forces now, `/new` for clean)
+- Built-in compaction with model-written summaries (heuristic digest fallback); tools/skills re-freeze automatically when their files change (`/reload` forces now, `/new` for clean)
+- `openmax --check` validates every extension file with per-file reasons; run it after writing one
 
 Not shipped: user keybindings, theme file hot reload, pluggable compactors, TUI plugin ABI (custom frontends speak `--stdio` JSONL).
 

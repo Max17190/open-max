@@ -144,6 +144,9 @@ pub struct App {
     /// Messages typed while the agent works, sent in order after the turn.
     queued: Vec<String>,
     flush_queue: bool,
+    /// Text of the in-flight user submit, kept so a `user_prompt_submit`
+    /// block can restore the composer and drop the optimistic UI bubble.
+    pending_submit: Option<String>,
 
     running: bool,
     stream_text: String,
@@ -217,6 +220,7 @@ pub async fn run(
         project,
         dir_label,
         session_id: None,
+        pending_submit: None,
         mode: Mode::Chat,
         composer: Composer::new(&core.data_dir),
         models: models::ModelsState::empty(),
@@ -1348,11 +1352,19 @@ impl App {
             }
         };
 
+        // Painted optimistically; rolled back on `stop_reason: "blocked"` if
+        // user_prompt_submit rejects before the text enters the core transcript.
         self.insert_user_block(&text);
         self.transcript.follow();
-        match agent::start_turn(self.core.clone(), session_id, self.project.clone(), text) {
+        match agent::start_turn(
+            self.core.clone(),
+            session_id,
+            self.project.clone(),
+            text.clone(),
+        ) {
             Ok(()) => {
                 self.running = true;
+                self.pending_submit = Some(text);
                 self.turn_started = Some(Instant::now());
                 self.first_token = None;
                 self.stream_chars = 0;
@@ -1368,7 +1380,10 @@ impl App {
                 self.dirty.mark_chat();
                 self.dirty.mark_chrome();
             }
-            Err(e) => self.error(&e),
+            Err(e) => {
+                let _ = self.transcript.pop_last_user();
+                self.error(&e);
+            }
         }
         Ok(())
     }
@@ -1937,17 +1952,55 @@ impl App {
                 self.dirty.mark_chat();
                 self.dirty.mark_chrome();
                 match stop_reason.as_str() {
-                    "stop" | "tool_calls" => self.push_turn_stats(),
-                    "cancelled" => self.note("cancelled"),
-                    "length" => self.note("stopped: hit the response token limit"),
-                    "max_iterations" => self.note("stopped: reached the tool-call limit for one turn (send a follow-up to continue)"),
-                    "error" => {}
-                    other => self.note(&format!("stopped: {other}")),
+                    "stop" | "tool_calls" => {
+                        self.pending_submit = None;
+                        self.push_turn_stats();
+                    }
+                    "cancelled" => {
+                        self.pending_submit = None;
+                        self.note("cancelled");
+                    }
+                    "length" => {
+                        self.pending_submit = None;
+                        self.note("stopped: hit the response token limit");
+                    }
+                    "max_iterations" => {
+                        self.pending_submit = None;
+                        self.note(
+                            "stopped: reached the tool-call limit for one turn (send a follow-up to continue)",
+                        );
+                    }
+                    "error" => {
+                        self.pending_submit = None;
+                    }
+                    "blocked" => {
+                        // Core never accepted the text: drop the optimistic
+                        // user bubble and restore it to the composer.
+                        let _ = self.transcript.pop_last_user();
+                        if let Some(text) = self.pending_submit.take() {
+                            if self.composer.is_empty() {
+                                self.composer.load(&text);
+                            } else {
+                                // Preserve any draft the user started typing
+                                // while the block was in flight.
+                                let mut combined = text;
+                                combined.push('\n');
+                                combined.push_str(&self.composer.text());
+                                self.composer.load(&combined);
+                            }
+                        }
+                        self.dirty.mark_chat();
+                        self.dirty.mark_chrome();
+                    }
+                    other => {
+                        self.pending_submit = None;
+                        self.note(&format!("stopped: {other}"));
+                    }
                 }
                 if !self.queued.is_empty() {
                     // An interrupted or failed turn returns the queue to the
                     // composer instead of firing blind into a broken state.
-                    if matches!(stop_reason.as_str(), "cancelled" | "error") {
+                    if matches!(stop_reason.as_str(), "cancelled" | "error" | "blocked") {
                         self.return_queue_to_composer();
                     } else {
                         self.flush_queue = true;

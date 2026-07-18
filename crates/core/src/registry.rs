@@ -2,10 +2,11 @@
 //! external tools configured under `.openmax/tools/*.toml` (project) and
 //! `~/.openmax/tools/*.toml` (global), plus discovered skills.
 //!
-//! Built exactly once per session and never rebuilt: the serialized tool
-//! schema array is part of the prompt prefix the server's KV cache keys on,
-//! so it must stay byte-stable for the session's whole lifetime. Config
-//! changes apply to new sessions only.
+//! Frozen per freeze window: built at session creation, then re-frozen when
+//! extension files change on disk (fingerprint at turn start) or the user
+//! forces `/reload`. Between freezes the serialized tool schema array is
+//! byte-stable so the server's KV cache stays warm. An unchanged disk is a
+//! no-op.
 //!
 //! With no external tools or skills installed, the schema JSON is
 //! byte-identical to the built-in `tools::tool_schemas()` array and the
@@ -385,10 +386,15 @@ fn default_timeout() -> u64 {
 /// first, then the project's `.openmax/tools/*.toml`, which wins on name
 /// collision. Malformed files are skipped, never fatal.
 fn discover_external(project_root: &Path) -> Vec<ToolSpec> {
-    discover_external_in(&[
+    discover_external_in(&external_tool_dirs(project_root))
+}
+
+/// Global then project tool dirs; later dirs win on name collision.
+pub(crate) fn external_tool_dirs(project_root: &Path) -> [PathBuf; 2] {
+    [
         crate::state::default_data_dir().join("tools"),
         project_root.join(".openmax").join("tools"),
-    ])
+    ]
 }
 
 fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
@@ -403,7 +409,7 @@ fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
         // Deterministic within a dir; later dirs (the project) win overall.
         paths.sort();
         for path in paths {
-            if let Some(spec) = parse_tool_file(&path) {
+            if let Ok(spec) = parse_tool_file(&path) {
                 by_name.insert(spec.name.clone(), spec);
             }
         }
@@ -411,16 +417,23 @@ fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
     by_name.into_values().collect()
 }
 
-fn parse_tool_file(path: &Path) -> Option<ToolSpec> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let file: ExternalToolFile = toml::from_str(&text).ok()?;
+/// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
+pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    let file: ExternalToolFile =
+        toml::from_str(&text).map_err(|e| format!("invalid TOML: {e}"))?;
     let name = file.name.trim().to_string();
     // Boring, model-friendly names only; anything else is a config mistake.
     let name_ok = !name.is_empty()
         && name.len() <= 64
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !name_ok || file.command.trim().is_empty() {
-        return None;
+    if !name_ok {
+        return Err(format!(
+            "invalid tool name '{name}': 1-64 chars of [a-zA-Z0-9_-] required"
+        ));
+    }
+    if file.command.trim().is_empty() {
+        return Err("command is empty".into());
     }
     let mut description = file.description.trim().replace(['\n', '\r'], " ");
     if description.chars().count() > MAX_EXTERNAL_DESC_CHARS {
@@ -428,10 +441,10 @@ fn parse_tool_file(path: &Path) -> Option<ToolSpec> {
     }
     let parameters = match file.params {
         Some(p) if p.is_object() => p,
-        Some(_) => return None,
+        Some(_) => return Err("params must be a JSON-schema object".into()),
         None => serde_json::json!({ "type": "object", "properties": {} }),
     };
-    Some(ToolSpec {
+    Ok(ToolSpec {
         name,
         description,
         parameters,
