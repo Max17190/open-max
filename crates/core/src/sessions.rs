@@ -166,8 +166,8 @@ fn must_rewrite_non_jsonl(path: &PathBuf) -> bool {
 /// 2. If that fails and `path` exists (Windows), move `path` aside to a unique
 ///    `.bak`, rename `tmp → path`, then drop the backup. If the install rename
 ///    fails, restore the backup so a transient error never erases the prior
-///    transcript/index/manifest.
-fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+///    data file.
+pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
