@@ -29,7 +29,7 @@ use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{
-    filter_matching_indices, wrap_lines, StreamingWrap, Term, Transcript,
+    filter_matching_indices, wrap_lines, Term, Transcript,
 };
 use crate::ui::{context, extensions, markdown, models};
 
@@ -45,9 +45,6 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const WHEEL_LINES: usize = 3;
 /// Paint-rate cap: coalesce redraw triggers into at most ~60 frames/s.
 const MIN_DRAW_INTERVAL: Duration = Duration::from_millis(16);
-/// Full markdown re-highlight of the live stream is O(n); refresh at this
-/// cadence (and on newlines / width change) so long replies stay smooth.
-const STREAM_MD_INTERVAL: Duration = Duration::from_millis(100);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
@@ -177,16 +174,15 @@ pub struct App {
 
     /// Live assistant stream, markdown-rendered and wrapped (matches final block).
     stream_wrapped: Vec<Line<'static>>,
-    /// Incremental plain wrap between markdown ticks (only incomplete line rewraps).
-    stream_plain_wrap: StreamingWrap,
-    /// Last full markdown render of `stream_text` (throttle re-highlight work).
-    stream_md_at: Instant,
-    stream_md_len: usize,
+    /// Incremental markdown highlighter for the live stream: completed lines are
+    /// highlighted once, only the growing tail line re-renders per token, and a
+    /// resize re-wraps without re-highlighting. Replaces the O(n)-per-refresh
+    /// full re-render that scaled poorly on long code replies.
+    stream_md: markdown::StreamingMarkdown,
     thinking_wrapped: Vec<Line<'static>>,
     thinking_source: String,
     tail_width: u16,
     tail_content_len: usize,
-    tail_stream_len: usize,
     tail_buf: Vec<Line<'static>>,
     chat_buf: Vec<Line<'static>>,
     /// Lines in `chat_buf` that are sticky + history (before live tail).
@@ -260,14 +256,11 @@ pub async fn run(
         should_quit: false,
         dirty: Dirty::all(),
         stream_wrapped: Vec::new(),
-        stream_plain_wrap: StreamingWrap::default(),
-        stream_md_at: Instant::now(),
-        stream_md_len: 0,
+        stream_md: markdown::StreamingMarkdown::default(),
         thinking_wrapped: Vec::new(),
         thinking_source: String::new(),
         tail_width: 0,
         tail_content_len: 0,
-        tail_stream_len: 0,
         tail_buf: Vec::new(),
         chat_buf: Vec::new(),
         hist_prefix_len: 0,
@@ -509,13 +502,11 @@ impl App {
         self.queued.clear();
         self.flush_queue = false;
         self.stream_wrapped.clear();
-        self.stream_plain_wrap.clear();
-        self.stream_md_len = 0;
+        self.stream_md.clear();
         self.thinking_wrapped.clear();
         self.thinking_source.clear();
         self.tail_width = 0;
         self.tail_content_len = 0;
-        self.tail_stream_len = 0;
         self.tail_buf.clear();
         self.hist_prefix_len = 0;
         self.hist_reuse_key = None;
@@ -1370,9 +1361,7 @@ impl App {
                 self.stream_chars = 0;
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
-                self.stream_plain_wrap.clear();
-                self.stream_md_len = 0;
-                self.tail_stream_len = 0;
+                self.stream_md.clear();
                 self.thinking_chars = 0;
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
@@ -1861,9 +1850,7 @@ impl App {
                 }
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
-                self.stream_plain_wrap.clear();
-                self.stream_md_len = 0;
-                self.tail_stream_len = 0;
+                self.stream_md.clear();
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
                 self.thinking_wrapped.clear();
@@ -2520,44 +2507,21 @@ impl App {
             self.tail_width = width;
             self.thinking_source.clear();
         }
-        // Catch up markdown after a stream pause: throttle may leave
-        // stream_md_len behind stream_text; interim plain wrap keeps text
-        // visible, and the next due tick upgrades to full highlight.
-        let md_pending =
-            !self.stream_text.is_empty() && self.stream_md_len != self.stream_text.len();
-        let md_due = self.stream_md_at.elapsed() >= STREAM_MD_INTERVAL;
-        let mut stream_changed = width_changed || self.stream_text.len() != self.tail_stream_len;
+        // Incremental markdown: completed lines are highlighted exactly once
+        // and a resize only re-wraps, so a long streamed code block stays O(n)
+        // over the reply instead of re-highlighting the whole buffer on every
+        // newline. `stream_changed` gates the tail_buf rebuild below.
+        let mut stream_changed = false;
         if self.stream_text.is_empty() {
-            if self.tail_stream_len != 0 || !self.stream_wrapped.is_empty() {
+            if self.stream_md.text_len() != 0 || !self.stream_wrapped.is_empty() {
+                self.stream_md.clear();
                 self.stream_wrapped.clear();
-                self.stream_plain_wrap.clear();
-                self.stream_md_len = 0;
-                self.tail_stream_len = 0;
                 stream_changed = true;
             }
-        } else if stream_changed || (md_pending && md_due) || width_changed {
-            // Throttled markdown refresh can rewrite wraps without stream_text
-            // growing; still treat that as a content change so tail_buf copies
-            // the new wraps (not only the spinner line).
-            if md_pending && md_due {
-                stream_changed = true;
-            }
-            self.tail_stream_len = self.stream_text.len();
-            let boundary = self.stream_text.ends_with('\n');
-            let first = self.stream_md_len == 0;
-            if width_changed || md_due || boundary || first {
-                let md = markdown::render(&self.stream_text, markdown::highlighter());
-                self.stream_wrapped = wrap_lines(&md, width);
-                self.stream_md_at = Instant::now();
-                self.stream_md_len = self.stream_text.len();
-                // Keep plain wrap state aligned so the next interim tokens
-                // continue incrementally from this length (not a full rewrap).
-                self.stream_plain_wrap.update(&self.stream_text, width);
-            } else {
-                // Sole interim path: only the incomplete line rewraps.
-                self.stream_plain_wrap.update(&self.stream_text, width);
-                self.stream_plain_wrap.copy_into(&mut self.stream_wrapped);
-            }
+        } else if width_changed || self.stream_md.text_len() != self.stream_text.len() {
+            self.stream_md.update(&self.stream_text, width);
+            self.stream_md.copy_into(&mut self.stream_wrapped);
+            stream_changed = true;
         }
 
         let mut thinking_changed = false;
