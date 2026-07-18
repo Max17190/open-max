@@ -24,8 +24,8 @@ use std::thread;
 
 use serde_json::{json, Value};
 use translate::{
-    child_command, classify_child_line, initialize_result, rpc_error, rpc_notification, rpc_result,
-    ChildLine, HostRequest,
+    check_jsonrpc_version, child_command, classify_child_line, initialize_result, rpc_error,
+    rpc_notification, rpc_result, ChildLine, HostRequest,
 };
 
 enum Incoming {
@@ -33,6 +33,15 @@ enum Incoming {
     Child(String),
     HostEof,
     ChildEof,
+}
+
+/// The at-most-one turn in flight. `active` gates concurrent prompts even when
+/// the prompt was a notification (no `id`); `id` is the request to resolve at
+/// `done`, absent for a notification prompt.
+#[derive(Default)]
+struct Turn {
+    active: bool,
+    id: Option<Value>,
 }
 
 fn main() {
@@ -100,8 +109,7 @@ fn main() {
     drop(tx);
 
     let mut stdout = std::io::stdout();
-    // JSON-RPC id of the prompt awaiting its terminal `done`, if any.
-    let mut pending_prompt: Option<Value> = None;
+    let mut turn = Turn::default();
 
     for msg in rx {
         match msg {
@@ -112,7 +120,8 @@ fn main() {
                 match classify_child_line(&line) {
                     Ok(ChildLine::Hello(v)) => hello = Some(v),
                     Ok(ChildLine::Done { stop_reason }) => {
-                        if let Some(id) = pending_prompt.take() {
+                        turn.active = false;
+                        if let Some(id) = turn.id.take() {
                             emit(&mut stdout, &rpc_result(id, json!({"stop_reason": stop_reason})));
                         }
                     }
@@ -131,14 +140,24 @@ fn main() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                handle_host_line(&line, &mut child_stdin, &mut stdout, &hello, &mut pending_prompt);
+                handle_host_line(&line, &mut child_stdin, &mut stdout, &hello, &mut turn);
             }
             Incoming::HostEof => {
                 // Mirror the child's EOF-is-quit rule: drain the in-flight turn.
                 let _ = writeln!(child_stdin, r#"{{"cmd":"quit"}}"#);
                 let _ = child_stdin.flush();
             }
-            Incoming::ChildEof => break,
+            Incoming::ChildEof => {
+                // The child died: fail any request still waiting on `done`
+                // rather than closing the transport on an unresolved call.
+                if let Some(id) = turn.id.take() {
+                    emit(
+                        &mut stdout,
+                        &rpc_error(id, -32001, "child exited before the turn completed"),
+                    );
+                }
+                break;
+            }
         }
     }
 
@@ -150,7 +169,7 @@ fn handle_host_line(
     child_stdin: &mut impl Write,
     stdout: &mut impl Write,
     hello: &Option<Value>,
-    pending_prompt: &mut Option<Value>,
+    turn: &mut Turn,
 ) {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -160,6 +179,13 @@ fn handle_host_line(
         }
     };
     let id = value.get("id").cloned().unwrap_or(Value::Null);
+
+    // A malformed or non-2.0 envelope must never reach a state-changing method.
+    if let Err(reason) = check_jsonrpc_version(&value) {
+        emit(stdout, &rpc_error(id, -32600, &reason));
+        return;
+    }
+
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
     let params = value.get("params").cloned().unwrap_or(Value::Null);
 
@@ -177,38 +203,54 @@ fn handle_host_line(
 
     match &req {
         HostRequest::Initialize => {
-            let result = match hello {
-                Some(h) => initialize_result(h),
-                None => json!({"server": "openmax"}),
-            };
-            emit(stdout, &rpc_result(id, result));
-        }
-        HostRequest::Prompt { .. } => {
-            if pending_prompt.is_some() {
-                emit(stdout, &rpc_error(id, -32000, "a prompt is already in flight"));
+            // A notification (no id) gets no response.
+            if id.is_null() {
                 return;
             }
-            forward(child_stdin, &req);
-            // A request (has id) is resolved at `done`; a notification streams
-            // updates only.
-            if !id.is_null() {
-                *pending_prompt = Some(id);
+            match hello {
+                Some(h) => emit(stdout, &rpc_result(id, initialize_result(h))),
+                // No valid handshake means compatibility is unknown: fail
+                // rather than report a partial success without a version.
+                None => emit(stdout, &rpc_error(id, -32002, "child did not hand shake")),
             }
         }
+        HostRequest::Prompt { .. } => {
+            if turn.active {
+                if !id.is_null() {
+                    emit(stdout, &rpc_error(id, -32000, "a prompt is already in flight"));
+                }
+                return;
+            }
+            // Only arm the turn once the command actually reached the child; a
+            // failed write would otherwise strand the request with no `done`.
+            if let Err(e) = forward(child_stdin, &req) {
+                if !id.is_null() {
+                    emit(stdout, &rpc_error(id, -32001, &format!("failed to send prompt: {e}")));
+                }
+                return;
+            }
+            turn.active = true;
+            turn.id = if id.is_null() { None } else { Some(id) };
+        }
         HostRequest::Cancel | HostRequest::Shutdown | HostRequest::Approve { .. } => {
-            forward(child_stdin, &req);
-            if !id.is_null() {
-                emit(stdout, &rpc_result(id, json!({"ok": true})));
+            let outcome = forward(child_stdin, &req);
+            if id.is_null() {
+                return;
+            }
+            match outcome {
+                Ok(()) => emit(stdout, &rpc_result(id, json!({"ok": true}))),
+                Err(e) => emit(stdout, &rpc_error(id, -32001, &format!("failed to reach child: {e}"))),
             }
         }
     }
 }
 
-fn forward(child_stdin: &mut impl Write, req: &HostRequest) {
+fn forward(child_stdin: &mut impl Write, req: &HostRequest) -> std::io::Result<()> {
     if let Some(cmd) = child_command(req) {
-        let _ = writeln!(child_stdin, "{cmd}");
-        let _ = child_stdin.flush();
+        writeln!(child_stdin, "{cmd}")?;
+        child_stdin.flush()?;
     }
+    Ok(())
 }
 
 fn emit(out: &mut impl Write, value: &Value) {

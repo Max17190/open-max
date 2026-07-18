@@ -57,6 +57,16 @@ impl HostRequest {
     }
 }
 
+/// A JSON-RPC 2.0 request or notification must be an object carrying
+/// `"jsonrpc":"2.0"`. Reject anything else before dispatch, so a malformed or
+/// 1.0 envelope cannot reach a state-changing method.
+pub fn check_jsonrpc_version(msg: &Value) -> Result<(), String> {
+    match msg.get("jsonrpc").and_then(Value::as_str) {
+        Some("2.0") => Ok(()),
+        _ => Err("invalid request: expected jsonrpc \"2.0\"".to_string()),
+    }
+}
+
 /// The `openmax-stdio` command line a request maps to, if any. `Initialize`
 /// has no child command (it is answered from the stored hello).
 pub fn child_command(req: &HostRequest) -> Option<Value> {
@@ -148,6 +158,14 @@ mod tests {
             HostRequest::Approve { approval_id: "a1".into(), approved: true }
         );
         assert_eq!(HostRequest::parse("shutdown", &Value::Null).unwrap(), HostRequest::Shutdown);
+    }
+
+    #[test]
+    fn rejects_non_2_0_envelopes() {
+        assert!(check_jsonrpc_version(&json!({"jsonrpc": "2.0", "method": "prompt"})).is_ok());
+        assert!(check_jsonrpc_version(&json!({"jsonrpc": "1.0", "method": "prompt"})).is_err());
+        assert!(check_jsonrpc_version(&json!({"method": "prompt"})).is_err());
+        assert!(check_jsonrpc_version(&json!(["not", "an", "object"])).is_err());
     }
 
     #[test]
