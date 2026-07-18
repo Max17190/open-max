@@ -210,7 +210,7 @@ Unknown `cmd` values are protocol errors; extra fields on a known command are ig
 | `done` | `stop_reason` |
 | `error` | `message` |
 
-A run of `token` deltas always ends in exactly one `message_done`; each turn ends with one `done`; bad input yields `{"type":"protocol_error","message":"..."}` and leaves the session unharmed. While a client is live, an `approval_request` is forwarded and openmax waits for an `approve`; after `quit` or EOF, pending and later approvals are declined so shutdown drains promptly. Example event line:
+Each turn ends with exactly one `done`, and `done` is the only guaranteed turn terminator: never block waiting for another event. On a normal turn a run of `token` deltas is terminated by one `message_done`, but a turn that hits a provider-stream error emits an `error` line and then `done` with no `message_done`. Bad input yields `{"type":"protocol_error","message":"..."}` and leaves the session unharmed. While a client is live, an `approval_request` is forwarded and openmax waits for an `approve`; after `quit` or EOF, pending and later approvals are declined so shutdown drains promptly. Example event line:
 
 ```json
 {"session_id":"s1","type":"tool_start","call_id":"c1","name":"read_file","args":{"path":"a.rs"}}

@@ -254,8 +254,17 @@ pub fn validate_line(line: &str) -> Result<String, String> {
                     return Err(format!("hello missing string '{field}'"));
                 }
             }
-            if !obj.get("protocol_version").map(serde_json::Value::is_u64).unwrap_or(false) {
-                return Err("hello missing integer 'protocol_version'".to_string());
+            // Conformance is against the contract THIS binary implements, so a
+            // foreign proto or version is a real mismatch, not just a
+            // well-typed line. Otherwise the validator would bless a stream it
+            // cannot actually speak.
+            if obj.get("proto").and_then(serde_json::Value::as_str) != Some(PROTO) {
+                return Err(format!("unsupported proto; expected '{PROTO}'"));
+            }
+            if obj.get("protocol_version").and_then(serde_json::Value::as_u64)
+                != Some(u64::from(PROTO_VERSION))
+            {
+                return Err(format!("unsupported protocol_version; expected {PROTO_VERSION}"));
             }
             Ok("hello".to_string())
         }
@@ -287,7 +296,15 @@ pub fn run_conformance() -> i32 {
     let mut seen = 0usize;
     let mut errors = 0usize;
     for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+        // A read failure is a validation failure, not a clean EOF: exiting
+        // zero here would report an unread tail of the stream as conforming.
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                println!("err  failed to read stdin: {e}");
+                return 1;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -389,6 +406,17 @@ mod tests {
             validate_line(r#"{"type":"protocol_error","message":"nope"}"#).unwrap(),
             "protocol_error"
         );
+
+        // A foreign proto or version fails: the validator only blesses the
+        // contract this binary implements.
+        assert!(validate_line(
+            r#"{"type":"hello","proto":"other/9","protocol_version":1,"session_id":"s","version":"0","project":"/p"}"#
+        )
+        .is_err());
+        assert!(validate_line(
+            r#"{"type":"hello","proto":"openmax-stdio/1","protocol_version":99,"session_id":"s","version":"0","project":"/p"}"#
+        )
+        .is_err());
 
         // Failures: unknown cmd, missing event field, missing session_id, junk.
         assert!(validate_line(r#"{"cmd":"reboot"}"#).is_err());
