@@ -15,10 +15,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::execution::{self, CaptureSpec, ProcessError, ProcessRequest, StdinMode, Termination};
 use crate::skills::{self, SkillSpec};
 use crate::state::CancelToken;
 use crate::tools::{self, ToolOutcome};
@@ -470,78 +470,47 @@ async fn spawn_external(
     caps: tools::OutputCaps,
     cancel: Arc<CancelToken>,
 ) -> ToolOutcome {
-    let stdin_json = args.to_string();
-    let mut cmd = tokio::process::Command::new(&tool.command);
-    cmd.args(&tool.args)
-        .current_dir(root)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    let request = ProcessRequest {
+        program: tool.command.clone().into(),
+        args: tool.args.iter().cloned().map(Into::into).collect(),
+        cwd: root.to_path_buf(),
+        stdin: StdinMode::Bytes(args.to_string().into_bytes()),
+        timeout: std::time::Duration::from_secs(tool.timeout_secs),
+        capture: CaptureSpec {
+            head_bytes: 0,
+            tail_bytes: caps.command_bytes,
+            spill_dir: Some(crate::state::default_data_dir().join("cmd-logs")),
+            spill_bytes_per_stream: 16 * 1024 * 1024,
+        },
+    };
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return ToolOutcome::err(format!(
+    match execution::run_process(request, cancel).await {
+        Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!(
                 "failed to start external tool '{name}' (command '{}', defined in {}): {e}",
                 tool.command,
                 tool.source_path.display()
-            ));
+        )),
+        Err(ProcessError::Wait(e)) => {
+            ToolOutcome::err(format!("external tool '{name}' failed: {e}"))
         }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        // A tool that exits without reading stdin closes the pipe; that is fine, not an error.
-        let _ = stdin.write_all(stdin_json.as_bytes()).await;
-    }
-
-    let mut child_slot = Some(child);
-    tokio::select! {
-        _ = cancel.cancelled() => {
-            if let Some(mut c) = child_slot.take() {
-                let _ = c.kill().await;
+        Ok(output) => match &output.termination {
+            Termination::Cancelled => {
+                ToolOutcome::err(format!("external tool '{name}' cancelled by user"))
             }
-            ToolOutcome::err(format!("external tool '{name}' cancelled by user"))
-        }
-        _ = tokio::time::sleep(Duration::from_secs(tool.timeout_secs)) => {
-            if let Some(mut c) = child_slot.take() {
-                let _ = c.kill().await;
-            }
-            ToolOutcome::err(format!(
+            Termination::TimedOut => ToolOutcome::err(format!(
                 "external tool '{name}' timed out after {}s",
                 tool.timeout_secs
-            ))
-        }
-        output = async {
-            child_slot.take().expect("child taken twice").wait_with_output().await
-        } => {
-            match output {
-                Err(e) => ToolOutcome::err(format!("external tool '{name}' failed: {e}")),
-                Ok(output) => {
-                    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.trim().is_empty() {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str("[stderr]\n");
-                        text.push_str(&stderr);
-                    }
-                    if text.len() > caps.command_bytes {
-                        text = tools::truncate_command_output(&text, caps.command_bytes);
-                    }
-                    if text.trim().is_empty() {
-                        text = "(no output)".into();
-                    }
-                    let code = output.status.code().unwrap_or(-1);
-                    if output.status.success() {
-                        ToolOutcome::ok(text)
-                    } else {
-                        ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
-                    }
+            )),
+            Termination::Exited(status) => {
+                let text = tools::render_process_output(&output, caps.command_bytes);
+                if status.success() {
+                    ToolOutcome::ok(text)
+                } else {
+                    let code = status.code().unwrap_or(-1);
+                    ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
                 }
             }
-        }
+        },
     }
 }
 

@@ -7,14 +7,14 @@
 //! into the model.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
+use crate::execution::{
+    self, CaptureSpec, ProcessError, ProcessRequest, StdinMode, Termination,
+};
 use crate::state::CancelToken;
 use std::sync::Arc;
 
@@ -432,81 +432,65 @@ async fn run_hook(
     if cancel.is_cancelled() {
         return HookRun::Cancelled;
     }
-    let stdin_json = payload.to_string();
+    let request = ProcessRequest {
+        program: hook.command.clone().into(),
+        args: hook.args.iter().cloned().map(Into::into).collect(),
+        cwd: cwd.to_path_buf(),
+        stdin: StdinMode::Bytes(payload.to_string().into_bytes()),
+        timeout: Duration::from_secs(hook.timeout_secs),
+        capture: CaptureSpec {
+            // Hook block reasons keep their beginning and are character-capped
+            // below. Four bytes per character covers valid UTF-8.
+            head_bytes: MAX_REASON_CHARS * 4,
+            tail_bytes: 0,
+            spill_dir: None,
+            spill_bytes_per_stream: 0,
+        },
+    };
 
-    let mut cmd = Command::new(&hook.command);
-    cmd.args(&hook.args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+    match execution::run_process(request, cancel.clone()).await {
+        Err(ProcessError::Spawn(e)) => {
             // Misconfigured hook: fail closed for pre, ignore for post-style.
             // Caller maps Block for pre_tool_use only.
-            return HookRun::Block(format!(
+            HookRun::Block(format!(
                 "failed to start hook '{}' ({}): {e}",
                 hook.command,
                 hook.source_path.display()
-            ));
+            ))
         }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_json.as_bytes()).await;
-    }
-
-    let mut child_slot = Some(child);
-    tokio::select! {
-        _ = cancel.cancelled() => {
-            if let Some(mut c) = child_slot.take() {
-                let _ = c.kill().await;
-            }
-            HookRun::Cancelled
+        Err(ProcessError::Wait(e)) => {
+            HookRun::Block(format!("hook '{}' failed: {e}", hook.source_path.display()))
         }
-        _ = tokio::time::sleep(Duration::from_secs(hook.timeout_secs)) => {
-            if let Some(mut c) = child_slot.take() {
-                let _ = c.kill().await;
-            }
-            HookRun::Block(format!(
+        Ok(output) => match output.termination {
+            Termination::Cancelled => HookRun::Cancelled,
+            Termination::TimedOut => HookRun::Block(format!(
                 "hook '{}' timed out after {}s",
                 hook.source_path.display(),
                 hook.timeout_secs
-            ))
-        }
-        output = async {
-            child_slot.take().expect("child taken twice").wait_with_output().await
-        } => {
-            match output {
-                Err(e) => HookRun::Block(format!(
-                    "hook '{}' failed: {e}",
-                    hook.source_path.display()
-                )),
-                Ok(output) => {
-                    if output.status.success() {
-                        HookRun::Allow
-                    } else {
-                        let mut reason = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if reason.is_empty() {
-                            reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        }
-                        if reason.is_empty() {
-                            reason = format!(
-                                "blocked by hook {} (exit {})",
-                                hook.source_path.display(),
-                                output.status.code().unwrap_or(-1)
-                            );
-                        }
-                        if reason.chars().count() > MAX_REASON_CHARS {
-                            reason = reason.chars().take(MAX_REASON_CHARS).collect::<String>() + "…";
-                        }
-                        HookRun::Block(reason)
+            )),
+            Termination::Exited(status) => {
+                if status.success() {
+                    HookRun::Allow
+                } else {
+                    let mut reason =
+                        String::from_utf8_lossy(&output.stdout.head).trim().to_string();
+                    if reason.is_empty() {
+                        reason = String::from_utf8_lossy(&output.stderr.head).trim().to_string();
                     }
+                    if reason.is_empty() {
+                        reason = format!(
+                            "blocked by hook {} (exit {})",
+                            hook.source_path.display(),
+                            status.code().unwrap_or(-1)
+                        );
+                    }
+                    if reason.chars().count() > MAX_REASON_CHARS {
+                        reason = reason.chars().take(MAX_REASON_CHARS).collect::<String>() + "…";
+                    }
+                    HookRun::Block(reason)
                 }
             }
-        }
+        },
     }
 }
 
