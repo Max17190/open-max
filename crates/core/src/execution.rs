@@ -385,10 +385,7 @@ pub(crate) async fn run_process(
     let termination = supervise_child(&mut child, pid, request.timeout, &cancel).await?;
 
     if let Some(task) = stdin_task {
-        // Preserve the historical caller contract: a child may exit without
-        // consuming stdin, and stdin transport errors do not replace its
-        // actual exit status or captured diagnostics.
-        let _ = task.await;
+        finish_stdin_task(task).await;
     }
     let (stdout, stderr) = join_streams(stdout_task, stderr_task, drain_stop).await?;
     let log_truncated = stdout.omitted || stderr.omitted;
@@ -422,6 +419,19 @@ pub(crate) async fn run_process(
         log_path,
         log_truncated,
     })
+}
+
+async fn finish_stdin_task(mut task: tokio::task::JoinHandle<io::Result<()>>) {
+    // A detached descendant can inherit the read end without consuming it.
+    // Once the supervised process is gone, stdin is best effort and must not
+    // strand the invocation.
+    if tokio::time::timeout(TERMINATION_GRACE, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 async fn join_streams(
@@ -820,6 +830,15 @@ mod tests {
         stop.cancel();
         let captured = task.await.unwrap().unwrap();
         assert_eq!(captured.stream.rendered_bytes(), b"partial");
+    }
+
+    #[tokio::test]
+    async fn blocked_stdin_writer_has_bounded_shutdown() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let task = tokio::spawn(async move { writer.write_all(&vec![b'x'; 64 * 1024]).await });
+        tokio::time::timeout(Duration::from_secs(1), finish_stdin_task(task))
+            .await
+            .expect("stdin writer shutdown exceeded its bound");
     }
 
     #[tokio::test]
