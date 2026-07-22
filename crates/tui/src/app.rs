@@ -2604,7 +2604,7 @@ impl App {
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-        if self.header_width != area.width {
+        if self.dirty.chrome || self.header_width != area.width {
             self.header_width = area.width;
             self.header_line = Line::from(vec![
                 Span::styled(
@@ -3345,6 +3345,19 @@ mod tests {
         let display_144hz = std::time::Duration::from_nanos(1_000_000_000 / 144);
         assert!(MIN_DRAW_INTERVAL < display_144hz);
         assert!(MIN_DRAW_INTERVAL < std::time::Duration::from_millis(6));
+    }
+
+    #[test]
+    fn chrome_invalidation_rebuilds_header_cache_at_the_same_width() {
+        let (mut app, dir) = app_fixture();
+        let _ = render_app(&mut app, 80, 24);
+        app.header_line = Line::from("stale theme");
+        app.dirty.mark_chrome();
+
+        let buffer = render_app(&mut app, 80, 24);
+
+        assert!(rows(&buffer)[0].starts_with("◆ Open Max"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
