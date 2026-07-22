@@ -192,6 +192,9 @@ pub struct App {
 
     /// Live assistant stream, markdown-rendered and wrapped (matches final block).
     stream_wrapped: Vec<Line<'static>>,
+    /// Complete wrapped stream lines already copied into `stream_wrapped`.
+    /// The partial line after this prefix is replaced on each token.
+    stream_stable_len: usize,
     /// Incremental markdown highlighter for the live stream: completed lines are
     /// highlighted once, only the growing tail line re-renders per token, and a
     /// resize re-wraps without re-highlighting. Replaces the O(n)-per-refresh
@@ -201,6 +204,10 @@ pub struct App {
     thinking_source: String,
     tail_width: u16,
     tail_content_len: usize,
+    /// Thinking plus complete stream lines at the front of `tail_buf`.
+    /// Content after this prefix is the changing partial line and transient
+    /// running metadata, so a token only rebuilds that suffix.
+    tail_stable_len: usize,
     tail_buf: Vec<Line<'static>>,
     chat_buf: Vec<Line<'static>>,
     /// Lines in `chat_buf` that are sticky + history (before live tail).
@@ -403,11 +410,13 @@ impl App {
             should_quit: false,
             dirty: Dirty::all(),
             stream_wrapped: Vec::new(),
+            stream_stable_len: 0,
             stream_md: markdown::StreamingMarkdown::default(),
             thinking_wrapped: Vec::new(),
             thinking_source: String::new(),
             tail_width: 0,
             tail_content_len: 0,
+            tail_stable_len: 0,
             tail_buf: Vec::new(),
             chat_buf: Vec::new(),
             hist_prefix_len: 0,
@@ -531,11 +540,13 @@ impl App {
         self.queued.clear();
         self.flush_queue = false;
         self.stream_wrapped.clear();
+        self.stream_stable_len = 0;
         self.stream_md.clear();
         self.thinking_wrapped.clear();
         self.thinking_source.clear();
         self.tail_width = 0;
         self.tail_content_len = 0;
+        self.tail_stable_len = 0;
         self.tail_buf.clear();
         self.hist_prefix_len = 0;
         self.hist_reuse_key = None;
@@ -1254,10 +1265,10 @@ impl App {
         let popup = self.completion.take()?;
         let item = popup.selected_item()?.clone();
         self.composer.replace_token(popup.token_start, popup.token_len, &item.insert);
-        self.sync_completion();
         if item.submits {
             Some(self.composer.take())
         } else {
+            self.sync_completion();
             None
         }
     }
@@ -1551,7 +1562,11 @@ impl App {
                 self.stream_chars = 0;
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
+                self.stream_stable_len = 0;
                 self.stream_md.clear();
+                self.tail_content_len = 0;
+                self.tail_stable_len = 0;
+                self.tail_buf.clear();
                 self.thinking_chars = 0;
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
@@ -2099,6 +2114,7 @@ impl App {
                 }
                 self.stream_text.clear();
                 self.stream_wrapped.clear();
+                self.stream_stable_len = 0;
                 self.stream_md.clear();
                 self.thinking_tail.clear();
                 self.thinking_source.clear();
@@ -2108,6 +2124,7 @@ impl App {
                 // stream_changed edge; drop the stitched tail content here so the
                 // finished assistant body is not still painted under the spinner.
                 self.tail_content_len = 0;
+                self.tail_stable_len = 0;
                 self.tail_buf.clear();
                 self.dirty.mark_chat();
             }
@@ -2727,6 +2744,8 @@ impl App {
     fn rebuild_tail(&mut self, width: u16) -> usize {
         let width_changed = width != self.tail_width;
         let prose_width = width.saturating_sub(2).max(8);
+        let previous_stream_stable = self.stream_stable_len;
+        let previous_thinking_len = self.thinking_wrapped.len();
         if width_changed {
             self.tail_width = width;
             self.thinking_source.clear();
@@ -2736,15 +2755,26 @@ impl App {
         // over the reply instead of re-highlighting the whole buffer on every
         // newline. `stream_changed` gates the tail_buf rebuild below.
         let mut stream_changed = false;
+        let mut stream_reset = false;
         if self.stream_text.is_empty() {
             if self.stream_md.text_len() != 0 || !self.stream_wrapped.is_empty() {
                 self.stream_md.clear();
                 self.stream_wrapped.clear();
+                self.stream_stable_len = 0;
                 stream_changed = true;
+                stream_reset = true;
             }
         } else if width_changed || self.stream_md.text_len() != self.stream_text.len() {
+            stream_reset = width_changed || self.stream_text.len() < self.stream_md.text_len();
             self.stream_md.update(&self.stream_text, prose_width);
-            self.stream_md.copy_into(&mut self.stream_wrapped);
+            let stable = if stream_reset {
+                0
+            } else {
+                self.stream_stable_len
+            };
+            self.stream_stable_len = self
+                .stream_md
+                .sync_into(&mut self.stream_wrapped, stable);
             stream_changed = true;
         }
 
@@ -2770,21 +2800,46 @@ impl App {
         let content_changed = stream_changed || thinking_changed;
 
         if content_changed {
-            self.tail_buf.clear();
-            self.tail_buf.extend(self.thinking_wrapped.iter().cloned().map(|mut line| {
-                line.spans.insert(
-                    0,
-                    Span::styled("◌ ", Style::default().fg(theme::DIM())),
+            // The completed stream prefix is append-only at a fixed width.
+            // Preserve it in both buffers and replace only the partial suffix,
+            // rather than cloning the whole response for every token.
+            let can_sync_stream_suffix = stream_changed
+                && !thinking_changed
+                && !stream_reset
+                && self.tail_stable_len == previous_thinking_len + previous_stream_stable
+                && self.tail_buf.len() >= self.tail_stable_len;
+            if can_sync_stream_suffix {
+                self.tail_buf.truncate(self.tail_stable_len);
+                self.tail_buf.extend(
+                    self.stream_wrapped[previous_stream_stable..]
+                        .iter()
+                        .cloned()
+                        .map(|mut line| {
+                            line.spans.insert(
+                                0,
+                                Span::styled("│ ", Style::default().fg(theme::BORDER())),
+                            );
+                            line
+                        }),
                 );
-                line
-            }));
-            self.tail_buf.extend(self.stream_wrapped.iter().cloned().map(|mut line| {
-                line.spans.insert(
-                    0,
-                    Span::styled("│ ", Style::default().fg(theme::BORDER())),
-                );
-                line
-            }));
+            } else {
+                self.tail_buf.clear();
+                self.tail_buf.extend(self.thinking_wrapped.iter().cloned().map(|mut line| {
+                    line.spans.insert(
+                        0,
+                        Span::styled("◌ ", Style::default().fg(theme::DIM())),
+                    );
+                    line
+                }));
+                self.tail_buf.extend(self.stream_wrapped.iter().cloned().map(|mut line| {
+                    line.spans.insert(
+                        0,
+                        Span::styled("│ ", Style::default().fg(theme::BORDER())),
+                    );
+                    line
+                }));
+            }
+            self.tail_stable_len = self.thinking_wrapped.len() + self.stream_stable_len;
             self.tail_content_len = self.tail_buf.len();
         } else {
             self.tail_buf.truncate(self.tail_content_len);
@@ -3476,6 +3531,22 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn submitting_exact_slash_completion_closes_the_popup() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("/status");
+        app.sync_completion();
+        assert!(app.completion.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.completion.is_none());
+        assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn idle_layout_is_restrained_and_has_bordered_composer() {
         let (mut app, dir) = app_fixture();
@@ -3586,5 +3657,45 @@ mod tests {
         let tiny = render_app(&mut app, 12, 5);
         assert!(buffer_text(&tiny).contains("Open Max"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_tail_suffix_sync_matches_full_rebuild_across_tokens_and_resize() {
+        let (mut incremental, incremental_dir) = app_fixture();
+        let (mut oracle, oracle_dir) = app_fixture();
+        let samples = [
+            ("intro\n```rust\nlet first = 1;", 48),
+            ("intro\n```rust\nlet first = 1; let second = 2;", 48),
+            (
+                "intro\n```rust\nlet first = 1; let second = 2;\nlet third = 3;",
+                48,
+            ),
+            (
+                "intro\n```rust\nlet first = 1; let second = 2;\nlet third = 3;",
+                28,
+            ),
+            (
+                "intro\n```rust\nlet first = 1; let second = 2;\nlet third = 3;\n```\ndone",
+                28,
+            ),
+        ];
+
+        for (text, width) in samples {
+            incremental.stream_text = text.to_string();
+            incremental.rebuild_tail(width);
+
+            oracle.stream_text = text.to_string();
+            oracle.tail_width = 0; // force the full-rebuild path
+            oracle.rebuild_tail(width);
+
+            assert_eq!(incremental.tail_buf, oracle.tail_buf);
+            assert_eq!(
+                incremental.tail_stable_len,
+                incremental.thinking_wrapped.len() + incremental.stream_stable_len
+            );
+        }
+
+        fs::remove_dir_all(incremental_dir).unwrap();
+        fs::remove_dir_all(oracle_dir).unwrap();
     }
 }

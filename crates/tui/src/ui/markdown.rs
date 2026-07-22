@@ -300,12 +300,36 @@ impl StreamingMarkdown {
         self.text_len = text.len();
     }
 
-    /// Fill `out` with the current wrapped lines (clones).
+    /// Synchronize `out` while preserving its already-copied complete prefix.
+    ///
+    /// `stable_complete` is the value returned by the previous call at the
+    /// same width. Completed lines are append-only, so only newly completed
+    /// lines and the changing partial tail need cloning. Pass `0` after a
+    /// resize or source reset.
+    pub fn sync_into(
+        &self,
+        out: &mut Vec<Line<'static>>,
+        stable_complete: usize,
+    ) -> usize {
+        let stable_complete = stable_complete
+            .min(self.complete_wrapped.len())
+            .min(out.len());
+        out.truncate(stable_complete);
+        out.reserve(
+            self.complete_wrapped.len() - stable_complete + self.partial_wrapped.len(),
+        );
+        out.extend(self.complete_wrapped[stable_complete..].iter().cloned());
+        let complete = self.complete_wrapped.len();
+        out.extend(self.partial_wrapped.iter().cloned());
+        complete
+    }
+
+    /// Fill `out` from scratch. Tests and one-shot callers use this; the live
+    /// TUI uses [`Self::sync_into`] to avoid cloning stable history per token.
+    #[cfg(test)]
     pub fn copy_into(&self, out: &mut Vec<Line<'static>>) {
         out.clear();
-        out.reserve(self.complete_wrapped.len() + self.partial_wrapped.len());
-        out.extend(self.complete_wrapped.iter().cloned());
-        out.extend(self.partial_wrapped.iter().cloned());
+        let _ = self.sync_into(out, 0);
     }
 }
 
@@ -548,6 +572,40 @@ mod tests {
     }
 
     #[test]
+    fn streaming_sync_reuses_complete_prefix_and_replaces_partial_suffix() {
+        let mut sm = StreamingMarkdown::default();
+        let mut out = Vec::new();
+
+        sm.update("first complete line\npartial", 40);
+        let stable = sm.sync_into(&mut out, 0);
+        assert_eq!(stable, 1);
+        let complete_prefix = sig(&out[..stable]);
+
+        sm.update("first complete line\npartial grows", 40);
+        let stable = sm.sync_into(&mut out, stable);
+        assert_eq!(stable, 1);
+        assert_eq!(sig(&out[..stable]), complete_prefix);
+        assert_eq!(
+            sig(&out),
+            sig(&wrap_lines(
+                &render("first complete line\npartial grows", highlighter()),
+                40,
+            )),
+        );
+
+        sm.update("first complete line\npartial grows\nnext", 40);
+        let stable = sm.sync_into(&mut out, stable);
+        assert_eq!(stable, 2);
+        assert_eq!(
+            sig(&out),
+            sig(&wrap_lines(
+                &render("first complete line\npartial grows\nnext", highlighter()),
+                40,
+            )),
+        );
+    }
+
+    #[test]
     fn streaming_resize_rewraps_and_keeps_highlight() {
         let hl = highlighter();
         let text = "```rust\nfn main() { let a = 1; let b = 2; let c = 3; done(a, b, c); }\n```\n";
@@ -615,6 +673,13 @@ mod tests {
         }
         reply.push_str("```\n\nThat should cover every case cleanly.\n");
         let lines: Vec<&str> = reply.split_inclusive('\n').collect();
+        // Provider deltas are much smaller than source lines. This fixture is
+        // ASCII, so byte chunks are also valid UTF-8 boundaries.
+        let deltas: Vec<&str> = reply
+            .as_bytes()
+            .chunks(8)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect();
 
         // OLD: full markdown re-render + re-wrap on each completed line (what
         // the `boundary` trigger did) — O(n) per line, O(n^2) over the reply.
@@ -628,22 +693,47 @@ mod tests {
         }
         let old_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-        // NEW: incremental — completed lines highlight once, tail re-renders.
+        // PREVIOUS: highlighting is incremental, but every update clones the
+        // complete accumulated output into the destination buffer.
         let mut acc = String::new();
         let mut sm = StreamingMarkdown::default();
         let mut buf = Vec::new();
         let t0 = Instant::now();
-        for l in &lines {
-            acc.push_str(l);
+        for delta in &deltas {
+            acc.push_str(delta);
             sm.update(&acc, w);
             sm.copy_into(&mut buf);
             std::hint::black_box(&buf);
         }
-        let new_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let clone_all_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // NEW: preserve the completed prefix and replace only the changing
+        // partial suffix, matching the live TUI buffer path.
+        let mut acc = String::new();
+        let mut sm = StreamingMarkdown::default();
+        let mut buf = Vec::new();
+        let mut stable = 0;
+        let t0 = Instant::now();
+        for delta in &deltas {
+            acc.push_str(delta);
+            sm.update(&acc, w);
+            stable = sm.sync_into(&mut buf, stable);
+            std::hint::black_box(&buf);
+        }
+        let suffix_sync_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         eprintln!("MEASURE stream_lines={}", lines.len());
+        eprintln!("MEASURE stream_deltas={}", deltas.len());
         eprintln!("MEASURE old_full_rerender_ms={old_ms:.3}");
-        eprintln!("MEASURE new_incremental_ms={new_ms:.3}");
-        eprintln!("MEASURE speedup={:.1}x", old_ms / new_ms.max(1e-6));
+        eprintln!("MEASURE incremental_clone_all_ms={clone_all_ms:.3}");
+        eprintln!("MEASURE incremental_suffix_sync_ms={suffix_sync_ms:.3}");
+        eprintln!(
+            "MEASURE suffix_sync_speedup={:.1}x",
+            clone_all_ms / suffix_sync_ms.max(1e-6)
+        );
+        eprintln!(
+            "MEASURE total_speedup={:.1}x",
+            old_ms / suffix_sync_ms.max(1e-6)
+        );
     }
 }
