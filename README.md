@@ -1,6 +1,6 @@
 # Open Max
 
-**A small Rust agent harness for coding in the terminal.**
+**A self-extending Rust agent harness for coding in the terminal.**
 
 Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at the model server you choose: local, cloud, or a private proxy. No desktop shell, no heavyweight runtime, no telemetry.
 
@@ -17,6 +17,26 @@ You own the endpoints, the tools, the skills, and the context.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; the harness re-freezes automatically on the next turn, so a tool the agent writes is a tool the agent uses.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
 - **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure, plus Hugging Face if you use managed model download. Native child processes can make their own network connections with the host authority Open Max inherits.
+
+## The intelligent harness
+
+Open Max's thesis is that it is the world's first intelligent harness: a living system that can construct the next capability it needs from ordinary files and native processes. A new tool, skill, hook, template, provider, tmux process, or frontend is a new neuron. The harness discovers it, gives the agent the minimum necessary description, and keeps the richer behavior outside the permanent loop.
+
+The design starts with one question: **What is the smallest capability Open Max must provide so the agent can construct richer behavior itself?** The answer is one focused native loop, seven primitive tools, a fast event-driven TUI, context management, and stable file and process contracts.
+
+| Need | Construct it with |
+| --- | --- |
+| External service or specialized capability | A CLI-backed TOML tool plus an on-demand skill, without an MCP runtime |
+| Reusable workflow or command | A `SKILL.md` package or prompt template slash command |
+| Isolated or parallel work | A child `openmax -p` or interactive `openmax --stdio` process, usually in tmux |
+| Durable background work | A named tmux session that the agent can inspect and reattach |
+| Planning and task state | `PLAN.md` and `TODO.md`, visible to the user and every tool |
+| Lifecycle policy and events | Process hooks and permission files |
+| Compaction integration | The built-in model summary plus the `compaction` hook event |
+| Model endpoints | `providers.json`, including local servers, gateways, and private proxies |
+| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/1` |
+
+These are deliberate boundaries, not placeholders for hidden orchestration products. Open Max does not carry an MCP host, nested-agent scheduler, plan mode, background-job product, built-in TODO database, user-keybinding engine, pluggable compactor, or TUI plugin ABI. The agent composes those richer workflows from the same host tools a developer can inspect, edit, test, and remove.
 
 ## Install
 
@@ -185,7 +205,7 @@ arg_regex = "^cargo (test|check|build)"
 
 `effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional: command for `bash`, path for file tools, pattern for `glob`/`grep`. For custom tools it matches the full serialized JSON arguments. Omit `arg_regex` (or leave it empty) to match every call of that tool.
 
-**Validation.** `openmax --check` parses every extension file and prints per-file results with the reason anything would be ignored (or fail closed, for permissions), exiting nonzero on errors. The agent is instructed to run it after writing extension files.
+**Validation.** `openmax --check` parses tools, skills, templates, hooks, permissions, and `providers.json`, then prints per-file results with the reason anything would be ignored, fail closed, or fail at request time. It exits nonzero on errors. The agent is instructed to run it after writing extension files.
 
 Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically: at each turn start it fingerprints the extension files, and if anything changed it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). An unchanged disk costs nothing. `/reload` forces it immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 

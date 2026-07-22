@@ -121,14 +121,17 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 /// a recurring capability, workflow, or policy, the right move is usually to
 /// write one of these files rather than to improvise each time. Static text,
 /// so the zero-cost invariant (byte-identical prompt with nothing installed)
-/// still holds; ~170 tokens is the price of an agent that can grow itself.
+/// still holds; roughly 360 tokens is the price of an agent that can grow and
+/// compose itself without permanent orchestration features.
 const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user asks for a reusable capability:\n\
 - New tool: .openmax/tools/<name>.toml with name, description, params (JSON schema), command, args, mutating.\n\
 - New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
 - Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
 - Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end.\n\
 - Permission rules: .openmax/permissions.toml with allow/deny/ask entries.\n\
+- Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
 A tool or skill you write is live on the next turn (the harness re-freezes automatically; /reload forces it now). Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check.\n\
+Compose beyond the loop with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.\n\
 \n\
 Working files (there is no built-in plan mode, todo list, or memory):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
@@ -270,6 +273,12 @@ mod tests {
         assert!(prompt.contains("/reload"));
         assert!(prompt.contains("openmax --check"));
         assert!(prompt.contains("user_prompt_submit"));
+        assert!(prompt.contains("providers.json"));
+        assert!(prompt.contains("Provider: use bash"));
+        assert!(prompt.contains("CLI-backed tools + skills"));
+        assert!(prompt.contains("openmax -p or openmax --stdio"));
+        assert!(prompt.contains("tmux for durable or parallel processes"));
+        assert!(prompt.contains("stdio protocol for custom frontends"));
         // The design's "use instead" contract: PLAN.md over plan mode,
         // TODO.md over a todo product, AGENTS.md as durable memory.
         assert!(prompt.contains("PLAN.md"));
@@ -348,7 +357,7 @@ mod tests {
     /// the serialized builtin tool array must stay within ~1150 tokens. The
     /// cap is in chars (the core stays tokenizer-free): the pre-guide 3452
     /// chars including a 52-char project root measured 794 tokens on
-    /// o200k_base and 775 on cl100k_base (2026-07-16); the guide adds ~300
+    /// o200k_base and 775 on cl100k_base (2026-07-16); the guide adds ~360
     /// tokens. The interpolated root varies per machine, so it is excluded
     /// here and the cap (4900) leaves room for a typical checkout path. If
     /// this fails, re-measure with a real tokenizer before raising anything.

@@ -32,7 +32,8 @@ options:
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
       --check            validate extension files (tools, skills, templates,
-                         hooks, permissions) and exit; nonzero if any is broken.
+                         hooks, permissions, providers) and exit; nonzero if
+                         any is broken.
                          with --stdio, validate a JSONL protocol stream on
                          stdin against the openmax-stdio contract instead
   -V, --version          print the version
@@ -170,7 +171,9 @@ async fn main() -> std::io::Result<()> {
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let findings = open_max_core::doctor::check(&project);
         if findings.is_empty() {
-            println!("no extension files found (tools, skills, templates, hooks, permissions)");
+            println!(
+                "no extension files found (tools, skills, templates, hooks, permissions, providers)"
+            );
             std::process::exit(0);
         }
         for f in &findings {

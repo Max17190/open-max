@@ -10,7 +10,7 @@ use crate::tools;
 
 #[derive(Debug)]
 pub struct Finding {
-    /// Surface: "tool" | "skill" | "template" | "hook" | "permissions".
+    /// Surface: tool, skill, template, hook, permissions, or providers.
     pub kind: &'static str,
     pub path: PathBuf,
     /// Ok holds a short summary (name, event, rule count); Err the reason
@@ -26,6 +26,10 @@ pub fn has_errors(findings: &[Finding]) -> bool {
 /// Missing dirs and files contribute nothing; an empty report means an empty
 /// (and healthy) configuration.
 pub fn check(project_root: &Path) -> Vec<Finding> {
+    check_at(project_root, &crate::state::default_data_dir())
+}
+
+fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for dir in crate::registry::external_tool_dirs(project_root) {
@@ -79,6 +83,15 @@ pub fn check(project_root: &Path) -> Vec<Finding> {
                 status: result.map(|n| format!("{n} rules")),
             });
         }
+    }
+
+    let path = crate::providers::providers_path(data_dir);
+    if let Some(result) = crate::providers::check_file(&path) {
+        findings.push(Finding {
+            kind: "providers",
+            path,
+            status: result.map(|n| format!("{n} providers")),
+        });
     }
 
     findings
@@ -167,5 +180,23 @@ mod tests {
         let root_str = root.to_string_lossy().to_string();
         assert!(!check(&root).iter().any(|f| f.path.to_string_lossy().contains(&root_str)));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reports_global_provider_configuration() {
+        let root = temp_project();
+        let data = temp_project();
+        std::fs::write(
+            data.join("providers.json"),
+            r#"{"providers":{"local":{"base_url":"http://127.0.0.1:11434/v1"}}}"#,
+        )
+        .unwrap();
+
+        let findings = check_at(&root, &data);
+        let provider = findings.iter().find(|f| f.kind == "providers").unwrap();
+        assert_eq!(provider.status.as_ref().unwrap(), "1 providers");
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
     }
 }

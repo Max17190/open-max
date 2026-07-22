@@ -180,6 +180,86 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
         .collect()
 }
 
+/// Diagnose `providers.json` for `openmax --check`. Runtime loading remains
+/// deliberately quiet, while the validator reports syntax and values that
+/// would otherwise produce an empty catalog or fail at request time.
+pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("cannot read: {e}"))),
+    };
+    let file = match serde_json::from_str::<ProvidersFile>(&text) {
+        Ok(file) => file,
+        Err(e) => return Some(Err(format!("invalid JSON: {e}"))),
+    };
+    for (name, provider) in &file.providers {
+        if name.trim().is_empty() {
+            return Some(Err("provider name cannot be empty".into()));
+        }
+        if name != name.trim() {
+            return Some(Err(format!(
+                "provider name '{name}' cannot have surrounding whitespace"
+            )));
+        }
+        let base_url = provider.base_url.trim();
+        if base_url.is_empty() {
+            return Some(Err(format!("provider '{name}' has an empty base_url")));
+        }
+        match reqwest::Url::parse(base_url) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => {}
+            Ok(_) => {
+                return Some(Err(format!(
+                    "provider '{name}' base_url must use http or https"
+                )))
+            }
+            Err(e) => {
+                return Some(Err(format!(
+                    "provider '{name}' has an invalid base_url: {e}"
+                )))
+            }
+        }
+        for (header, value) in &provider.headers {
+            if reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                return Some(Err(format!(
+                    "provider '{name}' has an invalid header name '{header}'"
+                )));
+            }
+            if reqwest::header::HeaderValue::from_str(value).is_err() {
+                return Some(Err(format!(
+                    "provider '{name}' header '{header}' has an invalid value"
+                )));
+            }
+        }
+        for model in &provider.models {
+            if model.id.trim().is_empty() {
+                return Some(Err(format!(
+                    "provider '{name}' contains a model with an empty id"
+                )));
+            }
+            if model.id != model.id.trim() {
+                return Some(Err(format!(
+                    "provider '{name}' model id '{}' cannot have surrounding whitespace",
+                    model.id
+                )));
+            }
+            if model.context_tokens == Some(0) {
+                return Some(Err(format!(
+                    "provider '{name}' model '{}' has zero context_tokens",
+                    model.id
+                )));
+            }
+            if model.max_tokens == Some(0) {
+                return Some(Err(format!(
+                    "provider '{name}' model '{}' has zero max_tokens",
+                    model.id
+                )));
+            }
+        }
+    }
+    Some(Ok(file.providers.len()))
+}
+
 /// Load named providers; empty map if missing or invalid.
 /// Cached by data_dir + content hash so multi-turn sessions do not re-parse
 /// disk. Keying on content (not mtime) means edits within one filesystem
@@ -410,6 +490,53 @@ mod tests {
         assert_eq!(ep.api_key.as_deref(), Some("k"));
         assert!(ep.provider.is_none());
         assert!(ep.compat.send_stream_options);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_file_reports_valid_and_invalid_provider_documents() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"local":{"base_url":"http://127.0.0.1:11434/v1","models":[{"id":"coder"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(check_file(&path).unwrap().unwrap(), 1);
+
+        std::fs::write(&path, r#"{"providers":{"local":{"base_url":"not a url"}}}"#)
+            .unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("invalid base_url"));
+
+        std::fs::write(
+            &path,
+            r#"{"providers":{" local ":{"base_url":"http://localhost/v1"}}}"#,
+        )
+        .unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("provider name ' local '"));
+
+        std::fs::write(
+            &path,
+            r#"{"providers":{"local":{"base_url":"http://localhost/v1","models":[{"id":" coder "}]}}}"#,
+        )
+        .unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("model id ' coder '"));
+
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("invalid JSON"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
