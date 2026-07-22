@@ -129,7 +129,7 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
 - Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end.\n\
 - Permission rules: .openmax/permissions.toml with allow/deny/ask entries.\n\
-- Provider: ~/.openmax/providers.json for named model endpoints.\n\
+- Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
 A tool or skill you write is live on the next turn (the harness re-freezes automatically; /reload forces it now). Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check.\n\
 Compose beyond the loop with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.\n\
 \n\
@@ -274,6 +274,7 @@ mod tests {
         assert!(prompt.contains("openmax --check"));
         assert!(prompt.contains("user_prompt_submit"));
         assert!(prompt.contains("providers.json"));
+        assert!(prompt.contains("Provider: use bash"));
         assert!(prompt.contains("CLI-backed tools + skills"));
         assert!(prompt.contains("openmax -p or openmax --stdio"));
         assert!(prompt.contains("tmux for durable or parallel processes"));

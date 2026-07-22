@@ -197,6 +197,11 @@ pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
         if name.trim().is_empty() {
             return Some(Err("provider name cannot be empty".into()));
         }
+        if name != name.trim() {
+            return Some(Err(format!(
+                "provider name '{name}' cannot have surrounding whitespace"
+            )));
+        }
         let base_url = provider.base_url.trim();
         if base_url.is_empty() {
             return Some(Err(format!("provider '{name}' has an empty base_url")));
@@ -230,6 +235,12 @@ pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
             if model.id.trim().is_empty() {
                 return Some(Err(format!(
                     "provider '{name}' contains a model with an empty id"
+                )));
+            }
+            if model.id != model.id.trim() {
+                return Some(Err(format!(
+                    "provider '{name}' model id '{}' cannot have surrounding whitespace",
+                    model.id
                 )));
             }
             if model.context_tokens == Some(0) {
@@ -500,6 +511,26 @@ mod tests {
             .unwrap()
             .unwrap_err()
             .contains("invalid base_url"));
+
+        std::fs::write(
+            &path,
+            r#"{"providers":{" local ":{"base_url":"http://localhost/v1"}}}"#,
+        )
+        .unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("provider name ' local '"));
+
+        std::fs::write(
+            &path,
+            r#"{"providers":{"local":{"base_url":"http://localhost/v1","models":[{"id":" coder "}]}}}"#,
+        )
+        .unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("model id ' coder '"));
 
         std::fs::write(&path, "{not json").unwrap();
         assert!(check_file(&path)
