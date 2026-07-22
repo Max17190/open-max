@@ -44,8 +44,10 @@ enum Focus {
 const TICK: Duration = Duration::from_millis(120);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
-/// Paint-rate cap: coalesce redraw triggers into at most ~60 frames/s.
-const MIN_DRAW_INTERVAL: Duration = Duration::from_millis(16);
+/// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
+/// leaves normal scheduler overhead inside a 144 Hz display interval without
+/// busy-spinning. The loop remains event-driven, so idle produces no frames.
+const MIN_DRAW_INTERVAL: Duration = Duration::from_micros(5_500);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
@@ -81,6 +83,9 @@ impl Dirty {
     fn mark_chat(&mut self) {
         self.chat = true;
         self.tail = true;
+        // Scroll and transcript changes can alter the status hint. Keeping
+        // this invariant lets draw_status reuse its line on token-only frames.
+        self.chrome = true;
     }
 
     fn mark_tail(&mut self) {
@@ -219,7 +224,10 @@ pub struct App {
     approval_hits: [Option<Rect>; 3],
     perf_layout_ms: f64,
     perf_selection_ms: f64,
+    header_line: Line<'static>,
+    header_width: u16,
     status_line: Line<'static>,
+    status_width: u16,
 }
 
 pub async fn run(
@@ -315,7 +323,7 @@ pub async fn run(
             let now = Instant::now();
             let deferred = draw_deadline.is_some_and(|d| now < d);
             if !deferred && now.duration_since(last_draw) >= MIN_DRAW_INTERVAL {
-                draw_frame(&mut terminal, &mut app)?;
+                draw_frame(&mut terminal, &mut app, now.duration_since(last_draw))?;
                 last_draw = now;
                 draw_deadline = None;
                 app.dirty.clear();
@@ -329,7 +337,11 @@ pub async fn run(
 
 /// One frame, wrapped in a synchronized update so the terminal applies it
 /// atomically — no half-painted frames under tmux or slow connections.
-fn draw_frame(terminal: &mut Term, app: &mut App) -> std::io::Result<()> {
+fn draw_frame(
+    terminal: &mut Term,
+    app: &mut App,
+    frame_interval: Duration,
+) -> std::io::Result<()> {
     use std::io::Write;
     let t0 = Instant::now();
     crossterm::queue!(terminal.backend_mut(), crossterm::terminal::BeginSynchronizedUpdate)?;
@@ -338,8 +350,9 @@ fn draw_frame(terminal: &mut Term, app: &mut App) -> std::io::Result<()> {
     terminal.backend_mut().flush()?;
     if std::env::var_os("OPENMAX_PERF").is_some() {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let interval_ms = frame_interval.as_secs_f64() * 1000.0;
         eprintln!(
-            "openmax_perf draw_frame_ms={ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
+            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
             app.perf_layout_ms, app.perf_selection_ms
         );
     }
@@ -426,7 +439,10 @@ impl App {
             approval_hits: [None; 3],
             perf_layout_ms: 0.0,
             perf_selection_ms: 0.0,
+            header_line: Line::default(),
+            header_width: u16::MAX,
             status_line: Line::default(),
+            status_width: u16::MAX,
         }
     }
 
@@ -2587,20 +2603,26 @@ impl App {
         }
     }
 
-    fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let line = Line::from(vec![
-            Span::styled(
-                "◆ Open Max",
-                Style::default()
-                    .fg(theme::ACCENT())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}", clip(&self.dir_label, area.width.saturating_sub(13) as usize)),
-                Style::default().fg(theme::DIM()),
-            ),
-        ]);
-        Paragraph::new(line).render(area, frame.buffer_mut());
+    fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
+        if self.dirty.chrome || self.header_width != area.width {
+            self.header_width = area.width;
+            self.header_line = Line::from(vec![
+                Span::styled(
+                    "◆ Open Max",
+                    Style::default()
+                        .fg(theme::ACCENT())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        clip(&self.dir_label, area.width.saturating_sub(13) as usize)
+                    ),
+                    Style::default().fg(theme::DIM()),
+                ),
+            ]);
+        }
+        (&self.header_line).render(area, frame.buffer_mut());
     }
 
     /// Finished transcript plus the live tail, bottom anchored, honoring the
@@ -2883,51 +2905,54 @@ impl App {
     }
 
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
-        let (model, approvals) = {
-            let s = self.core.settings.lock().unwrap();
-            (s.model.clone(), s.approval_mode.clone())
-        };
-        let width = area.width as usize;
-        let left = format!(" {}", self.status_hint());
-        let short_model = extensions::short_model(&model);
-        let context = self
-            .budget
-            .map(|(used, total)| {
-                format!(
-                    "ctx {}%",
-                    (used as f64 / total.max(1) as f64 * 100.0) as u32
-                )
-            })
-            .unwrap_or_else(|| "ctx 0%".into());
-        let right = if width >= 78 {
-            format!("● {short_model} · {context} · {approvals} ")
-        } else if width >= 54 {
-            format!("● {short_model} · {approvals} ")
-        } else if width < 4 {
-            "●".into()
-        } else {
-            let model_width = width
-                .saturating_sub(3)
-                .min(width.saturating_div(2).max(8));
-            format!("● {} ", clip(short_model, model_width))
-        };
-        let right_len = right.chars().count().min(width);
-        let left_max = width.saturating_sub(right_len + 1);
-        let left = clip(&left, left_max);
-        let padding = width.saturating_sub(left.chars().count() + right_len);
-        let dot_color = if self.running {
-            theme::WARN()
-        } else {
-            theme::OK()
-        };
-        let right_tail = right.strip_prefix('●').unwrap_or(&right).to_string();
-        self.status_line = Line::from(vec![
-            Span::styled(left, Style::default().fg(theme::DIM())),
-            Span::raw(" ".repeat(padding)),
-            Span::styled("●", Style::default().fg(dot_color)),
-            Span::styled(right_tail, Style::default().fg(theme::DIM())),
-        ]);
-        Paragraph::new(self.status_line.clone()).render(area, frame.buffer_mut());
+        if self.dirty.chrome || self.status_width != area.width {
+            self.status_width = area.width;
+            let (model, approvals) = {
+                let s = self.core.settings.lock().unwrap();
+                (s.model.clone(), s.approval_mode.clone())
+            };
+            let width = area.width as usize;
+            let left = format!(" {}", self.status_hint());
+            let short_model = extensions::short_model(&model);
+            let context = self
+                .budget
+                .map(|(used, total)| {
+                    format!(
+                        "ctx {}%",
+                        (used as f64 / total.max(1) as f64 * 100.0) as u32
+                    )
+                })
+                .unwrap_or_else(|| "ctx 0%".into());
+            let right = if width >= 78 {
+                format!("● {short_model} · {context} · {approvals} ")
+            } else if width >= 54 {
+                format!("● {short_model} · {approvals} ")
+            } else if width < 4 {
+                "●".into()
+            } else {
+                let model_width = width
+                    .saturating_sub(3)
+                    .min(width.saturating_div(2).max(8));
+                format!("● {} ", clip(short_model, model_width))
+            };
+            let right_len = right.chars().count().min(width);
+            let left_max = width.saturating_sub(right_len + 1);
+            let left = clip(&left, left_max);
+            let padding = width.saturating_sub(left.chars().count() + right_len);
+            let dot_color = if self.running {
+                theme::WARN()
+            } else {
+                theme::OK()
+            };
+            let right_tail = right.strip_prefix('●').unwrap_or(&right).to_string();
+            self.status_line = Line::from(vec![
+                Span::styled(left, Style::default().fg(theme::DIM())),
+                Span::raw(" ".repeat(padding)),
+                Span::styled("●", Style::default().fg(dot_color)),
+                Span::styled(right_tail, Style::default().fg(theme::DIM())),
+            ]);
+        }
+        (&self.status_line).render(area, frame.buffer_mut());
     }
 
     fn status_hint(&self) -> &'static str {
@@ -3128,7 +3153,7 @@ fn scroll_search_lines(
 
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {k:<10}"), Style::default().fg(theme::ACCENT())),
+        Span::styled(format!("  {k:<11}"), Style::default().fg(theme::ACCENT())),
         Span::raw(v.to_string()),
     ])
 }
@@ -3253,8 +3278,8 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_card_lines, approval_hit_regions, command_parts, paint_text_selection,
-        rect_contains, save_model_selection, App, Dirty, Focus,
+        approval_card_lines, approval_hit_regions, command_parts, kv, paint_text_selection,
+        rect_contains, save_model_selection, App, Dirty, Focus, MIN_DRAW_INTERVAL,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
@@ -3316,6 +3341,33 @@ mod tests {
     }
 
     #[test]
+    fn paint_budget_supports_144_hz_with_scheduler_headroom() {
+        let display_144hz = std::time::Duration::from_nanos(1_000_000_000 / 144);
+        assert!(MIN_DRAW_INTERVAL < display_144hz);
+        assert!(MIN_DRAW_INTERVAL < std::time::Duration::from_millis(6));
+    }
+
+    #[test]
+    fn chrome_invalidation_rebuilds_header_cache_at_the_same_width() {
+        let (mut app, dir) = app_fixture();
+        let _ = render_app(&mut app, 80, 24);
+        app.header_line = Line::from("stale theme");
+        app.dirty.mark_chrome();
+
+        let buffer = render_app(&mut app, 80, 24);
+
+        assert!(rows(&buffer)[0].starts_with("◆ Open Max"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_key_value_rows_keep_a_separator_after_long_keys() {
+        let line = kv("throughput", "not available");
+        let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "  throughput not available");
+    }
+
+    #[test]
     fn dirty_all_sets_every_region() {
         let d = Dirty::all();
         assert!(d.any());
@@ -3323,12 +3375,12 @@ mod tests {
     }
 
     #[test]
-    fn mark_chat_also_marks_tail() {
+    fn mark_chat_also_marks_tail_and_status() {
         let mut d = Dirty::default();
         d.mark_chat();
         assert!(d.chat);
         assert!(d.tail);
-        assert!(!d.chrome);
+        assert!(d.chrome);
         assert!(d.any());
     }
 
