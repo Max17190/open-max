@@ -68,6 +68,10 @@ pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<SkillSpec> {
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_skill_md(path: &Path) -> Result<SkillSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    parse_skill_source(path, &text)
+}
+
+pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, String> {
     let body = text
         .strip_prefix("---")
         .ok_or("missing `---` frontmatter block at the top")?;

@@ -20,4 +20,5 @@ pub mod skills;
 pub mod state;
 pub mod templates;
 pub mod tools;
+pub mod trust;
 pub mod types;

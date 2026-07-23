@@ -65,7 +65,7 @@ pub struct Registry {
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<SkillSpec>,
     /// Content hash of the extension files this registry was built from;
-    /// compared against disk at turn start to detect self-modification.
+    /// compared against disk at turn start to detect extension changes.
     pub ext_fingerprint: u64,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
@@ -75,21 +75,36 @@ pub struct Registry {
     by_name: HashMap<String, usize>,
 }
 
-/// Content hash of every extension file the registry freezes: external tool
-/// TOMLs and skill SKILL.mds, project and global, sorted. Contents (not
-/// mtimes) so a same-length rewrite is detected. These dirs hold a handful of
-/// small files; reading them at turn start is cheap.
-pub fn extensions_fingerprint(project_root: &Path) -> u64 {
+/// One immutable read generation of every file the registry can activate.
+/// Parsing and fingerprinting consume these same bytes, so a concurrent edit
+/// or atomic symlink swap cannot produce a registry whose content disagrees
+/// with its persisted fingerprint.
+pub(crate) struct ExtensionSnapshot {
+    fingerprint: u64,
+    external: Vec<ToolSpec>,
+    skills: Vec<SkillSpec>,
+}
+
+impl ExtensionSnapshot {
+    pub(crate) fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+}
+
+/// Read, content-hash, and parse every extension file exactly once: external
+/// tool TOMLs and skill SKILL.mds, global first and project second. Contents
+/// (not mtimes) detect same-length rewrites. Only parsed specs survive the
+/// scan, so peak memory is bounded by one source file plus the frozen registry.
+pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    let tool_dirs = [
-        crate::state::default_data_dir().join("tools"),
-        project_root.join(".openmax").join("tools"),
-    ];
-    for dir in &tool_dirs {
+    let mut external_by_name: HashMap<String, ToolSpec> = HashMap::new();
+    for dir in external_tool_dirs(project_root) {
         dir.hash(&mut h);
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut files: Vec<PathBuf> = rd
             .flatten()
             .map(|e| e.path())
@@ -98,16 +113,24 @@ pub fn extensions_fingerprint(project_root: &Path) -> u64 {
         files.sort();
         for path in files {
             path.hash(&mut h);
-            std::fs::read(&path).ok().hash(&mut h);
+            let bytes = std::fs::read(&path).ok();
+            bytes.hash(&mut h);
+            let Some(bytes) = bytes else { continue };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            if let Ok(spec) = parse_tool_source(&path, text) {
+                // Global is scanned first, so a project definition wins.
+                external_by_name.insert(spec.name.clone(), spec);
+            }
         }
     }
-    let skill_dirs = [
-        crate::state::default_data_dir().join("skills"),
-        project_root.join(".agents").join("skills"),
-    ];
-    for dir in &skill_dirs {
+    let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
+    for dir in skills::skill_dirs(project_root) {
         dir.hash(&mut h);
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut files: Vec<PathBuf> = rd
             .flatten()
             .map(|e| e.path().join("SKILL.md"))
@@ -116,20 +139,45 @@ pub fn extensions_fingerprint(project_root: &Path) -> u64 {
         files.sort();
         for path in files {
             path.hash(&mut h);
-            std::fs::read(&path).ok().hash(&mut h);
+            let bytes = std::fs::read(&path).ok();
+            bytes.hash(&mut h);
+            let Some(bytes) = bytes else { continue };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            if let Ok(spec) = skills::parse_skill_source(&path, text) {
+                // Global is scanned first, so a project definition wins.
+                skills_by_name.insert(spec.name.clone(), spec);
+            }
         }
     }
-    h.finish()
+    let external = external_by_name.into_values().collect();
+    let mut discovered_skills: Vec<SkillSpec> = skills_by_name.into_values().collect();
+    discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
+    discovered_skills.truncate(skills::MAX_SKILLS);
+    ExtensionSnapshot {
+        fingerprint: h.finish(),
+        external,
+        skills: discovered_skills,
+    }
+}
+
+/// Compatibility helper for diagnostics and tests that only need the content
+/// identity. Activation paths should retain and parse the full snapshot.
+pub fn extensions_fingerprint(project_root: &Path) -> u64 {
+    capture_extensions(project_root).fingerprint
 }
 
 impl Registry {
     /// Discover external tools and skills for a project and freeze the
     /// registry, stamped with the fingerprint of what was read.
     pub fn build(project_root: &Path) -> Self {
-        let fp = extensions_fingerprint(project_root);
-        let mut registry =
-            Self::assemble(discover_external(project_root), skills::discover(project_root));
-        registry.ext_fingerprint = fp;
+        Self::from_snapshot(capture_extensions(project_root))
+    }
+
+    pub(crate) fn from_snapshot(snapshot: ExtensionSnapshot) -> Self {
+        let mut registry = Self::assemble(snapshot.external, snapshot.skills);
+        registry.ext_fingerprint = snapshot.fingerprint;
         registry
     }
 
@@ -382,13 +430,6 @@ fn default_timeout() -> u64 {
     60
 }
 
-/// Discover external tool definitions: global `~/.openmax/tools/*.toml`
-/// first, then the project's `.openmax/tools/*.toml`, which wins on name
-/// collision. Malformed files are skipped, never fatal.
-fn discover_external(project_root: &Path) -> Vec<ToolSpec> {
-    discover_external_in(&external_tool_dirs(project_root))
-}
-
 /// Global then project tool dirs; later dirs win on name collision.
 pub(crate) fn external_tool_dirs(project_root: &Path) -> [PathBuf; 2] {
     [
@@ -397,6 +438,7 @@ pub(crate) fn external_tool_dirs(project_root: &Path) -> [PathBuf; 2] {
     ]
 }
 
+#[cfg(test)]
 fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
     let mut by_name: HashMap<String, ToolSpec> = HashMap::new();
     for dir in dirs {
@@ -420,8 +462,12 @@ fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    parse_tool_source(path, &text)
+}
+
+fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
     let file: ExternalToolFile =
-        toml::from_str(&text).map_err(|e| format!("invalid TOML: {e}"))?;
+        toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;
     let name = file.name.trim().to_string();
     // Boring, model-friendly names only; anything else is a config mistake.
     let name_ok = !name.is_empty()
@@ -667,6 +713,36 @@ mod tests {
             "schema serialization must be deterministic"
         );
         let _ = std::fs::remove_dir_all(global);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn snapshot_activates_the_same_generation_it_fingerprinted() {
+        let project = temp_dir("snapshot");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let path = tools_dir.join("generation.toml");
+        std::fs::write(
+            &path,
+            "name = \"generation\"\ndescription = \"first\"\ncommand = \"/bin/true\"\n",
+        )
+        .unwrap();
+
+        let snapshot = capture_extensions(&project);
+        let first_fingerprint = snapshot.fingerprint();
+        std::fs::write(
+            &path,
+            "name = \"generation\"\ndescription = \"later\"\ncommand = \"/bin/true\"\n",
+        )
+        .unwrap();
+
+        let frozen = Registry::from_snapshot(snapshot);
+        assert_eq!(frozen.ext_fingerprint, first_fingerprint);
+        assert_eq!(frozen.get("generation").unwrap().description, "first");
+
+        let current = Registry::build(&project);
+        assert_ne!(current.ext_fingerprint, first_fingerprint);
+        assert_eq!(current.get("generation").unwrap().description, "later");
         let _ = std::fs::remove_dir_all(project);
     }
 

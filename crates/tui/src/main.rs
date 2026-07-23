@@ -9,6 +9,7 @@ mod theme;
 mod ui;
 
 use std::ffi::OsString;
+use std::io::{IsTerminal, Write};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
@@ -36,6 +37,7 @@ options:
                          any is broken.
                          with --stdio, validate a JSONL protocol stream on
                          stdin against the openmax-stdio contract instead
+      --trust-project    persist trust for this exact project root, then run
   -V, --version          print the version
   -h, --help             this help
 
@@ -58,6 +60,7 @@ struct CliArgs {
     json: bool,
     stdio: bool,
     check: bool,
+    trust_project: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
     prompts: Vec<String>,
@@ -81,6 +84,7 @@ where
         json: false,
         stdio: false,
         check: false,
+        trust_project: false,
         prompts: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
@@ -101,6 +105,7 @@ where
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
+            Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -160,6 +165,10 @@ async fn main() -> std::io::Result<()> {
         eprintln!("openmax: --stdio takes commands on stdin, not flags or prompts\n\n{HELP}");
         std::process::exit(2);
     }
+    if cli.check && cli.trust_project {
+        eprintln!("openmax: --check and --trust-project are separate operations\n\n{HELP}");
+        std::process::exit(2);
+    }
 
     if cli.check {
         // With --stdio, validate a JSONL protocol stream on stdin instead of
@@ -185,7 +194,14 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(if open_max_core::doctor::has_errors(&findings) { 1 } else { 0 });
     }
 
-    let (core, core_rx) = Core::new(default_data_dir());
+    let data_dir = default_data_dir();
+    let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Err(e) = ensure_project_trust(&cli, &data_dir, &project) {
+        eprintln!("openmax: {e}");
+        std::process::exit(3);
+    }
+
+    let (core, core_rx) = Core::new(data_dir);
     {
         let mut s = core.settings.lock().unwrap();
         if let Some(provider) = &cli.provider {
@@ -275,6 +291,42 @@ async fn main() -> std::io::Result<()> {
     result
 }
 
+fn ensure_project_trust(
+    cli: &CliArgs,
+    data_dir: &std::path::Path,
+    project: &std::path::Path,
+) -> Result<(), String> {
+    if cli.trust_project {
+        let trusted = open_max_core::trust::trust_project(data_dir, project)?;
+        eprintln!("openmax: trusted project {}", trusted.display());
+        return Ok(());
+    }
+    if open_max_core::trust::is_trusted(data_dir, project)? {
+        return Ok(());
+    }
+    if cli.print || cli.stdio || !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "project {} is not trusted; inspect it, then rerun with --trust-project",
+            project.display()
+        ));
+    }
+
+    eprint!(
+        "Open Max can execute repository code with your user authority.\nTrust project {}? [y/N] ",
+        project.display()
+    );
+    std::io::stderr().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Err("project remains untrusted".into());
+    }
+    open_max_core::trust::trust_project(data_dir, project)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +395,13 @@ mod tests {
         // interactive stdio session and takes no prompt.
         let cli = parse_args_from(["--check", "--stdio"]).unwrap();
         assert!(cli.check && cli.stdio && !cli.print && cli.prompts.is_empty());
+    }
+
+    #[test]
+    fn trust_project_flag_parses() {
+        let cli = parse_args_from(["--trust-project", "-p", "inspect"]).unwrap();
+        assert!(cli.trust_project);
+        assert!(cli.print);
     }
 
     #[test]

@@ -21,6 +21,7 @@ ignore = "0.4"
 globset = "0.4"
 similar = "2"
 uuid = { version = "1", features = ["v4"] }
+fs2 = "0.4"
 # Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 libc = "0.2"

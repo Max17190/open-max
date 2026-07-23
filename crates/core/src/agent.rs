@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -270,6 +272,28 @@ struct ReadonlyBatchCtx<'a> {
     cancelled: Arc<CancelToken>,
     hooks: &'a Hooks,
     permissions: &'a Permissions,
+    parallelism: usize,
+}
+
+fn parallel_tool_limit(configured: usize) -> usize {
+    configured.clamp(1, 32)
+}
+
+async fn collect_bounded<F>(futures: Vec<F>, parallelism: usize) -> Vec<F::Output>
+where
+    F: Future,
+{
+    let mut completed: Vec<_> = futures_util::stream::iter(
+        futures
+            .into_iter()
+            .enumerate()
+            .map(|(index, future)| async move { (index, future.await) }),
+    )
+    .buffer_unordered(parallel_tool_limit(parallelism))
+    .collect()
+    .await;
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    completed.into_iter().map(|(_, output)| output).collect()
 }
 
 /// Returns true when the user cancelled mid-gate so the turn should stop
@@ -359,7 +383,7 @@ async fn execute_readonly_batch(
             }
         })
         .collect();
-    let outcomes = futures_util::future::join_all(futures).await;
+    let outcomes = collect_bounded(futures, ctx.parallelism).await;
 
     for (i, call) in calls.iter().enumerate() {
         let outcome = &outcomes[i];
@@ -588,6 +612,12 @@ pub fn start_turn(
     project_root: PathBuf,
     user_text: String,
 ) -> Result<(), String> {
+    if !crate::trust::is_trusted(&core.data_dir, &project_root)? {
+        return Err(format!(
+            "project {} is not trusted; establish trust before starting a turn",
+            project_root.display()
+        ));
+    }
     {
         let mut running = core.running.lock().unwrap();
         if running.contains(&session_id) {
@@ -623,6 +653,12 @@ pub async fn reload_session(
     session_id: &str,
     project_root: &Path,
 ) -> Result<(usize, usize), String> {
+    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
+        return Err(format!(
+            "project {} is not trusted; establish trust before reloading it",
+            project_root.display()
+        ));
+    }
     if core.is_running(session_id) {
         return Err("a turn is in flight; run /reload after it finishes".into());
     }
@@ -684,26 +720,24 @@ fn apply_freeze(
     sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
 }
 
-/// The self-modification loop closes here: at turn start, if the extension
-/// files on disk no longer match the fingerprint the session's registry froze
-/// from, rebuild registry + prompt in place. Costs one fingerprint read per
-/// turn (a handful of small files) and re-prefills the prompt cache only when
-/// something actually changed; a tool the agent wrote last turn is callable
-/// on this one, no /new and no human /reload required.
+/// The self-modification loop closes here: at turn start, capture one immutable
+/// generation of extension bytes. If its fingerprint no longer matches the
+/// session's registry, activate that exact generation and rebuild the prompt in
+/// place. An unchanged generation preserves the prompt cache; a tool the agent
+/// wrote last turn is callable on this one without /new or /reload.
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
 ) {
-    let disk_fp = {
+    let snapshot = {
         let root = project_root.to_path_buf();
-        match tokio::task::spawn_blocking(move || crate::registry::extensions_fingerprint(&root))
-            .await
-        {
-            Ok(fp) => fp,
+        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
+            Ok(snapshot) => snapshot,
             Err(_) => return,
         }
     };
+    let disk_fp = snapshot.fingerprint();
     let stale = {
         let sessions_map = core.sessions.lock().await;
         sessions_map
@@ -713,8 +747,7 @@ async fn refreeze_if_extensions_changed(
     if !stale {
         return;
     }
-    let root = project_root.to_path_buf();
-    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::build(&root)).await else {
+    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
         return;
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
@@ -979,6 +1012,7 @@ async fn run_loop(
                     cancelled: cancelled.clone(),
                     hooks: &hooks,
                     permissions: &permissions,
+                    parallelism: parallel_tool_limit(settings.max_parallel_tools),
                 };
                 if execute_readonly_batch(
                     &batch_ctx,
@@ -1700,6 +1734,76 @@ mod tests {
     }
 
     #[test]
+    fn parallel_tool_limit_clamps_to_supported_range() {
+        assert_eq!(parallel_tool_limit(0), 1);
+        assert_eq!(parallel_tool_limit(1), 1);
+        assert_eq!(parallel_tool_limit(4), 4);
+        assert_eq!(parallel_tool_limit(33), 32);
+        assert_eq!(parallel_tool_limit(usize::MAX), 32);
+    }
+
+    #[tokio::test]
+    async fn bounded_collector_caps_peak_and_restores_model_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let futures = (0..12)
+            .map(|index| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis((12 - index) as u64)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    index
+                }
+            })
+            .collect();
+
+        let output = collect_bounded(futures, 3).await;
+        assert_eq!(output, (0..12).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_collector_admits_later_work_without_head_of_line_blocking() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let release_first = Arc::new(Notify::new());
+        let third_started = Arc::new(AtomicBool::new(false));
+        let futures = (0..3)
+            .map(|index| {
+                let release_first = release_first.clone();
+                let third_started = third_started.clone();
+                async move {
+                    match index {
+                        0 => release_first.notified().await,
+                        1 => tokio::time::sleep(Duration::from_millis(10)).await,
+                        2 => third_started.store(true, Ordering::SeqCst),
+                        _ => unreachable!(),
+                    }
+                    index
+                }
+            })
+            .collect();
+
+        let collector = tokio::spawn(collect_bounded(futures, 2));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !third_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("third future should be admitted while the first is blocked");
+        release_first.notify_one();
+        assert_eq!(collector.await.unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
     fn partition_single_readonly_call_is_serial() {
         let registry = Registry::builtin_only();
         let tracker = RepeatCallTracker::new();
@@ -1867,6 +1971,7 @@ mod tests {
         let id = "reload-live";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
         {
             let mut data = build_session_data(&core, id, &project);
             data.messages.push(ChatMessage::user("hi"));
@@ -1968,6 +2073,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The public core boundary enforces trust even when a frontend bypasses
+    /// the first-party CLI.
+    #[tokio::test]
+    async fn start_turn_rejects_untrusted_project_before_spawning() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let error = start_turn(core.clone(), "untrusted".into(), project, "must not run".into())
+            .unwrap_err();
+        assert!(error.contains("not trusted"), "{error}");
+        assert!(!core.is_running("untrusted"));
+        assert!(core.cancel_flags.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// user_prompt_submit blocks before the message enters the transcript,
     /// and the turn ends with stop_reason "blocked" (no model call).
     #[tokio::test]
@@ -1995,6 +2120,7 @@ mod tests {
         )
         .unwrap();
         crate::hooks::invalidate_hooks_cache();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         let project_key = project.display().to_string();
         let meta = sessions::create(&core, project_key.clone()).unwrap();
@@ -2071,6 +2197,7 @@ mod tests {
         )
         .unwrap();
         crate::hooks::invalidate_hooks_cache();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         start_turn(core.clone(), "sess-early".into(), project.clone(), "hi".into()).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

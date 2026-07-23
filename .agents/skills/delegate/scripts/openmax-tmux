@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  openmax-tmux start <name> <project-dir> <prompt>
+  openmax-tmux status <generation>
+  openmax-tmux wait <generation>
+  openmax-tmux capture <generation>
+  openmax-tmux attach <generation>
+  openmax-tmux stop <generation>
+  openmax-tmux list
+EOF
+  exit 2
+}
+
+die() {
+  printf 'openmax-tmux: %s\n' "$*" >&2
+  exit 2
+}
+
+require_tmux() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required"
+}
+
+validate_name() {
+  [[ ${1:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]] ||
+    die "name must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
+}
+
+state_root=${OPENMAX_DELEGATE_DIR:-"$HOME/.openmax/delegates"}
+start_lock=
+
+release_start_lock() {
+  if [[ -n $start_lock ]]; then
+    rmdir "$start_lock" 2>/dev/null || true
+    start_lock=
+  fi
+}
+
+trap release_start_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+logical_link() {
+  printf '%s/names/%s' "$state_root" "$1"
+}
+
+generations_root() {
+  [[ -d $state_root/generations ]] || die "no delegate generations exist"
+  (cd -P "$state_root/generations" && pwd -P)
+}
+
+validate_generation_path() {
+  local candidate=$1
+  local root canonical parent
+  root=$(generations_root)
+  [[ -d $candidate ]] || die "unknown delegate generation: $candidate"
+  canonical=$(cd -P "$candidate" && pwd -P)
+  parent=$(cd -P "$(dirname "$canonical")" && pwd -P)
+  [[ $parent == "$root" ]] || die "generation is outside the delegate state root: $candidate"
+  printf '%s' "$canonical"
+}
+
+resolve_current_generation() {
+  local link
+  link=$(logical_link "$1")
+  [[ -L $link ]] || die "unknown delegate: $1"
+  local candidate
+  candidate=$(
+    cd -P "$(dirname "$link")"
+    cd -P -- "$(readlink "$link")"
+    pwd -P
+  )
+  validate_generation_path "$candidate"
+}
+
+resolve_generation() {
+  local selector=$1
+  if [[ -d $selector ]]; then
+    validate_generation_path "$selector"
+  elif [[ $selector != */* && -d $state_root/generations/$selector ]]; then
+    validate_generation_path "$state_root/generations/$selector"
+  else
+    die "use the immutable generation path returned by start, or a generation basename"
+  fi
+}
+
+read_state_value() {
+  local generation=$1
+  local key=$2
+  [[ -f $generation/$key ]] || die "delegate state is incomplete: $generation/$key"
+  IFS= read -r REPLY <"$generation/$key" || true
+  printf '%s' "$REPLY"
+}
+
+exact_target() {
+  printf '=%s' "$1"
+}
+
+exact_window_target() {
+  printf '=%s:' "$1"
+}
+
+session_running() {
+  local session=$1
+  tmux has-session -t "$(exact_target "$session")" 2>/dev/null &&
+    [[ $(tmux display-message -p -t "$(exact_window_target "$session")" '#{pane_dead}' 2>/dev/null) == 0 ]]
+}
+
+generation_status() {
+  local generation=$1
+  local session
+  session=$(read_state_value "$generation" session)
+  if [[ -f $generation/exit-code ]]; then
+    printf 'exited %s\n' "$(read_state_value "$generation" exit-code)"
+  elif session_running "$session"; then
+    printf 'running\n'
+  else
+    printf 'lost\n'
+    return 1
+  fi
+}
+
+record_exit_code() {
+  local generation=$1
+  local code=$2
+  [[ -f $generation/exit-code ]] && return 0
+  local temporary="$generation/exit-code.tmp.$$"
+  printf '%s\n' "$code" >"$temporary"
+  if ! ln "$temporary" "$generation/exit-code" 2>/dev/null; then
+    :
+  fi
+  rm -f "$temporary"
+}
+
+terminate_generation_processes() {
+  local generation=$1
+  local session=$2
+  local pane_pid=
+  if [[ -f $generation/pane-pid ]]; then
+    pane_pid=$(read_state_value "$generation" pane-pid)
+  fi
+  if [[ $pane_pid =~ ^[0-9]+$ ]] && kill -0 "$pane_pid" 2>/dev/null; then
+    kill -TERM -- "-$pane_pid" 2>/dev/null || true
+    local attempts=0
+    while kill -0 "$pane_pid" 2>/dev/null && [[ $attempts -lt 20 ]]; do
+      sleep 0.05
+      attempts=$((attempts + 1))
+    done
+    if kill -0 "$pane_pid" 2>/dev/null; then
+      kill -KILL -- "-$pane_pid" 2>/dev/null || true
+    fi
+  fi
+  tmux kill-session -t "$(exact_target "$session")" 2>/dev/null || true
+}
+
+acquire_start_lock() {
+  local name=$1
+  mkdir -p "$state_root/start-locks"
+  start_lock="$state_root/start-locks/$name"
+  if ! mkdir "$start_lock" 2>/dev/null; then
+    start_lock=
+    die "another start is already in progress for delegate: $name"
+  fi
+}
+
+ensure_name_replaceable() {
+  local name=$1
+  local link
+  link=$(logical_link "$name")
+  if [[ -e $link && ! -L $link ]]; then
+    die "delegate name is occupied by a non-symlink: $link"
+  fi
+  [[ -L $link ]] || return 0
+
+  local current status
+  current=$(resolve_current_generation "$name")
+  status=$(generation_status "$current" 2>/dev/null || true)
+  case "$status" in
+    running)
+      die "delegate '$name' is already running: $current"
+      ;;
+    lost)
+      die "delegate '$name' has incomplete state; stop its exact generation before restarting: $current"
+      ;;
+  esac
+}
+
+wait_for_completion() {
+  local generation=$1
+  local session channel waiter
+  session=$(read_state_value "$generation" session)
+  channel=$(read_state_value "$generation" channel)
+  [[ -f $generation/exit-code ]] && return 0
+
+  tmux wait-for -L "$channel" &
+  waiter=$!
+  while kill -0 "$waiter" 2>/dev/null; do
+    if [[ -f $generation/exit-code ]]; then
+      tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+      break
+    fi
+    if ! session_running "$session"; then
+      terminate_generation_processes "$generation" "$session"
+      tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 0.05
+  done
+  wait "$waiter" 2>/dev/null || true
+  # The waiter acquires the lock before returning. Release that ownership even
+  # on a lost child so future diagnostics cannot inherit a stuck channel.
+  tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+  [[ -f $generation/exit-code ]] ||
+    die "delegate session disappeared before recording an exit code"
+}
+
+start_delegate() {
+  [[ $# -eq 3 ]] || usage
+  local name=$1
+  local project_input=$2
+  local prompt=$3
+  validate_name "$name"
+  require_tmux
+  [[ -d $project_input ]] || die "project directory does not exist: $project_input"
+
+  local project
+  project=$(cd -P -- "$project_input" && pwd -P)
+  local openmax_bin=${OPENMAX_BIN:-openmax}
+  if [[ $openmax_bin == */* ]]; then
+    [[ -x $openmax_bin ]] || die "OPENMAX_BIN is not executable: $openmax_bin"
+    openmax_bin=$(cd -P -- "$(dirname "$openmax_bin")" && pwd -P)/$(basename "$openmax_bin")
+  else
+    openmax_bin=$(command -v "$openmax_bin") || die "openmax executable not found: ${OPENMAX_BIN:-openmax}"
+  fi
+
+  mkdir -p "$state_root/generations" "$state_root/names"
+  acquire_start_lock "$name"
+  ensure_name_replaceable "$name"
+
+  local generation_id
+  generation_id=$(date -u +%Y%m%dT%H%M%S)-$$
+  local generation="$state_root/generations/$name-$generation_id"
+  local suffix=0
+  while ! mkdir "$generation" 2>/dev/null; do
+    suffix=$((suffix + 1))
+    generation="$state_root/generations/$name-$generation_id-$suffix"
+  done
+
+  local session="openmax-delegate-$name-$generation_id"
+  local channel="openmax-delegate-done-$name-$generation_id"
+  printf '%s\n' "$name" >"$generation/name"
+  printf '%s' "$prompt" >"$generation/prompt"
+  printf '%s\n' "$project" >"$generation/project"
+  printf '%s\n' "$session" >"$generation/session"
+  printf '%s\n' "$channel" >"$generation/channel"
+  printf '%s\n' "$openmax_bin" >"$generation/openmax-bin"
+
+  local quoted_project quoted_bin quoted_prompt quoted_output quoted_exit quoted_channel
+  printf -v quoted_project '%q' "$project"
+  printf -v quoted_bin '%q' "$openmax_bin"
+  printf -v quoted_prompt '%q' "$generation/prompt"
+  printf -v quoted_output '%q' "$generation/output.log"
+  printf -v quoted_exit '%q' "$generation/exit-code"
+  printf -v quoted_channel '%q' "$channel"
+
+  tmux wait-for -L "$channel"
+  local command
+  command="finish() { code=\$1; trap - EXIT HUP INT TERM; tmp=$quoted_exit.tmp.\$\$; printf '%s\\n' \"\$code\" >\"\$tmp\"; ln \"\$tmp\" $quoted_exit 2>/dev/null || true; rm -f \"\$tmp\"; tmux wait-for -U $quoted_channel >/dev/null 2>&1 || true; exit \"\$code\"; }; trap 'finish \$?' EXIT; trap 'finish 129' HUP; trap 'finish 130' INT; trap 'finish 143' TERM; tmux set-option -w -t =$session: remain-on-exit on || exit 125; cd $quoted_project || exit 125; $quoted_bin --trust-project -p \"\$(cat $quoted_prompt)\" >$quoted_output 2>&1; exit \$?"
+  if ! tmux new-session -d -s "$session" /bin/sh -c "$command"; then
+    tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+    record_exit_code "$generation" 125
+    die "failed to create tmux session: $session"
+  fi
+  local pane_pid
+  if ! pane_pid=$(tmux display-message -p -t "$(exact_window_target "$session")" '#{pane_pid}'); then
+    terminate_generation_processes "$generation" "$session"
+    record_exit_code "$generation" 125
+    tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+    die "failed to record tmux pane process: $session"
+  fi
+  printf '%s\n' "$pane_pid" >"$generation/pane-pid"
+
+  local link temporary_link
+  link=$(logical_link "$name")
+  temporary_link="$state_root/names/.${name}.${generation_id}.$$"
+  ln -s "../generations/$(basename "$generation")" "$temporary_link"
+  if mv -Tf "$temporary_link" "$link" 2>/dev/null; then
+    :
+  elif mv -fh "$temporary_link" "$link" 2>/dev/null; then
+    :
+  else
+    terminate_generation_processes "$generation" "$session"
+    record_exit_code "$generation" 125
+    tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+    die "could not atomically update delegate link: $link"
+  fi
+  release_start_lock
+  printf '%s\n' "$generation"
+}
+
+status_delegate() {
+  [[ $# -eq 1 ]] || usage
+  local generation
+  generation=$(resolve_generation "$1")
+  generation_status "$generation"
+}
+
+wait_delegate() {
+  [[ $# -eq 1 ]] || usage
+  require_tmux
+  local generation
+  generation=$(resolve_generation "$1")
+  wait_for_completion "$generation"
+  local code
+  code=$(read_state_value "$generation" exit-code)
+  printf '%s\n' "$code"
+  return "$code"
+}
+
+capture_delegate() {
+  [[ $# -eq 1 ]] || usage
+  local generation session
+  generation=$(resolve_generation "$1")
+  session=$(read_state_value "$generation" session)
+  if [[ -f $generation/output.log ]]; then
+    cat "$generation/output.log"
+  elif tmux has-session -t "$(exact_target "$session")" 2>/dev/null; then
+    tmux capture-pane -p -t "$(exact_window_target "$session")"
+  fi
+}
+
+attach_delegate() {
+  [[ $# -eq 1 ]] || usage
+  require_tmux
+  local generation session
+  generation=$(resolve_generation "$1")
+  session=$(read_state_value "$generation" session)
+  exec tmux attach-session -t "$(exact_target "$session")"
+}
+
+stop_delegate() {
+  [[ $# -eq 1 ]] || usage
+  require_tmux
+  local generation session channel
+  generation=$(resolve_generation "$1")
+  session=$(read_state_value "$generation" session)
+  channel=$(read_state_value "$generation" channel)
+  terminate_generation_processes "$generation" "$session"
+  if [[ ! -f $generation/exit-code ]]; then
+    record_exit_code "$generation" 143
+    tmux wait-for -U "$channel" >/dev/null 2>&1 || true
+  fi
+  printf 'stopped\n'
+}
+
+list_delegates() {
+  [[ $# -eq 0 ]] || usage
+  [[ -d $state_root/generations ]] || return 0
+  local generation name status current current_generation
+  for generation in "$state_root"/generations/*; do
+    [[ -d $generation && -f $generation/name ]] || continue
+    generation=$(validate_generation_path "$generation")
+    name=$(read_state_value "$generation" name)
+    status=$(generation_status "$generation" 2>/dev/null || true)
+    current=
+    if [[ -L $(logical_link "$name") ]]; then
+      current_generation=$(resolve_current_generation "$name")
+      [[ $current_generation == "$generation" ]] && current=current
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$name" "$status" "$generation" "$current"
+  done
+}
+
+action=${1:-}
+[[ -n $action ]] || usage
+shift
+case "$action" in
+  start) start_delegate "$@" ;;
+  status) status_delegate "$@" ;;
+  wait) wait_delegate "$@" ;;
+  capture) capture_delegate "$@" ;;
+  attach) attach_delegate "$@" ;;
+  stop) stop_delegate "$@" ;;
+  list) list_delegates "$@" ;;
+  *) usage ;;
+esac

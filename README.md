@@ -13,6 +13,7 @@ You own the endpoints, the tools, the skills, and the context.
 
 - **Small by default.** Seven built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and `bash`. Short system prompt; old tool output is dropped before your task is, and dropped context is summarized by your own model into a compact note (heuristic digest as fallback).
 - **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch model and provider together with `/model`. `/provider` and the provider CLI option remain available for direct provider changes. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
+- **Trust before execution.** An exact canonical project root must be trusted before any agent turn or project behavior starts. Interactive use asks once; headless and stdio runs fail closed until explicitly started with `--trust-project`.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; the harness re-freezes automatically on the next turn, so a tool the agent writes is a tool the agent uses.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
@@ -63,11 +64,12 @@ Edit `~/.openmax/settings.json`:
   "base_url": "http://127.0.0.1:11434/v1",
   "model": "qwen2.5-coder:7b",
   "api_key": null,
-  "approval_mode": "ask"
+  "approval_mode": "ask",
+  "max_parallel_tools": 4
 }
 ```
 
-`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and is clamped to 1 through 32 at runtime. Mutating, approval-gated, and non-batchable calls remain serial.
 
 For several servers, define them in `~/.openmax/providers.json`. `/model` opens a searchable local catalog and selects the provider and model as one pair. Model names are optional, model ids are sent unchanged, and the configured order is preserved within each provider. Opening the picker makes no network requests.
 
@@ -102,6 +104,15 @@ On Apple Silicon, when `base_url` is the managed local port, Open Max can option
 cd ~/code/my-app
 openmax
 ```
+
+On the first interactive run, inspect the project and accept the trust prompt. For headless or stdio use, make the same decision explicitly:
+
+```sh
+openmax --trust-project -p "summarize this repo"
+openmax --trust-project --stdio
+```
+
+Trust is persisted for the exact canonical path in `~/.openmax/trust.json`. It authorizes the harness to run in that project; it does not sandbox project code.
 
 ```sh
 openmax --continue                    # resume latest session here
@@ -207,7 +218,7 @@ arg_regex = "^cargo (test|check|build)"
 
 **Validation.** `openmax --check` parses tools, skills, templates, hooks, permissions, and `providers.json`, then prints per-file results with the reason anything would be ignored, fail closed, or fail at request time. It exits nonzero on errors. The agent is instructed to run it after writing extension files.
 
-Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically: at each turn start it fingerprints the extension files, and if anything changed it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). An unchanged disk costs nothing. `/reload` forces it immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
+Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically. At each turn start it captures one immutable generation of extension bytes, fingerprints that snapshot, and parses those same bytes. If the generation changed, it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). Atomic replacement and symlink swaps cannot make the activated registry disagree with its fingerprint. An unchanged generation does not rebuild or invalidate the prompt cache. `/reload` forces a new capture immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 
 ## Native execution and privacy
 
