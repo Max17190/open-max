@@ -34,13 +34,15 @@ Use the bundled supervisor for work that must survive the launching shell or
 remain visible:
 
 ```sh
-.agents/skills/delegate/scripts/openmax-tmux start auth-a /path/to/project \
-  "Map the auth flow and write AUTH.md. Do not delegate further."
-.agents/skills/delegate/scripts/openmax-tmux status auth-a
-.agents/skills/delegate/scripts/openmax-tmux wait auth-a
-.agents/skills/delegate/scripts/openmax-tmux capture auth-a
-.agents/skills/delegate/scripts/openmax-tmux attach auth-a
-.agents/skills/delegate/scripts/openmax-tmux stop auth-a
+delegate=$(
+  .agents/skills/delegate/scripts/openmax-tmux start auth-a /path/to/project \
+    "Map the auth flow and write AUTH.md. Do not delegate further."
+)
+.agents/skills/delegate/scripts/openmax-tmux status "$delegate"
+.agents/skills/delegate/scripts/openmax-tmux wait "$delegate"
+.agents/skills/delegate/scripts/openmax-tmux capture "$delegate"
+.agents/skills/delegate/scripts/openmax-tmux attach "$delegate"
+.agents/skills/delegate/scripts/openmax-tmux stop "$delegate"
 .agents/skills/delegate/scripts/openmax-tmux list
 ```
 
@@ -48,7 +50,12 @@ remain visible:
 creates a persistent generation directory, and atomically updates the logical
 name symlink. It launches the configured `OPENMAX_BIN` or `openmax` using
 `--trust-project`, captures combined output and the exact exit code, and uses a
-tmux wait lock for race-free completion. Every tmux command uses an exact target.
+tmux wait lock for race-free completion. Capture the immutable generation path
+printed by `start` and pass that handle to every later command. Operational
+commands reject mutable logical names. Starting the same logical name while its
+current generation is running is also rejected. `list` reports every retained
+generation and marks the current logical-name target. Every tmux command uses an
+exact target.
 
 State defaults to `~/.openmax/delegates`. Set `OPENMAX_DELEGATE_DIR` to relocate
 it. Set `CARGO_TARGET_DIR` to share compilation artifacts across isolated Git
