@@ -25,6 +25,7 @@ Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash
 - Prompt templates: `.agents/prompts/<name>.md` or `~/.openmax/prompts/` (`$ARGUMENTS`, `$1`..`$9`; user runs `/<name>`)
 - Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` / `user_prompt_submit` gate; `post_tool_use` / `session_start` / `compaction` / `turn_end` observe; not in prompt)
 - Permissions: `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (allow/deny/ask; not in prompt)
+- Trust: exact canonical project roots in `~/.openmax/trust.json`; headless/stdio require `--trust-project` once
 - Providers: `~/.openmax/providers.json`; `/theme` for built-in palettes
 - Built-in compaction with model-written summaries (heuristic digest fallback); tools/skills re-freeze automatically when their files change (`/reload` forces now, `/new` for clean)
 - `openmax --check` validates every extension file with per-file reasons; run it after writing one

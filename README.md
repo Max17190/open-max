@@ -13,6 +13,7 @@ You own the endpoints, the tools, the skills, and the context.
 
 - **Small by default.** Seven built-in tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and `bash`. Short system prompt; old tool output is dropped before your task is, and dropped context is summarized by your own model into a compact note (heuristic digest as fallback).
 - **Your model, your server.** Set one `base_url`, or name several endpoints in `providers.json` and switch model and provider together with `/model`. `/provider` and the provider CLI option remain available for direct provider changes. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
+- **Trust before execution.** An exact canonical project root must be trusted before any agent turn or project behavior starts. Interactive use asks once; headless and stdio runs fail closed until explicitly started with `--trust-project`.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent knows these surfaces and writes them itself when you ask for a reusable capability; the harness re-freezes automatically on the next turn, so a tool the agent writes is a tool the agent uses.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
@@ -102,6 +103,15 @@ On Apple Silicon, when `base_url` is the managed local port, Open Max can option
 cd ~/code/my-app
 openmax
 ```
+
+On the first interactive run, inspect the project and accept the trust prompt. For headless or stdio use, make the same decision explicitly:
+
+```sh
+openmax --trust-project -p "summarize this repo"
+openmax --trust-project --stdio
+```
+
+Trust is persisted for the exact canonical path in `~/.openmax/trust.json`. It authorizes the harness to run in that project; it does not sandbox project code.
 
 ```sh
 openmax --continue                    # resume latest session here

@@ -588,6 +588,12 @@ pub fn start_turn(
     project_root: PathBuf,
     user_text: String,
 ) -> Result<(), String> {
+    if !crate::trust::is_trusted(&core.data_dir, &project_root)? {
+        return Err(format!(
+            "project {} is not trusted; establish trust before starting a turn",
+            project_root.display()
+        ));
+    }
     {
         let mut running = core.running.lock().unwrap();
         if running.contains(&session_id) {
@@ -623,6 +629,12 @@ pub async fn reload_session(
     session_id: &str,
     project_root: &Path,
 ) -> Result<(usize, usize), String> {
+    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
+        return Err(format!(
+            "project {} is not trusted; establish trust before reloading it",
+            project_root.display()
+        ));
+    }
     if core.is_running(session_id) {
         return Err("a turn is in flight; run /reload after it finishes".into());
     }
@@ -1867,6 +1879,7 @@ mod tests {
         let id = "reload-live";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
         {
             let mut data = build_session_data(&core, id, &project);
             data.messages.push(ChatMessage::user("hi"));
@@ -1968,6 +1981,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The public core boundary enforces trust even when a frontend bypasses
+    /// the first-party CLI.
+    #[tokio::test]
+    async fn start_turn_rejects_untrusted_project_before_spawning() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone());
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let error = start_turn(core.clone(), "untrusted".into(), project, "must not run".into())
+            .unwrap_err();
+        assert!(error.contains("not trusted"), "{error}");
+        assert!(!core.is_running("untrusted"));
+        assert!(core.cancel_flags.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// user_prompt_submit blocks before the message enters the transcript,
     /// and the turn ends with stop_reason "blocked" (no model call).
     #[tokio::test]
@@ -1995,6 +2028,7 @@ mod tests {
         )
         .unwrap();
         crate::hooks::invalidate_hooks_cache();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         let project_key = project.display().to_string();
         let meta = sessions::create(&core, project_key.clone()).unwrap();
@@ -2071,6 +2105,7 @@ mod tests {
         )
         .unwrap();
         crate::hooks::invalidate_hooks_cache();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         start_turn(core.clone(), "sess-early".into(), project.clone(), "hi".into()).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
