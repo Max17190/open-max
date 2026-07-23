@@ -28,6 +28,7 @@ Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash
 - Trust: exact canonical project roots in `~/.openmax/trust.json`; headless/stdio require `--trust-project` once
 - Providers: `~/.openmax/providers.json`; `/theme` for built-in palettes
 - Built-in compaction with model-written summaries (heuristic digest fallback); tools/skills re-freeze from one immutable byte snapshot when their files change (`/reload` forces now, `/new` for clean)
+- Read-only tool fanout is bounded by `max_parallel_tools` (default 4, runtime range 1 through 32); mutation and approval stay serial
 - `openmax --check` validates every extension file with per-file reasons; run it after writing one
 
 Not shipped: user keybindings, theme file hot reload, pluggable compactors, TUI plugin ABI (custom frontends speak `--stdio` JSONL).

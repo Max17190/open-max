@@ -64,11 +64,12 @@ Edit `~/.openmax/settings.json`:
   "base_url": "http://127.0.0.1:11434/v1",
   "model": "qwen2.5-coder:7b",
   "api_key": null,
-  "approval_mode": "ask"
+  "approval_mode": "ask",
+  "max_parallel_tools": 4
 }
 ```
 
-`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and is clamped to 1 through 32 at runtime. Mutating, approval-gated, and non-batchable calls remain serial.
 
 For several servers, define them in `~/.openmax/providers.json`. `/model` opens a searchable local catalog and selects the provider and model as one pair. Model names are optional, model ids are sent unchanged, and the configured order is preserved within each provider. Opening the picker makes no network requests.
 

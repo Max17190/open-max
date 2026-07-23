@@ -1,11 +1,13 @@
 ---
 name: delegate
-description: Hand a sub-task to a child openmax process (headless one-shot or interactive stdio) instead of doing it inline; the subagent replacement.
+description: Hand an isolated or parallel sub-task to a supervised child openmax process using headless, stdio, or durable tmux execution.
 ---
 
 # Delegate
 
-Use when a sub-task deserves its own context window: a large refactor step, an isolated investigation, work in a different directory, or anything you want to run in parallel with the main thread of work.
+Use when a sub-task deserves its own context window: a large refactor step, an
+isolated investigation, work in a different directory, or work that can proceed
+in parallel with the main task.
 
 ## One-shot: headless print
 
@@ -13,45 +15,56 @@ For a self-contained task with a clear deliverable:
 
 ```sh
 cd /path/to/target/project
-openmax -p "Rename the config module to settings across this crate; run cargo check; report what changed."
+openmax --trust-project -p "Rename the config module to settings across this crate; run cargo check; report what changed."
 ```
 
-- Output text arrives on stdout; tool progress on stderr.
-- Chain sequential turns on one child session: `openmax -p "explore X" -p "now fix X"`.
-- Mutating tools honor `approval_mode`; for unattended writes the child needs `"approval_mode": "auto"` in settings.
+- Output text arrives on stdout; tool progress arrives on stderr.
+- Chain sequential turns on one child session with repeated `-p`.
+- Mutating tools honor `approval_mode`; unattended writes require an explicit
+  configuration that permits them.
 
 ## Interactive: stdio protocol
 
-When you need to react to the child mid-run (answer approvals, add follow-ups, cancel), drive `openmax --stdio`: JSONL commands on stdin, AgentEvent JSONL on stdout.
+Use `openmax --stdio` when the parent must answer approvals, add follow-ups, or
+cancel. The JSONL contract is documented in the repository README.
+
+## Durable tmux supervisor
+
+Use the bundled supervisor for work that must survive the launching shell or
+remain visible:
 
 ```sh
-mkfifo /tmp/child-in
-openmax --stdio < /tmp/child-in > /tmp/child-out 2>/dev/null &
-exec 3>/tmp/child-in
-echo '{"cmd":"user","text":"Map the auth flow; list key files."}' >&3
-# read /tmp/child-out lines; {"type":"done",...} ends the turn
-echo '{"cmd":"user","text":"Now write the summary to AUTH.md."}' >&3
-echo '{"cmd":"quit"}' >&3
+.agents/skills/delegate/scripts/openmax-tmux start auth-a /path/to/project \
+  "Map the auth flow and write AUTH.md. Do not delegate further."
+.agents/skills/delegate/scripts/openmax-tmux status auth-a
+.agents/skills/delegate/scripts/openmax-tmux wait auth-a
+.agents/skills/delegate/scripts/openmax-tmux capture auth-a
+.agents/skills/delegate/scripts/openmax-tmux attach auth-a
+.agents/skills/delegate/scripts/openmax-tmux stop auth-a
+.agents/skills/delegate/scripts/openmax-tmux list
 ```
 
-- Commands: `user` (start a turn), `approve` (`approval_id`, `approved`), `cancel`, `quit`.
-- Approvals are not auto-declined: watch for `{"type":"approval_request",...}` and answer with `approve`.
-- EOF acts like `quit`: the in-flight turn drains, then the child exits, so a plain pipe works for scripted runs.
+`start` canonicalizes the project directory, saves the exact prompt to a file,
+creates a persistent generation directory, and atomically updates the logical
+name symlink. It launches the configured `OPENMAX_BIN` or `openmax` using
+`--trust-project`, captures combined output and the exact exit code, and uses a
+tmux wait lock for race-free completion. Every tmux command uses an exact target.
 
-## Long-running or visible: tmux
+State defaults to `~/.openmax/delegates`. Set `OPENMAX_DELEGATE_DIR` to relocate
+it. Set `CARGO_TARGET_DIR` to share compilation artifacts across isolated Git
+worktrees when appropriate.
 
-For work you or the user may want to watch or rejoin:
-
-```sh
-tmux new-session -d -s delegate-auth 'cd /path/to/project && openmax'
-tmux send-keys -t delegate-auth "Map the auth flow, then wait." Enter
-```
+tmux provides lifecycle and visibility, not filesystem or security isolation.
+Concurrent delegates that may mutate files must use separate Git worktrees.
+Read-only delegates may share a checkout.
 
 ## Bring results back
 
-Have the child write its deliverable to a file you both agree on (for example `NOTES.md` or the file it was asked to produce), or capture its stdout. Summarize into the main session; never paste raw transcripts.
+Ask the child to write a named deliverable or use `capture`. Summarize the
+result into the parent session; do not paste raw transcripts.
 
 ## Do not
 
-- Recurse without a budget: a child may delegate again, so state depth limits in the child's prompt ("do not spawn further openmax processes").
-- Run two children mutating the same files; split by directory or run sequentially.
+- Recurse without a depth budget. State "do not delegate further" by default.
+- Run two mutating children in one worktree.
+- Treat a tmux session as a permission or sandbox boundary.

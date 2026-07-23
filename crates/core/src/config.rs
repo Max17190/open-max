@@ -39,10 +39,18 @@ pub struct Settings {
     /// Cap on agent tool/model iterations per turn (main loop).
     #[serde(default = "default_max_agent_iterations")]
     pub max_agent_iterations: usize,
+    /// Maximum number of read-only tool calls admitted concurrently.
+    /// Runtime code clamps configured values to 1..=32.
+    #[serde(default = "default_max_parallel_tools")]
+    pub max_parallel_tools: usize,
 }
 
 fn default_max_agent_iterations() -> usize {
     50
+}
+
+fn default_max_parallel_tools() -> usize {
+    4
 }
 
 impl Default for Settings {
@@ -63,6 +71,7 @@ impl Default for Settings {
             chat_template_args: None,
             max_output_bytes: None,
             max_agent_iterations: default_max_agent_iterations(),
+            max_parallel_tools: default_max_parallel_tools(),
         }
     }
 }
@@ -101,12 +110,21 @@ mod tests {
     fn default_settings_use_iteration_cap() {
         let s = Settings::default();
         assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_parallel_tools, 4);
     }
 
     #[test]
     fn iteration_cap_round_trips_when_present() {
         let s: Settings = serde_json::from_str(r#"{"max_agent_iterations":3}"#).unwrap();
         assert_eq!(s.max_agent_iterations, 3);
+    }
+
+    #[test]
+    fn parallel_tool_limit_defaults_and_round_trips() {
+        let defaulted: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.max_parallel_tools, 4);
+        let configured: Settings = serde_json::from_str(r#"{"max_parallel_tools":7}"#).unwrap();
+        assert_eq!(configured.max_parallel_tools, 7);
     }
 
     #[test]
@@ -134,8 +152,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut first = Settings::default();
-        first.model = "one".into();
+        let first = Settings { model: "one".into(), ..Settings::default() };
         save(&dir, &first).unwrap();
         let mut second = first.clone();
         second.model = "vendor/family/two".into();

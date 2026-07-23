@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -270,6 +272,28 @@ struct ReadonlyBatchCtx<'a> {
     cancelled: Arc<CancelToken>,
     hooks: &'a Hooks,
     permissions: &'a Permissions,
+    parallelism: usize,
+}
+
+fn parallel_tool_limit(configured: usize) -> usize {
+    configured.clamp(1, 32)
+}
+
+async fn collect_bounded<F>(futures: Vec<F>, parallelism: usize) -> Vec<F::Output>
+where
+    F: Future,
+{
+    let mut completed: Vec<_> = futures_util::stream::iter(
+        futures
+            .into_iter()
+            .enumerate()
+            .map(|(index, future)| async move { (index, future.await) }),
+    )
+    .buffer_unordered(parallel_tool_limit(parallelism))
+    .collect()
+    .await;
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    completed.into_iter().map(|(_, output)| output).collect()
 }
 
 /// Returns true when the user cancelled mid-gate so the turn should stop
@@ -359,7 +383,7 @@ async fn execute_readonly_batch(
             }
         })
         .collect();
-    let outcomes = futures_util::future::join_all(futures).await;
+    let outcomes = collect_bounded(futures, ctx.parallelism).await;
 
     for (i, call) in calls.iter().enumerate() {
         let outcome = &outcomes[i];
@@ -988,6 +1012,7 @@ async fn run_loop(
                     cancelled: cancelled.clone(),
                     hooks: &hooks,
                     permissions: &permissions,
+                    parallelism: parallel_tool_limit(settings.max_parallel_tools),
                 };
                 if execute_readonly_batch(
                     &batch_ctx,
@@ -1706,6 +1731,76 @@ mod tests {
             &tracker,
             &empty_perms,
         ));
+    }
+
+    #[test]
+    fn parallel_tool_limit_clamps_to_supported_range() {
+        assert_eq!(parallel_tool_limit(0), 1);
+        assert_eq!(parallel_tool_limit(1), 1);
+        assert_eq!(parallel_tool_limit(4), 4);
+        assert_eq!(parallel_tool_limit(33), 32);
+        assert_eq!(parallel_tool_limit(usize::MAX), 32);
+    }
+
+    #[tokio::test]
+    async fn bounded_collector_caps_peak_and_restores_model_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let futures = (0..12)
+            .map(|index| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis((12 - index) as u64)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    index
+                }
+            })
+            .collect();
+
+        let output = collect_bounded(futures, 3).await;
+        assert_eq!(output, (0..12).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_collector_admits_later_work_without_head_of_line_blocking() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let release_first = Arc::new(Notify::new());
+        let third_started = Arc::new(AtomicBool::new(false));
+        let futures = (0..3)
+            .map(|index| {
+                let release_first = release_first.clone();
+                let third_started = third_started.clone();
+                async move {
+                    match index {
+                        0 => release_first.notified().await,
+                        1 => tokio::time::sleep(Duration::from_millis(10)).await,
+                        2 => third_started.store(true, Ordering::SeqCst),
+                        _ => unreachable!(),
+                    }
+                    index
+                }
+            })
+            .collect();
+
+        let collector = tokio::spawn(collect_bounded(futures, 2));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !third_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("third future should be admitted while the first is blocked");
+        release_first.notify_one();
+        assert_eq!(collector.await.unwrap(), vec![0, 1, 2]);
     }
 
     #[test]
