@@ -696,26 +696,24 @@ fn apply_freeze(
     sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
 }
 
-/// The self-modification loop closes here: at turn start, if the extension
-/// files on disk no longer match the fingerprint the session's registry froze
-/// from, rebuild registry + prompt in place. Costs one fingerprint read per
-/// turn (a handful of small files) and re-prefills the prompt cache only when
-/// something actually changed; a tool the agent wrote last turn is callable
-/// on this one, no /new and no human /reload required.
+/// The self-modification loop closes here: at turn start, capture one immutable
+/// generation of extension bytes. If its fingerprint no longer matches the
+/// session's registry, activate that exact generation and rebuild the prompt in
+/// place. An unchanged generation preserves the prompt cache; a tool the agent
+/// wrote last turn is callable on this one without /new or /reload.
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
 ) {
-    let disk_fp = {
+    let snapshot = {
         let root = project_root.to_path_buf();
-        match tokio::task::spawn_blocking(move || crate::registry::extensions_fingerprint(&root))
-            .await
-        {
-            Ok(fp) => fp,
+        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
+            Ok(snapshot) => snapshot,
             Err(_) => return,
         }
     };
+    let disk_fp = snapshot.fingerprint();
     let stale = {
         let sessions_map = core.sessions.lock().await;
         sessions_map
@@ -725,8 +723,7 @@ async fn refreeze_if_extensions_changed(
     if !stale {
         return;
     }
-    let root = project_root.to_path_buf();
-    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::build(&root)).await else {
+    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
         return;
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);

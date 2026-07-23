@@ -217,7 +217,7 @@ arg_regex = "^cargo (test|check|build)"
 
 **Validation.** `openmax --check` parses tools, skills, templates, hooks, permissions, and `providers.json`, then prints per-file results with the reason anything would be ignored, fail closed, or fail at request time. It exits nonzero on errors. The agent is instructed to run it after writing extension files.
 
-Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically: at each turn start it fingerprints the extension files, and if anything changed it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). An unchanged disk costs nothing. `/reload` forces it immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
+Tools and skills freeze per session for prompt-cache stability, and the harness re-freezes them automatically. At each turn start it captures one immutable generation of extension bytes, fingerprints that snapshot, and parses those same bytes. If the generation changed, it rebuilds the registry and prompt in place (one deliberate cache re-prefill, conversation kept, a `refrozen` event for clients). Atomic replacement and symlink swaps cannot make the activated registry disagree with its fingerprint. An unchanged generation does not rebuild or invalidate the prompt cache. `/reload` forces a new capture immediately; `/new` starts clean. Hooks, permissions, and templates re-discover on every turn or invocation. Use `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
 
 ## Native execution and privacy
 
