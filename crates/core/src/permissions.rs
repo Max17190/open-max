@@ -41,6 +41,11 @@ pub struct Permissions {
     /// then denies every tool so a broken policy cannot fail open.
     fail_closed: bool,
     fail_closed_reason: Option<String>,
+    /// The file that failed to parse, and the root that project-relative tool
+    /// paths resolve against. Rewriting exactly that file stays reachable so a
+    /// single bad rule cannot lock every repair out of the session.
+    invalid_path: Option<PathBuf>,
+    project_root: PathBuf,
 }
 
 /// Reject unknown top-level keys so `[rule]` / `[[rule]]` typos cannot load as empty policy.
@@ -72,10 +77,10 @@ impl Permissions {
     /// Discover rules under project `.openmax/permissions.toml` then global
     /// `~/.openmax/permissions.toml`. Project rules are listed first so they win.
     pub fn discover(project_root: &Path) -> Self {
-        Self::from_files(&permission_files(project_root))
+        Self::from_files(project_root, &permission_files(project_root))
     }
 
-    fn from_files(paths: &[PathBuf]) -> Self {
+    fn from_files(project_root: &Path, paths: &[PathBuf]) -> Self {
         let mut rules = Vec::new();
         for path in paths {
             match load_file(path) {
@@ -86,6 +91,8 @@ impl Permissions {
                         rules: Vec::new(),
                         fail_closed: true,
                         fail_closed_reason: Some(reason),
+                        invalid_path: Some(path.clone()),
+                        project_root: project_root.to_path_buf(),
                     };
                 }
             }
@@ -94,7 +101,47 @@ impl Permissions {
             rules,
             fail_closed: false,
             fail_closed_reason: None,
+            invalid_path: None,
+            project_root: project_root.to_path_buf(),
         }
+    }
+
+    /// True when this call is a rewrite of the very file that is failing
+    /// closed. The broken file expresses no enforceable policy, and the agent
+    /// is told to write this file, so leaving one path open keeps a typo from
+    /// being unrecoverable from inside the session. It grants nothing on its
+    /// own: the caller still applies `approval_mode`, so an interactive user
+    /// approves the repair and `readonly` still refuses it.
+    ///
+    /// Only the project file is reachable this way, and deliberately so. The
+    /// global file lives outside the project root, where the built-in file
+    /// tools cannot write even under a healthy policy; reaching it needs
+    /// `bash`, and exempting `bash` here would leave no gate at all. A broken
+    /// global policy is a user-authored config error, so it is fixed the same
+    /// way it was written: from the shell, guided by the path in the deny
+    /// reason and by `openmax --check`.
+    fn repairs_invalid_policy(&self, tool: &str, args: &Value) -> bool {
+        if !matches!(tool, "write_file" | "edit_file") {
+            return false;
+        }
+        let Some(invalid) = &self.invalid_path else {
+            return false;
+        };
+        let Some(raw) = args["path"].as_str() else {
+            return false;
+        };
+        // Compare resolved paths so `./x/../permissions.toml` and symlinked
+        // roots can neither dodge nor spoof the match, and require the result
+        // to sit inside the project, so `../` cannot walk out to the global
+        // file that the file tools would refuse to write anyway.
+        let (Ok(candidate), Ok(invalid), Ok(root)) = (
+            self.project_root.join(raw).canonicalize(),
+            invalid.canonicalize(),
+            self.project_root.canonicalize(),
+        ) else {
+            return false;
+        };
+        candidate == invalid && candidate.starts_with(&root)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -104,6 +151,9 @@ impl Permissions {
     /// First matching rule wins. Missing rules → [`PermissionDecision::Default`].
     pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
         if self.fail_closed {
+            if self.repairs_invalid_policy(tool, args) {
+                return PermissionDecision::Default;
+            }
             return PermissionDecision::Deny {
                 reason: self.fail_closed_reason.clone().unwrap_or_else(|| {
                     "permissions.toml is malformed; failing closed".into()
@@ -245,6 +295,67 @@ mod tests {
         dir
     }
 
+    /// A broken policy file must stay repairable from inside the session.
+    /// Everything else still fails closed, and the repair itself is only
+    /// exempted from the rules, not from `approval_mode` (Default, not Allow).
+    #[test]
+    fn invalid_policy_file_stays_repairable() {
+        let tmp = tempfile_dir();
+        let perms_path = tmp.join(".openmax").join("permissions.toml");
+        // The typo an agent actually writes: `[[rule]]` instead of `[[rules]]`.
+        write_perms(&perms_path, "[[rule]]\neffect = \"deny\"\ntool = \"bash\"\n");
+        let perms = Permissions::discover(&tmp);
+
+        assert_eq!(
+            perms.evaluate("write_file", &json!({"path": ".openmax/permissions.toml"})),
+            PermissionDecision::Default,
+            "rewriting the broken file must remain possible"
+        );
+        assert_eq!(
+            perms.evaluate("edit_file", &json!({"path": "./.openmax/../.openmax/permissions.toml"})),
+            PermissionDecision::Default,
+            "path resolution must not depend on spelling"
+        );
+
+        // Nothing else is exempt.
+        for (tool, args) in [
+            ("bash", json!({"command": "cat .openmax/permissions.toml"})),
+            ("read_file", json!({"path": ".openmax/permissions.toml"})),
+            ("write_file", json!({"path": "src/main.rs"})),
+        ] {
+            assert!(
+                matches!(perms.evaluate(tool, &args), PermissionDecision::Deny { .. }),
+                "{tool} must still fail closed"
+            );
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The repair exemption stops at the project boundary. A malformed global
+    /// file is only reachable through `bash`, and exempting `bash` while
+    /// failing closed would leave no gate, so it stays a shell-side fix.
+    #[test]
+    fn invalid_global_policy_is_not_repairable_from_the_project() {
+        let tmp = tempfile_dir();
+        let global = tmp.join("home").join(".openmax").join("permissions.toml");
+        write_perms(&global, "[[rule]]\neffect = \"deny\"\ntool = \"bash\"\n");
+        let project = tmp.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let perms = Permissions::from_files(&project, std::slice::from_ref(&global));
+
+        for args in [
+            json!({ "path": ".openmax/permissions.toml" }),
+            json!({ "path": global.to_str().unwrap() }),
+            json!({ "path": "../home/.openmax/permissions.toml" }),
+        ] {
+            assert!(
+                matches!(perms.evaluate("write_file", &args), PermissionDecision::Deny { .. }),
+                "global policy must not be repairable from inside the project: {args}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     #[test]
     fn missing_file_is_default() {
         let tmp = tempfile_dir();
@@ -329,7 +440,7 @@ arg_regex = "cargo"
         );
 
         // Same merge order as discover: project file first, then global.
-        let perms = Permissions::from_files(&[project, global]);
+        let perms = Permissions::from_files(&tmp, &[project, global]);
         match perms.evaluate("bash", &json!({"command": "cargo test"})) {
             PermissionDecision::Deny { .. } => {}
             other => panic!("project deny should win over global allow, got {other:?}"),

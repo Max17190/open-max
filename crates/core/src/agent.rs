@@ -725,6 +725,31 @@ fn apply_freeze(
 /// session's registry, activate that exact generation and rebuild the prompt in
 /// place. An unchanged generation preserves the prompt cache; a tool the agent
 /// wrote last turn is callable on this one without /new or /reload.
+/// Load a session into the in-memory map if this process has not seen it yet.
+/// Resuming with `-c` or `/resume` starts with an empty map, and the freeze
+/// check only inspects sessions it can find there.
+async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_root: &Path) {
+    if core.sessions.lock().await.contains_key(session_id) {
+        return;
+    }
+    let core_clone = core.clone();
+    let session_id_owned = session_id.to_string();
+    let project_root_owned = project_root.to_path_buf();
+    let Ok(built) = tokio::task::spawn_blocking(move || {
+        build_session_data(&core_clone, &session_id_owned, &project_root_owned)
+    })
+    .await
+    else {
+        // Leave the map untouched; the turn's own hydration path reports it.
+        return;
+    };
+    core.sessions
+        .lock()
+        .await
+        .entry(session_id.to_string())
+        .or_insert(built);
+}
+
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
@@ -834,6 +859,12 @@ async fn run_loop(
 
     // Accepted: title from the first real prompt, then self-modification.
     sessions::set_title_if_new(core, session_id, &user_text);
+
+    // Hydrate before the freeze check. A resumed session restores its registry
+    // from the persisted manifest, so it has to be in the map for the check to
+    // compare that registry against disk; otherwise the first turn after every
+    // resume silently runs without the extensions the agent already wrote.
+    ensure_session_hydrated(core, session_id, project_root).await;
 
     // Self-modification: pick up extension files written since the last
     // freeze before this turn's schemas and prompt are locked in.
@@ -2068,6 +2099,57 @@ mod tests {
         refreeze_if_extensions_changed(&core, id, &project).await;
         let map = core.sessions.lock().await;
         assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &after), "must converge");
+        drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Resuming a session in a fresh process must still see extension files
+    /// written after the manifest was persisted. The session is absent from
+    /// the in-memory map at that point, so the freeze check has to hydrate it
+    /// before comparing its registry against disk; otherwise `openmax -c`
+    /// spends its first turn without the tools the agent already wrote.
+    #[tokio::test]
+    async fn resumed_session_sees_extensions_on_its_first_turn() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "resume-refreeze";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // A prior session: transcript and manifest land on disk with no
+        // extensions installed yet.
+        {
+            let mut data = build_session_data(&core, id, &project);
+            data.messages.push(ChatMessage::user("hi"));
+            data.messages.push(ChatMessage::assistant(Some("hello".into()), None));
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, id, &data.registry.to_manifest());
+        }
+
+        // The agent wrote a tool during that session, then the process exited.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+        )
+        .unwrap();
+
+        // Fresh process: nothing is in the map yet, exactly as after `-c`.
+        assert!(core.sessions.lock().await.is_empty());
+        ensure_session_hydrated(&core, id, &project).await;
+        refreeze_if_extensions_changed(&core, id, &project).await;
+
+        let map = core.sessions.lock().await;
+        let data = map.get(id).expect("session hydrated");
+        assert!(
+            data.registry.get("deploy").is_some(),
+            "resumed turn one must see the tool written before the resume"
+        );
+        assert_eq!(data.messages.len(), 3, "conversation survives the re-freeze");
         drop(map);
 
         let _ = std::fs::remove_dir_all(dir);
