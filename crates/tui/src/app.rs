@@ -139,7 +139,6 @@ struct ToolMeta {
 pub struct App {
     core: Arc<Core>,
     project: PathBuf,
-    dir_label: String,
     session_id: Option<String>,
     mode: Mode,
     composer: Composer,
@@ -239,11 +238,7 @@ pub async fn run(
     let (hf_tx, mut hf_rx) = mpsc::unbounded_channel();
     let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let dir_label = project
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| project.display().to_string());
-    let mut app = App::new(core.clone(), project, dir_label, hf_tx, files_tx);
+    let mut app = App::new(core.clone(), project, hf_tx, files_tx);
 
     app.startup(&args).await;
 
@@ -377,7 +372,6 @@ impl App {
     fn new(
         core: Arc<Core>,
         project: PathBuf,
-        dir_label: String,
         hf_tx: mpsc::UnboundedSender<(String, u64)>,
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
@@ -385,7 +379,6 @@ impl App {
             composer: Composer::new(&core.data_dir),
             core,
             project,
-            dir_label,
             session_id: None,
             pending_submit: None,
             mode: Mode::Chat,
@@ -2560,10 +2553,15 @@ impl App {
         if self.pending_approval.is_some() {
             self.draw_approval(frame, input_area);
         } else if input_h > 0 {
+            let border_color = if self.focus == Focus::Composer {
+                theme::ACCENT()
+            } else {
+                theme::BORDER()
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme::BORDER()))
+                .border_style(Style::default().fg(border_color))
                 .style(Style::default().bg(theme::COMPOSER_BG()));
             let inner = block.inner(input_area);
             block.render(input_area, frame.buffer_mut());
@@ -2611,21 +2609,12 @@ impl App {
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
         if self.dirty.chrome || self.header_width != area.width {
             self.header_width = area.width;
-            self.header_line = Line::from(vec![
-                Span::styled(
-                    "◆ Open Max",
-                    Style::default()
-                        .fg(theme::ACCENT())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        "  {}",
-                        clip(&self.dir_label, area.width.saturating_sub(13) as usize)
-                    ),
-                    Style::default().fg(theme::DIM()),
-                ),
-            ]);
+            self.header_line = Line::from(Span::styled(
+                "OPEN MAX",
+                Style::default()
+                    .fg(theme::ACCENT())
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         (&self.header_line).render(area, frame.buffer_mut());
     }
@@ -2660,13 +2649,15 @@ impl App {
             self.chat_draw_area = Rect::default();
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
-            ready::render(
-                Rect {
-                    width: content_w,
-                    ..area
-                },
-                frame.buffer_mut(),
-            );
+            if self.composer.is_empty() {
+                ready::render(
+                    Rect {
+                        width: content_w,
+                        ..area
+                    },
+                    frame.buffer_mut(),
+                );
+            }
             return;
         }
         let visible = area.height as usize;
@@ -2934,44 +2925,39 @@ impl App {
                 (s.model.clone(), s.approval_mode.clone())
             };
             let width = area.width as usize;
-            let left = format!(" {}", self.status_hint());
+            let hint = self.status_hint();
+            let left = if hint.is_empty() {
+                String::new()
+            } else {
+                format!(" {hint}")
+            };
             let short_model = extensions::short_model(&model);
-            let context = self
-                .budget
-                .map(|(used, total)| {
-                    format!(
-                        "ctx {}%",
-                        (used as f64 / total.max(1) as f64 * 100.0) as u32
-                    )
-                })
-                .unwrap_or_else(|| "ctx 0%".into());
             let right = if width >= 78 {
-                format!("● {short_model} · {context} · {approvals} ")
+                match self.budget {
+                    Some((used, total)) => format!(
+                        "{short_model}  {}%  {approvals} ",
+                        (used as f64 / total.max(1) as f64 * 100.0) as u32
+                    ),
+                    None => format!("{short_model}  {approvals} "),
+                }
             } else if width >= 54 {
-                format!("● {short_model} · {approvals} ")
+                format!("{short_model}  {approvals} ")
             } else if width < 4 {
-                "●".into()
+                String::new()
             } else {
                 let model_width = width
-                    .saturating_sub(3)
+                    .saturating_sub(1)
                     .min(width.saturating_div(2).max(8));
-                format!("● {} ", clip(short_model, model_width))
+                format!("{} ", clip(short_model, model_width))
             };
             let right_len = right.chars().count().min(width);
             let left_max = width.saturating_sub(right_len + 1);
             let left = clip(&left, left_max);
             let padding = width.saturating_sub(left.chars().count() + right_len);
-            let dot_color = if self.running {
-                theme::WARN()
-            } else {
-                theme::OK()
-            };
-            let right_tail = right.strip_prefix('●').unwrap_or(&right).to_string();
             self.status_line = Line::from(vec![
                 Span::styled(left, Style::default().fg(theme::DIM())),
                 Span::raw(" ".repeat(padding)),
-                Span::styled("●", Style::default().fg(dot_color)),
-                Span::styled(right_tail, Style::default().fg(theme::DIM())),
+                Span::styled(right, Style::default().fg(theme::DIM())),
             ]);
         }
         (&self.status_line).render(area, frame.buffer_mut());
@@ -2999,7 +2985,7 @@ impl App {
         } else if self.quit_armed {
             "ctrl+c again to quit"
         } else {
-            "/ commands · @ files · drag to select"
+            ""
         }
     }
 }
@@ -3330,7 +3316,7 @@ mod tests {
         let (core, _rx) = Core::new(dir.clone());
         let (hf_tx, _hf_rx) = mpsc::unbounded_channel();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
-        let app = App::new(core, dir.clone(), "sample-project".into(), hf_tx, files_tx);
+        let app = App::new(core, dir.clone(), hf_tx, files_tx);
         (app, dir)
     }
 
@@ -3378,7 +3364,7 @@ mod tests {
 
         let buffer = render_app(&mut app, 80, 24);
 
-        assert!(rows(&buffer)[0].starts_with("◆ Open Max"));
+        assert!(rows(&buffer)[0].starts_with("OPEN MAX"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3624,16 +3610,36 @@ mod tests {
     #[test]
     fn idle_layout_is_restrained_and_has_bordered_composer() {
         let (mut app, dir) = app_fixture();
+        app.core.settings.lock().unwrap().model = "provider/test-model".into();
         let buffer = render_app(&mut app, 96, 18);
         let text = buffer_text(&buffer);
-        assert!(text.contains("◆ Open Max  sample-project"));
-        assert!(text.contains("◆ READY"));
-        assert!(text.contains("A small core, shaped by your workflow."));
-        assert!(text.contains("skills · tools · hooks · prompts"));
+        assert!(rows(&buffer)[0].starts_with("OPEN MAX"));
+        assert!(text.contains("READY"));
         assert!(text.contains("Describe a task"));
         assert!(text.contains("╭"));
-        assert!(text.contains("/ commands · @ files · drag to select"));
-        assert!(!text.contains("no telemetry"));
+        assert!(text.contains("test-model  ask"));
+        assert!(!text.contains("sample-project"));
+        assert!(!text.contains("small core"));
+        assert!(!text.contains("skills · tools"));
+        assert!(!text.contains("/ commands"));
+        assert!(!text.contains("●"));
+        assert!(!text.contains("ctx 0%"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn composer_focus_is_the_only_bright_border() {
+        let (mut app, dir) = app_fixture();
+        let focused = render_app(&mut app, 64, 12);
+        let border_y = rows(&focused)
+            .iter()
+            .position(|row| row.starts_with('╭'))
+            .unwrap() as u16;
+        assert_eq!(focused[(0, border_y)].fg, theme::ACCENT());
+
+        app.focus = Focus::Scrollback;
+        let unfocused = render_app(&mut app, 64, 12);
+        assert_eq!(unfocused[(0, border_y)].fg, theme::BORDER());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3642,13 +3648,13 @@ mod tests {
         let (mut app, dir) = app_fixture();
         app.insert_user_block("inspect this project");
         let conversation = buffer_text(&render_app(&mut app, 80, 16));
-        assert!(!conversation.contains("A small core, shaped by your workflow."));
+        assert!(!conversation.contains("READY"));
 
         app.reset_for_new_session();
         app.running = true;
         app.turn_started = Some(std::time::Instant::now());
         let running = buffer_text(&render_app(&mut app, 80, 16));
-        assert!(!running.contains("A small core, shaped by your workflow."));
+        assert!(!running.contains("READY"));
         assert!(running.contains("esc to cancel"));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -3729,6 +3735,7 @@ mod tests {
         let wide = render_app(&mut app, 88, 18);
         let text = buffer_text(&wide);
         assert!(text.contains("/model"));
+        assert!(!text.contains("READY"));
         let wide_rows = rows(&wide);
         let selected_y = wide_rows
             .iter()
@@ -3745,12 +3752,13 @@ mod tests {
         app.sync_completion();
         let narrow = render_app(&mut app, 34, 8);
         let narrow_text = buffer_text(&narrow);
-        assert!(narrow_text.contains("Open Max"));
-        assert!(narrow_text.contains("small core · your workflow"));
-        assert!(narrow_text.contains("skills · tools · hooks"));
+        assert!(narrow_text.contains("OPEN MAX"));
+        assert!(narrow_text.contains("READY"));
         assert!(narrow_text.contains("Describe a task"));
+        assert!(!narrow_text.contains("small core"));
+        assert!(!narrow_text.contains("skills · tools"));
         let tiny = render_app(&mut app, 12, 5);
-        assert!(buffer_text(&tiny).contains("Open Max"));
+        assert!(buffer_text(&tiny).contains("OPEN MAX"));
         fs::remove_dir_all(dir).unwrap();
     }
 

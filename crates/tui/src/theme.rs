@@ -1,6 +1,5 @@
-//! Theme tokens for the TUI. One accent identity; everything else stays
-//! neutral. `/theme dark|light|mono|catppuccin` switches at runtime;
-//! `NO_COLOR` forces mono.
+//! Theme tokens for the TUI. The default is monochrome; color themes remain
+//! explicit runtime choices through `/theme`. `NO_COLOR` locks monochrome.
 
 use ratatui::style::Color;
 use std::sync::RwLock;
@@ -100,27 +99,27 @@ impl Tokens {
             border: Color::DarkGray,
             user: Color::White,
             select: Color::DarkGray,
-            surface: Color::Reset,
-            user_bg: Color::Reset,
-            composer_bg: Color::Reset,
+            surface: Color::Black,
+            user_bg: Color::Black,
+            composer_bg: Color::Black,
         }
     }
 }
 
 fn store() -> &'static RwLock<Tokens> {
     static STORE: RwLock<Tokens> = RwLock::new(Tokens {
-        accent: Color::Rgb(0x63, 0xe0, 0xbd),
+        accent: Color::White,
         dim: Color::DarkGray,
-        code: Color::Rgb(0xd7, 0xba, 0x7d),
-        ok: Color::Green,
-        err: Color::Red,
-        warn: Color::Yellow,
+        code: Color::White,
+        ok: Color::White,
+        err: Color::White,
+        warn: Color::White,
         border: Color::DarkGray,
-        user: Color::Rgb(0x63, 0xe0, 0xbd),
-        select: Color::Rgb(0x3a, 0x5a, 0x52),
-        surface: Color::Rgb(0x20, 0x25, 0x29),
-        user_bg: Color::Rgb(0x24, 0x2d, 0x2c),
-        composer_bg: Color::Rgb(0x1d, 0x22, 0x25),
+        user: Color::White,
+        select: Color::DarkGray,
+        surface: Color::Black,
+        user_bg: Color::Black,
+        composer_bg: Color::Black,
     });
     &STORE
 }
@@ -132,12 +131,7 @@ pub fn set_tokens(t: Tokens) {
 }
 
 pub fn init() {
-    let level = detect_color_level();
-    let tokens = match level {
-        ColorLevel::Mono => Tokens::mono(),
-        _ => Tokens::dark(),
-    };
-    set_tokens(tokens);
+    set_tokens(Tokens::mono());
 }
 
 pub fn detect_color_level() -> ColorLevel {
@@ -174,7 +168,7 @@ fn t() -> Tokens {
     store()
         .read()
         .map(|g| *g)
-        .unwrap_or_else(|_| Tokens::dark())
+        .unwrap_or_else(|_| Tokens::mono())
 }
 
 // Call-site names match the old consts so a simple rename keeps working.
@@ -225,4 +219,41 @@ pub fn USER_BG() -> Color {
 #[allow(non_snake_case)]
 pub fn COMPOSER_BG() -> Color {
     t().composer_bg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_achromatic(color: Color) -> bool {
+        match color {
+            Color::Black | Color::White | Color::Gray | Color::DarkGray | Color::Reset => true,
+            Color::Rgb(r, g, b) => r == g && g == b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn monochrome_tokens_contain_no_hue() {
+        let tokens = Tokens::mono();
+        let colors = [
+            tokens.accent,
+            tokens.dim,
+            tokens.code,
+            tokens.ok,
+            tokens.err,
+            tokens.warn,
+            tokens.border,
+            tokens.user,
+            tokens.select,
+            tokens.surface,
+            tokens.user_bg,
+            tokens.composer_bg,
+        ];
+
+        assert!(colors.into_iter().all(is_achromatic));
+        assert_eq!(tokens.surface, Color::Black);
+        assert_eq!(tokens.user_bg, Color::Black);
+        assert_eq!(tokens.composer_bg, Color::Black);
+    }
 }
