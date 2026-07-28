@@ -141,14 +141,21 @@ fn conversation_layout(
     // keeps its requested height before the status or idle wordmark get rows.
     let input_h = desired_input_h.min(area.height);
     let mut remaining = area.height.saturating_sub(input_h);
+    // A keyboard-modal surface must never be invisible. Reserve its first row
+    // before passive status chrome, then let the normal layout fill it out.
+    let popup_min_h = u16::from(desired_popup_h > 0 && remaining > 0);
+    remaining = remaining.saturating_sub(popup_min_h);
     let status_h = u16::from(remaining > 0);
     remaining = remaining.saturating_sub(status_h);
     let header_h = u16::from(show_header && remaining > 0);
     remaining = remaining.saturating_sub(header_h);
     // Active completion and search surfaces own keyboard input, so they must
     // stay visible before passive queued-message previews receive rows.
-    let popup_h = desired_popup_h.min(remaining);
-    remaining = remaining.saturating_sub(popup_h);
+    let popup_extra_h = desired_popup_h
+        .saturating_sub(popup_min_h)
+        .min(remaining);
+    let popup_h = popup_min_h + popup_extra_h;
+    remaining = remaining.saturating_sub(popup_extra_h);
     let queue_h = desired_queue_h.min(remaining);
     let chat_h = remaining.saturating_sub(queue_h);
 
@@ -784,8 +791,10 @@ impl App {
             return Ok(());
         }
         if ctrl && key.code == KeyCode::Char('r') && self.mode == Mode::Chat {
-            self.scroll_search = None;
-            self.open_history_search();
+            if self.pending_approval.is_none() && self.completion.is_none() {
+                self.scroll_search = None;
+                self.open_history_search();
+            }
             return Ok(());
         }
         if ctrl && key.code == KeyCode::Char('f') && self.mode == Mode::Chat {
@@ -881,7 +890,12 @@ impl App {
                     }
                     return Ok(());
                 }
-                KeyCode::Tab | KeyCode::Enter => {
+                KeyCode::Tab | KeyCode::Enter
+                    if key.code == KeyCode::Tab
+                        || !key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
                     let has_item = self
                         .completion
                         .as_ref()
@@ -1013,7 +1027,13 @@ impl App {
                 self.completion = None;
                 self.handle_submit(text).await?;
             }
-            ComposerAction::None => self.sync_completion(),
+            ComposerAction::None => {
+                self.sync_completion();
+                // Composer edits and completion refilters only touch the
+                // bottom chrome plane. Avoid rebuilding wrapped transcript
+                // history on every printable key.
+                self.dirty.mark_chrome();
+            }
         }
         Ok(())
     }
@@ -2259,8 +2279,12 @@ impl App {
                     diff.as_ref(),
                     Some(duration),
                 );
-                self.transcript.push_tool(compact, output.clone());
-                self.last_tool_output = Some(output);
+                let expanded = diff
+                    .as_ref()
+                    .map(|change| change.diff.clone())
+                    .unwrap_or_else(|| output.clone());
+                self.transcript.push_tool(compact, expanded.clone());
+                self.last_tool_output = Some(expanded);
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
                 self.dirty.mark_chat();
@@ -2708,7 +2732,7 @@ impl App {
     /// of `chat_buf` is reused and the tail is re-stitched.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let layout_started = Instant::now();
-        let content_w = area.width.saturating_sub(1);
+        let mut content_w = area.width;
         if content_w == 0 || area.height == 0 {
             self.chat_draw_area = Rect::default();
             self.chat_line_map.clear();
@@ -2719,10 +2743,19 @@ impl App {
         let chat_dirty = self.dirty.chat;
 
         self.transcript.set_width(content_w);
-        let tail_len = self.rebuild_tail(content_w);
+        let mut tail_len = self.rebuild_tail(content_w);
 
         let hist_len = self.transcript.len();
-        let total = hist_len + tail_len;
+        let mut total = hist_len + tail_len;
+        let visible = area.height as usize;
+        // Reclaim the scrollbar column while the transcript fits. Once
+        // overflow begins, rewrap with a dedicated one-cell track.
+        if total > visible && area.width > 1 {
+            content_w = area.width - 1;
+            self.transcript.set_width(content_w);
+            tail_len = self.rebuild_tail(content_w);
+            total = self.transcript.len() + tail_len;
+        }
         if total == 0 && self.pending_approval.is_none() {
             self.chat_buf.clear();
             self.chat_line_map.clear();
@@ -2742,7 +2775,6 @@ impl App {
             }
             return;
         }
-        let visible = area.height as usize;
         self.transcript.clamp_offset(total.saturating_sub(visible));
         let offset = self.transcript.offset();
 
@@ -2775,7 +2807,7 @@ impl App {
             if has_sticky {
                 if let Some(mut s) = self.transcript.sticky_user_line(start) {
                     s.spans
-                        .insert(0, Span::styled("┊ ", Style::default().fg(theme::DIM())));
+                        .insert(0, Span::styled("❯ ", Style::default().fg(theme::DIM())));
                     self.chat_buf.push(s);
                     self.chat_line_map.push(None);
                 }
@@ -2828,30 +2860,23 @@ impl App {
         );
         self.perf_selection_ms = selection_started.elapsed().as_secs_f64() * 1000.0;
 
-        // Thin scrollbar: thumb position from bottom-based offset.
+        // One positional marker communicates scroll state without recreating
+        // a tall barcode rail when history barely exceeds the viewport.
         if total > visible && area.width > 0 {
             let track_h = area.height as usize;
-            let thumb_h = ((visible * track_h) / total).max(1);
             let max_off = total - visible;
             let from_top = max_off.saturating_sub(offset);
-            let thumb_y = if max_off == 0 {
+            let marker_y = if max_off == 0 {
                 0
             } else {
-                (from_top * track_h.saturating_sub(thumb_h)) / max_off
+                (from_top * track_h.saturating_sub(1)) / max_off
             };
-            for row_i in 0..track_h {
-                let on = row_i >= thumb_y && row_i < thumb_y + thumb_h;
-                if let Some(cell) = frame.buffer_mut().cell_mut((
-                    area.x + area.width.saturating_sub(1),
-                    area.y + row_i as u16,
-                )) {
-                    cell.set_symbol(if on { "▐" } else { " " });
-                    cell.set_style(if on {
-                        Style::default().fg(theme::DIM())
-                    } else {
-                        Style::default()
-                    });
-                }
+            if let Some(cell) = frame.buffer_mut().cell_mut((
+                area.x + area.width.saturating_sub(1),
+                area.y + marker_y as u16,
+            )) {
+                cell.set_symbol("▐");
+                cell.set_style(Style::default().fg(theme::DIM()));
             }
         }
     }
@@ -2930,14 +2955,7 @@ impl App {
                 self.tail_buf.extend(
                     self.stream_wrapped[previous_stream_stable..]
                         .iter()
-                        .cloned()
-                        .map(|mut line| {
-                            line.spans.insert(
-                                0,
-                                Span::styled("│ ", Style::default().fg(theme::BORDER())),
-                            );
-                            line
-                        }),
+                        .cloned(),
                 );
             } else {
                 self.tail_buf.clear();
@@ -2948,13 +2966,7 @@ impl App {
                     );
                     line
                 }));
-                self.tail_buf.extend(self.stream_wrapped.iter().cloned().map(|mut line| {
-                    line.spans.insert(
-                        0,
-                        Span::styled("│ ", Style::default().fg(theme::BORDER())),
-                    );
-                    line
-                }));
+                self.tail_buf.extend(self.stream_wrapped.iter().cloned());
             }
             self.tail_stable_len = self.thinking_wrapped.len() + self.stream_stable_len;
             self.tail_content_len = self.tail_buf.len();
@@ -3032,10 +3044,10 @@ impl App {
                     .min(width.saturating_div(2).max(8));
                 format!("{} ", clip(short_model, model_width))
             };
-            let right_len = right.chars().count().min(width);
+            let right_len = crate::ui::text::width(&right).min(width);
             let left_max = width.saturating_sub(right_len + 1);
             let left = clip(&left, left_max);
-            let padding = width.saturating_sub(left.chars().count() + right_len);
+            let padding = width.saturating_sub(crate::ui::text::width(&left) + right_len);
             self.status_line = Line::from(vec![
                 Span::styled(left, Style::default().fg(theme::DIM())),
                 Span::raw(" ".repeat(padding)),
@@ -3057,7 +3069,7 @@ impl App {
         } else if self.scroll_search.is_some() {
             "↑↓ match · enter jump · esc close"
         } else if self.completion.is_some() {
-            "↑↓ select · tab accept · esc close"
+            "↑↓ select · enter/tab accept · esc close"
         } else if self.focus == Focus::Scrollback {
             "j/k block · enter fold · y copy"
         } else if self.running {
@@ -3259,15 +3271,7 @@ fn kv(k: &str, v: &str) -> Line<'static> {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if max == 0 {
-        String::new()
-    } else if s.chars().count() <= max {
-        s.to_string()
-    } else if max == 1 {
-        "…".into()
-    } else {
-        format!("{}…", s.chars().take(max - 1).collect::<String>())
-    }
+    crate::ui::text::clip(s, max)
 }
 
 /// Replay shows a short tool-output preview, not the full persisted payload.
@@ -3431,7 +3435,7 @@ mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, help_line, kv, paint_text_selection, rect_contains,
-        save_model_selection, App, Dirty, Focus, MIN_DRAW_INTERVAL,
+        save_model_selection, App, Dirty, Focus, TermEvent, MIN_DRAW_INTERVAL,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
@@ -3446,17 +3450,24 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     use crate::theme;
     use crate::ui::transcript::Transcript;
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn app_fixture() -> (App, std::path::PathBuf) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openmax-app-render-{nonce}"));
+        let sequence = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-app-render-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         let (hf_tx, _hf_rx) = mpsc::unbounded_channel();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
@@ -3546,6 +3557,16 @@ mod tests {
     }
 
     #[test]
+    fn active_overlay_stays_visible_before_status_on_four_rows() {
+        let layout = conversation_layout(Rect::new(0, 0, 64, 4), false, 3, 0, 6);
+
+        assert_eq!(layout.popup.height, 1);
+        assert_eq!(layout.status.height, 0);
+        assert_eq!(layout.popup.bottom(), layout.input.y);
+        assert_eq!(layout.input.bottom(), 4);
+    }
+
+    #[test]
     fn chrome_invalidation_rebuilds_header_cache_at_the_same_width() {
         let (mut app, dir) = app_fixture();
         let _ = render_app(&mut app, 80, 24);
@@ -3598,6 +3619,25 @@ mod tests {
         assert!(!d.chat);
         assert!(!d.tail);
         assert!(d.chrome);
+    }
+
+    #[tokio::test]
+    async fn printable_key_invalidates_chrome_without_rebuilding_transcript() {
+        let (mut app, dir) = app_fixture();
+        app.dirty.clear();
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+        assert_eq!(app.composer.text(), "x");
+        assert!(!app.dirty.chat);
+        assert!(!app.dirty.tail);
+        assert!(app.dirty.chrome);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3797,6 +3837,49 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn modified_enter_inserts_newline_instead_of_accepting_completion() {
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let (mut app, dir) = app_fixture();
+            app.composer.load("/status");
+            app.sync_completion();
+            assert!(app.completion.is_some());
+
+            app.on_key(KeyEvent::new(KeyCode::Enter, modifiers))
+                .await
+                .unwrap();
+
+            assert_eq!(app.composer.text(), "/status\n");
+            assert!(app.completion.is_none());
+            assert_eq!(app.transcript.block_count(), 0);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_remains_modal_when_history_search_is_requested() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("previous prompt");
+        let _ = app.composer.take();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-history".into(),
+            name: "bash".into(),
+            summary: "run tests".into(),
+            detail: "cargo test".into(),
+        });
+
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ))
+        .await
+        .unwrap();
+
+        assert!(app.pending_approval.is_some());
+        assert!(app.history_search.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn idle_layout_is_restrained_and_has_bordered_composer() {
         let (mut app, dir) = app_fixture();
@@ -3804,6 +3887,7 @@ mod tests {
         let buffer = render_app(&mut app, 96, 18);
         let text = buffer_text(&buffer);
         assert!(rows(&buffer)[0].starts_with("OPEN MAX"));
+        assert!(rows(&buffer)[1].starts_with("READY"));
         assert!(text.contains("READY"));
         assert!(text.contains("Describe a task"));
         assert!(text.contains("╭"));
@@ -3912,7 +3996,8 @@ mod tests {
         let running = render_app(&mut app, 96, 20);
         let running_text = buffer_text(&running);
         assert!(running_text.contains("❯ please test this"));
-        assert!(running_text.contains("│ I will inspect it."));
+        assert!(running_text.contains("I will inspect it."));
+        assert!(!running_text.contains("│ I will inspect it."));
         assert!(running_text.contains("Shell cargo test"));
         let rendered_rows = rows(&running);
         let user_y = rendered_rows
@@ -3929,8 +4014,57 @@ mod tests {
         let complete = render_app(&mut app, 96, 22);
         let complete_text = buffer_text(&complete);
         assert!(complete_text.contains("✓ Shell"));
-        assert!(complete_text.contains("test three ok"));
-        assert!(complete_text.contains("1 more line"));
+        assert!(!complete_text.contains("test one ok"));
+        assert_eq!(
+            app.last_tool_output.as_deref(),
+            Some("test one ok\ntest two ok\ntest three ok\ntest four ok")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn assistant_code_has_one_structural_edge_without_prose_rails() {
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: "Plain response.\n```rust\nfn main() {}\n```\nDone.".into(),
+        });
+        let text = buffer_text(&render_app(&mut app, 64, 12));
+
+        assert!(text.contains("Plain response."));
+        assert!(text.contains("│ fn main() {}"));
+        assert!(!text.contains("│ Plain response."));
+        assert!(!text.contains("│ │"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_overflowing_transcript_reclaims_scrollbar_column() {
+        let (mut app, dir) = app_fixture();
+        let full_width = "1234567890123456789012345678901234";
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: full_width.into(),
+        });
+        let rendered = rows(&render_app(&mut app, 34, 8));
+
+        assert!(rendered.iter().any(|row| row == full_width));
+        assert!(rendered.iter().all(|row| !row.ends_with('▐')));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overflowing_transcript_uses_one_position_marker_not_a_rail() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..8 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index}"))]);
+        }
+        let rendered = rows(&render_app(&mut app, 40, 10));
+        let marker_count = rendered
+            .iter()
+            .map(|row| row.matches('▐').count())
+            .sum::<usize>();
+
+        assert_eq!(marker_count, 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4038,6 +4172,23 @@ mod tests {
         assert!(!narrow_text.contains("skills · tools"));
         let tiny = render_app(&mut app, 12, 5);
         assert!(buffer_text(&tiny).contains("OPEN MAX"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_remains_visible_through_tiny_resize_round_trip() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("/");
+        app.sync_completion();
+
+        let wide_before = buffer_text(&render_app(&mut app, 96, 18));
+        let tiny = buffer_text(&render_app(&mut app, 64, 4));
+        let wide_after = buffer_text(&render_app(&mut app, 96, 18));
+
+        assert!(wide_before.contains("/help"));
+        assert!(tiny.contains("/help"));
+        assert!(wide_after.contains("/help"));
+        assert!(app.completion.is_some());
         fs::remove_dir_all(dir).unwrap();
     }
 

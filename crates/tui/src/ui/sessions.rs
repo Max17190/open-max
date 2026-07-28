@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SessionsState, now: u64) {
         };
         lines.push(Line::from(vec![
             marker,
-            Span::styled(format!("{:<52}", clip(&item.title, 50)), title_style),
+            Span::styled(super::text::pad_right(&clip(&item.title, 50), 52), title_style),
             Span::styled(age(item.updated_at, now), Style::default().fg(theme::DIM())),
         ]));
     }
@@ -91,11 +91,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SessionsState, now: u64) {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
+    super::text::clip(s, max)
 }
 
 #[cfg(test)]

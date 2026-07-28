@@ -9,7 +9,8 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
 
@@ -140,8 +141,8 @@ impl Block {
         self.selectable = lines_to_plain(self.source_lines());
         self.selectable_chars = self.selectable.chars().count();
         let gutter = match self.kind {
-            BlockKind::User | BlockKind::Assistant | BlockKind::Tool => 2,
-            BlockKind::Thinking | BlockKind::System => 0,
+            BlockKind::User => 2,
+            BlockKind::Assistant | BlockKind::Tool | BlockKind::Thinking | BlockKind::System => 0,
         };
         let content_width = width.saturating_sub(gutter).max(8);
         let (wrapped, maps) = wrap_lines_mapped(self.source_lines(), content_width);
@@ -154,19 +155,6 @@ impl Block {
                 map.x_offset = x_offset;
                 map
             }));
-        }
-        if self.folded && self.compact.is_some() {
-            self.cache.push(surface_line(
-                Line::from(Span::styled(
-                    "  ⋯ enter expand · y copy",
-                    Style::default()
-                        .fg(theme::DIM())
-                        .add_modifier(Modifier::ITALIC),
-                )),
-                width,
-                theme::SURFACE(),
-            ));
-            self.cache_maps.push(None);
         }
         self.cache.push(Line::default());
         self.cache_maps.push(None);
@@ -929,38 +917,99 @@ fn wrap_lines_mapped(
             logical_start += 1;
             continue;
         }
-        let mut start = 0;
-        while start < chars.len() {
-            let mut used = 0usize;
-            let mut end = start;
-            let mut last_space: Option<usize> = None;
-            while end < chars.len() {
-                let w = chars[end].0.width().unwrap_or(0);
-                if used + w > width {
-                    break;
+        if chars.iter().all(|(ch, _)| ch.is_ascii()) {
+            // Coding-agent transcripts are overwhelmingly ASCII. Preserve the
+            // original scalar loop here so Unicode safety has no tax on the
+            // common resize and streaming paths.
+            let mut start = 0usize;
+            while start < chars.len() {
+                let mut used = 0usize;
+                let mut end = start;
+                let mut last_space: Option<usize> = None;
+                while end < chars.len() {
+                    let width_here = chars[end].0.width().unwrap_or(0);
+                    if used + width_here > width {
+                        break;
+                    }
+                    if chars[end].0 == ' ' {
+                        last_space = Some(end);
+                    }
+                    used += width_here;
+                    end += 1;
                 }
-                if chars[end].0 == ' ' {
-                    last_space = Some(end);
-                }
-                used += w;
-                end += 1;
+                let cut = if end == chars.len() {
+                    end
+                } else {
+                    match last_space {
+                        Some(space) if space > start => space + 1,
+                        _ => end.max(start + 1),
+                    }
+                };
+                out.push(rebuild(&chars[start..cut]));
+                maps.push(Some(CachedLineMap {
+                    start: logical_start + start,
+                    end: logical_start + cut,
+                    x_offset: 0,
+                    text: chars[start..cut].iter().map(|(ch, _)| ch).collect(),
+                }));
+                start = cut;
             }
-            let cut = if end == chars.len() {
-                end
-            } else {
-                match last_space {
-                    Some(s) if s > start => s + 1,
-                    _ => end.max(start + 1),
+        } else {
+            let plain: String = chars.iter().map(|(ch, _)| ch).collect();
+            let mut graphemes = Vec::new();
+            let mut char_start = 0usize;
+            for grapheme in plain.graphemes(true) {
+                let char_end = char_start + grapheme.chars().count();
+                graphemes.push((
+                    char_start,
+                    grapheme.width(),
+                    grapheme.chars().all(char::is_whitespace),
+                ));
+                char_start = char_end;
+            }
+
+            let mut start = 0usize;
+            while start < graphemes.len() {
+                let mut used = 0usize;
+                let mut end = start;
+                let mut last_space: Option<usize> = None;
+                while end < graphemes.len() {
+                    let (_, width_here, is_space) = graphemes[end];
+                    if used + width_here > width {
+                        break;
+                    }
+                    if is_space {
+                        last_space = Some(end);
+                    }
+                    used += width_here;
+                    end += 1;
                 }
-            };
-            out.push(rebuild(&chars[start..cut]));
-            maps.push(Some(CachedLineMap {
-                start: logical_start + start,
-                end: logical_start + cut,
-                x_offset: 0,
-                text: chars[start..cut].iter().map(|(ch, _)| ch).collect(),
-            }));
-            start = cut;
+                let cut = if end == graphemes.len() {
+                    end
+                } else {
+                    match last_space {
+                        Some(space) if space > start => space + 1,
+                        _ => end.max(start + 1),
+                    }
+                };
+                let from_char = graphemes[start].0;
+                let to_char = if cut == graphemes.len() {
+                    chars.len()
+                } else {
+                    graphemes[cut].0
+                };
+                out.push(rebuild(&chars[from_char..to_char]));
+                maps.push(Some(CachedLineMap {
+                    start: logical_start + from_char,
+                    end: logical_start + to_char,
+                    x_offset: 0,
+                    text: chars[from_char..to_char]
+                        .iter()
+                        .map(|(ch, _)| ch)
+                        .collect(),
+                }));
+                start = cut;
+            }
         }
         logical_start += chars.len() + 1;
     }
@@ -988,21 +1037,8 @@ fn decorate_line(
             );
             (surface_line(line, width, theme::USER_BG()), 2)
         }
-        BlockKind::Assistant => {
-            line.spans
-                .insert(0, Span::styled("│ ", Style::default().fg(theme::BORDER())));
-            (line, 2)
-        }
-        BlockKind::Tool => {
-            line.spans.insert(
-                0,
-                Span::styled(
-                    "│ ",
-                    Style::default().fg(theme::ACCENT()).bg(theme::SURFACE()),
-                ),
-            );
-            (surface_line(line, width, theme::SURFACE()), 2)
-        }
+        BlockKind::Assistant => (line, 0),
+        BlockKind::Tool => (surface_line(line, width, theme::SURFACE()), 0),
         BlockKind::Thinking | BlockKind::System => (line, 0),
     }
 }
@@ -1041,21 +1077,25 @@ fn selection_contains_block(selection: TextSelection, block: usize) -> bool {
 
 fn display_column_to_char_offset(text: &str, column: usize) -> usize {
     let mut used = 0usize;
-    for (index, ch) in text.chars().enumerate() {
-        let width = ch.width().unwrap_or(0);
+    let mut chars = 0usize;
+    for grapheme in text.graphemes(true) {
+        let width = grapheme.width();
         if used + width > column {
-            return index;
+            return chars;
         }
         used += width;
+        chars += grapheme.chars().count();
     }
-    text.chars().count()
+    chars
 }
 
 fn char_offset_to_display_column(text: &str, offset: usize) -> usize {
-    text.chars()
-        .take(offset)
-        .map(|ch| ch.width().unwrap_or(0))
-        .sum()
+    let byte = text
+        .char_indices()
+        .nth(offset)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len());
+    text[..byte].width()
 }
 
 fn slice_chars(text: &str, start: usize, end: usize) -> String {
@@ -1128,6 +1168,15 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_never_splits_emoji_or_combining_graphemes() {
+        let wrapped = wrap_lines(&[Line::from("1234567👩‍💻x")], 9);
+        assert_eq!(text(&wrapped), vec!["1234567👩‍💻", "x"]);
+
+        let wrapped = wrap_lines(&[Line::from("1234567e\u{301}x")], 8);
+        assert_eq!(text(&wrapped), vec!["1234567e\u{301}", "x"]);
+    }
+
+    #[test]
     fn empty_line_survives() {
         let wrapped = wrap_lines(&[Line::default()], 10);
         assert_eq!(wrapped.len(), 1);
@@ -1150,6 +1199,40 @@ mod tests {
         let wide = t.len();
         t.set_width(10);
         assert!(t.len() >= wide);
+    }
+
+    // Release-only diagnostic for the synchronous resize path. It is ignored
+    // in normal CI because elapsed-time assertions are machine-dependent.
+    // Run with:
+    //   cargo test -p open-max-tui --release -- --ignored --nocapture measure_transcript_resize
+    #[test]
+    #[ignore]
+    fn measure_transcript_resize_cost() {
+        use std::time::Instant;
+
+        let mut transcript = Transcript::new();
+        transcript.set_width(100);
+        for turn in 0..2_500 {
+            transcript.push_user(vec![Line::from(format!(
+                "request {turn}: inspect the rendering path and preserve exact terminal behavior"
+            ))]);
+            transcript.push_assistant(vec![
+                Line::from("The implementation keeps completed history in stable block caches."),
+                Line::from("Resize changes wrapping width while preserving the styled source spans."),
+                Line::from("Normal streaming and typing should never rebuild this finished prefix."),
+            ]);
+        }
+        let source_lines = 10_000usize;
+
+        for width in [72, 120, 88, 100] {
+            let started = Instant::now();
+            transcript.set_width(width);
+            std::hint::black_box(transcript.len());
+            eprintln!(
+                "MEASURE transcript_resize source_lines={source_lines} width={width} elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     #[test]
@@ -1398,14 +1481,15 @@ mod tests {
     }
 
     #[test]
-    fn user_and_assistant_blocks_have_distinct_gutters_and_surfaces() {
+    fn user_prompt_and_assistant_prose_have_distinct_structure() {
         let mut t = Transcript::new();
         t.set_width(24);
         t.push_user(vec![Line::from("hello")]);
         t.push_assistant(vec![Line::from("world")]);
         let rendered = text(t.lines());
         assert!(rendered[0].starts_with("❯ hello"));
-        assert!(rendered[2].starts_with("│ world"));
+        assert!(rendered[2].starts_with("world"));
+        assert!(!rendered[2].starts_with('│'));
         assert_eq!(t.lines()[0].style.bg, Some(theme::USER_BG()));
         assert_ne!(t.lines()[2].style.bg, Some(theme::USER_BG()));
     }
@@ -1429,7 +1513,7 @@ mod tests {
         t.push_user(vec![Line::from("alpha beta")]);
         t.push_assistant(vec![Line::from("gamma delta")]);
         assert!(t.begin_text_selection_at(0, 8));
-        assert!(t.update_text_selection_at(2, 7));
+        assert!(t.update_text_selection_at(2, 5));
         t.finish_text_selection();
         assert_eq!(t.selected_text().as_deref(), Some("beta\n\ngamma"));
         t.set_width(10);
