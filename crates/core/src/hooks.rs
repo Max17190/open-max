@@ -77,6 +77,10 @@ pub struct Hooks {
     session_start: Vec<HookSpec>,
     compaction: Vec<HookSpec>,
     turn_end: Vec<HookSpec>,
+    /// Hook files that exist but do not parse, as "path: reason". A file that
+    /// fails to parse might have been a gate, so tool execution fails closed
+    /// until it is fixed or removed (same policy as permissions).
+    invalid: Vec<String>,
 }
 
 use std::sync::{Mutex, OnceLock};
@@ -129,12 +133,22 @@ fn hooks_fingerprint(project_root: &Path) -> u64 {
 }
 
 fn discover_uncached(project_root: &Path) -> Hooks {
+    discover_in_dirs(&hook_dirs(project_root))
+}
+
+/// First stem wins: project dirs are listed before global, and that
+/// precedence covers parse errors too. A malformed file that is shadowed by
+/// an earlier valid one was never going to run, so it must not fail closed;
+/// a malformed file that holds its stem blocks instead of silently falling
+/// back to the definition it shadows.
+fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
     let mut by_stem: std::collections::BTreeMap<String, HookSpec> = std::collections::BTreeMap::new();
-    for dir in hook_dirs(project_root) {
+    let mut invalid_by_stem: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for dir in dirs {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -145,16 +159,24 @@ fn discover_uncached(project_root: &Path) -> Hooks {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            if stem.is_empty() {
+            if stem.is_empty()
+                || by_stem.contains_key(&stem)
+                || invalid_by_stem.contains_key(&stem)
+            {
                 continue;
             }
-            if let Ok(spec) = parse_hook_file(&path) {
-                // First wins: project dirs are listed before global.
-                by_stem.entry(stem).or_insert(spec);
+            match parse_hook_file(&path) {
+                Ok(spec) => {
+                    by_stem.insert(stem, spec);
+                }
+                Err(reason) => {
+                    invalid_by_stem.insert(stem, format!("{}: {reason}", path.display()));
+                }
             }
         }
     }
-    let mut hooks = Hooks::default();
+    let invalid: Vec<String> = invalid_by_stem.into_values().collect();
+    let mut hooks = Hooks { invalid, ..Hooks::default() };
     for spec in by_stem.into_values() {
         match spec.event {
             HookEvent::PreToolUse => hooks.pre.push(spec),
@@ -199,6 +221,20 @@ impl Hooks {
             && self.session_start.is_empty()
             && self.compaction.is_empty()
             && self.turn_end.is_empty()
+            && self.invalid.is_empty()
+    }
+
+    /// Non-empty when any hook file failed to parse. Tool execution blocks on
+    /// this: a broken file might have been a `pre_tool_use` gate, and running
+    /// without it would silently drop the policy the user wrote down.
+    fn fail_closed_reason(&self) -> Option<String> {
+        if self.invalid.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "invalid hook file(s), failing closed until fixed or removed (see openmax --check): {}",
+            self.invalid.join("; ")
+        ))
     }
 
     pub fn pre_count(&self) -> usize {
@@ -218,6 +254,9 @@ impl Hooks {
         cwd: &Path,
         cancel: &Arc<CancelToken>,
     ) -> PreToolResult {
+        if let Some(reason) = self.fail_closed_reason() {
+            return PreToolResult::Block { reason };
+        }
         for hook in &self.pre {
             if !hook.matches(tool) {
                 continue;
@@ -370,7 +409,10 @@ enum HookRun {
     Cancelled,
 }
 
+/// Unknown keys are rejected so a misspelled `tool` filter cannot silently
+/// widen a hook to every call.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HookFile {
     event: String,
     command: String,
@@ -548,8 +590,8 @@ mod tests {
         assert_eq!(hooks.pre[0].command, "/bin/bbbb");
     }
 
-    #[test]
-    fn parse_ignores_unknown_event() {
+    #[tokio::test]
+    async fn invalid_hook_file_fails_closed() {
         let tmp = tempfile_dir();
         let hooks_dir = tmp.join(".openmax").join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -562,7 +604,76 @@ command = "true"
 "#,
         );
         let hooks = Hooks::discover(&tmp);
-        assert!(hooks.is_empty());
+        assert!(!hooks.is_empty());
+        assert_eq!(hooks.pre_count(), 0);
+        let cancel = Arc::new(CancelToken::default());
+        let result = hooks
+            .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
+            .await;
+        match result {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("bad.toml"), "{reason}");
+                assert!(reason.contains("failing closed"), "{reason}");
+            }
+            PreToolResult::Allow | PreToolResult::Cancelled => panic!("expected block"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shadowed_invalid_hook_does_not_fail_closed() {
+        let tmp = tempfile_dir();
+        let project = tmp.join("project");
+        let global = tmp.join("global");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        write_hook_toml(&project, "audit.toml", "event = \"post_tool_use\"\ncommand = \"true\"\n");
+        write_hook_toml(&global, "audit.toml", "event = \"not_a_real_event\"\ncommand = \"true\"\n");
+        // The malformed global file is shadowed by the valid project one, so
+        // it was never going to run and must not block.
+        let hooks = discover_in_dirs(&[project.clone(), global.clone()]);
+        assert!(hooks.invalid.is_empty(), "{:?}", hooks.invalid);
+        assert_eq!(hooks.post_count(), 1);
+        let cancel = Arc::new(CancelToken::default());
+        let result = hooks
+            .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
+            .await;
+        assert_eq!(result, PreToolResult::Allow);
+
+        // The reverse still fails closed: a malformed file in the
+        // higher-precedence dir holds its stem instead of silently falling
+        // back to the valid definition it shadows.
+        let hooks = discover_in_dirs(&[global, project]);
+        assert_eq!(hooks.invalid.len(), 1, "{:?}", hooks.invalid);
+        assert_eq!(hooks.post_count(), 0);
+        let result = hooks
+            .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
+            .await;
+        assert!(matches!(result, PreToolResult::Block { .. }));
+    }
+
+    #[tokio::test]
+    async fn unknown_hook_key_is_rejected_and_fails_closed() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // `tools` (plural) is the likely typo for the `tool` filter; accepting
+        // it would silently widen the hook to every call.
+        write_hook_toml(
+            &hooks_dir,
+            "typo.toml",
+            r#"
+event = "pre_tool_use"
+command = "true"
+tools = "bash"
+"#,
+        );
+        let hooks = Hooks::discover(&tmp);
+        assert_eq!(hooks.pre_count(), 0);
+        let cancel = Arc::new(CancelToken::default());
+        let result = hooks
+            .pre_tool_use("sess", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        assert!(matches!(result, PreToolResult::Block { .. }));
     }
 
     #[tokio::test]

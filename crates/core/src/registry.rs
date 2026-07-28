@@ -409,8 +409,10 @@ fn summarize_external(args: &Value) -> String {
         .to_string()
 }
 
-/// The TOML shape of one tool definition file.
+/// The TOML shape of one tool definition file. Unknown keys are rejected so a
+/// misspelled `mutating` cannot silently drop a tool out of the approval gate.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExternalToolFile {
     name: String,
     description: String,
@@ -608,6 +610,20 @@ mod tests {
         let b = Registry::builtin_only();
         assert_eq!(a.tool_schemas_json().to_string(), b.tool_schemas_json().to_string());
         assert_eq!(a.tool_names(), b.tool_names());
+    }
+
+    #[test]
+    fn unknown_tool_file_key_is_rejected() {
+        // `mutatng` is the typo that matters: silently defaulting `mutating`
+        // to false would take the tool out of the approval gate.
+        let text = r#"
+name = "deploy"
+description = "ship it"
+command = "./deploy.sh"
+mutatng = true
+"#;
+        let err = parse_tool_source(Path::new("deploy.toml"), text).unwrap_err();
+        assert!(err.contains("mutatng"), "{err}");
     }
 
     #[test]

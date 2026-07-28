@@ -104,10 +104,12 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn new(data_dir: PathBuf) -> (Arc<Self>, mpsc::UnboundedReceiver<CoreEvent>) {
+    pub fn new(
+        data_dir: PathBuf,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<CoreEvent>), String> {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = std::fs::create_dir_all(&data_dir);
-        let settings = crate::config::load(&data_dir);
+        let settings = crate::config::load(&data_dir)?;
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
@@ -120,7 +122,7 @@ impl Core {
             download: Default::default(),
             events: tx,
         });
-        (core, rx)
+        Ok((core, rx))
     }
 
     pub fn send(&self, event: CoreEvent) {

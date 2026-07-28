@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn compaction_records_append_and_load() {
         let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "c1";
         let rec = CompactionRecord {
             ts: 1,
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn empty_or_corrupt_messages_file_loads_as_none() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "empty";
 
         std::fs::write(messages_path(&core, id), "").unwrap();
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn jsonl_append_only_writes_new_tail() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "test-session";
         let mut persisted = 0usize;
 
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn array_payload_is_not_loaded() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "array-payload";
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn save_over_array_blob_rewrites_jsonl_not_append() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "array-then-save";
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn manifest_round_trips_without_rediscovery() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "with-tools";
 
         let project = dir.join("project");
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn save_failure_does_not_advance_persisted_count() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "fail-save";
         let mut persisted = 0usize;
 
@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn missing_manifest_means_builtins_only() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         assert!(load_manifest(&core, "pre-feature-session").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn multi_message_append_is_all_or_nothing_and_round_trips() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "multi-append";
         let mut persisted = 0usize;
 
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn rewrite_leaves_complete_file_without_tmp() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "atomic-rewrite";
         let mut persisted = 0usize;
 
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn save_manifest_writes_parseable_file_atomically() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "manifest-atomic";
 
         let manifest = crate::registry::Registry::builtin_only().to_manifest();

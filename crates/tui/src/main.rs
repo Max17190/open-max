@@ -201,7 +201,15 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(3);
     }
 
-    let (core, core_rx) = Core::new(data_dir);
+    let (core, core_rx) = match Core::new(data_dir) {
+        Ok(pair) => pair,
+        // Fail closed: a malformed settings file is a configuration error,
+        // not a silent reset to defaults.
+        Err(e) => {
+            eprintln!("openmax: {e}");
+            std::process::exit(2);
+        }
+    };
     {
         let mut s = core.settings.lock().unwrap();
         if let Some(provider) = &cli.provider {
