@@ -145,10 +145,12 @@ fn conversation_layout(
     remaining = remaining.saturating_sub(status_h);
     let header_h = u16::from(show_header && remaining > 0);
     remaining = remaining.saturating_sub(header_h);
-    let queue_h = desired_queue_h.min(remaining);
-    remaining = remaining.saturating_sub(queue_h);
+    // Active completion and search surfaces own keyboard input, so they must
+    // stay visible before passive queued-message previews receive rows.
     let popup_h = desired_popup_h.min(remaining);
-    let chat_h = remaining.saturating_sub(popup_h);
+    remaining = remaining.saturating_sub(popup_h);
+    let queue_h = desired_queue_h.min(remaining);
+    let chat_h = remaining.saturating_sub(queue_h);
 
     let header = Rect {
         x: area.x,
@@ -2653,6 +2655,14 @@ impl App {
             Paragraph::new(lines)
                 .style(Style::default().bg(theme::SURFACE()))
                 .render(draw_area, frame.buffer_mut());
+            if height > 0 {
+                self.approval_hits = approval_choice_hit_regions(Rect {
+                    x: draw_area.x,
+                    y: draw_area.bottom() - 1,
+                    width: draw_area.width,
+                    height: 1,
+                });
+            }
             return;
         }
         let block = Block::default()
@@ -3298,6 +3308,19 @@ fn paint_text_selection(
 const APPROVAL_LABELS: [&str; 3] =
     ["▸ [y] Allow once", "   [a] Allow for run", "   [n] Deny"];
 
+fn approval_choice_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            APPROVAL_LABELS[0],
+            Style::default()
+                .fg(theme::WARN())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM())),
+        Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM())),
+    ])
+}
+
 fn compact_approval_lines(
     name: &str,
     summary: &str,
@@ -3309,14 +3332,8 @@ fn compact_approval_lines(
         return Vec::new();
     }
     let width = width as usize;
-    let actions = "y allow once · a allow for run · n deny";
     if height == 1 {
-        return vec![Line::from(Span::styled(
-            clip(actions, width),
-            Style::default()
-                .fg(theme::WARN())
-                .add_modifier(Modifier::BOLD),
-        ))];
+        return vec![approval_choice_line()];
     }
 
     let mut lines = vec![Line::from(vec![
@@ -3335,12 +3352,7 @@ fn compact_approval_lines(
             Style::default().fg(theme::DIM()),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        clip(actions, width),
-        Style::default()
-            .fg(theme::WARN())
-            .add_modifier(Modifier::BOLD),
-    )));
+    lines.push(approval_choice_line());
     lines
 }
 
@@ -3370,34 +3382,37 @@ fn approval_card_lines(
             clip(body, width),
             Style::default().fg(theme::DIM()),
         )),
-        Line::from(vec![
-            Span::styled(
-                APPROVAL_LABELS[0],
-                Style::default()
-                    .fg(theme::WARN())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM())),
-            Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM())),
-        ]),
+        approval_choice_line(),
     ]
 }
 
 fn approval_hit_regions(inner: Rect) -> [Option<Rect>; 3] {
-    let mut hits = [None; 3];
     if inner.height < 3 {
+        return [None; 3];
+    }
+    approval_choice_hit_regions(Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: 1,
+    })
+}
+
+fn approval_choice_hit_regions(row: Rect) -> [Option<Rect>; 3] {
+    let mut hits = [None; 3];
+    if row.height == 0 {
         return hits;
     }
-    let mut x = inner.x;
+    let mut x = row.x;
     for (index, label) in APPROVAL_LABELS.iter().enumerate() {
         let width = label
             .chars()
             .count()
-            .min(inner.right().saturating_sub(x) as usize);
+            .min(row.right().saturating_sub(x) as usize);
         if width > 0 {
             hits[index] = Some(Rect {
                 x,
-                y: inner.y + 2,
+                y: row.y,
                 width: width as u16,
                 height: 1,
             });
@@ -3518,6 +3533,16 @@ mod tests {
         assert_eq!(three_rows.input.height, 3);
         assert_eq!(three_rows.status.height, 0);
         assert_eq!(three_rows.header.height, 0);
+    }
+
+    #[test]
+    fn active_overlay_has_priority_over_passive_queue_rows() {
+        let layout = conversation_layout(Rect::new(0, 0, 64, 8), false, 3, 3, 6);
+
+        assert_eq!(layout.popup.height, 4);
+        assert_eq!(layout.queue.height, 0);
+        assert_eq!(layout.popup.bottom(), layout.status.y);
+        assert_eq!(layout.input.bottom(), 8);
     }
 
     #[test]
@@ -3942,7 +3967,34 @@ mod tests {
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Shell"));
         assert!(text.contains("cargo test"));
-        assert!(text.contains("y allow once · a allow for run · n deny"));
+        assert!(text.contains("[y] Allow once"));
+        assert!(text.contains("[a] Allow for run"));
+        assert!(text.contains("[n] Deny"));
+    }
+
+    #[test]
+    fn compact_approval_keeps_mouse_targets_aligned_with_choices() {
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-compact".into(),
+            name: "bash".into(),
+            summary: "run tests".into(),
+            detail: "cargo test".into(),
+        });
+        let buffer = render_app(&mut app, 64, 4);
+        let rendered = rows(&buffer);
+        let choices_y = rendered
+            .iter()
+            .position(|row| row.contains("[y] Allow once"))
+            .unwrap() as u16;
+
+        assert!(app.approval_hits.iter().all(Option::is_some));
+        assert!(app
+            .approval_hits
+            .iter()
+            .flatten()
+            .all(|region| region.y == choices_y));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
