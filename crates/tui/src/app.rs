@@ -791,8 +791,10 @@ impl App {
             return Ok(());
         }
         if ctrl && key.code == KeyCode::Char('r') && self.mode == Mode::Chat {
-            self.scroll_search = None;
-            self.open_history_search();
+            if self.pending_approval.is_none() && self.completion.is_none() {
+                self.scroll_search = None;
+                self.open_history_search();
+            }
             return Ok(());
         }
         if ctrl && key.code == KeyCode::Char('f') && self.mode == Mode::Chat {
@@ -888,7 +890,12 @@ impl App {
                     }
                     return Ok(());
                 }
-                KeyCode::Tab | KeyCode::Enter => {
+                KeyCode::Tab | KeyCode::Enter
+                    if key.code == KeyCode::Tab
+                        || !key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
                     let has_item = self
                         .completion
                         .as_ref()
@@ -3063,7 +3070,7 @@ impl App {
         } else if self.scroll_search.is_some() {
             "↑↓ match · enter jump · esc close"
         } else if self.completion.is_some() {
-            "↑↓ select · tab accept · esc close"
+            "↑↓ select · enter/tab accept · esc close"
         } else if self.focus == Focus::Scrollback {
             "j/k block · enter fold · y copy"
         } else if self.running {
@@ -3810,6 +3817,49 @@ mod tests {
 
         assert!(app.completion.is_none());
         assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn modified_enter_inserts_newline_instead_of_accepting_completion() {
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let (mut app, dir) = app_fixture();
+            app.composer.load("/status");
+            app.sync_completion();
+            assert!(app.completion.is_some());
+
+            app.on_key(KeyEvent::new(KeyCode::Enter, modifiers))
+                .await
+                .unwrap();
+
+            assert_eq!(app.composer.text(), "/status\n");
+            assert!(app.completion.is_none());
+            assert_eq!(app.transcript.block_count(), 0);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_remains_modal_when_history_search_is_requested() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("previous prompt");
+        let _ = app.composer.take();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-history".into(),
+            name: "bash".into(),
+            summary: "run tests".into(),
+            detail: "cargo test".into(),
+        });
+
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ))
+        .await
+        .unwrap();
+
+        assert!(app.pending_approval.is_some());
+        assert!(app.history_search.is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
