@@ -1126,6 +1126,40 @@ mod tests {
         assert!(t.len() >= wide);
     }
 
+    // Release-only diagnostic for the synchronous resize path. It is ignored
+    // in normal CI because elapsed-time assertions are machine-dependent.
+    // Run with:
+    //   cargo test -p open-max-tui --release -- --ignored --nocapture measure_transcript_resize
+    #[test]
+    #[ignore]
+    fn measure_transcript_resize_cost() {
+        use std::time::Instant;
+
+        let mut transcript = Transcript::new();
+        transcript.set_width(100);
+        for turn in 0..2_500 {
+            transcript.push_user(vec![Line::from(format!(
+                "request {turn}: inspect the rendering path and preserve exact terminal behavior"
+            ))]);
+            transcript.push_assistant(vec![
+                Line::from("The implementation keeps completed history in stable block caches."),
+                Line::from("Resize changes wrapping width while preserving the styled source spans."),
+                Line::from("Normal streaming and typing should never rebuild this finished prefix."),
+            ]);
+        }
+        let source_lines = 10_000usize;
+
+        for width in [72, 120, 88, 100] {
+            let started = Instant::now();
+            transcript.set_width(width);
+            std::hint::black_box(transcript.len());
+            eprintln!(
+                "MEASURE transcript_resize source_lines={source_lines} width={width} elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
     #[test]
     fn scrolled_view_stays_anchored_when_new_blocks_arrive() {
         let mut t = Transcript::new();

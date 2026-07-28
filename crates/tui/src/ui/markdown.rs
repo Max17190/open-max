@@ -261,8 +261,11 @@ impl StreamingMarkdown {
         self.width = width;
 
         // Commit any lines that ended since the last update (append-only).
-        if let Some(last_nl) = text.rfind('\n') {
-            let commit_end = last_nl + 1;
+        // Search only the uncommitted suffix. Completed lines can no longer
+        // change, so make the scan bound independent of accumulated history.
+        let uncommitted = &text[self.committed_bytes..];
+        if let Some(last_nl) = uncommitted.rfind('\n') {
+            let commit_end = self.committed_bytes + last_nl + 1;
             if commit_end > self.committed_bytes {
                 let hl = highlighter();
                 let newly = &text[self.committed_bytes..commit_end];

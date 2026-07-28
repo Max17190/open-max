@@ -1027,7 +1027,13 @@ impl App {
                 self.completion = None;
                 self.handle_submit(text).await?;
             }
-            ComposerAction::None => self.sync_completion(),
+            ComposerAction::None => {
+                self.sync_completion();
+                // Composer edits and completion refilters only touch the
+                // bottom chrome plane. Avoid rebuilding wrapped transcript
+                // history on every printable key.
+                self.dirty.mark_chrome();
+            }
         }
         Ok(())
     }
@@ -3444,7 +3450,7 @@ mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, help_line, kv, paint_text_selection, rect_contains,
-        save_model_selection, App, Dirty, Focus, MIN_DRAW_INTERVAL,
+        save_model_selection, App, Dirty, Focus, TermEvent, MIN_DRAW_INTERVAL,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
@@ -3621,6 +3627,25 @@ mod tests {
         assert!(!d.chat);
         assert!(!d.tail);
         assert!(d.chrome);
+    }
+
+    #[tokio::test]
+    async fn printable_key_invalidates_chrome_without_rebuilding_transcript() {
+        let (mut app, dir) = app_fixture();
+        app.dirty.clear();
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+        assert_eq!(app.composer.text(), "x");
+        assert!(!app.dirty.chat);
+        assert!(!app.dirty.tail);
+        assert!(app.dirty.chrome);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
