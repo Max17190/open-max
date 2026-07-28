@@ -32,7 +32,7 @@ use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{
     filter_matching_indices, wrap_lines, Term, Transcript,
 };
-use crate::ui::{context, extensions, markdown, model_picker, models};
+use crate::ui::{context, extensions, markdown, model_picker, models, ready};
 
 /// Where keyboard focus lives in chat mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -268,8 +268,13 @@ pub async fn run(
     // Paint pacing: at most one frame per MIN_DRAW_INTERVAL. A redraw that
     // arrives too early is deferred to `draw_deadline` and coalesced with
     // everything else that lands before it (grok-build's cadence model).
-    let mut last_draw = Instant::now() - MIN_DRAW_INTERVAL;
+    // An idle app has no armed tick and may receive no terminal event after
+    // entering the alternate screen. Paint once before waiting so first launch
+    // can never sit on a blank frame until the user presses a key.
+    let mut last_draw = Instant::now();
     let mut draw_deadline: Option<Instant> = None;
+    draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL)?;
+    app.dirty.clear();
 
     loop {
         tokio::select! {
@@ -2647,6 +2652,23 @@ impl App {
 
         let hist_len = self.transcript.len();
         let total = hist_len + tail_len;
+        if total == 0 && self.pending_approval.is_none() {
+            self.chat_buf.clear();
+            self.chat_line_map.clear();
+            self.hist_prefix_len = 0;
+            self.hist_reuse_key = None;
+            self.chat_draw_area = Rect::default();
+            self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
+            self.perf_selection_ms = 0.0;
+            ready::render(
+                Rect {
+                    width: content_w,
+                    ..area
+                },
+                frame.buffer_mut(),
+            );
+            return;
+        }
         let visible = area.height as usize;
         self.transcript.clamp_offset(total.saturating_sub(visible));
         let offset = self.transcript.offset();
@@ -3605,10 +3627,29 @@ mod tests {
         let buffer = render_app(&mut app, 96, 18);
         let text = buffer_text(&buffer);
         assert!(text.contains("◆ Open Max  sample-project"));
+        assert!(text.contains("◆ READY"));
+        assert!(text.contains("A small core, shaped by your workflow."));
+        assert!(text.contains("skills · tools · hooks · prompts"));
         assert!(text.contains("Describe a task"));
         assert!(text.contains("╭"));
         assert!(text.contains("/ commands · @ files · drag to select"));
         assert!(!text.contains("no telemetry"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ready_state_disappears_when_conversation_or_live_activity_starts() {
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("inspect this project");
+        let conversation = buffer_text(&render_app(&mut app, 80, 16));
+        assert!(!conversation.contains("A small core, shaped by your workflow."));
+
+        app.reset_for_new_session();
+        app.running = true;
+        app.turn_started = Some(std::time::Instant::now());
+        let running = buffer_text(&render_app(&mut app, 80, 16));
+        assert!(!running.contains("A small core, shaped by your workflow."));
+        assert!(running.contains("esc to cancel"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3705,6 +3746,8 @@ mod tests {
         let narrow = render_app(&mut app, 34, 8);
         let narrow_text = buffer_text(&narrow);
         assert!(narrow_text.contains("Open Max"));
+        assert!(narrow_text.contains("small core · your workflow"));
+        assert!(narrow_text.contains("skills · tools · hooks"));
         assert!(narrow_text.contains("Describe a task"));
         let tiny = render_app(&mut app, 12, 5);
         assert!(buffer_text(&tiny).contains("Open Max"));
