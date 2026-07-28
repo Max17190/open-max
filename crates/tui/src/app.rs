@@ -2209,10 +2209,12 @@ impl App {
             AgentEvent::MessageDone { text } => {
                 if !text.trim().is_empty() {
                     self.last_assistant_response = Some(text.clone());
-                    self.transcript.push_assistant(markdown::render(
-                        &text,
-                        markdown::highlighter(),
-                    ));
+                    let rendered = if self.stream_text == text {
+                        self.stream_md.finish(&text)
+                    } else {
+                        markdown::render(&text, markdown::highlighter())
+                    };
+                    self.transcript.push_assistant(rendered);
                     self.refilter_scroll_search_live();
                 }
                 self.stream_text.clear();
@@ -4065,6 +4067,24 @@ mod tests {
             .sum::<usize>();
 
         assert_eq!(marker_count, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn message_done_falls_back_to_the_provider_text_when_the_stream_differs() {
+        let (mut app, dir) = app_fixture();
+        app.stream_text = "stale streamed draft".into();
+        app.rebuild_tail(40);
+
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: "canonical provider response".into(),
+        });
+
+        assert_eq!(
+            app.transcript.last_assistant_text().as_deref(),
+            Some("canonical provider response")
+        );
+        assert!(app.stream_text.is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
