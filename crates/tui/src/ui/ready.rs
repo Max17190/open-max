@@ -6,16 +6,11 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::theme;
-
-const FULL_MIN_WIDTH: u16 = 52;
-const FULL_MIN_HEIGHT: u16 = 7;
-const COMPACT_MIN_WIDTH: u16 = 28;
-const COMPACT_MIN_HEIGHT: u16 = 3;
 
 pub fn render(area: Rect, buf: &mut Buffer) {
     let lines = lines(area.width, area.height);
@@ -38,39 +33,14 @@ pub fn render(area: Rect, buf: &mut Buffer) {
 }
 
 fn lines(width: u16, height: u16) -> Vec<Line<'static>> {
-    if width == 0 || height == 0 {
+    if width < 5 || height == 0 {
         return Vec::new();
     }
 
-    let title = Line::from(Span::styled(
-        "◆ READY",
-        Style::default()
-            .fg(theme::ACCENT())
-            .add_modifier(Modifier::BOLD),
-    ));
-    let dim = Style::default().fg(theme::DIM());
-    if width >= FULL_MIN_WIDTH && height >= FULL_MIN_HEIGHT {
-        vec![
-            title,
-            Line::default(),
-            Line::from(Span::styled("A small core, shaped by your workflow.", dim)),
-            Line::default(),
-            Line::from(Span::styled("skills · tools · hooks · prompts", dim)),
-        ]
-    } else if width >= COMPACT_MIN_WIDTH && height >= COMPACT_MIN_HEIGHT {
-        vec![
-            title,
-            Line::from(Span::styled("small core · your workflow", dim)),
-            Line::from(Span::styled("skills · tools · hooks", dim)),
-        ]
-    } else if width >= 10 {
-        vec![Line::from(Span::styled(
-            "◆ ready",
-            Style::default().fg(theme::DIM()),
-        ))]
-    } else {
-        Vec::new()
-    }
+    vec![Line::from(Span::styled(
+        "READY",
+        Style::default().fg(theme::DIM()),
+    ))]
 }
 
 #[cfg(test)]
@@ -90,35 +60,14 @@ mod tests {
     }
 
     #[test]
-    fn full_state_orients_without_repeating_the_help_screen() {
-        assert_eq!(
-            plain(&lines(80, 12)),
-            [
-                "◆ READY",
-                "",
-                "A small core, shaped by your workflow.",
-                "",
-                "skills · tools · hooks · prompts",
-            ]
-        );
+    fn ready_state_is_one_quiet_signal_at_every_supported_size() {
+        assert_eq!(plain(&lines(80, 12)), ["READY"]);
+        assert_eq!(plain(&lines(20, 2)), ["READY"]);
     }
 
     #[test]
-    fn compact_state_preserves_readiness_and_product_orientation() {
-        assert_eq!(
-            plain(&lines(34, 3)),
-            [
-                "◆ READY",
-                "small core · your workflow",
-                "skills · tools · hooks",
-            ]
-        );
-    }
-
-    #[test]
-    fn tiny_state_never_overflows_its_width() {
-        assert_eq!(plain(&lines(12, 1)), ["◆ ready"]);
-        assert!(lines(8, 1).is_empty());
+    fn tiny_state_never_overflows_its_width_or_height() {
+        assert!(lines(4, 1).is_empty());
         assert!(lines(80, 0).is_empty());
     }
 }

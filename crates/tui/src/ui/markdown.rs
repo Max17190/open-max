@@ -39,19 +39,15 @@ impl Default for Highlighter {
     }
 }
 
-/// Compact base16-eighties-inspired palette for fenced code only.
-/// Avoids embedding syntect's multi-theme `default.themedump` and the plist
-/// crate that a vendored `.tmTheme` would need.
+/// Compact grayscale palette for fenced code.
+/// Avoids embedding syntect's multi-theme `default.themedump` and keeps the
+/// default interface free of hue while retaining syntax hierarchy.
 fn code_theme() -> Theme {
-    let fg = rgb(0xd3, 0xd0, 0xc8);
-    let comment = rgb(0x74, 0x73, 0x69);
-    let red = rgb(0xf2, 0x77, 0x7a);
-    let orange = rgb(0xf9, 0x91, 0x57);
-    let yellow = rgb(0xff, 0xcc, 0x66);
-    let green = rgb(0x99, 0xcc, 0x99);
-    let cyan = rgb(0x66, 0xcc, 0xcc);
-    let blue = rgb(0x66, 0x99, 0xcc);
-    let magenta = rgb(0xcc, 0x99, 0xcc);
+    let fg = gray(0xe0);
+    let comment = gray(0x70);
+    let soft = gray(0xa0);
+    let mid = gray(0xb8);
+    let bright = gray(0xf0);
 
     let mut scopes = Vec::new();
     let mut rule = |selector: &str, color: SynColor| {
@@ -66,30 +62,35 @@ fn code_theme() -> Theme {
     };
 
     rule("comment, punctuation.definition.comment", comment);
-    rule("string, punctuation.definition.string", green);
-    rule("constant.numeric, constant.language, constant.character", orange);
-    rule("keyword, storage, storage.type, storage.modifier", magenta);
-    rule("entity.name.function, support.function, meta.function-call", blue);
-    rule("entity.name.type, entity.name.class, support.type, support.class", yellow);
-    rule("variable, variable.language, variable.parameter", red);
-    rule("keyword.operator", cyan);
-    rule("entity.name.tag", red);
-    rule("entity.other.attribute-name", orange);
+    rule("string, punctuation.definition.string", mid);
+    rule("constant.numeric, constant.language, constant.character", bright);
+    rule("keyword, storage, storage.type, storage.modifier", bright);
+    rule("entity.name.function, support.function, meta.function-call", bright);
+    rule("entity.name.type, entity.name.class, support.type, support.class", mid);
+    rule("variable, variable.language, variable.parameter", soft);
+    rule("keyword.operator", mid);
+    rule("entity.name.tag", bright);
+    rule("entity.other.attribute-name", soft);
 
     Theme {
         name: Some("open-max-code".into()),
         author: None,
         settings: ThemeSettings {
             foreground: Some(fg),
-            background: Some(rgb(0x2d, 0x2d, 0x2d)),
+            background: Some(gray(0x00)),
             ..ThemeSettings::default()
         },
         scopes,
     }
 }
 
-const fn rgb(r: u8, g: u8, b: u8) -> SynColor {
-    SynColor { r, g, b, a: 0xff }
+const fn gray(value: u8) -> SynColor {
+    SynColor {
+        r: value,
+        g: value,
+        b: value,
+        a: 0xff,
+    }
 }
 
 /// Per-line markdown state carried across source lines: fence status and the
@@ -451,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_fence_applies_syntect_colors() {
+    fn rust_fence_uses_a_monochrome_syntect_hierarchy() {
         let hl = Highlighter::default();
         let lines = render(
             "```rust\nfn main() { let x = 1; println!(\"hi\"); }\n```",
@@ -481,10 +482,14 @@ mod tests {
             fg_colors.len() >= 2,
             "expected RGB foregrounds from syntect theme, got {fg_colors:?}"
         );
+        assert!(
+            fg_colors.iter().all(|(r, g, b)| r == g && g == b),
+            "expected achromatic foregrounds, got {fg_colors:?}"
+        );
         let distinct: std::collections::HashSet<_> = fg_colors.into_iter().collect();
         assert!(
             distinct.len() >= 2,
-            "expected more than one highlight color for keywords/idents, got {distinct:?}"
+            "expected more than one grayscale value for syntax hierarchy, got {distinct:?}"
         );
     }
 
