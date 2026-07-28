@@ -112,6 +112,14 @@ impl Permissions {
     /// being unrecoverable from inside the session. It grants nothing on its
     /// own: the caller still applies `approval_mode`, so an interactive user
     /// approves the repair and `readonly` still refuses it.
+    ///
+    /// Only the project file is reachable this way, and deliberately so. The
+    /// global file lives outside the project root, where the built-in file
+    /// tools cannot write even under a healthy policy; reaching it needs
+    /// `bash`, and exempting `bash` here would leave no gate at all. A broken
+    /// global policy is a user-authored config error, so it is fixed the same
+    /// way it was written: from the shell, guided by the path in the deny
+    /// reason and by `openmax --check`.
     fn repairs_invalid_policy(&self, tool: &str, args: &Value) -> bool {
         if !matches!(tool, "write_file" | "edit_file") {
             return false;
@@ -122,13 +130,18 @@ impl Permissions {
         let Some(raw) = args["path"].as_str() else {
             return false;
         };
-        let candidate = self.project_root.join(raw);
         // Compare resolved paths so `./x/../permissions.toml` and symlinked
-        // roots cannot dodge or spoof the match.
-        match (candidate.canonicalize(), invalid.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        }
+        // roots can neither dodge nor spoof the match, and require the result
+        // to sit inside the project, so `../` cannot walk out to the global
+        // file that the file tools would refuse to write anyway.
+        let (Ok(candidate), Ok(invalid), Ok(root)) = (
+            self.project_root.join(raw).canonicalize(),
+            invalid.canonicalize(),
+            self.project_root.canonicalize(),
+        ) else {
+            return false;
+        };
+        candidate == invalid && candidate.starts_with(&root)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -313,6 +326,31 @@ mod tests {
             assert!(
                 matches!(perms.evaluate(tool, &args), PermissionDecision::Deny { .. }),
                 "{tool} must still fail closed"
+            );
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The repair exemption stops at the project boundary. A malformed global
+    /// file is only reachable through `bash`, and exempting `bash` while
+    /// failing closed would leave no gate, so it stays a shell-side fix.
+    #[test]
+    fn invalid_global_policy_is_not_repairable_from_the_project() {
+        let tmp = tempfile_dir();
+        let global = tmp.join("home").join(".openmax").join("permissions.toml");
+        write_perms(&global, "[[rule]]\neffect = \"deny\"\ntool = \"bash\"\n");
+        let project = tmp.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let perms = Permissions::from_files(&project, std::slice::from_ref(&global));
+
+        for args in [
+            json!({ "path": ".openmax/permissions.toml" }),
+            json!({ "path": global.to_str().unwrap() }),
+            json!({ "path": "../home/.openmax/permissions.toml" }),
+        ] {
+            assert!(
+                matches!(perms.evaluate("write_file", &args), PermissionDecision::Deny { .. }),
+                "global policy must not be repairable from inside the project: {args}"
             );
         }
         let _ = std::fs::remove_dir_all(tmp);
