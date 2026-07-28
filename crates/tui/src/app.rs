@@ -3450,17 +3450,24 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     use crate::theme;
     use crate::ui::transcript::Transcript;
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn app_fixture() -> (App, std::path::PathBuf) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openmax-app-render-{nonce}"));
+        let sequence = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-app-render-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         let (hf_tx, _hf_rx) = mpsc::unbounded_channel();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
