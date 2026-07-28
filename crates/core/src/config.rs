@@ -4,8 +4,41 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MLX_PORT: u16 = 8989;
 
+/// Gate for mutating tools. Parsed strictly: an unrecognized value is a
+/// configuration error, never a silent fallback, because a typo here would
+/// otherwise weaken the approval gate the user asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Run everything without prompting.
+    Auto,
+    /// Prompt before mutating tools.
+    Ask,
+    /// Block mutating tools entirely.
+    Readonly,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalMode::Auto => "auto",
+            ApprovalMode::Ask => "ask",
+            ApprovalMode::Readonly => "readonly",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "auto" => Some(ApprovalMode::Auto),
+            "ask" => Some(ApprovalMode::Ask),
+            "readonly" => Some(ApprovalMode::Readonly),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Named provider from `providers.json`. When set and found, supplies
     /// base_url, credentials, and headers; flat fields remain the fallback.
@@ -16,8 +49,7 @@ pub struct Settings {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
-    /// "auto" (run everything), "ask" (approve writes/commands), "readonly".
-    pub approval_mode: String,
+    pub approval_mode: ApprovalMode,
     pub context_tokens: usize,
     pub max_tokens: usize,
     pub temperature: f32,
@@ -60,7 +92,7 @@ impl Default for Settings {
             base_url: format!("http://127.0.0.1:{DEFAULT_MLX_PORT}/v1"),
             api_key: None,
             model: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
-            approval_mode: "ask".into(),
+            approval_mode: ApprovalMode::Ask,
             context_tokens: 16384,
             max_tokens: 4096,
             temperature: 0.2,
@@ -80,11 +112,20 @@ fn settings_path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.json")
 }
 
-pub fn load(data_dir: &Path) -> Settings {
-    std::fs::read_to_string(settings_path(data_dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// Load settings. A missing file means defaults; a file that exists but does
+/// not parse is a hard error. Falling back to defaults on malformed input
+/// would silently discard the user's endpoint and approval policy.
+pub fn load(data_dir: &Path) -> Result<Settings, String> {
+    let path = settings_path(data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Settings::default());
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map_err(|e| format!("invalid settings file {}: {e}", path.display()))
 }
 
 pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
@@ -137,9 +178,62 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let s = load(&dir);
+        let s = load(&dir).unwrap();
         assert_eq!(s.max_agent_iterations, 50);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-settings-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn malformed_settings_file_is_an_error_not_defaults() {
+        let dir = temp_dir("malformed");
+        std::fs::write(dir.join("settings.json"), "{\"model\": \"m\",}").unwrap();
+        let err = load(&dir).unwrap_err();
+        assert!(err.contains("invalid settings file"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_approval_mode_is_an_error() {
+        let dir = temp_dir("badmode");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"approval_mode": "read-only"}"#,
+        )
+        .unwrap();
+        assert!(load(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_settings_key_is_an_error() {
+        let dir = temp_dir("badkey");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"approval_mod": "readonly"}"#,
+        )
+        .unwrap();
+        assert!(load(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn approval_mode_round_trips_as_lowercase_string() {
+        let s: Settings = serde_json::from_str(r#"{"approval_mode": "readonly"}"#).unwrap();
+        assert_eq!(s.approval_mode, ApprovalMode::Readonly);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""approval_mode":"readonly""#), "{json}");
     }
 
     #[test]
@@ -157,7 +251,7 @@ mod tests {
         let mut second = first.clone();
         second.model = "vendor/family/two".into();
         save(&dir, &second).unwrap();
-        assert_eq!(load(&dir).model, "vendor/family/two");
+        assert_eq!(load(&dir).unwrap().model, "vendor/family/two");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()

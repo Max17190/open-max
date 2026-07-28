@@ -190,8 +190,8 @@ async fn run_turn_events(
                 summary,
                 detail: _,
             } => {
-                let mode = core.settings.lock().unwrap().approval_mode.clone();
-                let approve = mode == "auto";
+                let mode = core.settings.lock().unwrap().approval_mode;
+                let approve = mode == open_max_core::config::ApprovalMode::Auto;
                 if !approve {
                     let _ = writeln!(
                         stderr,

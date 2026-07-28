@@ -768,7 +768,7 @@ impl App {
                     self.core.respond_approval(&id, false);
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.core.settings.lock().unwrap().approval_mode = "auto".into();
+                    self.core.settings.lock().unwrap().approval_mode = config::ApprovalMode::Auto;
                     self.core.respond_approval(&id, true);
                     self.note("approvals set to auto for this run (change with /approvals)");
                 }
@@ -970,7 +970,7 @@ impl App {
         match choice {
             0 => self.core.respond_approval(&id, true),
             1 => {
-                self.core.settings.lock().unwrap().approval_mode = "auto".into();
+                self.core.settings.lock().unwrap().approval_mode = config::ApprovalMode::Auto;
                 self.core.respond_approval(&id, true);
                 self.note("approvals set to auto for this run (change with /approvals)");
             }
@@ -1763,16 +1763,16 @@ impl App {
                     }
                 }
             }
-            "approvals" => match rest.first() {
-                Some(&m @ ("auto" | "ask" | "readonly")) => {
+            "approvals" => match rest.first().and_then(|m| config::ApprovalMode::parse(m)) {
+                Some(mode) => {
                     {
                         let mut s = self.core.settings.lock().unwrap();
-                        s.approval_mode = m.into();
+                        s.approval_mode = mode;
                         let _ = config::save(&self.core.data_dir, &s);
                     }
-                    self.note(&format!("approvals: {m}"));
+                    self.note(&format!("approvals: {}", mode.as_str()));
                 }
-                _ => self.note("usage: /approvals auto|ask|readonly"),
+                None => self.note("usage: /approvals auto|ask|readonly"),
             },
             "resume" => {
                 let items = sessions::list(&self.core, &self.project.display().to_string());
@@ -1943,7 +1943,7 @@ impl App {
                     kv("endpoint", &endpoint),
                     kv("host", &host),
                     kv("server", &server),
-                    kv("approvals", &s.approval_mode),
+                    kv("approvals", s.approval_mode.as_str()),
                     kv("context", &format!("{ctx} of {} tokens", context_tokens)),
                     kv("cache", &cache),
                     kv("ttft", &ttft),
@@ -2909,7 +2909,7 @@ impl App {
             self.status_width = area.width;
             let (model, approvals) = {
                 let s = self.core.settings.lock().unwrap();
-                (s.model.clone(), s.approval_mode.clone())
+                (s.model.clone(), s.approval_mode.as_str().to_string())
             };
             let width = area.width as usize;
             let left = format!(" {}", self.status_hint());
@@ -3305,7 +3305,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("openmax-app-render-{nonce}"));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let (hf_tx, _hf_rx) = mpsc::unbounded_channel();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
         let app = App::new(core, dir.clone(), "sample-project".into(), hf_tx, files_tx);
@@ -3454,7 +3454,7 @@ mod tests {
         assert_eq!(saved.provider.as_deref(), Some("openrouter"));
         assert_eq!(saved.model, exact);
         assert_eq!(saved.mlx_model, current.mlx_model);
-        let disk = config::load(&dir);
+        let disk = config::load(&dir).unwrap();
         assert_eq!(disk.provider.as_deref(), Some("openrouter"));
         assert_eq!(disk.model, exact);
         fs::remove_dir_all(dir).unwrap();
@@ -3473,7 +3473,7 @@ mod tests {
         let saved = save_model_selection(&dir, &current, None, exact.clone()).unwrap();
         assert_eq!(saved.model, exact);
         assert_eq!(saved.mlx_model, exact);
-        let disk = config::load(&dir);
+        let disk = config::load(&dir).unwrap();
         assert_eq!(disk.model, exact);
         assert_eq!(disk.mlx_model, exact);
         fs::remove_dir_all(dir).unwrap();

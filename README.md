@@ -71,6 +71,8 @@ Edit `~/.openmax/settings.json`:
 
 `base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and is clamped to 1 through 32 at runtime. Mutating, approval-gated, and non-batchable calls remain serial.
 
+A missing settings file means defaults. A settings file that exists but does not parse, uses an unknown key, or sets an unrecognized `approval_mode` is a startup error (fail closed): Open Max exits with the parse reason instead of silently reverting your endpoint and approval policy to defaults.
+
 For several servers, define them in `~/.openmax/providers.json`. `/model` opens a searchable local catalog and selects the provider and model as one pair. Model names are optional, model ids are sent unchanged, and the configured order is preserved within each provider. Opening the picker makes no network requests.
 
 ```json
@@ -172,7 +174,7 @@ type = "string"
 description = "Directory to scan"
 ```
 
-`mutating` is trusted metadata for scheduling and approval behavior. It is not a security boundary and does not restrict what the command can do.
+`mutating` is trusted metadata for scheduling and approval behavior. It is not a security boundary and does not restrict what the command can do. Unknown keys in a tool file are rejected, so a misspelled `mutating` surfaces in `openmax --check` instead of silently taking the tool out of the approval gate.
 
 **Skills.** A directory with `SKILL.md` under `.agents/skills/` or `~/.openmax/skills/`. Only `name` and `description` live in the prompt; the model reads the full file when needed.
 
@@ -197,7 +199,7 @@ Fetch issue $1 with `gh issue view $1`, reproduce it, fix it, and add a test.
 
 Run it as `/fix-issue 42`.
 
-**Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` and `user_prompt_submit` can block (nonzero exit; the blocked prompt never reaches the model); `post_tool_use`, `session_start` (a session's first turn), `compaction` (context was pruned; receives the digest record), and `turn_end` (receives the stop reason, fires even on cancel) observe only. Each hook gets one JSON payload on stdin. Hooks never enter the model prompt and, like external tools and `bash`, run as native host processes with inherited filesystem, environment, credentials, and network access.
+**Hooks.** Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`. `pre_tool_use` and `user_prompt_submit` can block (nonzero exit; the blocked prompt never reaches the model); `post_tool_use`, `session_start` (a session's first turn), `compaction` (context was pruned; receives the digest record), and `turn_end` (receives the stop reason, fires even on cancel) observe only. Each hook gets one JSON payload on stdin. Hooks never enter the model prompt and, like external tools and `bash`, run as native host processes with inherited filesystem, environment, credentials, and network access. Unknown keys in a hook file are rejected, and a hook file that does not parse blocks every tool call until it is fixed or removed (fail closed, like permissions): a broken file might have been a gate, and `openmax --check` prints the reason.
 
 **Permissions.** Optional rules under `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty discovery is free. First match wins. Order: hooks pre → permissions → `approval_mode` → execute → hooks post. If a permissions file exists but is invalid, every tool is denied (fail closed).
 

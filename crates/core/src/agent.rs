@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::client::{ChatClient, StreamDelta};
-use crate::config::Settings;
+use crate::config::{ApprovalMode, Settings};
 use crate::fallback;
 use crate::hooks::{Hooks, PreToolResult};
 use crate::permissions::{PermissionDecision, Permissions};
@@ -1120,20 +1120,20 @@ async fn run_loop(
 
                 // Read live so "[a]lways" during an approval prompt takes effect
                 // for the rest of this turn, not just the next one.
-                let approval_mode = core.settings.lock().unwrap().approval_mode.clone();
+                let approval_mode = core.settings.lock().unwrap().approval_mode;
                 // Allow skips the approval prompt; Ask forces it (even in auto).
                 // Readonly still blocks mutating tools regardless of Allow.
                 let force_allow = matches!(perm, PermissionDecision::Allow);
                 let force_ask = matches!(perm, PermissionDecision::Ask);
                 let mut executed = false;
-                let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == "readonly" {
+                let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
                     (tools::ToolOutcome {
                         ok: false,
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None,
                     }, false)
                 } else if !force_allow
-                    && (force_ask || (registry.is_mutating(name) && approval_mode == "ask"))
+                    && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask))
                 {
                     match request_approval(core, session_id, name, &args, &cancelled).await {
                         ApprovalOutcome::Approved => {
@@ -1844,7 +1844,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "guard-contended";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1889,7 +1889,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "guard-stale";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1938,7 +1938,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "manifest-only";
         let project = dir.join("project");
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
@@ -1967,7 +1967,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "reload-live";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -2018,7 +2018,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, mut rx) = Core::new(dir.clone());
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let id = "auto-refreeze";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -2080,7 +2080,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
 
@@ -2102,7 +2102,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, mut rx) = Core::new(dir.clone());
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let project = dir.join("project");
         let hooks_dir = project.join(".openmax/hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -2177,7 +2177,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, mut rx) = Core::new(dir.clone());
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
         core.settings.lock().unwrap().provider = Some("no-such-provider".into());
         let project = dir.join("project");
         let hooks_dir = project.join(".openmax/hooks");
@@ -2227,7 +2227,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone());
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = "legacy-no-system";
         let mut persisted = 0usize;
         sessions::save_messages(&core, id, &[ChatMessage::user("hello")], &mut persisted, false);
