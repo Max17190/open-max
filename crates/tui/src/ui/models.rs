@@ -131,20 +131,20 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Green under 70% of RAM, yellow under 85%, red above.
+/// Non-color glyph plus hue when available: fit, tight, or over RAM.
 fn fit_dot(bytes: Option<u64>, ram: u64) -> Span<'static> {
     let Some(b) = bytes else {
         return Span::styled("· ", Style::default().fg(theme::DIM()));
     };
     let ratio = b as f64 / ram.max(1) as f64;
-    let color = if ratio <= 0.70 {
-        theme::OK()
+    let (glyph, color) = if ratio <= 0.70 {
+        ("● ", theme::OK())
     } else if ratio <= 0.85 {
-        theme::WARN()
+        ("◐ ", theme::WARN())
     } else {
-        theme::ERR()
+        ("! ", theme::ERR())
     };
-    Span::styled("● ", Style::default().fg(color))
+    Span::styled(glyph, Style::default().fg(color))
 }
 
 fn download_label(state: &ModelsState, repo: &str) -> String {
@@ -229,7 +229,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
             marker,
             fit_dot(item.bytes, state.ram_bytes),
             Span::styled(
-                format!("{:<22}", item.label),
+                super::text::pad_right(&item.label, 22),
                 if i == state.selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
@@ -258,11 +258,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
         ]));
     } else if let Some((msg, is_err)) = &state.footer {
         let style = if *is_err {
-            Style::default().fg(theme::ERR())
+            Style::default()
+                .fg(theme::ERR())
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)
         };
-        lines.push(Line::from(Span::styled(msg.clone(), style)));
+        let label = if *is_err {
+            format!("✗ error: {msg}")
+        } else {
+            msg.clone()
+        };
+        lines.push(Line::from(Span::styled(label, style)));
     } else {
         let oversized = state
             .items
@@ -282,9 +289,39 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelsState) {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
+    super::text::clip(s, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn ram_fit_has_non_color_semantics() {
+        assert_eq!(fit_dot(Some(5), 10).content.as_ref(), "● ");
+        assert_eq!(fit_dot(Some(8), 10).content.as_ref(), "◐ ");
+        assert_eq!(fit_dot(Some(9), 10).content.as_ref(), "! ");
+        assert_eq!(fit_dot(None, 10).content.as_ref(), "· ");
+    }
+
+    #[test]
+    fn error_footer_has_a_textual_prefix() {
+        let mut state = ModelsState::empty();
+        state.footer = Some(("download failed".into(), true));
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &state))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("✗ error: download failed"));
     }
 }

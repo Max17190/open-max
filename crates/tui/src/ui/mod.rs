@@ -5,5 +5,6 @@ pub mod model_picker;
 pub mod models;
 pub mod ready;
 pub mod sessions;
+pub mod text;
 pub mod tool_card;
 pub mod transcript;

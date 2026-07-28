@@ -201,16 +201,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
         let mut line = Line::from(vec![
             Span::styled(format!("{marker} {active} "), base),
             Span::styled(
-                format!(
-                    "{:<name_width$}",
-                    clip(&item.name, name_width.saturating_sub(1))
-                ),
+                super::text::pad_right(&clip(&item.name, name_width.saturating_sub(1)), name_width),
                 base,
             ),
             Span::styled(
-                format!(
-                    "{:<provider_width$}",
-                    clip(provider, provider_width.saturating_sub(1))
+                super::text::pad_right(
+                    &clip(provider, provider_width.saturating_sub(1)),
+                    provider_width,
                 ),
                 base.fg(theme::DIM()),
             ),
@@ -252,14 +249,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if max < 2 {
-        return String::new();
-    }
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max - 1).collect::<String>())
-    }
+    super::text::clip(s, max)
 }
 
 #[cfg(test)]

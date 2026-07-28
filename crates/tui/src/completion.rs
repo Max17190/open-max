@@ -359,12 +359,11 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
         } else {
             Style::default()
         };
-        let mut spans = vec![
-            marker,
-            Span::styled(clip(&item.label, width.saturating_sub(4)), label_style),
-        ];
+        let label = clip(&item.label, width.saturating_sub(4));
+        let label_width = crate::ui::text::width(&label);
+        let mut spans = vec![marker, Span::styled(label, label_style)];
         if !item.detail.is_empty() {
-            let room = width.saturating_sub(item.label.chars().count() + 6);
+            let room = width.saturating_sub(label_width + 6);
             if room > 4 {
                 spans.push(Span::styled(
                     format!("  {}", clip(&item.detail, room)),
@@ -400,11 +399,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max.max(4) {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max.max(4) - 1).collect::<String>())
-    }
+    crate::ui::text::clip(s, max)
 }
 
 #[cfg(test)]

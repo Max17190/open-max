@@ -13,11 +13,7 @@ use crate::theme;
 
 fn clip(s: &str, max: usize) -> String {
     let clean = s.replace(['\n', '\r'], " ");
-    if clean.chars().count() <= max {
-        clean
-    } else {
-        format!("{}…", clean.chars().take(max).collect::<String>())
-    }
+    super::text::clip(&clean, max)
 }
 
 /// Split an OpenAI-compatible base URL into (normalized scheme, authority, path).
@@ -126,7 +122,7 @@ pub fn tools_block(registry: &Registry, frozen: bool) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<14}", clip(&spec.name, 14)),
+                format!("  {}", super::text::pad_right(&spec.name, 14)),
                 Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -187,7 +183,7 @@ pub fn skills_block(skills: &[SkillSpec], project_root: &Path, frozen: bool) -> 
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {:<16}", clip(&skill.name, 16)),
+                    format!("  {}", super::text::pad_right(&skill.name, 16)),
                     Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(

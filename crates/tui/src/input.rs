@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
 
@@ -173,9 +174,11 @@ impl Composer {
             }
             KeyCode::Backspace => {
                 if self.col > 0 {
-                    let byte = char_to_byte(&self.lines[self.row], self.col - 1);
-                    self.lines[self.row].remove(byte);
-                    self.col -= 1;
+                    let start = previous_grapheme_boundary(&self.lines[self.row], self.col);
+                    let from = char_to_byte(&self.lines[self.row], start);
+                    let to = char_to_byte(&self.lines[self.row], self.col);
+                    self.lines[self.row].replace_range(from..to, "");
+                    self.col = start;
                 } else if self.row > 0 {
                     let removed = self.lines.remove(self.row);
                     self.row -= 1;
@@ -186,8 +189,10 @@ impl Composer {
             KeyCode::Delete => {
                 let len = self.lines[self.row].chars().count();
                 if self.col < len {
-                    let byte = char_to_byte(&self.lines[self.row], self.col);
-                    self.lines[self.row].remove(byte);
+                    let end = next_grapheme_boundary(&self.lines[self.row], self.col);
+                    let from = char_to_byte(&self.lines[self.row], self.col);
+                    let to = char_to_byte(&self.lines[self.row], end);
+                    self.lines[self.row].replace_range(from..to, "");
                 } else if self.row + 1 < self.lines.len() {
                     let next = self.lines.remove(self.row + 1);
                     self.lines[self.row].push_str(&next);
@@ -195,7 +200,7 @@ impl Composer {
             }
             KeyCode::Left => {
                 if self.col > 0 {
-                    self.col -= 1;
+                    self.col = previous_grapheme_boundary(&self.lines[self.row], self.col);
                 } else if self.row > 0 {
                     self.row -= 1;
                     self.col = self.lines[self.row].chars().count();
@@ -203,7 +208,7 @@ impl Composer {
             }
             KeyCode::Right => {
                 if self.col < self.lines[self.row].chars().count() {
-                    self.col += 1;
+                    self.col = next_grapheme_boundary(&self.lines[self.row], self.col);
                 } else if self.row + 1 < self.lines.len() {
                     self.row += 1;
                     self.col = 0;
@@ -212,7 +217,7 @@ impl Composer {
             KeyCode::Up => {
                 if self.row > 0 {
                     self.row -= 1;
-                    self.col = self.col.min(self.lines[self.row].chars().count());
+                    self.col = floor_grapheme_boundary(&self.lines[self.row], self.col);
                 } else {
                     self.history_prev();
                 }
@@ -220,7 +225,7 @@ impl Composer {
             KeyCode::Down => {
                 if self.row + 1 < self.lines.len() {
                     self.row += 1;
-                    self.col = self.col.min(self.lines[self.row].chars().count());
+                    self.col = floor_grapheme_boundary(&self.lines[self.row], self.col);
                 } else {
                     self.history_next();
                 }
@@ -234,18 +239,28 @@ impl Composer {
 
     fn delete_word(&mut self) {
         let line = &mut self.lines[self.row];
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = self.col;
-        while i > 0 && chars[i - 1] == ' ' {
+        let graphemes: Vec<&str> = line.graphemes(true).collect();
+        let boundaries = grapheme_boundaries(line);
+        let mut i = boundaries
+            .iter()
+            .position(|boundary| *boundary == self.col)
+            .unwrap_or_else(|| {
+                boundaries
+                    .iter()
+                    .rposition(|boundary| *boundary < self.col)
+                    .unwrap_or(0)
+            });
+        while i > 0 && graphemes[i - 1].chars().all(char::is_whitespace) {
             i -= 1;
         }
-        while i > 0 && chars[i - 1] != ' ' {
+        while i > 0 && !graphemes[i - 1].chars().all(char::is_whitespace) {
             i -= 1;
         }
-        let start = char_to_byte(line, i);
+        let start_col = boundaries[i];
+        let start = char_to_byte(line, start_col);
         let end = char_to_byte(line, self.col);
         line.replace_range(start..end, "");
-        self.col = i;
+        self.col = start_col;
     }
 
     fn history_prev(&mut self) {
@@ -328,11 +343,9 @@ impl Composer {
             }
         }
         let cursor_y = (self.row - first) as u16;
-        let cursor_x = 2 + self.lines[self.row]
-            .chars()
-            .take(self.col)
-            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum::<usize>() as u16;
+        let cursor_byte = char_to_byte(&self.lines[self.row], self.col);
+        let cursor_x =
+            2 + crate::ui::text::width(&self.lines[self.row][..cursor_byte]) as u16;
         (out, cursor_x, cursor_y)
     }
 }
@@ -342,6 +355,38 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(b, _)| b)
         .unwrap_or(s.len())
+}
+
+fn grapheme_boundaries(s: &str) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(s.graphemes(true).count() + 1);
+    boundaries.push(0);
+    let mut chars = 0usize;
+    for grapheme in s.graphemes(true) {
+        chars += grapheme.chars().count();
+        boundaries.push(chars);
+    }
+    boundaries
+}
+
+fn previous_grapheme_boundary(s: &str, col: usize) -> usize {
+    grapheme_boundaries(s)
+        .into_iter()
+        .rfind(|boundary| *boundary < col)
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(s: &str, col: usize) -> usize {
+    grapheme_boundaries(s)
+        .into_iter()
+        .find(|boundary| *boundary > col)
+        .unwrap_or_else(|| s.chars().count())
+}
+
+fn floor_grapheme_boundary(s: &str, col: usize) -> usize {
+    grapheme_boundaries(s)
+        .into_iter()
+        .rfind(|boundary| *boundary <= col)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -372,5 +417,28 @@ mod tests {
         assert_eq!(plain(&lines[0]), "❯ first");
         assert_eq!(plain(&lines[1]), "… second");
         assert_eq!((cursor_x, cursor_y), (8, 1));
+    }
+
+    #[test]
+    fn composer_edits_complete_graphemes() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("e\u{301}👩‍💻");
+
+        composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(composer.col, 2);
+        composer.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(composer.text(), "e\u{301}");
+
+        composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(composer.text(), "");
+        assert_eq!(composer.col, 0);
+    }
+
+    #[test]
+    fn composer_cursor_uses_terminal_cell_width() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("漢e\u{301}👩‍💻");
+        let (_, cursor_x, cursor_y) = composer.render(3);
+        assert_eq!((cursor_x, cursor_y), (7, 0));
     }
 }

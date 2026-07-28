@@ -2860,30 +2860,23 @@ impl App {
         );
         self.perf_selection_ms = selection_started.elapsed().as_secs_f64() * 1000.0;
 
-        // Thin scrollbar: thumb position from bottom-based offset.
+        // One positional marker communicates scroll state without recreating
+        // a tall barcode rail when history barely exceeds the viewport.
         if total > visible && area.width > 0 {
             let track_h = area.height as usize;
-            let thumb_h = ((visible * track_h) / total).max(1);
             let max_off = total - visible;
             let from_top = max_off.saturating_sub(offset);
-            let thumb_y = if max_off == 0 {
+            let marker_y = if max_off == 0 {
                 0
             } else {
-                (from_top * track_h.saturating_sub(thumb_h)) / max_off
+                (from_top * track_h.saturating_sub(1)) / max_off
             };
-            for row_i in 0..track_h {
-                let on = row_i >= thumb_y && row_i < thumb_y + thumb_h;
-                if let Some(cell) = frame.buffer_mut().cell_mut((
-                    area.x + area.width.saturating_sub(1),
-                    area.y + row_i as u16,
-                )) {
-                    cell.set_symbol(if on { "▐" } else { " " });
-                    cell.set_style(if on {
-                        Style::default().fg(theme::DIM())
-                    } else {
-                        Style::default()
-                    });
-                }
+            if let Some(cell) = frame.buffer_mut().cell_mut((
+                area.x + area.width.saturating_sub(1),
+                area.y + marker_y as u16,
+            )) {
+                cell.set_symbol("▐");
+                cell.set_style(Style::default().fg(theme::DIM()));
             }
         }
     }
@@ -3051,10 +3044,10 @@ impl App {
                     .min(width.saturating_div(2).max(8));
                 format!("{} ", clip(short_model, model_width))
             };
-            let right_len = right.chars().count().min(width);
+            let right_len = crate::ui::text::width(&right).min(width);
             let left_max = width.saturating_sub(right_len + 1);
             let left = clip(&left, left_max);
-            let padding = width.saturating_sub(left.chars().count() + right_len);
+            let padding = width.saturating_sub(crate::ui::text::width(&left) + right_len);
             self.status_line = Line::from(vec![
                 Span::styled(left, Style::default().fg(theme::DIM())),
                 Span::raw(" ".repeat(padding)),
@@ -3278,15 +3271,7 @@ fn kv(k: &str, v: &str) -> Line<'static> {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if max == 0 {
-        String::new()
-    } else if s.chars().count() <= max {
-        s.to_string()
-    } else if max == 1 {
-        "…".into()
-    } else {
-        format!("{}…", s.chars().take(max - 1).collect::<String>())
-    }
+    crate::ui::text::clip(s, max)
 }
 
 /// Replay shows a short tool-output preview, not the full persisted payload.
@@ -4056,6 +4041,23 @@ mod tests {
 
         assert!(rendered.iter().any(|row| row == full_width));
         assert!(rendered.iter().all(|row| !row.ends_with('▐')));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overflowing_transcript_uses_one_position_marker_not_a_rail() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..8 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index}"))]);
+        }
+        let rendered = rows(&render_app(&mut app, 40, 10));
+        let marker_count = rendered
+            .iter()
+            .map(|row| row.matches('▐').count())
+            .sum::<usize>();
+
+        assert_eq!(marker_count, 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
