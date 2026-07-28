@@ -141,14 +141,21 @@ fn conversation_layout(
     // keeps its requested height before the status or idle wordmark get rows.
     let input_h = desired_input_h.min(area.height);
     let mut remaining = area.height.saturating_sub(input_h);
+    // A keyboard-modal surface must never be invisible. Reserve its first row
+    // before passive status chrome, then let the normal layout fill it out.
+    let popup_min_h = u16::from(desired_popup_h > 0 && remaining > 0);
+    remaining = remaining.saturating_sub(popup_min_h);
     let status_h = u16::from(remaining > 0);
     remaining = remaining.saturating_sub(status_h);
     let header_h = u16::from(show_header && remaining > 0);
     remaining = remaining.saturating_sub(header_h);
     // Active completion and search surfaces own keyboard input, so they must
     // stay visible before passive queued-message previews receive rows.
-    let popup_h = desired_popup_h.min(remaining);
-    remaining = remaining.saturating_sub(popup_h);
+    let popup_extra_h = desired_popup_h
+        .saturating_sub(popup_min_h)
+        .min(remaining);
+    let popup_h = popup_min_h + popup_extra_h;
+    remaining = remaining.saturating_sub(popup_extra_h);
     let queue_h = desired_queue_h.min(remaining);
     let chat_h = remaining.saturating_sub(queue_h);
 
@@ -3546,6 +3553,16 @@ mod tests {
     }
 
     #[test]
+    fn active_overlay_stays_visible_before_status_on_four_rows() {
+        let layout = conversation_layout(Rect::new(0, 0, 64, 4), false, 3, 0, 6);
+
+        assert_eq!(layout.popup.height, 1);
+        assert_eq!(layout.status.height, 0);
+        assert_eq!(layout.popup.bottom(), layout.input.y);
+        assert_eq!(layout.input.bottom(), 4);
+    }
+
+    #[test]
     fn chrome_invalidation_rebuilds_header_cache_at_the_same_width() {
         let (mut app, dir) = app_fixture();
         let _ = render_app(&mut app, 80, 24);
@@ -3804,6 +3821,7 @@ mod tests {
         let buffer = render_app(&mut app, 96, 18);
         let text = buffer_text(&buffer);
         assert!(rows(&buffer)[0].starts_with("OPEN MAX"));
+        assert!(rows(&buffer)[1].starts_with("READY"));
         assert!(text.contains("READY"));
         assert!(text.contains("Describe a task"));
         assert!(text.contains("╭"));
@@ -4038,6 +4056,23 @@ mod tests {
         assert!(!narrow_text.contains("skills · tools"));
         let tiny = render_app(&mut app, 12, 5);
         assert!(buffer_text(&tiny).contains("OPEN MAX"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_remains_visible_through_tiny_resize_round_trip() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("/");
+        app.sync_completion();
+
+        let wide_before = buffer_text(&render_app(&mut app, 96, 18));
+        let tiny = buffer_text(&render_app(&mut app, 64, 4));
+        let wide_after = buffer_text(&render_app(&mut app, 96, 18));
+
+        assert!(wide_before.contains("/help"));
+        assert!(tiny.contains("/help"));
+        assert!(wide_after.contains("/help"));
+        assert!(app.completion.is_some());
         fs::remove_dir_all(dir).unwrap();
     }
 

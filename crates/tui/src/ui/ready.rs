@@ -5,7 +5,7 @@
 //! or the model context.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -18,18 +18,11 @@ pub fn render(area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let height = lines.len() as u16;
-    // Place the mark in the upper third. It feels anchored to the conversation
-    // plane while leaving a clear visual path down to the composer.
-    let top_pad = area.height.saturating_sub(height) / 3;
     let draw_area = Rect {
-        y: area.y + top_pad,
-        height: height.min(area.height),
+        height: (lines.len() as u16).min(area.height),
         ..area
     };
-    Paragraph::new(lines)
-        .alignment(Alignment::Center)
-        .render(draw_area, buf);
+    Paragraph::new(lines).render(draw_area, buf);
 }
 
 fn lines(width: u16, height: u16) -> Vec<Line<'static>> {
