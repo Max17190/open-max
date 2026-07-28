@@ -140,8 +140,8 @@ impl Block {
         self.selectable = lines_to_plain(self.source_lines());
         self.selectable_chars = self.selectable.chars().count();
         let gutter = match self.kind {
-            BlockKind::User | BlockKind::Assistant | BlockKind::Tool => 2,
-            BlockKind::Thinking | BlockKind::System => 0,
+            BlockKind::User => 2,
+            BlockKind::Assistant | BlockKind::Tool | BlockKind::Thinking | BlockKind::System => 0,
         };
         let content_width = width.saturating_sub(gutter).max(8);
         let (wrapped, maps) = wrap_lines_mapped(self.source_lines(), content_width);
@@ -154,19 +154,6 @@ impl Block {
                 map.x_offset = x_offset;
                 map
             }));
-        }
-        if self.folded && self.compact.is_some() {
-            self.cache.push(surface_line(
-                Line::from(Span::styled(
-                    "  ⋯ enter expand · y copy",
-                    Style::default()
-                        .fg(theme::DIM())
-                        .add_modifier(Modifier::ITALIC),
-                )),
-                width,
-                theme::SURFACE(),
-            ));
-            self.cache_maps.push(None);
         }
         self.cache.push(Line::default());
         self.cache_maps.push(None);
@@ -988,21 +975,8 @@ fn decorate_line(
             );
             (surface_line(line, width, theme::USER_BG()), 2)
         }
-        BlockKind::Assistant => {
-            line.spans
-                .insert(0, Span::styled("│ ", Style::default().fg(theme::BORDER())));
-            (line, 2)
-        }
-        BlockKind::Tool => {
-            line.spans.insert(
-                0,
-                Span::styled(
-                    "│ ",
-                    Style::default().fg(theme::ACCENT()).bg(theme::SURFACE()),
-                ),
-            );
-            (surface_line(line, width, theme::SURFACE()), 2)
-        }
+        BlockKind::Assistant => (line, 0),
+        BlockKind::Tool => (surface_line(line, width, theme::SURFACE()), 0),
         BlockKind::Thinking | BlockKind::System => (line, 0),
     }
 }
@@ -1398,14 +1372,15 @@ mod tests {
     }
 
     #[test]
-    fn user_and_assistant_blocks_have_distinct_gutters_and_surfaces() {
+    fn user_prompt_and_assistant_prose_have_distinct_structure() {
         let mut t = Transcript::new();
         t.set_width(24);
         t.push_user(vec![Line::from("hello")]);
         t.push_assistant(vec![Line::from("world")]);
         let rendered = text(t.lines());
         assert!(rendered[0].starts_with("❯ hello"));
-        assert!(rendered[2].starts_with("│ world"));
+        assert!(rendered[2].starts_with("world"));
+        assert!(!rendered[2].starts_with('│'));
         assert_eq!(t.lines()[0].style.bg, Some(theme::USER_BG()));
         assert_ne!(t.lines()[2].style.bg, Some(theme::USER_BG()));
     }
@@ -1429,7 +1404,7 @@ mod tests {
         t.push_user(vec![Line::from("alpha beta")]);
         t.push_assistant(vec![Line::from("gamma delta")]);
         assert!(t.begin_text_selection_at(0, 8));
-        assert!(t.update_text_selection_at(2, 7));
+        assert!(t.update_text_selection_at(2, 5));
         t.finish_text_selection();
         assert_eq!(t.selected_text().as_deref(), Some("beta\n\ngamma"));
         t.set_width(10);

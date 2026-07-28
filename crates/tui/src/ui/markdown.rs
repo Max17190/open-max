@@ -362,7 +362,10 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(close) = find(&chars, i + 1, "`") {
                 flush(&mut buf, &mut spans);
                 let code: String = chars[i + 1..close].iter().collect();
-                spans.push(Span::styled(code, base.fg(theme::CODE())));
+                spans.push(Span::styled(
+                    code,
+                    base.fg(theme::CODE()).add_modifier(Modifier::REVERSED),
+                ));
                 i = close + 1;
                 continue;
             }
@@ -442,6 +445,14 @@ mod tests {
         let hl = Highlighter::default();
         let lines = render("mix of `code`, **bold**, *italic*, and plain", &hl);
         assert_eq!(plain(&lines)[0], "mix of code, bold, italic, and plain");
+        assert!(lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "code")
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]

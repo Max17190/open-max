@@ -1,5 +1,5 @@
-//! Compact one-line tool cards with a short output preview, plus colored
-//! unified diffs. Full output is available on demand (Ctrl+O).
+//! Compact one-line tool results. Full output and diffs are available on
+//! demand (Ctrl+O); failures retain one diagnostic line in the transcript.
 
 use std::time::Duration;
 
@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 
 use crate::theme;
 
-/// Lines for a finished tool call: status glyph, name, summary, then a short
-/// dim preview of the output (more of it when the call failed).
+/// Lines for a finished tool call: status glyph, name, summary, and an
+/// optional first failure line.
 pub fn tool_block(
     name: &str,
     summary: &str,
@@ -66,46 +66,12 @@ pub fn tool_block_timed(
         ]);
     }
     let mut lines = vec![Line::from(header)];
-
-    match diff {
-        Some(d) => {
-            let diff = diff_lines(&d.diff);
-            let total = diff.len();
-            lines.extend(diff.into_iter().take(8));
-            if total > 8 {
-                lines.push(Line::from(Span::styled(
-                    format!("  … {} more diff lines", total - 8),
-                    Style::default()
-                        .fg(theme::DIM())
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
-        }
-        None => {
-            let preview_lines = if ok { 3 } else { 5 };
-            for (index, line) in output.lines().take(preview_lines).enumerate() {
-                let style = if !ok && index == 0 {
-                    Style::default().fg(theme::ERR())
-                } else {
-                    Style::default().fg(theme::DIM())
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(clip(line, 110), style),
-                ]));
-            }
-            let total = output.lines().count();
-            if total > preview_lines {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  … {} more lines (ctrl+o to expand)",
-                        total - preview_lines
-                    ),
-                    Style::default()
-                        .fg(theme::DIM())
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
+    if !ok {
+        if let Some(reason) = output.lines().find(|line| !line.trim().is_empty()) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(clip(reason, 110), Style::default().fg(theme::ERR())),
+            ]));
         }
     }
     lines
@@ -162,26 +128,6 @@ pub struct DiffText {
 }
 
 /// Unified diff with the conventional coloring, gutter-indented.
-pub fn diff_lines(diff: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for raw in diff.lines() {
-        let style = if raw.starts_with("+++") || raw.starts_with("---") || raw.starts_with("@@") {
-            Style::default().fg(theme::DIM())
-        } else if raw.starts_with('+') {
-            Style::default().fg(theme::OK())
-        } else if raw.starts_with('-') {
-            Style::default().fg(theme::ERR())
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(raw.to_string(), style),
-        ]));
-    }
-    lines
-}
-
 fn clip(s: &str, max: usize) -> String {
     let clean = s.replace(['\n', '\r'], " ");
     if clean.chars().count() <= max {
@@ -210,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_tool_has_human_label_duration_and_three_line_preview() {
+    fn successful_tool_is_one_line_with_human_label_and_duration() {
         let lines = tool_block_timed(
             "read_file",
             "src/main.rs",
@@ -222,17 +168,18 @@ mod tests {
         let text = plain(&lines);
         assert!(text.contains("✓ Read"));
         assert!(text.contains("42ms"));
-        assert!(text.contains("one"));
-        assert!(text.contains("three"));
-        assert!(text.contains("1 more line"));
+        assert!(!text.contains("one"));
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
-    fn failure_emphasizes_reason_and_caps_preview_at_five_lines() {
+    fn failure_keeps_only_the_first_diagnostic_line() {
         let output = "permission denied\n2\n3\n4\n5\n6\n7";
         let lines = tool_block_timed("bash", "cargo test", false, output, None, None);
         assert_eq!(lines[1].spans[1].style.fg, Some(theme::ERR()));
-        assert!(plain(&lines).contains("2 more lines"));
+        assert!(plain(&lines).contains("permission denied"));
+        assert!(!plain(&lines).contains("\n  2"));
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]
@@ -252,7 +199,6 @@ mod tests {
         assert!(text.contains("src/app.rs"));
         assert!(text.contains("+20"));
         assert!(text.contains("−3"));
-        assert!(text.contains("12 more diff lines"));
-        assert!(lines.len() <= 10);
+        assert_eq!(lines.len(), 1);
     }
 }

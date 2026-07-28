@@ -2266,8 +2266,12 @@ impl App {
                     diff.as_ref(),
                     Some(duration),
                 );
-                self.transcript.push_tool(compact, output.clone());
-                self.last_tool_output = Some(output);
+                let expanded = diff
+                    .as_ref()
+                    .map(|change| change.diff.clone())
+                    .unwrap_or_else(|| output.clone());
+                self.transcript.push_tool(compact, expanded.clone());
+                self.last_tool_output = Some(expanded);
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
                 self.dirty.mark_chat();
@@ -2715,7 +2719,7 @@ impl App {
     /// of `chat_buf` is reused and the tail is re-stitched.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let layout_started = Instant::now();
-        let content_w = area.width.saturating_sub(1);
+        let mut content_w = area.width;
         if content_w == 0 || area.height == 0 {
             self.chat_draw_area = Rect::default();
             self.chat_line_map.clear();
@@ -2726,10 +2730,19 @@ impl App {
         let chat_dirty = self.dirty.chat;
 
         self.transcript.set_width(content_w);
-        let tail_len = self.rebuild_tail(content_w);
+        let mut tail_len = self.rebuild_tail(content_w);
 
         let hist_len = self.transcript.len();
-        let total = hist_len + tail_len;
+        let mut total = hist_len + tail_len;
+        let visible = area.height as usize;
+        // Reclaim the scrollbar column while the transcript fits. Once
+        // overflow begins, rewrap with a dedicated one-cell track.
+        if total > visible && area.width > 1 {
+            content_w = area.width - 1;
+            self.transcript.set_width(content_w);
+            tail_len = self.rebuild_tail(content_w);
+            total = self.transcript.len() + tail_len;
+        }
         if total == 0 && self.pending_approval.is_none() {
             self.chat_buf.clear();
             self.chat_line_map.clear();
@@ -2749,7 +2762,6 @@ impl App {
             }
             return;
         }
-        let visible = area.height as usize;
         self.transcript.clamp_offset(total.saturating_sub(visible));
         let offset = self.transcript.offset();
 
@@ -2782,7 +2794,7 @@ impl App {
             if has_sticky {
                 if let Some(mut s) = self.transcript.sticky_user_line(start) {
                     s.spans
-                        .insert(0, Span::styled("┊ ", Style::default().fg(theme::DIM())));
+                        .insert(0, Span::styled("❯ ", Style::default().fg(theme::DIM())));
                     self.chat_buf.push(s);
                     self.chat_line_map.push(None);
                 }
@@ -2937,14 +2949,7 @@ impl App {
                 self.tail_buf.extend(
                     self.stream_wrapped[previous_stream_stable..]
                         .iter()
-                        .cloned()
-                        .map(|mut line| {
-                            line.spans.insert(
-                                0,
-                                Span::styled("│ ", Style::default().fg(theme::BORDER())),
-                            );
-                            line
-                        }),
+                        .cloned(),
                 );
             } else {
                 self.tail_buf.clear();
@@ -2955,13 +2960,7 @@ impl App {
                     );
                     line
                 }));
-                self.tail_buf.extend(self.stream_wrapped.iter().cloned().map(|mut line| {
-                    line.spans.insert(
-                        0,
-                        Span::styled("│ ", Style::default().fg(theme::BORDER())),
-                    );
-                    line
-                }));
+                self.tail_buf.extend(self.stream_wrapped.iter().cloned());
             }
             self.tail_stable_len = self.thinking_wrapped.len() + self.stream_stable_len;
             self.tail_content_len = self.tail_buf.len();
@@ -3930,7 +3929,8 @@ mod tests {
         let running = render_app(&mut app, 96, 20);
         let running_text = buffer_text(&running);
         assert!(running_text.contains("❯ please test this"));
-        assert!(running_text.contains("│ I will inspect it."));
+        assert!(running_text.contains("I will inspect it."));
+        assert!(!running_text.contains("│ I will inspect it."));
         assert!(running_text.contains("Shell cargo test"));
         let rendered_rows = rows(&running);
         let user_y = rendered_rows
@@ -3947,8 +3947,40 @@ mod tests {
         let complete = render_app(&mut app, 96, 22);
         let complete_text = buffer_text(&complete);
         assert!(complete_text.contains("✓ Shell"));
-        assert!(complete_text.contains("test three ok"));
-        assert!(complete_text.contains("1 more line"));
+        assert!(!complete_text.contains("test one ok"));
+        assert_eq!(
+            app.last_tool_output.as_deref(),
+            Some("test one ok\ntest two ok\ntest three ok\ntest four ok")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn assistant_code_has_one_structural_edge_without_prose_rails() {
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: "Plain response.\n```rust\nfn main() {}\n```\nDone.".into(),
+        });
+        let text = buffer_text(&render_app(&mut app, 64, 12));
+
+        assert!(text.contains("Plain response."));
+        assert!(text.contains("│ fn main() {}"));
+        assert!(!text.contains("│ Plain response."));
+        assert!(!text.contains("│ │"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_overflowing_transcript_reclaims_scrollbar_column() {
+        let (mut app, dir) = app_fixture();
+        let full_width = "1234567890123456789012345678901234";
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: full_width.into(),
+        });
+        let rendered = rows(&render_app(&mut app, 34, 8));
+
+        assert!(rendered.iter().any(|row| row == full_width));
+        assert!(rendered.iter().all(|row| !row.ends_with('▐')));
         fs::remove_dir_all(dir).unwrap();
     }
 
