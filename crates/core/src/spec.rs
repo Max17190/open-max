@@ -1,0 +1,437 @@
+//! `openmax --spec <surface>`: the complete authoring contract for each
+//! extension surface, printed by the binary that enforces it.
+//!
+//! The self-extension guide in the frozen prompt is an index: it names the
+//! surfaces and their file paths in ~360 tokens. This module is the body the
+//! agent reads on demand (via bash), the same progressive disclosure skills
+//! use, so knowing the exact grammar of a hook payload or a permissions rule
+//! costs zero prompt tokens until the moment it is needed. Every fenced
+//! example below is written to disk and run through the real extension
+//! parsers in tests, so the printed contract cannot drift from the loop.
+
+/// Every surface `render` accepts, in the order the help text lists them.
+pub const SURFACES: [&str; 7] = [
+    "tools",
+    "skills",
+    "prompts",
+    "hooks",
+    "permissions",
+    "providers",
+    "stdio",
+];
+
+/// The authoring contract for one surface, or None for an unknown name.
+pub fn render(surface: &str) -> Option<&'static str> {
+    match surface {
+        "tools" => Some(TOOLS),
+        "skills" => Some(SKILLS),
+        "prompts" => Some(PROMPTS),
+        "hooks" => Some(HOOKS),
+        "permissions" => Some(PERMISSIONS),
+        "providers" => Some(PROVIDERS),
+        "stdio" => Some(STDIO),
+        _ => None,
+    }
+}
+
+const TOOLS: &str = r#"# External tools
+
+One TOML file per tool: `.openmax/tools/<name>.toml` (project) or
+`~/.openmax/tools/<name>.toml` (global). Project wins on name collision.
+A tool named like a built-in (list_dir, read_file, write_file, edit_file,
+glob, grep, bash) is ignored.
+
+Fields:
+- `name` (required): 1-64 chars of [a-zA-Z0-9_-]. Becomes the tool's schema name.
+- `description` (required): one line; newlines are collapsed; capped at 200
+  chars in the schema. Rides in every request, so keep it short and put long
+  usage docs in a README the description points at.
+- `params` (optional): a JSON-schema object, written as TOML tables. Omitted
+  means "no parameters".
+- `command` (required): executable path or name, spawned in the project root.
+- `args` (optional): fixed argv strings appended to `command`.
+- `timeout_secs` (optional): default 60, clamped to 1..300.
+- `mutating` (optional, default false): routes calls through approval gating.
+  Trusted metadata for scheduling and UX, not a sandbox.
+
+Runtime contract: the harness spawns `command args...` in the project root,
+writes the call's JSON arguments to stdin, and returns stdout as the result.
+Nonzero exit makes the result an error carrying `exit code N` plus output.
+Output is capped; overflow spills to `~/.openmax/cmd-logs`. The process is a
+native host process: it inherits the environment, credentials, and network
+access of Open Max.
+
+Example (`.openmax/tools/todo_scan.toml`):
+
+```toml
+name = "todo_scan"
+description = "List TODO/FIXME comments with file and line"
+command = "./scripts/todo-scan.sh"
+timeout_secs = 30
+mutating = false
+
+[params]
+type = "object"
+[params.properties.path]
+type = "string"
+description = "Directory to scan"
+```
+
+Activation: automatic when extension bytes change, checked between
+iterations after a successful mutating call and at turn start; `/reload`
+forces it now. Verify the file parses with `openmax --check`. Test the
+script itself before first use:
+`echo '{"path":"src"}' | ./scripts/todo-scan.sh`.
+"#;
+
+const SKILLS: &str = r#"# Skills
+
+One directory per skill with a `SKILL.md` inside: `.agents/skills/<name>/SKILL.md`
+(project) or `~/.openmax/skills/<name>/SKILL.md` (global). Project wins on
+name collision.
+
+`SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
+keys are read (bare or double-quoted values, one line each):
+- `name:` (required): the skill's index name.
+- `description:` (required in practice): one line saying what the skill does
+  and when to use it; capped at 200 chars. This is the only text that enters
+  the prompt (~15 tokens per skill), so it must carry the "when".
+
+The body after the frontmatter is free-form markdown of any length: it loads
+only when the skill is used. A skill directory may bundle scripts and
+reference files next to SKILL.md; run them with bash.
+
+At most 50 skills are indexed, sorted by name. The prompt shows each as
+`- name: description — path/to/SKILL.md`.
+
+Example (`.agents/skills/release/SKILL.md`):
+
+```markdown
+---
+name: release
+description: How to cut a release of this project
+---
+Full instructions, checklists, and commands, read on demand.
+```
+
+Activation: automatic when extension bytes change, checked between
+iterations after a successful mutating call and at turn start; `/reload`
+forces it now. Verify with `openmax --check`.
+"#;
+
+const PROMPTS: &str = r#"# Prompt templates
+
+One markdown file per template: `.agents/prompts/<name>.md` (project) or
+`~/.openmax/prompts/<name>.md` (global). Project wins. The file stem becomes
+the user's slash command `/<name>` and must be 1-64 chars of [a-zA-Z0-9_-].
+
+Structure: an optional `---` frontmatter block with a one-line `description:`
+(shown in the completion popup, capped at 200 chars), then the body. An empty
+body is invalid.
+
+Substitution when the user runs `/<name> args...`:
+- `$ARGUMENTS` expands to the raw argument string.
+- `$1`..`$9` expand to whitespace-split positionals; missing ones become
+  empty; `$12` stays literal (only single digits exist).
+- `$$` escapes a literal dollar (`$$5` survives as `$5`).
+- A body with no placeholders gets the arguments appended after a blank line.
+
+Templates are message content: re-read on every invocation, never frozen,
+zero prompt tax. They are user-invoked; the model does not call them (read
+the file directly if its content is needed).
+
+Example (`.agents/prompts/fix-issue.md`):
+
+```markdown
+---
+description: Fix a GitHub issue by number
+---
+Fetch issue $1 with `gh issue view $1`, reproduce it, fix it, and add a test.
+```
+
+Activation: next invocation (no freeze involved). Verify with `openmax --check`.
+"#;
+
+const HOOKS: &str = r#"# Hooks
+
+One TOML file per hook: `.openmax/hooks/<name>.toml` (project) or
+`~/.openmax/hooks/<name>.toml` (global). A project file shadows a global file
+with the same stem. Unknown keys are rejected.
+
+Fields:
+- `event` (required): one of `pre_tool_use`, `post_tool_use`,
+  `user_prompt_submit`, `session_start`, `compaction`, `turn_end`.
+- `command` (required): executable, spawned in the project root.
+- `args` (optional): fixed argv strings.
+- `timeout_secs` (optional): default 10, clamped to 1..60.
+- `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
+
+Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
+call or the prompt. The block reason is the hook's stdout (or stderr if stdout
+is empty), capped at 500 chars. A blocked tool call returns to the model as a
+failed tool result carrying the reason; a blocked prompt never reaches the
+model. A gate that times out or fails to start blocks.
+
+Observe events (`post_tool_use`, `session_start`, `compaction`, `turn_end`):
+exit status is ignored. `session_start` fires on a session's first turn;
+`compaction` fires after context was pruned; `turn_end` fires with the stop
+reason, even on cancel. Hooks never inject text into the model context.
+
+Each run receives one JSON payload on stdin:
+- pre_tool_use / post_tool_use: {"event", "session_id", "tool", "args",
+  "cwd", "tool_ok"} where `tool_ok` is null before execution and a boolean after.
+- user_prompt_submit: {"event", "session_id", "cwd", "text"}
+- session_start: {"event", "session_id", "cwd"}
+- compaction: {"event", "session_id", "cwd", "record"} where `record` is the
+  persisted compaction digest.
+- turn_end: {"event", "session_id", "cwd", "stop_reason"}
+
+Fail closed: a hook file that exists but does not parse blocks every tool
+until it is fixed or removed (a broken file might have been a gate), unless a
+valid project file shadows its stem. Hooks are re-discovered every turn; no
+reload is needed.
+
+Example (`.openmax/hooks/deny-rm.toml`):
+
+```toml
+event = "pre_tool_use"
+command = "./scripts/deny-rm.sh"
+tool = "bash"
+timeout_secs = 5
+```
+
+Verify with `openmax --check`. Test the script directly:
+`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | ./scripts/deny-rm.sh`.
+"#;
+
+const PERMISSIONS: &str = r#"# Permission rules
+
+Optional declarative rules: `.openmax/permissions.toml` (project), then
+`~/.openmax/permissions.toml` (global). Project rules are evaluated first and
+the first matching rule wins. Evaluation order per call:
+hooks pre → permissions → approval_mode → execute → hooks post.
+
+Grammar: `[[rules]]` tables only; unknown keys anywhere are rejected.
+- `effect` (required): `"allow"`, `"deny"`, or `"ask"`.
+- `tool` (required): exact tool name.
+- `arg_regex` (optional): unanchored regex; omitted or empty matches every
+  call of that tool.
+
+What the regex matches:
+- `bash` → the command string.
+- `read_file`, `write_file`, `edit_file`, `list_dir` → the path argument.
+- `glob`, `grep` → the pattern argument.
+- any other tool → the full serialized JSON arguments.
+
+Rules never enter the prompt and are re-read every turn; an empty or missing
+file changes nothing. Fail closed: an unreadable or malformed file denies
+every tool. The one exemption: `write_file`/`edit_file` targeting the broken
+project file itself falls through to `approval_mode`, so a typo stays
+repairable from inside the session; a broken global file is fixed from the
+shell, guided by `openmax --check`.
+
+Example (`.openmax/permissions.toml`):
+
+```toml
+[[rules]]
+effect = "deny"
+tool = "bash"
+arg_regex = "rm\\s+-rf"
+
+[[rules]]
+effect = "allow"
+tool = "bash"
+arg_regex = "^cargo (test|check|build)"
+```
+
+Activation: next turn. Verify with `openmax --check` (it reports the exact
+fail-closed reason for a malformed file).
+"#;
+
+const PROVIDERS: &str = r#"# Providers
+
+Named OpenAI-compatible endpoints: `~/.openmax/providers.json` (global only;
+it lives outside the project root, so edit it via bash). A missing file is
+free; the flat `base_url`/`model` settings path keeps working without it.
+
+Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
+- `base_url` (required): root of the endpoint's HTTP API; the harness calls
+  `chat/completions` on it.
+- `api_key` (optional): literal secret. Prefer `api_key_env`.
+- `api_key_env` (optional): env var name, or list of names (first non-empty
+  wins).
+- `headers` (optional): extra HTTP headers as a string map.
+- `models` (optional): list of `{"id", "name"?, "context_tokens"?,
+  "max_tokens"?}`. Ids are sent unchanged; order is preserved in `/model`.
+- `compat` (optional): wire quirks for picky servers:
+  `{"use_max_completion_tokens": false, "send_stream_options": true}` are the
+  defaults.
+
+Select a provider with `"provider"` in settings.json, the `--provider` CLI
+option, or `/provider`; `/model` picks provider and model as one pair. This
+is endpoint configuration, not a plugin protocol.
+
+Example (`~/.openmax/providers.json`):
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": [{ "id": "qwen2.5-coder:7b", "name": "Qwen Coder 7B" }]
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "compat": { "use_max_completion_tokens": true }
+    }
+  }
+}
+```
+
+Activation: resolved at the next turn (settings edits apply without a
+restart). Verify with `openmax --check`.
+"#;
+
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/1)
+
+`openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
+`AgentEvent` envelopes on stdout. This is the stable contract for custom
+frontends, editor integrations, and one openmax driving another.
+
+Handshake: the first stdout line is
+{"type":"hello","proto":"openmax-stdio/1","protocol_version":1,"session_id":"...","version":"...","project":"/abs/path"}.
+`protocol_version` is compared as an integer; any wire change bumps it.
+
+Commands, one JSON object per line:
+- {"cmd":"user","text":"..."} starts a turn.
+- {"cmd":"approve","approval_id":"...","approved":true|false} answers a
+  pending approval.
+- {"cmd":"cancel"} cancels the running turn.
+- {"cmd":"quit"} drains the in-flight turn, then exits. EOF behaves like quit.
+Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
+session continues; extra fields on a known command are ignored; blank lines
+are skipped.
+
+Events: every line carries `session_id`, a `type` discriminator, then fields.
+Parse by field name, never by key order. Types: `token` (text), `thinking`
+(text), `message_done` (text), `budget` (used_tokens, context_tokens),
+`usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
+(call_id, name, args), `tool_end` (call_id, ok, output), `diff` (call_id,
+path, diff, added, removed), `approval_request` (approval_id, name, summary,
+detail), `approval_settled` (approval_id, outcome), `refrozen` (tools,
+skills), `done` (stop_reason), `error` (message).
+
+Each turn ends with exactly one `done`, and `done` is the only guaranteed
+turn terminator. While a client is live, approvals are forwarded and openmax
+waits for an `approve`; after quit or EOF, pending and later approvals are
+declined so shutdown drains promptly.
+
+Validate a stream against the contract: `openmax --check --stdio` reads JSONL
+on stdin, reports each line, and exits nonzero on any violation.
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("omx-spec-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The first fenced code block of a spec: the canonical example.
+    fn example(spec: &str) -> String {
+        let start = spec.find("```").expect("spec has a fenced example");
+        let after_fence = &spec[start + 3..];
+        let body_start = after_fence.find('\n').expect("fence has a language line") + 1;
+        let body = &after_fence[body_start..];
+        let end = body.find("```").expect("fence closes");
+        body[..end].to_string()
+    }
+
+    #[test]
+    fn every_surface_renders_and_unknown_does_not() {
+        for name in SURFACES {
+            let text = render(name).unwrap_or_else(|| panic!("no spec for {name}"));
+            assert!(!text.trim().is_empty(), "{name} spec is empty");
+        }
+        assert!(render("nope").is_none());
+        assert!(render("").is_none());
+    }
+
+    /// The printed contract cannot drift from the parsers: each example is
+    /// written to the exact path its spec names and must pass the same
+    /// validation `openmax --check` runs.
+    #[test]
+    fn examples_round_trip_through_check() {
+        let root = temp_dir("roundtrip");
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+        };
+        write(".openmax/tools/todo_scan.toml", &example(TOOLS));
+        write(".agents/skills/release/SKILL.md", &example(SKILLS));
+        write(".agents/prompts/fix-issue.md", &example(PROMPTS));
+        write(".openmax/hooks/deny-rm.toml", &example(HOOKS));
+        write(".openmax/permissions.toml", &example(PERMISSIONS));
+
+        let findings: Vec<_> = crate::doctor::check(&root)
+            .into_iter()
+            .filter(|f| f.path.starts_with(&root))
+            .collect();
+        assert_eq!(findings.len(), 5, "one finding per example: {findings:?}");
+        for finding in &findings {
+            assert!(
+                finding.status.is_ok(),
+                "spec example failed its own parser: {} → {:?}",
+                finding.path.display(),
+                finding.status
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn providers_example_round_trips_through_check_file() {
+        let dir = temp_dir("providers");
+        let path = dir.join("providers.json");
+        std::fs::write(&path, example(PROVIDERS)).unwrap();
+        match crate::providers::check_file(&path) {
+            Some(Ok(count)) => assert_eq!(count, 2, "example defines two providers"),
+            other => panic!("providers example must parse: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every file surface tells the agent how to verify what it wrote, and
+    /// every spec states when the file takes effect.
+    #[test]
+    fn specs_name_verification_and_activation() {
+        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers"] {
+            let text = render(name).unwrap();
+            assert!(text.contains("openmax --check"), "{name} spec must point at --check");
+        }
+        for name in ["tools", "skills"] {
+            assert!(
+                render(name).unwrap().contains("/reload"),
+                "{name} freezes per session, so its spec must name /reload"
+            );
+        }
+        assert!(render("stdio").unwrap().contains("openmax --check --stdio"));
+    }
+
+
+    /// Payload documentation must track the real hook payloads: the fields
+    /// named in the hooks spec are exactly the keys `hooks.rs` serializes.
+    #[test]
+    fn hook_spec_names_every_payload_field() {
+        let text = render("hooks").unwrap();
+        for field in ["event", "session_id", "tool", "args", "cwd", "tool_ok", "text", "record", "stop_reason"] {
+            assert!(text.contains(field), "hooks spec must document `{field}`");
+        }
+    }
+}
