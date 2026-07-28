@@ -128,7 +128,7 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
 - Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
 - Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end.\n\
-- Permission rules: .openmax/permissions.toml with allow/deny/ask entries.\n\
+- Permission rules: .openmax/permissions.toml, one [[rules]] table per rule with effect = allow|deny|ask, tool = \"<tool name>\", optional arg_regex (unanchored). Any error in this file denies every tool, so write it exactly and check it.\n\
 - Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
 A tool or skill you write is live on the next turn (the harness re-freezes automatically; /reload forces it now). Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check.\n\
 Compose beyond the loop with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.\n\
