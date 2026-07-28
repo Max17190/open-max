@@ -1,6 +1,6 @@
 //! The event loop and all interaction logic. A fullscreen session on the
-//! alternate screen: a pinned header at the top, the conversation anchored
-//! to the bottom above the composer, and the shell restored intact on exit.
+//! alternate screen: transient idle branding, a scrollable conversation, and
+//! a composer fixed to the terminal bottom.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -116,6 +116,87 @@ struct HistReuseKey {
     focus_scroll: bool,
     selected: Option<usize>,
     width: u16,
+}
+
+/// Chat-mode geometry. The input owns the terminal's bottom edge; every
+/// transient surface grows upward into the conversation plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConversationLayout {
+    header: Rect,
+    chat: Rect,
+    queue: Rect,
+    popup: Rect,
+    status: Rect,
+    input: Rect,
+}
+
+fn conversation_layout(
+    area: Rect,
+    show_header: bool,
+    desired_input_h: u16,
+    desired_queue_h: u16,
+    desired_popup_h: u16,
+) -> ConversationLayout {
+    // The composer is the primary interaction surface. On short terminals it
+    // keeps its requested height before the status or idle wordmark get rows.
+    let input_h = desired_input_h.min(area.height);
+    let mut remaining = area.height.saturating_sub(input_h);
+    let status_h = u16::from(remaining > 0);
+    remaining = remaining.saturating_sub(status_h);
+    let header_h = u16::from(show_header && remaining > 0);
+    remaining = remaining.saturating_sub(header_h);
+    // Active completion and search surfaces own keyboard input, so they must
+    // stay visible before passive queued-message previews receive rows.
+    let popup_h = desired_popup_h.min(remaining);
+    remaining = remaining.saturating_sub(popup_h);
+    let queue_h = desired_queue_h.min(remaining);
+    let chat_h = remaining.saturating_sub(queue_h);
+
+    let header = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: header_h,
+    };
+    let chat = Rect {
+        x: area.x,
+        y: header.bottom(),
+        width: area.width,
+        height: chat_h,
+    };
+    let queue = Rect {
+        x: area.x,
+        y: chat.bottom(),
+        width: area.width,
+        height: queue_h,
+    };
+    let popup = Rect {
+        x: area.x,
+        y: queue.bottom(),
+        width: area.width,
+        height: popup_h,
+    };
+    let status = Rect {
+        x: area.x,
+        y: popup.bottom(),
+        width: area.width,
+        height: status_h,
+    };
+    let input = Rect {
+        x: area.x,
+        y: status.bottom(),
+        width: area.width,
+        height: input_h,
+    };
+
+    ConversationLayout {
+        header,
+        chat,
+        queue,
+        popup,
+        status,
+        input,
+    }
 }
 
 pub struct Args {
@@ -1603,26 +1684,14 @@ impl App {
             "help" => {
                 let mut block: Vec<Line<'static>> = HELP_KEYS
                     .iter()
-                    .map(|(k, v)| {
-                        Line::from(vec![
-                            Span::styled(format!("  {k:<32}"), Style::default().fg(theme::ACCENT())),
-                            Span::styled((*v).to_string(), Style::default().fg(theme::DIM())),
-                        ])
-                    })
+                    .map(|(key, description)| help_line(key, description))
                     .collect();
                 block.push(Line::default());
-                block.extend(completion::COMMANDS.iter().map(|spec| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  {:<32}", spec.usage()),
-                            Style::default().fg(theme::ACCENT()),
-                        ),
-                        Span::styled(
-                            spec.description.to_string(),
-                            Style::default().fg(theme::DIM()),
-                        ),
-                    ])
-                }));
+                block.extend(
+                    completion::COMMANDS
+                        .iter()
+                        .map(|spec| help_line(&spec.usage(), spec.description)),
+                );
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
@@ -2422,22 +2491,17 @@ impl App {
             return;
         }
 
-        // The composer and approval card share one input band. Approvals
-        // temporarily own that space instead of stacking more chrome.
-        let status_h = 1u16.min(area.height);
-        let header_h = 1u16.min(area.height.saturating_sub(status_h + 2));
-        let input_h = if self.pending_approval.is_some() {
+        // The composer and approval card share the bottom band. Approvals
+        // temporarily own it instead of stacking more chrome.
+        let desired_input_h = if self.pending_approval.is_some() {
             5
         } else {
             self.composer.height().saturating_add(2).max(3)
-        }
-        .min(area.height.saturating_sub(header_h + status_h));
-        let queue_h = if self.queued.is_empty() {
+        };
+        let desired_queue_h = if self.queued.is_empty() {
             0
         } else {
-            (self.queued.len() as u16)
-                .min(3)
-                .min(area.height.saturating_sub(header_h + status_h + input_h))
+            (self.queued.len() as u16).min(3)
         };
         let hist_lines = self.history_search.as_ref().map(|(q, sel, items)| {
             history_search_lines(q, *sel, items, area.width)
@@ -2457,71 +2521,41 @@ impl App {
                 completion::render_lines(p, area.width, indexing)
             })
         };
-        let popup_h = hist_lines
+        let desired_popup_h = hist_lines
             .as_ref()
             .or(find_lines.as_ref())
             .or(popup_lines.as_ref())
             .map(|l| l.len() as u16)
-            .unwrap_or(0)
-            .min(area.height.saturating_sub(header_h + status_h + input_h + queue_h));
-        let chrome = header_h + queue_h + popup_h + input_h + status_h;
-        let chat_h = area.height.saturating_sub(chrome);
-        self.page_h = chat_h.saturating_sub(1).max(1);
+            .unwrap_or(0);
+        let show_header = self.transcript.block_count() == 0
+            && self.composer.is_empty()
+            && self.queued.is_empty()
+            && self.pending_approval.is_none()
+            && !self.running
+            && self.stream_text.is_empty();
+        let layout = conversation_layout(
+            area,
+            show_header,
+            desired_input_h,
+            desired_queue_h,
+            desired_popup_h,
+        );
+        self.page_h = layout.chat.height.saturating_sub(1).max(1);
 
-        // Top to bottom: header, transcript, queued input, popup, input, status.
-        let header_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: header_h,
-        };
-        let chat_area = Rect {
-            x: area.x,
-            y: area.y + header_h,
-            width: area.width,
-            height: chat_h,
-        };
-        let mut y = area.y + header_h + chat_h;
-        let queue_area = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: queue_h,
-        };
-        y += queue_h;
-        let popup_area = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: popup_h,
-        };
-        y += popup_h;
-        let input_area = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: input_h,
-        };
-        y += input_h;
-        let status_area = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: status_h,
-        };
-
-        if header_h > 0 {
-            self.draw_header(frame, header_area);
+        // Top to bottom: idle wordmark, transcript, transient overlays,
+        // status, and the bottom-fixed input surface.
+        if layout.header.height > 0 {
+            self.draw_header(frame, layout.header);
         }
-        if chat_h > 0 {
-            self.draw_chat(frame, chat_area);
+        if layout.chat.height > 0 {
+            self.draw_chat(frame, layout.chat);
         }
 
-        if queue_h > 0 {
+        if layout.queue.height > 0 {
             let mut qlines: Vec<Line> = self
                 .queued
                 .iter()
-                .take(queue_h as usize)
+                .take(layout.queue.height as usize)
                 .map(|q| {
                     Line::from(vec![
                         Span::styled("↳ ", Style::default().fg(theme::ACCENT())),
@@ -2534,25 +2568,28 @@ impl App {
                     ])
                 })
                 .collect();
-            if self.queued.len() as u16 > queue_h {
+            if self.queued.len() as u16 > layout.queue.height {
                 qlines.pop();
                 qlines.push(Line::from(Span::styled(
-                    format!("↳ … {} more queued", self.queued.len() as u16 - queue_h + 1),
+                    format!(
+                        "↳ … {} more queued",
+                        self.queued.len() as u16 - layout.queue.height + 1
+                    ),
                     Style::default().fg(theme::DIM()),
                 )));
             }
-            Paragraph::new(qlines).render(queue_area, frame.buffer_mut());
+            Paragraph::new(qlines).render(layout.queue, frame.buffer_mut());
         }
 
         if let Some(lines) = hist_lines.or(find_lines).or(popup_lines) {
-            if popup_h > 0 {
-                Paragraph::new(lines).render(popup_area, frame.buffer_mut());
+            if layout.popup.height > 0 {
+                Paragraph::new(lines).render(layout.popup, frame.buffer_mut());
             }
         }
 
         if self.pending_approval.is_some() {
-            self.draw_approval(frame, input_area);
-        } else if input_h > 0 {
+            self.draw_approval(frame, layout.input);
+        } else if layout.input.height >= 3 {
             let border_color = if self.focus == Focus::Composer {
                 theme::ACCENT()
             } else {
@@ -2563,8 +2600,8 @@ impl App {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(border_color))
                 .style(Style::default().bg(theme::COMPOSER_BG()));
-            let inner = block.inner(input_area);
-            block.render(input_area, frame.buffer_mut());
+            let inner = block.inner(layout.input);
+            block.render(layout.input, frame.buffer_mut());
             let (composer_lines, cx, cy) = self.composer.render(inner.height);
             Paragraph::new(composer_lines)
                 .style(Style::default().bg(theme::COMPOSER_BG()))
@@ -2575,14 +2612,59 @@ impl App {
             {
                 frame.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
             }
+        } else if layout.input.height > 0 {
+            // Below three rows a box has no interior. Keep the prompt usable
+            // by dropping only the border and bottom-aligning its visible rows.
+            let (composer_lines, cx, cy) = self.composer.render(layout.input.height);
+            let composer_h = (composer_lines.len() as u16).min(layout.input.height);
+            let composer_area = Rect {
+                y: layout.input.bottom().saturating_sub(composer_h),
+                height: composer_h,
+                ..layout.input
+            };
+            Paragraph::new(composer_lines)
+                .style(Style::default().bg(theme::COMPOSER_BG()))
+                .render(composer_area, frame.buffer_mut());
+            if self.focus == Focus::Composer
+                && self.history_search.is_none()
+                && self.scroll_search.is_none()
+                && composer_area.width > 0
+                && composer_area.height > 0
+            {
+                frame.set_cursor_position(Position::new(
+                    (composer_area.x + cx).min(composer_area.right().saturating_sub(1)),
+                    (composer_area.y + cy).min(composer_area.bottom().saturating_sub(1)),
+                ));
+            }
         }
-        self.draw_status(frame, status_area);
+        self.draw_status(frame, layout.status);
     }
 
     fn draw_approval(&mut self, frame: &mut Frame, area: Rect) {
         let Some((_, name, summary, detail)) = self.pending_approval.as_ref() else {
             return;
         };
+        if area.height < 5 {
+            let lines = compact_approval_lines(name, summary, detail, area.width, area.height);
+            let height = (lines.len() as u16).min(area.height);
+            let draw_area = Rect {
+                y: area.bottom().saturating_sub(height),
+                height,
+                ..area
+            };
+            Paragraph::new(lines)
+                .style(Style::default().bg(theme::SURFACE()))
+                .render(draw_area, frame.buffer_mut());
+            if height > 0 {
+                self.approval_hits = approval_choice_hit_regions(Rect {
+                    x: draw_area.x,
+                    y: draw_area.bottom() - 1,
+                    width: draw_area.width,
+                    height: 1,
+                });
+            }
+            return;
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -3042,6 +3124,16 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),
 ];
 
+fn help_line(key: &str, description: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:<32} "),
+            Style::default().fg(theme::ACCENT()),
+        ),
+        Span::styled(description.to_string(), Style::default().fg(theme::DIM())),
+    ])
+}
+
 fn history_search_lines(
     query: &str,
     selected: usize,
@@ -3216,6 +3308,54 @@ fn paint_text_selection(
 const APPROVAL_LABELS: [&str; 3] =
     ["▸ [y] Allow once", "   [a] Allow for run", "   [n] Deny"];
 
+fn approval_choice_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            APPROVAL_LABELS[0],
+            Style::default()
+                .fg(theme::WARN())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM())),
+        Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM())),
+    ])
+}
+
+fn compact_approval_lines(
+    name: &str,
+    summary: &str,
+    detail: &str,
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let width = width as usize;
+    if height == 1 {
+        return vec![approval_choice_line()];
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{}  ", tool_card::human_name(name)),
+            Style::default()
+                .fg(theme::WARN())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(clip(summary, width.saturating_sub(name.len() + 2))),
+    ])];
+    if height >= 3 {
+        let body = if detail.is_empty() { summary } else { detail };
+        lines.push(Line::from(Span::styled(
+            clip(body, width),
+            Style::default().fg(theme::DIM()),
+        )));
+    }
+    lines.push(approval_choice_line());
+    lines
+}
+
 fn approval_card_lines(
     name: &str,
     summary: &str,
@@ -3242,34 +3382,37 @@ fn approval_card_lines(
             clip(body, width),
             Style::default().fg(theme::DIM()),
         )),
-        Line::from(vec![
-            Span::styled(
-                APPROVAL_LABELS[0],
-                Style::default()
-                    .fg(theme::WARN())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM())),
-            Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM())),
-        ]),
+        approval_choice_line(),
     ]
 }
 
 fn approval_hit_regions(inner: Rect) -> [Option<Rect>; 3] {
-    let mut hits = [None; 3];
     if inner.height < 3 {
+        return [None; 3];
+    }
+    approval_choice_hit_regions(Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: 1,
+    })
+}
+
+fn approval_choice_hit_regions(row: Rect) -> [Option<Rect>; 3] {
+    let mut hits = [None; 3];
+    if row.height == 0 {
         return hits;
     }
-    let mut x = inner.x;
+    let mut x = row.x;
     for (index, label) in APPROVAL_LABELS.iter().enumerate() {
         let width = label
             .chars()
             .count()
-            .min(inner.right().saturating_sub(x) as usize);
+            .min(row.right().saturating_sub(x) as usize);
         if width > 0 {
             hits[index] = Some(Rect {
                 x,
-                y: inner.y + 2,
+                y: row.y,
                 width: width as u16,
                 height: 1,
             });
@@ -3286,8 +3429,9 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_card_lines, approval_hit_regions, command_parts, kv, paint_text_selection,
-        rect_contains, save_model_selection, App, Dirty, Focus, MIN_DRAW_INTERVAL,
+        approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
+        conversation_layout, help_line, kv, paint_text_selection, rect_contains,
+        save_model_selection, App, Dirty, Focus, MIN_DRAW_INTERVAL,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
@@ -3341,6 +3485,13 @@ mod tests {
         rows(buffer).join("\n")
     }
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn dirty_default_is_clean() {
         let d = Dirty::default();
@@ -3353,6 +3504,45 @@ mod tests {
         let display_144hz = std::time::Duration::from_nanos(1_000_000_000 / 144);
         assert!(MIN_DRAW_INTERVAL < display_144hz);
         assert!(MIN_DRAW_INTERVAL < std::time::Duration::from_millis(6));
+    }
+
+    #[test]
+    fn conversation_layout_pins_input_to_the_terminal_bottom() {
+        let area = Rect::new(2, 3, 80, 18);
+        let plain = conversation_layout(area, true, 3, 0, 0);
+        let busy = conversation_layout(area, false, 3, 3, 7);
+        let multiline = conversation_layout(area, false, 6, 3, 7);
+
+        assert_eq!(plain.input.bottom(), area.bottom());
+        assert_eq!(busy.input, plain.input);
+        assert_eq!(busy.status.bottom(), busy.input.y);
+        assert_eq!(busy.popup.bottom(), busy.status.y);
+        assert_eq!(multiline.input.bottom(), area.bottom());
+        assert!(multiline.input.y < busy.input.y);
+    }
+
+    #[test]
+    fn short_layout_yields_brand_and_status_before_prompt_height() {
+        let four_rows = conversation_layout(Rect::new(0, 0, 64, 4), true, 3, 0, 0);
+        assert_eq!(four_rows.input.height, 3);
+        assert_eq!(four_rows.status.height, 1);
+        assert_eq!(four_rows.header.height, 0);
+        assert_eq!(four_rows.input.bottom(), 4);
+
+        let three_rows = conversation_layout(Rect::new(0, 0, 64, 3), true, 3, 0, 0);
+        assert_eq!(three_rows.input.height, 3);
+        assert_eq!(three_rows.status.height, 0);
+        assert_eq!(three_rows.header.height, 0);
+    }
+
+    #[test]
+    fn active_overlay_has_priority_over_passive_queue_rows() {
+        let layout = conversation_layout(Rect::new(0, 0, 64, 8), false, 3, 3, 6);
+
+        assert_eq!(layout.popup.height, 4);
+        assert_eq!(layout.queue.height, 0);
+        assert_eq!(layout.popup.bottom(), layout.status.y);
+        assert_eq!(layout.input.bottom(), 8);
     }
 
     #[test]
@@ -3624,6 +3814,50 @@ mod tests {
         assert!(!text.contains("/ commands"));
         assert!(!text.contains("●"));
         assert!(!text.contains("ctx 0%"));
+        assert!(rows(&buffer).last().unwrap().starts_with('╰'));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prompt_stays_visible_at_the_bottom_of_short_terminals() {
+        let (mut app, dir) = app_fixture();
+
+        let four_rows = rows(&render_app(&mut app, 64, 4));
+        assert!(!four_rows[0].contains("OPEN MAX"));
+        assert!(four_rows[2].contains("Describe a task"));
+        assert!(four_rows[3].starts_with('╰'));
+
+        let two_rows = rows(&render_app(&mut app, 64, 2));
+        assert!(two_rows[1].contains("Describe a task"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_conversation_reclaims_idle_header_without_moving_prompt() {
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("inspect the current layout");
+        let buffer = render_app(&mut app, 72, 12);
+        let rendered = rows(&buffer);
+
+        assert!(!rendered[0].contains("OPEN MAX"));
+        assert!(rendered.iter().any(|row| row.contains("inspect the current layout")));
+        assert!(rendered.last().unwrap().starts_with('╰'));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_output_grows_above_the_fixed_prompt() {
+        let (mut app, dir) = app_fixture();
+        app.running = true;
+        app.turn_started = Some(std::time::Instant::now());
+        app.on_agent_event(AgentEvent::Token {
+            text: "first streamed line\nsecond streamed line".into(),
+        });
+        let rendered = rows(&render_app(&mut app, 64, 8));
+
+        assert!(rendered.iter().any(|row| row.contains("second streamed line")));
+        assert!(rendered.iter().any(|row| row.contains("esc to cancel")));
+        assert!(rendered.last().unwrap().starts_with('╰'));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3725,6 +3959,51 @@ mod tests {
         let settled = render_app(&mut app, 88, 16);
         assert!(buffer_text(&settled).contains("keep this draft"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compact_approval_keeps_keyboard_choices_visible() {
+        let lines = compact_approval_lines("bash", "run tests", "cargo test", 64, 4);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Shell"));
+        assert!(text.contains("cargo test"));
+        assert!(text.contains("[y] Allow once"));
+        assert!(text.contains("[a] Allow for run"));
+        assert!(text.contains("[n] Deny"));
+    }
+
+    #[test]
+    fn compact_approval_keeps_mouse_targets_aligned_with_choices() {
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-compact".into(),
+            name: "bash".into(),
+            summary: "run tests".into(),
+            detail: "cargo test".into(),
+        });
+        let buffer = render_app(&mut app, 64, 4);
+        let rendered = rows(&buffer);
+        let choices_y = rendered
+            .iter()
+            .position(|row| row.contains("[y] Allow once"))
+            .unwrap() as u16;
+
+        assert!(app.approval_hits.iter().all(Option::is_some));
+        assert!(app
+            .approval_hits
+            .iter()
+            .flatten()
+            .all(|region| region.y == choices_y));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn help_columns_always_separate_long_usage_from_description() {
+        let line = help_line(
+            "/theme dark|light|mono|catppuccin",
+            "switch appearance",
+        );
+        assert!(line_text(&line).contains("catppuccin switch appearance"));
     }
 
     #[test]
