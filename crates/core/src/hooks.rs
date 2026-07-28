@@ -133,13 +133,22 @@ fn hooks_fingerprint(project_root: &Path) -> u64 {
 }
 
 fn discover_uncached(project_root: &Path) -> Hooks {
+    discover_in_dirs(&hook_dirs(project_root))
+}
+
+/// First stem wins: project dirs are listed before global, and that
+/// precedence covers parse errors too. A malformed file that is shadowed by
+/// an earlier valid one was never going to run, so it must not fail closed;
+/// a malformed file that holds its stem blocks instead of silently falling
+/// back to the definition it shadows.
+fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
     let mut by_stem: std::collections::BTreeMap<String, HookSpec> = std::collections::BTreeMap::new();
-    let mut invalid: Vec<String> = Vec::new();
-    for dir in hook_dirs(project_root) {
+    let mut invalid_by_stem: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for dir in dirs {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -150,18 +159,23 @@ fn discover_uncached(project_root: &Path) -> Hooks {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            if stem.is_empty() {
+            if stem.is_empty()
+                || by_stem.contains_key(&stem)
+                || invalid_by_stem.contains_key(&stem)
+            {
                 continue;
             }
             match parse_hook_file(&path) {
-                // First wins: project dirs are listed before global.
                 Ok(spec) => {
-                    by_stem.entry(stem).or_insert(spec);
+                    by_stem.insert(stem, spec);
                 }
-                Err(reason) => invalid.push(format!("{}: {reason}", path.display())),
+                Err(reason) => {
+                    invalid_by_stem.insert(stem, format!("{}: {reason}", path.display()));
+                }
             }
         }
     }
+    let invalid: Vec<String> = invalid_by_stem.into_values().collect();
     let mut hooks = Hooks { invalid, ..Hooks::default() };
     for spec in by_stem.into_values() {
         match spec.event {
@@ -603,6 +617,38 @@ command = "true"
             }
             PreToolResult::Allow | PreToolResult::Cancelled => panic!("expected block"),
         }
+    }
+
+    #[tokio::test]
+    async fn shadowed_invalid_hook_does_not_fail_closed() {
+        let tmp = tempfile_dir();
+        let project = tmp.join("project");
+        let global = tmp.join("global");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        write_hook_toml(&project, "audit.toml", "event = \"post_tool_use\"\ncommand = \"true\"\n");
+        write_hook_toml(&global, "audit.toml", "event = \"not_a_real_event\"\ncommand = \"true\"\n");
+        // The malformed global file is shadowed by the valid project one, so
+        // it was never going to run and must not block.
+        let hooks = discover_in_dirs(&[project.clone(), global.clone()]);
+        assert!(hooks.invalid.is_empty(), "{:?}", hooks.invalid);
+        assert_eq!(hooks.post_count(), 1);
+        let cancel = Arc::new(CancelToken::default());
+        let result = hooks
+            .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
+            .await;
+        assert_eq!(result, PreToolResult::Allow);
+
+        // The reverse still fails closed: a malformed file in the
+        // higher-precedence dir holds its stem instead of silently falling
+        // back to the valid definition it shadows.
+        let hooks = discover_in_dirs(&[global, project]);
+        assert_eq!(hooks.invalid.len(), 1, "{:?}", hooks.invalid);
+        assert_eq!(hooks.post_count(), 0);
+        let result = hooks
+            .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
+            .await;
+        assert!(matches!(result, PreToolResult::Block { .. }));
     }
 
     #[tokio::test]
