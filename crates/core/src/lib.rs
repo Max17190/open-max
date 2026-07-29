@@ -9,6 +9,7 @@ pub mod doctor;
 pub(crate) mod execution;
 pub mod fallback;
 pub mod hooks;
+pub mod ledger;
 pub mod permissions;
 pub mod prompt;
 pub mod providers;

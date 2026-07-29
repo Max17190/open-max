@@ -96,7 +96,10 @@ pub enum AgentEvent {
     },
     /// The session's tools, skills, and system prompt were re-frozen from
     /// current config (extension files changed, or the user forced /reload).
-    Refrozen { tools: usize, skills: usize },
+    /// `changes` is the refreeze receipt: one line per capability file the
+    /// ledger recorded, with who changed it ("tool.toml modified (external)"),
+    /// so the action space never mutates silently.
+    Refrozen { tools: usize, skills: usize, changes: Vec<String> },
     /// An observe-only hook (post_tool_use, session_start, compaction,
     /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The
     /// turn proceeded - observe hooks are fail-open - but never silently.
@@ -200,8 +203,12 @@ mod tests {
             r#"{"session_id":"s1","type":"approval_settled","approval_id":"ap1","outcome":"approved"}"#
         );
         assert_eq!(
-            env(AgentEvent::Refrozen { tools: 7, skills: 2 }),
-            r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2}"#
+            env(AgentEvent::Refrozen {
+                tools: 7,
+                skills: 2,
+                changes: vec![".openmax/tools/deploy.toml added (session)".into()],
+            }),
+            r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added (session)"]}"#
         );
 
         assert_eq!(
