@@ -101,6 +101,10 @@ pub(crate) struct ExtensionSnapshot {
     tools_omitted: usize,
     /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
     skills_omitted: usize,
+    /// Every capability file this generation read: (path, sha256, bytes).
+    /// The ledger records exactly this generation, so what it attests is what
+    /// the freeze actually used - never a second read that could differ.
+    pub(crate) files: Vec<(PathBuf, String, Vec<u8>)>,
 }
 
 impl ExtensionSnapshot {
@@ -117,6 +121,7 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
+    let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
     let mut external_by_name: HashMap<String, ToolSpec> = HashMap::new();
     for dir in external_tool_dirs(project_root) {
         dir.hash(&mut h);
@@ -134,6 +139,7 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
             let bytes = std::fs::read(&path).ok();
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
+            files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 continue;
             };
@@ -160,6 +166,7 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
             let bytes = std::fs::read(&path).ok();
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
+            files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 continue;
             };
@@ -190,6 +197,7 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
         skills: discovered_skills,
         tools_omitted,
         skills_omitted,
+        files: files_read,
     }
 }
 

@@ -155,6 +155,24 @@ This covers the project file. A malformed global
 never write, so fix that one from the shell; the deny reason names the exact
 path and `openmax --check` prints the parse error.
 
+## The capability ledger
+
+Every tool and skill file a freeze reads is recorded in a per-project,
+append-only, hash-chained ledger under `~/.openmax/ledger/`, together with a
+content-addressed copy of the bytes. Each record carries the actor at the
+strength the harness can prove: `session` (changed while an agent turn was
+running), `external` (changed while none was: a human, `git pull`, an
+installer), or `initial` (present when the ledger was first populated). The
+ledger lives outside the project, where the confined file tools never write,
+and each record chains the hash of the previous one, so tampering through the
+shell is detectable.
+
+Every re-freeze announces a receipt - the `refrozen` event lists what changed
+and who changed it - so the agent's action space never mutates silently.
+`openmax --ledger` prints the history with object paths; restoring an earlier
+version is an ordinary `cp` from the objects directory. There is no rollback
+command: the core guarantees the history exists, using it stays file work.
+
 ## Validation
 
 `openmax --check` parses tools, skills, templates, hooks, permissions, and

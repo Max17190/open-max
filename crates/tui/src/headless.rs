@@ -215,9 +215,13 @@ async fn run_turn_events(
                 }
                 return exit_code;
             }
-            AgentEvent::Refrozen { tools, skills } => {
+            AgentEvent::Refrozen { tools, skills, changes } => {
                 if !json {
-                    let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills)");
+                    let _ = writeln!(
+                        stderr,
+                        "openmax: re-frozen ({tools} tools, {skills} skills): {}",
+                        changes.join(", ")
+                    );
                 }
             }
             AgentEvent::HookFailed { hook, event, detail } => {

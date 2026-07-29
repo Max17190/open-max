@@ -32,6 +32,7 @@ options:
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
+      --ledger           print the capability-file history for this project
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers) and exit; nonzero if
                          any is broken.
@@ -63,6 +64,7 @@ struct CliArgs {
     json: bool,
     stdio: bool,
     check: bool,
+    ledger: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
     trust_project: bool,
@@ -89,6 +91,7 @@ where
         json: false,
         stdio: false,
         check: false,
+        ledger: false,
         spec: None,
         trust_project: false,
         prompts: Vec::new(),
@@ -111,6 +114,7 @@ where
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
+            Long("ledger") => out.ledger = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
@@ -207,6 +211,38 @@ async fn main() -> std::io::Result<()> {
                     open_max_core::spec::SURFACES.join(", ")
                 );
                 std::process::exit(2);
+            }
+        }
+    }
+
+    if cli.ledger {
+        // Read-only history, like --check: no session, no endpoint, no trust.
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let data_dir = default_data_dir();
+        match open_max_core::ledger::history(&data_dir, &project) {
+            Ok(records) if records.is_empty() => {
+                println!("no capability-file history for this project yet");
+                std::process::exit(0);
+            }
+            Ok(records) => {
+                let objects = open_max_core::ledger::project_dir(&data_dir, &project).join("objects");
+                for r in &records {
+                    let what = match &r.sha256 {
+                        Some(sha) => format!("{} {}", &sha[..12.min(sha.len())], r.path.display()),
+                        None => format!("{:12} {}", "removed", r.path.display()),
+                    };
+                    println!(
+                        "{} {:8} {what}",
+                        r.ts,
+                        r.actor.as_str(),
+                    );
+                }
+                println!("\nobjects: {} (restore with cp <objects>/<sha> <path>)", objects.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openmax: {e}");
+                std::process::exit(1);
             }
         }
     }

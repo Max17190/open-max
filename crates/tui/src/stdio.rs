@@ -44,11 +44,11 @@ use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-pub const PROTO: &str = "openmax-stdio/1";
+pub const PROTO: &str = "openmax-stdio/2";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).
@@ -71,7 +71,7 @@ pub struct StdioArgs {
 
 pub async fn run(
     core: Arc<Core>,
-    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: StdioArgs,
 ) -> i32 {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -240,10 +240,10 @@ async fn drive<W: Write>(
                             continue;
                         }
                         match agent::reload_session(&core, &session_id, &project).await {
-                            Ok((tools, skills)) => {
+                            Ok((tools, skills, changes)) => {
                                 let env = AgentEventEnvelope {
                                     session_id: session_id.clone(),
-                                    event: AgentEvent::Refrozen { tools, skills },
+                                    event: AgentEvent::Refrozen { tools, skills, changes },
                                 };
                                 if let Ok(value) = serde_json::to_value(&env) {
                                     emit(out, &value);

@@ -724,7 +724,7 @@ pub async fn reload_session(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, Vec<String>), String> {
     if !crate::trust::is_trusted(&core.data_dir, project_root)? {
         return Err(format!(
             "project {} is not trusted; establish trust before reloading it",
@@ -735,11 +735,17 @@ pub async fn reload_session(
         return Err("a turn is in flight; run /reload after it finishes".into());
     }
     let root = project_root.to_path_buf();
-    let registry = tokio::task::spawn_blocking(move || Registry::build(&root))
+    let mut snapshot = tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root))
         .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
+    let files = std::mem::take(&mut snapshot.files);
+    let registry = Registry::from_snapshot(snapshot);
+    // A forced reload observes whatever is on disk now; no turn was running,
+    // so any delta since the last freeze is external to the session.
+    let reload_receipt =
+        ledger_changes(core, project_root, &files, crate::ledger::Actor::External, session_id);
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
-    let counts = (registry.tools.len(), registry.skills.len());
+    let counts = (registry.tools.len(), registry.skills.len(), reload_receipt);
 
     // Hydrate first if the session was resumed but never ran a turn, so the
     // reload applies to the real transcript rather than a fresh one.
@@ -827,13 +833,14 @@ async fn refreeze_if_extensions_changed(
     session_id: &str,
     project_root: &Path,
 ) {
-    let snapshot = {
+    let mut snapshot = {
         let root = project_root.to_path_buf();
         match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
             Ok(snapshot) => snapshot,
             Err(_) => return,
         }
     };
+    let files = std::mem::take(&mut snapshot.files);
     let disk_fp = snapshot.fingerprint();
     let stale = {
         let sessions_map = core.sessions.lock().await;
@@ -842,6 +849,9 @@ async fn refreeze_if_extensions_changed(
             .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
     };
     if !stale {
+        // Nothing to activate, but a project the ledger has never seen still
+        // gets its baseline, so the next change is attributable.
+        let _ = crate::ledger::seed_if_empty(&core.data_dir, project_root, &files);
         return;
     }
     let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
@@ -855,11 +865,37 @@ async fn refreeze_if_extensions_changed(
         // mutates the session, but stay defensive about empty (taken) state.
         if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp {
             apply_freeze(core, session_id, data, registry, prompt, breakdown);
+            // Turn start: the change happened while no turn was running, so
+            // it is external to this session (a human, git, an installer).
+            let changes = ledger_changes(
+                core,
+                project_root,
+                &files,
+                crate::ledger::Actor::External,
+                session_id,
+            );
             core.send_agent(session_id, AgentEvent::Refrozen {
                 tools: counts.0,
                 skills: counts.1,
+                changes,
             });
         }
+    }
+}
+
+/// Sync the ledger and describe the outcome for the refreeze receipt. A
+/// ledger failure never blocks activation, but it is reported in the receipt
+/// rather than swallowed.
+fn ledger_changes(
+    core: &Arc<Core>,
+    project_root: &Path,
+    files: &[(std::path::PathBuf, String, Vec<u8>)],
+    actor: crate::ledger::Actor,
+    session_id: &str,
+) -> Vec<String> {
+    match crate::ledger::sync(&core.data_dir, project_root, files, actor, Some(session_id)) {
+        Ok(changes) => crate::ledger::describe(&changes, project_root),
+        Err(e) => vec![format!("ledger error: {e}")],
     }
 }
 
@@ -882,13 +918,14 @@ async fn refreeze_between_iterations(
     registry: &mut Arc<Registry>,
     messages: &mut Vec<ChatMessage>,
 ) -> bool {
-    let snapshot = {
+    let mut snapshot = {
         let root = project_root.to_path_buf();
         match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
             Ok(snapshot) => snapshot,
             Err(_) => return false,
         }
     };
+    let files = std::mem::take(&mut snapshot.files);
     if snapshot.fingerprint() == registry.ext_fingerprint {
         return false;
     }
@@ -914,7 +951,19 @@ async fn refreeze_between_iterations(
         }
     }
     *registry = new_registry;
-    core.send_agent(session_id, AgentEvent::Refrozen { tools: counts.0, skills: counts.1 });
+    // Mid-turn: this session's own mutating call produced the change.
+    let changes = ledger_changes(
+        core,
+        project_root,
+        &files,
+        crate::ledger::Actor::Session,
+        session_id,
+    );
+    core.send_agent(session_id, AgentEvent::Refrozen {
+        tools: counts.0,
+        skills: counts.1,
+        changes,
+    });
     true
 }
 
@@ -2200,7 +2249,7 @@ mod tests {
         assert!(reload_session(&core, id, &project).await.is_err());
         core.running.lock().unwrap().remove(id);
 
-        let (tools, skills) = reload_session(&core, id, &project).await.unwrap();
+        let (tools, skills, _changes) = reload_session(&core, id, &project).await.unwrap();
         assert_eq!(tools, tools::TOOL_NAMES.len() + 1);
         assert_eq!(skills, 0);
 
@@ -2227,7 +2276,7 @@ mod tests {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let id = "midturn-refreeze";
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -2274,6 +2323,25 @@ mod tests {
         // Same generation again: idempotent, so the next model request keeps
         // its (already re-prefilled) cache.
         assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+
+        // The ledger recorded the exact generation the freeze used, and the
+        // wire event carried a receipt naming the file.
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        assert!(
+            records.iter().any(|r| r.path.ends_with(".openmax/tools/deploy.toml")),
+            "the activated tool must be in the ledger"
+        );
+        let mut receipt = None;
+        while let Ok(env) = rx.try_recv() {
+            if let AgentEvent::Refrozen { changes, .. } = env.event {
+                receipt = Some(changes);
+            }
+        }
+        let receipt = receipt.expect("a refreeze must announce itself");
+        assert!(
+            receipt.iter().any(|c| c.contains("deploy.toml")),
+            "the receipt must name what changed: {receipt:?}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

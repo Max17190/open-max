@@ -1731,7 +1731,7 @@ impl App {
                 Some(id) => {
                     let id = id.clone();
                     match agent::reload_session(&self.core, &id, &self.project).await {
-                        Ok((tools, skills)) => self.note(&format!(
+                        Ok((tools, skills, _changes)) => self.note(&format!(
                             "re-frozen: {}, {} (prompt cache will re-prefill once)",
                             plural(tools, "tool"),
                             plural(skills, "skill")
@@ -2103,11 +2103,26 @@ impl App {
                     }
                 }
             }
-            AgentEvent::Refrozen { tools, skills } => {
+            AgentEvent::Refrozen { tools, skills, changes } => {
+                // The receipt: what changed and who changed it, so the action
+                // space never mutates silently (a poisoned skill arriving via
+                // git pull is announced, not slipped in).
+                let detail = if changes.is_empty() {
+                    String::new()
+                } else {
+                    let head: Vec<&str> =
+                        changes.iter().take(3).map(String::as_str).collect();
+                    let more = changes.len().saturating_sub(3);
+                    if more > 0 {
+                        format!(" - {} (+{more} more)", head.join(", "))
+                    } else {
+                        format!(" - {}", head.join(", "))
+                    }
+                };
                 self.note(&format!(
-                    "extensions changed on disk: re-frozen with {}, {}",
+                    "toolbox changed: re-frozen with {}, {}{detail}",
                     plural(tools, "tool"),
-                    plural(skills, "skill")
+                    plural(skills, "skill"),
                 ));
             }
             AgentEvent::HookFailed { hook, event, detail } => {
