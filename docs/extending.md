@@ -155,6 +155,16 @@ This covers the project file. A malformed global
 never write, so fix that one from the shell; the deny reason names the exact
 path and `openmax --check` prints the parse error.
 
+## Proof of life
+
+A tool file may declare one `[example]` (JSON args plus an optional
+`expect_regex`). `openmax --check --run-examples` executes each declared
+example through the real spawn path and fails the check if the call fails or
+its output does not match. Plain `--check` stays read-only and never executes
+anything; running examples is opt-in per invocation. Fuller regression suites
+stay agent-authored files - the example is the smallest honest proof that a
+freshly written tool actually runs.
+
 ## Content-bound approvals
 
 The ledger's approval store (`approved.json`, beside the log) holds sha256

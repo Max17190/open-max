@@ -34,6 +34,7 @@ options:
                          envelopes on stdout; the custom-frontend protocol
       --ledger           print the capability-file history for this project
       --approve <path>   approve the exact current content of a capability file
+      --run-examples     with --check, execute each tool's [example] once
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers) and exit; nonzero if
                          any is broken.
@@ -65,6 +66,7 @@ struct CliArgs {
     json: bool,
     stdio: bool,
     check: bool,
+    run_examples: bool,
     approve: Option<String>,
     ledger: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
@@ -93,6 +95,7 @@ where
         json: false,
         stdio: false,
         check: false,
+        run_examples: false,
         approve: None,
         ledger: false,
         spec: None,
@@ -117,6 +120,7 @@ where
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
+            Long("run-examples") => out.run_examples = true,
             Long("approve") => out.approve = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
@@ -335,6 +339,10 @@ async fn main() -> std::io::Result<()> {
                 }
             }
         }
+        let mut example_failures = 0usize;
+        if cli.run_examples {
+            example_failures = run_tool_examples(&project).await;
+        }
         // Warnings do not fail the run: a shadowed global default and a rule
         // written before its tool are both normal.
         if open_max_core::doctor::has_warnings(&findings) {
@@ -343,7 +351,8 @@ async fn main() -> std::io::Result<()> {
                  as written. They do not fail this check."
             );
         }
-        std::process::exit(if open_max_core::doctor::has_errors(&findings) { 1 } else { 0 });
+        let failed = open_max_core::doctor::has_errors(&findings) || example_failures > 0;
+        std::process::exit(if failed { 1 } else { 0 });
     }
 
     let data_dir = default_data_dir();
@@ -521,6 +530,26 @@ impl<W: Write> Drop for FrameWriter<W> {
             }
         }
     }
+}
+
+/// Print `openmax --check --run-examples` results; returns the failure count.
+async fn run_tool_examples(project: &std::path::Path) -> usize {
+    let results = open_max_core::doctor::run_examples(project).await;
+    if results.is_empty() {
+        println!("no tool declares an [example]");
+        return 0;
+    }
+    let mut failures = 0usize;
+    for (name, verdict) in results {
+        match verdict {
+            Ok(()) => println!("ok   example     {name}"),
+            Err(reason) => {
+                failures += 1;
+                println!("err  example     {name}  {reason}");
+            }
+        }
+    }
+    failures
 }
 
 /// `openmax --spec usage`: per-extension prompt cost joined with lifetime

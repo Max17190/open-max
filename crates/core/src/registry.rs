@@ -48,6 +48,9 @@ pub struct ExternalTool {
     /// sha256 of the defining TOML's bytes at parse time: the identity the
     /// content-bound approval store keys on.
     pub source_sha256: String,
+    /// Optional proof-of-life: `openmax --check --run-examples` runs the tool
+    /// once with these args through the real spawn path.
+    pub example: Option<ToolExample>,
     pub command: String,
     pub args: Vec<String>,
     pub timeout_secs: u64,
@@ -406,6 +409,9 @@ impl Registry {
                 mutating: t.mutating,
                 kind: ToolKind::External(ExternalTool {
                     source_sha256: t.source_sha256,
+                    // Examples are a --check concern read from disk; frozen
+                    // sessions never run them.
+                    example: None,
                     command: t.command,
                     args: t.args,
                     timeout_secs: t.timeout_secs,
@@ -479,6 +485,8 @@ fn summarize_external(args: &Value) -> String {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExternalToolFile {
+    #[serde(default)]
+    example: Option<ExampleFile>,
     name: String,
     description: String,
     /// JSON-schema object for the parameters; defaults to "no parameters".
@@ -495,6 +503,24 @@ struct ExternalToolFile {
 
 fn default_timeout() -> u64 {
     60
+}
+
+/// One runnable example: the call must exit 0, and when `expect_regex` is
+/// set its output must match. Declared in the tool file so the contract
+/// travels with the tool.
+#[derive(Clone, Debug)]
+pub struct ToolExample {
+    pub args: Value,
+    pub expect_regex: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExampleFile {
+    #[serde(default)]
+    args: Option<Value>,
+    #[serde(default)]
+    expect_regex: Option<String>,
 }
 
 /// Global then project tool dirs; later dirs win on name collision.
@@ -526,6 +552,11 @@ fn discover_external_in(dirs: &[PathBuf]) -> Vec<ToolSpec> {
     by_name.into_values().collect()
 }
 
+#[cfg(test)]
+pub(crate) fn parse_tool_file_from_text_for_tests(text: &str) -> Result<ToolSpec, String> {
+    parse_tool_source(Path::new("test.toml"), text)
+}
+
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
@@ -553,6 +584,21 @@ fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
     if description.chars().count() > MAX_EXTERNAL_DESC_CHARS {
         description = description.chars().take(MAX_EXTERNAL_DESC_CHARS).collect::<String>() + "…";
     }
+    let example = match file.example {
+        None => None,
+        Some(ex) => {
+            if let Some(pattern) = ex.expect_regex.as_deref() {
+                regex::Regex::new(pattern)
+                    .map_err(|e| format!("example.expect_regex is invalid: {e}"))?;
+            }
+            let args = match ex.args {
+                None => serde_json::json!({}),
+                Some(v) if v.is_object() => v,
+                Some(_) => return Err("example.args must be a table".into()),
+            };
+            Some(ToolExample { args, expect_regex: ex.expect_regex })
+        }
+    };
     let parameters = match file.params {
         Some(p) if p.is_object() => {
             validate_params_schema(&p)?;
@@ -568,6 +614,7 @@ fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
         mutating: file.mutating,
         kind: ToolKind::External(ExternalTool {
             source_sha256,
+            example,
             command: file.command.trim().to_string(),
             args: file.args,
             timeout_secs: file.timeout_secs.clamp(1, 300),

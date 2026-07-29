@@ -306,6 +306,43 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     findings
 }
 
+/// `--check --run-examples`: prove each tool with an `[example]` actually
+/// runs, through the exact spawn path a session uses (stdin JSON, timeout,
+/// output caps). Returns (tool name, verdict) per declared example. This
+/// executes project commands: opt-in per invocation, never part of plain
+/// `--check`.
+pub async fn run_examples(project_root: &Path) -> Vec<(String, Result<(), String>)> {
+    use crate::registry::{Registry, ToolKind};
+    let registry = Registry::build(project_root);
+    let caps = crate::tools::OutputCaps::default();
+    let mut results = Vec::new();
+    for spec in &registry.tools {
+        let ToolKind::External(ext) = &spec.kind else { continue };
+        let Some(example) = &ext.example else { continue };
+        let cancel = std::sync::Arc::new(crate::state::CancelToken::default());
+        let outcome = registry
+            .execute(&spec.name, &example.args, project_root, caps, cancel)
+            .await;
+        let first_line = |s: &str| s.lines().next().unwrap_or("").to_string();
+        let verdict = if !outcome.ok {
+            Err(format!("example run failed: {}", first_line(&outcome.output)))
+        } else if let Some(pattern) = &example.expect_regex {
+            match regex::Regex::new(pattern) {
+                Ok(re) if re.is_match(&outcome.output) => Ok(()),
+                Ok(_) => Err(format!(
+                    "example output does not match expect_regex {pattern:?}: {}",
+                    first_line(&outcome.output)
+                )),
+                Err(e) => Err(format!("expect_regex failed to compile: {e}")),
+            }
+        } else {
+            Ok(())
+        };
+        results.push((spec.name.clone(), verdict));
+    }
+    results
+}
+
 /// Skill-library hygiene: extensions the usage record says are pure prompt
 /// tax, and near-duplicate skill descriptions that shadow each other in the
 /// index. Warnings only - the agent (or human) judges and deletes; nothing
@@ -759,6 +796,40 @@ mod tests {
         let root = temp_project();
         assert!(local(&root).is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_examples_proves_tools_through_the_real_spawn_path() {
+        let root = temp_project();
+        let tools_dir = root.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        // Echoes its stdin JSON back: the example asserts the payload arrived.
+        std::fs::write(
+            tools_dir.join("echoer.toml"),
+            "name = \"echoer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat\"]\n\n[example]\nexpect_regex = \"hello\"\n[example.args]\nmsg = \"hello\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tools_dir.join("broken.toml"),
+            "name = \"broken\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 3\"]\n\n[example]\n",
+        )
+        .unwrap();
+
+        let mut results = run_examples(&root).await;
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].0, "echoer");
+        assert!(results[1].1.is_ok(), "{:?}", results[1].1);
+        assert_eq!(results[0].0, "broken");
+        assert!(results[0].1.as_ref().unwrap_err().contains("failed"), "{:?}", results[0].1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_invalid_example_regex_is_a_parse_error() {
+        let text = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n\n[example]\nexpect_regex = \"(\"\n";
+        let err = crate::registry::parse_tool_file_from_text_for_tests(text).unwrap_err();
+        assert!(err.contains("expect_regex"), "{err}");
     }
 
     #[test]
