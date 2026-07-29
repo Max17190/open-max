@@ -264,6 +264,12 @@ impl Registry {
         &self.schemas_wire
     }
 
+    /// Owned handle to the same frozen bytes, for turn state that must
+    /// outlive a mid-turn registry swap.
+    pub(crate) fn schemas_wire_arc(&self) -> Arc<str> {
+        self.schemas_wire.clone()
+    }
+
     pub async fn execute(
         &self,
         name: &str,
