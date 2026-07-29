@@ -16,8 +16,9 @@ use crate::theme;
 
 /// Frames go through one large buffer per flush: bare `Stdout` is
 /// line-buffered at 1 KiB, which turns a busy streaming frame into dozens of
-/// write(2) calls.
-pub type Term = Terminal<CrosstermBackend<std::io::BufWriter<std::io::Stdout>>>;
+/// write(2) calls. `FrameWriter` also keeps a mid-panic partial frame from
+/// flushing over the restored shell.
+pub type Term = Terminal<CrosstermBackend<crate::FrameWriter<std::io::Stdout>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]

@@ -363,10 +363,10 @@ async fn main() -> std::io::Result<()> {
 }
 
 /// `ratatui::init` with one change: frame output goes through a 256 KiB
-/// `BufWriter` so each flush is one write(2) instead of the dozens that
-/// `Stdout`'s built-in 1 KiB line buffer produces on token-streaming frames.
+/// buffer so each flush is one write(2) instead of the dozens that `Stdout`'s
+/// built-in 1 KiB line buffer produces on token-streaming frames.
 /// `ratatui::restore` stays the counterpart on exit and panic; it operates on
-/// the shared stdout fd, and every frame ends fully flushed.
+/// the shared stdout fd, and every completed frame ends fully flushed.
 fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
     // Hook first: any panic or error past raw mode must restore the shell.
@@ -377,12 +377,51 @@ fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     }));
     enable_raw_mode()?;
     let init = || -> std::io::Result<ui::transcript::Term> {
-        let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout());
+        let mut out = FrameWriter::new(std::io::stdout(), 256 * 1024);
         execute!(out, EnterAlternateScreen)?;
         out.flush()?;
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
     };
     init().inspect_err(|_| ratatui::restore())
+}
+
+/// A frame-sized `BufWriter` that discards, rather than flushes, its buffered
+/// bytes when dropped mid-panic. The panic hook has already restored the
+/// normal screen by the time unwinding drops the terminal, so flushing a
+/// partial frame there would spray escape bytes over the user's shell.
+pub struct FrameWriter<W: Write>(Option<std::io::BufWriter<W>>);
+
+impl<W: Write> FrameWriter<W> {
+    fn new(inner: W, capacity: usize) -> Self {
+        Self(Some(std::io::BufWriter::with_capacity(capacity, inner)))
+    }
+
+    fn buf(&mut self) -> &mut std::io::BufWriter<W> {
+        self.0.as_mut().expect("writer present until drop")
+    }
+}
+
+impl<W: Write> Write for FrameWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.buf().flush()
+    }
+}
+
+impl<W: Write> Drop for FrameWriter<W> {
+    fn drop(&mut self) {
+        if let Some(w) = self.0.take() {
+            if std::thread::panicking() {
+                // into_parts hands the buffer back without writing it.
+                drop(w.into_parts());
+            } else {
+                drop(w);
+            }
+        }
+    }
 }
 
 fn ensure_project_trust(
@@ -424,6 +463,45 @@ fn ensure_project_trust(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_writer_flushes_buffered_bytes_on_normal_drop() {
+        let sink = Sink::default();
+        {
+            let mut w = FrameWriter::new(sink.clone(), 1024);
+            w.write_all(b"complete frame").unwrap();
+        }
+        assert_eq!(sink.0.lock().unwrap().as_slice(), b"complete frame");
+    }
+
+    #[test]
+    fn frame_writer_discards_partial_frame_when_dropped_panicking() {
+        let sink = Sink::default();
+        let inner = sink.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut w = FrameWriter::new(inner, 1024);
+            w.write_all(b"half a frame of escape bytes").unwrap();
+            panic!("draw failed");
+        }));
+        assert!(result.is_err());
+        // The restored shell must never receive the abandoned frame.
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn single_print_prompt_is_one_turn() {
