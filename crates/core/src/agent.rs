@@ -48,11 +48,12 @@ fn is_native_call_broken(call: &ToolCall) -> bool {
 fn resolve_tool_calls(
     mut content: String,
     mut tool_calls: Vec<ToolCall>,
-    known_tools: &[&str],
+    known_tools: &[String],
 ) -> (String, Vec<ToolCall>) {
     let all_broken = !tool_calls.is_empty() && tool_calls.iter().all(is_native_call_broken);
     if tool_calls.is_empty() || all_broken {
-        if let Some((clean, calls)) = fallback::extract_tool_calls(&content, known_tools) {
+        let names: Vec<&str> = known_tools.iter().map(String::as_str).collect();
+        if let Some((clean, calls)) = fallback::extract_tool_calls(&content, &names) {
             content = clean;
             tool_calls = calls;
         }
@@ -791,6 +792,61 @@ async fn refreeze_if_extensions_changed(
     }
 }
 
+/// The mid-turn half of the self-modification loop. The turn-start check
+/// closes create-then-use across turns; this closes it within one turn:
+/// called between iterations after a mutating call succeeded, it captures one
+/// immutable extension generation, and if the fingerprint moved it swaps the
+/// turn's registry and the transcript's system prompt in place, installs the
+/// new generation into the session (the next turn-start check must compare
+/// against it), and persists the manifest. The caller updates its own wire
+/// state and rewrites the transcript. The session's `data.messages` is empty
+/// while the turn owns the transcript, so unlike `apply_freeze` this never
+/// touches it; this turn holds `running`, so nothing else mutates the session.
+///
+/// Returns true when a new generation was activated.
+async fn refreeze_between_iterations(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    registry: &mut Arc<Registry>,
+    messages: &mut Vec<ChatMessage>,
+) -> bool {
+    let snapshot = {
+        let root = project_root.to_path_buf();
+        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return false,
+        }
+    };
+    if snapshot.fingerprint() == registry.ext_fingerprint {
+        return false;
+    }
+    let Ok(new_registry) =
+        tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await
+    else {
+        return false;
+    };
+    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
+    let counts = (new_registry.tools.len(), new_registry.skills.len());
+    let new_registry = Arc::new(new_registry);
+    if messages.first().is_some_and(|m| m.role == "system") {
+        messages[0] = ChatMessage::system(prompt);
+    } else {
+        messages.insert(0, ChatMessage::system(prompt));
+    }
+    {
+        let mut sessions_map = core.sessions.lock().await;
+        if let Some(data) = sessions_map.get_mut(session_id) {
+            data.registry = new_registry.clone();
+            data.prompt_breakdown = Arc::new(breakdown);
+            sessions::save_manifest(core, session_id, &data.registry.to_manifest());
+        }
+    }
+    *registry = new_registry;
+    core.send_agent(session_id, AgentEvent::Refrozen { tools: counts.0, skills: counts.1 });
+    true
+}
+
 /// Buffers streamed deltas and flushes them as batched events.
 struct TokenBatcher {
     core: Arc<Core>,
@@ -872,7 +928,7 @@ async fn run_loop(
 
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
-    let (messages, registry, take_seq, first_turn) = {
+    let (messages, mut registry, take_seq, first_turn) = {
         {
             let mut sessions_map = core.sessions.lock().await;
             if let Some(data) = sessions_map.get_mut(session_id) {
@@ -922,10 +978,11 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint);
-    // Frozen wire form once per turn: every iteration injects the same tool
-    // schema bytes without re-serializing the Value array.
-    let schemas_wire = registry.tool_schemas_wire();
-    let known_tools: Vec<&str> = registry.tools.iter().map(|s| s.name.as_str()).collect();
+    // Frozen wire form per freeze window: every iteration injects the same
+    // tool schema bytes without re-serializing the Value array. `mut` because
+    // a mid-turn refreeze swaps in the next generation between iterations.
+    let mut schemas_wire = registry.schemas_wire_arc();
+    let mut known_tools: Vec<String> = registry.tools.iter().map(|s| s.name.clone()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
@@ -969,7 +1026,7 @@ async fn run_loop(
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let result = client
-            .stream_chat(guard.messages(), schemas_wire, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -1022,6 +1079,11 @@ async fn run_loop(
             stop_reason = result.finish_reason;
             break 'turns;
         }
+
+        // True once any mutating call succeeded this iteration: only then can
+        // extension files have changed, so only then is the fingerprint
+        // re-checked before the next model request.
+        let mut extensions_touched = false;
 
         let segments = partition_concurrent_runs(&tool_calls, |call| {
             batchable_call(call, &registry, &repeat_tracker, &permissions)
@@ -1236,10 +1298,29 @@ async fn run_loop(
                 guard.messages().push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
                 if executed {
                     repeat_tracker.record_executed(name, &args_key);
+                    if outcome.ok && registry.is_mutating(name) {
+                        extensions_touched = true;
+                    }
                 }
             }
         }
-        save_messages(core, session_id, guard.messages(), false).await;
+
+        // The mid-turn half of the self-modification loop: an extension file
+        // written by this iteration's mutating calls activates before the
+        // next model request, so a tool the agent writes in iteration N is
+        // callable in iteration N+1 without ending the turn. One deliberate
+        // prompt-cache re-prefill, and only when extension bytes actually
+        // changed; hooks and permissions keep their per-turn discovery.
+        let refrozen = extensions_touched
+            && refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
+                .await;
+        if refrozen {
+            schemas_wire = registry.schemas_wire_arc();
+            known_tools = registry.tools.iter().map(|s| s.name.clone()).collect();
+        }
+        // The system prompt at index 0 changed on refreeze, so the transcript
+        // prefix on disk is stale: rewrite instead of append.
+        save_messages(core, session_id, guard.messages(), refrozen).await;
     }
 
     // Cancel mid-turn may leave the last assistant's tool_calls without tool
@@ -1566,7 +1647,7 @@ mod tests {
 
     #[test]
     fn broken_native_calls_fall_back_to_markup() {
-        let known = ["read_file", "bash"];
+        let known = ["read_file".to_string(), "bash".to_string()];
         let content = "I'll read it.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>";
         let broken = vec![ToolCall {
             id: "call_0".into(),
@@ -1584,7 +1665,7 @@ mod tests {
 
     #[test]
     fn partial_broken_native_calls_keep_native() {
-        let known = ["read_file", "bash"];
+        let known = ["read_file".to_string(), "bash".to_string()];
         let good = ToolCall {
             id: "call_0".into(),
             kind: "function".into(),
@@ -2037,6 +2118,67 @@ mod tests {
         drop(map);
         let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
         assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The create-then-use loop closes inside one turn: after a mutating call
+    /// writes a tool file, the between-iterations check swaps the turn's own
+    /// registry and system prompt, installs the generation into the session,
+    /// and persists the manifest, so iteration N+1 can call what iteration N
+    /// wrote. An unchanged disk stays a no-op (prompt cache kept).
+    #[tokio::test]
+    async fn midturn_refreeze_activates_new_tool_between_iterations() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "midturn-refreeze";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let mut data = build_session_data(&core, id, &project);
+            data.messages.push(ChatMessage::user("write a deploy tool"));
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+        // Simulate the running turn: the transcript is taken, the session's
+        // message list is empty, and the loop holds its own registry Arc.
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        assert!(registry.get("deploy").is_none());
+
+        // Unchanged disk between iterations: no-op, same registry Arc.
+        let before = registry.clone();
+        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(Arc::ptr_eq(&registry, &before), "no-op must not rebuild");
+
+        // Iteration N writes a tool file; the check activates it for N+1.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+        )
+        .unwrap();
+        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(registry.is_mutating("deploy"), "turn-local registry must carry the new tool");
+        assert_eq!(messages[0].role, "system", "system prompt swapped in place");
+        assert_eq!(messages.len(), 2, "conversation must survive the refreeze");
+        {
+            let map = core.sessions.lock().await;
+            let data = map.get(id).unwrap();
+            assert!(data.registry.get("deploy").is_some(), "session registry must be installed");
+            assert!(data.messages.is_empty(), "the taken transcript must stay owned by the turn");
+        }
+        let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
+        assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
+
+        // Same generation again: idempotent, so the next model request keeps
+        // its (already re-prefilled) cache.
+        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
