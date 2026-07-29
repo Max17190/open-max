@@ -147,7 +147,9 @@ fn conversation_layout(
     remaining = remaining.saturating_sub(popup_min_h);
     let status_h = u16::from(remaining > 0);
     remaining = remaining.saturating_sub(status_h);
-    let header_h = u16::from(show_header && remaining > 0);
+    // The path header is persistent chrome, but on degenerate heights the
+    // last row belongs to the conversation, not the address line.
+    let header_h = u16::from(show_header && remaining > 1);
     remaining = remaining.saturating_sub(header_h);
     // Active completion and search surfaces own keyboard input, so they must
     // stay visible before passive queued-message previews receive rows.
@@ -2567,22 +2569,16 @@ impl App {
             .or(popup_lines.as_ref())
             .map(|l| l.len() as u16)
             .unwrap_or(0);
-        let show_header = self.transcript.block_count() == 0
-            && self.composer.is_empty()
-            && self.queued.is_empty()
-            && self.pending_approval.is_none()
-            && !self.running
-            && self.stream_text.is_empty();
         let layout = conversation_layout(
             area,
-            show_header,
+            true,
             desired_input_h,
             desired_queue_h,
             desired_popup_h,
         );
         self.page_h = layout.chat.height.saturating_sub(1).max(1);
 
-        // Top to bottom: idle wordmark, transcript, transient overlays,
+        // Top to bottom: project path, transcript, transient overlays,
         // status, and the bottom-fixed input surface.
         if layout.header.height > 0 {
             self.draw_header(frame, layout.header);
@@ -2731,12 +2727,7 @@ impl App {
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
         if self.dirty.chrome || self.header_width != area.width {
             self.header_width = area.width;
-            self.header_line = Line::from(Span::styled(
-                "OPEN MAX",
-                Style::default()
-                    .fg(theme::ACCENT())
-                    .add_modifier(Modifier::BOLD),
-            ));
+            self.header_line = header_path_line(&self.project, area.width as usize);
         }
         (&self.header_line).render(area, frame.buffer_mut());
     }
@@ -3283,6 +3274,55 @@ fn scroll_search_lines(
     lines
 }
 
+/// The one persistent line of top chrome: the project path, parent dimmed
+/// and basename bright, shortened from the left so the basename survives
+/// narrow terminals. `$HOME` collapses to `~`.
+fn header_path_line(project: &std::path::Path, width: usize) -> Line<'static> {
+    if width < 2 {
+        return Line::default();
+    }
+    let home = std::env::var("HOME").ok();
+    let display = home_shortened(&project.display().to_string(), home.as_deref());
+    let (parent, base) = match display.rfind('/') {
+        Some(i) if i + 1 < display.len() => display.split_at(i + 1),
+        _ => ("", display.as_str()),
+    };
+    let base_style = Style::default()
+        .fg(theme::ACCENT())
+        .add_modifier(Modifier::BOLD);
+    let parent_w = crate::ui::text::width(parent);
+    let base_w = crate::ui::text::width(base);
+    if parent_w + base_w <= width {
+        return Line::from(vec![
+            Span::styled(parent.to_string(), Style::default().fg(theme::DIM())),
+            Span::styled(base.to_string(), base_style),
+        ]);
+    }
+    if base_w + 2 <= width {
+        return Line::from(vec![
+            Span::styled("…/", Style::default().fg(theme::DIM())),
+            Span::styled(base.to_string(), base_style),
+        ]);
+    }
+    Line::from(Span::styled(clip(base, width), base_style))
+}
+
+fn home_shortened(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    if home.is_empty() || home == "/" {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("{n} {word}")
@@ -3462,8 +3502,9 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
-        conversation_layout, help_line, kv, paint_text_selection, plural, rect_contains,
-        save_model_selection, App, Dirty, Focus, TermEvent, MIN_DRAW_INTERVAL,
+        conversation_layout, header_path_line, help_line, home_shortened, kv,
+        paint_text_selection, plural, rect_contains, save_model_selection, App, Dirty,
+        Focus, TermEvent, MIN_DRAW_INTERVAL,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
@@ -3572,6 +3613,15 @@ mod tests {
         assert_eq!(three_rows.input.height, 3);
         assert_eq!(three_rows.status.height, 0);
         assert_eq!(three_rows.header.height, 0);
+
+        // With exactly one spare row the conversation wins it, not the header.
+        let five_rows = conversation_layout(Rect::new(0, 0, 64, 5), true, 3, 0, 0);
+        assert_eq!(five_rows.header.height, 0);
+        assert_eq!(five_rows.chat.height, 1);
+
+        let six_rows = conversation_layout(Rect::new(0, 0, 64, 6), true, 3, 0, 0);
+        assert_eq!(six_rows.header.height, 1);
+        assert_eq!(six_rows.chat.height, 1);
     }
 
     #[test]
@@ -3603,7 +3653,7 @@ mod tests {
 
         let buffer = render_app(&mut app, 80, 24);
 
-        assert!(rows(&buffer)[0].starts_with("OPEN MAX"));
+        assert!(rows(&buffer)[0].contains("openmax-app-render"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3914,7 +3964,7 @@ mod tests {
         app.core.settings.lock().unwrap().model = "provider/test-model".into();
         let buffer = render_app(&mut app, 96, 18);
         let text = buffer_text(&buffer);
-        assert!(rows(&buffer)[0].starts_with("OPEN MAX"));
+        assert!(rows(&buffer)[0].contains("openmax-app-render"));
         assert!(rows(&buffer)[1].starts_with("READY"));
         assert!(text.contains("READY"));
         assert!(text.contains("Describe a task"));
@@ -3935,7 +3985,7 @@ mod tests {
         let (mut app, dir) = app_fixture();
 
         let four_rows = rows(&render_app(&mut app, 64, 4));
-        assert!(!four_rows[0].contains("OPEN MAX"));
+        assert!(!four_rows[0].contains("openmax-app-render"));
         assert!(four_rows[2].contains("Describe a task"));
         assert!(four_rows[3].starts_with('╰'));
 
@@ -3945,16 +3995,47 @@ mod tests {
     }
 
     #[test]
-    fn active_conversation_reclaims_idle_header_without_moving_prompt() {
+    fn project_path_header_persists_through_active_conversation() {
         let (mut app, dir) = app_fixture();
         app.insert_user_block("inspect the current layout");
         let buffer = render_app(&mut app, 72, 12);
         let rendered = rows(&buffer);
 
-        assert!(!rendered[0].contains("OPEN MAX"));
+        assert!(rendered[0].contains("openmax-app-render"));
         assert!(rendered.iter().any(|row| row.contains("inspect the current layout")));
         assert!(rendered.last().unwrap().starts_with('╰'));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_path_dims_parent_and_keeps_basename_on_narrow_widths() {
+        let path = std::path::Path::new("/work/deep/nested/project");
+
+        let wide = header_path_line(path, 40);
+        assert_eq!(line_text(&wide), "/work/deep/nested/project");
+        assert_eq!(wide.spans.len(), 2);
+        assert_eq!(wide.spans[1].content.as_ref(), "project");
+
+        let narrow = header_path_line(path, 12);
+        assert_eq!(line_text(&narrow), "…/project");
+
+        let tiny = header_path_line(path, 5);
+        assert_eq!(line_text(&tiny), "proj…");
+        for width in 0..30 {
+            let text = line_text(&header_path_line(path, width));
+            assert!(crate::ui::text::width(&text) <= width);
+        }
+    }
+
+    #[test]
+    fn home_prefix_collapses_to_tilde_without_eating_sibling_dirs() {
+        let home = Some("/Users/max");
+        assert_eq!(home_shortened("/Users/max/code/app", home), "~/code/app");
+        assert_eq!(home_shortened("/Users/max", home), "~");
+        assert_eq!(home_shortened("/Users/maxine/code", home), "/Users/maxine/code");
+        assert_eq!(home_shortened("/srv/data", home), "/srv/data");
+        assert_eq!(home_shortened("/srv/data", None), "/srv/data");
+        assert_eq!(home_shortened("/srv/data", Some("/")), "/srv/data");
     }
 
     #[test]
@@ -4211,13 +4292,15 @@ mod tests {
         app.sync_completion();
         let narrow = render_app(&mut app, 34, 8);
         let narrow_text = buffer_text(&narrow);
-        assert!(narrow_text.contains("OPEN MAX"));
+        assert!(narrow_text.contains("openmax-app-render"));
         assert!(narrow_text.contains("READY"));
         assert!(narrow_text.contains("Describe a task"));
         assert!(!narrow_text.contains("small core"));
         assert!(!narrow_text.contains("skills · tools"));
+        // At five rows the header yields its row to the conversation plane.
         let tiny = render_app(&mut app, 12, 5);
-        assert!(buffer_text(&tiny).contains("OPEN MAX"));
+        assert!(buffer_text(&tiny).contains("READY"));
+        assert!(!buffer_text(&tiny).contains("openmax-app-render"));
         fs::remove_dir_all(dir).unwrap();
     }
 

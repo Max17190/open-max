@@ -28,6 +28,41 @@ pub fn highlighter() -> &'static Highlighter {
     HL.get_or_init(Highlighter::default)
 }
 
+/// Syntect compiles each syntax's regexes lazily on first use, which lands as
+/// a 10-25 ms stall inside the frame that renders a session's first code line
+/// in that language. The moment a fence opens, this kicks that compilation
+/// onto a background thread; by the time the first code line inside the fence
+/// completes, the syntax is usually warm. Pre-warming a fixed language list
+/// instead would pin ~5-9 MB of compiled regexes per language whether or not
+/// the session ever renders it, so warming stays demand-driven: memory goes
+/// only to languages actually on screen, exactly as the lazy path spends it.
+/// Concurrent first use is safe: syntect's lazy cells accept one winner and
+/// the loser's compile is discarded.
+fn warm_lang_async(lang: &str) {
+    static STARTED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    let started = STARTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut started) = started.lock() else {
+        return;
+    };
+    if !started.insert(lang.to_string()) {
+        return;
+    }
+    drop(started);
+    let lang = lang.to_string();
+    std::thread::spawn(move || {
+        let hl = highlighter();
+        let mut st = LineState::default();
+        for line in [
+            format!("```{lang}"),
+            "let x = f(0); // c #".to_string(),
+            "```".to_string(),
+        ] {
+            let _ = render_line(&line, &mut st, hl);
+        }
+    });
+}
+
 impl Default for Highlighter {
     fn default() -> Self {
         // Keep default-syntaxes: we have no vendored language subset, so the
@@ -129,6 +164,9 @@ pub fn render_line<'a>(raw: &str, st: &mut LineState<'a>, hl: &'a Highlighter) -
         } else {
             st.in_fence = true;
             let fence_lang = trimmed.trim_start_matches('`').trim();
+            if !fence_lang.is_empty() {
+                warm_lang_async(fence_lang);
+            }
             let syntax = hl
                 .syntaxes
                 .find_syntax_by_token(fence_lang)
@@ -456,6 +494,19 @@ fn find(chars: &[char], from: usize, needle: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "memory probe; run under /usr/bin/time -l with WARM_PROBE=<langs>"]
+    fn warm_rss_probe() {
+        let langs = std::env::var("WARM_PROBE").unwrap_or_default();
+        let hl = highlighter();
+        for lang in langs.split(',').filter(|s| !s.is_empty()) {
+            let mut st = LineState::default();
+            for line in [format!("```{lang}"), "let x = f(0); // c #".into(), "```".into()] {
+                let _ = render_line(&line, &mut st, hl);
+            }
+        }
+    }
 
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
