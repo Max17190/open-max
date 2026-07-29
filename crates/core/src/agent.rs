@@ -619,29 +619,82 @@ pub fn start_turn(
             project_root.display()
         ));
     }
+    let cancelled = Arc::new(CancelToken::default());
     {
+        // `running` is the outer lock for both pieces of turn state. Claiming
+        // the session and publishing its cancel token under one hold is what
+        // makes "a running session always has a live token" true, so a turn
+        // can never be started into a state where cancel does nothing.
         let mut running = core.running.lock().unwrap();
         if running.contains(&session_id) {
             return Err("the agent is already working in this session".into());
         }
+        core.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), cancelled.clone());
         running.insert(session_id.clone());
     }
-    let cancelled = Arc::new(CancelToken::default());
-    core.cancel_flags
-        .lock()
-        .unwrap()
-        .insert(session_id.clone(), cancelled.clone());
 
     let settings = core.settings.lock().unwrap().clone();
     // Title is set after user_prompt_submit accepts the text (see run_loop).
     // Titling here would fail-open secret/PII gates into the session index.
 
-    tokio::spawn(async move {
-        run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await;
-        core.running.lock().unwrap().remove(&session_id);
-        core.cancel_flags.lock().unwrap().remove(&session_id);
-    });
+    let turn = {
+        let (core, session_id, project_root) =
+            (core.clone(), session_id.clone(), project_root.clone());
+        async move {
+            run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await;
+        }
+    };
+    spawn_guarded_turn(core, session_id, turn);
     Ok(())
+}
+
+/// Run one turn to completion and guarantee it ends observably.
+///
+/// A turn owns the only terminator its clients get. A panic inside the loop
+/// would unwind past both the `Done` event and the bookkeeping below, leaving
+/// the session marked running forever: the TUI spinner never stops, a
+/// `--stdio` frontend blocks on a `done` that can no longer arrive, and every
+/// later prompt is refused because the session still looks busy. Isolating the
+/// loop in its own task turns that unwind into an ordinary error report.
+fn spawn_guarded_turn<F>(core: Arc<Core>, session_id: String, turn: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(join) = tokio::spawn(turn).await {
+            let detail = if join.is_cancelled() {
+                "the turn task was dropped".to_string()
+            } else {
+                panic_detail(join.into_panic())
+            };
+            core.send_agent(
+                &session_id,
+                AgentEvent::Error { message: format!("the turn ended unexpectedly: {detail}") },
+            );
+            core.send_agent(&session_id, AgentEvent::Done { stop_reason: "error".into() });
+        }
+        // Released together, under the same outer lock the turn claimed them
+        // with. Dropping `running` first would let a client that just saw
+        // `done` start the next turn in the gap and have its fresh cancel
+        // token deleted by the line below, leaving a turn nobody can stop.
+        let mut running = core.running.lock().unwrap();
+        core.cancel_flags.lock().unwrap().remove(&session_id);
+        running.remove(&session_id);
+    });
+}
+
+/// Recover the message a panic carried, for the error event that replaces it.
+fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(_) => "panic".to_string(),
+    }
 }
 
 /// Re-freeze a live session's registry and system prompt from the current
@@ -2646,5 +2699,50 @@ mod tests {
         );
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
         assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
+    }
+
+    /// A turn that dies mid-flight must still terminate for its clients and
+    /// must not leave the session looking busy forever.
+    #[tokio::test]
+    async fn a_panicking_turn_still_reports_done_and_frees_the_session() {
+        use crate::state::{CancelToken, Core, CoreEvent};
+
+        let dir = std::env::temp_dir().join(format!("openmax-panic-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir).unwrap();
+        let session_id = "sess-panic".to_string();
+        core.running.lock().unwrap().insert(session_id.clone());
+        core.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), Arc::new(CancelToken::default()));
+
+        spawn_guarded_turn(core.clone(), session_id.clone(), async {
+            panic!("provider client exploded");
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let (mut saw_error, mut stop_reason) = (false, None);
+        while stop_reason.is_none() && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(CoreEvent::Agent(env))) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Error { message } => {
+                        assert!(message.contains("provider client exploded"), "{message}");
+                        saw_error = true;
+                    }
+                    AgentEvent::Done { stop_reason: reason } => stop_reason = Some(reason),
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(stop_reason.as_deref(), Some("error"), "a dead turn must still emit Done");
+        assert!(saw_error, "the panic must be reported before Done");
+        assert!(!core.is_running(&session_id), "a dead turn must release the session");
+        assert!(
+            !core.cancel_flags.lock().unwrap().contains_key(&session_id),
+            "a dead turn must drop its cancel token"
+        );
     }
 }

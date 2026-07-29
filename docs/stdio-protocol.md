@@ -64,11 +64,35 @@ Example event line:
 
 ## Turn guarantees
 
-Each turn ends with exactly one `done`, and `done` is the only guaranteed turn
-terminator: never block waiting for another event. On a normal turn a run of
-`token` deltas is terminated by one `message_done`, but a turn that hits a
-provider-stream error emits an `error` line and then `done` with no
-`message_done`. Bad input yields `{"type":"protocol_error","message":"..."}`
-and leaves the session unharmed. While a client is live, an `approval_request`
-is forwarded and openmax waits for an `approve`; after `quit` or EOF, pending
-and later approvals are declined so shutdown drains promptly.
+Every `user` command is answered by exactly one `done`, and `done` is the only
+guaranteed terminator: never block waiting for another event. On a normal turn
+a run of `token` deltas is terminated by one `message_done`, but a turn that
+hits a provider-stream error emits an `error` line and then `done` with no
+`message_done`. A turn that dies unexpectedly reports `error` and then `done`
+with `stop_reason` `error`, so a crash is an event rather than a silent stall.
+
+A `user` command that starts no turn still terminates. Empty text, or a project
+that is not trusted, yields `{"type":"protocol_error","message":"..."}`
+followed by `done` with `stop_reason` `refused`, so a client that blocks on
+`done` is never stuck waiting on a prompt nothing will answer.
+
+| `stop_reason` | Meaning |
+| --- | --- |
+| provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
+| `max_iterations` | The turn hit the tool-call ceiling |
+| `blocked` | A `user_prompt_submit` hook refused the prompt |
+| `cancelled` | A `cancel` command or shutdown stopped the turn |
+| `error` | The turn failed; an `error` line precedes it |
+| `refused` | The command started no turn; a `protocol_error` precedes it |
+
+The one case with no `done` is a `user` sent while a turn is already in flight:
+it is refused with a `protocol_error` alone, because the running turn owns the
+next `done` and a second one would report that turn as finished.
+
+Bad input leaves the session unharmed. A line that is not valid UTF-8, or one
+longer than 8 MiB, is reported as a `protocol_error` and skipped; the reader
+resynchronizes on the next newline and keeps going.
+
+While a client is live, an `approval_request` is forwarded and openmax waits for
+an `approve`; after `quit` or EOF, pending and later approvals are declined so
+shutdown drains promptly.

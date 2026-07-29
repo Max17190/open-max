@@ -322,10 +322,20 @@ path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail), `approval_settled` (approval_id, outcome), `refrozen` (tools,
 skills), `done` (stop_reason), `error` (message).
 
-Each turn ends with exactly one `done`, and `done` is the only guaranteed
-turn terminator. While a client is live, approvals are forwarded and openmax
-waits for an `approve`; after quit or EOF, pending and later approvals are
-declined so shutdown drains promptly.
+Every `user` command is answered by exactly one `done`, and `done` is the
+only guaranteed terminator. A command that starts no turn (empty text, an
+untrusted project) still gets one, with stop_reason `refused`, after the
+`protocol_error` that says why. A turn that dies unexpectedly reports
+`error` and then `done` with stop_reason `error`. The single exception is a
+`user` sent while a turn is in flight: that is refused with a
+`protocol_error` and no `done`, because the running turn owns the next one.
+
+A command line over 8 MiB, or one that is not valid UTF-8, is refused with a
+`protocol_error` and skipped; the session keeps reading.
+
+While a client is live, approvals are forwarded and openmax waits for an
+`approve`; after quit or EOF, pending and later approvals are declined so
+shutdown drains promptly.
 
 Validate a stream against the contract: `openmax --check --stdio` reads JSONL
 on stdin, reports each line, and exits nonzero on any violation.
