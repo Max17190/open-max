@@ -27,6 +27,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Skill script tests
+        run: .agents/skills/delegate/scripts/test-openmax-tmux
+
   release-build:
     name: Release build (Ubuntu)
     runs-on: ubuntu-latest

@@ -9,13 +9,22 @@ Use when a sub-task deserves its own context window: a large refactor step, an
 isolated investigation, work in a different directory, or work that can proceed
 in parallel with the main task.
 
+## Trust comes from the human, never from you
+
+A child openmax refuses to run in a project the human has not trusted (exit
+code 3). Never pass `--trust-project` to a child or run it yourself; trust
+grants are human actions. When delegating outside the current trusted root,
+ask the human to run `openmax --trust-project /path/to/project` first, then
+start the child.
+
 ## One-shot: headless print
 
-For a self-contained task with a clear deliverable:
+For a self-contained task with a clear deliverable in an already-trusted
+project:
 
 ```sh
 cd /path/to/target/project
-openmax --trust-project -p "Rename the config module to settings across this crate; run cargo check; report what changed."
+openmax -p "Rename the config module to settings across this crate; run cargo check; report what changed."
 ```
 
 - Output text arrives on stdout; tool progress arrives on stderr.
@@ -48,9 +57,11 @@ delegate=$(
 
 `start` canonicalizes the project directory, saves the exact prompt to a file,
 creates a persistent generation directory, and atomically updates the logical
-name symlink. It launches the configured `OPENMAX_BIN` or `openmax` using
-`--trust-project`, captures combined output and the exact exit code, and uses a
-tmux wait lock for race-free completion. Capture the immutable generation path
+name symlink. It launches the configured `OPENMAX_BIN` or `openmax` in the
+target directory, captures combined output and the exact exit code, and uses a
+tmux wait lock for race-free completion. If the target is untrusted, the child
+exits 3 and `status` reports `exited 3`; that means the human still has to run
+`openmax --trust-project` there. Capture the immutable generation path
 printed by `start` and pass that handle to every later command. Operational
 commands reject mutable logical names. Starting the same logical name while its
 current generation is running is also rejected. `list` reports every retained
@@ -72,6 +83,7 @@ result into the parent session; do not paste raw transcripts.
 
 ## Do not
 
+- Pass `--trust-project` to a child or run it on the human's behalf.
 - Recurse without a depth budget. State "do not delegate further" by default.
 - Run two mutating children in one worktree.
 - Treat a tmux session as a permission or sandbox boundary.

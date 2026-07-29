@@ -269,7 +269,7 @@ start_delegate() {
 
   tmux wait-for -L "$channel"
   local command
-  command="finish() { code=\$1; trap - EXIT HUP INT TERM; tmp=$quoted_exit.tmp.\$\$; printf '%s\\n' \"\$code\" >\"\$tmp\"; ln \"\$tmp\" $quoted_exit 2>/dev/null || true; rm -f \"\$tmp\"; tmux wait-for -U $quoted_channel >/dev/null 2>&1 || true; exit \"\$code\"; }; trap 'finish \$?' EXIT; trap 'finish 129' HUP; trap 'finish 130' INT; trap 'finish 143' TERM; tmux set-option -w -t =$session: remain-on-exit on || exit 125; cd $quoted_project || exit 125; $quoted_bin --trust-project -p \"\$(cat $quoted_prompt)\" >$quoted_output 2>&1; exit \$?"
+  command="finish() { code=\$1; trap - EXIT HUP INT TERM; tmp=$quoted_exit.tmp.\$\$; printf '%s\\n' \"\$code\" >\"\$tmp\"; ln \"\$tmp\" $quoted_exit 2>/dev/null || true; rm -f \"\$tmp\"; tmux wait-for -U $quoted_channel >/dev/null 2>&1 || true; exit \"\$code\"; }; trap 'finish \$?' EXIT; trap 'finish 129' HUP; trap 'finish 130' INT; trap 'finish 143' TERM; tmux set-option -w -t =$session: remain-on-exit on || exit 125; cd $quoted_project || exit 125; $quoted_bin -p \"\$(cat $quoted_prompt)\" >$quoted_output 2>&1; exit \$?"
   if ! tmux new-session -d -s "$session" /bin/sh -c "$command"; then
     tmux wait-for -U "$channel" >/dev/null 2>&1 || true
     record_exit_code "$generation" 125
