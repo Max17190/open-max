@@ -14,11 +14,22 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/1","protocol_version":1,"session_id":"...","version":"0.2.0","project":"/abs/path"}
+{"type":"hello","proto":"openmax-stdio/1","protocol_version":1,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
-the same major as a readable id. Any wire change bumps both.
+the same major as a readable id. Any wire change bumps both. `continued` is
+true when `--continue` resumed a prior session; the next line is then one
+`transcript` object so the client can render history without synthetic events:
+
+```json
+{"type":"transcript","session_id":"...","messages":[{"role":"user","content":"..."}],"truncated":false}
+```
+
+`messages` carries user and assistant text only (tool traffic and the system
+prompt are session internals), each message capped at 4096 characters and the
+whole line at 256 KiB of content; `truncated` says whether anything was cut.
+The session file on disk remains the full record.
 
 ## Commands (stdin)
 
@@ -28,6 +39,8 @@ One JSON object per line.
 | --- | --- | --- |
 | `user` | `text` | Start a turn with the text |
 | `approve` | `approval_id`, `approved` (bool) | Answer a pending approval |
+| `approval_mode` | `mode` (`auto`, `ask`, or `readonly`) | Set and persist the approval gate; answered by an `approval_mode` line |
+| `reload` | none | Re-freeze tools, skills, and prompt from current config; answered by `refrozen`, or `protocol_error` while a turn is in flight |
 | `cancel` | none | Cancel the running turn |
 | `quit` | none | Drain the in-flight turn, then exit |
 
@@ -95,4 +108,8 @@ resynchronizes on the next newline and keeps going.
 
 While a client is live, an `approval_request` is forwarded and openmax waits for
 an `approve`; after `quit` or EOF, pending and later approvals are declined so
-shutdown drains promptly.
+shutdown drains promptly. An `approve` naming an id that was never issued or
+has already settled is answered with a `protocol_error` instead of being
+silently dropped: the client's picture of open gates is wrong and should say
+so. A successful `approval_mode` command is acknowledged with
+`{"type":"approval_mode","mode":"..."}` after the setting is persisted.
