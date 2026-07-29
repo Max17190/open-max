@@ -86,6 +86,12 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // Later directories overwrite earlier ones by name, so the last file to
     // claim a name is the live one.
     mark_shadowed(&mut tools_found, false);
+    mark_beyond_cap(
+        &mut tools_found,
+        crate::registry::MAX_EXTERNAL_TOOLS,
+        |_| true,
+        "tool cap",
+    );
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
 
     let mut skills_found: Vec<Entry> = Vec::new();
@@ -159,6 +165,8 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 
     let known_tools = known_tool_names(&external_names);
     let mut hooks_found: Vec<Entry> = Vec::new();
+    // Aligned with hooks_found: the parsed event of each Ok entry.
+    let mut hook_events: Vec<Option<&'static str>> = Vec::new();
     let mut hook_extras: Vec<Finding> = Vec::new();
     for dir in crate::hooks::hook_dirs(project_root) {
         for path in files_with_extension(&dir, "toml") {
@@ -182,9 +190,13 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             });
                         }
                     }
+                    hook_events.push(Some(h.event.as_str()));
                     Status::Ok(format!("hook on {}", h.event.as_str()))
                 }
-                Err(reason) => Status::Err(reason),
+                Err(reason) => {
+                    hook_events.push(None);
+                    Status::Err(reason)
+                }
             };
             hooks_found.push((Finding { kind: "hook", path, status }, id));
         }
@@ -192,6 +204,15 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // First stem wins, and a shadowed file is never loaded: the runtime does
     // not fail closed on one, so neither does this.
     mark_shadowed(&mut hooks_found, true);
+    for event in crate::hooks::HookEvent::ALL {
+        let event = event.as_str();
+        mark_beyond_cap(
+            &mut hooks_found,
+            crate::hooks::MAX_HOOKS_PER_EVENT,
+            |i| hook_events.get(i).copied().flatten() == Some(event),
+            &format!("{event} hook cap"),
+        );
+    }
     findings.extend(hooks_found.into_iter().map(|(f, _)| f));
     findings.extend(hook_extras);
 
@@ -305,6 +326,32 @@ fn mark_shadowed(entries: &mut [Entry], first_wins: bool) {
         entries[i].0.status = Status::Warn(format!(
             "shadowed by {}, where {kind} '{id}' resolves",
             winner_path.display()
+        ));
+    }
+}
+
+/// Mark live (Ok, unshadowed) entries the loader's cap drops. The loader keeps
+/// the identity-sorted head, so ranking live identities reproduces exactly
+/// which files never load. `in_scope` restricts the ranking (hooks cap per
+/// event); `what` names the cap in the message.
+fn mark_beyond_cap(
+    entries: &mut [Entry],
+    cap: usize,
+    in_scope: impl Fn(usize) -> bool,
+    what: &str,
+) {
+    let mut live: Vec<(String, usize)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, (f, id))| {
+            id.is_some() && matches!(f.status, Status::Ok(_)) && in_scope(*i)
+        })
+        .map(|(i, (_, id))| (id.clone().unwrap(), i))
+        .collect();
+    live.sort();
+    for (id, i) in live.into_iter().skip(cap) {
+        entries[i].0.status = Status::Err(format!(
+            "'{id}' is beyond the {cap}-file {what} and never loads: consolidate or delete files"
         ));
     }
 }
@@ -552,6 +599,59 @@ mod tests {
         let root = temp_project();
         assert!(local(&root).is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn files_beyond_loader_caps_are_errors_not_silence() {
+        let root = temp_project();
+        let data = temp_project();
+        let tools_dir = root.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        for i in 0..(crate::registry::MAX_EXTERNAL_TOOLS + 1) {
+            std::fs::write(
+                tools_dir.join(format!("tool-{i:03}.toml")),
+                format!("name = \"tool-{i:03}\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n"),
+            )
+            .unwrap();
+        }
+        let hooks_dir = root.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for i in 0..(crate::hooks::MAX_HOOKS_PER_EVENT + 1) {
+            std::fs::write(
+                hooks_dir.join(format!("hook-{i:03}.toml")),
+                "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n",
+            )
+            .unwrap();
+        }
+
+        let findings = check_at(&root, &data);
+        let over_tool = findings
+            .iter()
+            .find(|f| f.kind == "tool" && f.path.ends_with(format!(
+                "tool-{:03}.toml",
+                crate::registry::MAX_EXTERNAL_TOOLS
+            )))
+            .unwrap();
+        assert!(
+            over_tool.status.summary().contains("never loads"),
+            "{}",
+            over_tool.status.summary()
+        );
+        let over_hook = findings
+            .iter()
+            .find(|f| f.kind == "hook" && f.path.ends_with(format!(
+                "hook-{:03}.toml",
+                crate::hooks::MAX_HOOKS_PER_EVENT
+            )))
+            .unwrap();
+        assert!(
+            over_hook.status.summary().contains("never loads"),
+            "{}",
+            over_hook.status.summary()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]

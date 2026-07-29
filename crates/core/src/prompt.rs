@@ -113,6 +113,15 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         prompt.push_str(&skills);
         breakdown.components.push(("skills index".into(), prompt.len() - before));
     }
+    if registry.tools_omitted > 0 {
+        let before = prompt.len();
+        prompt.push_str(&format!(
+            "\n\n… {} more tools were discovered but not loaded ({}-tool cap): consolidate or delete files in .openmax/tools and ~/.openmax/tools; openmax --check names them.\n",
+            registry.tools_omitted,
+            crate::registry::MAX_EXTERNAL_TOOLS,
+        ));
+        breakdown.components.push(("tools trailer".into(), prompt.len() - before));
+    }
     breakdown.add_registry(registry);
     (prompt, breakdown)
 }

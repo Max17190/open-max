@@ -20,6 +20,10 @@ use std::sync::Arc;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const MAX_TIMEOUT_SECS: u64 = 60;
+/// Per-event hook cap. Every pre_tool_use hook runs on every tool call, so an
+/// unbounded set turns discovery mistakes into unbounded per-call latency.
+/// Stems sort deterministically; the head runs, --check names the rest.
+pub const MAX_HOOKS_PER_EVENT: usize = 32;
 const MAX_REASON_CHARS: usize = 500;
 /// How much tool output a `post_tool_use` hook is handed. Enough for an eval
 /// or telemetry hook to work with, small enough that copying it to every
@@ -37,6 +41,16 @@ pub enum HookEvent {
 }
 
 impl HookEvent {
+    /// Every event, for diagnostics that group hooks per event.
+    pub(crate) const ALL: [HookEvent; 6] = [
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
+        HookEvent::UserPromptSubmit,
+        HookEvent::SessionStart,
+        HookEvent::Compaction,
+        HookEvent::TurnEnd,
+    ];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             HookEvent::PreToolUse => "pre_tool_use",
@@ -137,6 +151,18 @@ fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
             HookEvent::Compaction => hooks.compaction.push(spec),
             HookEvent::TurnEnd => hooks.turn_end.push(spec),
         }
+    }
+    // BTreeMap iteration is stem-sorted, so each event list is deterministic
+    // and the cap keeps the sorted head. --check names what is beyond it.
+    for list in [
+        &mut hooks.pre,
+        &mut hooks.post,
+        &mut hooks.user_prompt,
+        &mut hooks.session_start,
+        &mut hooks.compaction,
+        &mut hooks.turn_end,
+    ] {
+        list.truncate(MAX_HOOKS_PER_EVENT);
     }
     hooks
 }
@@ -539,6 +565,23 @@ mod tests {
 
     fn write_hook_toml(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn hooks_beyond_the_per_event_cap_never_run() {
+        let dir = tempfile_dir();
+        for i in 0..(MAX_HOOKS_PER_EVENT + 3) {
+            write_hook_toml(
+                &dir,
+                &format!("hook-{i:03}.toml"),
+                "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n",
+            );
+        }
+        let hooks = discover_in_dirs(&[dir.clone()]);
+        assert_eq!(hooks.post.len(), MAX_HOOKS_PER_EVENT);
+        // Other events are unaffected by post_tool_use volume.
+        assert!(hooks.pre.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

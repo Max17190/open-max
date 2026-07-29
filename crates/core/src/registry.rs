@@ -26,6 +26,14 @@ use crate::tools::{self, ToolOutcome};
 /// External tool descriptions ride in the prompt prefix of every request, so
 /// they are capped hard; authors link a README for anything longer.
 pub const MAX_EXTERNAL_DESC_CHARS: usize = 200;
+/// Serialized-size cap for one tool's `params` schema. The schema is embedded
+/// in the frozen prompt prefix and paid on every request, so it is the one
+/// place an extension could grow context cost without bound. Oversized schemas
+/// are rejected, not truncated: a truncated schema lies to the model.
+pub const MAX_EXTERNAL_PARAMS_BYTES: usize = 4_096;
+/// External-tool cap, mirroring `skills::MAX_SKILLS`: the sorted head loads,
+/// the rest is counted, reported by the prompt trailer, and named by --check.
+pub const MAX_EXTERNAL_TOOLS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub enum ToolKind {
@@ -67,6 +75,9 @@ pub struct Registry {
     /// Skills discovered on disk but not indexed because of the `MAX_SKILLS`
     /// cap. Never silent: the prompt trailer reports this count.
     pub skills_omitted: usize,
+    /// External tools discovered on disk but not loaded because of the
+    /// `MAX_EXTERNAL_TOOLS` cap; the prompt trailer reports the count.
+    pub tools_omitted: usize,
     /// Content hash of the extension files this registry was built from;
     /// compared against disk at turn start to detect extension changes.
     pub ext_fingerprint: u64,
@@ -86,6 +97,8 @@ pub(crate) struct ExtensionSnapshot {
     fingerprint: u64,
     external: Vec<ToolSpec>,
     skills: Vec<SkillSpec>,
+    /// External tools discovered but dropped by the `MAX_EXTERNAL_TOOLS` cap.
+    tools_omitted: usize,
     /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
     skills_omitted: usize,
 }
@@ -156,18 +169,26 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
             }
         }
     }
-    let external = external_by_name.into_values().collect();
+    let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
+    // Built-in shadows never load (assemble drops them); excluding them here
+    // keeps them from wasting a cap slot, so --check and the loader agree on
+    // exactly which files are live.
+    external.retain(|t| !tools::TOOL_NAMES.contains(&t.name.as_str()));
+    external.sort_by(|a, b| a.name.cmp(&b.name));
+    // Caps bound the frozen prompt, but a tool or skill dropped here must not
+    // vanish silently: the counts survive so the prompt trailer can say what
+    // is not loaded and --check can name the files.
+    let tools_omitted = external.len().saturating_sub(MAX_EXTERNAL_TOOLS);
+    external.truncate(MAX_EXTERNAL_TOOLS);
     let mut discovered_skills: Vec<SkillSpec> = skills_by_name.into_values().collect();
     discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
-    // The cap bounds the prompt index and the manifest, but a skill dropped
-    // here must not vanish silently: the count survives so the prompt trailer
-    // can say what the index is not showing.
     let skills_omitted = discovered_skills.len().saturating_sub(skills::MAX_SKILLS);
     discovered_skills.truncate(skills::MAX_SKILLS);
     ExtensionSnapshot {
         fingerprint: h.finish(),
         external,
         skills: discovered_skills,
+        tools_omitted,
         skills_omitted,
     }
 }
@@ -188,6 +209,7 @@ impl Registry {
     pub(crate) fn from_snapshot(snapshot: ExtensionSnapshot) -> Self {
         let mut registry = Self::assemble(snapshot.external, snapshot.skills);
         registry.ext_fingerprint = snapshot.fingerprint;
+        registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
         registry
     }
@@ -232,6 +254,7 @@ impl Registry {
             tools: tools_list,
             skills,
             skills_omitted: 0,
+            tools_omitted: 0,
             ext_fingerprint: 0,
             schemas,
             schemas_wire,
@@ -506,7 +529,10 @@ fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
         description = description.chars().take(MAX_EXTERNAL_DESC_CHARS).collect::<String>() + "…";
     }
     let parameters = match file.params {
-        Some(p) if p.is_object() => p,
+        Some(p) if p.is_object() => {
+            validate_params_schema(&p)?;
+            p
+        }
         Some(_) => return Err("params must be a JSON-schema object".into()),
         None => serde_json::json!({ "type": "object", "properties": {} }),
     };
@@ -522,6 +548,35 @@ fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
             source_path: path.to_path_buf(),
         }),
     })
+}
+
+/// Light structural checks on a tool's `params`, not a JSON-Schema engine:
+/// the top level must be `type = "object"`, `properties` values must be
+/// objects, and the serialized schema must fit the per-tool byte cap that
+/// bounds its cost in the frozen prompt prefix.
+fn validate_params_schema(params: &Value) -> Result<(), String> {
+    match params.get("type").and_then(Value::as_str) {
+        Some("object") => {}
+        Some(other) => return Err(format!("params.type must be \"object\", not \"{other}\"")),
+        None => return Err("params.type = \"object\" is required".into()),
+    }
+    if let Some(properties) = params.get("properties") {
+        let Some(map) = properties.as_object() else {
+            return Err("params.properties must be an object".into());
+        };
+        for (key, schema) in map {
+            if !schema.is_object() {
+                return Err(format!("params.properties.{key} must be an object"));
+            }
+        }
+    }
+    let bytes = params.to_string().len();
+    if bytes > MAX_EXTERNAL_PARAMS_BYTES {
+        return Err(format!(
+            "params schema is {bytes} bytes; the cap is {MAX_EXTERNAL_PARAMS_BYTES} because every request pays for these bytes - shrink the schema or split the tool"
+        ));
+    }
+    Ok(())
 }
 
 /// Run one external tool: spawn the command in the project root, hand it the
@@ -642,6 +697,63 @@ mod tests {
         let registry = Registry::build(&project);
         assert_eq!(registry.skills.len(), crate::skills::MAX_SKILLS);
         assert_eq!(registry.skills_omitted, 3);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn oversized_params_schema_is_rejected_not_truncated() {
+        let mut properties = String::new();
+        for i in 0..200 {
+            properties.push_str(&format!(
+                "[params.properties.field_{i:03}]\ntype = \"string\"\ndescription = \"a reasonably long description that pads the schema out\"\n"
+            ));
+        }
+        let text = format!(
+            "name = \"big\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n\n[params]\ntype = \"object\"\n{properties}"
+        );
+        let err = parse_tool_source(Path::new("big.toml"), &text).unwrap_err();
+        assert!(err.contains("bytes"), "{err}");
+        assert!(err.contains(&MAX_EXTERNAL_PARAMS_BYTES.to_string()), "{err}");
+    }
+
+    #[test]
+    fn params_structural_validation_rejects_wrong_shapes() {
+        let missing_type = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n\n[params]\n[params.properties.a]\ntype = \"string\"\n";
+        let err = parse_tool_source(Path::new("t.toml"), missing_type).unwrap_err();
+        assert!(err.contains("params.type"), "{err}");
+
+        let wrong_type = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n\n[params]\ntype = \"array\"\n";
+        let err = parse_tool_source(Path::new("t.toml"), wrong_type).unwrap_err();
+        assert!(err.contains("\"array\""), "{err}");
+
+        let bad_property = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n\n[params]\ntype = \"object\"\n[params.properties]\na = \"string\"\n";
+        let err = parse_tool_source(Path::new("t.toml"), bad_property).unwrap_err();
+        assert!(err.contains("params.properties.a"), "{err}");
+    }
+
+    /// A tool sorted past MAX_EXTERNAL_TOOLS never loads, but the count
+    /// survives so the prompt trailer can say what is missing.
+    #[test]
+    fn external_tools_beyond_cap_are_counted_not_hidden() {
+        let project = temp_dir("toolcap");
+        let dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..(MAX_EXTERNAL_TOOLS + 2) {
+            std::fs::write(
+                dir.join(format!("tool-{i:03}.toml")),
+                format!("name = \"tool-{i:03}\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n"),
+            )
+            .unwrap();
+        }
+        let snapshot = capture_extensions(&project);
+        assert!(snapshot.external.len() <= MAX_EXTERNAL_TOOLS);
+        assert!(snapshot.tools_omitted >= 2, "{}", snapshot.tools_omitted);
+        // The sorted head loads: the lexicographically first names survive.
+        assert!(snapshot.external.iter().any(|t| t.name == "tool-000"));
+        assert!(!snapshot.external.iter().any(|t| t.name == format!(
+            "tool-{:03}",
+            MAX_EXTERNAL_TOOLS + 1
+        )));
         let _ = std::fs::remove_dir_all(project);
     }
 
