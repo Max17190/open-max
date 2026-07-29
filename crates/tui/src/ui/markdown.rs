@@ -28,6 +28,35 @@ pub fn highlighter() -> &'static Highlighter {
     HL.get_or_init(Highlighter::default)
 }
 
+/// Languages models emit most often. Syntect compiles each syntax's regexes
+/// lazily on first use, which otherwise lands as a 10-25 ms hitch inside the
+/// frame that renders a session's first code line in that language.
+const WARM_LANGS: &[&str] = &[
+    "rust", "python", "javascript", "json", "bash", "go", "c", "yaml",
+];
+
+/// Pre-compile common syntaxes on a background thread at startup: the dump
+/// itself loads in ~2 ms, but the first highlighted line per language pays
+/// its lazy regex compilation. Warming renders one throwaway fence per
+/// language so a streamed reply's first code line only paints. A fence
+/// rendered inside the warm window blocks on the `OnceLock` at most as long
+/// as a cold load would have, so this can only remove the hitch.
+pub fn warm_highlighter() {
+    std::thread::spawn(|| {
+        let hl = highlighter();
+        for lang in WARM_LANGS {
+            let mut st = LineState::default();
+            for line in [
+                format!("```{lang}"),
+                "let x = f(0); // c #".to_string(),
+                "```".to_string(),
+            ] {
+                let _ = render_line(&line, &mut st, hl);
+            }
+        }
+    });
+}
+
 impl Default for Highlighter {
     fn default() -> Self {
         // Keep default-syntaxes: we have no vendored language subset, so the
@@ -456,6 +485,18 @@ fn find(chars: &[char], from: usize, needle: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_languages_resolve_to_real_syntaxes() {
+        // A typo here would silently warm nothing for that language.
+        let hl = highlighter();
+        for lang in WARM_LANGS {
+            assert!(
+                hl.syntaxes.find_syntax_by_token(lang).is_some(),
+                "unknown warm language {lang}"
+            );
+        }
+    }
 
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
