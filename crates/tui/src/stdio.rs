@@ -11,6 +11,8 @@
 //! stdin commands:
 //!   {"cmd":"user","text":"..."}                      start a turn
 //!   {"cmd":"approve","approval_id":"...","approved":true}
+//!   {"cmd":"approval_mode","mode":"auto|ask|readonly"}
+//!   {"cmd":"reload"}                                 re-freeze tools/skills/prompt
 //!   {"cmd":"cancel"}                                 cancel the running turn
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
@@ -55,6 +57,10 @@ pub const PROTO_VERSION: u32 = 1;
 enum Command {
     User { text: String },
     Approve { approval_id: String, approved: bool },
+    /// Set the approval gate for mutating tools; persisted like /approvals.
+    ApprovalMode { mode: String },
+    /// Re-freeze tools, skills, and prompt from current config, like /reload.
+    Reload,
     Cancel,
     Quit,
 }
@@ -71,9 +77,9 @@ pub async fn run(
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_key = project.display().to_string();
 
-    let session_id = if args.continue_session {
+    let (session_id, continued) = if args.continue_session {
         match sessions::latest(&core, &project_key) {
-            Some(meta) => meta.id,
+            Some(meta) => (meta.id, true),
             None => {
                 eprintln!("openmax: no prior session in this directory to continue");
                 return 2;
@@ -81,7 +87,7 @@ pub async fn run(
         }
     } else {
         match sessions::create(&core, project_key.clone()) {
-            Ok(meta) => meta.id,
+            Ok(meta) => (meta.id, false),
             Err(e) => {
                 eprintln!("openmax: failed to create session: {e}");
                 return 1;
@@ -90,15 +96,28 @@ pub async fn run(
     };
 
     let mut stdout = std::io::stdout();
-    emit(&mut stdout, &hello_value(&session_id, &project_key));
+    emit(&mut stdout, &hello_value(&session_id, &project_key, continued));
+    if continued {
+        // One bounded history line so an attaching frontend can render what
+        // came before, without replaying synthetic live events (a replayed
+        // `token` stream would be indistinguishable from a running turn).
+        let messages = sessions::load_messages(&core, &session_id).unwrap_or_default();
+        emit(&mut stdout, &transcript_value(&session_id, &messages));
+    }
+    let stdin_rx = spawn_stdin_reader();
+    drive(core, core_rx, session_id, project, stdin_rx, &mut stdout).await
+}
 
-    // Blocking stdin reader on its own thread; malformed input travels as Err
-    // so the async loop can answer without ever blocking on the pipe. The
-    // channel is bounded because every line, valid or not, costs one answer
-    // written and flushed one at a time: a peer that floods faster than the
-    // loop drains would otherwise queue its own backlog until memory runs
-    // out. A full queue parks the reader, stdin backs up, and the peer waits.
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Result<Command, String>>(64);
+/// The blocking stdin reader on its own thread; malformed input travels as
+/// Err so the async loop can answer without ever blocking on the pipe.
+fn spawn_stdin_reader() -> mpsc::Receiver<Result<Command, String>> {
+
+    // The channel is bounded because every line, valid or not, costs one
+    // answer written and flushed one at a time: a peer that floods faster
+    // than the loop drains would otherwise queue its own backlog until
+    // memory runs out. A full queue parks the reader, stdin backs up, and
+    // the peer waits.
+    let (stdin_tx, stdin_rx) = mpsc::channel::<Result<Command, String>>(64);
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
@@ -131,7 +150,20 @@ pub async fn run(
         }
         // Dropping the sender closes the channel: EOF.
     });
+    stdin_rx
+}
 
+/// The protocol loop, separated from real stdin/stdout so tests can drive a
+/// session in-process: commands arrive on a channel, every emitted line goes
+/// to `out`.
+async fn drive<W: Write>(
+    core: Arc<Core>,
+    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    session_id: String,
+    project: PathBuf,
+    mut stdin_rx: mpsc::Receiver<Result<Command, String>>,
+    out: &mut W,
+) -> i32 {
     let mut running = false;
     let mut closing = false;
     let mut exit_code = 0i32;
@@ -152,26 +184,88 @@ pub async fn run(
                             core.respond_approval(&id, false);
                         }
                     }
-                    Some(Err(message)) => protocol_error(&mut stdout, &message),
+                    Some(Err(message)) => protocol_error(out, &message),
                     Some(Ok(Command::Cancel)) => core.cancel(&session_id),
                     Some(Ok(Command::Approve { approval_id, approved })) => {
-                        open_approvals.remove(&approval_id);
-                        core.respond_approval(&approval_id, approved);
+                        // An id that was never issued (or already settled) is
+                        // a client-state bug worth reporting, not a no-op:
+                        // the client believes a gate is still open.
+                        if open_approvals.remove(&approval_id) {
+                            core.respond_approval(&approval_id, approved);
+                        } else {
+                            protocol_error(
+                                out,
+                                &format!("unknown or already settled approval_id '{approval_id}'"),
+                            );
+                        }
+                    }
+                    Some(Ok(Command::ApprovalMode { mode })) => {
+                        match open_max_core::config::ApprovalMode::parse(&mode) {
+                            Some(parsed) => {
+                                // Persist first, mutate the live gate only on
+                                // success: the acknowledged state, the live
+                                // state, and the on-disk state must never
+                                // disagree about how mutating tools are gated.
+                                let saved = {
+                                    let mut next = core.settings.lock().unwrap().clone();
+                                    next.approval_mode = parsed;
+                                    open_max_core::config::save(&core.data_dir, &next)
+                                };
+                                match saved {
+                                    Ok(()) => {
+                                        core.settings.lock().unwrap().approval_mode = parsed;
+                                        emit(
+                                            out,
+                                            &serde_json::json!({
+                                                "type": "approval_mode",
+                                                "mode": parsed.as_str(),
+                                            }),
+                                        );
+                                    }
+                                    Err(e) => protocol_error(
+                                        out,
+                                        &format!("approval mode unchanged; persisting it failed: {e}"),
+                                    ),
+                                }
+                            }
+                            None => protocol_error(
+                                out,
+                                &format!("unknown approval mode '{mode}': auto|ask|readonly"),
+                            ),
+                        }
+                    }
+                    Some(Ok(Command::Reload)) => {
+                        if running {
+                            protocol_error(out, "a turn is in flight; wait for done");
+                            continue;
+                        }
+                        match agent::reload_session(&core, &session_id, &project).await {
+                            Ok((tools, skills)) => {
+                                let env = AgentEventEnvelope {
+                                    session_id: session_id.clone(),
+                                    event: AgentEvent::Refrozen { tools, skills },
+                                };
+                                if let Ok(value) = serde_json::to_value(&env) {
+                                    emit(out, &value);
+                                }
+                            }
+                            Err(e) => protocol_error(out, &e),
+                        }
                     }
                     Some(Ok(Command::User { text })) => {
                         if text.trim().is_empty() {
-                            refuse(&mut stdout, &session_id, "user text is empty");
+                            refuse(out, &session_id, "user text is empty");
                             continue;
                         }
                         if running || !crate::headless::wait_until_idle(&core, &session_id).await {
                             // The in-flight turn owns the next `done`; a second
                             // one here would tell the client that turn ended.
-                            protocol_error(&mut stdout, "a turn is in flight; wait for done");
+                            protocol_error(out, "a turn is in flight; wait for done");
                             continue;
                         }
                         match agent::start_turn(core.clone(), session_id.clone(), project.clone(), text) {
                             Ok(()) => running = true,
-                            Err(e) => refuse(&mut stdout, &session_id, &e),
+                            Err(e) => refuse(out, &session_id, &e),
                         }
                     }
                 }
@@ -186,7 +280,7 @@ pub async fn run(
                     continue;
                 }
                 if let Ok(value) = serde_json::to_value(&env) {
-                    emit(&mut stdout, &value);
+                    emit(out, &value);
                 }
                 match &env.event {
                     AgentEvent::ApprovalRequest { approval_id, .. } => {
@@ -213,14 +307,14 @@ pub async fn run(
     }
 }
 
-fn emit(stdout: &mut std::io::Stdout, value: &serde_json::Value) {
+fn emit<W: Write>(stdout: &mut W, value: &serde_json::Value) {
     if let Ok(line) = serde_json::to_string(value) {
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
     }
 }
 
-fn protocol_error(stdout: &mut std::io::Stdout, message: &str) {
+fn protocol_error<W: Write>(stdout: &mut W, message: &str) {
     emit(
         stdout,
         &serde_json::json!({ "type": "protocol_error", "message": message }),
@@ -232,7 +326,7 @@ fn protocol_error(stdout: &mut std::io::Stdout, message: &str) {
 /// that follows the documented rule (block until `done`) hangs forever on a
 /// prompt nothing will ever answer, which an untrusted project reproduces on
 /// the very first command.
-fn refuse(stdout: &mut std::io::Stdout, session_id: &str, message: &str) {
+fn refuse<W: Write>(stdout: &mut W, session_id: &str, message: &str) {
     protocol_error(stdout, message);
     let env = AgentEventEnvelope {
         session_id: session_id.to_string(),
@@ -282,7 +376,7 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::R
 /// The `hello` handshake line, single-sourced so `run` and the tests cannot
 /// drift. Carries both the human-readable `proto` id and the integer
 /// `protocol_version` a client compares against.
-fn hello_value(session_id: &str, project: &str) -> serde_json::Value {
+fn hello_value(session_id: &str, project: &str, continued: bool) -> serde_json::Value {
     serde_json::json!({
         "type": "hello",
         "proto": PROTO,
@@ -290,6 +384,49 @@ fn hello_value(session_id: &str, project: &str) -> serde_json::Value {
         "session_id": session_id,
         "version": env!("CARGO_PKG_VERSION"),
         "project": project,
+        "continued": continued,
+    })
+}
+
+/// Per-message and total content budgets for the `transcript` line. History
+/// exists to orient an attaching frontend, not to re-carry every byte; the
+/// session file remains the full record.
+const TRANSCRIPT_MSG_CHARS: usize = 4_096;
+const TRANSCRIPT_TOTAL_CHARS: usize = 262_144;
+
+/// One bounded history line for a continued session: user and assistant text
+/// only (tool traffic and the system prompt are session internals).
+fn transcript_value(
+    session_id: &str,
+    messages: &[open_max_core::types::ChatMessage],
+) -> serde_json::Value {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    for m in messages {
+        if m.role != "user" && m.role != "assistant" {
+            continue;
+        }
+        let Some(content) = m.content.as_deref().filter(|c| !c.trim().is_empty()) else {
+            continue;
+        };
+        if total >= TRANSCRIPT_TOTAL_CHARS {
+            truncated = true;
+            break;
+        }
+        let mut text: String = content.chars().take(TRANSCRIPT_MSG_CHARS).collect();
+        if text.len() < content.len() {
+            text.push('…');
+            truncated = true;
+        }
+        total += text.chars().count();
+        out.push(serde_json::json!({ "role": m.role, "content": text }));
+    }
+    serde_json::json!({
+        "type": "transcript",
+        "session_id": session_id,
+        "messages": out,
+        "truncated": truncated,
     })
 }
 
@@ -311,6 +448,8 @@ pub fn validate_line(line: &str) -> Result<String, String> {
         let name = match cmd {
             Command::User { .. } => "user",
             Command::Approve { .. } => "approve",
+            Command::ApprovalMode { .. } => "approval_mode",
+            Command::Reload => "reload",
             Command::Cancel => "cancel",
             Command::Quit => "quit",
         };
@@ -348,6 +487,28 @@ pub fn validate_line(line: &str) -> Result<String, String> {
                 return Err("protocol_error missing string 'message'".to_string());
             }
             Ok("protocol_error".to_string())
+        }
+        "approval_mode" => {
+            if !obj.get("mode").map(serde_json::Value::is_string).unwrap_or(false) {
+                return Err("approval_mode missing string 'mode'".to_string());
+            }
+            Ok("approval_mode".to_string())
+        }
+        "transcript" => {
+            if !obj.get("session_id").map(serde_json::Value::is_string).unwrap_or(false) {
+                return Err("transcript missing string 'session_id'".to_string());
+            }
+            let Some(messages) = obj.get("messages").and_then(serde_json::Value::as_array) else {
+                return Err("transcript missing array 'messages'".to_string());
+            };
+            for m in messages {
+                let ok = m.get("role").map(serde_json::Value::is_string).unwrap_or(false)
+                    && m.get("content").map(serde_json::Value::is_string).unwrap_or(false);
+                if !ok {
+                    return Err("transcript message missing string 'role'/'content'".to_string());
+                }
+            }
+            Ok("transcript".to_string())
         }
         // An event envelope carries a flattened session_id plus the event.
         _ => {
@@ -435,7 +596,8 @@ mod tests {
 
     #[test]
     fn hello_line_carries_protocol_version() {
-        let hello = hello_value("sess-1", "/tmp/proj");
+        let hello = hello_value("sess-1", "/tmp/proj", false);
+        assert_eq!(hello["continued"], false);
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["proto"], PROTO);
         assert_eq!(hello["protocol_version"], PROTO_VERSION);
@@ -601,6 +763,106 @@ mod tests {
         assert!(results[0].is_ok());
         assert!(results[1].is_err(), "the invalid line must be reported");
         assert!(results[2].is_ok(), "the command after it must still be read");
+    }
+
+    #[test]
+    fn transcript_line_is_bounded_and_validates() {
+        use open_max_core::types::ChatMessage;
+        let mk = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let messages = vec![
+            mk("system", "hidden"),
+            mk("user", "hello"),
+            mk("assistant", &"x".repeat(TRANSCRIPT_MSG_CHARS + 10)),
+            mk("tool", "internals"),
+        ];
+        let t = transcript_value("s1", &messages);
+        assert_eq!(t["type"], "transcript");
+        let out = t["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 2, "system and tool messages stay internal");
+        assert_eq!(out[0]["role"], "user");
+        let long = out[1]["content"].as_str().unwrap();
+        assert!(long.chars().count() <= TRANSCRIPT_MSG_CHARS + 1);
+        assert_eq!(t["truncated"], true);
+        assert_eq!(validate_line(&serde_json::to_string(&t).unwrap()).unwrap(), "transcript");
+    }
+
+    /// Drive the protocol loop in-process: commands in, emitted lines out.
+    async fn drive_commands(commands: Vec<Command>) -> (Vec<serde_json::Value>, i32, Arc<Core>) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("openmax-stdio-{}-{nonce}", std::process::id()));
+        let (core, core_rx) = Core::new(dir.clone()).unwrap();
+        let meta = sessions::create(&core, dir.display().to_string()).unwrap();
+        let (tx, rx) = mpsc::channel(64);
+        for cmd in commands {
+            tx.send(Ok(cmd)).await.unwrap();
+        }
+        drop(tx);
+        let mut out = Vec::new();
+        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &mut out).await;
+        let lines = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(dir);
+        (lines, code, core)
+    }
+
+    #[tokio::test]
+    async fn empty_user_text_is_refused_with_a_terminator() {
+        let (lines, code, _core) =
+            drive_commands(vec![Command::User { text: "  ".into() }]).await;
+        assert_eq!(lines[0]["type"], "protocol_error");
+        assert_eq!(lines[1]["type"], "done");
+        assert_eq!(lines[1]["stop_reason"], "refused");
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn a_user_turn_in_an_untrusted_project_is_refused_not_hung() {
+        let (lines, _code, _core) =
+            drive_commands(vec![Command::User { text: "hi".into() }]).await;
+        // The temp project was never trusted: the refusal must still end in
+        // the one terminator the client is allowed to block on.
+        assert_eq!(lines[0]["type"], "protocol_error");
+        assert_eq!(lines[1]["type"], "done");
+        assert_eq!(lines[1]["stop_reason"], "refused");
+    }
+
+    #[tokio::test]
+    async fn an_unissued_approval_id_is_a_protocol_error() {
+        let (lines, _code, _core) = drive_commands(vec![Command::Approve {
+            approval_id: "ghost".into(),
+            approved: true,
+        }])
+        .await;
+        assert_eq!(lines[0]["type"], "protocol_error");
+        assert!(lines[0]["message"].as_str().unwrap().contains("ghost"));
+    }
+
+    #[tokio::test]
+    async fn approval_mode_command_persists_and_acknowledges() {
+        let (lines, _code, core) = drive_commands(vec![
+            Command::ApprovalMode { mode: "auto".into() },
+            Command::ApprovalMode { mode: "sometimes".into() },
+        ])
+        .await;
+        assert_eq!(lines[0]["type"], "approval_mode");
+        assert_eq!(lines[0]["mode"], "auto");
+        assert_eq!(lines[1]["type"], "protocol_error");
+        assert_eq!(
+            core.settings.lock().unwrap().approval_mode,
+            open_max_core::config::ApprovalMode::Auto
+        );
     }
 
     #[test]
