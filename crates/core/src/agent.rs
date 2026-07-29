@@ -1023,7 +1023,12 @@ async fn run_loop(
         Ok(ep) => ep,
         Err(e) => {
             core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
-            // User message was already appended; restore so the next turn sees it.
+            // Resolution failures are configuration errors, never transient:
+            // the prompt was not processed and must not linger as context the
+            // model never saw (resubmitting after /model would duplicate it).
+            if guard.messages().last().is_some_and(|m| m.role == "user") {
+                guard.messages().pop();
+            }
             guard.commit().await;
             hooks.turn_end(session_id, project_root, "error").await;
             core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
@@ -2490,6 +2495,14 @@ mod tests {
             }
         }
         assert!(saw_done, "early provider failure must still emit Done");
+        // The unprocessed prompt must not linger as context: a resubmit after
+        // fixing the endpoint would otherwise duplicate it.
+        let map = core.sessions.lock().await;
+        let data = map.get("sess-early").unwrap();
+        assert!(
+            !data.messages.iter().any(|m| m.role == "user"),
+            "an unresolved turn must not retain the user prompt"
+        );
         let end: Value =
             serde_json::from_str(&std::fs::read_to_string(project.join("end.json")).unwrap())
                 .unwrap();
