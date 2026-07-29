@@ -189,8 +189,9 @@ Each run receives one JSON payload on stdin:
   of it. Behind that, `process_bytes` is how many bytes the command actually
   produced (null when the tool ran no process) and `process_truncated` says
   whether the result dropped part of that, so an audit hook can tell a quiet
-  command from a clipped one. `bash` also names its bounded output log in the
-  result text. Reading any of this changes nothing: an observe event cannot
+  command from a clipped one. A call killed by timeout or cancel reports the
+  bytes it printed before it died, even though the result carries none of
+  them. `bash` also names its bounded output log in the result text. Reading any of this changes nothing: an observe event cannot
   alter what the model receives.
 - user_prompt_submit: {"event", "session_id", "cwd", "text"}
 - session_start: {"event", "session_id", "cwd"}

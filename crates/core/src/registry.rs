@@ -560,13 +560,14 @@ async fn spawn_external(
             ToolOutcome::err(format!("external tool '{name}' failed: {e}"))
         }
         Ok(output) => match &output.termination {
-            Termination::Cancelled => {
-                ToolOutcome::err(format!("external tool '{name}' cancelled by user"))
-            }
-            Termination::TimedOut => ToolOutcome::err(format!(
-                "external tool '{name}' timed out after {}s",
-                tool.timeout_secs
-            )),
+            Termination::Cancelled => ToolOutcome::from_killed_process(
+                format!("external tool '{name}' cancelled by user"),
+                &output,
+            ),
+            Termination::TimedOut => ToolOutcome::from_killed_process(
+                format!("external tool '{name}' timed out after {}s", tool.timeout_secs),
+                &output,
+            ),
             Termination::Exited(status) => {
                 let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
                 let (ok, text) = match status.success() {

@@ -72,6 +72,20 @@ impl ToolOutcome {
     pub(crate) fn err(output: impl Into<String>) -> Self {
         Self { ok: false, output: output.into(), ..Self::default() }
     }
+    /// A result that carries none of the process output, because the call was
+    /// killed before it could be rendered. What the process managed to print
+    /// still happened, and the result dropped all of it.
+    pub(crate) fn from_killed_process(output: impl Into<String>, process: &ProcessOutput) -> Self {
+        let produced = process.stdout.total_bytes.saturating_add(process.stderr.total_bytes);
+        Self {
+            ok: false,
+            output: output.into(),
+            diff: None,
+            process_bytes: Some(produced),
+            process_truncated: produced > 0,
+        }
+    }
+
     /// Record what the process behind this result produced, so a
     /// `post_tool_use` hook can tell a quiet command from a clipped one
     /// without parsing the truncation notice out of the text.
@@ -867,8 +881,13 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<Canc
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
         Err(ProcessError::Wait(e)) => ToolOutcome::err(format!("command failed: {e}")),
         Ok(output) => match &output.termination {
-            Termination::Cancelled => ToolOutcome::err("command cancelled by user"),
-            Termination::TimedOut => ToolOutcome::err(format!("command timed out after {timeout_secs}s")),
+            Termination::Cancelled => {
+                ToolOutcome::from_killed_process("command cancelled by user", &output)
+            }
+            Termination::TimedOut => ToolOutcome::from_killed_process(
+                format!("command timed out after {timeout_secs}s"),
+                &output,
+            ),
             Termination::Exited(status) => {
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 let (ok, text) = match status.success() {
@@ -1072,6 +1091,31 @@ mod tests {
         assert!(read.process_bytes.is_none(), "no process ran behind a file read");
         assert!(!read.process_truncated);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A command killed for running too long still printed something, and a
+    /// hook that is told a process ran no bytes would draw the wrong
+    /// conclusion about the turn.
+    #[tokio::test]
+    async fn a_timed_out_command_still_reports_what_it_printed() {
+        let root = temp_project();
+        let out = bash_tool(
+            &root,
+            &json!({"command": "echo before-the-timeout; sleep 30", "timeout_secs": 1}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+
+        assert!(!out.ok);
+        assert!(out.output.contains("timed out"), "{}", out.output);
+        assert_eq!(
+            out.process_bytes,
+            Some("before-the-timeout\n".len() as u64),
+            "the bytes it managed to print still happened"
+        );
+        assert!(out.process_truncated, "and the result carries none of them");
         let _ = std::fs::remove_dir_all(root);
     }
 
