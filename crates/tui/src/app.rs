@@ -1731,7 +1731,7 @@ impl App {
                 Some(id) => {
                     let id = id.clone();
                     match agent::reload_session(&self.core, &id, &self.project).await {
-                        Ok((tools, skills)) => self.note(&format!(
+                        Ok((tools, skills, _changes)) => self.note(&format!(
                             "re-frozen: {}, {} (prompt cache will re-prefill once)",
                             plural(tools, "tool"),
                             plural(skills, "skill")

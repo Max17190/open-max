@@ -71,7 +71,7 @@ pub struct StdioArgs {
 
 pub async fn run(
     core: Arc<Core>,
-    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: StdioArgs,
 ) -> i32 {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -240,10 +240,10 @@ async fn drive<W: Write>(
                             continue;
                         }
                         match agent::reload_session(&core, &session_id, &project).await {
-                            Ok((tools, skills)) => {
+                            Ok((tools, skills, changes)) => {
                                 let env = AgentEventEnvelope {
                                     session_id: session_id.clone(),
-                                    event: AgentEvent::Refrozen { tools, skills },
+                                    event: AgentEvent::Refrozen { tools, skills, changes },
                                 };
                                 if let Ok(value) = serde_json::to_value(&env) {
                                     emit(out, &value);

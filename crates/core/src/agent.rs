@@ -724,7 +724,7 @@ pub async fn reload_session(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, Vec<String>), String> {
     if !crate::trust::is_trusted(&core.data_dir, project_root)? {
         return Err(format!(
             "project {} is not trusted; establish trust before reloading it",
@@ -742,9 +742,10 @@ pub async fn reload_session(
     let registry = Registry::from_snapshot(snapshot);
     // A forced reload observes whatever is on disk now; no turn was running,
     // so any delta since the last freeze is external to the session.
-    let _ = ledger_changes(core, project_root, &files, crate::ledger::Actor::External, session_id);
+    let reload_receipt =
+        ledger_changes(core, project_root, &files, crate::ledger::Actor::External, session_id);
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
-    let counts = (registry.tools.len(), registry.skills.len());
+    let counts = (registry.tools.len(), registry.skills.len(), reload_receipt);
 
     // Hydrate first if the session was resumed but never ran a turn, so the
     // reload applies to the real transcript rather than a fresh one.
@@ -2248,7 +2249,7 @@ mod tests {
         assert!(reload_session(&core, id, &project).await.is_err());
         core.running.lock().unwrap().remove(id);
 
-        let (tools, skills) = reload_session(&core, id, &project).await.unwrap();
+        let (tools, skills, _changes) = reload_session(&core, id, &project).await.unwrap();
         assert_eq!(tools, tools::TOOL_NAMES.len() + 1);
         assert_eq!(skills, 0);
 
@@ -2331,11 +2332,9 @@ mod tests {
             "the activated tool must be in the ledger"
         );
         let mut receipt = None;
-        while let Ok(ev) = rx.try_recv() {
-            if let crate::state::CoreEvent::Agent(env) = ev {
-                if let AgentEvent::Refrozen { changes, .. } = env.event {
-                    receipt = Some(changes);
-                }
+        while let Ok(env) = rx.try_recv() {
+            if let AgentEvent::Refrozen { changes, .. } = env.event {
+                receipt = Some(changes);
             }
         }
         let receipt = receipt.expect("a refreeze must announce itself");
