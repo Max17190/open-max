@@ -202,18 +202,27 @@ async fn drive<W: Write>(
                     Some(Ok(Command::ApprovalMode { mode })) => {
                         match open_max_core::config::ApprovalMode::parse(&mode) {
                             Some(parsed) => {
-                                {
+                                let saved = {
                                     let mut s = core.settings.lock().unwrap();
                                     s.approval_mode = parsed;
-                                    let _ = open_max_core::config::save(&core.data_dir, &s);
+                                    open_max_core::config::save(&core.data_dir, &s)
+                                };
+                                match saved {
+                                    // Acknowledge only what actually
+                                    // persisted: a mode that reverts on
+                                    // restart must not read as accepted.
+                                    Ok(()) => emit(
+                                        out,
+                                        &serde_json::json!({
+                                            "type": "approval_mode",
+                                            "mode": parsed.as_str(),
+                                        }),
+                                    ),
+                                    Err(e) => protocol_error(
+                                        out,
+                                        &format!("approval mode applied for this run but not persisted: {e}"),
+                                    ),
                                 }
-                                emit(
-                                    out,
-                                    &serde_json::json!({
-                                        "type": "approval_mode",
-                                        "mode": parsed.as_str(),
-                                    }),
-                                );
                             }
                             None => protocol_error(
                                 out,
