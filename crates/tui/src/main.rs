@@ -33,6 +33,7 @@ options:
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
       --ledger           print the capability-file history for this project
+      --approve <path>   approve the exact current content of a capability file
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers) and exit; nonzero if
                          any is broken.
@@ -64,6 +65,7 @@ struct CliArgs {
     json: bool,
     stdio: bool,
     check: bool,
+    approve: Option<String>,
     ledger: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
@@ -91,6 +93,7 @@ where
         json: false,
         stdio: false,
         check: false,
+        approve: None,
         ledger: false,
         spec: None,
         trust_project: false,
@@ -114,6 +117,7 @@ where
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
+            Long("approve") => out.approve = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
@@ -238,6 +242,37 @@ async fn main() -> std::io::Result<()> {
                     );
                 }
                 println!("\nobjects: {} (restore with cp <objects>/<sha> <path>)", objects.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openmax: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(path) = &cli.approve {
+        // Approval is a human action, exactly like trust: agent-spawned
+        // processes are refused.
+        if std::env::var_os("OPENMAX_SESSION").is_some() {
+            eprintln!(
+                "openmax: approvals are human actions: this process was started from an agent session; ask the user to run `openmax --approve {path}`"
+            );
+            std::process::exit(3);
+        }
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let file = std::path::Path::new(path);
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("openmax: cannot read {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let sha = open_max_core::ledger::sha256_hex(&bytes);
+        match open_max_core::ledger::approve_hash(&default_data_dir(), &project, &sha) {
+            Ok(()) => {
+                println!("approved {path} ({})", &sha[..12]);
                 std::process::exit(0);
             }
             Err(e) => {

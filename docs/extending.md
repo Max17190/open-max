@@ -155,6 +155,29 @@ This covers the project file. A malformed global
 never write, so fix that one from the shell; the deny reason names the exact
 path and `openmax --check` prints the parse error.
 
+## Content-bound approvals
+
+The ledger's approval store (`approved.json`, beside the log) holds sha256
+hashes a human has approved. Approval binds to content, never to a path: any
+edit produces a new hash and revokes itself. Two hard rules ride on it, with
+no rule language to widen them:
+
+- A mutating external tool whose defining TOML no human has approved always
+  prompts on its first run - even in `auto` mode, even under a permissions
+  `allow` rule, both of which the agent can write for itself. Approving that
+  run approves the exact content; later runs of the same bytes are unattended.
+- An unapproved hook file is inert. Hooks run with host authority on every
+  matching call with no per-invocation gate, so they are the one capability
+  file that never loads until approved. `openmax --check` names each one.
+
+Approvals happen two ways: a human approving an in-session `write_file` or
+`edit_file` into a capability path approves the resulting content
+automatically (the common case costs no extra prompt), and
+`openmax --approve <path>` approves a file that arrived from outside (a
+clone, an installer, an auto-mode write). Like `--trust-project`, `--approve`
+refuses inside agent-spawned processes: approvals are human actions. Skills
+have no enforcement; they are prose, and the tools they invoke are the gate.
+
 ## The capability ledger
 
 Every tool and skill file a freeze reads is recorded in a per-project,

@@ -63,7 +63,7 @@ key order is not significant: parse every line by field name.
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
-| `approval_request` | `approval_id`, `name`, `summary`, `detail` |
+| `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
 | `hook_failed` | `hook`, `event`, `detail` (an observe-only hook failed; the turn proceeded) |

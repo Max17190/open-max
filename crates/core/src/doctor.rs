@@ -69,7 +69,7 @@ pub fn check(project_root: &Path) -> Vec<Finding> {
 /// which of two files with the same identity actually wins.
 type Entry = (Finding, Option<String>);
 
-fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
+pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     let mut tools_found: Vec<Entry> = Vec::new();
@@ -216,9 +216,19 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         }
                     }
                     hook_events.push(Some(h.event.as_str()));
-                    match missing_command_reason(&h.command, project_root) {
-                        Some(reason) => Status::Warn(reason),
-                        None => Status::Ok(format!("hook on {}", h.event.as_str())),
+                    if !crate::ledger::is_approved(data_dir, project_root, &h.source_sha256) {
+                        // Hooks run with host authority and no per-call gate,
+                        // so unapproved content is inert, and this is where
+                        // that inertness stops being silent.
+                        Status::Err(format!(
+                            "unapproved and inert: a human must approve this exact content with `openmax --approve {}` (an in-session write approval also counts)",
+                            path.display()
+                        ))
+                    } else {
+                        match missing_command_reason(&h.command, project_root) {
+                            Some(reason) => Status::Warn(reason),
+                            None => Status::Ok(format!("hook on {}", h.event.as_str())),
+                        }
                     }
                 }
                 Err(reason) => {
@@ -690,6 +700,14 @@ mod tests {
             )
             .unwrap();
         }
+        // Approve the (identical) hook content so the cap ranking, not the
+        // approval gate, is what this test exercises.
+        crate::ledger::approve_hash(
+            &data,
+            &root,
+            &crate::ledger::sha256_hex(b"event = \"post_tool_use\"\ncommand = \"/bin/sh\"\n"),
+        )
+        .unwrap();
 
         let findings = check_at(&root, &data);
         let over_tool = findings
