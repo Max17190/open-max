@@ -64,6 +64,7 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     let mut tools_found: Vec<Entry> = Vec::new();
+    #[allow(unused_assignments)]
     let mut external_names: Vec<String> = Vec::new();
     for dir in crate::registry::external_tool_dirs(project_root) {
         for path in files_with_extension(&dir, "toml") {
@@ -92,6 +93,14 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         |_| true,
         "tool cap",
     );
+    // Rules and hook filters resolve against what actually loads, so the
+    // known-tool set is the live entries after shadowing and the cap - a
+    // rule naming a beyond-cap tool is as dead as one naming a typo.
+    external_names = tools_found
+        .iter()
+        .filter(|(f, id)| id.is_some() && matches!(f.status, Status::Ok(_)))
+        .filter_map(|(_, id)| id.clone())
+        .collect();
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
 
     let mut skills_found: Vec<Entry> = Vec::new();
