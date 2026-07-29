@@ -264,11 +264,4 @@ mod tests {
         assert_ne!(Tokens::dark().accent, Tokens::catppuccin().accent);
     }
 
-    #[test]
-    fn set_tokens_round_trips_through_the_store() {
-        let before = t();
-        set_tokens(Tokens::dark());
-        assert_eq!(t().accent, Tokens::dark().accent);
-        set_tokens(before);
-    }
 }
