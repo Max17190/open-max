@@ -274,10 +274,15 @@ async fn main() -> std::io::Result<()> {
         if let Some(model) = &cli.model {
             s.model = model.clone();
         }
-        // Fail fast on an explicit but unknown --provider (no silent flat fallback).
+        // Headless and stdio runs fail fast on an unresolvable endpoint: there
+        // is no interface behind them to fix it in. The interactive TUI starts
+        // anyway - /model and /provider are exactly how a first run gets
+        // configured, and every turn surfaces the same actionable error.
         if let Err(e) = open_max_core::providers::resolve(&s, &core.data_dir) {
-            eprintln!("openmax: {e}");
-            std::process::exit(2);
+            if cli.stdio || cli.print {
+                eprintln!("openmax: {e}");
+                std::process::exit(2);
+            }
         }
     }
 
