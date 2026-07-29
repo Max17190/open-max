@@ -2347,7 +2347,6 @@ mod tests {
             format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\n", script.display()),
         )
         .unwrap();
-        crate::hooks::invalidate_hooks_cache();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         let project_key = project.display().to_string();
@@ -2424,7 +2423,6 @@ mod tests {
             format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display()),
         )
         .unwrap();
-        crate::hooks::invalidate_hooks_cache();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         start_turn(core.clone(), "sess-early".into(), project.clone(), "hi".into()).unwrap();
