@@ -560,21 +560,24 @@ async fn spawn_external(
             ToolOutcome::err(format!("external tool '{name}' failed: {e}"))
         }
         Ok(output) => match &output.termination {
-            Termination::Cancelled => {
-                ToolOutcome::err(format!("external tool '{name}' cancelled by user"))
-            }
-            Termination::TimedOut => ToolOutcome::err(format!(
-                "external tool '{name}' timed out after {}s",
-                tool.timeout_secs
-            )),
+            Termination::Cancelled => ToolOutcome::from_killed_process(
+                format!("external tool '{name}' cancelled by user"),
+                &output,
+            ),
+            Termination::TimedOut => ToolOutcome::from_killed_process(
+                format!("external tool '{name}' timed out after {}s", tool.timeout_secs),
+                &output,
+            ),
             Termination::Exited(status) => {
-                let text = tools::render_process_output(&output, caps.command_bytes);
-                if status.success() {
-                    ToolOutcome::ok(text)
-                } else {
-                    let code = status.code().unwrap_or(-1);
-                    ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
-                }
+                let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
+                let (ok, text) = match status.success() {
+                    true => (true, text),
+                    false => {
+                        let code = status.code().unwrap_or(-1);
+                        (false, format!("exit code {code}\n{text}"))
+                    }
+                };
+                ToolOutcome::from_process(ok, text, &output, truncated)
             }
         },
     }
@@ -842,6 +845,38 @@ mutatng = true
             .await;
         assert!(out.ok, "{}", out.output);
         assert!(out.output.contains("got: {\"message\":\"hi\"}"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// The successful branch must carry the same process metadata the failing
+    /// one does: a hook cannot be told a clipped tool was quiet.
+    #[tokio::test]
+    async fn successful_external_tool_reports_what_it_produced() {
+        let project = temp_dir("proj");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let script = write_script(
+            &project,
+            "noisy.sh",
+            "#!/bin/sh\nread -r line\nfor i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done\n",
+        );
+        write_tool(
+            &tools_dir,
+            "noisy.toml",
+            &format!(
+                "name = \"noisy\"\ndescription = \"prints a lot\"\ncommand = \"{}\"\n\n[params]\ntype = \"object\"\n",
+                script.display()
+            ),
+        );
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let out = registry
+            .execute("noisy", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel())
+            .await;
+
+        assert!(out.ok, "{}", out.output);
+        let produced = out.process_bytes.expect("a successful external tool reports its size");
+        assert!(produced > out.output.len() as u64, "the result is a bounded rendering");
+        assert!(out.process_truncated);
         let _ = std::fs::remove_dir_all(project);
     }
 

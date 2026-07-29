@@ -70,7 +70,28 @@ Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`.
 prompt never reaches the model); `post_tool_use`, `session_start` (a session's
 first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` (receives the stop reason, fires even on cancel) observe only. Each
-hook gets one JSON payload on stdin. Hooks never enter the model prompt and,
+hook gets one JSON payload on stdin.
+
+A `post_tool_use` payload carries the tool result the model saw: `output` (its
+first 16 KiB, cut on a character boundary), `output_bytes` (that result's
+size), and `output_truncated` (whether the payload dropped part of it). That is
+what an eval, audit, or telemetry hook needs to be written as a file instead of
+a core feature.
+
+Output is bounded twice and the payload reports both cuts. A tool result is
+itself a bounded rendering of what a process printed: `bash` keeps the tail up
+to its output cap and names a log file holding the bounded capture. So
+`process_bytes` is how many bytes the command actually produced (null when the
+tool ran no process, such as the file and search built-ins) and
+`process_truncated` says whether the result dropped part of it. A call killed
+by timeout or cancel reports the bytes it printed before it died, even though
+its result carries none of them. An audit hook can therefore tell a quiet
+command from a clipped one without parsing a truncation notice out of the text,
+and `output_bytes` still measures the result, because that is the text the
+model actually reasoned about.
+
+It stays observation: the hook's own exit status and stdout are ignored, so
+nothing it does changes what the model receives. Hooks never enter the model prompt and,
 like external tools and `bash`, run as native host processes with inherited
 filesystem, environment, credentials, and network access.
 

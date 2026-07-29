@@ -178,8 +178,21 @@ exit status is ignored. `session_start` fires on a session's first turn;
 reason, even on cancel. Hooks never inject text into the model context.
 
 Each run receives one JSON payload on stdin:
-- pre_tool_use / post_tool_use: {"event", "session_id", "tool", "args",
-  "cwd", "tool_ok"} where `tool_ok` is null before execution and a boolean after.
+- pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
+  where `tool_ok` is null, because the call has not run yet.
+- post_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok",
+  "output", "output_bytes", "output_truncated", "process_bytes",
+  "process_truncated"} where `tool_ok` is a boolean. A hook sees the tool
+  result the model saw, bounded twice and told about both bounds. `output` is
+  the result's first 16 KiB cut on a character boundary, `output_bytes` is the
+  result's size, and `output_truncated` says whether this payload dropped part
+  of it. Behind that, `process_bytes` is how many bytes the command actually
+  produced (null when the tool ran no process) and `process_truncated` says
+  whether the result dropped part of that, so an audit hook can tell a quiet
+  command from a clipped one. A call killed by timeout or cancel reports the
+  bytes it printed before it died, even though the result carries none of
+  them. `bash` also names its bounded output log in the result text. Reading any of this changes nothing: an observe event cannot
+  alter what the model receives.
 - user_prompt_submit: {"event", "session_id", "cwd", "text"}
 - session_start: {"event", "session_id", "cwd"}
 - compaction: {"event", "session_id", "cwd", "record"} where `record` is the
@@ -456,7 +469,14 @@ mod tests {
             entry[open..=close].to_string()
         };
         let cases = [
-            ("pre_tool_use / post_tool_use", vec!["event", "session_id", "tool", "args", "cwd", "tool_ok"]),
+            ("pre_tool_use", vec!["event", "session_id", "tool", "args", "cwd", "tool_ok"]),
+            (
+                "post_tool_use",
+                vec![
+                    "event", "session_id", "tool", "args", "cwd", "tool_ok", "output",
+                    "output_bytes", "output_truncated", "process_bytes", "process_truncated",
+                ],
+            ),
             ("user_prompt_submit", vec!["event", "session_id", "cwd", "text"]),
             ("session_start", vec!["event", "session_id", "cwd"]),
             ("compaction", vec!["event", "session_id", "cwd", "record"]),
