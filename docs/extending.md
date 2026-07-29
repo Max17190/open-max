@@ -196,6 +196,20 @@ and who changed it - so the agent's action space never mutates silently.
 version is an ordinary `cp` from the objects directory. There is no rollback
 command: the core guarantees the history exists, using it stays file work.
 
+## Self-measurement
+
+The dispatcher counts what only it can see: every external-tool call (with
+outcome) and every skill-body read, merged once per turn into the project's
+usage record beside the ledger. `openmax --spec usage` joins those counters
+with each extension's frozen-prompt cost - the characters every request pays
+while the file is installed - and its approval state, so the agent can see
+which of its own creations are pure tax and delete them. Nothing is pruned
+automatically: the core measures, the agent judges.
+
+With enough recorded signal (50 calls), `openmax --check` warns about
+extensions that were never used, and it always warns when two skills describe
+nearly the same thing - look-alike skills degrade the model's selection.
+
 ## Validation
 
 `openmax --check` parses tools, skills, templates, hooks, permissions, and

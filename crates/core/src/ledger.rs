@@ -391,6 +391,115 @@ pub fn is_approved(data_dir: &Path, project_root: &Path, sha: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ---------- usage accounting ----------
+
+/// Lifetime usage counters for one extension.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageEntry {
+    pub calls: u64,
+    pub ok: u64,
+    pub err: u64,
+    /// Unix seconds of the most recent use.
+    pub last_used: u64,
+}
+
+/// Per-project usage file: what only the dispatcher can measure. Core
+/// measures; the agent judges and deletes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageFile {
+    #[serde(default)]
+    pub version: u32,
+    /// Every recorded tool call, external or skill read, for base rates.
+    #[serde(default)]
+    pub total_calls: u64,
+    #[serde(default)]
+    pub tools: std::collections::BTreeMap<String, UsageEntry>,
+    #[serde(default)]
+    pub skills: std::collections::BTreeMap<String, UsageEntry>,
+}
+
+/// One turn's accumulated usage, merged into the file at turn end.
+#[derive(Debug, Default)]
+pub struct UsageDelta {
+    /// (external tool name, call succeeded)
+    pub tools: Vec<(String, bool)>,
+    /// Skill names whose SKILL.md the model read this turn.
+    pub skills: Vec<String>,
+}
+
+impl UsageDelta {
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.skills.is_empty()
+    }
+}
+
+fn usage_path(dir: &Path) -> PathBuf {
+    dir.join("usage.json")
+}
+
+pub fn load_usage(data_dir: &Path, project_root: &Path) -> Result<UsageFile, String> {
+    let path = usage_path(&project_dir(data_dir, project_root));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(UsageFile::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&text).map_err(|e| format!("{} is malformed: {e}", path.display()))
+}
+
+/// Merge one turn's usage under the ledger lock: one atomic write per turn,
+/// no per-call I/O.
+pub fn record_usage(
+    data_dir: &Path,
+    project_root: &Path,
+    delta: &UsageDelta,
+) -> Result<(), String> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+    let dir = project_dir(data_dir, project_root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(&dir))
+        .map_err(|e| format!("cannot open ledger lock: {e}"))?;
+    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
+    let result = (|| {
+        // A malformed usage file starts over rather than blocking turns:
+        // usage is telemetry, not policy.
+        let mut file = load_usage(data_dir, project_root).unwrap_or_default();
+        file.version = 1;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for (name, ok) in &delta.tools {
+            let entry = file.tools.entry(name.clone()).or_default();
+            entry.calls += 1;
+            if *ok {
+                entry.ok += 1;
+            } else {
+                entry.err += 1;
+            }
+            entry.last_used = ts;
+            file.total_calls += 1;
+        }
+        for name in &delta.skills {
+            let entry = file.skills.entry(name.clone()).or_default();
+            entry.calls += 1;
+            entry.ok += 1;
+            entry.last_used = ts;
+            file.total_calls += 1;
+        }
+        let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+        crate::sessions::write_atomic(&usage_path(&dir), json)
+    })();
+    let _ = fs2::FileExt::unlock(&lock);
+    result
+}
+
 /// A short human line per change, for the refreeze receipt. The paths are
 /// project-relative where possible so the note reads like the tree.
 pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
@@ -511,6 +620,26 @@ mod tests {
         std::fs::write(&object, "forged").unwrap();
         sync(&data, &root, &[(path, sha.clone(), bytes)], Actor::External, None).unwrap();
         assert_eq!(std::fs::read_to_string(&object).unwrap(), "authentic");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usage_merges_across_turns() {
+        let data = temp("use-data");
+        let root = temp("use-proj");
+        let mut delta = UsageDelta::default();
+        delta.tools.push(("deploy".into(), true));
+        delta.tools.push(("deploy".into(), false));
+        delta.skills.push("release".into());
+        record_usage(&data, &root, &delta).unwrap();
+        record_usage(&data, &root, &delta).unwrap();
+        let usage = load_usage(&data, &root).unwrap();
+        assert_eq!(usage.total_calls, 6);
+        let deploy = &usage.tools["deploy"];
+        assert_eq!((deploy.calls, deploy.ok, deploy.err), (4, 2, 2));
+        assert_eq!(usage.skills["release"].calls, 2);
+        assert!(deploy.last_used > 0);
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
