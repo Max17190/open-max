@@ -4,6 +4,12 @@ target
 # Local tooling state
 .firecrawl
 .claude/settings.local.json
+.claude/worktrees/
+.worktrees/
+.env
+
+# Local planning notes (not shipped)
+/PLAN.md
 
 # Editor and OS
 .idea
