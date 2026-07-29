@@ -79,9 +79,17 @@ where the harness contacts Hugging Face; see
 
 ## Project trust
 
-An exact canonical project root must be trusted before any agent turn or
-project behavior starts. Interactive use asks once; headless and stdio runs
-fail closed until explicitly started with `--trust-project`.
+A canonical project root must be trusted before any agent turn or project
+behavior starts. Interactive use asks once; headless and stdio runs fail
+closed until explicitly started with `--trust-project`. A trusted root covers
+its subtree, so worktrees under it (for example `.worktrees/`) need no extra
+grant; a sibling directory whose name merely extends the root never rides
+along.
+
+Trust grants are human actions. Every process the agent loop spawns carries
+`OPENMAX_SESSION`, and under that marker both `--trust-project` and the
+interactive trust prompt refuse: a session cannot grant itself, or a child it
+starts, trust in a new directory.
 
 ```sh
 openmax --trust-project -p "summarize this repo"

@@ -429,7 +429,18 @@ fn ensure_project_trust(
     data_dir: &std::path::Path,
     project: &std::path::Path,
 ) -> Result<(), String> {
+    // Trust grants are human actions. Any process the agent loop spawns
+    // carries OPENMAX_SESSION, and both the flag and the interactive prompt
+    // refuse under it: a session must not be able to grant itself (or a
+    // child) trust in a new directory.
+    let agent_spawned = std::env::var_os("OPENMAX_SESSION").is_some();
     if cli.trust_project {
+        if agent_spawned {
+            return Err(format!(
+                "trust grants are human actions: this process was started from an agent session; ask the user to run `openmax --trust-project` in {}",
+                project.display()
+            ));
+        }
         let trusted = open_max_core::trust::trust_project(data_dir, project)?;
         eprintln!("openmax: trusted project {}", trusted.display());
         return Ok(());
@@ -437,7 +448,7 @@ fn ensure_project_trust(
     if open_max_core::trust::is_trusted(data_dir, project)? {
         return Ok(());
     }
-    if cli.print || cli.stdio || !std::io::stdin().is_terminal() {
+    if agent_spawned || cli.print || cli.stdio || !std::io::stdin().is_terminal() {
         return Err(format!(
             "project {} is not trusted; inspect it, then rerun with --trust-project",
             project.display()
@@ -477,6 +488,29 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Trust grants are human actions: under an agent-spawned process
+    /// (OPENMAX_SESSION set), --trust-project must refuse rather than record.
+    #[test]
+    fn trust_project_refuses_under_an_agent_session() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openmax-trustgate-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cli = parse_args_from(["--trust-project"]).unwrap();
+        std::env::set_var("OPENMAX_SESSION", "1");
+        let result = ensure_project_trust(&cli, &dir.join("data"), &dir);
+        std::env::remove_var("OPENMAX_SESSION");
+        let err = result.unwrap_err();
+        assert!(err.contains("human actions"), "{err}");
+        assert!(
+            !open_max_core::trust::is_trusted(&dir.join("data"), &dir).unwrap_or(true),
+            "no trust may be recorded"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

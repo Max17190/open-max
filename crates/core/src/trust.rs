@@ -71,7 +71,14 @@ fn load(data_dir: &Path) -> Result<TrustFile, String> {
 /// Malformed trust state is an error so callers fail closed.
 pub fn is_trusted(data_dir: &Path, project_root: &Path) -> Result<bool, String> {
     let canonical = canonical_project(project_root)?;
-    Ok(load(data_dir)?.projects.iter().any(|p| p == &canonical))
+    // A trusted root covers its subtree: the agent already holds full
+    // authority inside that root, so a worktree or subdirectory of it (the
+    // delegation case) is not a widening. Comparison is component-wise on
+    // canonical paths, so /a/b never covers /a/bc.
+    Ok(load(data_dir)?
+        .projects
+        .iter()
+        .any(|p| canonical == *p || canonical.starts_with(p)))
 }
 
 /// Persist trust for the exact canonical project root.
@@ -111,6 +118,29 @@ mod tests {
             std::env::temp_dir().join(format!("openmax-trust-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A trusted root covers its worktrees and subdirectories, but never a
+    /// sibling whose name merely extends it.
+    #[test]
+    fn subtree_of_a_trusted_root_is_trusted() {
+        let data = temp_dir("subtree-data");
+        let root = temp_dir("subtree-root");
+        let child = root.join(".worktrees").join("task-a");
+        std::fs::create_dir_all(&child).unwrap();
+        let sibling = root
+            .parent()
+            .unwrap()
+            .join(format!("{}-evil", root.file_name().unwrap().to_str().unwrap()));
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        trust_project(&data, &root).unwrap();
+        assert!(is_trusted(&data, &root).unwrap());
+        assert!(is_trusted(&data, &child).unwrap(), "worktree under the root");
+        assert!(!is_trusted(&data, &sibling).unwrap(), "path-prefix sibling must not ride along");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 
     #[test]
