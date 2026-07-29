@@ -14,8 +14,13 @@ in parallel with the main task.
 A child openmax refuses to run in a project the human has not trusted (exit
 code 3). Never pass `--trust-project` to a child or run it yourself; trust
 grants are human actions. When delegating outside the current trusted root,
-ask the human to run `openmax --trust-project /path/to/project` first, then
-start the child.
+ask the human to trust the target first. `--trust-project` takes no path; it
+trusts the directory it runs in:
+
+    cd /path/to/project && openmax --trust-project
+
+That records trust and opens a session there (quit it with /quit). Then start
+the child.
 
 ## One-shot: headless print
 
@@ -60,8 +65,8 @@ creates a persistent generation directory, and atomically updates the logical
 name symlink. It launches the configured `OPENMAX_BIN` or `openmax` in the
 target directory, captures combined output and the exact exit code, and uses a
 tmux wait lock for race-free completion. If the target is untrusted, the child
-exits 3 and `status` reports `exited 3`; that means the human still has to run
-`openmax --trust-project` there. Capture the immutable generation path
+exits 3 and `status` reports `exited 3`; that means the human still has to
+trust that directory (see above). Capture the immutable generation path
 printed by `start` and pass that handle to every later command. Operational
 commands reject mutable logical names. Starting the same logical name while its
 current generation is running is also rejected. `list` reports every retained
