@@ -83,59 +83,6 @@ pub struct Hooks {
     invalid: Vec<String>,
 }
 
-use std::sync::{Mutex, OnceLock};
-
-struct HooksCache {
-    project_root: PathBuf,
-    /// Fingerprint of hook dirs/files; None means uncached.
-    fingerprint: Option<u64>,
-    hooks: Hooks,
-}
-
-static HOOKS_CACHE: OnceLock<Mutex<HooksCache>> = OnceLock::new();
-
-/// Drop cached hooks (tests or after external config install).
-pub fn invalidate_hooks_cache() {
-    if let Some(lock) = HOOKS_CACHE.get() {
-        if let Ok(mut cache) = lock.lock() {
-            cache.project_root.clear();
-            cache.fingerprint = None;
-            cache.hooks = Hooks::default();
-        }
-    }
-}
-
-/// Hash the contents of every hook definition (`.toml`) file, in sorted path
-/// order. Hook files gate tool execution, so the cache key must reflect what
-/// the files say, not filesystem metadata: a same-length rewrite inside one
-/// timestamp tick would leave an mtime+len key unchanged and keep an obsolete
-/// policy live. Hook dirs hold a handful of small files; reading them per
-/// discovery is cheap.
-fn hooks_fingerprint(project_root: &Path) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    for dir in hook_dirs(project_root) {
-        dir.hash(&mut h);
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        let mut files: Vec<PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
-            .collect();
-        files.sort();
-        for path in files {
-            path.hash(&mut h);
-            std::fs::read(&path).ok().hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
-fn discover_uncached(project_root: &Path) -> Hooks {
-    discover_in_dirs(&hook_dirs(project_root))
-}
-
 /// First stem wins: project dirs are listed before global, and that
 /// precedence covers parse errors too. A malformed file that is shadowed by
 /// an earlier valid one was never going to run, so it must not fail closed;
@@ -193,25 +140,17 @@ fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
 impl Hooks {
     /// Discover hooks under project `.openmax/hooks/` then global
     /// `~/.openmax/hooks/`. Project entries with the same file stem win.
-    /// Results are cached by project root + directory fingerprint.
+    ///
+    /// Every file is read exactly once and the policy is parsed from those
+    /// same bytes, so what a turn enforces is always a generation that
+    /// existed on disk. Nothing is cached between calls: a cache key has to
+    /// be computed from a read of its own, and a file edited between that
+    /// read and the parse would store a policy under the fingerprint of a
+    /// different one, leaving a gate that never runs while its file sits on
+    /// disk. Discovery is one directory list per turn, so there is nothing
+    /// worth that risk.
     pub fn discover(project_root: &Path) -> Self {
-        let fp = hooks_fingerprint(project_root);
-        let lock = HOOKS_CACHE.get_or_init(|| {
-            Mutex::new(HooksCache {
-                project_root: PathBuf::new(),
-                fingerprint: None,
-                hooks: Hooks::default(),
-            })
-        });
-        let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.project_root == project_root && cache.fingerprint == Some(fp) {
-            return cache.hooks.clone();
-        }
-        let hooks = discover_uncached(project_root);
-        cache.project_root = project_root.to_path_buf();
-        cache.fingerprint = Some(fp);
-        cache.hooks = hooks.clone();
-        hooks
+        discover_in_dirs(&hook_dirs(project_root))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -588,6 +527,29 @@ mod tests {
         let hooks = Hooks::discover(&tmp);
         assert_eq!(hooks.pre.len(), 1);
         assert_eq!(hooks.pre[0].command, "/bin/bbbb");
+    }
+
+    #[test]
+    fn discovery_holds_no_memory_between_calls() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let gate = "event = \"pre_tool_use\"\ncommand = \"/bin/aaaa\"\n";
+        let path = hooks_dir.join("gate.toml");
+
+        write_hook_toml(&hooks_dir, "gate.toml", gate);
+        assert_eq!(Hooks::discover(&tmp).pre.len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(Hooks::discover(&tmp).is_empty(), "a removed gate must stop applying");
+
+        // Restoring byte-identical content puts the policy back. Anything
+        // that remembered the gap keyed by content would answer "no gate"
+        // here, and a gate that does not run is a gate that is not enforced.
+        write_hook_toml(&hooks_dir, "gate.toml", gate);
+        let hooks = Hooks::discover(&tmp);
+        assert_eq!(hooks.pre.len(), 1, "invalid: {:?}", hooks.invalid);
+        assert_eq!(hooks.pre[0].command, "/bin/aaaa");
     }
 
     #[tokio::test]
