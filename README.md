@@ -136,7 +136,6 @@ Sessions, settings, tools, and skills stay under `~/.openmax/` and your project 
 - [Usage](docs/usage.md): CLI flags, keybindings, slash commands
 - [Extending](docs/extending.md): tools, skills, templates, hooks, permissions, validation, freezing
 - [stdio protocol](docs/stdio-protocol.md): the `openmax-stdio/1` contract for custom frontends
-- [JSON-RPC bridge](docs/json-rpc-bridge.md): `openmax-bridge`, a JSON-RPC 2.0 client of that contract
 
 ## Development
 
