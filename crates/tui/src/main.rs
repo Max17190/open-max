@@ -369,16 +369,20 @@ async fn main() -> std::io::Result<()> {
 /// the shared stdout fd, and every frame ends fully flushed.
 fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
-    enable_raw_mode()?;
-    let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout());
-    execute!(out, EnterAlternateScreen)?;
-    out.flush()?;
+    // Hook first: any panic or error past raw mode must restore the shell.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
         hook(info);
     }));
-    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
+    enable_raw_mode()?;
+    let init = || -> std::io::Result<ui::transcript::Term> {
+        let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout());
+        execute!(out, EnterAlternateScreen)?;
+        out.flush()?;
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
+    };
+    init().inspect_err(|_| ratatui::restore())
 }
 
 fn ensure_project_trust(
