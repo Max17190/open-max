@@ -334,7 +334,8 @@ Parse by field name, never by key order. Types: `token` (text), `thinking`
 (call_id, name, args), `tool_end` (call_id, ok, output), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail), `approval_settled` (approval_id, outcome), `refrozen` (tools,
-skills), `done` (stop_reason), `error` (message).
+skills), `hook_failed` (hook, event, detail: an observe-only hook failed,
+the turn proceeded), `done` (stop_reason), `error` (message).
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
