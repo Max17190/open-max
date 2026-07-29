@@ -44,11 +44,11 @@ use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-pub const PROTO: &str = "openmax-stdio/1";
+pub const PROTO: &str = "openmax-stdio/2";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).

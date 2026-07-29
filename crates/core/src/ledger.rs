@@ -101,8 +101,9 @@ fn lock_path(dir: &Path) -> PathBuf {
     dir.join("ledger.lock")
 }
 
-/// Read the full history. A malformed line is an error, never silently
-/// skipped: a ledger that cannot be read must not be read around.
+/// Read the full history, verifying the hash chain as it goes. A malformed
+/// line or a broken chain is an error, never silently skipped or displayed
+/// as authentic: a ledger that cannot be trusted must not be read around.
 pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, String> {
     let path = log_path(&project_dir(data_dir, project_root));
     let text = match std::fs::read_to_string(&path) {
@@ -111,12 +112,28 @@ pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, Stri
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
     let mut out = Vec::new();
+    let mut prev = String::new();
+    let last_line_number = text.lines().count();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let record: Record = serde_json::from_str(line)
-            .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?;
+        let record: Record = serde_json::from_str(line).map_err(|e| {
+            let repair_hint = if i + 1 == last_line_number && !text.ends_with('\n') {
+                " (likely an interrupted write; remove the partial last line to repair)"
+            } else {
+                ""
+            };
+            format!("{} line {}: {e}{repair_hint}", path.display(), i + 1)
+        })?;
+        if record.prev != prev {
+            return Err(format!(
+                "{} line {}: hash chain broken - the ledger was modified outside the harness",
+                path.display(),
+                i + 1
+            ));
+        }
+        prev = sha256_hex(line.as_bytes());
         out.push(record);
     }
     Ok(out)

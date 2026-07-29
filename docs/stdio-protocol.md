@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/1`)
+# stdio protocol (`openmax-stdio/2`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -14,7 +14,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/1","protocol_version":1,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/2","protocol_version":2,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -65,7 +65,7 @@ key order is not significant: parse every line by field name.
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
 | `approval_request` | `approval_id`, `name`, `summary`, `detail` |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
-| `refrozen` | `tools`, `skills` |
+| `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
 | `hook_failed` | `hook`, `event`, `detail` (an observe-only hook failed; the turn proceeded) |
 | `done` | `stop_reason` |
 | `error` | `message` |
