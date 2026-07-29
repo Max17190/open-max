@@ -97,6 +97,10 @@ pub enum AgentEvent {
     /// The session's tools, skills, and system prompt were re-frozen from
     /// current config (extension files changed, or the user forced /reload).
     Refrozen { tools: usize, skills: usize },
+    /// An observe-only hook (post_tool_use, session_start, compaction,
+    /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The
+    /// turn proceeded - observe hooks are fail-open - but never silently.
+    HookFailed { hook: String, event: String, detail: String },
     Done { stop_reason: String },
     Error { message: String },
 }
@@ -198,6 +202,15 @@ mod tests {
         assert_eq!(
             env(AgentEvent::Refrozen { tools: 7, skills: 2 }),
             r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2}"#
+        );
+
+        assert_eq!(
+            env(AgentEvent::HookFailed {
+                hook: "audit".into(),
+                event: "post_tool_use".into(),
+                detail: "exit code 1".into(),
+            }),
+            r#"{"session_id":"s1","type":"hook_failed","hook":"audit","event":"post_tool_use","detail":"exit code 1"}"#
         );
         assert_eq!(
             env(AgentEvent::Done { stop_reason: "stop".into() }),

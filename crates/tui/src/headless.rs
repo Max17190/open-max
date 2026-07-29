@@ -223,6 +223,11 @@ async fn run_turn_events(
                     let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills)");
                 }
             }
+            AgentEvent::HookFailed { hook, event, detail } => {
+                if !json {
+                    let _ = writeln!(stderr, "openmax: hook '{hook}' failed on {event}: {detail}");
+                }
+            }
             AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }
             | AgentEvent::Usage { .. }
