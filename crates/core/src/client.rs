@@ -332,7 +332,7 @@ impl ChatClient {
             let resp = match send_result {
                 Ok(r) => r,
                 Err(e) => {
-                    let msg = format!("request failed: {e}");
+                    let msg = format!("request failed: {}", describe_transport(&e));
                     if attempt < MAX_ATTEMPTS && is_transient_transport(&e) {
                         backoff_sleep(attempt).await;
                         if cancelled.is_cancelled() {
@@ -354,7 +354,7 @@ impl ChatClient {
             }
             let code = status.as_u16();
             let text = resp.text().await.unwrap_or_default();
-            let err = format!("backend returned {status}: {}", truncate(&text, 600));
+            let err = format!("backend returned {status}: {}", describe_backend(&text));
             if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
                 backoff_sleep(attempt).await;
                 if cancelled.is_cancelled() {
@@ -537,6 +537,40 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
         .collect()
 }
 
+/// reqwest's `Display` stops at "error sending request for url (...)" and
+/// hides the cause underneath, which is the only part a user can act on:
+/// "connection refused" means the local model server is not running. Walk the
+/// source chain so that line survives into the transcript.
+fn describe_transport(e: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Wrappers often restate their child verbatim; keep the chain short.
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    truncate(&out, 600)
+}
+
+/// OpenAI-compatible servers wrap failures in `{"error": {"message": ...}}`.
+/// Show that message; fall back to the raw body for servers that do not.
+fn describe_backend(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message").or(Some(e)))
+                .and_then(|m| m.as_str().map(str::to_string))
+        })
+        .map(|m| truncate(&m, 600))
+        .unwrap_or_else(|| truncate(body, 600))
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -573,6 +607,26 @@ mod tests {
     #[test]
     fn trim_bytes_strips_whitespace() {
         assert_eq!(trim_bytes(b"  hello \r"), b"hello");
+    }
+
+    #[test]
+    fn backend_errors_surface_the_message_not_the_envelope() {
+        let body = r#"{"error":{"message":"model \"qwen\" not found","type":"not_found"}}"#;
+        assert_eq!(describe_backend(body), "model \"qwen\" not found");
+        // Servers that answer with plain text or HTML still show something.
+        assert_eq!(describe_backend("upstream timeout"), "upstream timeout");
+        assert_eq!(describe_backend(""), "");
+    }
+
+    #[test]
+    fn backend_error_without_a_message_falls_back_to_the_error_value() {
+        assert_eq!(
+            describe_backend(r#"{"error":"quota exceeded"}"#),
+            "quota exceeded"
+        );
+        // An object with no message is not a string; keep the raw body.
+        let body = r#"{"error":{"code":42}}"#;
+        assert_eq!(describe_backend(body), body);
     }
 
     #[test]

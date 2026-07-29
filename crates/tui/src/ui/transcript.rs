@@ -152,7 +152,9 @@ impl Block {
             let (line, x_offset) = decorate_line(self.kind, line, i == 0, width);
             self.cache.push(line);
             self.cache_maps.push(map.map(|mut map| {
-                map.x_offset = x_offset;
+                // The wrapper may already have shifted continuation rows by a
+                // hanging indent; the gutter stacks on top of that.
+                map.x_offset += x_offset;
                 map
             }));
         }
@@ -917,18 +919,21 @@ fn wrap_lines_mapped(
             logical_start += 1;
             continue;
         }
+        let indent = hanging_indent(&chars, width);
         if chars.iter().all(|(ch, _)| ch.is_ascii()) {
             // Coding-agent transcripts are overwhelmingly ASCII. Preserve the
             // original scalar loop here so Unicode safety has no tax on the
             // common resize and streaming paths.
             let mut start = 0usize;
+            let mut first_row = true;
             while start < chars.len() {
+                let avail = if first_row { width } else { width - indent };
                 let mut used = 0usize;
                 let mut end = start;
                 let mut last_space: Option<usize> = None;
                 while end < chars.len() {
                     let width_here = chars[end].0.width().unwrap_or(0);
-                    if used + width_here > width {
+                    if used + width_here > avail {
                         break;
                     }
                     if chars[end].0 == ' ' {
@@ -945,14 +950,19 @@ fn wrap_lines_mapped(
                         _ => end.max(start + 1),
                     }
                 };
-                out.push(rebuild(&chars[start..cut]));
+                let mut row = rebuild(&chars[start..cut]);
+                if !first_row && indent > 0 {
+                    row.spans.insert(0, Span::raw(" ".repeat(indent)));
+                }
+                out.push(row);
                 maps.push(Some(CachedLineMap {
                     start: logical_start + start,
                     end: logical_start + cut,
-                    x_offset: 0,
+                    x_offset: if first_row { 0 } else { indent },
                     text: chars[start..cut].iter().map(|(ch, _)| ch).collect(),
                 }));
                 start = cut;
+                first_row = false;
             }
         } else {
             let plain: String = chars.iter().map(|(ch, _)| ch).collect();
@@ -969,13 +979,15 @@ fn wrap_lines_mapped(
             }
 
             let mut start = 0usize;
+            let mut first_row = true;
             while start < graphemes.len() {
+                let avail = if first_row { width } else { width - indent };
                 let mut used = 0usize;
                 let mut end = start;
                 let mut last_space: Option<usize> = None;
                 while end < graphemes.len() {
                     let (_, width_here, is_space) = graphemes[end];
-                    if used + width_here > width {
+                    if used + width_here > avail {
                         break;
                     }
                     if is_space {
@@ -998,22 +1010,58 @@ fn wrap_lines_mapped(
                 } else {
                     graphemes[cut].0
                 };
-                out.push(rebuild(&chars[from_char..to_char]));
+                let mut row = rebuild(&chars[from_char..to_char]);
+                if !first_row && indent > 0 {
+                    row.spans.insert(0, Span::raw(" ".repeat(indent)));
+                }
+                out.push(row);
                 maps.push(Some(CachedLineMap {
                     start: logical_start + from_char,
                     end: logical_start + to_char,
-                    x_offset: 0,
+                    x_offset: if first_row { 0 } else { indent },
                     text: chars[from_char..to_char]
                         .iter()
                         .map(|(ch, _)| ch)
                         .collect(),
                 }));
                 start = cut;
+                first_row = false;
             }
         }
         logical_start += chars.len() + 1;
     }
     (out, maps)
+}
+
+/// Continuation indent for a wrapped line: its leading whitespace plus any
+/// list marker. Without it the second row of a long bullet starts in the
+/// marker column and reads as a separate item.
+fn hanging_indent(chars: &[(char, Style)], width: usize) -> usize {
+    let mut i = 0;
+    while i < chars.len() && chars[i].0 == ' ' {
+        i += 1;
+    }
+    let marker = match chars.get(i).map(|c| c.0) {
+        Some('•' | '-' | '*') if chars.get(i + 1).map(|c| c.0) == Some(' ') => 2,
+        Some(d) if d.is_ascii_digit() => {
+            let mut j = i;
+            while j < chars.len() && chars[j].0.is_ascii_digit() {
+                j += 1;
+            }
+            match (chars.get(j).map(|c| c.0), chars.get(j + 1).map(|c| c.0)) {
+                (Some('.' | ')'), Some(' ')) => j + 2 - i,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+    let indent = i + marker;
+    // An indent that swallows half the line would wrap worse than none.
+    if indent >= width / 2 {
+        0
+    } else {
+        indent
+    }
 }
 
 fn decorate_line(
@@ -1158,6 +1206,59 @@ mod tests {
             text(&wrapped).join(""),
             "the quick brown fox jumps over the lazy dog"
         );
+    }
+
+    #[test]
+    fn wrapped_list_items_hang_under_their_marker() {
+        let wrapped = text(&wrap_lines(&[Line::from("• alpha beta gamma delta")], 16));
+        assert_eq!(wrapped[0], "• alpha beta ");
+        for row in &wrapped[1..] {
+            assert!(row.starts_with("  "), "continuation not indented: {row:?}");
+            assert!(row.chars().count() <= 16, "line too long: {row:?}");
+        }
+        // Dropping the injected indent recovers the original text exactly.
+        let rejoined: String = std::iter::once(wrapped[0].clone())
+            .chain(wrapped[1..].iter().map(|r| r[2..].to_string()))
+            .collect();
+        assert_eq!(rejoined, "• alpha beta gamma delta");
+
+        let numbered = text(&wrap_lines(&[Line::from("12. alpha beta gamma delta")], 16));
+        assert!(numbered[1].starts_with("    "), "{:?}", numbered[1]);
+
+        // Plain prose keeps flush continuations.
+        let prose = text(&wrap_lines(&[Line::from("alpha beta gamma delta")], 12));
+        assert!(!prose[1].starts_with(' '), "{:?}", prose[1]);
+    }
+
+    #[test]
+    fn hanging_indent_applies_to_the_unicode_path_too() {
+        let wrapped = text(&wrap_lines(&[Line::from("• héllo wörld again now")], 14));
+        assert!(wrapped.len() > 1);
+        for row in &wrapped[1..] {
+            assert!(row.starts_with("  "), "continuation not indented: {row:?}");
+        }
+    }
+
+    /// The indent shifts continuation rows on screen, so the column map that
+    /// drives mouse selection has to shift with them. Without this, clicking
+    /// the start of the indented row selects two characters too far in.
+    #[test]
+    fn mouse_selection_accounts_for_the_hanging_indent() {
+        let mut t = Transcript::new();
+        t.set_width(20);
+        t.push(vec![Line::from("• alpha beta gamma delta")]);
+        let rendered = text(t.lines());
+        let row = rendered
+            .iter()
+            .position(|r| r.trim_start() == "delta")
+            .expect("wrapped continuation row");
+        assert_eq!(rendered[row], "  delta");
+
+        assert!(t.begin_text_selection_at(row, 2));
+        assert!(t.update_text_selection_at(row, 7));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("delta"));
+        assert_eq!(t.selection_columns(row), Some((2, 7)));
     }
 
     #[test]
@@ -1565,3 +1666,4 @@ mod tests {
         assert_eq!(t.last_assistant_text().as_deref(), Some("latest\nresponse"));
     }
 }
+
