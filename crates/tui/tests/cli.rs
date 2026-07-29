@@ -44,6 +44,9 @@ fn cmd(project: &Path, home: &Path) -> Command {
     c.current_dir(project);
     c.env("HOME", home);
     c.env_remove("OPENMAX_API_KEY");
+    // A developer dogfooding openmax runs cargo test from inside a session;
+    // the harness marks such children and trust would refuse (#83).
+    c.env_remove("OPENMAX_SESSION");
     c
 }
 
