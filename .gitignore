@@ -9,7 +9,7 @@ target
 .env
 
 # Local planning notes (not shipped)
-PLAN.md
+/PLAN.md
 
 # Editor and OS
 .idea
