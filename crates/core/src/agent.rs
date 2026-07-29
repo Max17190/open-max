@@ -883,6 +883,36 @@ async fn refreeze_if_extensions_changed(
     }
 }
 
+/// After a human approved a write_file/edit_file into a capability path,
+/// record the resulting content as approved so the capability it defines is
+/// live without a second prompt. Anything else (auto-mode writes, bash
+/// heredocs, files arriving from outside) stays unapproved until a human
+/// acts.
+fn record_capability_write_approval(
+    core: &Arc<Core>,
+    project_root: &Path,
+    tool: &str,
+    args: &serde_json::Value,
+) {
+    if tool != "write_file" && tool != "edit_file" {
+        return;
+    }
+    let Some(rel) = args.get("path").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let is_capability = rel.starts_with(".openmax/tools/")
+        || rel.starts_with(".openmax/hooks/")
+        || (rel.starts_with(".agents/skills/") && rel.ends_with("SKILL.md"));
+    if !is_capability {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(project_root.join(rel)) else {
+        return;
+    };
+    let sha = crate::ledger::sha256_hex(&bytes);
+    let _ = crate::ledger::approve_hash(&core.data_dir, project_root, &sha);
+}
+
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
 /// ledger failure never blocks activation, but it is reported in the receipt
 /// rather than swallowed.
@@ -1013,7 +1043,7 @@ async fn run_loop(
     // Discover hooks first: user_prompt_submit gates the input before it
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
-    let hooks = Hooks::discover(project_root);
+    let hooks = Hooks::discover(project_root, &core.data_dir);
     match hooks
         .user_prompt_submit(session_id, &user_text, project_root, &cancelled)
         .await
@@ -1353,19 +1383,50 @@ async fn run_loop(
                 // Readonly still blocks mutating tools regardless of Allow.
                 let force_allow = matches!(perm, PermissionDecision::Allow);
                 let force_ask = matches!(perm, PermissionDecision::Ask);
+                // A mutating external tool whose defining file no human has
+                // approved (by exact content hash) always prompts - even in
+                // auto mode, even under a permissions Allow rule, both of
+                // which the agent can write for itself. This is the invariant
+                // that makes same-turn self-extension safe: the agent can
+                // grow its own action space but cannot grant it unattended
+                // host authority.
+                let unapproved_source = registry.is_mutating(name)
+                    && registry.get(name).is_some_and(|spec| match &spec.kind {
+                        crate::registry::ToolKind::External(ext) => {
+                            !crate::ledger::is_approved(&core.data_dir, project_root, &ext.source_sha256)
+                        }
+                        crate::registry::ToolKind::Builtin => false,
+                    });
                 let mut executed = false;
+                let mut prompt_approved = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
                     (tools::ToolOutcome {
                         ok: false,
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None, ..Default::default()
                     }, false)
-                } else if !force_allow
-                    && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask))
+                } else if unapproved_source
+                    || (!force_allow
+                        && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask)))
                 {
                     match request_approval(core, session_id, name, &args, &cancelled).await {
                         ApprovalOutcome::Approved => {
                             executed = true;
+                            prompt_approved = true;
+                            // Approving the first run of an unapproved tool
+                            // approves this exact content: later runs of the
+                            // same bytes need no prompt, any edit revokes.
+                            if unapproved_source {
+                                if let Some(crate::registry::ToolKind::External(ext)) =
+                                    registry.get(name).map(|spec| &spec.kind)
+                                {
+                                    let _ = crate::ledger::approve_hash(
+                                        &core.data_dir,
+                                        project_root,
+                                        &ext.source_sha256,
+                                    );
+                                }
+                            }
                             (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
@@ -1398,6 +1459,13 @@ async fn run_loop(
                     guard.messages().push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
                     stop_reason = "cancelled".into();
                     break 'turns;
+                }
+
+                if prompt_approved && outcome.ok {
+                    // An in-session approval of a capability-file write is a
+                    // human content approval: record the resulting hash so
+                    // the file is live without a second prompt.
+                    record_capability_write_approval(core, project_root, name, &args);
                 }
 
                 if executed {
@@ -1769,6 +1837,14 @@ fn enforce_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hooks are inert until a human approves their exact content; tests
+    /// stand in for the human.
+    fn approve_hook(core: &Arc<Core>, project: &Path, path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        crate::ledger::approve_hash(&core.data_dir, project, &crate::ledger::sha256_hex(&bytes))
+            .unwrap();
+    }
     use crate::types::{ToolCall, ToolCallFunction};
 
     fn msg(role: &str, len: usize) -> ChatMessage {
@@ -2504,6 +2580,7 @@ mod tests {
             format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\n", script.display()),
         )
         .unwrap();
+        approve_hook(&core, &project, &hooks_dir.join("gate.toml"));
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         let project_key = project.display().to_string();
@@ -2580,6 +2657,7 @@ mod tests {
             format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display()),
         )
         .unwrap();
+        approve_hook(&core, &project, &hooks_dir.join("end.toml"));
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         start_turn(core.clone(), "sess-early".into(), project.clone(), "hi".into()).unwrap();

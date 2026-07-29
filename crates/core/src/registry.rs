@@ -45,6 +45,9 @@ pub enum ToolKind {
 /// JSON arguments to stdin, read the result from stdout.
 #[derive(Clone, Debug)]
 pub struct ExternalTool {
+    /// sha256 of the defining TOML's bytes at parse time: the identity the
+    /// content-bound approval store keys on.
+    pub source_sha256: String,
     pub command: String,
     pub args: Vec<String>,
     pub timeout_secs: u64,
@@ -350,6 +353,10 @@ pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
+    /// Frozen source hash; absent in old manifests, which reads as
+    /// unapproved (the safe direction: the tool asks once more).
+    #[serde(default)]
+    pub source_sha256: String,
     pub name: String,
     pub description: String,
     pub parameters: Value,
@@ -368,6 +375,7 @@ impl Registry {
             .filter_map(|spec| match &spec.kind {
                 ToolKind::Builtin => None,
                 ToolKind::External(t) => Some(ExternalToolManifest {
+                    source_sha256: t.source_sha256.clone(),
                     name: spec.name.clone(),
                     description: spec.description.clone(),
                     parameters: spec.parameters.clone(),
@@ -397,6 +405,7 @@ impl Registry {
                 parameters: t.parameters,
                 mutating: t.mutating,
                 kind: ToolKind::External(ExternalTool {
+                    source_sha256: t.source_sha256,
                     command: t.command,
                     args: t.args,
                     timeout_secs: t.timeout_secs,
@@ -524,6 +533,7 @@ pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
 }
 
 fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
+    let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
     let file: ExternalToolFile =
         toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;
     let name = file.name.trim().to_string();
@@ -557,6 +567,7 @@ fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
         parameters,
         mutating: file.mutating,
         kind: ToolKind::External(ExternalTool {
+            source_sha256,
             command: file.command.trim().to_string(),
             args: file.args,
             timeout_secs: file.timeout_secs.clamp(1, 300),

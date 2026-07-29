@@ -77,6 +77,9 @@ impl HookEvent {
 
 #[derive(Clone, Debug)]
 pub struct HookSpec {
+    /// sha256 of the defining TOML's bytes: the identity the content-bound
+    /// approval store keys on.
+    pub source_sha256: String,
     pub event: HookEvent,
     pub command: String,
     pub args: Vec<String>,
@@ -203,8 +206,30 @@ impl Hooks {
     /// different one, leaving a gate that never runs while its file sits on
     /// disk. Discovery is one directory list per turn, so there is nothing
     /// worth that risk.
-    pub fn discover(project_root: &Path) -> Self {
-        discover_in_dirs(&hook_dirs(project_root))
+    pub fn discover(project_root: &Path, data_dir: &Path) -> Self {
+        let mut hooks = discover_in_dirs(&hook_dirs(project_root));
+        hooks.retain_approved(data_dir, project_root);
+        hooks
+    }
+
+    /// Drop hooks whose exact content no human has approved. Hooks run with
+    /// host authority on every matching call with no per-invocation gate, so
+    /// they are the one capability file that is inert until approved - via
+    /// `openmax --approve <path>`, or automatically when a human approves the
+    /// in-session write that created the file. Inert is not silent:
+    /// `openmax --check` names every unapproved hook.
+    fn retain_approved(&mut self, data_dir: &Path, project_root: &Path) {
+        let approved = crate::ledger::approved_hashes(data_dir, project_root).unwrap_or_default();
+        for list in [
+            &mut self.pre,
+            &mut self.post,
+            &mut self.user_prompt,
+            &mut self.session_start,
+            &mut self.compaction,
+            &mut self.turn_end,
+        ] {
+            list.retain(|spec| approved.contains(&spec.source_sha256));
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -509,6 +534,7 @@ pub(crate) fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_hook_file(path: &Path) -> Result<HookSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
     let file: HookFile = toml::from_str(&text).map_err(|e| format!("invalid TOML: {e}"))?;
     let event = HookEvent::parse(&file.event).ok_or_else(|| {
         format!(
@@ -525,6 +551,7 @@ pub(crate) fn parse_hook_file(path: &Path) -> Result<HookSpec, String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
     Ok(HookSpec {
+        source_sha256,
         event,
         command,
         args: file.args,
@@ -621,6 +648,53 @@ mod tests {
         path
     }
 
+    /// The approval boundary itself: an unapproved hook never runs, and the
+    /// same content approved (as `openmax --approve` or an in-session write
+    /// approval would) is live on the next discovery.
+    #[test]
+    fn unapproved_hooks_are_inert_until_their_content_is_approved() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.toml");
+        std::fs::write(&path, "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\n").unwrap();
+
+        let hooks = Hooks::discover(&tmp, &data);
+        assert!(hooks.post.is_empty(), "unapproved content must not load");
+
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&path).unwrap());
+        crate::ledger::approve_hash(&data, &tmp, &sha).unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.post.len(), 1, "approved content loads");
+
+        // Any edit revokes: the new bytes have a new, unapproved hash.
+        std::fs::write(&path, "event = \"post_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        assert!(hooks.post.is_empty(), "an edited hook must fall back to inert");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Discover with every hook file under the project pre-approved, plus a
+    /// throwaway data dir: these tests exercise parse and gate semantics, not
+    /// the approval boundary (which has its own tests).
+    fn discover_for_test(project: &Path) -> Hooks {
+        let data = project.join("test-approvals-data");
+        for dir in hook_dirs(project) {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for entry in rd.flatten() {
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    let _ = crate::ledger::approve_hash(
+                        &data,
+                        project,
+                        &crate::ledger::sha256_hex(&bytes),
+                    );
+                }
+            }
+        }
+        Hooks::discover(project, &data)
+    }
+
     fn write_hook_toml(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).unwrap();
     }
@@ -645,7 +719,7 @@ mod tests {
     #[test]
     fn discover_empty_when_no_hooks_dir() {
         let tmp = tempfile_dir();
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert!(hooks.is_empty());
     }
 
@@ -658,7 +732,7 @@ mod tests {
         let body_b = "event = \"pre_tool_use\"\ncommand = \"/bin/bbbb\"\n";
         assert_eq!(body_a.len(), body_b.len());
         write_hook_toml(&hooks_dir, "gate.toml", body_a);
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre.len(), 1);
         assert_eq!(hooks.pre[0].command, "/bin/aaaa");
 
@@ -671,7 +745,7 @@ mod tests {
         f.set_modified(mtime).unwrap();
         drop(f);
 
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre.len(), 1);
         assert_eq!(hooks.pre[0].command, "/bin/bbbb");
     }
@@ -685,16 +759,16 @@ mod tests {
         let path = hooks_dir.join("gate.toml");
 
         write_hook_toml(&hooks_dir, "gate.toml", gate);
-        assert_eq!(Hooks::discover(&tmp).pre.len(), 1);
+        assert_eq!(discover_for_test(&tmp).pre.len(), 1);
 
         std::fs::remove_file(&path).unwrap();
-        assert!(Hooks::discover(&tmp).is_empty(), "a removed gate must stop applying");
+        assert!(discover_for_test(&tmp).is_empty(), "a removed gate must stop applying");
 
         // Restoring byte-identical content puts the policy back. Anything
         // that remembered the gap keyed by content would answer "no gate"
         // here, and a gate that does not run is a gate that is not enforced.
         write_hook_toml(&hooks_dir, "gate.toml", gate);
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre.len(), 1, "invalid: {:?}", hooks.invalid);
         assert_eq!(hooks.pre[0].command, "/bin/aaaa");
     }
@@ -712,7 +786,7 @@ event = "not_a_real_event"
 command = "true"
 "#,
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert!(!hooks.is_empty());
         assert_eq!(hooks.pre_count(), 0);
         let cancel = Arc::new(CancelToken::default());
@@ -776,7 +850,7 @@ command = "true"
 tools = "bash"
 "#,
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre_count(), 0);
         let cancel = Arc::new(CancelToken::default());
         let result = hooks
@@ -807,7 +881,7 @@ tool = "bash"
                 script.display()
             ),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre_count(), 1);
         let cancel = Arc::new(CancelToken::default());
         let result = hooks
@@ -859,7 +933,7 @@ tool = "bash"
             "compact.toml",
             &format!("event = \"compaction\"\ncommand = \"{}\"\n", compact_script.display()),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         assert!(!hooks.is_empty());
         let cancel = Arc::new(CancelToken::default());
 
@@ -893,7 +967,7 @@ tool = "bash"
             "audit.toml",
             &format!("event = \"post_tool_use\"\ncommand = \"{}\"\n", script.display()),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         let cancel = Arc::new(CancelToken::default());
         let args = serde_json::json!({"command": "echo hi"});
 
@@ -930,7 +1004,7 @@ tool = "bash"
             "gate.toml",
             &format!("event = \"pre_tool_use\"\ncommand = \"{}\"\n", script.display()),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         let cancel = Arc::new(CancelToken::default());
 
         let result = hooks
@@ -951,6 +1025,7 @@ tool = "bash"
         // the payload has to stay valid JSON.
         let long = "é".repeat(MAX_OUTPUT_BYTES);
         let hook = HookSpec {
+            source_sha256: String::new(),
             event: HookEvent::PostToolUse,
             command: "/bin/true".into(),
             args: Vec::new(),
@@ -987,6 +1062,7 @@ tool = "bash"
         let rendered = "[start of output truncated; bounded output log saved to /logs/x; \
                         tail or grep it with bash]\n…LINE-B\n";
         let hook = HookSpec {
+            source_sha256: String::new(),
             event: HookEvent::PostToolUse,
             command: "/bin/true".into(),
             args: Vec::new(),
@@ -1051,7 +1127,7 @@ tool = "bash"
             "gate.toml",
             &format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\n", script.display()),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         let cancel = Arc::new(CancelToken::default());
         let blocked = hooks
             .user_prompt_submit("sess", "here is a SECRET token", &tmp, &cancel)
@@ -1076,7 +1152,7 @@ tool = "bash"
             "slow.toml",
             &format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\ntimeout_secs = 30\n", script.display()),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         let cancel = Arc::new(CancelToken::default());
         let cancel_flag = cancel.clone();
         let task = tokio::spawn(async move {
@@ -1106,7 +1182,7 @@ tool = "bash"
             "end.toml",
             &format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display()),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         // turn_end uses its own fresh token, so a cancelled turn still fires.
         hooks.turn_end("sess", &tmp, "cancelled").await;
         let end: Value =
@@ -1132,7 +1208,7 @@ command = "{}"
                 script.display()
             ),
         );
-        let hooks = Hooks::discover(&tmp);
+        let hooks = discover_for_test(&tmp);
         let cancel = Arc::new(CancelToken::default());
         let result = hooks
             .pre_tool_use("sess", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)

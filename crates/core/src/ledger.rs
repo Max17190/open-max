@@ -323,6 +323,74 @@ fn sync_locked(
     Ok(changes)
 }
 
+// ---------- content-bound approvals ----------
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ApprovedFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    hashes: Vec<String>,
+}
+
+fn approved_path(dir: &Path) -> PathBuf {
+    dir.join("approved.json")
+}
+
+/// The sha256 set a human has approved for this project. Approval binds to
+/// content, not path: any edit changes the hash and revokes itself. Missing
+/// file means nothing approved; a malformed file is an error, and callers
+/// treat that as nothing approved (fail closed) while surfacing the reason.
+pub fn approved_hashes(
+    data_dir: &Path,
+    project_root: &Path,
+) -> Result<std::collections::HashSet<String>, String> {
+    let path = approved_path(&project_dir(data_dir, project_root));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashSet::new())
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let file: ApprovedFile = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is malformed ({e}); nothing is approved until it is fixed", path.display()))?;
+    Ok(file.hashes.into_iter().collect())
+}
+
+/// Record a human approval of exact content. Serialized under the ledger lock.
+pub fn approve_hash(data_dir: &Path, project_root: &Path, sha: &str) -> Result<(), String> {
+    let dir = project_dir(data_dir, project_root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(&dir))
+        .map_err(|e| format!("cannot open ledger lock: {e}"))?;
+    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
+    let result = (|| {
+        let mut hashes = approved_hashes(data_dir, project_root)?;
+        if hashes.insert(sha.to_string()) {
+            let file = ApprovedFile { version: 1, hashes: hashes.into_iter().collect() };
+            let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+            crate::sessions::write_atomic(&approved_path(&dir), json)?;
+        }
+        Ok(())
+    })();
+    let _ = fs2::FileExt::unlock(&lock);
+    result
+}
+
+/// Whether `sha` is human-approved. Any failure reads as unapproved: the
+/// enforcement this feeds must fail toward asking, never toward running.
+pub fn is_approved(data_dir: &Path, project_root: &Path, sha: &str) -> bool {
+    approved_hashes(data_dir, project_root)
+        .map(|set| set.contains(sha))
+        .unwrap_or(false)
+}
+
 /// A short human line per change, for the refreeze receipt. The paths are
 /// project-relative where possible so the note reads like the tree.
 pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
@@ -443,6 +511,24 @@ mod tests {
         std::fs::write(&object, "forged").unwrap();
         sync(&data, &root, &[(path, sha.clone(), bytes)], Actor::External, None).unwrap();
         assert_eq!(std::fs::read_to_string(&object).unwrap(), "authentic");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn approvals_bind_to_content_and_fail_closed() {
+        let data = temp("appr-data");
+        let root = temp("appr-proj");
+        let sha = sha256_hex(b"name = \"t\"");
+        assert!(!is_approved(&data, &root, &sha));
+        approve_hash(&data, &root, &sha).unwrap();
+        assert!(is_approved(&data, &root, &sha));
+        assert!(!is_approved(&data, &root, &sha256_hex(b"edited")), "new content, new approval");
+
+        // A malformed store approves nothing and says why.
+        std::fs::write(approved_path(&project_dir(&data, &root)), "{broken").unwrap();
+        assert!(!is_approved(&data, &root, &sha));
+        assert!(approved_hashes(&data, &root).is_err());
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }

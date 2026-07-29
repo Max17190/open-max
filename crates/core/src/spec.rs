@@ -418,7 +418,14 @@ mod tests {
         write(".openmax/hooks/deny-rm.toml", &example(HOOKS));
         write(".openmax/permissions.toml", &example(PERMISSIONS));
 
-        let findings: Vec<_> = crate::doctor::check(&root)
+        // Hooks are inert until a human approves the exact content; the test
+        // stands in for the human, against a scoped data dir.
+        let data = root.join("test-data");
+        let hook_bytes = std::fs::read(root.join(".openmax/hooks/deny-rm.toml")).unwrap();
+        crate::ledger::approve_hash(&data, &root, &crate::ledger::sha256_hex(&hook_bytes))
+            .unwrap();
+
+        let findings: Vec<_> = crate::doctor::check_at(&root, &data)
             .into_iter()
             .filter(|f| f.path.starts_with(&root))
             .collect();
