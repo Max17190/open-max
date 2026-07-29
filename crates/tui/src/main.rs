@@ -176,6 +176,15 @@ async fn main() -> std::io::Result<()> {
         eprintln!("openmax: --check and --trust-project are separate operations\n\n{HELP}");
         std::process::exit(2);
     }
+    // --spec prints one contract and exits; silently swallowing another
+    // requested operation (e.g. --spec hooks --check) would look like success
+    // for work that never ran.
+    if cli.spec.is_some()
+        && (cli.check || cli.stdio || cli.print || cli.trust_project || !cli.prompts.is_empty())
+    {
+        eprintln!("openmax: --spec is a standalone operation; run other modes separately\n\n{HELP}");
+        std::process::exit(2);
+    }
 
     if let Some(surface) = &cli.spec {
         // Pure print: no session, no endpoint, no state dir, no trust. The

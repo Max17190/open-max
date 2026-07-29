@@ -251,8 +251,8 @@ fail-closed reason for a malformed file).
 const PROVIDERS: &str = r#"# Providers
 
 Named OpenAI-compatible endpoints: `~/.openmax/providers.json` (global only;
-it lives outside the project root, so edit it via bash). A missing file is
-free; the flat `base_url`/`model` settings path keeps working without it.
+it lives outside the project root, so edit it via bash). The file is optional;
+the flat `base_url`/`model` settings path keeps working without it.
 
 Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
 - `base_url` (required): root of the endpoint's HTTP API; the harness calls
@@ -425,13 +425,43 @@ mod tests {
     }
 
 
-    /// Payload documentation must track the real hook payloads: the fields
-    /// named in the hooks spec are exactly the keys `hooks.rs` serializes.
+    /// Payload documentation must track the real hook payloads per event:
+    /// each event's spec entry must name exactly the keys `hooks.rs`
+    /// serializes for that event, checked inside that entry's own braces so a
+    /// field cannot drift to the wrong event while the test stays green.
     #[test]
-    fn hook_spec_names_every_payload_field() {
+    fn hook_spec_names_every_payload_field_per_event() {
         let text = render("hooks").unwrap();
-        for field in ["event", "session_id", "tool", "args", "cwd", "tool_ok", "text", "record", "stop_reason"] {
-            assert!(text.contains(field), "hooks spec must document `{field}`");
+        // The braced field list of one event's payload entry: from the
+        // `- <marker>:` bullet to its closing brace.
+        let payload_of = |marker: &str| -> String {
+            let bullet = format!("- {marker}:");
+            let start = text
+                .find(&bullet)
+                .unwrap_or_else(|| panic!("hooks spec has no payload entry for {marker}"));
+            let entry = &text[start..];
+            let open = entry.find('{').expect("payload entry opens a brace");
+            let close = entry[open..].find('}').expect("payload entry closes its brace") + open;
+            entry[open..=close].to_string()
+        };
+        let cases = [
+            ("pre_tool_use / post_tool_use", vec!["event", "session_id", "tool", "args", "cwd", "tool_ok"]),
+            ("user_prompt_submit", vec!["event", "session_id", "cwd", "text"]),
+            ("session_start", vec!["event", "session_id", "cwd"]),
+            ("compaction", vec!["event", "session_id", "cwd", "record"]),
+            ("turn_end", vec!["event", "session_id", "cwd", "stop_reason"]),
+        ];
+        for (marker, fields) in cases {
+            let payload = payload_of(marker);
+            let named: Vec<&str> = payload
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .collect();
+            assert_eq!(
+                named, fields,
+                "payload fields documented for `{marker}` must match hooks.rs exactly"
+            );
         }
     }
 }
