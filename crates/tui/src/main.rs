@@ -226,11 +226,27 @@ async fn main() -> std::io::Result<()> {
             );
             std::process::exit(0);
         }
+        use open_max_core::doctor::Status;
         for f in &findings {
             match &f.status {
-                Ok(summary) => println!("ok   {:<11} {}  ({summary})", f.kind, f.path.display()),
-                Err(reason) => println!("err  {:<11} {}  {reason}", f.kind, f.path.display()),
+                Status::Ok(summary) => {
+                    println!("ok   {:<11} {}  ({summary})", f.kind, f.path.display())
+                }
+                Status::Warn(reason) => {
+                    println!("warn {:<11} {}  {reason}", f.kind, f.path.display())
+                }
+                Status::Err(reason) => {
+                    println!("err  {:<11} {}  {reason}", f.kind, f.path.display())
+                }
             }
+        }
+        // Warnings do not fail the run: a shadowed global default and a rule
+        // written before its tool are both normal.
+        if open_max_core::doctor::has_warnings(&findings) {
+            println!(
+                "\nwarn lines are files the agent loop never reads, or reads but cannot act on \
+                 as written. They do not fail this check."
+            );
         }
         std::process::exit(if open_max_core::doctor::has_errors(&findings) { 1 } else { 0 });
     }

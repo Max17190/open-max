@@ -183,12 +183,14 @@ impl Permissions {
 }
 
 /// Diagnose one permissions file for `openmax --check`: None when the file
-/// does not exist, Ok(rule count) when it loads, Err(reason) when the agent
-/// loop would fail closed because of it.
-pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
+/// does not exist, Ok(the tool each rule names, in file order) when it loads,
+/// Err(reason) when the agent loop would fail closed because of it. The names
+/// come back rather than just a count because matching is exact, so a rule
+/// naming a tool that does not exist is a rule that silently never fires.
+pub(crate) fn check_file(path: &Path) -> Option<Result<Vec<String>, String>> {
     match load_file(path) {
         FileLoad::Missing => None,
-        FileLoad::Ok(rules) => Some(Ok(rules.len())),
+        FileLoad::Ok(rules) => Some(Ok(rules.into_iter().map(|r| r.tool).collect())),
         FileLoad::Invalid(reason) => Some(Err(reason)),
     }
 }

@@ -104,6 +104,13 @@ arg_regex = "^cargo (test|check|build)"
 matches the full serialized JSON arguments. Omit `arg_regex` (or leave it
 empty) to match every call of that tool.
 
+`tool` is matched by exact name, so a rule naming a tool that does not exist
+never fires: a misspelled `deny` reads exactly like a `deny` that never had to
+act. `openmax --check` warns about any project rule whose tool is neither a
+built-in nor a tool in `.openmax/tools/`. It is a warning rather than an error
+because writing the rule before the tool is a normal order to work in. Hook
+`tool` filters are matched and reported the same way.
+
 ### Fail closed, with a repair path
 
 If a permissions file exists but is invalid, every tool is denied (fail
@@ -122,8 +129,25 @@ path and `openmax --check` prints the parse error.
 
 `openmax --check` parses tools, skills, templates, hooks, permissions, and
 `providers.json`, then prints per-file results with the reason anything would
-be ignored, fail closed, or fail at request time. It exits nonzero on errors.
-The agent is instructed to run it after writing extension files.
+be ignored, fail closed, or fail at request time. The agent is instructed to
+run it after writing extension files.
+
+Each line is `ok`, `warn`, or `err`, and only `err` exits nonzero:
+
+- `err` is a file the loop cannot use: it does not parse, it fails closed, or
+  it can never work (a tool shadowing a built-in name).
+- `warn` is a file the loop reads past or cannot act on as written: a path
+  nothing reads, a definition another tier overrides, a rule naming a tool
+  that does not exist. Each of these is legitimate in some project, so none
+  of them fails the check.
+
+Warnings cover the ways a file goes missing without being broken. A directory
+at `.openmax/tool/` or `.openmax/skills/`, a `.yaml` where a `.toml` is read,
+or a skill directory with no exactly spelled `SKILL.md` are all reported with
+the path that would work instead. A global file shadowed by a project file of
+the same name is reported against the file that loses, naming the winner. A
+broken file that something shadows is a warning, not an error, because the
+loop never loads it and so never fails closed on it.
 
 ## Self-description
 
