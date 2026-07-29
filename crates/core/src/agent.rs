@@ -199,6 +199,22 @@ fn complete_pending_tool_replies(messages: &mut Vec<ChatMessage>, note: &str) ->
     true
 }
 
+/// Forward observe-only hook failures to the frontend. The turn proceeds
+/// (observe hooks are fail-open) but a broken observer is never silent.
+fn report_hook_failures(
+    core: &Arc<Core>,
+    session_id: &str,
+    failures: Vec<crate::hooks::HookFailure>,
+) {
+    for f in failures {
+        core.send_agent(session_id, AgentEvent::HookFailed {
+            hook: f.hook,
+            event: f.event.to_string(),
+            detail: f.detail,
+        });
+    }
+}
+
 fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> SessionData {
     if let Some(mut messages) = sessions::load_messages(core, session_id) {
         // Resume: registry frozen at creation — manifest if present, else built-ins only.
@@ -392,7 +408,8 @@ async fn execute_readonly_batch(
         let args_key = &parsed[i].1;
         let args = &parsed[i].0;
         if blocked[i].is_none() {
-            ctx.hooks
+            let failures = ctx
+                .hooks
                 .post_tool_use(
                     ctx.session_id,
                     name,
@@ -402,6 +419,7 @@ async fn execute_readonly_batch(
                     &ctx.cancelled,
                 )
                 .await;
+            report_hook_failures(ctx.core, ctx.session_id, failures);
         }
         if let Some(diff) = &outcome.diff {
             ctx.core.send_agent(ctx.session_id, AgentEvent::Diff {
@@ -1030,7 +1048,11 @@ async fn run_loop(
                 guard.messages().pop();
             }
             guard.commit().await;
-            hooks.turn_end(session_id, project_root, "error").await;
+            report_hook_failures(
+                &core,
+                session_id,
+                hooks.turn_end(session_id, project_root, "error").await,
+            );
             core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
             return;
         }
@@ -1045,7 +1067,11 @@ async fn run_loop(
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
     if first_turn {
-        hooks.session_start(session_id, project_root, &cancelled).await;
+        report_hook_failures(
+            &core,
+            session_id,
+            hooks.session_start(session_id, project_root, &cancelled).await,
+        );
     }
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
@@ -1075,7 +1101,9 @@ async fn run_loop(
             let record = digest.to_record(note);
             sessions::append_compaction(core, session_id, &record);
             if let Ok(value) = serde_json::to_value(&record) {
-                hooks.compaction(session_id, project_root, &value, &cancelled).await;
+                let failures =
+                    hooks.compaction(session_id, project_root, &value, &cancelled).await;
+                report_hook_failures(&core, session_id, failures);
             }
         }
         let used = guard.messages().iter().map(|m| m.estimated_tokens()).sum();
@@ -1324,7 +1352,7 @@ async fn run_loop(
                 }
 
                 if executed {
-                    hooks
+                    let failures = hooks
                         .post_tool_use(
                             session_id,
                             name,
@@ -1334,6 +1362,7 @@ async fn run_loop(
                             &cancelled,
                         )
                         .await;
+                    report_hook_failures(&core, session_id, failures);
                 }
 
                 if let Some(diff) = &outcome.diff {
@@ -1396,7 +1425,11 @@ async fn run_loop(
     // Restore in-memory transcript under the async lock (Drop is try_lock only).
     guard.commit().await;
     sessions::touch(core, session_id);
-    hooks.turn_end(session_id, project_root, &stop_reason).await;
+    report_hook_failures(
+        &core,
+        session_id,
+        hooks.turn_end(session_id, project_root, &stop_reason).await,
+    );
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
 }
 

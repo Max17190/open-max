@@ -66,6 +66,7 @@ key order is not significant: parse every line by field name.
 | `approval_request` | `approval_id`, `name`, `summary`, `detail` |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills` |
+| `hook_failed` | `hook`, `event`, `detail` (an observe-only hook failed; the turn proceeded) |
 | `done` | `stop_reason` |
 | `error` | `message` |
 

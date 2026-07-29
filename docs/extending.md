@@ -97,8 +97,10 @@ command from a clipped one without parsing a truncation notice out of the text,
 and `output_bytes` still measures the result, because that is the text the
 model actually reasoned about.
 
-It stays observation: the hook's own exit status and stdout are ignored, so
-nothing it does changes what the model receives. Hooks never enter the model prompt and,
+It stays observation: a failing observe hook (spawn error, nonzero exit, or
+timeout) never blocks the turn, but it is not silent either - the harness
+emits a `hook_failed` event that the TUI shows as a note and `--json`/stdio
+streams carry verbatim. Nothing a hook prints changes what the model receives. Hooks never enter the model prompt and,
 like external tools and `bash`, run as native host processes with inherited
 filesystem, environment, credentials, and network access.
 

@@ -2110,6 +2110,10 @@ impl App {
                     plural(skills, "skill")
                 ));
             }
+            AgentEvent::HookFailed { hook, event, detail } => {
+                // Observe hooks are fail-open; the note keeps them honest.
+                self.note(&format!("hook '{hook}' failed on {event}: {detail}"));
+            }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
                 self.running_tool = None;

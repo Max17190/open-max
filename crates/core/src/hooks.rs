@@ -86,6 +86,30 @@ pub struct HookSpec {
     pub source_path: PathBuf,
 }
 
+/// One observe-only hook run that failed (spawn error, nonzero exit, or
+/// timeout). Observe hooks stay fail-open - the turn proceeds - but the
+/// failure is returned so the frontend can say so instead of silence.
+#[derive(Clone, Debug)]
+pub struct HookFailure {
+    /// File stem, the hook's identity.
+    pub hook: String,
+    pub event: &'static str,
+    pub detail: String,
+}
+
+fn failure(hook: &HookSpec, detail: String) -> HookFailure {
+    HookFailure {
+        hook: hook
+            .source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string(),
+        event: hook.event.as_str(),
+        detail,
+    }
+}
+
 /// Hooks discovered for the current project. Loaded once per agent turn.
 #[derive(Clone, Debug, Default)]
 pub struct Hooks {
@@ -241,8 +265,8 @@ impl Hooks {
     }
 
     /// Run all matching `post_tool_use` hooks with what the call returned.
-    /// Failures are ignored (observe only), and the output is passed for
-    /// observation alone: a post hook cannot change what the model sees.
+    /// Observe only - a failure never blocks and a post hook cannot change
+    /// what the model sees - but failures are returned, not swallowed.
     pub async fn post_tool_use(
         &self,
         session_id: &str,
@@ -251,14 +275,20 @@ impl Hooks {
         cwd: &Path,
         outcome: &crate::tools::ToolOutcome,
         cancel: &Arc<CancelToken>,
-    ) {
+    ) -> Vec<HookFailure> {
+        let mut failures = Vec::new();
         for hook in &self.post {
             if !hook.matches(tool) {
                 continue;
             }
             let payload = tool_payload(hook, session_id, tool, args, cwd, Some(outcome));
-            let _ = run_hook(hook, payload, cwd, cancel).await;
+            match run_hook(hook, payload, cwd, cancel).await {
+                HookRun::Allow => {}
+                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Cancelled => break,
+            }
         }
+        failures
     }
 
     /// Run all `user_prompt_submit` hooks against the text the user typed,
@@ -289,27 +319,39 @@ impl Hooks {
     }
 
     /// Run `session_start` hooks (a session's first turn). Observe only:
-    /// failures are ignored and nothing enters the model context.
-    pub async fn session_start(&self, session_id: &str, cwd: &Path, cancel: &Arc<CancelToken>) {
+    /// nothing enters the model context, but failures are returned.
+    pub async fn session_start(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        cancel: &Arc<CancelToken>,
+    ) -> Vec<HookFailure> {
+        let mut failures = Vec::new();
         for hook in &self.session_start {
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
                 "session_id": session_id,
                 "cwd": cwd.display().to_string(),
             });
-            let _ = run_hook(hook, payload, cwd, cancel).await;
+            match run_hook(hook, payload, cwd, cancel).await {
+                HookRun::Allow => {}
+                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Cancelled => break,
+            }
         }
+        failures
     }
 
     /// Run `compaction` hooks after context was pruned, with the same digest
-    /// record that was persisted. Observe only.
+    /// record that was persisted. Observe only; failures are returned.
     pub async fn compaction(
         &self,
         session_id: &str,
         cwd: &Path,
         record: &Value,
         cancel: &Arc<CancelToken>,
-    ) {
+    ) -> Vec<HookFailure> {
+        let mut failures = Vec::new();
         for hook in &self.compaction {
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
@@ -317,15 +359,26 @@ impl Hooks {
                 "cwd": cwd.display().to_string(),
                 "record": record,
             });
-            let _ = run_hook(hook, payload, cwd, cancel).await;
+            match run_hook(hook, payload, cwd, cancel).await {
+                HookRun::Allow => {}
+                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Cancelled => break,
+            }
         }
+        failures
     }
 
     /// Run `turn_end` hooks with the turn's stop reason. Observe only, and
     /// deliberately run with a fresh cancel token: a cancelled turn is still
-    /// a finished turn worth observing.
-    pub async fn turn_end(&self, session_id: &str, cwd: &Path, stop_reason: &str) {
+    /// a finished turn worth observing. Failures are returned.
+    pub async fn turn_end(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        stop_reason: &str,
+    ) -> Vec<HookFailure> {
         let cancel = Arc::new(CancelToken::default());
+        let mut failures = Vec::new();
         for hook in &self.turn_end {
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
@@ -333,8 +386,13 @@ impl Hooks {
                 "cwd": cwd.display().to_string(),
                 "stop_reason": stop_reason,
             });
-            let _ = run_hook(hook, payload, cwd, &cancel).await;
+            match run_hook(hook, payload, cwd, &cancel).await {
+                HookRun::Allow => {}
+                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Cancelled => break,
+            }
         }
+        failures
     }
 }
 
@@ -1080,6 +1138,33 @@ command = "{}"
             .pre_tool_use("sess", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
             .await;
         assert_eq!(result, PreToolResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn failing_observe_hook_is_reported_not_silent() {
+        let dir = tempfile_dir();
+        write_hook_toml(
+            &dir,
+            "audit.toml",
+            "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 7\"]\n",
+        );
+        let hooks = discover_in_dirs(&[dir.clone()]);
+        let outcome = crate::tools::ToolOutcome::ok("fine".into());
+        let failures = hooks
+            .post_tool_use(
+                "s1",
+                "bash",
+                &serde_json::json!({}),
+                &dir,
+                &outcome,
+                &Arc::new(CancelToken::default()),
+            )
+            .await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].hook, "audit");
+        assert_eq!(failures[0].event, "post_tool_use");
+        assert!(failures[0].detail.contains("7"), "{}", failures[0].detail);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn tempfile_dir() -> PathBuf {
