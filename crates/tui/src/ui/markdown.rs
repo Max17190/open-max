@@ -28,31 +28,37 @@ pub fn highlighter() -> &'static Highlighter {
     HL.get_or_init(Highlighter::default)
 }
 
-/// Languages models emit most often. Syntect compiles each syntax's regexes
-/// lazily on first use, which otherwise lands as a 10-25 ms hitch inside the
-/// frame that renders a session's first code line in that language.
-const WARM_LANGS: &[&str] = &[
-    "rust", "python", "javascript", "json", "bash", "go", "c", "yaml",
-];
-
-/// Pre-compile common syntaxes on a background thread at startup: the dump
-/// itself loads in ~2 ms, but the first highlighted line per language pays
-/// its lazy regex compilation. Warming renders one throwaway fence per
-/// language so a streamed reply's first code line only paints. A fence
-/// rendered inside the warm window blocks on the `OnceLock` at most as long
-/// as a cold load would have, so this can only remove the hitch.
-pub fn warm_highlighter() {
-    std::thread::spawn(|| {
+/// Syntect compiles each syntax's regexes lazily on first use, which lands as
+/// a 10-25 ms stall inside the frame that renders a session's first code line
+/// in that language. The moment a fence opens, this kicks that compilation
+/// onto a background thread; by the time the first code line inside the fence
+/// completes, the syntax is usually warm. Pre-warming a fixed language list
+/// instead would pin ~5-9 MB of compiled regexes per language whether or not
+/// the session ever renders it, so warming stays demand-driven: memory goes
+/// only to languages actually on screen, exactly as the lazy path spends it.
+/// Concurrent first use is safe: syntect's lazy cells accept one winner and
+/// the loser's compile is discarded.
+fn warm_lang_async(lang: &str) {
+    static STARTED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    let started = STARTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut started) = started.lock() else {
+        return;
+    };
+    if !started.insert(lang.to_string()) {
+        return;
+    }
+    drop(started);
+    let lang = lang.to_string();
+    std::thread::spawn(move || {
         let hl = highlighter();
-        for lang in WARM_LANGS {
-            let mut st = LineState::default();
-            for line in [
-                format!("```{lang}"),
-                "let x = f(0); // c #".to_string(),
-                "```".to_string(),
-            ] {
-                let _ = render_line(&line, &mut st, hl);
-            }
+        let mut st = LineState::default();
+        for line in [
+            format!("```{lang}"),
+            "let x = f(0); // c #".to_string(),
+            "```".to_string(),
+        ] {
+            let _ = render_line(&line, &mut st, hl);
         }
     });
 }
@@ -158,6 +164,9 @@ pub fn render_line<'a>(raw: &str, st: &mut LineState<'a>, hl: &'a Highlighter) -
         } else {
             st.in_fence = true;
             let fence_lang = trimmed.trim_start_matches('`').trim();
+            if !fence_lang.is_empty() {
+                warm_lang_async(fence_lang);
+            }
             let syntax = hl
                 .syntaxes
                 .find_syntax_by_token(fence_lang)
@@ -487,14 +496,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warm_languages_resolve_to_real_syntaxes() {
-        // A typo here would silently warm nothing for that language.
+    #[ignore = "memory probe; run under /usr/bin/time -l with WARM_PROBE=<langs>"]
+    fn warm_rss_probe() {
+        let langs = std::env::var("WARM_PROBE").unwrap_or_default();
         let hl = highlighter();
-        for lang in WARM_LANGS {
-            assert!(
-                hl.syntaxes.find_syntax_by_token(lang).is_some(),
-                "unknown warm language {lang}"
-            );
+        for lang in langs.split(',').filter(|s| !s.is_empty()) {
+            let mut st = LineState::default();
+            for line in [format!("```{lang}"), "let x = f(0); // c #".into(), "```".into()] {
+                let _ = render_line(&line, &mut st, hl);
+            }
         }
     }
 

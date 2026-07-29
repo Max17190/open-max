@@ -331,7 +331,6 @@ pub async fn run(
     let mut app = App::new(core.clone(), project, hf_tx, files_tx);
 
     app.startup(&args).await;
-    markdown::warm_highlighter();
 
     // Terminal events are forwarded through a channel so the core-event arm
     // can be gated on `input_rx.is_empty()` — a token firehose must never
