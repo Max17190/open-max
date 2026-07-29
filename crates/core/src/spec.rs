@@ -83,6 +83,21 @@ iterations after a successful mutating call and at turn start; `/reload`
 forces it now. Verify the file parses with `openmax --check`. Test the
 script itself before first use:
 `echo '{"path":"src"}' | ./scripts/todo-scan.sh`.
+
+## Proof of life
+
+An optional `[example]` table declares one runnable call:
+
+```toml
+[example]
+expect_regex = "TODO"      # optional; output must match when set
+[example.args]
+path = "src"               # the JSON arguments for the example call
+```
+
+`openmax --check --run-examples` executes each declared example through the
+real spawn path (stdin JSON, timeout, output caps): the call must exit 0 and
+match `expect_regex` when present. Plain `--check` never executes anything.
 "#;
 
 const SKILLS: &str = r#"# Skills
