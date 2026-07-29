@@ -72,12 +72,22 @@ first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` (receives the stop reason, fires even on cancel) observe only. Each
 hook gets one JSON payload on stdin.
 
-A `post_tool_use` payload carries what the call returned: `output` (the first
-16 KiB, cut on a character boundary), `output_bytes` (the full size), and
-`output_truncated`. That is what an eval, audit, or telemetry hook needs to be
-written as a file instead of a core feature. It stays observation: the hook's
-own exit status and stdout are ignored, so nothing it does changes what the
-model receives. Hooks never enter the model prompt and,
+A `post_tool_use` payload carries the tool result the model saw: `output` (its
+first 16 KiB, cut on a character boundary), `output_bytes` (that result's
+size), and `output_truncated` (whether the payload dropped part of it). That is
+what an eval, audit, or telemetry hook needs to be written as a file instead of
+a core feature.
+
+Bounding happens twice, and the fields describe the second cut. A tool result
+is already a bounded rendering of what a process printed: `bash` keeps the tail
+up to its output cap, prepends a `[start of output truncated...]` notice when
+it dropped anything, and names a log file holding the bounded capture. A hook
+that needs more than the result can read that log; `output_bytes` deliberately
+measures the result rather than the process, because that is the text the model
+actually reasoned about.
+
+It stays observation: the hook's own exit status and stdout are ignored, so
+nothing it does changes what the model receives. Hooks never enter the model prompt and,
 like external tools and `bash`, run as native host processes with inherited
 filesystem, environment, credentials, and network access.
 

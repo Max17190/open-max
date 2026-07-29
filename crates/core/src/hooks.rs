@@ -345,9 +345,14 @@ fn tool_payload(
 }
 
 /// The longest prefix of `s` that fits in `max` bytes without splitting a
-/// character. Tool output is unbounded (a `bash` call can print megabytes) and
-/// every matching hook is handed a copy, so what a hook sees is a head, the
-/// same shape hook block reasons already take.
+/// character. A tool result can be large (a `bash` call can print megabytes)
+/// and every matching hook is handed a copy, so what a hook sees is a head,
+/// the same shape hook block reasons already take.
+///
+/// This is the second of two bounds. The tool layer has already rendered the
+/// process output down to a result, keeping its tail and saying so inline when
+/// it dropped anything, and that result is what the model reasoned about. It
+/// is therefore what a hook is shown, and what `output_bytes` measures.
 fn head_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -860,6 +865,42 @@ tool = "bash"
         // Round-trips, which is the point of respecting the boundary.
         let encoded = serde_json::to_string(&payload).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap()["output"], head);
+    }
+
+    /// The payload describes the tool result, which is the text the model
+    /// reasoned about. A result that the tool layer already bounded carries
+    /// its own notice, so a hook can see that a larger output existed.
+    #[test]
+    fn the_payload_measures_the_tool_result_it_was_given() {
+        let rendered = "[start of output truncated; bounded output log saved to /logs/x; \
+                        tail or grep it with bash]\n…LINE-B\n";
+        let hook = HookSpec {
+            event: HookEvent::PostToolUse,
+            command: "/bin/true".into(),
+            args: Vec::new(),
+            timeout_secs: 1,
+            tool_filter: None,
+            source_path: PathBuf::from("/hooks/audit.toml"),
+        };
+        let payload = tool_payload(
+            &hook,
+            "sess",
+            "bash",
+            &serde_json::json!({}),
+            Path::new("/project"),
+            Some((true, rendered)),
+        );
+
+        assert_eq!(payload["output"], rendered);
+        assert_eq!(payload["output_bytes"].as_u64().unwrap() as usize, rendered.len());
+        assert_eq!(
+            payload["output_truncated"], false,
+            "this payload dropped nothing, whatever the tool layer did earlier"
+        );
+        assert!(
+            payload["output"].as_str().unwrap().contains("start of output truncated"),
+            "the earlier bound stays visible to the hook in the text itself"
+        );
     }
 
     #[test]
