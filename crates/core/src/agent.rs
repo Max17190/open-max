@@ -290,6 +290,40 @@ struct ReadonlyBatchCtx<'a> {
     hooks: &'a Hooks,
     permissions: &'a Permissions,
     parallelism: usize,
+    /// Turn-local usage accumulator, flushed once at turn end.
+    usage: &'a std::sync::Mutex<crate::ledger::UsageDelta>,
+}
+
+/// Count what only the dispatcher sees: external tool calls (by outcome) and
+/// skill-body reads (a read_file whose path is a frozen skill's SKILL.md).
+fn count_usage(
+    usage: &std::sync::Mutex<crate::ledger::UsageDelta>,
+    registry: &Registry,
+    project_root: &Path,
+    name: &str,
+    args: &serde_json::Value,
+    ok: bool,
+) {
+    let mut delta = usage.lock().unwrap_or_else(|e| e.into_inner());
+    if registry
+        .get(name)
+        .is_some_and(|spec| matches!(spec.kind, crate::registry::ToolKind::External(_)))
+    {
+        delta.tools.push((name.to_string(), ok));
+        return;
+    }
+    if name == "read_file" && ok {
+        if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
+            let absolute = project_root.join(rel);
+            if let Some(skill) = registry
+                .skills
+                .iter()
+                .find(|skill| skill.path == absolute || skill.path == Path::new(rel))
+            {
+                delta.skills.push(skill.name.clone());
+            }
+        }
+    }
 }
 
 fn parallel_tool_limit(configured: usize) -> usize {
@@ -408,6 +442,7 @@ async fn execute_readonly_batch(
         let args_key = &parsed[i].1;
         let args = &parsed[i].0;
         if blocked[i].is_none() {
+            count_usage(ctx.usage, ctx.registry, ctx.project_root, name, args, outcome.ok);
             let failures = ctx
                 .hooks
                 .post_tool_use(
@@ -1164,6 +1199,9 @@ async fn run_loop(
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
     let mut repeat_tracker = RepeatCallTracker::new();
+    // What this turn used, merged into the project usage file at turn end so
+    // the agent (via openmax --spec usage) can prune its own toolbox.
+    let turn_usage = std::sync::Mutex::new(crate::ledger::UsageDelta::default());
     let context_tokens = endpoint.context_tokens;
     let max_tokens = endpoint.max_tokens;
     let max_iterations = settings.max_agent_iterations.max(1);
@@ -1279,6 +1317,7 @@ async fn run_loop(
                     hooks: &hooks,
                     permissions: &permissions,
                     parallelism: parallel_tool_limit(settings.max_parallel_tools),
+                    usage: &turn_usage,
                 };
                 if execute_readonly_batch(
                     &batch_ctx,
@@ -1512,6 +1551,9 @@ async fn run_loop(
                     ok: outcome.ok,
                     output: outcome.output.clone(),
                 });
+                if executed {
+                    count_usage(&turn_usage, &registry, project_root, name, &args, outcome.ok);
+                }
 
                 // Approval timeouts are not model errors; the "Error:" prefix
                 // would push small models into pointless retry loops.
@@ -1558,6 +1600,10 @@ async fn run_loop(
     // Restore in-memory transcript under the async lock (Drop is try_lock only).
     guard.commit().await;
     sessions::touch(core, session_id);
+    {
+        let delta = std::mem::take(&mut *turn_usage.lock().unwrap_or_else(|e| e.into_inner()));
+        let _ = crate::ledger::record_usage(&core.data_dir, project_root, &delta);
+    }
     report_hook_failures(
         &core,
         session_id,

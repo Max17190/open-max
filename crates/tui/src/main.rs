@@ -202,6 +202,14 @@ async fn main() -> std::io::Result<()> {
     }
 
     if let Some(surface) = &cli.spec {
+        // `usage` is the one dynamic surface: it joins each extension's
+        // frozen-prompt cost (paid on every request) with its recorded use,
+        // so the agent can see which of its own creations are pure tax and
+        // prune them - the deletion roadmap applied to the agent's toolbox.
+        if surface == "usage" {
+            print_usage_economics();
+            std::process::exit(0);
+        }
         // Pure print: no session, no endpoint, no state dir, no trust. The
         // error path lists every valid surface so a wrong guess self-corrects.
         match open_max_core::spec::render(surface) {
@@ -513,6 +521,81 @@ impl<W: Write> Drop for FrameWriter<W> {
             }
         }
     }
+}
+
+/// `openmax --spec usage`: per-extension prompt cost joined with lifetime
+/// usage and approval state. Read-only; requires no trust or endpoint.
+fn print_usage_economics() {
+    use open_max_core::registry::ToolKind;
+    let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let data_dir = default_data_dir();
+    let registry = open_max_core::registry::Registry::build(&project);
+    let usage = open_max_core::ledger::load_usage(&data_dir, &project).unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ago = |ts: u64| -> String {
+        if ts == 0 {
+            return "never".into();
+        }
+        match (now.saturating_sub(ts)) / 86_400 {
+            0 => "today".into(),
+            d => format!("{d}d ago"),
+        }
+    };
+
+    let externals: Vec<_> = registry
+        .tools
+        .iter()
+        .filter_map(|spec| match &spec.kind {
+            ToolKind::External(ext) => Some((spec, ext)),
+            ToolKind::Builtin => None,
+        })
+        .collect();
+    if externals.is_empty() && registry.skills.is_empty() {
+        println!("no extensions installed; the frozen prompt carries zero extension cost");
+        return;
+    }
+    println!(
+        "{:<24} {:<6} {:>12} {:>7} {:>5} {:>5} {:>10}  approved",
+        "extension", "kind", "prompt_chars", "calls", "ok", "err", "last_used"
+    );
+    for (spec, ext) in &externals {
+        let chars = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }
+        })
+        .to_string()
+        .len();
+        let entry = usage.tools.get(&spec.name).cloned().unwrap_or_default();
+        let approved = if open_max_core::ledger::is_approved(&data_dir, &project, &ext.source_sha256)
+        {
+            "yes"
+        } else {
+            "no"
+        };
+        println!(
+            "{:<24} {:<6} {:>12} {:>7} {:>5} {:>5} {:>10}  {approved}",
+            spec.name, "tool", chars, entry.calls, entry.ok, entry.err, ago(entry.last_used)
+        );
+    }
+    for skill in &registry.skills {
+        let chars = skill.name.len() + skill.description.len() + skill.path.as_os_str().len() + 6;
+        let entry = usage.skills.get(&skill.name).cloned().unwrap_or_default();
+        println!(
+            "{:<24} {:<6} {:>12} {:>7} {:>5} {:>5} {:>10}  -",
+            skill.name, "skill", chars, entry.calls, entry.ok, entry.err, ago(entry.last_used)
+        );
+    }
+    println!(
+        "\nprompt_chars are paid on every request while the extension is installed.\n{} recorded calls total. Delete what you do not use; openmax --ledger keeps the history restorable.",
+        usage.total_calls
+    );
 }
 
 fn ensure_project_trust(

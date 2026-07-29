@@ -75,6 +75,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut tools_found: Vec<Entry> = Vec::new();
     #[allow(unused_assignments)]
     let mut external_names: Vec<String> = Vec::new();
+    let mut tool_meta: Vec<(String, PathBuf)> = Vec::new();
     for dir in crate::registry::external_tool_dirs(project_root) {
         for path in files_with_extension(&dir, "toml") {
             let parsed = crate::registry::parse_tool_file(&path);
@@ -86,6 +87,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 Ok(spec) => {
                     id = Some(spec.name.clone());
                     external_names.push(spec.name.clone());
+                    tool_meta.push((spec.name.clone(), path.clone()));
                     let command = match &spec.kind {
                         crate::registry::ToolKind::External(ext) => Some(ext.command.clone()),
                         crate::registry::ToolKind::Builtin => None,
@@ -120,6 +122,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
 
     let mut skills_found: Vec<Entry> = Vec::new();
+    let mut skill_meta: Vec<(String, String, PathBuf)> = Vec::new();
     for dir in crate::skills::skill_dirs(project_root) {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
@@ -161,6 +164,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             let status = match crate::skills::parse_skill_md(&path) {
                 Ok(s) => {
                     id = Some(s.name.clone());
+                    skill_meta.push((s.name.clone(), s.description.clone(), path.clone()));
                     Status::Ok(format!("skill '{}'", s.name))
                 }
                 Err(reason) => Status::Err(reason),
@@ -298,7 +302,88 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
 
     findings.extend(unread_paths(project_root));
+    findings.extend(hygiene_findings(project_root, data_dir, &tool_meta, &skill_meta));
     findings
+}
+
+/// Skill-library hygiene: extensions the usage record says are pure prompt
+/// tax, and near-duplicate skill descriptions that shadow each other in the
+/// index. Warnings only - the agent (or human) judges and deletes; nothing
+/// is pruned automatically.
+fn hygiene_findings(
+    project_root: &Path,
+    data_dir: &Path,
+    tools: &[(String, PathBuf)],
+    skills: &[(String, String, PathBuf)],
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    /// Enough recorded calls to judge non-use as signal rather than youth.
+    const MIN_SIGNAL_CALLS: u64 = 50;
+    if let Ok(usage) = crate::ledger::load_usage(data_dir, project_root) {
+        if usage.total_calls >= MIN_SIGNAL_CALLS {
+            for (name, path) in tools {
+                if usage.tools.get(name).map(|e| e.calls).unwrap_or(0) == 0 {
+                    findings.push(Finding {
+                        kind: "tool",
+                        path: path.clone(),
+                        status: Status::Warn(format!(
+                            "'{name}' was never called across {} recorded calls; its schema is pure prompt tax - consider deleting it",
+                            usage.total_calls
+                        )),
+                    });
+                }
+            }
+            for (name, _, path) in skills {
+                if usage.skills.get(name).map(|e| e.calls).unwrap_or(0) == 0 {
+                    findings.push(Finding {
+                        kind: "skill",
+                        path: path.clone(),
+                        status: Status::Warn(format!(
+                            "'{name}' was never read across {} recorded calls; consider deleting or merging it",
+                            usage.total_calls
+                        )),
+                    });
+                }
+            }
+        }
+    }
+    // Near-duplicate descriptions make the model pick between look-alikes
+    // (skill shadowing); flag the later name of each pair.
+    for (i, (name_a, desc_a, _)) in skills.iter().enumerate() {
+        for (name_b, desc_b, path_b) in skills.iter().skip(i + 1) {
+            if name_a == name_b {
+                continue; // cross-tier shadowing is reported elsewhere
+            }
+            if description_similarity(desc_a, desc_b) > 0.6 {
+                findings.push(Finding {
+                    kind: "skill",
+                    path: path_b.clone(),
+                    status: Status::Warn(format!(
+                        "'{name_b}' describes nearly the same thing as '{name_a}'; look-alike skills degrade selection - consider merging"
+                    )),
+                });
+            }
+        }
+    }
+    findings
+}
+
+/// Word-set Jaccard similarity, lowercase: cheap, deterministic, no model.
+fn description_similarity(a: &str, b: &str) -> f64 {
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2)
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (words(a), words(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(&b).count() as f64;
+    let union = a.union(&b).count() as f64;
+    intersection / union
 }
 
 /// Every tool name this project can actually call: the built-ins plus every
@@ -761,6 +846,51 @@ mod tests {
         assert!(ghost.status.summary().contains("does not exist"), "{}", ghost.status.summary());
         let real = findings.iter().find(|f| f.path.ends_with("real.toml")).unwrap();
         assert!(matches!(real.status, Status::Ok(_)), "{:?}", real.status);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn hygiene_flags_unused_tools_and_lookalike_skills() {
+        let root = temp_project();
+        let data = temp_project();
+        let tools_dir = root.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(
+            tools_dir.join("ghost.toml"),
+            "name = \"ghost\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n",
+        )
+        .unwrap();
+        for (name, desc) in [
+            ("deploy-app", "Deploy the application to the production cluster safely"),
+            ("ship-app", "Deploy the application to the production cluster with checks"),
+        ] {
+            let dir = root.join(".agents").join("skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        // Enough recorded signal to judge non-use.
+        let mut delta = crate::ledger::UsageDelta::default();
+        for _ in 0..50 {
+            delta.tools.push(("something-else".into(), true));
+        }
+        crate::ledger::record_usage(&data, &root, &delta).unwrap();
+
+        let findings = check_at(&root, &data);
+        assert!(
+            findings.iter().any(|f| f.path.ends_with("ghost.toml")
+                && f.status.summary().contains("never called")),
+            "unused tool must be flagged"
+        );
+        assert!(
+            findings.iter().any(|f| matches!(f.status, Status::Warn(_))
+                && f.status.summary().contains("nearly the same thing")),
+            "look-alike skills must be flagged"
+        );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }

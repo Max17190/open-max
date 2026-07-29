@@ -10,7 +10,7 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 7] = [
+pub const SURFACES: [&str; 8] = [
     "tools",
     "skills",
     "prompts",
@@ -18,6 +18,7 @@ pub const SURFACES: [&str; 7] = [
     "permissions",
     "providers",
     "stdio",
+    "usage",
 ];
 
 /// The authoring contract for one surface, or None for an unknown name.
@@ -381,6 +382,11 @@ mod tests {
     #[test]
     fn every_surface_renders_and_unknown_does_not() {
         for name in SURFACES {
+            // `usage` is dynamic (joined with the project's usage record) and
+            // rendered by the CLI, not this static table.
+            if name == "usage" {
+                continue;
+            }
             let text = render(name).unwrap_or_else(|| panic!("no spec for {name}"));
             assert!(!text.trim().is_empty(), "{name} spec is empty");
         }
