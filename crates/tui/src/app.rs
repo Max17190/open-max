@@ -285,9 +285,9 @@ pub struct App {
     /// Complete wrapped stream lines already copied into `stream_wrapped`.
     /// The partial line after this prefix is replaced on each token.
     stream_stable_len: usize,
-    /// Incremental markdown highlighter for the live stream: completed lines are
-    /// highlighted once, only the growing tail line re-renders per token, and a
-    /// resize re-wraps without re-highlighting. Replaces the O(n)-per-refresh
+    /// Incremental markdown renderer for the live stream: completed lines are
+    /// rendered once, only the growing tail line re-renders per token, and a
+    /// resize re-wraps without re-rendering. Replaces the O(n)-per-refresh
     /// full re-render that scaled poorly on long code replies.
     stream_md: markdown::StreamingMarkdown,
     thinking_wrapped: Vec<Line<'static>>,
@@ -543,10 +543,7 @@ impl App {
                     if let Some(text) = &m.content {
                         if !text.trim().is_empty() {
                             self.last_assistant_response = Some(text.clone());
-                            self.transcript.push_assistant(markdown::render(
-                                text,
-                                markdown::highlighter(),
-                            ));
+                            self.transcript.push_assistant(markdown::render(text));
                         }
                     }
                     if let Some(calls) = &m.tool_calls {
@@ -1999,7 +1996,7 @@ impl App {
                     let rendered = if self.stream_text == text {
                         self.stream_md.finish(&text)
                     } else {
-                        markdown::render(&text, markdown::highlighter())
+                        markdown::render(&text)
                     };
                     self.transcript.push_assistant(rendered);
                     self.refilter_scroll_search_live();
@@ -2627,9 +2624,9 @@ impl App {
             self.tail_width = width;
             self.thinking_source.clear();
         }
-        // Incremental markdown: completed lines are highlighted exactly once
+        // Incremental markdown: completed lines are rendered exactly once
         // and a resize only re-wraps, so a long streamed code block stays O(n)
-        // over the reply instead of re-highlighting the whole buffer on every
+        // over the reply instead of re-rendering the whole buffer on every
         // newline. `stream_changed` gates the tail_buf rebuild below.
         let mut stream_changed = false;
         let mut stream_reset = false;

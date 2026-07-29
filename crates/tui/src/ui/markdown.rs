@@ -1,199 +1,45 @@
 //! A deliberately small markdown renderer producing ratatui Lines: headings,
-//! emphasis, inline code, lists, blockquotes, rules, and syntect-highlighted
-//! fenced code. Enough for model output without pulling in a full parser.
+//! emphasis, inline code, lists, blockquotes, rules, and fenced code behind a
+//! dim gutter. Enough for model output without pulling in a full parser.
 
-use std::str::FromStr;
-use std::sync::OnceLock;
-
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{
-    Color as SynColor, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
-};
-use syntect::parsing::SyntaxSet;
 
 use crate::theme;
 use crate::ui::transcript::wrap_lines;
 
-pub struct Highlighter {
-    syntaxes: SyntaxSet,
-    theme: Theme,
-}
-
-/// Loading syntect's syntax dump costs tens of milliseconds, so it happens
-/// lazily on the first rendered code fence, not at startup.
-pub fn highlighter() -> &'static Highlighter {
-    static HL: OnceLock<Highlighter> = OnceLock::new();
-    HL.get_or_init(Highlighter::default)
-}
-
-/// Syntect compiles each syntax's regexes lazily on first use, which lands as
-/// a 10-25 ms stall inside the frame that renders a session's first code line
-/// in that language. The moment a fence opens, this kicks that compilation
-/// onto a background thread; by the time the first code line inside the fence
-/// completes, the syntax is usually warm. Pre-warming a fixed language list
-/// instead would pin ~5-9 MB of compiled regexes per language whether or not
-/// the session ever renders it, so warming stays demand-driven: memory goes
-/// only to languages actually on screen, exactly as the lazy path spends it.
-/// Concurrent first use is safe: syntect's lazy cells accept one winner and
-/// the loser's compile is discarded.
-fn warm_lang_async(lang: &str) {
-    static STARTED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        OnceLock::new();
-    let started = STARTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let Ok(mut started) = started.lock() else {
-        return;
-    };
-    if !started.insert(lang.to_string()) {
-        return;
-    }
-    drop(started);
-    let lang = lang.to_string();
-    std::thread::spawn(move || {
-        let hl = highlighter();
-        let mut st = LineState::default();
-        for line in [
-            format!("```{lang}"),
-            "let x = f(0); // c #".to_string(),
-            "```".to_string(),
-        ] {
-            let _ = render_line(&line, &mut st, hl);
-        }
-    });
-}
-
-impl Default for Highlighter {
-    fn default() -> Self {
-        // Keep default-syntaxes: we have no vendored language subset, so the
-        // full packdump is still the honest choice for fence language coverage.
-        // Theme is a single in-memory palette (no ThemeSet / default-themes dump).
-        let syntaxes = SyntaxSet::load_defaults_newlines();
-        let theme = code_theme();
-        Self { syntaxes, theme }
-    }
-}
-
-/// Compact grayscale palette for fenced code.
-/// Avoids embedding syntect's multi-theme `default.themedump` and keeps the
-/// default interface free of hue while retaining syntax hierarchy.
-fn code_theme() -> Theme {
-    let fg = gray(0xe0);
-    let comment = gray(0x70);
-    let soft = gray(0xa0);
-    let mid = gray(0xb8);
-    let bright = gray(0xf0);
-
-    let mut scopes = Vec::new();
-    let mut rule = |selector: &str, color: SynColor| {
-        scopes.push(ThemeItem {
-            scope: ScopeSelectors::from_str(selector).expect("static scope selector"),
-            style: StyleModifier {
-                foreground: Some(color),
-                background: None,
-                font_style: None,
-            },
-        });
-    };
-
-    rule("comment, punctuation.definition.comment", comment);
-    rule("string, punctuation.definition.string", mid);
-    rule("constant.numeric, constant.language, constant.character", bright);
-    rule("keyword, storage, storage.type, storage.modifier", bright);
-    rule("entity.name.function, support.function, meta.function-call", bright);
-    rule("entity.name.type, entity.name.class, support.type, support.class", mid);
-    rule("variable, variable.language, variable.parameter", soft);
-    rule("keyword.operator", mid);
-    rule("entity.name.tag", bright);
-    rule("entity.other.attribute-name", soft);
-
-    Theme {
-        name: Some("open-max-code".into()),
-        author: None,
-        settings: ThemeSettings {
-            foreground: Some(fg),
-            background: Some(gray(0x00)),
-            ..ThemeSettings::default()
-        },
-        scopes,
-    }
-}
-
-const fn gray(value: u8) -> SynColor {
-    SynColor {
-        r: value,
-        g: value,
-        b: value,
-        a: 0xff,
-    }
-}
-
-/// Per-line markdown state carried across source lines: fence status and the
-/// active syntect highlighter inside a fence. Both the batch [`render`] and the
-/// incremental [`StreamingMarkdown`] drive lines through [`render_line`] with
-/// this state, so their per-line output is identical by construction.
+/// Per-line markdown state carried across source lines: fence status. Both the
+/// batch [`render`] and the incremental [`StreamingMarkdown`] drive lines
+/// through [`render_line`] with this state, so their per-line output is
+/// identical by construction.
 #[derive(Default)]
-pub struct LineState<'a> {
+pub struct LineState {
     in_fence: bool,
-    code: Option<HighlightLines<'a>>,
 }
 
-impl LineState<'_> {
+impl LineState {
     /// A throwaway state seeded from `in_fence` for rendering an uncommitted
-    /// trailing line without disturbing (or cloning) the committed highlighter.
+    /// trailing line without disturbing the committed state.
     fn detached(in_fence: bool) -> Self {
-        Self {
-            in_fence,
-            code: None,
-        }
+        Self { in_fence }
     }
 }
 
 /// Render one source line, advancing `st`. Returns `None` for fence-marker
-/// lines (```` ``` ````), which emit nothing but toggle fence state. A line
-/// inside a fence with no active highlighter (`st.code` is `None`) renders as
-/// plain code under the gutter — the streaming path uses this for the
-/// still-growing partial line, which the committed highlighter colors once the
-/// line ends.
-pub fn render_line<'a>(raw: &str, st: &mut LineState<'a>, hl: &'a Highlighter) -> Option<Line<'static>> {
+/// lines (```` ``` ````), which emit nothing but toggle fence state. Lines
+/// inside a fence render as plain code behind a dim gutter bar.
+pub fn render_line(raw: &str, st: &mut LineState) -> Option<Line<'static>> {
     let trimmed = raw.trim_start();
     if trimmed.starts_with("```") {
-        if st.in_fence {
-            st.in_fence = false;
-            st.code = None;
-        } else {
-            st.in_fence = true;
-            let fence_lang = trimmed.trim_start_matches('`').trim();
-            if !fence_lang.is_empty() {
-                warm_lang_async(fence_lang);
-            }
-            let syntax = hl
-                .syntaxes
-                .find_syntax_by_token(fence_lang)
-                .unwrap_or_else(|| hl.syntaxes.find_syntax_plain_text());
-            st.code = Some(HighlightLines::new(syntax, &hl.theme));
-        }
+        st.in_fence = !st.in_fence;
         return None;
     }
 
     if st.in_fence {
-        let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::DIM()))];
-        match st.code.as_mut() {
-            Some(h) => match h.highlight_line(raw, &hl.syntaxes) {
-                Ok(ranges) => {
-                    for (style, piece) in ranges {
-                        let fg = style.foreground;
-                        spans.push(Span::styled(
-                            piece.to_string(),
-                            Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b)),
-                        ));
-                    }
-                }
-                Err(_) => spans.push(Span::raw(raw.to_string())),
-            },
-            None => spans.push(Span::raw(raw.to_string())),
-        }
-        return Some(Line::from(spans));
+        return Some(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(theme::DIM())),
+            Span::styled(raw.to_string(), Style::default().fg(theme::CODE())),
+        ]));
     }
 
     // Headings.
@@ -235,13 +81,13 @@ pub fn render_line<'a>(raw: &str, st: &mut LineState<'a>, hl: &'a Highlighter) -
     Some(Line::from(spans))
 }
 
-/// Render markdown to styled lines. Code fences are highlighted and prefixed
-/// with a dim gutter bar; everything else is line-oriented markdown.
-pub fn render(text: &str, hl: &Highlighter) -> Vec<Line<'static>> {
+/// Render markdown to styled lines. Code fences render behind a dim gutter
+/// bar; everything else is line-oriented markdown.
+pub fn render(text: &str) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut st = LineState::default();
     for raw in text.lines() {
-        if let Some(line) = render_line(raw, &mut st, hl) {
+        if let Some(line) = render_line(raw, &mut st) {
             out.push(line);
         }
     }
@@ -250,15 +96,13 @@ pub fn render(text: &str, hl: &Highlighter) -> Vec<Line<'static>> {
 
 /// Incremental markdown renderer for the live assistant stream.
 ///
-/// The batch [`render`] re-highlights the whole message on every refresh, so a
-/// long streamed code block costs O(n) per newline and O(n²) over the reply —
-/// the exact shape of a coding agent's output. This keeps completed source
-/// lines highlighted once (append-only, syntect's `HighlightLines` carries
-/// fence state across lines) and re-renders only the growing trailing line each
-/// token. Highlighting is width-independent, so a resize re-wraps the cached
-/// lines without re-highlighting. Committing a line yields output identical to
-/// batch [`render`]; the uncommitted partial line inside a fence shows plain
-/// until its newline lands.
+/// The batch [`render`] re-renders the whole message on every refresh, so a
+/// long streamed reply costs O(n) per newline and O(n²) over the reply — the
+/// exact shape of a coding agent's output. This renders completed source lines
+/// once (append-only, fence state carries across lines) and re-renders only
+/// the growing trailing line each token. Rendering is width-independent, so a
+/// resize re-wraps the cached lines without re-rendering. Committing a line
+/// yields output identical to batch [`render`].
 #[derive(Default)]
 pub struct StreamingMarkdown {
     width: u16,
@@ -266,9 +110,9 @@ pub struct StreamingMarkdown {
     text_len: usize,
     /// Bytes committed as complete lines; always at a `\n` boundary (or 0).
     committed_bytes: usize,
-    /// Committed fence/highlighter state at `committed_bytes`.
-    state: LineState<'static>,
-    /// Highlighted, unwrapped, one per committed non-marker source line.
+    /// Committed fence state at `committed_bytes`.
+    state: LineState,
+    /// Rendered, unwrapped, one per committed non-marker source line.
     complete_md: Vec<Line<'static>>,
     /// `complete_md` wrapped for `width`.
     complete_wrapped: Vec<Line<'static>>,
@@ -301,7 +145,7 @@ impl StreamingMarkdown {
         // Commit any lines that ended since the last update (append-only).
         self.commit_complete_lines(text);
 
-        // Wrapping is width-dependent; highlighting is not. On resize re-wrap
+        // Wrapping is width-dependent; rendering is not. On resize re-wrap
         // every cached line; otherwise wrap only the freshly committed ones.
         if width_changed {
             self.complete_wrapped = wrap_lines(&self.complete_md, width);
@@ -313,12 +157,12 @@ impl StreamingMarkdown {
         }
 
         // The uncommitted trailing line: render on a detached state so the
-        // committed highlighter is untouched (and never cloned).
+        // committed state is untouched.
         self.partial_wrapped.clear();
         let partial = &text[self.committed_bytes..];
         if !partial.is_empty() {
             let mut tmp = LineState::detached(self.state.in_fence);
-            if let Some(line) = render_line(partial, &mut tmp, highlighter()) {
+            if let Some(line) = render_line(partial, &mut tmp) {
                 self.partial_wrapped = wrap_lines(&[line], width);
             }
         }
@@ -335,14 +179,13 @@ impl StreamingMarkdown {
         };
         let commit_end = self.committed_bytes + last_nl + 1;
 
-        let hl = highlighter();
         let newly = &text[self.committed_bytes..commit_end];
         for raw in newly.split_inclusive('\n') {
             let line = raw
                 .strip_suffix('\n')
                 .map(|line| line.strip_suffix('\r').unwrap_or(line))
                 .unwrap_or(raw);
-            if let Some(rendered) = render_line(line, &mut self.state, hl) {
+            if let Some(rendered) = render_line(line, &mut self.state) {
                 self.complete_md.push(rendered);
             }
         }
@@ -379,7 +222,7 @@ impl StreamingMarkdown {
     /// The caller compares its token buffer with the provider's final message
     /// before taking this path. A final delta may arrive after the last paint,
     /// so catch up here, then commit the trailing partial line with the real
-    /// syntax state instead of highlighting the whole response again.
+    /// fence state instead of re-rendering the whole response.
     pub fn finish(&mut self, text: &str) -> Vec<Line<'static>> {
         if text.len() < self.text_len {
             self.clear();
@@ -388,7 +231,7 @@ impl StreamingMarkdown {
 
         let partial = &text[self.committed_bytes..];
         if !partial.is_empty() {
-            if let Some(line) = render_line(partial, &mut self.state, highlighter()) {
+            if let Some(line) = render_line(partial, &mut self.state) {
                 self.complete_md.push(line);
             }
         }
@@ -495,19 +338,6 @@ fn find(chars: &[char], from: usize, needle: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "memory probe; run under /usr/bin/time -l with WARM_PROBE=<langs>"]
-    fn warm_rss_probe() {
-        let langs = std::env::var("WARM_PROBE").unwrap_or_default();
-        let hl = highlighter();
-        for lang in langs.split(',').filter(|s| !s.is_empty()) {
-            let mut st = LineState::default();
-            for line in [format!("```{lang}"), "let x = f(0); // c #".into(), "```".into()] {
-                let _ = render_line(&line, &mut st, hl);
-            }
-        }
-    }
-
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
             .iter()
@@ -517,8 +347,7 @@ mod tests {
 
     #[test]
     fn renders_headings_bullets_and_code_fence() {
-        let hl = Highlighter::default();
-        let lines = render("# Title\n- item one\n```rust\nfn main() {}\n```\ndone", &hl);
+        let lines = render("# Title\n- item one\n```rust\nfn main() {}\n```\ndone");
         let texts = plain(&lines);
         assert_eq!(texts[0], "Title");
         assert_eq!(texts[1], "• item one");
@@ -528,8 +357,7 @@ mod tests {
 
     #[test]
     fn inline_styles_do_not_lose_text() {
-        let hl = Highlighter::default();
-        let lines = render("mix of `code`, **bold**, *italic*, and plain", &hl);
+        let lines = render("mix of `code`, **bold**, *italic*, and plain");
         assert_eq!(plain(&lines)[0], "mix of code, bold, italic, and plain");
         assert!(lines[0]
             .spans
@@ -543,51 +371,8 @@ mod tests {
 
     #[test]
     fn unclosed_markers_stay_literal() {
-        let hl = Highlighter::default();
-        let lines = render("a * lone star and `tick", &hl);
+        let lines = render("a * lone star and `tick");
         assert_eq!(plain(&lines)[0], "a * lone star and `tick");
-    }
-
-    #[test]
-    fn rust_fence_uses_a_monochrome_syntect_hierarchy() {
-        let hl = Highlighter::default();
-        let lines = render(
-            "```rust\nfn main() { let x = 1; println!(\"hi\"); }\n```",
-            &hl,
-        );
-        assert!(!lines.is_empty());
-        let code = &lines[0];
-        // Gutter bar + highlighted pieces; more than a single plain span.
-        assert!(
-            code.spans.len() > 2,
-            "expected multi-span highlight, got {}",
-            code.spans.len()
-        );
-        let texts: String = code.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(texts.contains("fn main()"));
-
-        let fg_colors: Vec<_> = code
-            .spans
-            .iter()
-            .skip(1) // skip gutter
-            .filter_map(|s| match s.style.fg {
-                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            fg_colors.len() >= 2,
-            "expected RGB foregrounds from syntect theme, got {fg_colors:?}"
-        );
-        assert!(
-            fg_colors.iter().all(|(r, g, b)| r == g && g == b),
-            "expected achromatic foregrounds, got {fg_colors:?}"
-        );
-        let distinct: std::collections::HashSet<_> = fg_colors.into_iter().collect();
-        assert!(
-            distinct.len() >= 2,
-            "expected more than one grayscale value for syntax hierarchy, got {distinct:?}"
-        );
     }
 
     // ---- StreamingMarkdown: incremental output must match batch render ----
@@ -627,7 +412,6 @@ mod tests {
 
     #[test]
     fn streaming_commit_matches_batch_for_any_chunking() {
-        let hl = highlighter();
         let samples = [
             "hello world this is a fairly long line that should wrap somewhere nice\n",
             "windows first line\r\nwindows second line\r\n",
@@ -637,7 +421,7 @@ mod tests {
             "> a quoted line that is long enough to wrap at a narrow width for sure\n",
         ];
         for text in samples {
-            let batch = wrap_lines(&render(text, hl), 30);
+            let batch = wrap_lines(&render(text), 30);
             for chunk in [1usize, 3, 7, text.len()] {
                 let sm = feed(text, chunk, 30);
                 let mut out = Vec::new();
@@ -653,7 +437,6 @@ mod tests {
 
     #[test]
     fn streaming_partial_code_line_is_visible_then_commits() {
-        let hl = highlighter();
         let mut sm = StreamingMarkdown::default();
         // Partial code line (no trailing newline yet) must still be shown.
         sm.update("```rust\nlet x = 1;", 40);
@@ -666,12 +449,12 @@ mod tests {
             .collect();
         assert!(joined.contains("let x = 1;"), "partial line hidden: {joined:?}");
 
-        // Once the newline lands, output matches batch (syntect-highlighted).
+        // Once the newline lands, output matches batch.
         let full = "```rust\nlet x = 1;\n";
         sm.update(full, 40);
         let mut out2 = Vec::new();
         sm.copy_into(&mut out2);
-        assert_eq!(sig(&out2), sig(&wrap_lines(&render(full, hl), 40)));
+        assert_eq!(sig(&out2), sig(&wrap_lines(&render(full), 40)));
     }
 
     #[test]
@@ -690,10 +473,7 @@ mod tests {
         assert_eq!(sig(&out[..stable]), complete_prefix);
         assert_eq!(
             sig(&out),
-            sig(&wrap_lines(
-                &render("first complete line\npartial grows", highlighter()),
-                40,
-            )),
+            sig(&wrap_lines(&render("first complete line\npartial grows"), 40)),
         );
 
         sm.update("first complete line\npartial grows\nnext", 40);
@@ -701,33 +481,23 @@ mod tests {
         assert_eq!(stable, 2);
         assert_eq!(
             sig(&out),
-            sig(&wrap_lines(
-                &render("first complete line\npartial grows\nnext", highlighter()),
-                40,
-            )),
+            sig(&wrap_lines(&render("first complete line\npartial grows\nnext"), 40)),
         );
     }
 
     #[test]
-    fn streaming_resize_rewraps_and_keeps_highlight() {
-        let hl = highlighter();
+    fn streaming_resize_rewraps_and_matches_batch() {
         let text = "```rust\nfn main() { let a = 1; let b = 2; let c = 3; done(a, b, c); }\n```\n";
         let mut sm = StreamingMarkdown::default();
         sm.update(text, 80);
-        sm.update(text, 24); // narrow resize: re-wrap without re-highlighting
+        sm.update(text, 24); // narrow resize: re-wrap the cached lines
         let mut out = Vec::new();
         sm.copy_into(&mut out);
-        assert_eq!(sig(&out), sig(&wrap_lines(&render(text, hl), 24)));
-        let has_rgb = out
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .any(|s| matches!(s.style.fg, Some(Color::Rgb(..))));
-        assert!(has_rgb, "resize dropped syntect colors");
+        assert_eq!(sig(&out), sig(&wrap_lines(&render(text), 24)));
     }
 
     #[test]
     fn streaming_resize_midstream_then_continue_matches_batch() {
-        let hl = highlighter();
         let text = "intro line\n```rust\nfn a() { one(); }\nfn b() { two(); }\nfn c() { three(); }\n```\ntrailing prose that is long enough to wrap narrowly\n";
         let mid = text.find("fn c").unwrap();
         let mut sm = StreamingMarkdown::default();
@@ -736,7 +506,7 @@ mod tests {
         sm.update(text, 30); // keep streaming to completion at new width
         let mut out = Vec::new();
         sm.copy_into(&mut out);
-        assert_eq!(sig(&out), sig(&wrap_lines(&render(text, hl), 30)));
+        assert_eq!(sig(&out), sig(&wrap_lines(&render(text), 30)));
     }
 
     #[test]
@@ -754,7 +524,7 @@ mod tests {
         sm.update("short\n", 20);
         let mut out2 = Vec::new();
         sm.copy_into(&mut out2);
-        assert_eq!(sig(&out2), sig(&wrap_lines(&render("short\n", highlighter()), 20)));
+        assert_eq!(sig(&out2), sig(&wrap_lines(&render("short\n"), 20)));
     }
 
     #[test]
@@ -766,7 +536,7 @@ mod tests {
 
         let finished = sm.finish(complete);
 
-        assert_eq!(sig(&finished), sig(&render(complete, highlighter())));
+        assert_eq!(sig(&finished), sig(&render(complete)));
         assert_eq!(sm.text_len(), 0);
         let mut stream = Vec::new();
         sm.copy_into(&mut stream);
@@ -781,7 +551,6 @@ mod tests {
     fn measure_stream_render_cost() {
         use std::time::Instant;
 
-        let hl = highlighter();
         let w: u16 = 100;
         // ~240-line rust reply, streamed one source line at a time.
         let mut reply = String::from("Here is the implementation you asked for.\n\n```rust\n");
@@ -806,7 +575,7 @@ mod tests {
         let t0 = Instant::now();
         for l in &lines {
             acc.push_str(l);
-            let md = render(&acc, hl);
+            let md = render(&acc);
             let wrapped = wrap_lines(&md, w);
             std::hint::black_box(&wrapped);
         }
@@ -844,7 +613,7 @@ mod tests {
         // OLD completion: discard the incremental state and highlight the
         // finished response from scratch.
         let t0 = Instant::now();
-        let batch_finished = render(&reply, hl);
+        let batch_finished = render(&reply);
         let batch_finish_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         // NEW completion: promote the already-highlighted stream and commit
