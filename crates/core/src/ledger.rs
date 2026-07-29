@@ -101,6 +101,13 @@ fn lock_path(dir: &Path) -> PathBuf {
     dir.join("ledger.lock")
 }
 
+/// The hash of the log's final record, stored beside it. The chain alone
+/// proves internal order but not completeness: removing whole trailing
+/// records leaves a valid prefix. This pin makes truncation detectable.
+fn chain_head_path(dir: &Path) -> PathBuf {
+    dir.join("chain-head")
+}
+
 /// Read the full history, verifying the hash chain as it goes. A malformed
 /// line or a broken chain is an error, never silently skipped or displayed
 /// as authentic: a ledger that cannot be trusted must not be read around.
@@ -135,6 +142,19 @@ pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, Stri
         }
         prev = sha256_hex(line.as_bytes());
         out.push(record);
+    }
+    let dir = project_dir(data_dir, project_root);
+    match std::fs::read_to_string(chain_head_path(&dir)) {
+        Ok(stored) if stored.trim() != prev => {
+            return Err(format!(
+                "{}: the log's final record does not match the stored chain head - trailing records were removed or rewritten outside the harness",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        // A pre-chain-head ledger (or a fresh project) has no pin yet; the
+        // next sync writes one.
+        Err(_) => {}
     }
     Ok(out)
 }
@@ -244,8 +264,14 @@ fn sync_locked(
             Some(None) => "modified", // re-added after removal
             None => "added",
         };
+        // Never trust a pre-existing object blindly: rollback follows these
+        // bytes, so an object that does not hash to its own name is replaced
+        // with the authentic content this generation actually read.
         let object = dir.join("objects").join(sha);
-        if !object.exists() {
+        let object_valid = std::fs::read(&object)
+            .map(|existing| sha256_hex(&existing) == *sha)
+            .unwrap_or(false);
+        if !object_valid {
             crate::sessions::write_atomic(&object, bytes)?;
         }
         let record = Record {
@@ -291,6 +317,8 @@ fn sync_locked(
             .map_err(|e| format!("cannot append to ledger: {e}"))?;
         file.write_all(lines.as_bytes())
             .map_err(|e| format!("cannot append to ledger: {e}"))?;
+        // Pin the new final record so silent truncation is detectable.
+        crate::sessions::write_atomic(&chain_head_path(dir), &prev)?;
     }
     Ok(changes)
 }
@@ -383,6 +411,38 @@ mod tests {
         let tampered = text.replacen(&first_sha, &"0".repeat(first_sha.len()), 1);
         assert_ne!(tampered, text, "tampering must actually change the log");
         assert!(verify_chain(&tampered).is_err());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_trailing_records_is_detected() {
+        let data = temp("trunc-data");
+        let root = temp("trunc-proj");
+        for v in ["v1", "v2", "v3"] {
+            let files = vec![entry(&root, ".openmax/tools/a.toml", v)];
+            sync(&data, &root, &files, Actor::External, None).unwrap();
+        }
+        let log = log_path(&project_dir(&data, &root));
+        let text = std::fs::read_to_string(&log).unwrap();
+        let prefix: String = text.lines().take(2).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&log, prefix).unwrap();
+        let err = history(&data, &root).unwrap_err();
+        assert!(err.contains("chain head"), "{err}");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_corrupted_object_is_replaced_with_authentic_bytes() {
+        let data = temp("objfix-data");
+        let root = temp("objfix-proj");
+        let (path, sha, bytes) = entry(&root, ".openmax/tools/a.toml", "authentic");
+        let object = project_dir(&data, &root).join("objects").join(&sha);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, "forged").unwrap();
+        sync(&data, &root, &[(path, sha.clone(), bytes)], Actor::External, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&object).unwrap(), "authentic");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }

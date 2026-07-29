@@ -307,14 +307,14 @@ Activation: resolved at the next turn (settings edits apply without a
 restart). Verify with `openmax --check`.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/1)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/2)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/1","protocol_version":1,"session_id":"...","version":"...","project":"/abs/path"}.
+{"type":"hello","proto":"openmax-stdio/2","protocol_version":2,"session_id":"...","version":"...","project":"/abs/path"}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -334,8 +334,9 @@ Parse by field name, never by key order. Types: `token` (text), `thinking`
 (call_id, name, args), `tool_end` (call_id, ok, output), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail), `approval_settled` (approval_id, outcome), `refrozen` (tools,
-skills), `hook_failed` (hook, event, detail: an observe-only hook failed,
-the turn proceeded), `done` (stop_reason), `error` (message).
+skills, changes: the refreeze receipt naming each recorded capability-file
+change and its actor), `hook_failed` (hook, event, detail: an observe-only
+hook failed, the turn proceeded), `done` (stop_reason), `error` (message).
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
