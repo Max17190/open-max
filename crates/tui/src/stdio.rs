@@ -93,8 +93,12 @@ pub async fn run(
     emit(&mut stdout, &hello_value(&session_id, &project_key));
 
     // Blocking stdin reader on its own thread; malformed input travels as Err
-    // so the async loop can answer without ever blocking on the pipe.
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Result<Command, String>>();
+    // so the async loop can answer without ever blocking on the pipe. The
+    // channel is bounded because every line, valid or not, costs one answer
+    // written and flushed one at a time: a peer that floods faster than the
+    // loop drains would otherwise queue its own backlog until memory runs
+    // out. A full queue parks the reader, stdin backs up, and the peer waits.
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Result<Command, String>>(64);
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
@@ -117,11 +121,11 @@ pub async fn run(
                         .map_err(|e| format!("bad command line: {e}")),
                 },
                 Err(e) => {
-                    let _ = stdin_tx.send(Err(format!("stdin read failed: {e}")));
+                    let _ = stdin_tx.blocking_send(Err(format!("stdin read failed: {e}")));
                     break;
                 }
             };
-            if stdin_tx.send(parsed).is_err() {
+            if stdin_tx.blocking_send(parsed).is_err() {
                 break;
             }
         }
@@ -249,23 +253,26 @@ enum LineRead {
     Eof,
 }
 
-/// Read one newline-terminated line into `buf` without buffering more than
-/// `MAX_LINE_BYTES`. An oversized line is drained to its newline so the next
-/// line still starts at a frame boundary.
+/// Read one line into `buf` without buffering more than `MAX_LINE_BYTES` of
+/// content. An oversized line is drained to its newline so the next line still
+/// starts at a frame boundary. Reading one byte past the cap is what separates
+/// a line that ends exactly at it from one that runs past it.
 fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<LineRead> {
+    const LIMIT: u64 = MAX_LINE_BYTES as u64 + 1;
     buf.clear();
-    let read = (&mut *reader).take(MAX_LINE_BYTES as u64).read_until(b'\n', buf)?;
+    let read = (&mut *reader).take(LIMIT).read_until(b'\n', buf)?;
     if read == 0 {
         return Ok(LineRead::Eof);
     }
-    if buf.last() == Some(&b'\n') || read < MAX_LINE_BYTES {
-        // Terminated, or a final line that ends at EOF without a newline.
+    // Terminated, or a final line that ends at EOF without a newline. Either
+    // way it stopped within the cap, so the content fits.
+    if buf.last() == Some(&b'\n') || read <= MAX_LINE_BYTES {
         return Ok(LineRead::Line);
     }
     let mut sink = Vec::new();
     loop {
         sink.clear();
-        let more = (&mut *reader).take(MAX_LINE_BYTES as u64).read_until(b'\n', &mut sink)?;
+        let more = (&mut *reader).take(LIMIT).read_until(b'\n', &mut sink)?;
         if more == 0 || sink.last() == Some(&b'\n') {
             return Ok(LineRead::TooLong);
         }
@@ -537,7 +544,9 @@ mod tests {
                 LineRead::TooLong => seen.push("too-long".to_string()),
                 LineRead::Line => seen.push(String::from_utf8_lossy(&buf).trim().to_string()),
             }
-            assert!(buf.len() <= MAX_LINE_BYTES, "buffer must stay capped");
+            // Content stays within the cap; the extra byte is the newline, or
+            // the single byte read past it to detect an overlong line.
+            assert!(buf.len() <= MAX_LINE_BYTES + 1, "buffer must stay capped");
         }
         assert_eq!(
             seen,
@@ -548,6 +557,31 @@ mod tests {
             ],
             "an oversized line must not desynchronize framing"
         );
+    }
+
+    #[test]
+    fn a_line_exactly_at_the_cap_is_accepted() {
+        // The cap is a limit on content, so a line of exactly that many bytes
+        // is valid and only the one after it is too long.
+        for (content_len, expect_line) in [
+            (MAX_LINE_BYTES - 1, true),
+            (MAX_LINE_BYTES, true),
+            (MAX_LINE_BYTES + 1, false),
+        ] {
+            let mut input = vec![b'x'; content_len];
+            input.push(b'\n');
+            let mut reader = std::io::BufReader::new(input.as_slice());
+            let mut buf = Vec::new();
+            let got = read_line_capped(&mut reader, &mut buf).unwrap();
+            assert_eq!(
+                matches!(got, LineRead::Line),
+                expect_line,
+                "a {content_len} byte line was classified wrong"
+            );
+            if expect_line {
+                assert_eq!(buf.len(), content_len + 1, "the whole line must be kept");
+            }
+        }
     }
 
     #[test]

@@ -619,18 +619,22 @@ pub fn start_turn(
             project_root.display()
         ));
     }
+    let cancelled = Arc::new(CancelToken::default());
     {
+        // `running` is the outer lock for both pieces of turn state. Claiming
+        // the session and publishing its cancel token under one hold is what
+        // makes "a running session always has a live token" true, so a turn
+        // can never be started into a state where cancel does nothing.
         let mut running = core.running.lock().unwrap();
         if running.contains(&session_id) {
             return Err("the agent is already working in this session".into());
         }
+        core.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), cancelled.clone());
         running.insert(session_id.clone());
     }
-    let cancelled = Arc::new(CancelToken::default());
-    core.cancel_flags
-        .lock()
-        .unwrap()
-        .insert(session_id.clone(), cancelled.clone());
 
     let settings = core.settings.lock().unwrap().clone();
     // Title is set after user_prompt_submit accepts the text (see run_loop).
@@ -672,8 +676,13 @@ where
             );
             core.send_agent(&session_id, AgentEvent::Done { stop_reason: "error".into() });
         }
-        core.running.lock().unwrap().remove(&session_id);
+        // Released together, under the same outer lock the turn claimed them
+        // with. Dropping `running` first would let a client that just saw
+        // `done` start the next turn in the gap and have its fresh cancel
+        // token deleted by the line below, leaving a turn nobody can stop.
+        let mut running = core.running.lock().unwrap();
         core.cancel_flags.lock().unwrap().remove(&session_id);
+        running.remove(&session_id);
     });
 }
 
