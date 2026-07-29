@@ -52,18 +52,44 @@ pub struct DiffInfo {
 }
 
 #[derive(Clone)]
+#[derive(Default)]
 pub struct ToolOutcome {
     pub ok: bool,
     pub output: String,
     pub diff: Option<DiffInfo>,
+    /// Bytes the underlying process produced, when the tool ran one. `output`
+    /// is a bounded rendering of that, so the two differ for a noisy command.
+    /// None for tools that are not a process (file and search built-ins).
+    pub process_bytes: Option<u64>,
+    /// True when `output` dropped part of what the process produced.
+    pub process_truncated: bool,
 }
 
 impl ToolOutcome {
     pub(crate) fn ok(output: String) -> Self {
-        Self { ok: true, output, diff: None }
+        Self { ok: true, output, ..Self::default() }
     }
     pub(crate) fn err(output: impl Into<String>) -> Self {
-        Self { ok: false, output: output.into(), diff: None }
+        Self { ok: false, output: output.into(), ..Self::default() }
+    }
+    /// Record what the process behind this result produced, so a
+    /// `post_tool_use` hook can tell a quiet command from a clipped one
+    /// without parsing the truncation notice out of the text.
+    pub(crate) fn from_process(
+        ok: bool,
+        output: String,
+        process: &ProcessOutput,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            ok,
+            output,
+            diff: None,
+            process_bytes: Some(
+                process.stdout.total_bytes.saturating_add(process.stderr.total_bytes),
+            ),
+            process_truncated: truncated,
+        }
     }
 }
 
@@ -421,7 +447,7 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
     }
     let diff = make_diff(root, &path, &old, content);
     let summary = format!("wrote {} (+{} −{})", diff.path, diff.added, diff.removed);
-    ToolOutcome { ok: true, output: summary, diff: Some(diff) }
+    ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
 fn leading_whitespace(s: &str) -> &str {
@@ -583,7 +609,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let diff = make_diff(root, &path, &old, &new);
     let suffix = if fuzzy_match { " [matched with whitespace normalization]" } else { "" };
     let summary = format!("edited {} (+{} −{}){}", diff.path, diff.added, diff.removed, suffix);
-    ToolOutcome { ok: true, output: summary, diff: Some(diff) }
+    ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
 fn project_walk(root: &Path) -> ignore::Walk {
@@ -780,7 +806,7 @@ fn stream_was_truncated(stream: &execution::CapturedStream) -> bool {
 
 /// Format native-process output identically for bash and external tools.
 /// The supervisor has already bounded each stream and owns any spill log.
-pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) -> String {
+pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) -> (String, bool) {
     let mut text = captured_text(&output.stdout);
     let stderr = captured_text(&output.stderr);
     if !stderr.trim().is_empty() {
@@ -808,9 +834,9 @@ pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) ->
         }
     }
     if text.trim().is_empty() {
-        "(no output)".into()
+        ("(no output)".into(), needs_notice)
     } else {
-        text
+        (text, needs_notice)
     }
 }
 
@@ -844,13 +870,15 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<Canc
             Termination::Cancelled => ToolOutcome::err("command cancelled by user"),
             Termination::TimedOut => ToolOutcome::err(format!("command timed out after {timeout_secs}s")),
             Termination::Exited(status) => {
-                let text = render_process_output(&output, caps.command_bytes);
-                if status.success() {
-                    ToolOutcome::ok(text)
-                } else {
-                    let code = status.code().unwrap_or(-1);
-                    ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
-                }
+                let (text, truncated) = render_process_output(&output, caps.command_bytes);
+                let (ok, text) = match status.success() {
+                    true => (true, text),
+                    false => {
+                        let code = status.code().unwrap_or(-1);
+                        (false, format!("exit code {code}\n{text}"))
+                    }
+                };
+                ToolOutcome::from_process(ok, text, &output, truncated)
             }
         },
     }
@@ -975,7 +1003,7 @@ mod tests {
     #[test]
     fn process_renderer_does_not_duplicate_overlapping_head_and_tail() {
         let output = rendered_output(stream(3, b"ab", b"abc"), stream(0, b"", b""), None, false);
-        assert_eq!(render_process_output(&output, 100), "abc");
+        assert_eq!(render_process_output(&output, 100).0, "abc");
     }
 
     #[test]
@@ -986,13 +1014,13 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(render_process_output(&output, 100), "stdout\n[stderr]\nstderr");
+        assert_eq!(render_process_output(&output, 100).0, "stdout\n[stderr]\nstderr");
     }
 
     #[test]
     fn process_renderer_marks_truncated_capture_without_log() {
         let output = rendered_output(stream(100, b"", b"tail"), stream(0, b"", b""), None, false);
-        let text = render_process_output(&output, 100);
+        let (text, _) = render_process_output(&output, 100);
         assert!(text.starts_with("[start of output truncated]"), "{text}");
         assert!(text.ends_with("tail"), "{text}");
     }
@@ -1006,7 +1034,7 @@ mod tests {
             Some(path),
             false,
         );
-        let text = render_process_output(&output, 100);
+        let (text, _) = render_process_output(&output, 100);
         assert!(
             text.contains("bounded output log saved to /tmp/openmax-command.log"),
             "{text}"

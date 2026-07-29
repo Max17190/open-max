@@ -223,15 +223,14 @@ impl Hooks {
         tool: &str,
         args: &Value,
         cwd: &Path,
-        tool_ok: bool,
-        output: &str,
+        outcome: &crate::tools::ToolOutcome,
         cancel: &Arc<CancelToken>,
     ) {
         for hook in &self.post {
             if !hook.matches(tool) {
                 continue;
             }
-            let payload = tool_payload(hook, session_id, tool, args, cwd, Some((tool_ok, output)));
+            let payload = tool_payload(hook, session_id, tool, args, cwd, Some(outcome));
             let _ = run_hook(hook, payload, cwd, cancel).await;
         }
     }
@@ -322,7 +321,7 @@ fn tool_payload(
     tool: &str,
     args: &Value,
     cwd: &Path,
-    result: Option<(bool, &str)>,
+    result: Option<&crate::tools::ToolOutcome>,
 ) -> Value {
     let mut payload = serde_json::json!({
         "event": hook.event.as_str(),
@@ -330,16 +329,24 @@ fn tool_payload(
         "tool": tool,
         "args": args,
         "cwd": cwd.display().to_string(),
-        "tool_ok": result.map(|(ok, _)| ok),
+        "tool_ok": result.map(|o| o.ok),
     });
-    if let Some((_, output)) = result {
-        let head = head_bytes(output, MAX_OUTPUT_BYTES);
+    if let Some(outcome) = result {
+        let head = head_bytes(&outcome.output, MAX_OUTPUT_BYTES);
         let Some(map) = payload.as_object_mut() else { return payload };
         map.insert("output".into(), Value::String(head.to_string()));
-        // The full size travels even when the text does not, so a hook can
-        // tell a short output from the start of a long one.
-        map.insert("output_bytes".into(), Value::from(output.len()));
-        map.insert("output_truncated".into(), Value::Bool(head.len() < output.len()));
+        // Output is bounded twice, and a hook is told about both cuts rather
+        // than left to infer either from the length it received.
+        map.insert("output_bytes".into(), Value::from(outcome.output.len()));
+        map.insert(
+            "output_truncated".into(),
+            Value::Bool(head.len() < outcome.output.len()),
+        );
+        map.insert(
+            "process_bytes".into(),
+            outcome.process_bytes.map(Value::from).unwrap_or(Value::Null),
+        );
+        map.insert("process_truncated".into(), Value::Bool(outcome.process_truncated));
     }
     payload
 }
@@ -789,7 +796,8 @@ tool = "bash"
         let cancel = Arc::new(CancelToken::default());
         let args = serde_json::json!({"command": "echo hi"});
 
-        hooks.post_tool_use("sess", "bash", &args, &tmp, true, "hi\n", &cancel).await;
+        let outcome = crate::tools::ToolOutcome::ok("hi\n".into());
+        hooks.post_tool_use("sess", "bash", &args, &tmp, &outcome, &cancel).await;
 
         let payload: Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join("audit.json")).unwrap()).unwrap();
@@ -799,6 +807,8 @@ tool = "bash"
         assert_eq!(payload["output"], "hi\n");
         assert_eq!(payload["output_bytes"], 3);
         assert_eq!(payload["output_truncated"], false);
+        assert!(payload["process_bytes"].is_null(), "no process ran behind this result");
+        assert_eq!(payload["process_truncated"], false);
         assert_eq!(payload["args"]["command"], "echo hi");
     }
 
@@ -853,7 +863,7 @@ tool = "bash"
             "bash",
             &serde_json::json!({}),
             Path::new("/project"),
-            Some((true, long.as_str())),
+            Some(&crate::tools::ToolOutcome::ok(long.clone())),
         );
 
         let head = payload["output"].as_str().unwrap();
@@ -867,11 +877,12 @@ tool = "bash"
         assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap()["output"], head);
     }
 
-    /// The payload describes the tool result, which is the text the model
-    /// reasoned about. A result that the tool layer already bounded carries
-    /// its own notice, so a hook can see that a larger output existed.
+    /// Output is bounded twice: the tool renders a process down to a result,
+    /// then this payload takes a head of that result. A hook is told about
+    /// both, so an audit hook never has to parse a notice out of the text to
+    /// learn that a larger output existed.
     #[test]
-    fn the_payload_measures_the_tool_result_it_was_given() {
+    fn the_payload_reports_both_bounds() {
         let rendered = "[start of output truncated; bounded output log saved to /logs/x; \
                         tail or grep it with bash]\n…LINE-B\n";
         let hook = HookSpec {
@@ -888,19 +899,30 @@ tool = "bash"
             "bash",
             &serde_json::json!({}),
             Path::new("/project"),
-            Some((true, rendered)),
+            Some(&crate::tools::ToolOutcome {
+                ok: true,
+                output: rendered.to_string(),
+                process_bytes: Some(400_001),
+                process_truncated: true,
+                ..Default::default()
+            }),
         );
 
         assert_eq!(payload["output"], rendered);
-        assert_eq!(payload["output_bytes"].as_u64().unwrap() as usize, rendered.len());
+        assert_eq!(
+            payload["output_bytes"].as_u64().unwrap() as usize,
+            rendered.len(),
+            "output_bytes measures the result the model reasoned about"
+        );
         assert_eq!(
             payload["output_truncated"], false,
             "this payload dropped nothing, whatever the tool layer did earlier"
         );
-        assert!(
-            payload["output"].as_str().unwrap().contains("start of output truncated"),
-            "the earlier bound stays visible to the hook in the text itself"
+        assert_eq!(
+            payload["process_bytes"], 400_001,
+            "the size the command actually produced survives the rendering"
         );
+        assert_eq!(payload["process_truncated"], true);
     }
 
     #[test]

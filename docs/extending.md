@@ -78,13 +78,15 @@ size), and `output_truncated` (whether the payload dropped part of it). That is
 what an eval, audit, or telemetry hook needs to be written as a file instead of
 a core feature.
 
-Bounding happens twice, and the fields describe the second cut. A tool result
-is already a bounded rendering of what a process printed: `bash` keeps the tail
-up to its output cap, prepends a `[start of output truncated...]` notice when
-it dropped anything, and names a log file holding the bounded capture. A hook
-that needs more than the result can read that log; `output_bytes` deliberately
-measures the result rather than the process, because that is the text the model
-actually reasoned about.
+Output is bounded twice and the payload reports both cuts. A tool result is
+itself a bounded rendering of what a process printed: `bash` keeps the tail up
+to its output cap and names a log file holding the bounded capture. So
+`process_bytes` is how many bytes the command actually produced (null when the
+tool ran no process, such as the file and search built-ins) and
+`process_truncated` says whether the result dropped part of it. An audit hook
+can therefore tell a quiet command from a clipped one without parsing a
+truncation notice out of the text, and `output_bytes` still measures the
+result, because that is the text the model actually reasoned about.
 
 It stays observation: the hook's own exit status and stdout are ignored, so
 nothing it does changes what the model receives. Hooks never enter the model prompt and,

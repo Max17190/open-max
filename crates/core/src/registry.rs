@@ -568,12 +568,17 @@ async fn spawn_external(
                 tool.timeout_secs
             )),
             Termination::Exited(status) => {
-                let text = tools::render_process_output(&output, caps.command_bytes);
+                let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
                 if status.success() {
                     ToolOutcome::ok(text)
                 } else {
                     let code = status.code().unwrap_or(-1);
-                    ToolOutcome { ok: false, output: format!("exit code {code}\n{text}"), diff: None }
+                    ToolOutcome::from_process(
+                        false,
+                        format!("exit code {code}\n{text}"),
+                        &output,
+                        truncated,
+                    )
                 }
             }
         },
