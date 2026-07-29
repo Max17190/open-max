@@ -244,3 +244,18 @@ fn truncate_line(s: &str, max: usize) -> String {
     out.push('…');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_line_flattens_and_caps_on_char_boundaries() {
+        assert_eq!(truncate_line("a\nb\rc", 10), "a b c");
+        assert_eq!(truncate_line("  padded  ", 10), "padded");
+        let long = "é".repeat(200);
+        let cut = truncate_line(&long, 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.ends_with('…'));
+    }
+}
