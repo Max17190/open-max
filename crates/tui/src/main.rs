@@ -321,7 +321,13 @@ async fn main() -> std::io::Result<()> {
     // Fullscreen session on the alternate screen: openmax owns the whole
     // terminal while it runs, and your shell (prompt, history, scrollback)
     // reappears untouched on exit.
-    let terminal = ratatui::init();
+    let terminal = match init_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("openmax: failed to initialize terminal: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Kitty keyboard protocol makes Shift+Enter distinct; Alt+Enter stays as
     // the fallback everywhere else. Bracketed paste for sane multiline paste.
@@ -354,6 +360,25 @@ async fn main() -> std::io::Result<()> {
     }
     ratatui::restore();
     result
+}
+
+/// `ratatui::init` with one change: frame output goes through a 256 KiB
+/// `BufWriter` so each flush is one write(2) instead of the dozens that
+/// `Stdout`'s built-in 1 KiB line buffer produces on token-streaming frames.
+/// `ratatui::restore` stays the counterpart on exit and panic; it operates on
+/// the shared stdout fd, and every frame ends fully flushed.
+fn init_terminal() -> std::io::Result<ui::transcript::Term> {
+    use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+    enable_raw_mode()?;
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout());
+    execute!(out, EnterAlternateScreen)?;
+    out.flush()?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        hook(info);
+    }));
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
 }
 
 fn ensure_project_trust(
