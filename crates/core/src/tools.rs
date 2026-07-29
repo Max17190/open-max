@@ -1041,6 +1041,40 @@ mod tests {
         );
     }
 
+    /// A command that succeeds reports its size just as a failing one does.
+    /// Only a process-backed tool can, so the file tools stay empty.
+    #[tokio::test]
+    async fn a_successful_command_reports_what_it_produced() {
+        let root = temp_project();
+        let out = bash_tool(
+            &root,
+            &json!({"command": "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        let produced = out.process_bytes.expect("a command reports its own size");
+        assert!(produced > out.output.len() as u64, "the result is a bounded rendering");
+        assert!(out.process_truncated, "and it says so, without parsing the notice");
+
+        let quiet = bash_tool(
+            &root,
+            &json!({"command": "printf 'hi\\n'"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert_eq!(quiet.process_bytes, Some(3));
+        assert!(!quiet.process_truncated, "a short command is distinguishable from a clipped one");
+
+        let read = read_file(&root, &json!({"path": "src/a.rs"}));
+        assert!(read.process_bytes.is_none(), "no process ran behind a file read");
+        assert!(!read.process_truncated);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn bash_failure_preserves_tail_of_output() {
         let root = temp_project();
