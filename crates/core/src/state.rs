@@ -6,8 +6,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Settings;
-use crate::hf::DownloadProc;
-use crate::mlx::{MlxEvent, MlxProc};
 use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
@@ -29,21 +27,6 @@ pub struct SessionData {
     /// only valid while this still matches the taker (guards against a newer
     /// turn or a recreated session reusing the id).
     pub take_seq: u64,
-}
-
-/// Progress of a model download managed by `hf.rs`.
-#[derive(Clone, Debug)]
-pub enum DownloadEvent {
-    Progress { repo: String, done_bytes: u64, total_bytes: u64 },
-    Done { repo: String, ok: bool, message: String },
-}
-
-/// Everything the core emits toward the UI, multiplexed on one channel.
-#[derive(Clone, Debug)]
-pub enum CoreEvent {
-    Agent(AgentEventEnvelope),
-    Mlx(MlxEvent),
-    Download(DownloadEvent),
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous
@@ -97,16 +80,13 @@ pub struct Core {
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Serializes read-modify-write cycles on the session index file.
     pub sessions_lock: Mutex<()>,
-    pub mlx: Mutex<MlxProc>,
-    /// At most one model download runs at a time.
-    pub download: Mutex<Option<DownloadProc>>,
-    events: mpsc::UnboundedSender<CoreEvent>,
+    events: mpsc::UnboundedSender<AgentEventEnvelope>,
 }
 
 impl Core {
     pub fn new(
         data_dir: PathBuf,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<CoreEvent>), String> {
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<AgentEventEnvelope>), String> {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = std::fs::create_dir_all(&data_dir);
         let settings = crate::config::load(&data_dir)?;
@@ -118,26 +98,16 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
-            mlx: Default::default(),
-            download: Default::default(),
             events: tx,
         });
         Ok((core, rx))
     }
 
-    pub fn send(&self, event: CoreEvent) {
-        let _ = self.events.send(event);
-    }
-
     pub fn send_agent(&self, session_id: &str, event: AgentEvent) {
-        self.send(CoreEvent::Agent(AgentEventEnvelope {
+        let _ = self.events.send(AgentEventEnvelope {
             session_id: session_id.to_string(),
             event,
-        }));
-    }
-
-    pub fn send_mlx(&self, event: MlxEvent) {
-        self.send(CoreEvent::Mlx(event));
+        });
     }
 
     pub fn respond_approval(&self, approval_id: &str, approved: bool) {
@@ -159,7 +129,7 @@ impl Core {
 }
 
 /// `~/.openmax`, the single place Open Max keeps its state (settings, sessions,
-/// the managed Python environment, logs).
+/// logs).
 pub fn default_data_dir() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".openmax"),

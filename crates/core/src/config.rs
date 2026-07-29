@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_MLX_PORT: u16 = 8989;
-
 /// Gate for mutating tools. Parsed strictly: an unrecognized value is a
 /// configuration error, never a silent fallback, because a typo here would
 /// otherwise weaken the approval gate the user asked for.
@@ -44,8 +42,8 @@ pub struct Settings {
     /// base_url, credentials, and headers; flat fields remain the fallback.
     #[serde(default)]
     pub provider: Option<String>,
-    /// OpenAI-compatible base URL. Defaults to the optional managed local MLX
-    /// port; any other compatible endpoint can be configured instead.
+    /// OpenAI-compatible base URL. There is no default endpoint: an empty
+    /// value is a hard resolve error, never a silent localhost fallback.
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -53,18 +51,6 @@ pub struct Settings {
     pub context_tokens: usize,
     pub max_tokens: usize,
     pub temperature: f32,
-    /// HuggingFace repo id served by the managed MLX server.
-    pub mlx_model: String,
-    pub mlx_port: u16,
-    /// Draft model repo id for speculative decoding. Opt-in: payoff is
-    /// hardware-dependent (and negative on MoE models), and setting it
-    /// disables the server's continuous batching.
-    pub draft_model: Option<String>,
-    /// Tokens drafted per speculative step; only sent alongside draft_model.
-    pub num_draft_tokens: Option<u32>,
-    /// JSON object passed to the chat template, e.g. {"enable_thinking": false}
-    /// to cut reasoning tokens on Qwen3-family models.
-    pub chat_template_args: Option<String>,
     /// Byte cap for bash/external tool output before tail-truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
@@ -89,18 +75,13 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             provider: None,
-            base_url: format!("http://127.0.0.1:{DEFAULT_MLX_PORT}/v1"),
+            base_url: String::new(),
             api_key: None,
-            model: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
+            model: String::new(),
             approval_mode: ApprovalMode::Ask,
             context_tokens: 16384,
             max_tokens: 4096,
             temperature: 0.2,
-            mlx_model: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
-            mlx_port: DEFAULT_MLX_PORT,
-            draft_model: None,
-            num_draft_tokens: None,
-            chat_template_args: None,
             max_output_bytes: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),

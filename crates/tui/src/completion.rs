@@ -44,7 +44,6 @@ const fn command(
 
 pub const COMMANDS: &[CommandSpec] = &[
     command("help", "", "keybindings and commands", true),
-    command("models", "", "manage and serve local models", true),
     command(
         "model",
         "[id]",
@@ -91,7 +90,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         "endpoint, cache, performance, privacy, and network details",
         true,
     ),
-    command("logs", "", "recent model server logs", true),
     command(
         "theme",
         "dark|light|mono|catppuccin",
@@ -428,12 +426,11 @@ mod tests {
     fn slash_items_filter_by_prefix() {
         let items = slash_items("mo", &[]);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, vec!["/models", "/model"]);
+        assert_eq!(labels, vec!["/model"]);
         // Bare /model is a real action that opens the picker. A user can type
         // a space after it to use the raw-id escape hatch.
+        assert_eq!(items[0].insert, "/model");
         assert!(items[0].submits);
-        assert_eq!(items[1].insert, "/model");
-        assert!(items[1].submits);
     }
 
     #[test]

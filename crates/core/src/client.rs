@@ -106,7 +106,7 @@ pub struct CompletionResult {
 }
 
 /// Ground-truth token usage from the server. `cached_tokens` is the number of
-/// prompt tokens served from the prompt cache (mlx-lm reports it under
+/// prompt tokens served from the prompt cache (servers report it under
 /// `prompt_tokens_details`): if it stays near zero across turns, the harness
 /// broke prefix stability and every step is paying a full re-prefill.
 #[derive(Clone, Copy, Debug, Default)]

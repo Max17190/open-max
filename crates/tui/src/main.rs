@@ -1,5 +1,4 @@
 mod app;
-mod catalog;
 mod clipboard;
 mod completion;
 mod headless;
@@ -274,7 +273,6 @@ async fn main() -> std::io::Result<()> {
         }
         if let Some(model) = &cli.model {
             s.model = model.clone();
-            s.mlx_model = model.clone();
         }
         // Fail fast on an explicit but unknown --provider (no silent flat fallback).
         if let Err(e) = open_max_core::providers::resolve(&s, &core.data_dir) {

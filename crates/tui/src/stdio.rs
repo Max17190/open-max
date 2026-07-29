@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use open_max_core::agent;
 use open_max_core::sessions;
-use open_max_core::state::{Core, CoreEvent};
+use open_max_core::state::Core;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -65,7 +65,7 @@ pub struct StdioArgs {
 
 pub async fn run(
     core: Arc<Core>,
-    mut core_rx: mpsc::UnboundedReceiver<CoreEvent>,
+    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: StdioArgs,
 ) -> i32 {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -181,7 +181,7 @@ pub async fn run(
                     eprintln!("openmax: event channel closed");
                     return 1;
                 };
-                let CoreEvent::Agent(env) = event else { continue };
+                let env = event;
                 if env.session_id != session_id {
                     continue;
                 }

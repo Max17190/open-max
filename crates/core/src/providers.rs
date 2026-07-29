@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Settings, DEFAULT_MLX_PORT};
+use crate::config::Settings;
 
 /// Wire quirks for picky OpenAI-compatible servers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,13 +146,13 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
     let Ok(file) = serde_json::from_str::<ProvidersFile>(text) else {
         return BTreeMap::new();
     };
+    // A provider with an empty base_url is kept, not dropped: it still shows
+    // up in listings and fails loudly at resolve time (MissingEndpoint)
+    // instead of silently vanishing from the picker.
     file.providers
         .into_iter()
-        .filter_map(|(name, raw)| {
+        .map(|(name, raw)| {
             let base_url = raw.base_url.trim().to_string();
-            if base_url.is_empty() {
-                return None;
-            }
             let api_key_env = match raw.api_key_env {
                 Some(ApiKeyEnv::One(s)) => {
                     let s = s.trim().to_string();
@@ -165,7 +165,7 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
                     .collect(),
                 None => Vec::new(),
             };
-            Some((
+            (
                 name,
                 ProviderConfig {
                     base_url,
@@ -175,7 +175,7 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
                     models: raw.models,
                     compat: raw.compat.into(),
                 },
-            ))
+            )
         })
         .collect()
 }
@@ -295,6 +295,10 @@ pub fn list_provider_names(data_dir: &Path) -> Vec<String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
+    /// No endpoint configured anywhere; there is no default to fall back to.
+    MissingEndpoint,
+    /// No model id configured for the resolved endpoint.
+    MissingModel,
     /// Settings named a provider that is not in providers.json (or the file is bad).
     UnknownProvider(String),
 }
@@ -302,6 +306,14 @@ pub enum ResolveError {
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResolveError::MissingEndpoint => write!(
+                f,
+                "no model endpoint configured: set base_url in ~/.openmax/settings.json, or define one in ~/.openmax/providers.json and select it with settings.provider"
+            ),
+            ResolveError::MissingModel => write!(
+                f,
+                "no model configured: set model in ~/.openmax/settings.json"
+            ),
             ResolveError::UnknownProvider(name) => write!(
                 f,
                 "unknown provider '{name}': add it to ~/.openmax/providers.json or clear settings.provider"
@@ -326,7 +338,15 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         let Some(p) = providers.get(name) else {
             return Err(ResolveError::UnknownProvider(name.clone()));
         };
-        let model_entry = p.models.iter().find(|m| m.id == settings.model);
+        let base_url = p.base_url.trim();
+        if base_url.is_empty() {
+            return Err(ResolveError::MissingEndpoint);
+        }
+        let model = settings.model.trim();
+        if model.is_empty() {
+            return Err(ResolveError::MissingModel);
+        }
+        let model_entry = p.models.iter().find(|m| m.id == model);
         let context_tokens = model_entry
             .and_then(|m| m.context_tokens)
             .unwrap_or(settings.context_tokens)
@@ -346,10 +366,10 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         let headers = expand_headers(&p.headers);
         return Ok(ActiveEndpoint {
             provider: Some(name.clone()),
-            base_url: p.base_url.clone(),
+            base_url: base_url.to_string(),
             api_key,
             headers,
-            model: settings.model.clone(),
+            model: model.to_string(),
             context_tokens,
             max_tokens,
             temperature: settings.temperature,
@@ -357,35 +377,30 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         });
     }
 
-    // Flat settings path when no provider is selected.
+    // Flat settings path when no provider is selected. No endpoint or model
+    // means no request: there is no default server to guess at.
+    let base_url = settings.base_url.trim();
+    if base_url.is_empty() {
+        return Err(ResolveError::MissingEndpoint);
+    }
+    let model = settings.model.trim();
+    if model.is_empty() {
+        return Err(ResolveError::MissingModel);
+    }
     let context_tokens = settings.context_tokens.max(1);
     let max_allowed = context_tokens.saturating_sub(2048).max(1);
     let max_tokens = settings.max_tokens.max(1).min(max_allowed);
     Ok(ActiveEndpoint {
         provider: None,
-        base_url: settings.base_url.clone(),
+        base_url: base_url.to_string(),
         api_key: resolve_api_key(None, &[], settings.api_key.as_deref()),
         headers: Vec::new(),
-        model: settings.model.clone(),
+        model: model.to_string(),
         context_tokens,
         max_tokens,
         temperature: settings.temperature,
         compat: CompatFlags::defaults_for_missing(),
     })
-}
-
-/// True when the resolved URL is the managed local MLX port (host is loopback).
-pub fn is_managed_mlx(endpoint: &ActiveEndpoint, mlx_port: u16) -> bool {
-    let port = if mlx_port == 0 { DEFAULT_MLX_PORT } else { mlx_port };
-    let s = endpoint.base_url.trim();
-    let rest = s
-        .strip_prefix("http://")
-        .or_else(|| s.strip_prefix("https://"))
-        .unwrap_or(s);
-    let authority = rest.split('/').next().unwrap_or("").split('@').next_back().unwrap_or("");
-    authority.eq_ignore_ascii_case(&format!("127.0.0.1:{port}"))
-        || authority.eq_ignore_ascii_case(&format!("localhost:{port}"))
-        || authority.eq_ignore_ascii_case(&format!("[::1]:{port}"))
 }
 
 fn resolve_api_key(
@@ -645,6 +660,7 @@ mod tests {
         );
         let mut s = Settings {
             provider: Some("a".into()),
+            model: "m".into(),
             ..Default::default()
         };
         let ep = resolve(&s, &dir).unwrap();
@@ -681,25 +697,35 @@ mod tests {
     }
 
     #[test]
-    fn managed_mlx_detection() {
-        let ep = ActiveEndpoint {
-            provider: None,
-            base_url: format!("http://127.0.0.1:{DEFAULT_MLX_PORT}/v1"),
-            api_key: None,
-            headers: vec![],
-            model: "m".into(),
-            context_tokens: 1,
-            max_tokens: 1,
-            temperature: 0.0,
-            compat: CompatFlags::defaults_for_missing(),
+    fn empty_flat_settings_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = resolve(&Settings::default(), &dir).unwrap_err();
+        assert!(matches!(err, ResolveError::MissingEndpoint));
+        let s = Settings {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            ..Default::default()
         };
-        assert!(is_managed_mlx(&ep, DEFAULT_MLX_PORT));
-        let mut remote = ep.clone();
-        remote.base_url = "https://api.example.com/v1".into();
-        assert!(!is_managed_mlx(&remote, DEFAULT_MLX_PORT));
-        // Path must not trigger false positive.
-        remote.base_url = "https://api.example.com/v1/127.0.0.1:8989".into();
-        assert!(!is_managed_mlx(&remote, DEFAULT_MLX_PORT));
+        let err = resolve(&s, &dir).unwrap_err();
+        assert!(matches!(err, ResolveError::MissingModel));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn named_provider_without_endpoint_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(
+            &dir,
+            r#"{"providers":{"empty":{"base_url":"","models":[{"id":"m"}]}}}"#,
+        );
+        let settings = Settings {
+            provider: Some("empty".into()),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let err = resolve(&settings, &dir).unwrap_err();
+        assert!(matches!(err, ResolveError::MissingEndpoint));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

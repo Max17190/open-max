@@ -12,10 +12,9 @@ use crossterm::event::{
     MouseEventKind,
 };
 use futures_util::StreamExt;
-use open_max_core::mlx::MlxEvent;
-use open_max_core::state::{Core, CoreEvent, DownloadEvent};
-use open_max_core::types::AgentEvent;
-use open_max_core::{agent, config, hf, mlx, prompt, registry, sessions};
+use open_max_core::state::Core;
+use open_max_core::types::{AgentEvent, AgentEventEnvelope};
+use open_max_core::{agent, config, prompt, registry, sessions};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,7 +31,7 @@ use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{
     filter_matching_indices, wrap_lines, Term, Transcript,
 };
-use crate::ui::{context, extensions, markdown, model_picker, models, ready};
+use crate::ui::{context, extensions, markdown, model_picker, ready};
 
 /// Where keyboard focus lives in chat mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,7 +215,6 @@ pub struct Args {
 enum Mode {
     Chat,
     ModelPicker,
-    Models,
     Sessions,
 }
 
@@ -232,7 +230,6 @@ pub struct App {
     session_id: Option<String>,
     mode: Mode,
     composer: Composer,
-    models: models::ModelsState,
     model_picker: Option<model_picker::ModelPickerState>,
     sessions_panel: Option<sessions_ui::SessionsState>,
     transcript: Transcript,
@@ -279,7 +276,6 @@ pub struct App {
     tick_i: u64,
     page_h: u16,
 
-    hf_tx: mpsc::UnboundedSender<(String, u64)>,
     files_tx: mpsc::UnboundedSender<Vec<String>>,
     should_quit: bool,
     dirty: Dirty,
@@ -322,13 +318,12 @@ pub struct App {
 pub async fn run(
     mut terminal: Term,
     core: Arc<Core>,
-    mut core_rx: mpsc::UnboundedReceiver<CoreEvent>,
+    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: Args,
 ) -> std::io::Result<()> {
-    let (hf_tx, mut hf_rx) = mpsc::unbounded_channel();
     let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut app = App::new(core.clone(), project, hf_tx, files_tx);
+    let mut app = App::new(core.clone(), project, files_tx);
 
     app.startup(&args).await;
 
@@ -391,10 +386,6 @@ pub async fn run(
                     None => app.should_quit = true,
                 }
             }
-            Some((repo, bytes)) = hf_rx.recv() => {
-                app.models.set_remote_size(&repo, bytes);
-                app.dirty.mark_chrome();
-            }
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
@@ -449,20 +440,11 @@ fn draw_frame(
     Ok(())
 }
 
-fn ram_bytes() -> u64 {
-    std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0)
-}
 
 impl App {
     fn new(
         core: Arc<Core>,
         project: PathBuf,
-        hf_tx: mpsc::UnboundedSender<(String, u64)>,
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
         Self {
@@ -472,7 +454,6 @@ impl App {
             session_id: None,
             pending_submit: None,
             mode: Mode::Chat,
-            models: models::ModelsState::empty(),
             model_picker: None,
             sessions_panel: None,
             transcript: Transcript::new(),
@@ -506,7 +487,6 @@ impl App {
             spinner_i: 0,
             tick_i: 0,
             page_h: 10,
-            hf_tx,
             files_tx,
             should_quit: false,
             dirty: Dirty::all(),
@@ -535,15 +515,6 @@ impl App {
     }
 
     async fn startup(&mut self, args: &Args) {
-        // Adopt a still-running server from a previous launch — in the
-        // background: reattach spawns `ps` and probes HTTP with a 2s timeout,
-        // and the first frame must never wait on that. ServerReady flips the
-        // status dot when it resolves.
-        let core = self.core.clone();
-        tokio::spawn(async move {
-            mlx::reattach(&core).await;
-        });
-
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
@@ -819,10 +790,6 @@ impl App {
             return Ok(());
         }
 
-        if self.mode == Mode::Models {
-            self.on_models_key(key).await;
-            return Ok(());
-        }
         if self.mode == Mode::ModelPicker {
             self.on_model_picker_key(key);
             return Ok(());
@@ -1450,76 +1417,6 @@ impl App {
         });
     }
 
-    async fn on_models_key(&mut self, key: KeyEvent) {
-        // Delete confirmation intercepts.
-        if let Some(repo) = self.models.confirm_delete.clone() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    match hf::delete_model(&repo) {
-                        Ok(()) => self.note(&format!("deleted {repo}")),
-                        Err(e) => self.error(&e),
-                    }
-                    self.models.confirm_delete = None;
-                    self.models.refresh();
-                }
-                _ => self.models.confirm_delete = None,
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Chat,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.models.selected = self.models.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.models.selected + 1 < self.models.items.len() {
-                    self.models.selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if self.models.download.is_some() {
-                    self.note("download in progress");
-                    return;
-                }
-                let Some(item) = self.models.selected_item().cloned() else {
-                    return;
-                };
-                if item.installed {
-                    self.serve_selected_model(item.repo).await;
-                } else {
-                    self.begin_model_download(&item);
-                }
-            }
-            KeyCode::Char('d') => {
-                if self.models.download.is_some() {
-                    self.note("download in progress");
-                    return;
-                }
-                if let Some(item) = self.models.selected_item().cloned() {
-                    self.begin_model_download(&item);
-                }
-            }
-            KeyCode::Char('x') => {
-                if let Some(repo) = self.models.selected_repo().map(str::to_string) {
-                    if hf::is_installed(&repo) {
-                        self.models.confirm_delete = Some(repo);
-                    }
-                }
-            }
-            KeyCode::Char('s') => {
-                mlx::stop(&self.core);
-                self.models.status = Some(mlx::status(&self.core).await);
-                self.note("model server stopped");
-            }
-            KeyCode::Char('u') => match mlx::setup(self.core.clone()) {
-                Ok(()) => self.note("setting up the MLX environment (watch /logs)"),
-                Err(e) => self.error(&e),
-            },
-            _ => {}
-        }
-    }
-
     fn on_sessions_key(&mut self, key: KeyEvent) {
         let Some(panel) = &mut self.sessions_panel else {
             self.mode = Mode::Chat;
@@ -1584,33 +1481,6 @@ impl App {
         }
     }
 
-    fn begin_model_download(&mut self, item: &models::ModelItem) {
-        let total = item.bytes.unwrap_or(0);
-        match hf::start_download(self.core.clone(), item.repo.clone()) {
-            Ok(()) => {
-                self.models.download = Some((item.repo.clone(), 0, total));
-                self.models.footer = None;
-            }
-            Err(e) => self.error(&e),
-        }
-    }
-
-    async fn serve_selected_model(&mut self, repo: String) {
-        let port = {
-            let mut s = self.core.settings.lock().unwrap();
-            s.model = repo.clone();
-            s.mlx_model = repo.clone();
-            s.base_url = format!("http://127.0.0.1:{}/v1", s.mlx_port);
-            let _ = config::save(&self.core.data_dir, &s);
-            s.mlx_port
-        };
-        match mlx::start(self.core.clone(), repo.clone(), port) {
-            Ok(()) => self.note(&format!("starting {repo}")),
-            Err(e) => self.error(&e),
-        }
-        self.models.status = Some(mlx::status(&self.core).await);
-    }
-
     // ---------- submission and slash commands ----------
 
     async fn handle_submit(&mut self, text: String) -> std::io::Result<()> {
@@ -1643,21 +1513,6 @@ impl App {
             self.transcript.follow();
             self.dirty.mark_chat();
             self.dirty.mark_chrome();
-            return Ok(());
-        }
-
-        // Friendly gate: when the resolved endpoint is the managed local MLX
-        // server and it is not serving yet, guide to /models instead of erroring.
-        let (managed, ready) = {
-            let s = self.core.settings.lock().unwrap();
-            let managed = match open_max_core::providers::resolve(&s, &self.core.data_dir) {
-                Ok(ep) => open_max_core::providers::is_managed_mlx(&ep, s.mlx_port),
-                Err(_) => false,
-            };
-            (managed, self.core.mlx.lock().unwrap().ready)
-        };
-        if managed && !ready {
-            self.note("no model is being served yet: open /models to set one up");
             return Ok(());
         }
 
@@ -1753,14 +1608,6 @@ impl App {
                 self.thinking_source.clear();
                 self.dirty = Dirty::all();
             }
-            "models" => {
-                self.mode = Mode::Models;
-                self.models.ensure_loaded(ram_bytes());
-                self.models.refresh();
-                self.models.status = Some(mlx::status(&self.core).await);
-                self.fetch_missing_sizes();
-                self.dirty.mark_chrome();
-            }
             "model" if raw_rest.is_empty() => {
                 let settings = self.core.settings.lock().unwrap().clone();
                 self.model_picker = Some(model_picker::ModelPickerState::load(
@@ -1843,7 +1690,6 @@ impl App {
                             // otherwise switch to the first listed model.
                             if !p.models.is_empty() && !p.models.iter().any(|m| m.id == s.model) {
                                 s.model = p.models[0].id.clone();
-                                s.mlx_model = s.model.clone();
                             }
                             let _ = config::save(&self.core.data_dir, &s);
                         }
@@ -1987,14 +1833,6 @@ impl App {
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
                 let ep = open_max_core::providers::resolve(&s, &self.core.data_dir);
-                let status = mlx::status(&self.core).await;
-                let server = if status.server_ready {
-                    format!("serving {} on :{}", status.model.as_deref().unwrap_or("?"), status.port)
-                } else if status.server_running {
-                    "starting".into()
-                } else {
-                    "stopped".into()
-                };
                 let ctx = self
                     .budget
                     .map(|(u, t)| format!("{}%", (u as f64 / t.max(1) as f64 * 100.0) as u32))
@@ -2043,7 +1881,6 @@ impl App {
                     kv("model", &model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
-                    kv("server", &server),
                     kv("approvals", s.approval_mode.as_str()),
                     kv("context", &format!("{ctx} of {} tokens", context_tokens)),
                     kv("cache", &cache),
@@ -2058,30 +1895,11 @@ impl App {
                     )),
                     kv("  dest", &endpoint),
                     kv(
-                        "  also",
-                        "Hugging Face only when you use /models to download or serve",
-                    ),
-                    kv(
                         "  privacy",
                         "no telemetry · sessions stay local · external tools may use the network",
                     ),
                 ];
                 self.transcript.push(block);
-            }
-            "logs" => {
-                let logs = mlx::logs(&self.core);
-                let tail: Vec<Line> = logs
-                    .iter()
-                    .rev()
-                    .take(30)
-                    .rev()
-                    .map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme::DIM()))))
-                    .collect();
-                if tail.is_empty() {
-                    self.note("no server logs yet");
-                } else {
-                    self.transcript.push(tail);
-                }
             }
             "quit" | "exit" => self.should_quit = true,
             other => self.note(&format!(
@@ -2090,56 +1908,11 @@ impl App {
         }
     }
 
-    /// Fetch hub sizes for catalog entries that are not on disk yet.
-    fn fetch_missing_sizes(&self) {
-        for item in &self.models.items {
-            if item.bytes.is_none() {
-                let repo = item.repo.clone();
-                let tx = self.hf_tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(bytes) = hf::repo_total_bytes(&repo).await {
-                        let _ = tx.send((repo, bytes));
-                    }
-                });
-            }
-        }
-    }
-
     // ---------- core events ----------
 
-    async fn on_core_event(&mut self, event: CoreEvent) {
-        match event {
-            CoreEvent::Agent(env) => {
-                if self.session_id.as_deref() != Some(env.session_id.as_str()) {
-                    return;
-                }
-                self.on_agent_event(env.event);
-            }
-            CoreEvent::Mlx(ev) => {
-                // Log lines are pull-only (/logs). Repainting per line would
-                // turn the server's own logging into a render load while the
-                // model generates.
-                if matches!(ev, MlxEvent::ServerLog { .. } | MlxEvent::SetupLog { .. }) {
-                    return;
-                }
-                self.on_mlx_event(ev).await
-            }
-            CoreEvent::Download(ev) => match ev {
-                DownloadEvent::Progress { repo, done_bytes, total_bytes } => {
-                    self.models.download = Some((repo, done_bytes, total_bytes));
-                    self.dirty.mark_chrome();
-                }
-                DownloadEvent::Done { ok, message, .. } => {
-                    self.models.download = None;
-                    self.models.refresh();
-                    self.dirty.mark_chrome();
-                    if ok {
-                        self.note(&message);
-                    } else {
-                        self.error(&message);
-                    }
-                }
-            },
+    async fn on_core_event(&mut self, env: AgentEventEnvelope) {
+        if self.session_id.as_deref() == Some(env.session_id.as_str()) {
+            self.on_agent_event(env.event);
         }
         // Send the next queued message once the turn has fully settled.
         if self.flush_queue {
@@ -2411,31 +2184,8 @@ impl App {
         }
     }
 
-    async fn on_mlx_event(&mut self, event: MlxEvent) {
-        match event {
-            MlxEvent::SetupDone { ok, message } => {
-                if ok {
-                    self.note(&message);
-                } else {
-                    self.error(&message);
-                }
-            }
-            MlxEvent::ServerReady { model } => {
-                self.note(&format!("{model} is serving"));
-            }
-            MlxEvent::ServerExit { code } => {
-                self.error(&format!("model server exited with code {code} (see /logs)"));
-            }
-            MlxEvent::SetupLog { .. } | MlxEvent::ServerLog { .. } => {}
-        }
-        if self.mode == Mode::Models {
-            self.models.status = Some(mlx::status(&self.core).await);
-            self.dirty.mark_chrome();
-        }
-    }
-
     fn tick_armed(&self) -> bool {
-        self.running || self.models.download.is_some() || self.mode == Mode::Models
+        self.running
     }
 
     async fn on_tick(&mut self) {
@@ -2444,14 +2194,6 @@ impl App {
             self.spinner_i = (self.spinner_i + 1) % SPINNER.len();
             // Spinner lives in the live tail; history stays reusable.
             self.dirty.mark_tail();
-        } else if self.models.download.is_some() {
-            self.spinner_i = (self.spinner_i + 1) % SPINNER.len();
-            self.dirty.mark_chrome();
-        }
-        // Refresh server status occasionally while the panel is open.
-        if self.mode == Mode::Models && self.tick_i.is_multiple_of(16) {
-            self.models.status = Some(mlx::status(&self.core).await);
-            self.dirty.mark_chrome();
         }
     }
 
@@ -2472,39 +2214,29 @@ impl App {
     }
 
     fn note(&mut self, text: &str) {
-        if self.mode == Mode::Models {
-            self.models.footer = Some((text.to_string(), false));
-            self.dirty.mark_chrome();
-        } else {
-            self.transcript.push(vec![Line::from(vec![
-                Span::styled("• ", Style::default().fg(theme::ACCENT())),
-                Span::styled(
-                    text.to_string(),
-                    Style::default()
-                        .fg(theme::DIM())
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ])]);
-            self.dirty.mark_chat();
-        }
+        self.transcript.push(vec![Line::from(vec![
+            Span::styled("• ", Style::default().fg(theme::ACCENT())),
+            Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(theme::DIM())
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])]);
+        self.dirty.mark_chat();
     }
 
     fn error(&mut self, text: &str) {
-        if self.mode == Mode::Models {
-            self.models.footer = Some((text.to_string(), true));
-            self.dirty.mark_chrome();
-        } else {
-            let mut lines = Vec::new();
-            for (i, l) in text.lines().enumerate() {
-                let prefix = if i == 0 { "✗ " } else { "  " };
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix}{l}"),
-                    Style::default().fg(theme::ERR()),
-                )));
-            }
-            self.transcript.push(lines);
-            self.dirty.mark_chat();
+        let mut lines = Vec::new();
+        for (i, l) in text.lines().enumerate() {
+            let prefix = if i == 0 { "✗ " } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{l}"),
+                Style::default().fg(theme::ERR()),
+            )));
         }
+        self.transcript.push(lines);
+        self.dirty.mark_chat();
     }
 
     // ---------- drawing ----------
@@ -2516,10 +2248,6 @@ impl App {
             if let Some(picker) = &self.model_picker {
                 model_picker::render(frame, area, picker);
             }
-            return;
-        }
-        if self.mode == Mode::Models {
-            models::render(frame, area, &self.models);
             return;
         }
         if self.mode == Mode::Sessions {
@@ -3113,14 +2841,7 @@ fn save_model_selection(
 ) -> Result<config::Settings, String> {
     let mut next = current.clone();
     next.provider = provider;
-    next.model = model.clone();
-    let uses_managed_mlx = open_max_core::providers::resolve(&next, data_dir)
-        .is_ok_and(|endpoint| {
-            open_max_core::providers::is_managed_mlx(&endpoint, next.mlx_port)
-        });
-    if uses_managed_mlx {
-        next.mlx_model = model;
-    }
+    next.model = model;
     config::save(data_dir, &next)?;
     Ok(next)
 }
@@ -3538,9 +3259,8 @@ mod tests {
             std::process::id()
         ));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let (hf_tx, _hf_rx) = mpsc::unbounded_channel();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
-        let app = App::new(core, dir.clone(), hf_tx, files_tx);
+        let app = App::new(core, dir.clone(), files_tx);
         (app, dir)
     }
 
@@ -3769,29 +3489,9 @@ mod tests {
         .unwrap();
         assert_eq!(saved.provider.as_deref(), Some("openrouter"));
         assert_eq!(saved.model, exact);
-        assert_eq!(saved.mlx_model, current.mlx_model);
         let disk = config::load(&dir).unwrap();
         assert_eq!(disk.provider.as_deref(), Some("openrouter"));
         assert_eq!(disk.model, exact);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn managed_mlx_model_selection_updates_the_served_repo() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openmax-mlx-model-save-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        let current = config::Settings::default();
-        let exact = "mlx-community/new-model".to_string();
-        let saved = save_model_selection(&dir, &current, None, exact.clone()).unwrap();
-        assert_eq!(saved.model, exact);
-        assert_eq!(saved.mlx_model, exact);
-        let disk = config::load(&dir).unwrap();
-        assert_eq!(disk.model, exact);
-        assert_eq!(disk.mlx_model, exact);
         fs::remove_dir_all(dir).unwrap();
     }
 
