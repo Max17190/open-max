@@ -330,6 +330,11 @@ pub(crate) async fn run_process(
     command
         .args(&request.args)
         .current_dir(&request.cwd)
+        // Mark every native child as agent-spawned. Trust grants are human
+        // actions: the CLI refuses --trust-project (and the interactive trust
+        // prompt) when this marker is present, so an agent cannot launder a
+        // trust grant through a child process it starts.
+        .env("OPENMAX_SESSION", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -678,6 +683,25 @@ mod tests {
                 spill_bytes_per_stream: 1024,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn spawned_processes_carry_the_session_marker() {
+        let request = ProcessRequest {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf %s \"$OPENMAX_SESSION\"".into()],
+            cwd: std::env::temp_dir(),
+            stdin: StdinMode::Null,
+            timeout: Duration::from_secs(5),
+            capture: CaptureSpec {
+                head_bytes: 1024,
+                tail_bytes: 1024,
+                spill_dir: None,
+                spill_bytes_per_stream: 0,
+            },
+        };
+        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
     }
 
     #[tokio::test]
