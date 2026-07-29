@@ -213,7 +213,8 @@ hooks pre → permissions → approval_mode → execute → hooks post.
 
 Grammar: `[[rules]]` tables only; unknown keys anywhere are rejected.
 - `effect` (required): `"allow"`, `"deny"`, or `"ask"`.
-- `tool` (required): exact tool name.
+- `tool` (required): exact tool name. A name no tool has never matches,
+  so the rule silently does nothing; `openmax --check` warns about that.
 - `arg_regex` (optional): unanchored regex; omitted or empty matches every
   call of that tool.
 
@@ -396,7 +397,7 @@ mod tests {
         assert_eq!(findings.len(), 5, "one finding per example: {findings:?}");
         for finding in &findings {
             assert!(
-                finding.status.is_ok(),
+                matches!(finding.status, crate::doctor::Status::Ok(_)),
                 "spec example failed its own parser: {} → {:?}",
                 finding.path.display(),
                 finding.status
