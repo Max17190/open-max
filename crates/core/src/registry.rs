@@ -64,6 +64,9 @@ pub struct Registry {
     /// name — deterministic so two builds serialize identically.
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<SkillSpec>,
+    /// Skills discovered on disk but not indexed because of the `MAX_SKILLS`
+    /// cap. Never silent: the prompt trailer reports this count.
+    pub skills_omitted: usize,
     /// Content hash of the extension files this registry was built from;
     /// compared against disk at turn start to detect extension changes.
     pub ext_fingerprint: u64,
@@ -83,6 +86,8 @@ pub(crate) struct ExtensionSnapshot {
     fingerprint: u64,
     external: Vec<ToolSpec>,
     skills: Vec<SkillSpec>,
+    /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
+    skills_omitted: usize,
 }
 
 impl ExtensionSnapshot {
@@ -154,11 +159,16 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
     let external = external_by_name.into_values().collect();
     let mut discovered_skills: Vec<SkillSpec> = skills_by_name.into_values().collect();
     discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
+    // The cap bounds the prompt index and the manifest, but a skill dropped
+    // here must not vanish silently: the count survives so the prompt trailer
+    // can say what the index is not showing.
+    let skills_omitted = discovered_skills.len().saturating_sub(skills::MAX_SKILLS);
     discovered_skills.truncate(skills::MAX_SKILLS);
     ExtensionSnapshot {
         fingerprint: h.finish(),
         external,
         skills: discovered_skills,
+        skills_omitted,
     }
 }
 
@@ -178,6 +188,7 @@ impl Registry {
     pub(crate) fn from_snapshot(snapshot: ExtensionSnapshot) -> Self {
         let mut registry = Self::assemble(snapshot.external, snapshot.skills);
         registry.ext_fingerprint = snapshot.fingerprint;
+        registry.skills_omitted = snapshot.skills_omitted;
         registry
     }
 
@@ -220,6 +231,7 @@ impl Registry {
         Self {
             tools: tools_list,
             skills,
+            skills_omitted: 0,
             ext_fingerprint: 0,
             schemas,
             schemas_wire,
@@ -602,6 +614,26 @@ mod tests {
         );
         assert!(registry.skills.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A skill sorted past MAX_SKILLS is dropped from the index but never
+    /// silently: the omission count survives the snapshot into the registry.
+    #[test]
+    fn skills_beyond_cap_are_counted_not_silent() {
+        let project = temp_dir("skill-cap");
+        for i in 0..(crate::skills::MAX_SKILLS + 3) {
+            let dir = project.join(".agents/skills").join(format!("s{i:03}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: skill-{i:03}\ndescription: d\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let registry = Registry::build(&project);
+        assert_eq!(registry.skills.len(), crate::skills::MAX_SKILLS);
+        assert_eq!(registry.skills_omitted, 3);
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[test]
