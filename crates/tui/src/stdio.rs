@@ -31,14 +31,14 @@
 //! approvals are declined so shutdown drains promptly instead of stalling
 //! on the approval timeout.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use open_max_core::agent;
 use open_max_core::sessions;
 use open_max_core::state::{Core, CoreEvent};
-use open_max_core::types::AgentEvent;
+use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -92,18 +92,35 @@ pub async fn run(
     let mut stdout = std::io::stdout();
     emit(&mut stdout, &hello_value(&session_id, &project_key));
 
-    // Blocking stdin reader on its own thread; parse errors travel as Err so
-    // the async loop can answer without ever blocking on the pipe.
+    // Blocking stdin reader on its own thread; malformed input travels as Err
+    // so the async loop can answer without ever blocking on the pipe.
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Result<Command, String>>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let parsed = serde_json::from_str::<Command>(&line)
-                .map_err(|e| format!("bad command line: {e}"));
+        let mut reader = stdin.lock();
+        let mut buf = Vec::new();
+        loop {
+            let parsed = match read_line_capped(&mut reader, &mut buf) {
+                Ok(LineRead::Eof) => break,
+                // A peer that never sends a newline must not be able to grow
+                // this buffer without bound. The rest of the line is drained,
+                // so framing survives and the next command still parses.
+                Ok(LineRead::TooLong) => Err(format!(
+                    "command line exceeds {MAX_LINE_BYTES} bytes and was discarded"
+                )),
+                Ok(LineRead::Line) => match std::str::from_utf8(&buf) {
+                    // Reporting beats the silent shutdown a lossy read would
+                    // hide: one bad byte is a bad line, not a dead session.
+                    Err(e) => Err(format!("command line is not valid UTF-8: {e}")),
+                    Ok(line) if line.trim().is_empty() => continue,
+                    Ok(line) => serde_json::from_str::<Command>(line)
+                        .map_err(|e| format!("bad command line: {e}")),
+                },
+                Err(e) => {
+                    let _ = stdin_tx.send(Err(format!("stdin read failed: {e}")));
+                    break;
+                }
+            };
             if stdin_tx.send(parsed).is_err() {
                 break;
             }
@@ -139,16 +156,18 @@ pub async fn run(
                     }
                     Some(Ok(Command::User { text })) => {
                         if text.trim().is_empty() {
-                            protocol_error(&mut stdout, "user text is empty");
+                            refuse(&mut stdout, &session_id, "user text is empty");
                             continue;
                         }
                         if running || !crate::headless::wait_until_idle(&core, &session_id).await {
+                            // The in-flight turn owns the next `done`; a second
+                            // one here would tell the client that turn ended.
                             protocol_error(&mut stdout, "a turn is in flight; wait for done");
                             continue;
                         }
                         match agent::start_turn(core.clone(), session_id.clone(), project.clone(), text) {
                             Ok(()) => running = true,
-                            Err(e) => protocol_error(&mut stdout, &e),
+                            Err(e) => refuse(&mut stdout, &session_id, &e),
                         }
                     }
                 }
@@ -202,6 +221,55 @@ fn protocol_error(stdout: &mut std::io::Stdout, message: &str) {
         stdout,
         &serde_json::json!({ "type": "protocol_error", "message": message }),
     );
+}
+
+/// Refuse a `user` command that starts no turn: say why, then close it out
+/// with the terminator the client is waiting on. Without the `done`, a client
+/// that follows the documented rule (block until `done`) hangs forever on a
+/// prompt nothing will ever answer, which an untrusted project reproduces on
+/// the very first command.
+fn refuse(stdout: &mut std::io::Stdout, session_id: &str, message: &str) {
+    protocol_error(stdout, message);
+    let env = AgentEventEnvelope {
+        session_id: session_id.to_string(),
+        event: AgentEvent::Done { stop_reason: "refused".into() },
+    };
+    if let Ok(value) = serde_json::to_value(&env) {
+        emit(stdout, &value);
+    }
+}
+
+/// Cap on one stdin line. Prompts can carry a pasted file, so the ceiling is
+/// generous; it exists only to deny a peer unbounded memory.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+enum LineRead {
+    Line,
+    TooLong,
+    Eof,
+}
+
+/// Read one newline-terminated line into `buf` without buffering more than
+/// `MAX_LINE_BYTES`. An oversized line is drained to its newline so the next
+/// line still starts at a frame boundary.
+fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<LineRead> {
+    buf.clear();
+    let read = (&mut *reader).take(MAX_LINE_BYTES as u64).read_until(b'\n', buf)?;
+    if read == 0 {
+        return Ok(LineRead::Eof);
+    }
+    if buf.last() == Some(&b'\n') || read < MAX_LINE_BYTES {
+        // Terminated, or a final line that ends at EOF without a newline.
+        return Ok(LineRead::Line);
+    }
+    let mut sink = Vec::new();
+    loop {
+        sink.clear();
+        let more = (&mut *reader).take(MAX_LINE_BYTES as u64).read_until(b'\n', &mut sink)?;
+        if more == 0 || sink.last() == Some(&b'\n') {
+            return Ok(LineRead::TooLong);
+        }
+    }
 }
 
 /// The `hello` handshake line, single-sourced so `run` and the tests cannot
@@ -425,5 +493,92 @@ mod tests {
         assert!(validate_line(r#"{"type":"not_a_real_event","session_id":"s1"}"#).is_err());
         assert!(validate_line(r#"{"neither":1}"#).is_err());
         assert!(validate_line("not json").is_err());
+    }
+
+    /// Mirror of the reader thread's per-line handling: each line comes back
+    /// as the text a command would parse from, or the reason it was refused.
+    fn read_all(input: &[u8]) -> Vec<Result<String, String>> {
+        let mut reader = std::io::BufReader::new(input);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            match read_line_capped(&mut reader, &mut buf) {
+                Ok(LineRead::Eof) => return out,
+                Ok(LineRead::TooLong) => out.push(Err("line too long".to_string())),
+                Ok(LineRead::Line) => out.push(
+                    std::str::from_utf8(&buf)
+                        .map(|line| line.trim().to_string())
+                        .map_err(|e| e.to_string()),
+                ),
+                Err(e) => {
+                    out.push(Err(e.to_string()));
+                    return out;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_line_is_refused_without_losing_the_next_command() {
+        let mut input = Vec::new();
+        input.extend_from_slice(br#"{"cmd":"cancel"}"#);
+        input.push(b'\n');
+        input.extend_from_slice(vec![b'x'; MAX_LINE_BYTES + 64].as_slice());
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"cmd":"quit"}"#);
+        input.push(b'\n');
+
+        let mut reader = std::io::BufReader::new(input.as_slice());
+        let mut buf = Vec::new();
+        let mut seen = Vec::new();
+        loop {
+            match read_line_capped(&mut reader, &mut buf).unwrap() {
+                LineRead::Eof => break,
+                LineRead::TooLong => seen.push("too-long".to_string()),
+                LineRead::Line => seen.push(String::from_utf8_lossy(&buf).trim().to_string()),
+            }
+            assert!(buf.len() <= MAX_LINE_BYTES, "buffer must stay capped");
+        }
+        assert_eq!(
+            seen,
+            vec![
+                r#"{"cmd":"cancel"}"#.to_string(),
+                "too-long".to_string(),
+                r#"{"cmd":"quit"}"#.to_string(),
+            ],
+            "an oversized line must not desynchronize framing"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_trailing_newline_still_arrives() {
+        let mut reader = std::io::BufReader::new(&br#"{"cmd":"quit"}"#[..]);
+        let mut buf = Vec::new();
+        assert!(matches!(read_line_capped(&mut reader, &mut buf).unwrap(), LineRead::Line));
+        assert_eq!(buf, br#"{"cmd":"quit"}"#);
+        assert!(matches!(read_line_capped(&mut reader, &mut buf).unwrap(), LineRead::Eof));
+    }
+
+    #[test]
+    fn invalid_utf8_is_one_bad_line_not_a_dead_session() {
+        let input: Vec<u8> = b"{\"cmd\":\"cancel\"}\n\xff\xfe\n{\"cmd\":\"quit\"}\n".to_vec();
+        let results = read_all(&input);
+        assert_eq!(results.len(), 3, "reading must continue past the bad line");
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err(), "the invalid line must be reported");
+        assert!(results[2].is_ok(), "the command after it must still be read");
+    }
+
+    #[test]
+    fn a_refused_user_command_is_terminated_by_done() {
+        let env = AgentEventEnvelope {
+            session_id: "s1".into(),
+            event: AgentEvent::Done { stop_reason: "refused".into() },
+        };
+        let line = serde_json::to_string(&env).unwrap();
+        // The terminator a refusal writes must be a real event on the wire, so
+        // a client that only knows `done` needs no new parsing to be unblocked.
+        assert_eq!(validate_line(&line).unwrap(), "event done");
+        assert!(line.contains(r#""session_id":"s1""#), "{line}");
     }
 }
