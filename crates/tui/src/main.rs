@@ -37,6 +37,9 @@ options:
                          any is broken.
                          with --stdio, validate a JSONL protocol stream on
                          stdin against the openmax-stdio contract instead
+      --spec <surface>   print the authoring contract for one extension
+                         surface and exit (tools, skills, prompts, hooks,
+                         permissions, providers, stdio)
       --trust-project    persist trust for this exact project root, then run
   -V, --version          print the version
   -h, --help             this help
@@ -60,6 +63,8 @@ struct CliArgs {
     json: bool,
     stdio: bool,
     check: bool,
+    /// Surface name whose authoring contract should be printed (`--spec`).
+    spec: Option<String>,
     trust_project: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
@@ -84,6 +89,7 @@ where
         json: false,
         stdio: false,
         check: false,
+        spec: None,
         trust_project: false,
         prompts: Vec::new(),
     };
@@ -105,6 +111,7 @@ where
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
+            Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
@@ -168,6 +175,40 @@ async fn main() -> std::io::Result<()> {
     if cli.check && cli.trust_project {
         eprintln!("openmax: --check and --trust-project are separate operations\n\n{HELP}");
         std::process::exit(2);
+    }
+    // --spec prints one contract and exits; silently swallowing any other
+    // requested option (e.g. --spec hooks --check, or --spec tools -m qwen)
+    // would look like success for work that never ran.
+    if cli.spec.is_some()
+        && (cli.check
+            || cli.stdio
+            || cli.print
+            || cli.trust_project
+            || cli.continue_session
+            || cli.model.is_some()
+            || cli.provider.is_some()
+            || !cli.prompts.is_empty())
+    {
+        eprintln!("openmax: --spec is a standalone operation; run other options separately\n\n{HELP}");
+        std::process::exit(2);
+    }
+
+    if let Some(surface) = &cli.spec {
+        // Pure print: no session, no endpoint, no state dir, no trust. The
+        // error path lists every valid surface so a wrong guess self-corrects.
+        match open_max_core::spec::render(surface) {
+            Some(text) => {
+                println!("{text}");
+                std::process::exit(0);
+            }
+            None => {
+                eprintln!(
+                    "openmax: unknown spec surface '{surface}'; available: {}",
+                    open_max_core::spec::SURFACES.join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
     }
 
     if cli.check {
@@ -395,6 +436,14 @@ mod tests {
     fn check_flag_parses() {
         let cli = parse_args_from(["--check"]).unwrap();
         assert!(cli.check && !cli.print && !cli.stdio);
+    }
+
+    #[test]
+    fn spec_flag_takes_a_surface_and_requires_a_value() {
+        let cli = parse_args_from(["--spec", "hooks"]).unwrap();
+        assert_eq!(cli.spec.as_deref(), Some("hooks"));
+        assert!(!cli.check && !cli.print && !cli.stdio);
+        assert!(parse_args_from(["--spec"]).is_err());
     }
 
     #[test]

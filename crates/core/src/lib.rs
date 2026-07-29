@@ -17,6 +17,7 @@ pub mod providers;
 pub mod registry;
 pub mod sessions;
 pub mod skills;
+pub mod spec;
 pub mod state;
 pub mod templates;
 pub mod tools;
