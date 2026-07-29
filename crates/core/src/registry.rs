@@ -324,6 +324,7 @@ impl Default for Registry {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RegistryManifest {
     pub version: u32,
+
     pub external_tools: Vec<ExternalToolManifest>,
     pub skills: Vec<SkillSpec>,
     /// Fingerprint of the extension files at freeze time. Manifests written
@@ -332,6 +333,12 @@ pub struct RegistryManifest {
     #[serde(default)]
     pub ext_fingerprint: u64,
 }
+
+/// Current manifest format. A manifest carrying any other version is treated
+/// as absent (fail closed on unknown future formats): the session falls back
+/// to built-ins and the next turn re-freezes cleanly from disk, instead of
+/// deserializing a newer format into the wrong shape.
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
@@ -365,7 +372,7 @@ impl Registry {
             })
             .collect();
         RegistryManifest {
-            version: 2,
+            version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
             ext_fingerprint: self.ext_fingerprint,

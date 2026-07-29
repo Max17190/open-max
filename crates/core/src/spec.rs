@@ -398,6 +398,19 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, body).unwrap();
         };
+        // The example tools reference scripts relative to the project root;
+        // create them so the command-existence check sees what a real user
+        // following the spec would have.
+        for script in ["scripts/todo-scan.sh", "scripts/deny-rm.sh"] {
+            let path = root.join(script);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
         write(".openmax/tools/todo_scan.toml", &example(TOOLS));
         write(".agents/skills/release/SKILL.md", &example(SKILLS));
         write(".agents/prompts/fix-issue.md", &example(PROMPTS));
