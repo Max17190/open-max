@@ -202,25 +202,29 @@ async fn drive<W: Write>(
                     Some(Ok(Command::ApprovalMode { mode })) => {
                         match open_max_core::config::ApprovalMode::parse(&mode) {
                             Some(parsed) => {
+                                // Persist first, mutate the live gate only on
+                                // success: the acknowledged state, the live
+                                // state, and the on-disk state must never
+                                // disagree about how mutating tools are gated.
                                 let saved = {
-                                    let mut s = core.settings.lock().unwrap();
-                                    s.approval_mode = parsed;
-                                    open_max_core::config::save(&core.data_dir, &s)
+                                    let mut next = core.settings.lock().unwrap().clone();
+                                    next.approval_mode = parsed;
+                                    open_max_core::config::save(&core.data_dir, &next)
                                 };
                                 match saved {
-                                    // Acknowledge only what actually
-                                    // persisted: a mode that reverts on
-                                    // restart must not read as accepted.
-                                    Ok(()) => emit(
-                                        out,
-                                        &serde_json::json!({
-                                            "type": "approval_mode",
-                                            "mode": parsed.as_str(),
-                                        }),
-                                    ),
+                                    Ok(()) => {
+                                        core.settings.lock().unwrap().approval_mode = parsed;
+                                        emit(
+                                            out,
+                                            &serde_json::json!({
+                                                "type": "approval_mode",
+                                                "mode": parsed.as_str(),
+                                            }),
+                                        );
+                                    }
                                     Err(e) => protocol_error(
                                         out,
-                                        &format!("approval mode applied for this run but not persisted: {e}"),
+                                        &format!("approval mode unchanged; persisting it failed: {e}"),
                                     ),
                                 }
                             }
