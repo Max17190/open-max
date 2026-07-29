@@ -186,14 +186,22 @@ async fn run_turn_events(
                 name,
                 summary,
                 detail: _,
+                reason,
             } => {
                 let mode = core.settings.lock().unwrap().approval_mode;
-                let approve = mode == open_max_core::config::ApprovalMode::Auto;
+                // Unattended auto mode covers the ordinary mutating gate, but
+                // never the human boundary itself: the first run of
+                // capability content no human has approved always needs a
+                // person (interactively, or via openmax --approve).
+                let approve = mode == open_max_core::config::ApprovalMode::Auto
+                    && reason != "unapproved_source";
                 if !approve {
-                    let _ = writeln!(
-                        stderr,
-                        "openmax: declining {name} ({summary}); set approval_mode to auto for unattended mutating tools"
-                    );
+                    let hint = if reason == "unapproved_source" {
+                        "a human must approve this tool's content first: openmax --approve <its .toml>"
+                    } else {
+                        "set approval_mode to auto for unattended mutating tools"
+                    };
+                    let _ = writeln!(stderr, "openmax: declining {name} ({summary}); {hint}");
                 }
                 core.respond_approval(approval_id, approve);
             }

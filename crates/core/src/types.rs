@@ -86,6 +86,11 @@ pub enum AgentEvent {
         name: String,
         summary: String,
         detail: String,
+        /// Why this prompt fired: `gate` (approval_mode or a permission rule)
+        /// or `unapproved_source` (first run of capability content no human
+        /// has approved). Unattended frontends must never auto-approve
+        /// `unapproved_source`: that is the human boundary itself.
+        reason: String,
     },
     /// The approval waiter closed (approve, deny, timeout, cancel, or drop).
     /// Frontends must clear any pending approval UI matching `approval_id`.
@@ -192,8 +197,9 @@ mod tests {
                 name: "bash".into(),
                 summary: "run".into(),
                 detail: "ls".into(),
+                reason: "gate".into(),
             }),
-            r#"{"session_id":"s1","type":"approval_request","approval_id":"ap1","name":"bash","summary":"run","detail":"ls"}"#
+            r#"{"session_id":"s1","type":"approval_request","approval_id":"ap1","name":"bash","summary":"run","detail":"ls","reason":"gate"}"#
         );
         assert_eq!(
             env(AgentEvent::ApprovalSettled {

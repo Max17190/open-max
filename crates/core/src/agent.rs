@@ -890,6 +890,7 @@ async fn refreeze_if_extensions_changed(
 /// acts.
 fn record_capability_write_approval(
     core: &Arc<Core>,
+    session_id: &str,
     project_root: &Path,
     tool: &str,
     args: &serde_json::Value,
@@ -910,7 +911,14 @@ fn record_capability_write_approval(
         return;
     };
     let sha = crate::ledger::sha256_hex(&bytes);
-    let _ = crate::ledger::approve_hash(&core.data_dir, project_root, &sha);
+    if let Err(e) = crate::ledger::approve_hash(&core.data_dir, project_root, &sha) {
+        core.send_agent(
+            session_id,
+            AgentEvent::Error {
+                message: format!("write approval could not be recorded for {rel}: {e}"),
+            },
+        );
+    }
 }
 
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
@@ -1409,7 +1417,9 @@ async fn run_loop(
                     || (!force_allow
                         && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask)))
                 {
-                    match request_approval(core, session_id, name, &args, &cancelled).await {
+                    let approval_reason =
+                        if unapproved_source { "unapproved_source" } else { "gate" };
+                    match request_approval(core, session_id, name, &args, approval_reason, &cancelled).await {
                         ApprovalOutcome::Approved => {
                             executed = true;
                             prompt_approved = true;
@@ -1420,11 +1430,17 @@ async fn run_loop(
                                 if let Some(crate::registry::ToolKind::External(ext)) =
                                     registry.get(name).map(|spec| &spec.kind)
                                 {
-                                    let _ = crate::ledger::approve_hash(
+                                    if let Err(e) = crate::ledger::approve_hash(
                                         &core.data_dir,
                                         project_root,
                                         &ext.source_sha256,
-                                    );
+                                    ) {
+                                        core.send_agent(session_id, AgentEvent::Error {
+                                            message: format!(
+                                                "approval was granted but could not be recorded (the tool will ask again): {e}"
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                             (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
@@ -1465,7 +1481,7 @@ async fn run_loop(
                     // An in-session approval of a capability-file write is a
                     // human content approval: record the resulting hash so
                     // the file is live without a second prompt.
-                    record_capability_write_approval(core, project_root, name, &args);
+                    record_capability_write_approval(core, session_id, project_root, name, &args);
                 }
 
                 if executed {
@@ -1669,6 +1685,7 @@ async fn request_approval(
     session_id: &str,
     name: &str,
     args: &Value,
+    reason: &str,
     cancelled: &Arc<CancelToken>,
 ) -> ApprovalOutcome {
     let approval_id = uuid::Uuid::new_v4().to_string();
@@ -1681,6 +1698,7 @@ async fn request_approval(
         name: name.to_string(),
         summary,
         detail,
+        reason: reason.to_string(),
     });
 
     let outcome = tokio::select! {

@@ -2080,7 +2080,19 @@ impl App {
                 name,
                 summary,
                 detail,
+                reason,
             } => {
+                // Interactive approvals show provenance at the moment it
+                // matters: the first run of unapproved capability content.
+                let detail = if reason == "unapproved_source" {
+                    if detail.is_empty() {
+                        "first run of unapproved tool content".to_string()
+                    } else {
+                        format!("first run of unapproved tool content · {detail}")
+                    }
+                } else {
+                    detail
+                };
                 self.pending_approval = Some((approval_id, name, summary, detail));
                 self.completion = None;
                 self.dirty.mark_chrome();
@@ -3656,6 +3668,7 @@ mod tests {
         app.composer.load("previous prompt");
         let _ = app.composer.take();
         app.on_agent_event(AgentEvent::ApprovalRequest {
+            reason: "gate".into(),
             approval_id: "approval-history".into(),
             name: "bash".into(),
             summary: "run tests".into(),
@@ -3916,6 +3929,7 @@ mod tests {
         let (mut app, dir) = app_fixture();
         app.composer.load("keep this draft");
         app.on_agent_event(AgentEvent::ApprovalRequest {
+            reason: "gate".into(),
             approval_id: "approval-1".into(),
             name: "bash".into(),
             summary: "install dependencies".into(),
@@ -3953,6 +3967,7 @@ mod tests {
     fn compact_approval_keeps_mouse_targets_aligned_with_choices() {
         let (mut app, dir) = app_fixture();
         app.on_agent_event(AgentEvent::ApprovalRequest {
+            reason: "gate".into(),
             approval_id: "approval-compact".into(),
             name: "bash".into(),
             summary: "run tests".into(),
