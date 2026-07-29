@@ -22,6 +22,10 @@ openmax --spec hooks                  # print an extension surface's contract
 openmax --stdio                       # full session over JSONL pipes
 ```
 
+`openmax --check --json` prints the same findings as one JSON array of
+`{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
+with the same exit code, so the agent can parse its own verification.
+
 In print mode, text goes to stdout and tool progress to stderr. With `--json`,
 each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
 `approval_mode`; for unattended runs set `"approval_mode": "auto"`.

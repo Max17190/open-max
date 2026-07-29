@@ -31,6 +31,15 @@ impl Status {
             Status::Ok(s) | Status::Warn(s) | Status::Err(s) => s,
         }
     }
+
+    /// Stable machine-readable discriminator for `--check --json`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Ok(_) => "ok",
+            Status::Warn(_) => "warn",
+            Status::Err(_) => "err",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -77,7 +86,14 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 Ok(spec) => {
                     id = Some(spec.name.clone());
                     external_names.push(spec.name.clone());
-                    Status::Ok(format!("tool '{}'", spec.name))
+                    let command = match &spec.kind {
+                        crate::registry::ToolKind::External(ext) => Some(ext.command.clone()),
+                        crate::registry::ToolKind::Builtin => None,
+                    };
+                    match command.and_then(|c| missing_command_reason(&c, project_root)) {
+                        Some(reason) => Status::Warn(reason),
+                        None => Status::Ok(format!("tool '{}'", spec.name)),
+                    }
                 }
                 Err(reason) => Status::Err(reason),
             };
@@ -200,7 +216,10 @@ fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         }
                     }
                     hook_events.push(Some(h.event.as_str()));
-                    Status::Ok(format!("hook on {}", h.event.as_str()))
+                    match missing_command_reason(&h.command, project_root) {
+                        Some(reason) => Status::Warn(reason),
+                        None => Status::Ok(format!("hook on {}", h.event.as_str())),
+                    }
                 }
                 Err(reason) => {
                     hook_events.push(None);
@@ -305,6 +324,43 @@ fn unknown_tool_reason(
     Some(format!(
         "no tool named '{tool}' exists in this project, so {consequence}{hint}"
     ))
+}
+
+/// Why `command` will not spawn from this checkout, if it will not. A path
+/// (contains '/') resolves against the project root, exactly as the runtime
+/// spawns it; a bare name resolves on PATH. This warns rather than errors:
+/// check-time and run-time environments legitimately differ (CI without the
+/// tool installed, a script the agent writes next).
+fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None; // the parser already errors on this
+    }
+    if command.contains('/') {
+        let path = if Path::new(command).is_absolute() {
+            PathBuf::from(command)
+        } else {
+            project_root.join(command)
+        };
+        if !path.is_file() {
+            return Some(format!("command '{command}' does not exist from the project root"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = std::fs::metadata(&path)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if !executable {
+                return Some(format!("command '{command}' exists but is not executable"));
+            }
+        }
+        return None;
+    }
+    let found = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join(command).is_file())
+    });
+    (!found).then(|| format!("command '{command}' is not on PATH"))
 }
 
 /// Mark files a loader never reaches because another file claims the same
@@ -549,7 +605,7 @@ mod tests {
     }
 
     fn tool_toml(name: &str) -> String {
-        format!("name = \"{name}\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n")
+        format!("name = \"{name}\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n")
     }
 
     /// Findings for paths under this project only: the developer's real global
@@ -582,7 +638,7 @@ mod tests {
         write(root.join(".agents/prompts/review.md"), "Review the diff.\n");
         write(
             root.join(".openmax/hooks/bad-event.toml"),
-            "event = \"on_fire\"\ncommand = \"/bin/true\"\n",
+            "event = \"on_fire\"\ncommand = \"/bin/sh\"\n",
         );
         write(root.join(".openmax/permissions.toml"), "[[rule]]\n");
 
@@ -616,10 +672,12 @@ mod tests {
         let data = temp_project();
         let tools_dir = root.join(".openmax").join("tools");
         std::fs::create_dir_all(&tools_dir).unwrap();
+        // /bin/sh exists everywhere: the command probe must stay quiet so the
+        // cap ranking (which counts live entries) is what gets exercised.
         for i in 0..(crate::registry::MAX_EXTERNAL_TOOLS + 1) {
             std::fs::write(
                 tools_dir.join(format!("tool-{i:03}.toml")),
-                format!("name = \"tool-{i:03}\"\ndescription = \"d\"\ncommand = \"/bin/true\"\n"),
+                format!("name = \"tool-{i:03}\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n"),
             )
             .unwrap();
         }
@@ -628,7 +686,7 @@ mod tests {
         for i in 0..(crate::hooks::MAX_HOOKS_PER_EVENT + 1) {
             std::fs::write(
                 hooks_dir.join(format!("hook-{i:03}.toml")),
-                "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n",
+                "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\n",
             )
             .unwrap();
         }
@@ -658,7 +716,33 @@ mod tests {
             "{}",
             over_hook.status.summary()
         );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
 
+    #[test]
+    fn missing_tool_command_warns_instead_of_looking_healthy() {
+        let root = temp_project();
+        let data = temp_project();
+        let tools_dir = root.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(
+            tools_dir.join("ghost.toml"),
+            "name = \"ghost\"\ndescription = \"d\"\ncommand = \"./scripts/does-not-exist.sh\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tools_dir.join("real.toml"),
+            "name = \"real\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n",
+        )
+        .unwrap();
+
+        let findings = check_at(&root, &data);
+        let ghost = findings.iter().find(|f| f.path.ends_with("ghost.toml")).unwrap();
+        assert!(matches!(ghost.status, Status::Warn(_)), "{:?}", ghost.status);
+        assert!(ghost.status.summary().contains("does not exist"), "{}", ghost.status.summary());
+        let real = findings.iter().find(|f| f.path.ends_with("real.toml")).unwrap();
+        assert!(matches!(real.status, Status::Ok(_)), "{:?}", real.status);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
@@ -781,7 +865,7 @@ mod tests {
         let root = temp_project();
         write(
             root.join(".openmax/hooks/gate.toml"),
-            "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\ntool = \"write-file\"\n",
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\ntool = \"write-file\"\n",
         );
         let findings = local(&root);
         let warn = findings

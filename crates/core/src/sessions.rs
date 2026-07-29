@@ -112,7 +112,8 @@ pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::Registry
 pub fn load_manifest(core: &Core, id: &str) -> Option<crate::registry::RegistryManifest> {
     std::fs::read_to_string(manifest_path(core, id))
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<crate::registry::RegistryManifest>(&s).ok())
+        .filter(|m| m.version == crate::registry::MANIFEST_VERSION)
 }
 
 fn load_index(core: &Core) -> Vec<SessionMeta> {
@@ -642,6 +643,24 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "unexpected .tmp files: {leftovers:?}");
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A manifest from a newer format version is treated as absent: the
+    /// session falls back to built-ins and re-freezes cleanly, instead of
+    /// deserializing an unknown shape into this one.
+    #[test]
+    fn unknown_manifest_version_reads_as_no_manifest() {
+        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "future-manifest";
+        let mut manifest = crate::registry::Registry::builtin_only().to_manifest();
+        save_manifest(&core, id, &manifest);
+        assert!(load_manifest(&core, id).is_some());
+
+        manifest.version = crate::registry::MANIFEST_VERSION + 1;
+        save_manifest(&core, id, &manifest);
+        assert!(load_manifest(&core, id).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

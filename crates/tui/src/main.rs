@@ -27,7 +27,8 @@ options:
       --provider <name>  use a named provider from ~/.openmax/providers.json
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
-      --json             with --print, emit AgentEvent envelopes as JSONL
+      --json             with --print, emit AgentEvent envelopes as JSONL;
+                         with --check, emit findings as one JSON array
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
@@ -163,8 +164,8 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    if cli.json && !cli.print {
-        eprintln!("openmax: --json requires --print\n\n{HELP}");
+    if cli.json && !cli.print && !cli.check {
+        eprintln!("openmax: --json requires --print or --check\n\n{HELP}");
         std::process::exit(2);
     }
     if cli.stdio && (cli.print || !cli.prompts.is_empty()) {
@@ -219,6 +220,22 @@ async fn main() -> std::io::Result<()> {
         // Pure filesystem validation: no session, no endpoint, no state dir.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let findings = open_max_core::doctor::check(&project);
+        if cli.json {
+            // Machine face of the same report: the agent parses this in-turn.
+            let array: Vec<serde_json::Value> = findings
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "surface": f.kind,
+                        "path": f.path.display().to_string(),
+                        "status": f.status.as_str(),
+                        "message": f.status.summary(),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::Value::Array(array));
+            std::process::exit(if open_max_core::doctor::has_errors(&findings) { 1 } else { 0 });
+        }
         if findings.is_empty() {
             println!(
                 "no extension files found (tools, skills, templates, hooks, permissions, providers)"
@@ -562,6 +579,13 @@ mod tests {
     fn check_flag_parses() {
         let cli = parse_args_from(["--check"]).unwrap();
         assert!(cli.check && !cli.print && !cli.stdio);
+    }
+
+    #[test]
+    fn check_json_is_a_valid_combination() {
+        let cli = parse_args_from(["--check", "--json"]).unwrap();
+        assert!(cli.check);
+        assert!(cli.json);
     }
 
     #[test]
