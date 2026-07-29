@@ -328,7 +328,7 @@ async fn execute_readonly_batch(
             PreToolResult::Block { reason } => Some(tools::ToolOutcome {
                 ok: false,
                 output: reason,
-                diff: None,
+                diff: None, ..Default::default()
             }),
             PreToolResult::Cancelled => {
                 // Close every ToolStart already emitted in this batch so the
@@ -347,7 +347,7 @@ async fn execute_readonly_batch(
                 PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
                     ok: false,
                     output: reason,
-                    diff: None,
+                    diff: None, ..Default::default()
                 }),
                 // Ask is excluded from batching (see batchable_call); if it
                 // still lands here, block rather than silently auto-run.
@@ -355,7 +355,7 @@ async fn execute_readonly_batch(
                     ok: false,
                     output: "permission rule requires approval; re-run outside a concurrent batch"
                         .into(),
-                    diff: None,
+                    diff: None, ..Default::default()
                 }),
                 // Allow/Default: readonly batch tools are non-mutating.
                 PermissionDecision::Allow | PermissionDecision::Default => None,
@@ -398,7 +398,7 @@ async fn execute_readonly_batch(
                     name,
                     args,
                     ctx.project_root,
-                    outcome.ok,
+                    outcome,
                     &ctx.cancelled,
                 )
                 .await;
@@ -1230,7 +1230,7 @@ async fn run_loop(
                             tool_message_content(&tools::ToolOutcome {
                                 ok: false,
                                 output: reason,
-                                diff: None,
+                                diff: None, ..Default::default()
                             }),
                         ));
                         continue;
@@ -1254,7 +1254,7 @@ async fn run_loop(
                         tool_message_content(&tools::ToolOutcome {
                             ok: false,
                             output: reason.clone(),
-                            diff: None,
+                            diff: None, ..Default::default()
                         }),
                     ));
                     continue;
@@ -1276,7 +1276,7 @@ async fn run_loop(
                     (tools::ToolOutcome {
                         ok: false,
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
-                        diff: None,
+                        diff: None, ..Default::default()
                     }, false)
                 } else if !force_allow
                     && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask))
@@ -1289,17 +1289,17 @@ async fn run_loop(
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
                             output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
-                            diff: None,
+                            diff: None, ..Default::default()
                         }, false),
                         ApprovalOutcome::TimedOut => (tools::ToolOutcome {
                             ok: false,
                             output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
-                            diff: None,
+                            diff: None, ..Default::default()
                         }, false),
                         ApprovalOutcome::Cancelled => (tools::ToolOutcome {
                             ok: false,
                             output: "The user cancelled this turn.".into(),
-                            diff: None,
+                            diff: None, ..Default::default()
                         }, true),
                     }
                 } else {
@@ -1325,7 +1325,7 @@ async fn run_loop(
                             name,
                             &args,
                             project_root,
-                            outcome.ok,
+                            &outcome,
                             &cancelled,
                         )
                         .await;

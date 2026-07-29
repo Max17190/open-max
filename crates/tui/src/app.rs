@@ -790,6 +790,16 @@ impl App {
         }
         if ctrl && key.code == KeyCode::Char('t') {
             self.show_thinking = !self.show_thinking;
+            self.dirty.mark_tail();
+            // Between turns there is no thinking on screen to appear or
+            // vanish, so the toggle has to say what it did.
+            if !self.running {
+                self.note(if self.show_thinking {
+                    "thinking shown while the model streams (ctrl+t to hide)"
+                } else {
+                    "thinking hidden (ctrl+t to show)"
+                });
+            }
             return Ok(());
         }
         if ctrl && key.code == KeyCode::Char('r') && self.mode == Mode::Chat {
@@ -1879,7 +1889,9 @@ impl App {
                     let id = id.clone();
                     match agent::reload_session(&self.core, &id, &self.project).await {
                         Ok((tools, skills)) => self.note(&format!(
-                            "re-frozen: {tools} tools, {skills} skills (prompt cache will re-prefill once)"
+                            "re-frozen: {}, {} (prompt cache will re-prefill once)",
+                            plural(tools, "tool"),
+                            plural(skills, "skill")
                         )),
                         Err(e) => self.error(&e),
                     }
@@ -2323,7 +2335,9 @@ impl App {
             }
             AgentEvent::Refrozen { tools, skills } => {
                 self.note(&format!(
-                    "extensions changed on disk: re-frozen with {tools} tools, {skills} skills"
+                    "extensions changed on disk: re-frozen with {}, {}",
+                    plural(tools, "tool"),
+                    plural(skills, "skill")
                 ));
             }
             AgentEvent::Done { stop_reason } => {
@@ -2978,7 +2992,11 @@ impl App {
                 meta.push_str(&format!(" · {toks:.0} tok/s"));
             }
             if self.thinking_chars > 0 && self.stream_text.is_empty() {
-                meta.push_str(" · thinking (ctrl+t to peek)");
+                meta.push_str(if self.show_thinking {
+                    " · thinking (ctrl+t to hide)"
+                } else {
+                    " · thinking (ctrl+t to peek)"
+                });
             }
             meta.push_str(" · esc to cancel");
             self.tail_buf.push(Line::from(vec![
@@ -3305,6 +3323,14 @@ fn home_shortened(path: &str, home: Option<&str>) -> String {
     }
 }
 
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("{n} {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {k:<11}"), Style::default().fg(theme::ACCENT())),
@@ -3477,8 +3503,8 @@ mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, header_path_line, help_line, home_shortened, kv,
-        paint_text_selection, rect_contains, save_model_selection, App, Dirty, Focus,
-        TermEvent, MIN_DRAW_INTERVAL,
+        paint_text_selection, plural, rect_contains, save_model_selection, App, Dirty,
+        Focus, TermEvent, MIN_DRAW_INTERVAL,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
@@ -4333,5 +4359,12 @@ mod tests {
 
         fs::remove_dir_all(incremental_dir).unwrap();
         fs::remove_dir_all(oracle_dir).unwrap();
+    }
+
+    #[test]
+    fn counts_read_naturally_in_singular() {
+        assert_eq!(plural(1, "skill"), "1 skill");
+        assert_eq!(plural(0, "skill"), "0 skills");
+        assert_eq!(plural(8, "tool"), "8 tools");
     }
 }
