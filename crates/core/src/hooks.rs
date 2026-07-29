@@ -21,6 +21,10 @@ use std::sync::Arc;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const MAX_TIMEOUT_SECS: u64 = 60;
 const MAX_REASON_CHARS: usize = 500;
+/// How much tool output a `post_tool_use` hook is handed. Enough for an eval
+/// or telemetry hook to work with, small enough that copying it to every
+/// matching hook on every tool call stays cheap.
+const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookEvent {
@@ -210,7 +214,9 @@ impl Hooks {
         PreToolResult::Allow
     }
 
-    /// Run all matching `post_tool_use` hooks. Failures are ignored (observe only).
+    /// Run all matching `post_tool_use` hooks with what the call returned.
+    /// Failures are ignored (observe only), and the output is passed for
+    /// observation alone: a post hook cannot change what the model sees.
     pub async fn post_tool_use(
         &self,
         session_id: &str,
@@ -218,13 +224,14 @@ impl Hooks {
         args: &Value,
         cwd: &Path,
         tool_ok: bool,
+        output: &str,
         cancel: &Arc<CancelToken>,
     ) {
         for hook in &self.post {
             if !hook.matches(tool) {
                 continue;
             }
-            let payload = tool_payload(hook, session_id, tool, args, cwd, Some(tool_ok));
+            let payload = tool_payload(hook, session_id, tool, args, cwd, Some((tool_ok, output)));
             let _ = run_hook(hook, payload, cwd, cancel).await;
         }
     }
@@ -306,23 +313,50 @@ impl Hooks {
     }
 }
 
-/// The stdin payload for tool-scoped events, shared by pre and post.
+/// The stdin payload for tool-scoped events, shared by pre and post. `result`
+/// is the outcome a `post_tool_use` hook is reporting on, and is None before
+/// the call runs.
 fn tool_payload(
     hook: &HookSpec,
     session_id: &str,
     tool: &str,
     args: &Value,
     cwd: &Path,
-    tool_ok: Option<bool>,
+    result: Option<(bool, &str)>,
 ) -> Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "event": hook.event.as_str(),
         "session_id": session_id,
         "tool": tool,
         "args": args,
         "cwd": cwd.display().to_string(),
-        "tool_ok": tool_ok,
-    })
+        "tool_ok": result.map(|(ok, _)| ok),
+    });
+    if let Some((_, output)) = result {
+        let head = head_bytes(output, MAX_OUTPUT_BYTES);
+        let Some(map) = payload.as_object_mut() else { return payload };
+        map.insert("output".into(), Value::String(head.to_string()));
+        // The full size travels even when the text does not, so a hook can
+        // tell a short output from the start of a long one.
+        map.insert("output_bytes".into(), Value::from(output.len()));
+        map.insert("output_truncated".into(), Value::Bool(head.len() < output.len()));
+    }
+    payload
+}
+
+/// The longest prefix of `s` that fits in `max` bytes without splitting a
+/// character. Tool output is unbounded (a `bash` call can print megabytes) and
+/// every matching hook is handed a copy, so what a hook sees is a head, the
+/// same shape hook block reasons already take.
+fn head_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -729,6 +763,112 @@ tool = "bash"
                 .unwrap();
         assert_eq!(compact["event"], "compaction");
         assert_eq!(compact["record"]["message_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_receives_the_tool_output() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = write_script(
+            &tmp,
+            "audit.sh",
+            &format!("#!/bin/sh\ncat > {}/audit.json\n", tmp.display()),
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "audit.toml",
+            &format!("event = \"post_tool_use\"\ncommand = \"{}\"\n", script.display()),
+        );
+        let hooks = Hooks::discover(&tmp);
+        let cancel = Arc::new(CancelToken::default());
+        let args = serde_json::json!({"command": "echo hi"});
+
+        hooks.post_tool_use("sess", "bash", &args, &tmp, true, "hi\n", &cancel).await;
+
+        let payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("audit.json")).unwrap()).unwrap();
+        assert_eq!(payload["event"], "post_tool_use");
+        assert_eq!(payload["tool"], "bash");
+        assert_eq!(payload["tool_ok"], true);
+        assert_eq!(payload["output"], "hi\n");
+        assert_eq!(payload["output_bytes"], 3);
+        assert_eq!(payload["output_truncated"], false);
+        assert_eq!(payload["args"]["command"], "echo hi");
+    }
+
+    /// A pre hook is asked whether a call may run, and there is no output yet
+    /// to report. It must not look like an empty one.
+    #[tokio::test]
+    async fn pre_tool_use_payload_carries_no_output() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = write_script(
+            &tmp,
+            "gate.sh",
+            &format!("#!/bin/sh\ncat > {}/gate.json\n", tmp.display()),
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "gate.toml",
+            &format!("event = \"pre_tool_use\"\ncommand = \"{}\"\n", script.display()),
+        );
+        let hooks = Hooks::discover(&tmp);
+        let cancel = Arc::new(CancelToken::default());
+
+        let result = hooks
+            .pre_tool_use("sess", "bash", &serde_json::json!({}), &tmp, &cancel)
+            .await;
+        assert_eq!(result, PreToolResult::Allow);
+
+        let payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("gate.json")).unwrap()).unwrap();
+        assert!(payload.get("output").is_none(), "{payload}");
+        assert!(payload.get("output_truncated").is_none());
+        assert!(payload["tool_ok"].is_null());
+    }
+
+    #[test]
+    fn a_long_output_is_capped_without_splitting_a_character() {
+        // A multibyte character straddling the cap must not be cut in half:
+        // the payload has to stay valid JSON.
+        let long = "é".repeat(MAX_OUTPUT_BYTES);
+        let hook = HookSpec {
+            event: HookEvent::PostToolUse,
+            command: "/bin/true".into(),
+            args: Vec::new(),
+            timeout_secs: 1,
+            tool_filter: None,
+            source_path: PathBuf::from("/hooks/audit.toml"),
+        };
+        let payload = tool_payload(
+            &hook,
+            "sess",
+            "bash",
+            &serde_json::json!({}),
+            Path::new("/project"),
+            Some((true, long.as_str())),
+        );
+
+        let head = payload["output"].as_str().unwrap();
+        assert!(head.len() <= MAX_OUTPUT_BYTES);
+        assert!(head.len() > MAX_OUTPUT_BYTES - 4, "the cap must not round down far");
+        assert!(long.starts_with(head), "what a hook sees must be a real prefix");
+        assert_eq!(payload["output_bytes"].as_u64().unwrap() as usize, long.len());
+        assert_eq!(payload["output_truncated"], true);
+        // Round-trips, which is the point of respecting the boundary.
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap()["output"], head);
+    }
+
+    #[test]
+    fn head_bytes_returns_everything_that_fits() {
+        assert_eq!(head_bytes("short", 16), "short");
+        assert_eq!(head_bytes("exact", 5), "exact");
+        assert_eq!(head_bytes("abcdef", 3), "abc");
+        assert_eq!(head_bytes("éé", 3), "é", "a split character is dropped whole");
+        assert_eq!(head_bytes("", 0), "");
     }
 
     #[tokio::test]

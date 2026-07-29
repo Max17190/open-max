@@ -70,7 +70,14 @@ Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`.
 prompt never reaches the model); `post_tool_use`, `session_start` (a session's
 first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` (receives the stop reason, fires even on cancel) observe only. Each
-hook gets one JSON payload on stdin. Hooks never enter the model prompt and,
+hook gets one JSON payload on stdin.
+
+A `post_tool_use` payload carries what the call returned: `output` (the first
+16 KiB, cut on a character boundary), `output_bytes` (the full size), and
+`output_truncated`. That is what an eval, audit, or telemetry hook needs to be
+written as a file instead of a core feature. It stays observation: the hook's
+own exit status and stdout are ignored, so nothing it does changes what the
+model receives. Hooks never enter the model prompt and,
 like external tools and `bash`, run as native host processes with inherited
 filesystem, environment, credentials, and network access.
 

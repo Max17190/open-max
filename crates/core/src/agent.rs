@@ -399,6 +399,7 @@ async fn execute_readonly_batch(
                     args,
                     ctx.project_root,
                     outcome.ok,
+                    &outcome.output,
                     &ctx.cancelled,
                 )
                 .await;
@@ -1326,6 +1327,7 @@ async fn run_loop(
                             &args,
                             project_root,
                             outcome.ok,
+                            &outcome.output,
                             &cancelled,
                         )
                         .await;
