@@ -261,23 +261,7 @@ impl StreamingMarkdown {
         self.width = width;
 
         // Commit any lines that ended since the last update (append-only).
-        // Search only the uncommitted suffix. Completed lines can no longer
-        // change, so make the scan bound independent of accumulated history.
-        let uncommitted = &text[self.committed_bytes..];
-        if let Some(last_nl) = uncommitted.rfind('\n') {
-            let commit_end = self.committed_bytes + last_nl + 1;
-            if commit_end > self.committed_bytes {
-                let hl = highlighter();
-                let newly = &text[self.committed_bytes..commit_end];
-                for raw in newly.split_inclusive('\n') {
-                    let line = raw.strip_suffix('\n').unwrap_or(raw);
-                    if let Some(rendered) = render_line(line, &mut self.state, hl) {
-                        self.complete_md.push(rendered);
-                    }
-                }
-                self.committed_bytes = commit_end;
-            }
-        }
+        self.commit_complete_lines(text);
 
         // Wrapping is width-dependent; highlighting is not. On resize re-wrap
         // every cached line; otherwise wrap only the freshly committed ones.
@@ -304,6 +288,29 @@ impl StreamingMarkdown {
         self.text_len = text.len();
     }
 
+    fn commit_complete_lines(&mut self, text: &str) {
+        // Search only the uncommitted suffix. Completed lines can no longer
+        // change, so the scan bound is independent of accumulated history.
+        let uncommitted = &text[self.committed_bytes..];
+        let Some(last_nl) = uncommitted.rfind('\n') else {
+            return;
+        };
+        let commit_end = self.committed_bytes + last_nl + 1;
+
+        let hl = highlighter();
+        let newly = &text[self.committed_bytes..commit_end];
+        for raw in newly.split_inclusive('\n') {
+            let line = raw
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .unwrap_or(raw);
+            if let Some(rendered) = render_line(line, &mut self.state, hl) {
+                self.complete_md.push(rendered);
+            }
+        }
+        self.committed_bytes = commit_end;
+    }
+
     /// Synchronize `out` while preserving its already-copied complete prefix.
     ///
     /// `stable_complete` is the value returned by the previous call at the
@@ -326,6 +333,31 @@ impl StreamingMarkdown {
         let complete = self.complete_wrapped.len();
         out.extend(self.partial_wrapped.iter().cloned());
         complete
+    }
+
+    /// Promote the current stream into an unwrapped finished message.
+    ///
+    /// `text` must be the exact append-only source used to build this stream.
+    /// The caller compares its token buffer with the provider's final message
+    /// before taking this path. A final delta may arrive after the last paint,
+    /// so catch up here, then commit the trailing partial line with the real
+    /// syntax state instead of highlighting the whole response again.
+    pub fn finish(&mut self, text: &str) -> Vec<Line<'static>> {
+        if text.len() < self.text_len {
+            self.clear();
+        }
+        self.commit_complete_lines(text);
+
+        let partial = &text[self.committed_bytes..];
+        if !partial.is_empty() {
+            if let Some(line) = render_line(partial, &mut self.state, highlighter()) {
+                self.complete_md.push(line);
+            }
+        }
+
+        let finished = std::mem::take(&mut self.complete_md);
+        self.clear();
+        finished
     }
 
     /// Fill `out` from scratch. Tests and one-shot callers use this; the live
@@ -547,6 +579,7 @@ mod tests {
         let hl = highlighter();
         let samples = [
             "hello world this is a fairly long line that should wrap somewhere nice\n",
+            "windows first line\r\nwindows second line\r\n",
             "# Title\n\n- one\n- two\n\nsome **bold** and `code` and *italic* text here\n",
             "intro\n```rust\nfn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n```\ndone\n",
             "```\nplain block line one\nno language given here\n```\ntrailing prose\n",
@@ -673,6 +706,22 @@ mod tests {
         assert_eq!(sig(&out2), sig(&wrap_lines(&render("short\n", highlighter()), 20)));
     }
 
+    #[test]
+    fn finishing_promotes_incremental_markdown_and_commits_the_unpainted_tail() {
+        let complete = "intro\n```rust\nfn main() {\n    println!(\"done\");\n}\n```\nfinal prose";
+        let painted = complete.find("    println!").unwrap();
+        let mut sm = StreamingMarkdown::default();
+        sm.update(&complete[..painted], 24);
+
+        let finished = sm.finish(complete);
+
+        assert_eq!(sig(&finished), sig(&render(complete, highlighter())));
+        assert_eq!(sm.text_len(), 0);
+        let mut stream = Vec::new();
+        sm.copy_into(&mut stream);
+        assert!(stream.is_empty());
+    }
+
     // Streaming-cost comparison for a long code reply (the coding-agent hot
     // case). Not a correctness test; run with:
     //   cargo test -p open-max-tui --release -- --ignored --nocapture measure_stream
@@ -741,11 +790,32 @@ mod tests {
         }
         let suffix_sync_ms = t0.elapsed().as_secs_f64() * 1e3;
 
+        // OLD completion: discard the incremental state and highlight the
+        // finished response from scratch.
+        let t0 = Instant::now();
+        let batch_finished = render(&reply, hl);
+        let batch_finish_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // NEW completion: promote the already-highlighted stream and commit
+        // only a possible trailing partial line. Include the exact source
+        // comparison that guards the live promotion path.
+        let provider_finished = reply.clone();
+        let t0 = Instant::now();
+        assert_eq!(
+            std::hint::black_box(reply.as_str()),
+            std::hint::black_box(provider_finished.as_str())
+        );
+        let promoted = sm.finish(&provider_finished);
+        let promote_finish_ms = t0.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(sig(&promoted), sig(&batch_finished));
+
         eprintln!("MEASURE stream_lines={}", lines.len());
         eprintln!("MEASURE stream_deltas={}", deltas.len());
         eprintln!("MEASURE old_full_rerender_ms={old_ms:.3}");
         eprintln!("MEASURE incremental_clone_all_ms={clone_all_ms:.3}");
         eprintln!("MEASURE incremental_suffix_sync_ms={suffix_sync_ms:.3}");
+        eprintln!("MEASURE completion_batch_render_ms={batch_finish_ms:.3}");
+        eprintln!("MEASURE completion_promote_ms={promote_finish_ms:.3}");
         eprintln!(
             "MEASURE suffix_sync_speedup={:.1}x",
             clone_all_ms / suffix_sync_ms.max(1e-6)
@@ -753,6 +823,10 @@ mod tests {
         eprintln!(
             "MEASURE total_speedup={:.1}x",
             old_ms / suffix_sync_ms.max(1e-6)
+        );
+        eprintln!(
+            "MEASURE completion_speedup={:.1}x",
+            batch_finish_ms / promote_finish_ms.max(1e-6)
         );
     }
 }
