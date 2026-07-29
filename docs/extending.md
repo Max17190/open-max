@@ -30,6 +30,13 @@ a security boundary and does not restrict what the command can do. Unknown keys
 in a tool file are rejected, so a misspelled `mutating` surfaces in
 `openmax --check` instead of silently taking the tool out of the approval gate.
 
+`params` must declare `type = "object"`, and every `properties` entry must be
+an object. The serialized schema is capped at 4096 bytes because it lives in
+the frozen prompt prefix and is paid on every request; an oversized schema is
+rejected, not truncated. At most 64 external tools load (the name-sorted head);
+the prompt trailer reports how many were left out and `openmax --check` names
+the files. Hooks are capped at 32 per event the same way.
+
 ## Skills
 
 A directory with `SKILL.md` under `.agents/skills/` or `~/.openmax/skills/`.
