@@ -107,7 +107,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         prompt.push_str(&map);
         breakdown.components.push(("project layout map".into(), prompt.len() - before));
     }
-    if let Some(skills) = skills_section(project_root, &registry.skills) {
+    if let Some(skills) = skills_section(project_root, &registry.skills, registry.skills_omitted) {
         let before = prompt.len();
         prompt.push_str("\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n");
         prompt.push_str(&skills);
@@ -143,12 +143,16 @@ Working files (there is no built-in plan mode, todo list, or memory):\n\
 /// reaches it); global skills keep their absolute path (bash reaches it).
 /// None when there are no skills: an empty section would still cost tokens
 /// and change the byte-stable prompt for nothing.
-fn skills_section(project_root: &Path, skills: &[SkillSpec]) -> Option<String> {
+///
+/// `beyond_cap` is how many discovered skills the registry's `MAX_SKILLS`
+/// index cap already dropped; the trailer folds those in with the byte-cap
+/// omissions so no skill on disk ever vanishes without a count.
+fn skills_section(project_root: &Path, skills: &[SkillSpec], beyond_cap: usize) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
     let mut out = String::new();
-    let mut omitted = 0usize;
+    let mut omitted = beyond_cap;
     for skill in skills {
         let shown = skill
             .path
@@ -163,7 +167,9 @@ fn skills_section(project_root: &Path, skills: &[SkillSpec]) -> Option<String> {
         out.push_str(&line);
     }
     if omitted > 0 {
-        out.push_str(&format!("… {omitted} more skills\n"));
+        out.push_str(&format!(
+            "… {omitted} more skills (list them: ls .agents/skills ~/.openmax/skills)\n"
+        ));
     }
     Some(out)
 }
@@ -309,6 +315,41 @@ mod tests {
         assert!(
             prompt.contains("- pdf-tools: handles PDFs — /somewhere/global/skills/pdf/SKILL.md"),
             "global skill keeps its absolute path:\n{prompt}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every skill on disk is accounted for: lines shown plus the trailer
+    /// count must equal the number discovered, whether a skill was dropped
+    /// by the index byte cap or by the registry's MAX_SKILLS cap.
+    #[test]
+    fn skills_trailer_counts_both_byte_cap_and_index_cap_omissions() {
+        let dir = temp_project();
+        let total = crate::skills::MAX_SKILLS + 4;
+        for i in 0..total {
+            let skill_dir = dir.join(".agents/skills").join(format!("s{i:03}"));
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: skill-{i:03}\ndescription: {}\n---\nbody\n", "d".repeat(120)),
+            )
+            .unwrap();
+        }
+        let registry = Registry::build(&dir);
+        assert_eq!(registry.skills_omitted, 4);
+        let prompt = system_prompt(&dir, &registry);
+        let shown = prompt.matches("\n- skill-").count();
+        let trailer_count: usize = prompt
+            .split("… ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("trailer with a count must be present");
+        assert!(prompt.contains("more skills"), "trailer must name the omission");
+        assert_eq!(
+            shown + trailer_count,
+            total,
+            "shown ({shown}) + omitted ({trailer_count}) must cover all {total} skills"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
