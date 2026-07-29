@@ -700,6 +700,14 @@ mod tests {
             )
             .unwrap();
         }
+        // Approve the (identical) hook content so the cap ranking, not the
+        // approval gate, is what this test exercises.
+        crate::ledger::approve_hash(
+            &data,
+            &root,
+            &crate::ledger::sha256_hex(b"event = \"post_tool_use\"\ncommand = \"/bin/sh\"\n"),
+        )
+        .unwrap();
 
         let findings = check_at(&root, &data);
         let over_tool = findings
