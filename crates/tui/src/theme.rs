@@ -256,4 +256,19 @@ mod tests {
         assert_eq!(tokens.user_bg, Color::Black);
         assert_eq!(tokens.composer_bg, Color::Black);
     }
+
+    /// The palettes must actually differ where the UI depends on it.
+    #[test]
+    fn palettes_are_distinct() {
+        assert_ne!(Tokens::dark().accent, Tokens::light().accent);
+        assert_ne!(Tokens::dark().accent, Tokens::catppuccin().accent);
+    }
+
+    #[test]
+    fn set_tokens_round_trips_through_the_store() {
+        let before = t();
+        set_tokens(Tokens::dark());
+        assert_eq!(t().accent, Tokens::dark().accent);
+        set_tokens(before);
+    }
 }
