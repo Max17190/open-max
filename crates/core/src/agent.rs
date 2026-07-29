@@ -1317,6 +1317,10 @@ async fn run_loop(
         if refrozen {
             schemas_wire = registry.schemas_wire_arc();
             known_tools = registry.tools.iter().map(|s| s.name.clone()).collect();
+            // A new generation changes what an identical call means: a tool
+            // rewritten this iteration must not have its first post-refreeze
+            // call vetoed as a "third repeat" of the old implementation.
+            repeat_tracker = RepeatCallTracker::new();
         }
         // The system prompt at index 0 changed on refreeze, so the transcript
         // prefix on disk is stale: rewrite instead of append.
