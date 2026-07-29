@@ -1023,7 +1023,12 @@ async fn run_loop(
         Ok(ep) => ep,
         Err(e) => {
             core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
-            // User message was already appended; restore so the next turn sees it.
+            // Resolution failures are configuration errors, never transient:
+            // the prompt was not processed and must not linger as context the
+            // model never saw (resubmitting after /model would duplicate it).
+            if guard.messages().last().is_some_and(|m| m.role == "user") {
+                guard.messages().pop();
+            }
             guard.commit().await;
             hooks.turn_end(session_id, project_root, "error").await;
             core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
@@ -2285,10 +2290,8 @@ mod tests {
         assert_ne!(manifest.ext_fingerprint, 0);
         let mut saw_refrozen = false;
         while let Ok(ev) = rx.try_recv() {
-            if let crate::state::CoreEvent::Agent(env) = ev {
-                if matches!(env.event, AgentEvent::Refrozen { tools, .. } if tools == tools::TOOL_NAMES.len() + 1) {
-                    saw_refrozen = true;
-                }
+            if matches!(ev.event, AgentEvent::Refrozen { tools, .. } if tools == tools::TOOL_NAMES.len() + 1) {
+                saw_refrozen = true;
             }
         }
         assert!(saw_refrozen, "UI must be told the session shape changed");
@@ -2378,7 +2381,7 @@ mod tests {
     /// and the turn ends with stop_reason "blocked" (no model call).
     #[tokio::test]
     async fn user_prompt_submit_blocks_before_transcript() {
-        use crate::state::{Core, CoreEvent};
+        use crate::state::Core;
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2417,7 +2420,7 @@ mod tests {
         let mut stop = None;
         let mut saw_error = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(CoreEvent::Agent(env))) =
+            if let Ok(Some(env)) =
                 tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
             {
                 match env.event {
@@ -2452,7 +2455,7 @@ mod tests {
     /// return that never reaches the main loop.
     #[tokio::test]
     async fn turn_end_hook_fires_on_provider_resolution_failure() {
-        use crate::state::{Core, CoreEvent};
+        use crate::state::Core;
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2482,7 +2485,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut saw_done = false;
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(CoreEvent::Agent(env))) =
+            if let Ok(Some(env)) =
                 tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
             {
                 if matches!(env.event, AgentEvent::Done { .. }) {
@@ -2492,6 +2495,14 @@ mod tests {
             }
         }
         assert!(saw_done, "early provider failure must still emit Done");
+        // The unprocessed prompt must not linger as context: a resubmit after
+        // fixing the endpoint would otherwise duplicate it.
+        let map = core.sessions.lock().await;
+        let data = map.get("sess-early").unwrap();
+        assert!(
+            !data.messages.iter().any(|m| m.role == "user"),
+            "an unresolved turn must not retain the user prompt"
+        );
         let end: Value =
             serde_json::from_str(&std::fs::read_to_string(project.join("end.json")).unwrap())
                 .unwrap();
@@ -2705,7 +2716,7 @@ mod tests {
     /// must not leave the session looking busy forever.
     #[tokio::test]
     async fn a_panicking_turn_still_reports_done_and_frees_the_session() {
-        use crate::state::{CancelToken, Core, CoreEvent};
+        use crate::state::{CancelToken, Core};
 
         let dir = std::env::temp_dir().join(format!("openmax-panic-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir).unwrap();
@@ -2723,7 +2734,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let (mut saw_error, mut stop_reason) = (false, None);
         while stop_reason.is_none() && tokio::time::Instant::now() < deadline {
-            if let Ok(Some(CoreEvent::Agent(env))) =
+            if let Ok(Some(env)) =
                 tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
             {
                 match env.event {

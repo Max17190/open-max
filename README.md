@@ -17,7 +17,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent writes them itself and the harness re-freezes as soon as a mutating call lands, so a tool the agent writes is a tool the agent uses on its very next step.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
-- **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure, plus Hugging Face if you use managed model download.
+- **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure.
 
 ## The intelligent harness
 
@@ -65,11 +65,11 @@ Edit `~/.openmax/settings.json`:
 }
 ```
 
-`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. There is no default endpoint or model: until both are configured (here or through a named provider), Open Max refuses to start a turn with an error that says exactly what to set.
 
 A settings file that exists but does not parse, uses an unknown key, or sets an unrecognized `approval_mode` is a startup error (fail closed): Open Max exits with the parse reason instead of silently reverting your endpoint and approval policy to defaults.
 
-Named endpoints in `providers.json`, `compat` flags for picky gateways, and MLX models served through `/models` on Apple Silicon are covered in [configuration](docs/configuration.md).
+Named endpoints in `providers.json` and `compat` flags for picky gateways are covered in [configuration](docs/configuration.md).
 
 ## Use
 
@@ -123,16 +123,13 @@ File formats, hook events, permission rule syntax (including the in-session repa
 
 The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
-Open Max itself does not phone home. Apart from native child processes, the harness only contacts:
-
-1. The model endpoint in `base_url` (your choice).
-2. Hugging Face, only when you download or serve a model through `/models`.
+Open Max itself does not phone home. Apart from native child processes, the harness contacts only the model endpoint you configure.
 
 Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists the destinations configured by the harness and detailed runtime information; it does not enforce or enumerate child-process network access, and external tools you install may open their own network connections.
 
 ## Documentation
 
-- [Configuration](docs/configuration.md): settings, approvals, providers, managed models, project trust
+- [Configuration](docs/configuration.md): settings, approvals, providers, project trust
 - [Usage](docs/usage.md): CLI flags, keybindings, slash commands
 - [Extending](docs/extending.md): tools, skills, templates, hooks, permissions, validation, freezing
 - [stdio protocol](docs/stdio-protocol.md): the `openmax-stdio/1` contract for custom frontends

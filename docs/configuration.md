@@ -22,10 +22,13 @@ optional `~/.openmax/providers.json` for a catalog of named endpoints.
 is clamped to 1 through 32 at runtime. Mutating, approval-gated, and
 non-batchable calls remain serial.
 
-A missing settings file means defaults. A settings file that exists but does
-not parse, uses an unknown key, or sets an unrecognized `approval_mode` is a
-startup error (fail closed): Open Max exits with the parse reason instead of
-silently reverting your endpoint and approval policy to defaults.
+A missing settings file means defaults, and the default `base_url` and `model`
+are empty: endpoint resolution fails with an actionable error until you set
+both, here or through a named provider. There is no built-in localhost
+fallback. A settings file that exists but does not parse, uses an unknown key,
+or sets an unrecognized `approval_mode` is a startup error (fail closed): Open
+Max exits with the parse reason instead of silently reverting your endpoint and
+approval policy to defaults.
 
 ## Approvals
 
@@ -69,13 +72,6 @@ gateways (for example `max_completion_tokens` versus `max_tokens`).
 
 Open Max works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud
 gateways (OpenRouter and similar), and private proxies.
-
-## Managed local models
-
-On Apple Silicon, when `base_url` is the managed local port, Open Max can
-optionally provision and serve MLX models via `/models`. This is the one case
-where the harness contacts Hugging Face; see
-[native execution and privacy](../README.md#native-execution-and-privacy).
 
 ## Project trust
 

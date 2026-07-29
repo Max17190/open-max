@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use open_max_core::agent;
 use open_max_core::sessions;
-use open_max_core::state::{Core, CoreEvent};
-use open_max_core::types::AgentEvent;
+use open_max_core::state::Core;
+use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use tokio::sync::mpsc;
 
 pub struct HeadlessArgs {
@@ -24,7 +24,7 @@ pub struct HeadlessArgs {
 /// to `auto` for unattended mutations. Multiple prompts reuse one session_id.
 pub async fn run(
     core: Arc<Core>,
-    mut core_rx: mpsc::UnboundedReceiver<CoreEvent>,
+    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: HeadlessArgs,
 ) -> i32 {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -110,7 +110,7 @@ pub(crate) async fn wait_until_idle(core: &Arc<Core>, session_id: &str) -> bool 
 
 async fn run_turn_events(
     core: &Arc<Core>,
-    core_rx: &mut mpsc::UnboundedReceiver<CoreEvent>,
+    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: &str,
     json: bool,
     saw_tokens: &mut bool,
@@ -133,10 +133,7 @@ async fn run_turn_events(
             }
         };
 
-        let CoreEvent::Agent(env) = event else {
-            // Ignore MLX/download events in headless; the user configured the endpoint.
-            continue;
-        };
+        let env = event;
         if env.session_id != session_id {
             continue;
         }
