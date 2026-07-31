@@ -837,7 +837,7 @@ pub async fn reload_session(
     let registry = Registry::from_snapshot(snapshot);
     // A forced reload observes whatever is on disk now; no turn was running,
     // so any delta since the last freeze is external to the session.
-    let reload_receipt =
+    let (reload_receipt, _) =
         ledger_changes(core, project_root, &files, crate::ledger::Actor::External, session_id);
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
     let counts = (registry.tools.len(), registry.skills.len(), reload_receipt);
@@ -956,15 +956,24 @@ async fn refreeze_if_extensions_changed(
             // sweep them up as this agent's work. Reconcile once, before any
             // agent attribution is possible; on a project the ledger has
             // never seen this same sync writes the initial baseline.
-            let _ = ledger_changes(
+            let (receipt, synced) = ledger_changes(
                 core,
                 project_root,
                 &files,
                 crate::ledger::Actor::External,
                 session_id,
             );
-            if let Some(d) = core.sessions.lock().await.get_mut(session_id) {
-                d.ledger_synced = true;
+            if synced {
+                if let Some(d) = core.sessions.lock().await.get_mut(session_id) {
+                    d.ledger_synced = true;
+                }
+            } else {
+                // Failed is not settled: stay unsynced so the next turn start
+                // retries, and say so - silence here is how a backlog ends up
+                // recorded later as the agent's own work.
+                for message in receipt {
+                    core.send_agent(session_id, AgentEvent::Error { message });
+                }
             }
         }
         return;
@@ -982,14 +991,16 @@ async fn refreeze_if_extensions_changed(
             apply_freeze(core, session_id, data, registry, prompt, breakdown);
             // Turn start: the change happened while no turn was running, so
             // it is external to this session (a human, git, an installer).
-            let changes = ledger_changes(
+            let (changes, synced) = ledger_changes(
                 core,
                 project_root,
                 &files,
                 crate::ledger::Actor::External,
                 session_id,
             );
-            data.ledger_synced = true;
+            // Only a landed sync settles reconciliation; a failure rides the
+            // receipt below and the next turn start retries.
+            data.ledger_synced = synced;
             core.send_agent(session_id, AgentEvent::Refrozen {
                 tools: counts.0,
                 skills: counts.1,
@@ -1077,17 +1088,19 @@ fn is_code_of_installed_manifest(path: &Path, project_root: &Path) -> bool {
 
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
 /// ledger failure never blocks activation, but it is reported in the receipt
-/// rather than swallowed.
+/// rather than swallowed. The flag says whether the sync actually landed:
+/// receipt text alone must never count as reconciliation, or a failed sync
+/// reads as a settled one and its backlog is later misattributed.
 fn ledger_changes(
     core: &Arc<Core>,
     project_root: &Path,
     files: &[(std::path::PathBuf, String, Vec<u8>)],
     actor: crate::ledger::Actor,
     session_id: &str,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     match crate::ledger::sync(&core.data_dir, project_root, files, actor, Some(session_id)) {
-        Ok(changes) => crate::ledger::describe(&changes, project_root),
-        Err(e) => vec![format!("ledger error: {e}")],
+        Ok(changes) => (crate::ledger::describe(&changes, project_root), true),
+        Err(e) => (vec![format!("ledger error: {e}")], false),
     }
 }
 
@@ -1143,8 +1156,11 @@ async fn refreeze_between_iterations(
         }
     }
     *registry = new_registry;
-    // Mid-turn: this session's own mutating call produced the change.
-    let changes = ledger_changes(
+    // Mid-turn: this session's own mutating call produced the change. A
+    // failure here must not re-arm the turn-start reconciliation: that path
+    // writes External, and this delta is the agent's. The receipt reports
+    // the failure, and the next Session-actor sync sweeps the backlog.
+    let (changes, _) = ledger_changes(
         core,
         project_root,
         &files,
@@ -3136,6 +3152,69 @@ mod tests {
             settled,
             "a synced session must not re-record on every turn start"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A first-turn reconciliation that fails must say so and stay unsynced,
+    /// so the next turn start retries. Marking a failed sync as settled would
+    /// drop the between-sessions delta forever - or worse, hand it to the
+    /// next mid-turn sync to record as the agent's own work.
+    #[tokio::test]
+    async fn failed_first_turn_reconciliation_reports_and_retries() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v1).unwrap();
+
+        {
+            let mut data = build_session_data(&core, "earlier", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("earlier".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "earlier", &project).await;
+        while rx.try_recv().is_ok() {}
+
+        // Between sessions the file changes - and the ledger breaks (a
+        // partial write): reconciliation must fail loudly, not settle.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+
+        {
+            let mut data = build_session_data(&core, "later", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("later".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let mut reported = false;
+        while let Ok(env) = rx.try_recv() {
+            if let AgentEvent::Error { message } = env.event {
+                assert!(message.contains("ledger"), "{message}");
+                reported = true;
+            }
+        }
+        assert!(reported, "a failed reconciliation must be reported, not swallowed");
+
+        // The ledger is repaired; the next turn start retries and lands the
+        // delta as external, because the session never marked itself synced.
+        std::fs::write(&log, &intact).unwrap();
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(v2.as_bytes());
+        let change = records
+            .iter()
+            .rev()
+            .find(|r| r.path.ends_with("deploy.toml") && r.sha256.as_deref() == Some(v2_sha.as_str()))
+            .expect("the retry must record the between-sessions change");
+        assert_eq!(change.actor, crate::ledger::Actor::External);
 
         let _ = std::fs::remove_dir_all(dir);
     }
