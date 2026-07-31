@@ -589,6 +589,9 @@ struct CompactionDigest {
     /// note's address points at. Transient: held only until the prune's
     /// archive append, never sent to the model.
     dropped: Vec<ChatMessage>,
+    /// Pre-truncation originals of tool outputs phase 1 cut in place: that
+    /// edit is as destructive as a drop, so the archive covers it too.
+    truncated: Vec<ChatMessage>,
 }
 
 impl CompactionDigest {
@@ -601,7 +604,13 @@ impl CompactionDigest {
             dropped_text: String::new(),
             text_cap,
             dropped: Vec::new(),
+            truncated: Vec::new(),
         }
+    }
+
+    /// True when this prune has anything the archive must record.
+    fn has_archive_material(&self) -> bool {
+        !self.dropped.is_empty() || !self.truncated.is_empty()
     }
 
     fn record_message(&mut self, msg: &ChatMessage) {
@@ -1402,33 +1411,40 @@ async fn run_loop(
         }
         let (budget_changed, compaction) = enforce_budget(guard.messages(), budget, schema_tokens);
         if let Some(mut digest) = compaction {
-            // Structured fields from the previous record carry forward by
-            // code: the prune may have dropped the old digest note, whose
-            // prose is lossy about the paths and tools it condensed.
-            if let Some(prior) = sessions::load_compaction(core, session_id).last() {
-                digest.absorb_prior(prior);
-            }
             // The lossless record behind the note's address, written before
-            // the transcript rewrite below makes the removal permanent.
-            sessions::append_archive(core, session_id, &digest.dropped);
-            let archive = sessions::archive_display(core, session_id);
-            // Upgrade the heuristic note to a model-written summary when the
-            // endpoint cooperates; the note at index 2 was just inserted by
-            // enforce_budget, so replacing it here keeps one digest message.
-            let note = match summarize_compaction(&client, &digest, &cancelled).await {
-                Some(summary) => digest.format_with_summary(&summary, Some(&archive)),
-                None => digest.format(Some(&archive)),
-            };
-            let messages = guard.messages();
-            if messages.len() > 2 && is_digest_message(&messages[2]) {
-                messages[2] = ChatMessage::user(note.clone());
-            }
-            let record = digest.to_record(note);
-            sessions::append_compaction(core, session_id, &record);
-            if let Ok(value) = serde_json::to_value(&record) {
-                let failures =
-                    hooks.compaction(session_id, project_root, &value, &cancelled).await;
-                report_hook_failures(&core, session_id, failures);
+            // the transcript rewrite below makes the edits permanent: both
+            // the pre-truncation originals and the dropped messages. `&` so
+            // both appends are attempted; a failed archive must not be
+            // advertised, so the address is withheld unless both landed.
+            let archived = sessions::append_archive(core, session_id, &digest.truncated)
+                & sessions::append_archive(core, session_id, &digest.dropped);
+            if digest.message_count > 0 {
+                // Structured fields from the previous record carry forward by
+                // code: the prune may have dropped the old digest note, whose
+                // prose is lossy about the paths and tools it condensed.
+                if let Some(prior) = sessions::last_compaction(core, session_id) {
+                    digest.absorb_prior(&prior);
+                }
+                let archive = archived.then(|| sessions::archive_display(core, session_id));
+                // Upgrade the heuristic note to a model-written summary when
+                // the endpoint cooperates; the note at index 2 was just
+                // inserted by enforce_budget, so replacing it here keeps one
+                // digest message.
+                let note = match summarize_compaction(&client, &digest, &cancelled).await {
+                    Some(summary) => digest.format_with_summary(&summary, archive.as_deref()),
+                    None => digest.format(archive.as_deref()),
+                };
+                let messages = guard.messages();
+                if messages.len() > 2 && is_digest_message(&messages[2]) {
+                    messages[2] = ChatMessage::user(note.clone());
+                }
+                let record = digest.to_record(note);
+                sessions::append_compaction(core, session_id, &record);
+                if let Ok(value) = serde_json::to_value(&record) {
+                    let failures =
+                        hooks.compaction(session_id, project_root, &value, &cancelled).await;
+                    report_hook_failures(&core, session_id, failures);
+                }
             }
         }
         let used = schema_tokens
@@ -2195,11 +2211,13 @@ fn enforce_budget(
     }
     let target = achievable_target(budget, schema_tokens);
     let keep_tail = messages.len().saturating_sub(6);
+    let mut digest = CompactionDigest::new(dropped_text_cap(budget));
     let mut truncated = false;
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
+                    digest.truncated.push(msg.clone());
                     let mut cut = 160;
                     while !c.is_char_boundary(cut) {
                         cut -= 1;
@@ -2212,12 +2230,12 @@ fn enforce_budget(
             }
         }
         if total <= target {
-            return (true, None);
+            let digest = Some(digest).filter(CompactionDigest::has_archive_material);
+            return (true, digest);
         }
     }
     // Drop whole exchanges starting after [system, first user]. Keep tool
     // replies consistent with the assistant message that requested them.
-    let mut digest = CompactionDigest::new(dropped_text_cap(budget));
     while total > target && messages.len() > 6 {
         let removed = messages.remove(2);
         digest.record_message(&removed);
@@ -2262,7 +2280,7 @@ fn enforce_budget(
         }
         (true, Some(digest))
     } else {
-        (truncated, None)
+        (truncated, Some(digest).filter(CompactionDigest::has_archive_material))
     }
 }
 
@@ -3396,7 +3414,13 @@ mod tests {
         }
         let (changed, digest) = enforce_budget(&mut messages, 700, 0);
         assert!(changed);
-        assert!(digest.is_none(), "truncate-only should not emit an exchange digest");
+        let digest = digest.expect("truncation is destructive, so it must reach the archive");
+        assert_eq!(digest.message_count, 0, "no exchanges dropped, so no digest note");
+        assert_eq!(digest.truncated.len(), 1, "the pre-truncation original is captured");
+        assert!(
+            digest.truncated[0].content.as_deref().unwrap().len() >= 4000,
+            "the archive copy is the original, not the stub"
+        );
         assert_eq!(messages.len(), 10, "nothing should be dropped, only truncated");
         let tool_len = messages[2].content.as_deref().unwrap().len();
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");

@@ -80,6 +80,17 @@ pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
     }
 }
 
+/// The most recent compaction record, parsing only the final valid line:
+/// carry-forward wants one record, and re-parsing an append-only history
+/// that only ever grows would make every prune slower than the last.
+pub fn last_compaction(core: &Core, id: &str) -> Option<CompactionRecord> {
+    let text = std::fs::read_to_string(compaction_path(core, id)).ok()?;
+    text.lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find_map(|l| serde_json::from_str(l).ok())
+}
+
 /// Load compaction history for a session (corrupt lines skipped).
 pub fn load_compaction(core: &Core, id: &str) -> Vec<CompactionRecord> {
     let Ok(text) = std::fs::read_to_string(compaction_path(core, id)) else {
@@ -101,14 +112,16 @@ pub fn archive_display(core: &Core, id: &str) -> String {
     archive_path(core, id).display().to_string()
 }
 
-/// Append the messages a prune dropped, oldest first, one JSON line each.
-/// The transcript rewrite that follows the prune is destructive; this file is
-/// the lossless record behind the digest note's address. Best-effort like
-/// `append_compaction`: a failure warns and the prune proceeds, because
-/// fitting the window beats archiving what no longer fits in it.
-pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) {
+/// Append the messages a prune dropped (or truncated in place), oldest
+/// first, one JSON line each. The transcript rewrite that follows the prune
+/// is destructive; this file is the lossless record behind the digest note's
+/// address. Best-effort like `append_compaction`: a failure warns and the
+/// prune proceeds, because fitting the window beats archiving what no longer
+/// fits in it - but the caller gets `false` so the note never advertises an
+/// address the archive does not honor.
+pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
-        return;
+        return true;
     }
     let mut lines = String::new();
     for msg in messages {
@@ -121,13 +134,17 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) {
         .append(true)
         .open(archive_path(core, id))
         .and_then(|mut f| f.write_all(lines.as_bytes()));
-    if let Err(e) = result {
-        core.send_agent(
-            id,
-            AgentEvent::Error {
-                message: format!("warning: failed to archive compacted messages: {e}"),
-            },
-        );
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            core.send_agent(
+                id,
+                AgentEvent::Error {
+                    message: format!("warning: failed to archive compacted messages: {e}"),
+                },
+            );
+            false
+        }
     }
 }
 
@@ -463,6 +480,34 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].message_count, 3);
         assert_eq!(loaded[1].ts, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Carry-forward reads one record, not the history: the final valid line
+    /// wins, and trailing garbage (a torn write) falls through to the last
+    /// parseable record instead of erasing the carry.
+    #[test]
+    fn last_compaction_parses_only_the_final_valid_line() {
+        let dir = std::env::temp_dir().join(format!("openmax-lastcomp-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "lc1";
+        assert!(last_compaction(&core, id).is_none());
+        for ts in [1u64, 2] {
+            append_compaction(&core, id, &CompactionRecord {
+                ts,
+                message_count: ts as usize,
+                tools: vec![],
+                paths: vec![format!("src/{ts}.rs")],
+                user_snippets: vec![],
+                digest: format!("[context note: {ts}]"),
+            });
+        }
+        let path = sessions_dir(&core).join(format!("{id}.compaction.jsonl"));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{{torn").unwrap();
+        let last = last_compaction(&core, id).expect("a valid record exists");
+        assert_eq!(last.ts, 2, "the final valid line wins over trailing garbage");
+        assert_eq!(last.paths, vec!["src/2.rs".to_string()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
