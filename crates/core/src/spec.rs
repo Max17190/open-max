@@ -452,8 +452,10 @@ No memories, no section, zero prompt cost.
 
 Scoring is ACT-R base-level activation, computed lazily from timestamps:
 each past access at age t hours contributes t^-0.5 (ages under one hour
-count as one hour), and activation is ln of the sum, so recency and
-frequency trade off in one number and one recall revives an old memory.
+count as one hour; events in the same hour collapse to one, so a write's
+mtime and its log line do not double-count), and activation is ln of the
+sum, so recency and frequency trade off in one number and one recall
+revives an old memory.
 Accesses are the file's mtime plus logged events in
 `.openmax/memory/.access.jsonl` (the harness appends `read` when read_file
 targets a memory path and `write` for write_file/edit_file, once per kind

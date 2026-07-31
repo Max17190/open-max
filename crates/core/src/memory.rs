@@ -214,17 +214,23 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
         // A file with no describable first line is skipped, not guessed at:
         // openmax --check names it and the fix (write a first line).
         let Some(description) = description_of(&text) else { continue };
-        let mut ages: Vec<f64> = Vec::new();
+        // One physical act, one event: a write_file produces both an mtime
+        // and a logged write at the same instant, and summing them would add
+        // a permanent ln(2) of activation (a 21-day fade becomes ~84 days).
+        // Ages bucket to whole hours (matching the one-hour clamp in
+        // `activation`), and buckets deduplicate.
+        let mut hour_buckets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
             let ts = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(now);
-            ages.push(now.saturating_sub(ts) as f64 / 3600.0);
+            hour_buckets.insert((now.saturating_sub(ts) / 3600).max(1));
         }
         for record in log.iter().filter(|r| r.name == name && r.kind != "gc") {
-            ages.push(now.saturating_sub(record.ts) as f64 / 3600.0);
+            hour_buckets.insert((now.saturating_sub(record.ts) / 3600).max(1));
         }
-        if ages.is_empty() {
-            ages.push(0.0);
+        if hour_buckets.is_empty() {
+            hour_buckets.insert(1);
         }
+        let ages: Vec<f64> = hour_buckets.into_iter().map(|h| h as f64).collect();
         entries.push(MemoryEntry {
             name: name.to_string(),
             description,
@@ -365,10 +371,9 @@ mod tests {
         let now = unix_now();
         write_memory(&root, "fresh-fact", "# The deploy port is 7443\ndetails");
         write_memory(&root, "old-fact", "# Old decision nobody reads");
-        // Backdate old-fact's mtime signal by logging nothing and pushing the
-        // file into the past via an old logged write plus filetime-free mtime:
-        // mtime is now for both, so use log weight to rank fresh-fact higher.
-        log_access(&root, "fresh-fact", now - HOUR, "read");
+        // Both files share a fresh mtime; a distinct-hour logged read gives
+        // fresh-fact a second event, which frequency must reward.
+        log_access(&root, "fresh-fact", now - 2 * HOUR, "read");
         let scan = scan(&root, now);
         assert_eq!(scan.entries.len(), 2);
         assert_eq!(scan.entries[0].name, "fresh-fact");
@@ -386,6 +391,27 @@ mod tests {
 
     fn scan_len(root: &Path, now: u64) -> usize {
         scan(root, now).entries.len()
+    }
+
+    /// One physical act must be one event: a write_file leaves both an mtime
+    /// and a logged write at the same instant, and counting both would add a
+    /// permanent ln(2) of activation, stretching the documented 21-day fade
+    /// to ~84 days. Found by the wire-level lifecycle eval, pinned here.
+    #[test]
+    fn same_hour_signals_collapse_to_one_event() {
+        let root = temp_project();
+        let now = unix_now();
+        write_memory(&root, "written-once", "# a fact");
+        write_memory(&root, "control", "# another fact");
+        log_access(&root, "written-once", now, "write");
+        let scan = scan(&root, now);
+        let written = scan.entries.iter().find(|e| e.name == "written-once").unwrap();
+        let control = scan.entries.iter().find(|e| e.name == "control").unwrap();
+        assert_eq!(
+            written.activation, control.activation,
+            "an mtime and its logged write must not double-count"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// mtime alone cannot fade (editing the file is a use); fading needs the
