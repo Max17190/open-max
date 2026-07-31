@@ -18,7 +18,7 @@ use crate::registry::Registry;
 use crate::sessions;
 use crate::state::{CancelToken, Core, SessionData};
 use crate::tools;
-use crate::types::{AgentEvent, ChatMessage, ToolCall};
+use crate::types::{estimate_tokens, AgentEvent, ChatMessage, ToolCall};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
@@ -1236,9 +1236,15 @@ async fn run_loop(
     let max_iterations = settings.max_agent_iterations.max(1);
 
     'turns: for _ in 0..max_iterations {
+        // The tool schemas are re-sent whole on every request, so they are as
+        // real as the transcript. Read per iteration: a mid-turn refreeze
+        // swaps the wire bytes, and the overhead must follow the current
+        // generation, not the one this turn started with.
+        let schema_tokens = estimate_tokens(schemas_wire.len());
         let (budget_changed, compaction) = enforce_budget(
             guard.messages(),
             context_tokens.saturating_sub(max_tokens + 1024),
+            schema_tokens,
         );
         if let Some(digest) = compaction {
             // Upgrade the heuristic note to a model-written summary when the
@@ -1260,7 +1266,8 @@ async fn run_loop(
                 report_hook_failures(&core, session_id, failures);
             }
         }
-        let used = guard.messages().iter().map(|m| m.estimated_tokens()).sum();
+        let used = schema_tokens
+            + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
@@ -1938,13 +1945,20 @@ fn approval_detail(args: &Value) -> String {
 /// cache warm) until the budget is crossed again.
 const PRUNE_TARGET_PCT: usize = 70;
 
+/// `schema_tokens` is the frozen tool schema array's estimated cost: it is
+/// re-sent in full on every request, so it counts against the same window as
+/// the transcript. Ignoring it under-reports a zero-extension session by
+/// several hundred tokens, and by more with every tool the agent writes.
+///
 /// Returns `(changed, exchange_digest)` where `exchange_digest` is set only when
 /// whole exchanges were dropped (not when only tool outputs were truncated).
 fn enforce_budget(
     messages: &mut Vec<ChatMessage>,
     budget: usize,
+    schema_tokens: usize,
 ) -> (bool, Option<CompactionDigest>) {
-    let mut total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+    let mut total: usize =
+        schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
     if total <= budget {
         return (false, None);
     }
@@ -1997,7 +2011,7 @@ fn enforce_budget(
         // append-only and does not re-mutate history for another prune.
         // Record dropped messages into the same digest so the note stays a
         // faithful summary of everything removed (not only the first pass).
-        total = messages.iter().map(|m| m.estimated_tokens()).sum();
+        total = schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         while total > target && messages.len() > 6 {
             let removed = messages.remove(3);
             digest.record_message(&removed);
@@ -3022,7 +3036,7 @@ mod tests {
             messages.push(msg("assistant", 2000));
             messages.push(msg("user", 2000));
         }
-        let _ = enforce_budget(&mut messages, 2000);
+        let _ = enforce_budget(&mut messages, 2000, 0);
         // Floor is system + first user + digest + a short tail (post-digest
         // drops may trim one more exchange when the digest itself overshoots).
         assert!(messages.len() >= 6 && messages.len() <= 7, "len={}", messages.len());
@@ -3042,7 +3056,7 @@ mod tests {
             messages.push(msg("user", 100));
             messages.push(msg("assistant", 100));
         }
-        let (changed, digest) = enforce_budget(&mut messages, 700);
+        let (changed, digest) = enforce_budget(&mut messages, 700, 0);
         assert!(changed);
         assert!(digest.is_none(), "truncate-only should not emit an exchange digest");
         assert_eq!(messages.len(), 10, "nothing should be dropped, only truncated");
@@ -3050,10 +3064,10 @@ mod tests {
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");
     }
 
-    /// One prune must buy headroom: after compaction the transcript sits at or
-    /// below the prune target, and re-running enforce_budget mutates nothing,
-    /// so the token prefix (and the server's prompt cache) stays stable while
-    /// the next iterations append.
+    /// One prune must buy headroom: after compaction the transcript *plus the
+    /// schema overhead* sits at or below the prune target, and re-running
+    /// enforce_budget mutates nothing, so the token prefix (and the server's
+    /// prompt cache) stays stable while the next iterations append.
     #[test]
     fn budget_prunes_once_with_hysteresis() {
         let mut messages = vec![msg("system", 400), msg("user", 400)];
@@ -3062,15 +3076,20 @@ mod tests {
             messages.push(msg("tool", 3000));
         }
         let budget = 4000;
-        assert!(enforce_budget(&mut messages, budget).0);
-        let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        let schema_tokens = 300;
+        assert!(enforce_budget(&mut messages, budget, schema_tokens).0);
+        let total: usize =
+            schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         assert!(
             total <= budget * PRUNE_TARGET_PCT / 100,
             "prune should reach the target, got {total} of {budget}"
         );
 
         let snapshot: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
-        assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
+        assert!(
+            !enforce_budget(&mut messages, budget, schema_tokens).0,
+            "second pass must be a no-op"
+        );
         let after: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
         assert_eq!(snapshot, after, "no message may change between prunes");
     }
@@ -3083,19 +3102,19 @@ mod tests {
             messages.push(msg("tool", 2500));
         }
         let budget = 3000;
-        let (changed, digest) = enforce_budget(&mut messages, budget);
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0);
         assert!(changed);
         assert!(digest.is_some());
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
         let first_digest = messages[2].content.clone();
-        assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
+        assert!(!enforce_budget(&mut messages, budget, 0).0, "second pass must be a no-op");
         assert_eq!(messages[2].content, first_digest, "digest must not be replaced on no-op");
 
         for _ in 0..6 {
             messages.push(assistant_with_tools("edit_file", r#"{"path":"src/new.rs"}"#));
             messages.push(msg("tool", 2500));
         }
-        assert!(enforce_budget(&mut messages, budget).0);
+        assert!(enforce_budget(&mut messages, budget, 0).0);
         let digest_count = messages
             .iter()
             .filter(|m| m.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX)))
@@ -3163,7 +3182,7 @@ mod tests {
             messages.push(msg("assistant", 2000));
             messages.push(msg("user", 2000));
         }
-        let (_, digest) = enforce_budget(&mut messages, 2500);
+        let (_, digest) = enforce_budget(&mut messages, 2500, 0);
         let digest = digest.expect("exchange drop should produce a digest");
         let text = digest.format();
         assert!(text.contains("read_file"), "{text}");
@@ -3184,17 +3203,116 @@ mod tests {
             messages.push(msg("tool", 1800));
         }
         let budget = 3500;
+        let schema_tokens = 300;
         let target = budget * PRUNE_TARGET_PCT / 100;
-        let (changed, digest) = enforce_budget(&mut messages, budget);
+        let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens);
         assert!(changed);
         assert!(digest.is_some());
-        let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        let total: usize =
+            schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         assert!(
             total <= target,
             "post-digest total {total} must be <= target {target} (budget {budget})"
         );
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
-        assert!(!enforce_budget(&mut messages, budget).0, "second pass must be a no-op");
+        assert!(
+            !enforce_budget(&mut messages, budget, schema_tokens).0,
+            "second pass must be a no-op"
+        );
+    }
+
+    /// The tools JSON is re-sent whole on every request, so it spends the same
+    /// window the transcript does. A transcript that fits on message bytes
+    /// alone can still be over once the frozen schemas are counted, and the
+    /// used total the Budget event reports is messages + schemas.
+    #[test]
+    fn budget_counts_frozen_tool_schemas() {
+        let mut messages = vec![msg("system", 200), msg("user", 200)];
+        for _ in 0..4 {
+            messages.push(msg("assistant", 200));
+            messages.push(msg("tool", 4000));
+        }
+        let message_tokens: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        let schema_tokens = 600;
+
+        // Messages alone exactly fill the window: nothing to do.
+        let mut without = messages.clone();
+        assert!(
+            !enforce_budget(&mut without, message_tokens, 0).0,
+            "message-only total at budget must be a no-op"
+        );
+
+        // Same messages, same window, schemas now counted: over, so compaction
+        // fires. This is the case the old message-only sum missed entirely.
+        let mut with = messages.clone();
+        assert!(
+            enforce_budget(&mut with, message_tokens, schema_tokens).0,
+            "schema overhead must push an at-budget transcript over"
+        );
+        let pruned: usize = with.iter().map(|m| m.estimated_tokens()).sum();
+        let target = message_tokens * PRUNE_TARGET_PCT / 100;
+        assert!(
+            pruned + schema_tokens <= target,
+            "used total (messages {pruned} + schemas {schema_tokens}) must reach target {target}"
+        );
+    }
+
+    /// A mid-turn refreeze changes the wire schemas, so the overhead the
+    /// budget carries must track the current frozen generation, not the one
+    /// the session started with.
+    #[tokio::test]
+    async fn budget_overhead_tracks_refrozen_schemas() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "budget-refreeze";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let data = build_session_data(&core, id, &project);
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        let before = registry.schema_tokens();
+        assert_eq!(
+            before,
+            estimate_tokens(registry.tool_schemas_wire().len()),
+            "overhead must be the wire bytes the request actually carries"
+        );
+
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships the current branch to production\"\ncommand = \"/bin/true\"\n",
+        )
+        .unwrap();
+        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        let after = registry.schema_tokens();
+        assert!(after > before, "a new tool must grow the overhead: {before} -> {after}");
+
+        // And enforcement follows: a window that fit the old generation with
+        // this transcript no longer fits the new one.
+        let mut transcript = vec![msg("system", 200), msg("user", 200)];
+        for _ in 0..4 {
+            transcript.push(msg("assistant", 200));
+            transcript.push(msg("tool", 4000));
+        }
+        let budget: usize =
+            before + transcript.iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        let mut old_generation = transcript.clone();
+        assert!(!enforce_budget(&mut old_generation, budget, before).0);
+        assert!(
+            enforce_budget(&mut transcript, budget, after).0,
+            "the refrozen schemas must be what pushes the turn over"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A turn that dies mid-flight must still terminate for its clients and

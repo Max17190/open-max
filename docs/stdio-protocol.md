@@ -58,7 +58,7 @@ key order is not significant: parse every line by field name.
 | `token` | `text` |
 | `thinking` | `text` |
 | `message_done` | `text` |
-| `budget` | `used_tokens`, `context_tokens` |
+| `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas re-sent every request), `context_tokens` |
 | `usage` | `prompt_tokens`, `completion_tokens`, `cached_tokens` (or null) |
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |

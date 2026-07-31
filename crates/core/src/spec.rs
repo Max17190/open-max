@@ -381,7 +381,8 @@ are skipped.
 
 Events: every line carries `session_id`, a `type` discriminator, then fields.
 Parse by field name, never by key order. Types: `token` (text), `thinking`
-(text), `message_done` (text), `budget` (used_tokens, context_tokens),
+(text), `message_done` (text), `budget` (used_tokens: the transcript plus
+the frozen tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
 (call_id, name, args), `tool_end` (call_id, ok, output), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,

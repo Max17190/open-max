@@ -46,7 +46,8 @@ impl ChatMessage {
         Self { role: "tool".into(), content: Some(content.into()), tool_calls: None, tool_call_id: Some(tool_call_id.into()) }
     }
 
-    /// Rough size estimate used for context budgeting (~4 chars per token).
+    /// Rough size estimate used for context budgeting, plus a small constant
+    /// for the role/envelope bytes every message pays.
     pub fn estimated_tokens(&self) -> usize {
         let mut chars = self.content.as_deref().map(str::len).unwrap_or(0);
         if let Some(calls) = &self.tool_calls {
@@ -54,8 +55,16 @@ impl ChatMessage {
                 chars += c.function.name.len() + c.function.arguments.len() + 16;
             }
         }
-        chars / 4 + 8
+        estimate_tokens(chars) + 8
     }
+}
+
+/// The one token estimator (~4 chars per token) behind every context number:
+/// message sizes, the frozen tool schemas that ride on every request, and the
+/// /context display. Keeping it in one place is what makes what the budget
+/// enforces and what the UI shows the same quantity.
+pub fn estimate_tokens(chars: usize) -> usize {
+    chars / 4
 }
 
 /// Events streamed from the agent loop to the frontend. `Deserialize` makes
