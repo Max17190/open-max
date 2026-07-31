@@ -8,8 +8,7 @@
 //!
 //! - `<tool_call>{...}</tool_call>` blocks (Qwen template family), including
 //!   an unclosed final tag from a truncated stream
-//! - fenced ```tool_call / ```tool_code / ```tool / ```json blocks with a JSON
-//!   body, which is also why models writing JSON examples in prose are safe
+//! - fenced ```tool_call / ```tool_code / ```tool blocks with a JSON body
 //! - `<function=...>{json}</function>` tags (and the `<function name="...">` form)
 //! - bare `<invoke name="..."><parameter>...</parameter></invoke>` blocks
 //!
@@ -18,6 +17,13 @@
 //! Assistant text routinely quotes file content, and a file can contain call
 //! markup. Extraction therefore never trusts markup found inside a fenced code
 //! block, and every shape must name a tool the registry actually serves.
+//!
+//! Nothing outside the shapes above is recovered. A plain ```json fence is
+//! always prose, even when its body has call shape and names a real tool: a
+//! coding agent writing JSON examples is ordinary output, the builtins are
+//! always known tools, and so a known name is no evidence of intent to call.
+//! Only the tool-flavored fence infos, which no model emits by accident, and
+//! the XML-ish tags carry that evidence.
 
 use serde_json::Value;
 
@@ -190,8 +196,9 @@ fn collect_tagged(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, u
     }
 }
 
-/// Fenced code blocks that carry a call. Every shape requires a known tool
-/// name, which also keeps ordinary JSON examples in prose from being eaten.
+/// Fenced code blocks that carry a call. The info string must be explicitly
+/// tool-flavored; a plain `json` fence is prose whatever its body says. The
+/// body must still name a tool the registry serves.
 fn collect_fenced(
     content: &str,
     fences: &[Fence],
@@ -199,7 +206,7 @@ fn collect_fenced(
     spans: &mut Vec<(usize, usize, ToolCallFunction)>,
 ) {
     for fence in fences {
-        if !matches!(fence.info.as_str(), "tool_call" | "tool_code" | "tool" | "json") {
+        if !matches!(fence.info.as_str(), "tool_call" | "tool_code" | "tool") {
             continue;
         }
         let body = &content[fence.body.0..fence.body.1];
@@ -444,14 +451,21 @@ mod tests {
     }
 
     #[test]
-    fn fenced_json_requires_known_tool() {
-        let call = "Some explanation.\n```json\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"todo\"}}\n```";
-        let (clean, calls) = extract_tool_calls(call, known()).unwrap();
-        assert_eq!(clean, "Some explanation.");
-        assert_eq!(calls[0].function.name, "grep");
-
-        let prose = "Here is a config example:\n```json\n{\"name\": \"my-app\", \"arguments\": {\"port\": 3000}}\n```";
-        assert!(extract_tool_calls(prose, known()).is_none());
+    fn a_json_fence_is_never_executed() {
+        // Documenting a call is what a coding agent does all day, and the
+        // builtins are always known tools, so naming one proves nothing. A
+        // plain json fence stays prose whatever its body holds.
+        for body in [
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"rm -rf /tmp/canary\"}}",
+            "{\"name\": \"grep\", \"arguments\": {\"pattern\": \"todo\"}}",
+            "{\"name\": \"my-app\", \"arguments\": {\"port\": 3000}}",
+        ] {
+            let text = format!("Here is the call, which I am only documenting:\n```json\n{body}\n```");
+            assert!(
+                extract_tool_calls(&text, known()).is_none(),
+                "extracted a call from a json fence: {body}"
+            );
+        }
     }
 
     #[test]
