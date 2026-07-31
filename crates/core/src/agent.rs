@@ -382,7 +382,7 @@ fn count_usage(
                     delta.ledger.skills.push(skill.name.clone());
                 }
             }
-            if let Some(event) = crate::memory::access_of(name, rel) {
+            if let Some(event) = crate::memory::access_of(name, rel, project_root) {
                 delta.memory.push(event);
             }
         }

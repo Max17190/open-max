@@ -169,19 +169,43 @@ pub fn record_accesses(project_root: &Path, events: &[(String, String)]) {
 
 /// The file tools' view of a call against the memory directory, for the turn
 /// loop: `read_file` of a memory path is a recall, `write_file`/`edit_file`
-/// is a reinforcement. Paths are project-relative as the prompt mandates.
-pub fn access_of(tool: &str, path: &str) -> Option<(String, String)> {
-    let rel = path.trim_start_matches("./");
-    let name = rel.strip_prefix(".openmax/memory/")?.strip_suffix(".md")?;
-    if !valid_name(name) {
-        return None;
-    }
+/// is a reinforcement. Paths are matched the way the tools resolve them -
+/// `subdir/../.openmax/memory/x.md` and an absolute path inside the project
+/// are the same access - or an actively used memory would starve and fade.
+pub fn access_of(tool: &str, path: &str, project_root: &Path) -> Option<(String, String)> {
     let kind = match tool {
         "read_file" => "read",
         "write_file" | "edit_file" => "write",
         _ => return None,
     };
+    let normalized = normalize(path, project_root)?;
+    let name = normalized.strip_prefix(".openmax/memory/")?.strip_suffix(".md")?;
+    if !valid_name(name) {
+        return None;
+    }
     Some((name.to_string(), kind.to_string()))
+}
+
+/// Lexically resolve `.`/`..` and strip an absolute project prefix, without
+/// touching the filesystem: the dispatcher classifies calls after the tool
+/// already ran, it never re-resolves them. A path that walks above its root
+/// is not a memory access (the tools reject it anyway).
+fn normalize(path: &str, project_root: &Path) -> Option<String> {
+    let p = Path::new(path);
+    let rel = p.strip_prefix(project_root).unwrap_or(p);
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(s) => parts.push(s),
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let joined: PathBuf = parts.iter().collect();
+    joined.to_str().map(str::to_string)
 }
 
 fn load_log(project_root: &Path) -> Vec<AccessRecord> {
@@ -256,7 +280,21 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
             omitted += 1;
         }
     }
+    // The omission trailer spends the same budget the lines do: evict the
+    // weakest surfaced entries until lines plus trailer fit the cap, so the
+    // documented 1500 bytes is what the prompt actually pays.
+    while omitted > 0 && spent + trailer_line(omitted).len() > MAX_MEMORY_BYTES {
+        let Some(last_in) = entries.iter_mut().rev().find(|e| e.in_index) else { break };
+        let line_len = index_line(last_in).len();
+        last_in.in_index = false;
+        spent -= line_len;
+        omitted += 1;
+    }
     MemoryScan { entries, omitted }
+}
+
+fn trailer_line(omitted: usize) -> String {
+    format!("… {omitted} more (ls {MEMORY_DIR})\n")
 }
 
 pub fn index_line(entry: &MemoryEntry) -> String {
@@ -279,7 +317,7 @@ pub fn index_section(project_root: &Path, now: u64) -> Option<(String, Vec<(Stri
         out.push_str(&line);
     }
     if scan.omitted > 0 {
-        out.push_str(&format!("… {} more (ls {MEMORY_DIR})\n", scan.omitted));
+        out.push_str(&trailer_line(scan.omitted));
     }
     Some((out, breakdown))
 }
@@ -296,9 +334,6 @@ pub fn forget_faded(project_root: &Path, now: u64) -> Vec<String> {
     for entry in scan.entries.iter().filter(|e| e.activation < gc_floor) {
         let path = project_root.join(&entry.path);
         let Ok(bytes) = std::fs::read(&path) else { continue };
-        if std::fs::remove_file(&path).is_err() {
-            continue;
-        }
         let record = AccessRecord {
             name: entry.name.clone(),
             ts: now,
@@ -306,12 +341,20 @@ pub fn forget_faded(project_root: &Path, now: u64) -> Vec<String> {
             sha256: Some(crate::ledger::sha256_hex(&bytes)),
             description: Some(entry.description.clone()),
         };
-        if let Ok(line) = serde_json::to_string(&record) {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path(project_root))
-                .and_then(|mut f| writeln!(f, "{line}"));
+        let Ok(line) = serde_json::to_string(&record) else { continue };
+        // Tombstone first, delete second: a memory may outlive its GC round
+        // when the log cannot be written, but no memory ever vanishes
+        // untombstoned. If the delete then fails, the stale tombstone is
+        // harmless (scan ignores gc records; the file keeps scoring) and the
+        // next round appends a fresh one.
+        let logged = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path(project_root))
+            .and_then(|mut f| writeln!(f, "{line}"))
+            .is_ok();
+        if !logged || std::fs::remove_file(&path).is_err() {
+            continue;
         }
         forgotten.push(entry.name.clone());
     }
@@ -465,7 +508,11 @@ mod tests {
             write_memory(&root, &format!("fact-{i:02}"), &format!("# {}", "d".repeat(120)));
         }
         let (section, breakdown) = index_section(&root, now).expect("index exists");
-        assert!(section.len() <= MAX_MEMORY_BYTES + 64, "section stays near budget");
+        assert!(
+            section.len() <= MAX_MEMORY_BYTES,
+            "lines plus trailer must fit the documented budget, got {}",
+            section.len()
+        );
         assert!(breakdown.len() < 40, "not everything fits");
         assert!(section.contains("more (ls .openmax/memory)"), "{section}");
         let shown_bytes: usize = breakdown.iter().map(|(_, b)| b).sum();
@@ -485,18 +532,21 @@ mod tests {
 
     #[test]
     fn tool_calls_map_to_access_events() {
-        assert_eq!(
-            access_of("read_file", ".openmax/memory/deploy-port.md"),
-            Some(("deploy-port".into(), "read".into()))
-        );
-        assert_eq!(
-            access_of("edit_file", "./.openmax/memory/deploy-port.md"),
-            Some(("deploy-port".into(), "write".into()))
-        );
-        assert_eq!(access_of("read_file", "src/main.rs"), None);
-        assert_eq!(access_of("bash", ".openmax/memory/deploy-port.md"), None);
-        assert_eq!(access_of("read_file", ".openmax/memory/.access.jsonl"), None);
-        assert_eq!(access_of("read_file", ".openmax/memory/Bad.md"), None);
+        let root = Path::new("/proj");
+        let read = Some(("deploy-port".to_string(), "read".to_string()));
+        let write = Some(("deploy-port".to_string(), "write".to_string()));
+        assert_eq!(access_of("read_file", ".openmax/memory/deploy-port.md", root), read);
+        assert_eq!(access_of("edit_file", "./.openmax/memory/deploy-port.md", root), write);
+        // The tools resolve dot segments and project-absolute forms to the
+        // same file; classification must too, or a used memory starves.
+        assert_eq!(access_of("read_file", "subdir/../.openmax/memory/deploy-port.md", root), read);
+        assert_eq!(access_of("read_file", "/proj/.openmax/memory/deploy-port.md", root), read);
+        assert_eq!(access_of("read_file", "../elsewhere/.openmax/memory/deploy-port.md", root), None);
+        assert_eq!(access_of("read_file", "/other/.openmax/memory/deploy-port.md", root), None);
+        assert_eq!(access_of("read_file", "src/main.rs", root), None);
+        assert_eq!(access_of("bash", ".openmax/memory/deploy-port.md", root), None);
+        assert_eq!(access_of("read_file", ".openmax/memory/.access.jsonl", root), None);
+        assert_eq!(access_of("read_file", ".openmax/memory/Bad.md", root), None);
     }
 
     #[test]
