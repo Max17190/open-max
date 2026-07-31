@@ -39,6 +39,8 @@ pub struct PromptBreakdown {
     pub tools: Vec<(String, usize, bool)>,
     /// (name, index line chars) per skill.
     pub skills: Vec<(String, usize)>,
+    /// (name, index line chars) per memory the index surfaced.
+    pub memory: Vec<(String, usize)>,
 }
 
 impl PromptBreakdown {
@@ -99,6 +101,20 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         prompt.push_str(&instructions);
         breakdown.components.push(("AGENTS.md".into(), prompt.len() - before));
     }
+    // The memory index rides the frozen prefix like the skills index: a line
+    // per surfaced fact, bodies loaded on demand, nothing when the project
+    // has no live memories so the zero-cost invariant holds.
+    if let Some((index, rows)) =
+        crate::memory::index_section(project_root, crate::memory::unix_now())
+    {
+        let before = prompt.len();
+        prompt.push_str(
+            "\n\nMemory (facts saved in earlier sessions; read_file one before relying on it):\n",
+        );
+        prompt.push_str(&index);
+        breakdown.components.push(("memory index".into(), prompt.len() - before));
+        breakdown.memory = rows;
+    }
     if let Some(map) = project_map(project_root) {
         let before = prompt.len();
         prompt.push_str("\n\nProject layout (top levels; explore deeper with tools):\n");
@@ -137,13 +153,14 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end. Unapproved hooks are inert; approval covers the .toml and the code it runs, and editing either revokes it (a revoked live gate then blocks tools).\n\
 - Permission rules: .openmax/permissions.toml, one [[rules]] table per rule with effect = allow|deny|ask, tool = \"<tool name>\", optional arg_regex (unanchored). Any error in this file denies every tool, so write it exactly and check it.\n\
 - Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
-A tool or skill you write goes live before your next step: the harness re-freezes after a successful mutating call and at turn start (/reload also forces it). The harness records tool/skill file changes (actor + hash); bash: openmax --ledger lists history and restorable objects. Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check. Before writing a surface, read its full contract (fields, stdin payloads, activation) with bash: openmax --spec tools|skills|prompts|hooks|permissions|providers|stdio.\n\
+A tool or skill you write goes live before your next step: the harness re-freezes after a successful mutating call and at turn start (/reload also forces it). The harness records tool/skill file changes (actor + hash); bash: openmax --ledger lists history and restorable objects. Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check. Before writing a surface, read its full contract (fields, stdin payloads, activation) with bash: openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
 Compose beyond the loop with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.\n\
 \n\
-Working files (there is no built-in plan mode, todo list, or memory):\n\
+Working files (there is no built-in plan mode or todo list):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
 - TODO.md: the running task list; check items off as you finish.\n\
-- AGENTS.md: durable project facts worth remembering across sessions; keep it short (loads at session create and on /reload).";
+- AGENTS.md: standing project instructions; keep it short (loads at session create and on /reload).\n\
+- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line becomes an index line in future sessions. Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -334,7 +351,9 @@ mod tests {
         assert!(prompt.contains("openmax --check"));
         // The guide is an index; the full per-surface contract is read on
         // demand, and the pointer must name every surface --spec accepts.
-        assert!(prompt.contains("openmax --spec tools|skills|prompts|hooks|permissions|providers|stdio"));
+        assert!(prompt.contains(
+            "openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio"
+        ));
         assert!(prompt.contains("user_prompt_submit"));
         assert!(prompt.contains("providers.json"));
         assert!(prompt.contains("Provider: use bash"));
@@ -343,10 +362,14 @@ mod tests {
         assert!(prompt.contains("tmux for durable or parallel processes"));
         assert!(prompt.contains("stdio protocol for custom frontends"));
         // The design's "use instead" contract: PLAN.md over plan mode,
-        // TODO.md over a todo product, AGENTS.md as durable memory.
+        // TODO.md over a todo product, AGENTS.md for standing instructions,
+        // and the memory surface for facts that must survive sessions.
         assert!(prompt.contains("PLAN.md"));
         assert!(prompt.contains("TODO.md"));
-        assert!(prompt.contains("AGENTS.md: durable project facts"));
+        assert!(prompt.contains("AGENTS.md: standing project instructions"));
+        assert!(prompt.contains(".openmax/memory/<name>.md"));
+        assert!(prompt.contains("fade from the index"));
+        assert!(prompt.contains("openmax --spec memory"));
         assert!(prompt.contains("on /reload"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -548,6 +571,14 @@ mod tests {
     /// unapproved hooks are inert and stopped there, which taught the agent
     /// that rewriting a hook's script was harmless - the exact belief the
     /// approval binding exists to correct.
+    ///
+    /// Raised from 5020 to 5280 (2026-07-31): the working-files contract now
+    /// names the memory surface (+220 chars). Re-measured per the rule above
+    /// with `dump_frozen_prompt_payload_for_tokenizer`: 1196 tokens on
+    /// o200k_base, 1174 on cl100k_base at 5240 path-free chars, so the cap
+    /// tracks ~1200 tokens. The old guide taught "there is no memory", which
+    /// held the agent to AGENTS.md hand-editing; ~20 real tokens is the price
+    /// of the index being discoverable at all.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -574,9 +605,63 @@ mod tests {
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
         assert!(
-            total <= 5_020,
-            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5020 ≈ 1180 tokens with a typical checkout path)",
+            total <= 5_280,
+            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5280 ≈ 1200 tokens with a typical checkout path)",
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Measurement helper for cap raises (see the budget-gate comment): dumps
+    /// the exact path-free payload the cap test measures so a real tokenizer
+    /// can count it. Run with `--ignored --nocapture`; files land in the OS
+    /// temp dir.
+    #[test]
+    #[ignore]
+    fn dump_frozen_prompt_payload_for_tokenizer() {
+        let dir = temp_project();
+        let registry = crate::registry::Registry::build(&dir);
+        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let base_chars: usize = breakdown
+            .components
+            .iter()
+            .filter(|(name, _)| name == "base rules" || name == "self-extension guide")
+            .map(|(_, c)| *c)
+            .sum();
+        let path_free = prompt[..base_chars].replace(&dir.to_string_lossy().to_string(), "");
+        let base_path = std::env::temp_dir().join("openmax-prompt-base.txt");
+        let tools_path = std::env::temp_dir().join("openmax-prompt-tools.json");
+        std::fs::write(&base_path, path_free).unwrap();
+        std::fs::write(&tools_path, registry.tool_schemas_wire()).unwrap();
+        eprintln!("wrote {} and {}", base_path.display(), tools_path.display());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The memory index is a prompt section like the skills index: one line
+    /// per surfaced fact when memories exist, and nothing at all when none
+    /// do, so a memoryless project's prompt stays byte-identical.
+    #[test]
+    fn memory_index_appears_only_when_memories_exist() {
+        let dir = temp_project();
+        let registry = Registry::builtin_only();
+        let without = system_prompt(&dir, &registry);
+        assert!(!without.contains("Memory ("), "no memories, no section:\n{without}");
+
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/deploy-port.md"),
+            "# The deploy port is 7443\nSet in infra/nginx.conf.",
+        )
+        .unwrap();
+        let (with, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        assert!(
+            with.contains("Memory (facts saved in earlier sessions"),
+            "memory section must appear:\n{with}"
+        );
+        assert!(with.contains(
+            "- deploy-port: The deploy port is 7443 — .openmax/memory/deploy-port.md"
+        ));
+        assert_eq!(breakdown.memory.len(), 1);
+        assert!(breakdown.components.iter().any(|(name, _)| name == "memory index"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

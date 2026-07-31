@@ -73,6 +73,18 @@ pub fn context_block(
         lines.push(row(&format!("skills ({})", breakdown.skills.len()), 0, &detail));
     }
 
+    if !breakdown.memory.is_empty() {
+        // Memory lines are already counted inside the "memory index" prompt
+        // component; this row just itemizes them.
+        let detail = breakdown
+            .memory
+            .iter()
+            .map(|(name, c)| format!("{name} {}", tok(*c)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(row(&format!("memory ({})", breakdown.memory.len()), 0, &detail));
+    }
+
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(34)),
         Style::default().fg(theme::DIM()),

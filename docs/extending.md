@@ -52,6 +52,28 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
+## Memory
+
+One durable fact per markdown file under `.openmax/memory/`, written with the
+ordinary file tools. The file stem is the memory's name (1-64 chars of
+`[a-z0-9-]`), the first non-empty line is its description, and the body loads
+only on demand. At session creation the live memories are ranked by ACT-R
+base-level activation (each past access at age `t` hours contributes
+`t^-0.5`; activation is the log of the sum, so one recall revives an old
+memory) and injected as one index line each under a 1500-byte budget. The
+harness appends reads and writes of memory paths to
+`.openmax/memory/.access.jsonl`; a memory that would score below one access
+21 days old leaves the index, and below one access 60 days old the file is
+deleted at the next session creation, leaving a tombstone line (name, sha256,
+description) in the log. No memories, no section, zero prompt cost. Full
+contract: `openmax --spec memory`.
+
+```
+.openmax/memory/deploy-port.md
+# The staging deploy port is 7443 (set 2026-07-31)
+Set in infra/nginx.conf; the health check expects /healthz on the same port.
+```
+
 ## Prompt templates
 
 A markdown file under `.agents/prompts/` or `~/.openmax/prompts/`; the file
