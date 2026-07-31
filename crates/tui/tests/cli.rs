@@ -342,7 +342,8 @@ fn a_print_turn_expands_a_prompt_template() {
 
 /// One scripted SSE completion per request, and every request body appended to
 /// `record`, so a test can assert both what openmax did and what the model was
-/// told afterwards.
+/// told afterwards. Records to a file (not memory) so a test can read the wire
+/// after the run without holding the server handle.
 fn spawn_recording_server(
     bodies: Vec<String>,
     record: PathBuf,
@@ -400,11 +401,24 @@ fn sse(chunks: &[serde_json::Value]) -> String {
 }
 
 fn sse_tool_call(name: &str, args: serde_json::Value) -> String {
+    sse_tool_calls(&[(name, args)])
+}
+
+/// One assistant message carrying several tool calls, the shape that routes
+/// consecutive read-only calls into the concurrent batch path.
+fn sse_tool_calls(calls: &[(&str, serde_json::Value)]) -> String {
+    let deltas: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| {
+            serde_json::json!({
+                "index": i, "id": format!("call_{i}"), "type": "function",
+                "function": {"name": name, "arguments": args.to_string()}
+            })
+        })
+        .collect();
     sse(&[
-        serde_json::json!({"choices":[{"delta":{"tool_calls":[{
-            "index": 0, "id": "call_1", "type": "function",
-            "function": {"name": name, "arguments": args.to_string()}
-        }]},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":deltas},"finish_reason":null}]}),
         serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
     ])
 }
@@ -414,6 +428,59 @@ fn sse_text(text: &str) -> String {
         serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]}),
         serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
     ])
+}
+
+/// Emitting the same unapproved tool twice in one message is the bypass:
+/// consecutive external non-mutating calls are routed to the concurrent batch
+/// path, which has no approval UI. The gate has to survive that routing, so
+/// both calls must land on the serial path and prompt.
+#[test]
+fn two_calls_to_an_unapproved_tool_cannot_batch_past_the_gate() {
+    let (project, home) = fresh_dirs("unapproved-batch");
+    let record = project.parent().unwrap().join("requests.jsonl");
+    let (base_url, _server) = spawn_recording_server(
+        vec![
+            sse_tool_calls(&[
+                ("peek", serde_json::json!({"count": 1})),
+                ("peek", serde_json::json!({"count": 2})),
+            ]),
+            sse_text("blocked"),
+        ],
+        record,
+    );
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(
+        tools.join("peek.toml"),
+        "name = \"peek\"\ndescription = \"look something up\"\ncommand = \"/bin/sh\"\n\
+         args = [\"-c\", \"cat >/dev/null; echo ran >> peeked.txt; echo looked\"]\nmutating = false\n\
+         \n[params]\ntype = \"object\"\n[params.properties.count]\ntype = \"number\"\n",
+    )
+    .unwrap();
+
+    let out = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "peek twice"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !project.join("peeked.txt").exists(),
+        "batching must not run unapproved host code\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let events: Vec<serde_json::Value> =
+        stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let prompts: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["type"] == "approval_request").collect();
+    assert_eq!(prompts.len(), 2, "each call takes the serial path: {stdout}");
+    for prompt in prompts {
+        assert_eq!(prompt["reason"], "unapproved_source");
+        assert_eq!(prompt["source_path"], ".openmax/tools/peek.toml");
+    }
 }
 
 /// The human content boundary covers every agent-written tool, not only the

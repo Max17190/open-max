@@ -146,6 +146,8 @@ fn batchable_call(
     registry: &Registry,
     repeat_tracker: &RepeatCallTracker,
     permissions: &Permissions,
+    data_dir: &Path,
+    project_root: &Path,
 ) -> bool {
     let name = call.function.name.as_str();
     if name.is_empty() {
@@ -164,7 +166,17 @@ fn batchable_call(
         PermissionDecision::Allow | PermissionDecision::Default => {}
     }
     let args_key = canonicalize_args(&args);
-    !repeat_tracker.would_block(name, &args_key)
+    if repeat_tracker.would_block(name, &args_key) {
+        return false;
+    }
+    // Same principle as Ask: a tool whose content no human has approved needs
+    // the serial path, which is where the prompt and its actionable event live.
+    // This check is load-bearing rather than defensive - batching selects for
+    // external non-mutating tools, which is exactly the population the content
+    // gate exists to catch, so an unapproved tool called twice in one message
+    // would otherwise run unattended. Kept last because it is the only check
+    // that touches disk, and built-ins return before the ledger is read.
+    unapproved_capability(registry, data_dir, project_root, name).is_none()
 }
 
 /// Append cancel/error tool messages for any tool_call_ids on the last assistant
@@ -369,7 +381,10 @@ async fn execute_readonly_batch(
             name: name.into(),
             args: args.clone(),
         });
-        // hooks pre → permissions → (readonly tools skip approval_mode)
+        // hooks pre → permissions → content gate. approval_mode and
+        // snapshot_file are skipped because both only ever act on mutating
+        // tools, which batchable_call excludes: that exclusion is what makes
+        // the shorter sequence equivalent, not an assumption about intent.
         let block = match ctx
             .hooks
             .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
@@ -411,6 +426,20 @@ async fn execute_readonly_batch(
                 PermissionDecision::Allow | PermissionDecision::Default => None,
             },
         };
+        // Unapproved content is excluded from batching (see batchable_call) so
+        // the serial path can prompt; if one still lands here, block rather
+        // than run host code no human approved. The two sites share the one
+        // predicate, so the batch path cannot drift away from the gate again.
+        let block = block.or_else(|| {
+            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
+                |source| tools::ToolOutcome {
+                    ok: false,
+                    output: declined_message(Some(&source)),
+                    diff: None,
+                    ..Default::default()
+                },
+            )
+        });
         blocked.push(block);
     }
 
@@ -1315,10 +1344,23 @@ async fn run_loop(
         // True once any mutating call succeeded this iteration: only then can
         // extension files have changed, so only then is the fingerprint
         // re-checked before the next model request.
+        //
+        // Only the serial path sets this. A batched external tool is host code
+        // that could also write a capability file, so a mid-turn refreeze can
+        // be one iteration late after a pure batch; turn start always catches
+        // it. Not a gate hole - whatever such a tool writes is unapproved
+        // content, which asks on its own first call.
         let mut extensions_touched = false;
 
         let segments = partition_concurrent_runs(&tool_calls, |call| {
-            batchable_call(call, &registry, &repeat_tracker, &permissions)
+            batchable_call(
+                call,
+                &registry,
+                &repeat_tracker,
+                &permissions,
+                &core.data_dir,
+                project_root,
+            )
         });
 
         'calls: for segment in segments {
@@ -2216,6 +2258,63 @@ mod tests {
         assert!(!complete_pending_tool_replies(&mut done, note));
     }
 
+    /// Built-in tools never reach the ledger inside `batchable_call`, so
+    /// partitioning fixtures need no real dirs; the content-gate test below
+    /// uses real ones.
+    fn nowhere() -> &'static Path {
+        Path::new("/nonexistent")
+    }
+
+    /// Concurrent batching selects for external non-mutating tools - exactly
+    /// the population the content gate exists to catch - and the batch path
+    /// has no approval UI. So an unapproved tool must never be batchable: two
+    /// consecutive calls to it have to fall to the serial path that prompts,
+    /// or the gate would only cover calls the model happens to emit alone.
+    #[test]
+    fn an_unapproved_external_tool_is_never_batchable() {
+        let dir = std::env::temp_dir().join(format!("openmax-batch-{}", uuid::Uuid::new_v4()));
+        let data_dir = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/peek.toml"),
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/true\"\nmutating = false\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&project);
+        let tracker = RepeatCallTracker::new();
+        let perms = Permissions::default();
+        let calls = vec![
+            tool_call("peek", r#"{"key":"a"}"#),
+            tool_call("peek", r#"{"key":"b"}"#),
+        ];
+
+        assert!(
+            !batchable_call(&calls[0], &registry, &tracker, &perms, &data_dir, &project),
+            "unapproved host code must not be eligible for the unattended batch path"
+        );
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &perms, &data_dir, &project)
+        });
+        assert_eq!(segments.len(), 2, "each call gets its own serial segment");
+        assert!(segments.iter().all(|s| !s.concurrent));
+
+        // Approved content is ordinary read-only work and batches again.
+        let sha = match &registry.get("peek").unwrap().kind {
+            crate::registry::ToolKind::External(ext) => ext.source_sha256.clone(),
+            crate::registry::ToolKind::Builtin => unreachable!("peek is external"),
+        };
+        crate::ledger::approve_hash(&data_dir, &project, &sha).unwrap();
+        assert!(batchable_call(&calls[0], &registry, &tracker, &perms, &data_dir, &project));
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &perms, &data_dir, &project)
+        });
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].concurrent, "approved read-only tools still batch");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn partition_splits_readonly_runs_and_breaks_on_mutating() {
         let registry = Registry::builtin_only();
@@ -2229,7 +2328,7 @@ mod tests {
         ];
         let empty_perms = Permissions::default();
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 3);
         assert!(segments[0].concurrent && segments[0].start == 0 && segments[0].end == 2);
@@ -2249,7 +2348,7 @@ mod tests {
             tool_call("grep", r#"{"pattern":"fn"}"#),
         ];
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 1);
         assert!(segments[0].concurrent);
@@ -2259,12 +2358,16 @@ mod tests {
             &registry,
             &tracker,
             &empty_perms,
+            nowhere(),
+            nowhere(),
         ));
         assert!(!batchable_call(
             &tool_call("nope", r#"{}"#),
             &registry,
             &tracker,
             &empty_perms,
+            nowhere(),
+            nowhere(),
         ));
     }
 
@@ -2345,7 +2448,7 @@ mod tests {
         let calls = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
         let empty_perms = Permissions::default();
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 1);
         assert!(!segments[0].concurrent);
@@ -2366,7 +2469,7 @@ mod tests {
         ];
         let empty_perms = Permissions::default();
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 3);
         assert!(!segments[0].concurrent);
