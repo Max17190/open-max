@@ -9,6 +9,10 @@ use crate::config::Settings;
 use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
+/// One extension generation exactly as a freeze captured it: for each file,
+/// its path, sha256, and bytes.
+pub type ExtensionGeneration = Vec<(PathBuf, String, Vec<u8>)>;
+
 /// In-memory state of one agent session.
 #[derive(Default, Clone)]
 pub struct SessionData {
@@ -31,6 +35,23 @@ pub struct SessionData {
     /// context window. The condition holds on every turn once it holds at all,
     /// so the advisory is emitted once and not per turn.
     pub schemas_over_budget_reported: bool,
+    /// Whether the ledger has reconciled with the extension files this session
+    /// froze. False until the first turn start: a freeze reads disk directly,
+    /// so changes made while no session was running would otherwise never be
+    /// recorded - and the next mid-turn sync would sweep them up as the
+    /// agent's own work.
+    pub ledger_synced: bool,
+    /// Deferred ledger syncs, oldest first: (extension generation, actor). A
+    /// sync that cannot land is held here with the attribution it was owed,
+    /// and every sync path drains this queue in order before adding its own
+    /// claim - the head must never advance past an unlanded one, or its
+    /// changes get recorded later under whoever syncs next, and that
+    /// misattribution is permanent. Every distinct generation observed
+    /// across a broken window stays queued (dropping one would erase its
+    /// content from history); only an entry identical to the queue tail is
+    /// skipped, which is what keeps unchanged turn starts from growing this
+    /// by one per turn.
+    pub pending_syncs: Vec<(ExtensionGeneration, crate::ledger::Actor)>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous

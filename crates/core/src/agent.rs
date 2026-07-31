@@ -288,6 +288,8 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
+            ledger_synced: false,
+            pending_syncs: Vec::new(),
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -312,6 +314,8 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
+            ledger_synced: false,
+            pending_syncs: Vec::new(),
         }
     }
 }
@@ -836,15 +840,11 @@ pub async fn reload_session(
         .map_err(|e| format!("reload discovery failed: {e}"))?;
     let files = std::mem::take(&mut snapshot.files);
     let registry = Registry::from_snapshot(snapshot);
-    // A forced reload observes whatever is on disk now; no turn was running,
-    // so any delta since the last freeze is external to the session.
-    let reload_receipt =
-        ledger_changes(core, project_root, &files, crate::ledger::Actor::External, session_id);
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
-    let counts = (registry.tools.len(), registry.skills.len(), reload_receipt);
 
     // Hydrate first if the session was resumed but never ran a turn, so the
-    // reload applies to the real transcript rather than a fresh one.
+    // reload applies to the real transcript rather than a fresh one - and so
+    // the settlement below has a session to hold its claim in if it fails.
     let hydrated = core.sessions.lock().await.contains_key(session_id);
     if !hydrated {
         let core_clone = core.clone();
@@ -858,17 +858,37 @@ pub async fn reload_session(
         core.sessions.lock().await.entry(session_id.to_string()).or_insert(built);
     }
 
-    let mut sessions_map = core.sessions.lock().await;
-    let data = sessions_map
-        .get_mut(session_id)
-        .ok_or_else(|| "session state is unavailable; try /new".to_string())?;
-    // A turn that slipped past the running check owns the transcript
-    // (mem::take leaves it empty); refuse rather than clobber.
-    if data.messages.is_empty() {
-        return Err("a turn is in flight; run /reload after it finishes".into());
+    let counts = (registry.tools.len(), registry.skills.len());
+    {
+        let mut sessions_map = core.sessions.lock().await;
+        let data = sessions_map
+            .get_mut(session_id)
+            .ok_or_else(|| "session state is unavailable; try /new".to_string())?;
+        // A turn that slipped past the running check owns the transcript
+        // (mem::take leaves it empty); refuse rather than clobber - and
+        // refuse before touching the ledger, whose state must not move for
+        // a reload that was never applied.
+        if data.messages.is_empty() {
+            return Err("a turn is in flight; run /reload after it finishes".into());
+        }
+        apply_freeze(core, session_id, data, registry, prompt, breakdown);
     }
-    apply_freeze(core, session_id, data, registry, prompt, breakdown);
-    Ok(counts)
+
+    // A forced reload observes whatever is on disk now; no turn was running,
+    // so any delta since the last freeze is external to the session. Settled
+    // through the same queue as every other sync - a reload that advanced
+    // the head past claims a broken ledger left behind would mislabel them -
+    // and only after the freeze applied, mirroring the turn-start refreeze:
+    // the claim is the snapshot this reload activated, never bytes a racing
+    // turn is writing.
+    let (reload_receipt, _) = settle_ledger(
+        core,
+        session_id,
+        project_root,
+        Some((files, crate::ledger::Actor::External)),
+    )
+    .await;
+    Ok((counts.0, counts.1, reload_receipt))
 }
 
 /// Install a rebuilt registry + system prompt into a live session and persist
@@ -938,16 +958,51 @@ async fn refreeze_if_extensions_changed(
     };
     let files = std::mem::take(&mut snapshot.files);
     let disk_fp = snapshot.fingerprint();
-    let stale = {
+    let (stale, unsynced) = {
         let sessions_map = core.sessions.lock().await;
-        sessions_map
-            .get(session_id)
-            .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+        match sessions_map.get(session_id) {
+            Some(d) => (
+                !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp,
+                !d.ledger_synced,
+            ),
+            None => (false, false),
+        }
     };
     if !stale {
-        // Nothing to activate, but a project the ledger has never seen still
-        // gets its baseline, so the next change is attributable.
-        let _ = crate::ledger::seed_if_empty(&core.data_dir, project_root, &files);
+        if unsynced {
+            // Nothing to activate, but the freeze read these files straight
+            // from disk, so the ledger has not necessarily met them: changes
+            // made while no session was running (a human, git, an installer)
+            // would stay unrecorded - and the first mid-turn sync would then
+            // sweep them up as this agent's work. Reconcile before any agent
+            // attribution is possible; on a project the ledger has never
+            // seen, this same sync writes the initial baseline. When claims
+            // are already queued, the disk beyond them arose from this
+            // session's own turns (an external edit would have moved the
+            // fingerprint into the stale path), so the current generation
+            // queues as Session and its delta past the External claim stays
+            // the agent's.
+            let first_attempt = {
+                let map = core.sessions.lock().await;
+                map.get(session_id).map(|d| d.pending_syncs.is_empty()).unwrap_or(true)
+            };
+            let actor = if first_attempt {
+                crate::ledger::Actor::External
+            } else {
+                crate::ledger::Actor::Session
+            };
+            let (receipt, landed) =
+                settle_ledger(core, session_id, project_root, Some((files, actor))).await;
+            if !landed {
+                // Failed is not settled: the claims stay queued with the
+                // attribution they were owed, every later sync drains them
+                // first, and silence here is how a backlog ends up recorded
+                // as someone else's work.
+                for message in receipt {
+                    core.send_agent(session_id, AgentEvent::Error { message });
+                }
+            }
+        }
         return;
     }
     let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
@@ -955,27 +1010,35 @@ async fn refreeze_if_extensions_changed(
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
     let counts = (registry.tools.len(), registry.skills.len());
-    let mut sessions_map = core.sessions.lock().await;
-    if let Some(data) = sessions_map.get_mut(session_id) {
-        // Re-check under the lock: this turn owns `running`, so nothing else
-        // mutates the session, but stay defensive about empty (taken) state.
-        if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp {
-            apply_freeze(core, session_id, data, registry, prompt, breakdown);
-            // Turn start: the change happened while no turn was running, so
-            // it is external to this session (a human, git, an installer).
-            let changes = ledger_changes(
-                core,
-                project_root,
-                &files,
-                crate::ledger::Actor::External,
-                session_id,
-            );
-            core.send_agent(session_id, AgentEvent::Refrozen {
-                tools: counts.0,
-                skills: counts.1,
-                changes,
-            });
+    let applied = {
+        let mut sessions_map = core.sessions.lock().await;
+        match sessions_map.get_mut(session_id) {
+            // Re-check under the lock: this turn owns `running`, so nothing
+            // else mutates the session, but stay defensive about empty
+            // (taken) state.
+            Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
+                apply_freeze(core, session_id, data, registry, prompt, breakdown);
+                true
+            }
+            _ => false,
         }
+    };
+    if applied {
+        // Turn start: the change happened while no turn was running, so it
+        // is external to this session (a human, git, an installer). Claims a
+        // broken ledger left queued land first, under their own actors.
+        let (changes, _) = settle_ledger(
+            core,
+            session_id,
+            project_root,
+            Some((files, crate::ledger::Actor::External)),
+        )
+        .await;
+        core.send_agent(session_id, AgentEvent::Refrozen {
+            tools: counts.0,
+            skills: counts.1,
+            changes,
+        });
     }
 }
 
@@ -1057,18 +1120,85 @@ fn is_code_of_installed_manifest(path: &Path, project_root: &Path) -> bool {
 
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
 /// ledger failure never blocks activation, but it is reported in the receipt
-/// rather than swallowed.
+/// rather than swallowed. The flag says whether the sync actually landed:
+/// receipt text alone must never count as reconciliation, or a failed sync
+/// reads as a settled one and its backlog is later misattributed.
 fn ledger_changes(
     core: &Arc<Core>,
     project_root: &Path,
     files: &[(std::path::PathBuf, String, Vec<u8>)],
     actor: crate::ledger::Actor,
     session_id: &str,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     match crate::ledger::sync(&core.data_dir, project_root, files, actor, Some(session_id)) {
-        Ok(changes) => crate::ledger::describe(&changes, project_root),
-        Err(e) => vec![format!("ledger error: {e}")],
+        Ok(changes) => (crate::ledger::describe(&changes, project_root), true),
+        Err(e) => (vec![format!("ledger error: {e}")], false),
     }
+}
+
+/// Land the session's deferred syncs in order, then `next`. Attribution
+/// rides each queued generation, so it survives any window of ledger
+/// failure: a claim that cannot land stays queued rather than being
+/// absorbed - permanently mislabeled - by whichever sync happens to run
+/// next. The drain stops at the first failure, because a head advanced
+/// past an unlanded claim is exactly that absorption. An already-landed
+/// earlier claim makes a later same-generation entry a no-op delta, which
+/// is what lets every path queue its own full snapshot without care for
+/// what the others already recorded; only an entry identical to the queue
+/// tail is dropped outright.
+///
+/// Returns the concatenated receipts and whether everything landed.
+async fn settle_ledger(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    next: Option<(crate::state::ExtensionGeneration, crate::ledger::Actor)>,
+) -> (Vec<String>, bool) {
+    let mut queue = {
+        let mut map = core.sessions.lock().await;
+        match map.get_mut(session_id) {
+            Some(d) => std::mem::take(&mut d.pending_syncs),
+            None => Vec::new(),
+        }
+    };
+    if let Some((files, actor)) = next {
+        // Only an identical generation is dropped: landing the earlier claim
+        // records these exact hashes, so the newcomer's delta is empty.
+        // Distinct generations all stay, whatever their actors - a
+        // create-then-delete or change-then-revert observed across a broken
+        // window is history the ledger promised to keep, and collapsing it
+        // would erase the intermediate content from the record for good.
+        let duplicate = queue.last().is_some_and(|(gen, _)| {
+            gen.len() == files.len()
+                && gen
+                    .iter()
+                    .zip(&files)
+                    .all(|((path_a, sha_a, _), (path_b, sha_b, _))| {
+                        path_a == path_b && sha_a == sha_b
+                    })
+        });
+        if !duplicate {
+            queue.push((files, actor));
+        }
+    }
+    let mut receipt = Vec::new();
+    let mut landed_all = true;
+    let mut remaining = std::collections::VecDeque::from(queue);
+    while let Some((files, actor)) = remaining.front() {
+        let (lines, landed) = ledger_changes(core, project_root, files, *actor, session_id);
+        receipt.extend(lines);
+        if !landed {
+            landed_all = false;
+            break;
+        }
+        remaining.pop_front();
+    }
+    let mut map = core.sessions.lock().await;
+    if let Some(d) = map.get_mut(session_id) {
+        d.pending_syncs = remaining.into();
+        d.ledger_synced = landed_all;
+    }
+    (receipt, landed_all)
 }
 
 /// The mid-turn half of the self-modification loop. The turn-start check
@@ -1123,14 +1253,20 @@ async fn refreeze_between_iterations(
         }
     }
     *registry = new_registry;
-    // Mid-turn: this session's own mutating call produced the change.
-    let changes = ledger_changes(
+    // Mid-turn: this session's own mutating call produced the change, so
+    // the current generation queues as Session. Claims a broken ledger left
+    // behind land first, under the actors they were owed - this sync
+    // advances the head, and a head past an unlanded claim turns a human's
+    // pre-session edits into this session's record for good. If nothing can
+    // land, the claims stay queued, the receipt says so, and activation
+    // still proceeds.
+    let (changes, _) = settle_ledger(
         core,
-        project_root,
-        &files,
-        crate::ledger::Actor::Session,
         session_id,
-    );
+        project_root,
+        Some((files, crate::ledger::Actor::Session)),
+    )
+    .await;
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
         skills: counts.1,
@@ -3074,6 +3210,533 @@ mod tests {
         let map = core.sessions.lock().await;
         assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &after), "must converge");
         drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Changes made while no session was running (a human, git, an installer)
+    /// are recorded at the next session's first turn start, as `external`.
+    /// The freeze reads disk directly, so without this reconciliation the
+    /// delta would either never be ledgered at all (the new registry's
+    /// fingerprint already matches disk, so no refreeze ever fires) or be
+    /// swept into the first mid-turn sync as the agent's own work.
+    #[tokio::test]
+    async fn first_turn_records_changes_made_between_sessions() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v1).unwrap();
+
+        // An earlier session's first turn writes the baseline (Initial, since
+        // the ledger has never seen this project).
+        {
+            let mut data = build_session_data(&core, "earlier", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("earlier".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "earlier", &project).await;
+        let baseline = crate::ledger::history(&core.data_dir, &project).unwrap();
+        assert!(
+            baseline.iter().any(|r| r.path.ends_with("deploy.toml")),
+            "first contact must write the baseline"
+        );
+
+        // Between sessions the file changes, with no harness running.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v2).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(v2.as_bytes());
+
+        // A fresh session freezes v2 straight from disk: fingerprints agree,
+        // so nothing refreezes - but the ledger must still meet v2.
+        {
+            let mut data = build_session_data(&core, "later", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("later".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let change = records
+            .iter()
+            .rev()
+            .find(|r| r.path.ends_with("deploy.toml") && r.sha256.as_deref() == Some(v2_sha.as_str()))
+            .expect("the between-sessions change must be recorded");
+        assert_eq!(
+            change.actor,
+            crate::ledger::Actor::External,
+            "no turn was running, so the change is external, not the agent's"
+        );
+
+        // Reconciliation is once per session: the next turn start of the same
+        // session touches the ledger not at all.
+        let settled = records.len();
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        assert_eq!(
+            crate::ledger::history(&core.data_dir, &project).unwrap().len(),
+            settled,
+            "a synced session must not re-record on every turn start"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A first-turn reconciliation that fails must say so and stay unsynced,
+    /// so the next turn start retries. Marking a failed sync as settled would
+    /// drop the between-sessions delta forever - or worse, hand it to the
+    /// next mid-turn sync to record as the agent's own work.
+    #[tokio::test]
+    async fn failed_first_turn_reconciliation_reports_and_retries() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v1).unwrap();
+
+        {
+            let mut data = build_session_data(&core, "earlier", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("earlier".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "earlier", &project).await;
+        while rx.try_recv().is_ok() {}
+
+        // Between sessions the file changes - and the ledger breaks (a
+        // partial write): reconciliation must fail loudly, not settle.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+
+        {
+            let mut data = build_session_data(&core, "later", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("later".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let mut reported = false;
+        while let Ok(env) = rx.try_recv() {
+            if let AgentEvent::Error { message } = env.event {
+                assert!(message.contains("ledger"), "{message}");
+                reported = true;
+            }
+        }
+        assert!(reported, "a failed reconciliation must be reported, not swallowed");
+
+        // The ledger is repaired; the next turn start retries and lands the
+        // delta as external, because the session never marked itself synced.
+        std::fs::write(&log, &intact).unwrap();
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(v2.as_bytes());
+        let change = records
+            .iter()
+            .rev()
+            .find(|r| r.path.ends_with("deploy.toml") && r.sha256.as_deref() == Some(v2_sha.as_str()))
+            .expect("the retry must record the between-sessions change");
+        assert_eq!(change.actor, crate::ledger::Actor::External);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The laundering path: the first-turn reconciliation fails, and the
+    /// agent mutates an extension in that same turn. The mid-turn sync must
+    /// settle the held External backlog before writing any Session record -
+    /// a head advanced past the backlog would attribute the human's
+    /// pre-session edits to the agent for good. While the ledger stays
+    /// broken the Session sync is skipped too (activation still proceeds);
+    /// once it heals, the backlog lands External, then the agent's own
+    /// delta lands Session.
+    #[tokio::test]
+    async fn midturn_sync_settles_the_external_backlog_first() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let deploy = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v1).unwrap();
+        {
+            let mut data = build_session_data(&core, "earlier", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("earlier".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "earlier", &project).await;
+        let baseline = crate::ledger::history(&core.data_dir, &project).unwrap().len();
+
+        // Between sessions: a human edits the tool, and the ledger breaks.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+
+        // First turn start fails and stashes the External generation.
+        {
+            let mut data = build_session_data(&core, "later", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("later".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut("later").unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+
+        // The agent writes a tool while the ledger is still broken:
+        // activation proceeds, but no Session record may land over the
+        // unsettled backlog.
+        std::fs::write(
+            project.join(".openmax/tools/built.toml"),
+            "name = \"built\"\ndescription = \"agent-written\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        assert!(
+            refreeze_between_iterations(&core, "later", &project, &mut registry, &mut messages)
+                .await,
+            "activation must not wait on the ledger"
+        );
+        assert!(registry.get("built").is_some(), "the new tool is live");
+        std::fs::write(&log, &intact).unwrap();
+        assert_eq!(
+            crate::ledger::history(&core.data_dir, &project).unwrap().len(),
+            baseline,
+            "nothing may land while the backlog cannot: a Session record here is the laundering"
+        );
+
+        // Healed: the next mid-turn sync settles the backlog as External
+        // first, then records the agent's own delta as Session.
+        std::fs::write(
+            project.join(".openmax/tools/second.toml"),
+            "name = \"second\"\ndescription = \"agent-written too\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        assert!(
+            refreeze_between_iterations(&core, "later", &project, &mut registry, &mut messages)
+                .await
+        );
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(v2.as_bytes());
+        let external_at = records
+            .iter()
+            .position(|r| {
+                r.path.ends_with("deploy.toml") && r.sha256.as_deref() == Some(v2_sha.as_str())
+            })
+            .expect("the human's edit must be recorded");
+        assert_eq!(records[external_at].actor, crate::ledger::Actor::External);
+        for name in ["built.toml", "second.toml"] {
+            let at = records
+                .iter()
+                .position(|r| r.path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} must be recorded"));
+            assert_eq!(
+                records[at].actor,
+                crate::ledger::Actor::Session,
+                "the agent's own work stays the agent's"
+            );
+            assert!(
+                external_at < at,
+                "the External backlog must land before any Session record"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A broken ledger spanning several sync sites must lose no claim and no
+    /// attribution: the failed first-turn External claim and the failed
+    /// mid-turn Session claim queue in order, and the next sync path to run
+    /// - here the stale turn-start refreeze, itself carrying a fresh
+    /// External claim - drains them under the actors they were owed before
+    /// adding its own. This is the general shape behind every laundering
+    /// variant: the head never advances past an unlanded claim.
+    #[tokio::test]
+    async fn stale_refreeze_drains_queued_claims_in_order() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let deploy = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v1).unwrap();
+        {
+            let mut data = build_session_data(&core, "earlier", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("earlier".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "earlier", &project).await;
+
+        // The ledger breaks; a human edits the tool; a new session starts.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+        {
+            let mut data = build_session_data(&core, "later", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("later".into(), data);
+        }
+        // First turn start fails: the External claim queues.
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        // The agent writes a tool mid-turn, still broken: Session claim queues.
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut("later").unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        std::fs::write(
+            project.join(".openmax/tools/built.toml"),
+            "name = \"built\"\ndescription = \"agent-written\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        assert!(
+            refreeze_between_iterations(&core, "later", &project, &mut registry, &mut messages)
+                .await
+        );
+
+        // Turn ends (transcript restored); the ledger heals; a human edits
+        // the tool again while no turn runs.
+        {
+            let mut map = core.sessions.lock().await;
+            map.get_mut("later").unwrap().messages = messages;
+        }
+        std::fs::write(&log, &intact).unwrap();
+        let v3 = "name = \"deploy\"\ndescription = \"ships it thrice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v3).unwrap();
+
+        // The stale turn-start refreeze drains everything in order.
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let at = |sha: &str, name: &str| {
+            records
+                .iter()
+                .position(|r| r.path.ends_with(name) && r.sha256.as_deref() == Some(sha))
+                .unwrap_or_else(|| panic!("{name}@{sha} must be recorded"))
+        };
+        let v2_at = at(&crate::ledger::sha256_hex(v2.as_bytes()), "deploy.toml");
+        let built_at = at(
+            &crate::ledger::sha256_hex(
+                &std::fs::read(project.join(".openmax/tools/built.toml")).unwrap(),
+            ),
+            "built.toml",
+        );
+        let v3_at = at(&crate::ledger::sha256_hex(v3.as_bytes()), "deploy.toml");
+        assert_eq!(records[v2_at].actor, crate::ledger::Actor::External);
+        assert_eq!(records[built_at].actor, crate::ledger::Actor::Session);
+        assert_eq!(records[v3_at].actor, crate::ledger::Actor::External);
+        assert!(
+            v2_at < built_at && built_at < v3_at,
+            "claims must land in the order they were owed: {v2_at} {built_at} {v3_at}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `/reload` syncs through the same queue as every other path: invoked
+    /// after a failed reconciliation, it must drain the held claim before
+    /// its own - a reload that advanced the head past it would mislabel the
+    /// human's edits or record their snapshot as a backwards transition.
+    #[tokio::test]
+    async fn reload_drains_queued_claims_before_its_own() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let deploy = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v1).unwrap();
+        {
+            let mut data = build_session_data(&core, "s", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("s".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+
+        // Break the ledger, edit the tool, fail the first-turn reconcile.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+        {
+            let mut map = core.sessions.lock().await;
+            map.get_mut("s").unwrap().ledger_synced = false;
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+        assert!(
+            !core.sessions.lock().await.get("s").unwrap().pending_syncs.is_empty(),
+            "the failed claim must be queued"
+        );
+
+        // Heal, then /reload: the queued External claim lands (the reload's
+        // own claim is the identical generation, so it dedups away).
+        std::fs::write(&log, &intact).unwrap();
+        reload_session(&core, "s", &project).await.unwrap();
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(v2.as_bytes());
+        let change = records
+            .iter()
+            .find(|r| r.path.ends_with("deploy.toml") && r.sha256.as_deref() == Some(v2_sha.as_str()))
+            .expect("reload must land the held claim");
+        assert_eq!(change.actor, crate::ledger::Actor::External);
+        assert!(
+            core.sessions.lock().await.get("s").unwrap().pending_syncs.is_empty(),
+            "nothing may stay queued after a successful reload"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A reload refused because a turn owns the transcript must refuse
+    /// before touching the ledger: settling first would drain queued claims
+    /// and mark the session reconciled for a registry generation that was
+    /// never applied - ledger state moving for a reload that did not happen.
+    #[tokio::test]
+    async fn refused_reload_leaves_the_ledger_untouched() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let deploy = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v1).unwrap();
+        {
+            let mut data = build_session_data(&core, "s", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("s".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+        let baseline = crate::ledger::history(&core.data_dir, &project).unwrap().len();
+
+        // A failed reconcile leaves a claim queued; the ledger then heals.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+        {
+            let mut map = core.sessions.lock().await;
+            map.get_mut("s").unwrap().ledger_synced = false;
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+        std::fs::write(&log, &intact).unwrap();
+
+        // A turn takes the transcript, then a reload races in: it must be
+        // refused with the queue and history exactly as they were.
+        {
+            let mut map = core.sessions.lock().await;
+            let _ = take_messages(map.get_mut("s").unwrap());
+        }
+        let err = reload_session(&core, "s", &project).await.unwrap_err();
+        assert!(err.contains("turn is in flight"), "{err}");
+        assert_eq!(
+            crate::ledger::history(&core.data_dir, &project).unwrap().len(),
+            baseline,
+            "a refused reload must not land claims"
+        );
+        assert!(
+            !core.sessions.lock().await.get("s").unwrap().pending_syncs.is_empty(),
+            "the queued claim must survive a refused reload"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every distinct generation observed across a broken window survives:
+    /// an agent that changes a tool twice while the ledger is down must have
+    /// both states land when it heals - collapsing to the newest would erase
+    /// the intermediate content (a change-then-revert, a create-then-delete)
+    /// from history for good.
+    #[tokio::test]
+    async fn queued_claims_keep_every_distinct_generation() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        {
+            let mut data = build_session_data(&core, "s", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("s".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut("s").unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        // Two agent writes to the same tool while the ledger is down: two
+        // distinct generations, both owed to history.
+        let built = project.join(".openmax/tools/built.toml");
+        let b1 = "name = \"built\"\ndescription = \"first draft\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&built, b1).unwrap();
+        assert!(
+            refreeze_between_iterations(&core, "s", &project, &mut registry, &mut messages).await
+        );
+        let b2 = "name = \"built\"\ndescription = \"second draft\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&built, b2).unwrap();
+        assert!(
+            refreeze_between_iterations(&core, "s", &project, &mut registry, &mut messages).await
+        );
+        assert_eq!(
+            core.sessions.lock().await.get("s").unwrap().pending_syncs.len(),
+            2,
+            "both generations must stay queued"
+        );
+
+        // Healed: the next sync lands both, in order.
+        std::fs::write(&log, &intact).unwrap();
+        let b3 = "name = \"built\"\ndescription = \"third draft\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&built, b3).unwrap();
+        assert!(
+            refreeze_between_iterations(&core, "s", &project, &mut registry, &mut messages).await
+        );
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let position = |body: &str| {
+            let sha = crate::ledger::sha256_hex(body.as_bytes());
+            records
+                .iter()
+                .position(|r| r.path.ends_with("built.toml") && r.sha256.as_deref() == Some(sha.as_str()))
+                .unwrap_or_else(|| panic!("draft {body:?} must be in history"))
+        };
+        let (p1, p2, p3) = (position(b1), position(b2), position(b3));
+        assert!(p1 < p2 && p2 < p3, "drafts must land in observation order: {p1} {p2} {p3}");
+        for p in [p1, p2, p3] {
+            assert_eq!(records[p].actor, crate::ledger::Actor::Session);
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -398,20 +398,6 @@ pub fn verify_chain(records_text: &str) -> Result<usize, usize> {
     Ok(records_text.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
-/// Populate a project's ledger the first time the harness sees it, so later
-/// syncs have a baseline to attribute changes against. One existence check
-/// when already seeded.
-pub fn seed_if_empty(
-    data_dir: &Path,
-    project_root: &Path,
-    files: &[(PathBuf, String, Vec<u8>)],
-) -> Result<(), String> {
-    if log_path(&project_dir(data_dir, project_root)).exists() {
-        return Ok(());
-    }
-    sync(data_dir, project_root, files, Actor::Initial, None).map(|_| ())
-}
-
 /// Record the difference between the ledger head and `files` (the exact
 /// generation a freeze read: path -> (sha256, bytes)). New and changed files
 /// get `actor` (or `Initial` when the ledger is empty), removed paths get a
