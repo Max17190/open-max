@@ -46,9 +46,11 @@ pub struct SessionData {
     /// and every sync path drains this queue in order before adding its own
     /// claim - the head must never advance past an unlanded one, or its
     /// changes get recorded later under whoever syncs next, and that
-    /// misattribution is permanent. Consecutive same-actor entries collapse
-    /// to the newest generation, so a ledger that stays broken holds at most
-    /// one entry per attribution stretch, not one per turn.
+    /// misattribution is permanent. Every distinct generation observed
+    /// across a broken window stays queued (dropping one would erase its
+    /// content from history); only an entry identical to the queue tail is
+    /// skipped, which is what keeps unchanged turn starts from growing this
+    /// by one per turn.
     pub pending_syncs: Vec<(ExtensionGeneration, crate::ledger::Actor)>,
 }
 
