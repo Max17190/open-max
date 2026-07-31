@@ -3268,24 +3268,13 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     use crate::theme;
     use crate::ui::transcript::Transcript;
 
-    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
-
     fn app_fixture() -> (App, std::path::PathBuf) {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let sequence = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "openmax-app-render-{}-{nonce}-{sequence}",
-            std::process::id()
-        ));
+        let dir = crate::test_temp_dir("openmax-app-render");
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
         let app = App::new(core, dir.clone(), files_tx);
@@ -3500,11 +3489,7 @@ mod tests {
 
     #[test]
     fn model_selection_persists_provider_and_complete_id() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openmax-model-save-{nonce}"));
+        let dir = crate::test_temp_dir("openmax-model-save");
         fs::create_dir_all(&dir).unwrap();
         let current = config::Settings::default();
         let exact = "openrouter/vendor/family/model".to_string();
@@ -3535,13 +3520,7 @@ mod tests {
     #[test]
     fn model_selection_failure_leaves_current_settings_unchanged() {
         let current = config::Settings::default();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let missing = std::env::temp_dir()
-            .join(format!("openmax-model-save-missing-{nonce}"))
-            .join("nested");
+        let missing = crate::test_temp_dir("openmax-model-save-missing").join("nested");
         let result = save_model_selection(
             &missing,
             &current,
