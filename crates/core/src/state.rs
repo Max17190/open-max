@@ -37,6 +37,12 @@ pub struct SessionData {
     /// recorded - and the next mid-turn sync would sweep them up as the
     /// agent's own work.
     pub ledger_synced: bool,
+    /// The turn-start extension generation whose External reconciliation
+    /// failed, held so it lands - still as External - before any other sync
+    /// advances the ledger head past it. Once a Session record absorbs that
+    /// delta the misattribution is permanent, so every sync path settles this
+    /// first or does not run. Cleared the moment it lands.
+    pub pending_reconcile: Option<Vec<(PathBuf, String, Vec<u8>)>>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous
