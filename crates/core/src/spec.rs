@@ -295,10 +295,13 @@ Fail closed, four ways, all reported by `openmax --check`:
   refuses without an interactive terminal, then asks for the path typed back.
   Read that as a speed bump, not a boundary: it removes the one-command
   bypass, but an attacker holding `bash` can still allocate a pty to answer
-  the prompt, and can more cheaply delete the approval store itself. Without
-  an OS sandbox nothing here survives an agent that is determined and has a
-  shell; what the harness guarantees is that the easy path is closed and the
-  state is visible.
+  the prompt. What it can no longer do is edit the approval store: approvals
+  are records in the ledger's hash chain, so writing one outside the harness
+  reads as tamper and grants nothing. Erasing the whole ledger directory still
+  works, and surrenders every approval - fail closed, so gates stop running
+  rather than start. Without an OS sandbox nothing here survives an agent that
+  is determined and has a shell; what the harness guarantees is that the easy
+  path is closed and the state is visible.
 - A `command` (or `args` path) that resolves to no file at all is not covered
   by anything: there is nothing to approve, so the hook does not load. Install
   or create it, then approve.

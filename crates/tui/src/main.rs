@@ -33,6 +33,9 @@ options:
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
       --ledger           print the capability-file history for this project
+      --ledger-repair    quarantine an unverifiable ledger log (nothing is
+                         deleted) and start a new chain; approvals in the
+                         quarantined log must be granted again
       --approve <path>   approve the exact current content of a capability file
                          and of the project-local code it runs
       --forget <path>    stop expecting an approved capability file to exist
@@ -76,6 +79,8 @@ struct CliArgs {
     approve: Option<String>,
     forget: Option<String>,
     ledger: bool,
+    /// Quarantine an unverifiable ledger log and start a new chain.
+    ledger_repair: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
     trust_project: bool,
@@ -106,6 +111,7 @@ where
         approve: None,
         forget: None,
         ledger: false,
+        ledger_repair: false,
         spec: None,
         trust_project: false,
         prompts: Vec::new(),
@@ -132,6 +138,7 @@ where
             Long("approve") => out.approve = Some(parser.value()?.string()?),
             Long("forget") => out.forget = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
+            Long("ledger-repair") => out.ledger_repair = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
@@ -251,25 +258,225 @@ async fn main() -> std::io::Result<()> {
         // Read-only history, like --check: no session, no endpoint, no trust.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let data_dir = default_data_dir();
-        match open_max_core::ledger::history(&data_dir, &project) {
-            Ok(records) if records.is_empty() => {
+        match open_max_core::ledger::read(&data_dir, &project) {
+            Ok(history) if history.records.is_empty() => {
                 println!("no capability-file history for this project yet");
                 std::process::exit(0);
             }
-            Ok(records) => {
+            Ok(history) => {
+                use open_max_core::ledger::{Kind, ObjectState};
                 let objects = open_max_core::ledger::project_dir(&data_dir, &project).join("objects");
-                for r in &records {
-                    let what = match &r.sha256 {
-                        Some(sha) => format!("{} {}", &sha[..12.min(sha.len())], r.path.display()),
-                        None => format!("{:12} {}", "removed", r.path.display()),
+                // Approvals are recorded by content hash; a path is carried
+                // when the caller knew one, and otherwise resolved from the
+                // change record that observed the same bytes.
+                let mut path_of: std::collections::HashMap<&str, &std::path::Path> =
+                    std::collections::HashMap::new();
+                for r in &history.records {
+                    if let (Kind::Change, Some(sha)) = (r.kind, &r.sha256) {
+                        path_of.insert(sha.as_str(), r.path.as_path());
+                    }
+                }
+                let mut states: std::collections::HashMap<&str, ObjectState> =
+                    std::collections::HashMap::new();
+                let mut damaged = 0usize;
+                for r in &history.records {
+                    let short = r.sha256.as_deref().map(|s| &s[..12.min(s.len())]);
+                    let where_ = match (r.path.as_os_str().is_empty(), r.sha256.as_deref()) {
+                        (false, _) => r.path.display().to_string(),
+                        (true, Some(sha)) => path_of
+                            .get(sha)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(file not in this ledger)".to_string()),
+                        (true, None) => String::new(),
+                    };
+                    // Objects are the bytes rollback copies, so a rewritten
+                    // one is a backdoor with a documented delivery route:
+                    // verify on read, not only on write.
+                    let note = match (r.kind, r.sha256.as_deref()) {
+                        (Kind::Change, Some(sha)) => {
+                            let state = *states.entry(sha).or_insert_with(|| {
+                                open_max_core::ledger::object_state(&data_dir, &project, sha)
+                            });
+                            match state {
+                                ObjectState::Intact => "",
+                                ObjectState::Missing => {
+                                    damaged += 1;
+                                    "  (object missing: cannot restore)"
+                                }
+                                ObjectState::Corrupt => {
+                                    damaged += 1;
+                                    "  (object CORRUPT: does not hash to its name - do not restore it)"
+                                }
+                            }
+                        }
+                        _ => "",
+                    };
+                    let session = r
+                        .session_id
+                        .as_deref()
+                        .map(|s| format!("  session {s}"))
+                        .unwrap_or_default();
+                    // One approval act can bless a manifest and the code it
+                    // runs; the audit has to show that it covered both.
+                    let bound = match r.also.len() {
+                        0 => String::new(),
+                        n => format!("  (+{n} bound file{})", if n == 1 { "" } else { "s" }),
+                    };
+                    let what = match (r.kind, short) {
+                        (Kind::Change, Some(sha)) => format!("change   {sha} {where_}"),
+                        (Kind::Change, None) => format!("removed  {:12} {where_}", ""),
+                        (Kind::Approval, Some(sha)) => format!("approved {sha} {where_}{bound}"),
+                        (Kind::Approval, None) => {
+                            format!("approved {:12} {where_} (path only)", "")
+                        }
+                        (Kind::ApprovalsImported, _) => format!(
+                            "imported {:12} pre-chain approvals from {where_}",
+                            ""
+                        ),
+                        (Kind::PathRetired, _) => {
+                            format!("retired  {:12} {where_} (path no longer expected)", "")
+                        }
                     };
                     println!(
-                        "{} {:8} {what}",
-                        r.ts,
+                        "{} {:8} {what}{note}{session}",
+                        open_max_core::ledger::format_ts(r.ts),
                         r.actor.as_str(),
                     );
                 }
-                println!("\nobjects: {} (restore with cp <objects>/<sha> <path>)", objects.display());
+                if history.interrupted_write {
+                    let authority = history.records[history.pinned..]
+                        .iter()
+                        .filter(|r| r.kind != open_max_core::ledger::Kind::Change)
+                        .count();
+                    if authority > 0 {
+                        println!(
+                            "\nnote: {authority} record(s) past the chain-head pin grant or retire authority; nobody's pin vouches for them, so they are inert until `openmax --ledger-repair` sets them aside"
+                        );
+                    } else {
+                        println!(
+                            "\nnote: the last append landed but its chain-head pin did not (an interrupted write); nothing was removed, and the next capability change re-pins it"
+                        );
+                    }
+                }
+                if objects.is_dir() {
+                    println!(
+                        "\nobjects: {} (restore with cp <objects>/<sha> <path>)",
+                        objects.display()
+                    );
+                    if damaged > 0 {
+                        println!(
+                            "warning: {damaged} record(s) have no trustworthy object; those bytes cannot be restored from this ledger"
+                        );
+                    }
+                } else {
+                    println!(
+                        "\nobjects: {} is gone, so no version above can be restored from this ledger",
+                        objects.display()
+                    );
+                }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openmax: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if cli.ledger_repair {
+        use open_max_core::ledger::RepairPlan;
+        // Repair rewrites the record of what happened, so it is a human
+        // action for the same reason approval is - and guarded the same way
+        // as --forget: the marker is one `unset` away from any shell the
+        // agent already has, so a terminal and a typed word stand behind it.
+        // The same honest ceiling applies; see the --forget comment.
+        if std::env::var_os("OPENMAX_SESSION").is_some() {
+            eprintln!(
+                "openmax: ledger repair is a human action: this process was started from an agent session; ask the user to run `openmax --ledger-repair`"
+            );
+            std::process::exit(3);
+        }
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let plan = open_max_core::ledger::repair_plan(&default_data_dir(), &project);
+        // The word the human must type is the operation they just read, so a
+        // confirmation proves they saw which repair this is.
+        let word = match &plan {
+            RepairPlan::Nothing => None,
+            RepairPlan::Repin => {
+                println!(
+                    "the last append landed but its chain-head pin did not (an interrupted write)."
+                );
+                println!("re-pinning keeps every record; nothing gains authority.");
+                Some("repin")
+            }
+            RepairPlan::QuarantineTail { tail } => {
+                println!(
+                    "{} record(s) sit past the pinned chain head, and some grant or retire authority:",
+                    tail.len()
+                );
+                for r in tail {
+                    let sha = r.sha256.as_deref().unwrap_or("-");
+                    println!(
+                        "  {}  {:<16} {}  {}",
+                        open_max_core::ledger::format_ts(r.ts),
+                        r.kind.as_str(),
+                        &sha[..12.min(sha.len())],
+                        r.path.display(),
+                    );
+                }
+                println!(
+                    "nobody's pin vouches for these lines, so repair sets them aside (nothing is deleted)."
+                );
+                println!(
+                    "if an approval above is one you performed, re-run `openmax --approve <path>` afterwards."
+                );
+                Some("quarantine")
+            }
+            RepairPlan::Quarantine { records, approvals } => {
+                println!(
+                    "the ledger does not verify: {records} record(s), {approvals} of them approval-grade, will be set aside (nothing is deleted)."
+                );
+                println!("a new chain starts at the next capability change; every approval must be granted again.");
+                Some("quarantine")
+            }
+        };
+        if let Some(word) = word {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                eprintln!(
+                    "openmax: --ledger-repair changes what this project's history vouches for, so it only runs at an interactive terminal"
+                );
+                std::process::exit(3);
+            }
+            print!("type `{word}` to confirm: ");
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != word {
+                eprintln!("openmax: confirmation did not match; nothing was changed");
+                std::process::exit(1);
+            }
+        }
+        match open_max_core::ledger::repair(&default_data_dir(), &project) {
+            Ok(outcome) => {
+                match outcome.quarantined {
+                    Some(path) => {
+                        println!(
+                            "quarantined {} unverifiable record(s) to {}",
+                            outcome.records,
+                            path.display()
+                        );
+                        println!("a new chain starts at the next capability change; nothing was deleted, and the objects for rollback are untouched");
+                        if outcome.approvals > 0 {
+                            println!(
+                                "{} approval(s) went with it: re-approve each file you still trust with `openmax --approve <path>`",
+                                outcome.approvals
+                            );
+                        }
+                    }
+                    None if outcome.repinned => {
+                        println!("re-pinned the chain head after an interrupted write; no records were lost")
+                    }
+                    None => println!("ledger verifies; nothing to repair"),
+                }
                 std::process::exit(0);
             }
             Err(e) => {
@@ -350,10 +557,13 @@ async fn main() -> std::io::Result<()> {
         // the one-liner: `unset OPENMAX_SESSION; openmax --forget <path>` now
         // exits 3. It does not stop an attacker who allocates a pty and
         // answers this prompt - roughly twenty lines of Python, verified to
-        // still retire the approval. And it is not even the cheapest path
-        // left: `bash` is unconfined, so deleting the approval store outright
-        // clears every fail-closed state in one command, because that file
-        // carries no tamper-evidence of its own (unlike the ledger's chain).
+        // still retire the approval. What is left for `bash` to do outright
+        // is destroy ledger state, and destruction now fails closed: a
+        // removed or rewritten chain reads as tamper, surrenders every
+        // approval, and waits for `--ledger-repair`. The one memory an
+        // attacker can still erase wholesale is the ledger directory itself,
+        // which forgets that a gate ever existed - documented, detected by
+        // nothing short of an OS sandbox.
         //
         // So this is a speed bump on the supported route, not a boundary.
         // Without an OS sandbox that is the honest ceiling, the same one
@@ -370,10 +580,7 @@ async fn main() -> std::io::Result<()> {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             eprintln!(
                 "openmax: --forget retires a human-installed policy, so it only runs at an interactive terminal.\n\
-                 to retire {path} without one, restore the file instead, or remove its entry from {} by hand",
-                open_max_core::ledger::project_dir(&default_data_dir(), &project)
-                    .join("approved.json")
-                    .display()
+                 without one, restore the file instead: `openmax --ledger` names the object holding its approved bytes"
             );
             std::process::exit(3);
         }

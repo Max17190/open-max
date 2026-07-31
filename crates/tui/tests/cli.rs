@@ -273,7 +273,7 @@ fn forget_refuses_without_a_human_at_a_terminal() {
     assert_eq!(out.status.code(), Some(3), "stdout: {}", String::from_utf8_lossy(&out.stdout));
     assert!(stderr.contains("interactive terminal"), "{stderr}");
     // The refusal has to leave the human a way forward that does not need one.
-    assert!(stderr.contains("approved.json"), "{stderr}");
+    assert!(stderr.contains("restore the file"), "{stderr}");
 
     // Refused means refused: the gate is still expected, so tools still fail
     // closed and --check still reports it.
@@ -293,6 +293,77 @@ fn forget_refuses_without_a_human_at_a_terminal() {
         Some(0),
         "restoring the approved bytes must clear the fail-closed state: {}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A ledger nobody can verify refuses to be read as history and names the
+/// way back - which is a human at an interactive terminal: agent sessions
+/// and terminal-less runs are both refused, and the fail-closed state
+/// survives the refusal. The quarantine itself is proven at the unit level,
+/// where no confirmation prompt stands in the way.
+#[test]
+fn an_unverifiable_ledger_is_refused_and_repairable() {
+    let (project, home) = fresh_dirs("ledger-repair");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    // /usr/bin/true exists on both CI platforms; /bin/true is Linux-only.
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/usr/bin/true\"\n",
+    )
+    .unwrap();
+    // An approval is a ledger record, so this is also what writes the chain.
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let ledger = home.join(".openmax").join("ledger");
+    let dir = std::fs::read_dir(&ledger)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a ledger directory");
+    // The easiest tamper there is: delete the pin.
+    std::fs::remove_file(dir.join("chain-head")).unwrap();
+
+    let out = cmd(&project, &home).arg("--ledger").output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("--ledger-repair"), "the way back must be named: {stderr}");
+
+    // The gate it approved is revoked while the chain cannot be trusted.
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let out = cmd(&project, &home)
+        .arg("--ledger-repair")
+        .env("OPENMAX_SESSION", "s-1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "repair is a human action");
+
+    // The marker is one `unset` away from any shell the agent already has,
+    // so a terminal stands behind it - but the stakes still print first, so
+    // even a refused run says what repair would set aside.
+    let out = cmd(&project, &home).arg("--ledger-repair").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stderr.contains("interactive terminal"), "{stderr}");
+    assert!(stdout.contains("set aside"), "the stakes must print before the refusal: {stdout}");
+
+    // Refused means refused: the chain is still unverifiable and --check
+    // still fails closed.
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        !std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+            e.file_name().to_string_lossy().starts_with("log.jsonl.unverified-")
+        }),
+        "a refused repair must move nothing"
     );
 }
 

@@ -48,7 +48,46 @@ impl Actor {
     }
 }
 
+/// What a record asserts. Omitted from the wire for `Change` and defaulted on
+/// read, so every line an older harness wrote keeps its exact bytes and its
+/// place in the chain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// A capability file appeared, changed, or was removed.
+    #[default]
+    Change,
+    /// A human approved this exact content for unattended execution.
+    Approval,
+    /// One-time import of a pre-chain `approved.json` (see the approvals
+    /// section): after this marker the legacy file is ignored forever.
+    ApprovalsImported,
+    /// A human stopped expecting an approved capability at this path
+    /// (`openmax --forget` after a deliberate deletion). The hashes stay
+    /// blessed - approval binds bytes - only the path memory ends.
+    PathRetired,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Change => "change",
+            Kind::Approval => "approval",
+            Kind::ApprovalsImported => "approvals-imported",
+            Kind::PathRetired => "path-retired",
+        }
+    }
+
+    fn is_change(&self) -> bool {
+        matches!(self, Kind::Change)
+    }
+}
+
 /// One observed change. `sha256` is `None` when the file was removed.
+/// Approval records reuse the shape: `sha256` is the manifest's content,
+/// `also` carries the rest of the hashes blessed in the same act (the
+/// project-local code that manifest runs), and `path` is where the human
+/// approved it (empty when the caller only knew a hash).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub v: u32,
@@ -60,6 +99,23 @@ pub struct Record {
     pub actor: Actor,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Kind::is_change")]
+    pub kind: Kind,
+    /// Further hashes covered by the same approval act. Absent on change
+    /// records, so their lines keep the bytes an older harness wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<String>,
+    /// The `event` the approved bytes declared, when the act approved a hook
+    /// manifest. Read back instead of the file so an approved gate cannot
+    /// rewrite itself into an observer; the chain is what makes this
+    /// answer harder to forge than the file it replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// The project-local files those approved bytes named as code, for the
+    /// repair carve-out. Same reason: a rewritten manifest must not be able to
+    /// widen its own exemption.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code: Vec<String>,
     /// sha256 of the previous record's serialized line ("" for the first).
     pub prev: String,
 }
@@ -73,7 +129,11 @@ pub struct Change {
     pub kind: &'static str,
 }
 
-const RECORD_VERSION: u32 = 1;
+/// Bumped when approvals moved into the chain. The value is also the marker
+/// that tells a ledger written before that move from one written after it,
+/// which is what bounds the one-time `approved.json` import (see
+/// `migrate_legacy_approvals_locked`).
+const RECORD_VERSION: u32 = 2;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -108,17 +168,106 @@ fn chain_head_path(dir: &Path) -> PathBuf {
     dir.join("chain-head")
 }
 
-/// Read the full history, verifying the hash chain as it goes. A malformed
-/// line or a broken chain is an error, never silently skipped or displayed
-/// as authentic: a ledger that cannot be trusted must not be read around.
-pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, String> {
-    let path = log_path(&project_dir(data_dir, project_root));
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+/// The head an append is *about to* create, written and flushed before the
+/// records are. A log that runs past its pin is only accepted when this file
+/// names exactly the head those extra records produce, which is what a crash
+/// between the two writes leaves behind - and which a forged tail cannot
+/// claim without also writing here.
+fn pending_head_path(dir: &Path) -> PathBuf {
+    dir.join("chain-head.pending")
+}
+
+fn legacy_approved_path(dir: &Path) -> PathBuf {
+    dir.join("approved.json")
+}
+
+/// Every unverifiable-ledger error ends with this. The old message asserted
+/// tampering and stopped there, which left the ledger write-dead with no
+/// stated way back (recovery was "delete the directory", documented nowhere).
+const REPAIR_HINT: &str = "; the ledger will not append until a human repairs it: `openmax --ledger-repair` quarantines the damaged log (nothing is deleted) and starts a new chain";
+
+fn tampered(message: String) -> String {
+    format!("{message}{REPAIR_HINT}")
+}
+
+/// What the stored pin says about the log that was just verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pin {
+    /// The stored head is the log's final record.
+    Matches,
+    /// No pin and no records: a project the ledger has never seen.
+    Fresh,
+    /// The log carries records past the pin and the pending pin names exactly
+    /// the head they produce: an append that landed while its pin did not.
+    Interrupted,
+}
+
+struct Verified {
+    records: Vec<Record>,
+    /// sha256 of the log's final line ("" when there are no records).
+    head: String,
+    pin: Pin,
+    /// How many leading records the stored chain head covers. Records at or
+    /// past this index landed without their pin (an interrupted append), and
+    /// nothing there may grant or retire authority until a human repairs it:
+    /// the pin is what separates history somebody vouched for from a tail
+    /// anybody could have written.
+    pinned: usize,
+}
+
+impl Verified {
+    /// Records past the pin that grant or retire authority. A crashed sync
+    /// leaves only observations behind; anything stronger in an unpinned
+    /// tail has to wait for a human.
+    fn unpinned_authority(&self) -> impl Iterator<Item = &Record> {
+        self.records[self.pinned..].iter().filter(|r| !r.kind.is_change())
+    }
+}
+
+/// Refuse to append while unpinned authority records exist: any append moves
+/// the pin past them, which would convert a tail nobody vouched for into
+/// approved history. `openmax --ledger-repair` is the one door out, and it
+/// quarantines such a tail rather than blessing it.
+fn refuse_unpinned_authority(verified: &Verified) -> Result<(), String> {
+    let count = verified.unpinned_authority().count();
+    if count == 0 {
+        return Ok(());
+    }
+    Err(tampered(format!(
+        "the log carries {count} approval-grade record(s) past the pinned chain head - an approval whose write was interrupted, or a tail planted outside the harness; either way they grant nothing"
+    )))
+}
+
+/// The full history plus whether the last append's pin never landed.
+pub struct History {
+    pub records: Vec<Record>,
+    /// True when a crash left records past the pin; the next sync re-pins.
+    /// Nothing was removed, so this is a repairable state, not tampering.
+    pub interrupted_write: bool,
+    /// How many leading records the stored chain head vouches for. Records
+    /// past this index are the interrupted (unpinned) tail.
+    pub pinned: usize,
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// Read and verify the log, the chain, and the pin together. A malformed
+/// line, a broken chain, a missing pin, or a pin the log does not match is an
+/// error, never silently skipped or displayed as authentic: a ledger that
+/// cannot be trusted must not be read around.
+fn read_verified(dir: &Path) -> Result<Verified, String> {
+    let path = log_path(dir);
+    let (text, log_present) = match std::fs::read_to_string(&path) {
+        Ok(text) => (text, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let mut out = Vec::new();
+    let mut records = Vec::new();
+    // Hash of every record line in order, so a stored pin can be located
+    // inside the log rather than only compared against its end.
+    let mut line_hashes = Vec::new();
     let mut prev = String::new();
     let last_line_number = text.lines().count();
     for (i, line) in text.lines().enumerate() {
@@ -134,35 +283,102 @@ pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, Stri
             format!("{} line {}: {e}{repair_hint}", path.display(), i + 1)
         })?;
         if record.prev != prev {
-            return Err(format!(
-                "{} line {}: hash chain broken - the ledger was modified outside the harness",
+            // Chain semantics name the record *after* the damage: this line's
+            // `prev` is what fails to match, but the edit is at or before the
+            // line it points at. Say both so the repair looks in one place.
+            return Err(tampered(format!(
+                "{} line {}: hash chain broken - this record does not follow line {}, so line {} or an earlier one was modified or removed outside the harness",
                 path.display(),
-                i + 1
-            ));
+                i + 1,
+                i,
+                i
+            )));
         }
         prev = sha256_hex(line.as_bytes());
-        out.push(record);
+        line_hashes.push(prev.clone());
+        records.push(record);
     }
-    let dir = project_dir(data_dir, project_root);
-    match std::fs::read_to_string(chain_head_path(&dir)) {
-        Ok(stored) if stored.trim() != prev => {
-            return Err(format!(
+
+    let stored = read_trimmed(&chain_head_path(dir));
+    let pending = read_trimmed(&pending_head_path(dir));
+    let pin = match stored.as_deref() {
+        Some(stored) if stored == prev => Pin::Matches,
+        Some(stored) if !records.is_empty() && pending.as_deref() == Some(prev.as_str()) => {
+            // The pending pin vouches for the log's final head, but only a
+            // tail that grows pinned history is an interrupted append: the
+            // stored head must still name a record inside this log. A log
+            // that merely ends where the pending file says, without the
+            // pinned prefix in it, is a rewrite carrying a forged receipt.
+            if !line_hashes.iter().any(|h| h == stored) {
+                return Err(tampered(format!(
+                    "{}: the stored chain head names no record in the log, yet a pending head vouches for its end - the pinned history was rewritten outside the harness",
+                    path.display()
+                )));
+            }
+            Pin::Interrupted
+        }
+        // A surviving pin proves history existed, so an empty or absent log is
+        // deletion, not a fresh project. This is checked before the log's own
+        // absence: reaching for the log first is how `rm log.jsonl` used to
+        // read as "no history yet".
+        Some(_) if records.is_empty() => {
+            return Err(tampered(format!(
+                "{}: a chain head is stored but the log is {} - the history it pins was removed outside the harness",
+                dir.display(),
+                if log_present { "empty" } else { "missing" }
+            )))
+        }
+        Some(_) => {
+            return Err(tampered(format!(
                 "{}: the log's final record does not match the stored chain head - trailing records were removed or rewritten outside the harness",
                 path.display()
-            ));
+            )))
         }
-        Ok(_) => {}
-        // A pre-chain-head ledger (or a fresh project) has no pin yet; the
-        // next sync writes one.
-        Err(_) => {}
-    }
-    Ok(out)
+        // Genuine first run: nothing written, nothing pinned.
+        None if records.is_empty() => Pin::Fresh,
+        // Every append writes the pin, so records without one cannot be
+        // checked for truncation. Deleting a file is easier than rewriting a
+        // chain, so this has to read as tamper rather than as a quiet
+        // downgrade to "internally consistent".
+        None => {
+            return Err(tampered(format!(
+                "{}: the log has {} records but no chain head - the pin every append writes is missing, so trailing records cannot be ruled out as removed",
+                path.display(),
+                records.len()
+            )))
+        }
+    };
+    let pinned = match pin {
+        Pin::Matches => records.len(),
+        Pin::Fresh => 0,
+        // The anchor check above guarantees the position exists.
+        Pin::Interrupted => {
+            let stored = stored.as_deref().unwrap_or_default();
+            line_hashes.iter().position(|h| h == stored).map(|i| i + 1).unwrap_or(0)
+        }
+    };
+    Ok(Verified { records, head: prev, pin, pinned })
+}
+
+/// Read the full history, verifying the hash chain and the truncation pin.
+pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, String> {
+    read_verified(&project_dir(data_dir, project_root)).map(|v| v.records)
+}
+
+/// History plus the interrupted-write flag, for callers that report state.
+pub fn read(data_dir: &Path, project_root: &Path) -> Result<History, String> {
+    read_verified(&project_dir(data_dir, project_root)).map(|v| History {
+        records: v.records,
+        interrupted_write: v.pin == Pin::Interrupted,
+        pinned: v.pinned,
+    })
 }
 
 /// The last known hash per path (None = removed), from the full history.
+/// Only change records describe files; approvals carry a hash, not a state.
 fn head(records: &[Record]) -> HashMap<PathBuf, Option<String>> {
     let mut map = HashMap::new();
-    for r in records {
+    for r in records.iter().filter(|r| r.kind.is_change()) {
         map.insert(r.path.clone(), r.sha256.clone());
     }
     map
@@ -214,44 +430,104 @@ pub fn sync(
     let dir = project_dir(data_dir, project_root);
     std::fs::create_dir_all(dir.join("objects"))
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    with_lock(&dir, || sync_locked(&dir, files, actor, session_id))
+}
+
+/// Run `f` under the ledger's exclusive flock. Never call this from inside
+/// another `with_lock`: flock is per open file description, so a second lock
+/// in the same process would wait on itself forever.
+fn with_lock<R>(dir: &Path, f: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(lock_path(&dir))
+        .open(lock_path(dir))
         .map_err(|e| format!("cannot open ledger lock: {e}"))?;
     lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
-
-    let result = sync_locked(&dir, project_root, files, actor, session_id, data_dir);
+    let result = f();
     let _ = fs2::FileExt::unlock(&lock);
     result
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Durable atomic replace. Used only where a crash that loses the write would
+/// be *harmful*; the ordering below spends exactly one of these per append,
+/// because on macOS each one is a full drive barrier.
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{}: no file name", path.display()))?
+        .to_string_lossy()
+        .to_string();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!("{name}.writing"));
+    let mut file = std::fs::File::create(&tmp)
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    file.write_all(bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    file.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot replace {}: {e}", path.display())
+    })?;
+    // Best effort: directory fsync is the POSIX way to make the rename
+    // durable, and is not available on every platform.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Append chained lines and move the pin in an order no crash can turn into a
+/// false tamper report. Three writes, and what each one costs is chosen by
+/// what its loss would mean:
+///
+/// * the pending pin is durable *before* the records exist, so a crash can
+///   never leave records whose head nothing vouched for;
+/// * the records are flushed before the pin moves, so the pin can never name
+///   a record the log does not have;
+/// * the pin itself needs no barrier: losing it lands in exactly the state
+///   the pending pin describes, which reads as an interrupted write and
+///   re-pins on the next sync.
+fn append_chained(dir: &Path, lines: &str, new_head: &str) -> Result<(), String> {
+    write_durable(&pending_head_path(dir), new_head.as_bytes())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path(dir))
+        .map_err(|e| format!("cannot append to ledger: {e}"))?;
+    file.write_all(lines.as_bytes())
+        .map_err(|e| format!("cannot append to ledger: {e}"))?;
+    file.sync_data().map_err(|e| format!("cannot flush ledger: {e}"))?;
+    crate::sessions::write_atomic(&chain_head_path(dir), new_head)?;
+    let _ = std::fs::remove_file(pending_head_path(dir));
+    Ok(())
+}
+
 fn sync_locked(
     dir: &Path,
-    project_root: &Path,
     files: &[(PathBuf, String, Vec<u8>)],
     actor: Actor,
     session_id: Option<&str>,
-    data_dir: &Path,
 ) -> Result<Vec<Change>, String> {
-    let records = history(data_dir, project_root)?;
-    let effective_actor = if records.is_empty() { Actor::Initial } else { actor };
-    let known = head(&records);
-    let mut prev = std::fs::read_to_string(log_path(dir))
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .next_back()
-                .map(|l| sha256_hex(l.as_bytes()))
-        })
-        .unwrap_or_default();
+    let verified = read_verified(dir)?;
+    // A sync appends and re-pins, which must never quietly bless an unpinned
+    // authority tail; a change-only tail (a crashed sync) heals below.
+    refuse_unpinned_authority(&verified)?;
+    let known = head(&verified.records);
+    // Keyed on change records, not on the log: a ledger that so far holds
+    // only approvals has still never seen this project's files.
+    let effective_actor = if known.is_empty() { Actor::Initial } else { actor };
+    let mut prev = verified.head.clone();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = unix_now();
 
     let mut changes = Vec::new();
     let mut lines = String::new();
@@ -281,6 +557,10 @@ fn sync_locked(
             sha256: Some(sha.clone()),
             actor: effective_actor,
             session_id: session_id.map(str::to_string),
+            kind: Kind::Change,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
             prev: prev.clone(),
         };
         let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
@@ -299,6 +579,10 @@ fn sync_locked(
                 sha256: None,
                 actor: effective_actor,
                 session_id: session_id.map(str::to_string),
+                kind: Kind::Change,
+                also: Vec::new(),
+                event: None,
+                code: Vec::new(),
                 prev: prev.clone(),
             };
             let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
@@ -310,20 +594,26 @@ fn sync_locked(
     }
 
     if !lines.is_empty() {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path(dir))
-            .map_err(|e| format!("cannot append to ledger: {e}"))?;
-        file.write_all(lines.as_bytes())
-            .map_err(|e| format!("cannot append to ledger: {e}"))?;
-        // Pin the new final record so silent truncation is detectable.
-        crate::sessions::write_atomic(&chain_head_path(dir), &prev)?;
+        append_chained(dir, &lines, &prev)?;
+    } else if verified.pin == Pin::Interrupted {
+        // Heal a crash-interrupted append even when this generation changed
+        // nothing: the records are intact and chained, only the pin is stale.
+        crate::sessions::write_atomic(&chain_head_path(dir), &verified.head)?;
+        let _ = std::fs::remove_file(pending_head_path(dir));
     }
     Ok(changes)
 }
 
 // ---------- content-bound approvals ----------
+//
+// Approvals are ledger records, not a file beside the ledger. `approved.json`
+// was plain JSON in the same directory as the chain with none of its
+// protection, so anything that could append a line of JSON - including the
+// agent's own `bash`, which has full host authority - could approve its own
+// hook and have the next session run it. As records they inherit the chain,
+// the pin, and the audit trail: a forged approval has to forge the chain
+// (detectable, and the same ceiling trust already lives at), and every real
+// one shows up in `openmax --ledger` with its time, actor, and session.
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -379,13 +669,9 @@ impl ApprovedHook {
     }
 }
 
-fn approved_path(dir: &Path) -> PathBuf {
-    dir.join("approved.json")
-}
-
 /// What a human has approved for this project: exact content hashes, plus the
 /// capability paths those approvals were granted at.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Approvals {
     hashes: std::collections::HashSet<String>,
     paths: std::collections::HashSet<PathBuf>,
@@ -428,24 +714,88 @@ impl Approvals {
     }
 }
 
+/// Everything the chain says a human approved. One act can bless several
+/// hashes (a manifest plus the code it runs), so a record's hashes are read
+/// together; the path it was granted at is what `was_live` remembers, and the
+/// shape it recorded (the event those bytes declared, and the code they named)
+/// is what reconciliation judges a modified hook by, since the file on disk is
+/// the part an edit controls. Records are consumed in order: a later act at
+/// a path replaces the shape an earlier one recorded, so a human who
+/// deliberately changes a hook's event gets the new shape, and a later
+/// `PathRetired` ends the path memory and the shape together. The exhaustive
+/// match is deliberate - a new record kind must decide here what it means for
+/// authority.
+fn approvals_from(records: &[Record]) -> Approvals {
+    let mut approvals = Approvals::default();
+    for r in records {
+        match r.kind {
+            Kind::Approval => {
+                approvals.hashes.extend(r.sha256.iter().cloned());
+                approvals.hashes.extend(r.also.iter().cloned());
+                if r.path.as_os_str().is_empty() {
+                    continue;
+                }
+                approvals.paths.insert(r.path.clone());
+                let key = r.path.display().to_string();
+                approvals.hooks.retain(|h| h.path != key);
+                if let Some(event) = &r.event {
+                    approvals.hooks.push(ApprovedHook {
+                        path: key,
+                        event: event.clone(),
+                        code: r.code.clone(),
+                    });
+                }
+            }
+            Kind::PathRetired => {
+                approvals.paths.remove(&r.path);
+                let key = r.path.display().to_string();
+                approvals.hooks.retain(|h| h.path != key);
+            }
+            Kind::Change | Kind::ApprovalsImported => {}
+        }
+    }
+    approvals
+}
+
 /// Everything a human approved for this project. Approval binds to content,
-/// not path: any edit changes the hash and revokes itself. Missing file means
-/// nothing approved; a malformed file is an error, and callers treat that as
-/// nothing approved (fail closed) while surfacing the reason.
+/// not path: any edit changes the hash and revokes itself. No approval records
+/// means nothing approved; an unverifiable ledger is an error, and callers
+/// treat that as nothing approved (fail closed) while surfacing the reason.
 pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, String> {
-    let path = approved_path(&project_dir(data_dir, project_root));
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Approvals::default()),
-        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
-    };
-    let file: ApprovedFile = serde_json::from_str(&text)
-        .map_err(|e| format!("{} is malformed ({e}); nothing is approved until it is fixed", path.display()))?;
-    Ok(Approvals {
-        hashes: file.hashes.into_iter().collect(),
-        paths: file.paths.into_iter().map(PathBuf::from).collect(),
-        hooks: file.hooks,
-    })
+    let dir = project_dir(data_dir, project_root);
+    if legacy_approved_path(&dir).exists() {
+        with_lock(&dir, || migrate_legacy_approvals_locked(&dir))?;
+    }
+    // The pin plus the log's length name one exact chain: a different log that
+    // hashed to the same pin would be a sha256 collision on the final record.
+    // Every mutating call and every hook run asks this question, so verifying
+    // thousands of records again each time is worth avoiding - but only
+    // against a key that cannot be forged into a stale answer.
+    let key = read_trimmed(&chain_head_path(&dir))
+        .zip(std::fs::metadata(log_path(&dir)).ok().map(|m| m.len()));
+    if let Some((pin, len)) = &key {
+        if let Some(hit) = cached_approvals(&dir, pin, *len) {
+            return Ok(hit);
+        }
+    }
+    let verified = read_verified(&dir)?;
+    if pre_chain(&verified.records) {
+        // First contact with a ledger written before approvals moved into the
+        // chain, and no legacy file to fold in: seal the import now, or the
+        // window stays open and an `approved.json` planted later walks in as
+        // an heirloom. Sealed once, this branch never runs again.
+        with_lock(&dir, || seal_legacy_import_locked(&dir))?;
+        // The seal moved the head, so skip the cache this round; the next
+        // call keys on the sealed chain.
+        return Ok(approvals_from(&verified.records[..verified.pinned]));
+    }
+    // Only the pinned prefix speaks for a human: an unpinned tail is bytes
+    // nobody vouched for, so what it grants or retires stays inert.
+    let approved = approvals_from(&verified.records[..verified.pinned]);
+    if let Some((pin, len)) = key {
+        remember_approvals(&dir, pin, len, &approved);
+    }
+    Ok(approved)
 }
 
 /// The approved sha256 set alone, for callers with no path question to ask.
@@ -456,9 +806,175 @@ pub fn approved_hashes(
     approvals(data_dir, project_root).map(|a| a.hashes)
 }
 
+type ApprovalCache = HashMap<PathBuf, (String, u64, Approvals)>;
+
+fn approval_cache() -> &'static std::sync::Mutex<ApprovalCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ApprovalCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn cached_approvals(dir: &Path, pin: &str, len: u64) -> Option<Approvals> {
+    let cache = approval_cache().lock().ok()?;
+    match cache.get(dir) {
+        Some((cached_pin, cached_len, approved)) if cached_pin == pin && *cached_len == len => {
+            Some(approved.clone())
+        }
+        _ => None,
+    }
+}
+
+fn remember_approvals(dir: &Path, pin: String, len: u64, approved: &Approvals) {
+    if let Ok(mut cache) = approval_cache().lock() {
+        cache.insert(dir.to_path_buf(), (pin, len, approved.clone()));
+    }
+}
+
+/// Fold a pre-chain `approved.json` into the chain, once. Imported entries are
+/// `Initial`: that file carried no time, no actor, and no integrity, so no
+/// stronger claim can be made about where they came from - and `--ledger`
+/// names them, so a human can audit exactly what was inherited. All three of
+/// its shapes are carried faithfully: the hash set, the approved paths that
+/// tell a modified gate from one nobody ever installed, and the per-hook shape
+/// (event plus the code it named) that says whether a modified hook used to
+/// gate. A store old enough to remember no shape imports the path alone, which
+/// reconciliation already reads as a gate - the safe answer when the question
+/// can no longer be asked.
+///
+/// Only a ledger that predates the move is eligible: records exist and none of
+/// them carry the current version. Otherwise the file is something that
+/// appeared next to a modern chain, which is precisely the forgery this change
+/// closes, so it is set aside unread rather than honored. Either way no
+/// `approved.json` survives, so the fast path stays one `exists` call.
+/// A ledger written before approvals moved into the chain: records exist,
+/// none carries the current version, and no import marker has sealed it. Only
+/// this state may absorb a legacy `approved.json` - and only once, which is
+/// why first contact writes the marker whether or not a file was found.
+fn pre_chain(records: &[Record]) -> bool {
+    !records.is_empty()
+        && records.iter().all(|r| r.v < RECORD_VERSION)
+        && !records.iter().any(|r| r.kind == Kind::ApprovalsImported)
+}
+
+/// Seal a pre-chain ledger that has no legacy file to import: append the
+/// import marker alone, recording that nothing was inherited. Without this,
+/// the eligibility window stays open for as long as the project stays quiet,
+/// and an `approved.json` planted after the upgrade reads as an heirloom.
+fn seal_legacy_import_locked(dir: &Path) -> Result<(), String> {
+    let verified = read_verified(dir)?;
+    if !pre_chain(&verified.records) {
+        // Lost the race to another process: already sealed or migrated.
+        return Ok(());
+    }
+    if legacy_approved_path(dir).exists() {
+        // A file arrived between the unlocked check and this lock: fold it in
+        // through the one gate that authenticates the decision.
+        return migrate_legacy_approvals_locked(dir);
+    }
+    refuse_unpinned_authority(&verified)?;
+    let record = Record {
+        v: RECORD_VERSION,
+        ts: unix_now(),
+        path: PathBuf::new(),
+        sha256: None,
+        actor: Actor::Initial,
+        session_id: None,
+        kind: Kind::ApprovalsImported,
+        also: Vec::new(),
+        event: None,
+        code: Vec::new(),
+        prev: String::new(),
+    };
+    let (lines, head) = chain(vec![record], &verified.head)?;
+    append_chained(dir, &lines, &head)
+}
+
+fn migrate_legacy_approvals_locked(dir: &Path) -> Result<(), String> {
+    let legacy = legacy_approved_path(dir);
+    let verified = read_verified(dir)?;
+    if !pre_chain(&verified.records) {
+        if legacy.exists() {
+            let aside = dir.join(format!("approved.json.ignored-{}", unix_now()));
+            let _ = std::fs::rename(&legacy, &aside);
+            let _ = std::fs::remove_file(&legacy);
+        }
+        return Ok(());
+    }
+    refuse_unpinned_authority(&verified)?;
+    let text = match std::fs::read_to_string(&legacy) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read {}: {e}", legacy.display())),
+    };
+    let file: ApprovedFile = serde_json::from_str(&text).map_err(|e| {
+        format!("{} is malformed ({e}); nothing is approved until it is fixed or removed", legacy.display())
+    })?;
+    let ts = unix_now();
+    let imported = |path: PathBuf, hashes: &[String], shape: Option<&ApprovedHook>| Record {
+        v: RECORD_VERSION,
+        ts,
+        path,
+        sha256: hashes.first().cloned(),
+        actor: Actor::Initial,
+        session_id: None,
+        kind: Kind::Approval,
+        also: hashes.iter().skip(1).cloned().collect(),
+        event: shape.map(|h| h.event.clone()),
+        code: shape.map(|h| h.code.clone()).unwrap_or_default(),
+        prev: String::new(),
+    };
+    let mut records = Vec::new();
+    if !file.hashes.is_empty() {
+        records.push(imported(PathBuf::new(), &file.hashes, None));
+    }
+    // One record per approved path: a record carries a single path, and
+    // dropping them would turn every installed gate into one nobody blessed.
+    // The remembered shape rides the path it describes, so an observe hook a
+    // human really installed does not come back as a demoted gate.
+    for path in &file.paths {
+        let shape = file.hooks.iter().find(|h| h.path == *path);
+        records.push(imported(PathBuf::from(path), &[], shape));
+    }
+    // A shape whose path is not in the path set has nothing to hang on; the
+    // released store never wrote one, and inventing a path memory from it
+    // would grant authority the old file never carried.
+    records.push(Record {
+        v: RECORD_VERSION,
+        ts,
+        path: legacy.clone(),
+        sha256: None,
+        actor: Actor::Initial,
+        session_id: None,
+        kind: Kind::ApprovalsImported,
+        also: Vec::new(),
+        event: None,
+        code: Vec::new(),
+        prev: String::new(),
+    });
+    let (lines, head) = chain(records, &verified.head)?;
+    append_chained(dir, &lines, &head)?;
+    // Only now: an unremovable legacy file must not cost the user their
+    // approvals, and the marker already makes it inert.
+    let _ = std::fs::remove_file(&legacy);
+    Ok(())
+}
+
+/// Link records onto `head`, returning the lines to append and the new head.
+fn chain(records: Vec<Record>, head: &str) -> Result<(String, String), String> {
+    let mut prev = head.to_string();
+    let mut lines = String::new();
+    for mut record in records {
+        record.prev = prev.clone();
+        let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+        prev = sha256_hex(line.as_bytes());
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+    Ok((lines, prev))
+}
+
 /// Record a human approval of exact content. Serialized under the ledger lock.
 pub fn approve_hash(data_dir: &Path, project_root: &Path, sha: &str) -> Result<(), String> {
-    approve(data_dir, project_root, &[sha.to_string()], None)
+    approve(data_dir, project_root, &[sha.to_string()], None, None)
 }
 
 /// Record a human approval of a capability file: the hashes they blessed, and
@@ -469,58 +985,239 @@ pub fn approve_capability(
     path: &Path,
     shas: &[String],
 ) -> Result<(), String> {
-    approve(data_dir, project_root, shas, Some(path))
+    approve(data_dir, project_root, shas, Some(path), None)
 }
 
+/// One approval act, as one chained record: every hash it blessed, the path it
+/// was granted at, and - for a hook - the shape those bytes declared, read
+/// while they are still the approved ones. Nothing new means no record, so
+/// re-approving unchanged content does not grow the log; a shape that moved is
+/// something new, because that is how a human retracts a gate or installs one.
 fn approve(
     data_dir: &Path,
     project_root: &Path,
     shas: &[String],
     path: Option<&Path>,
+    session_id: Option<&str>,
 ) -> Result<(), String> {
     let dir = project_dir(data_dir, project_root);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path(&dir))
-        .map_err(|e| format!("cannot open ledger lock: {e}"))?;
-    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
-    let result = (|| {
-        let current = approvals(data_dir, project_root)?;
-        let mut hashes = current.hashes;
-        let mut paths = current.paths;
-        let mut hooks = current.hooks;
-        let mut changed = false;
-        for sha in shas {
-            changed |= hashes.insert(sha.clone());
+    with_lock(&dir, || {
+        migrate_legacy_approvals_locked(&dir)?;
+        let verified = read_verified(&dir)?;
+        refuse_unpinned_authority(&verified)?;
+        let known = approvals_from(&verified.records[..verified.pinned]);
+        let shape = path.and_then(|p| hook_record(p, project_root));
+        let path = path.map(canonical_or);
+        let new_hash = shas.iter().any(|sha| !known.contains(sha));
+        let new_path = path.as_deref().is_some_and(|p| !known.was_live(p));
+        let new_shape = path
+            .as_deref()
+            .is_some_and(|p| shape_of(known.approved_hook(p)) != shape_of(shape.as_ref()));
+        if !new_hash && !new_path && !new_shape {
+            return Ok(());
         }
-        if let Some(path) = path {
-            changed |= paths.insert(canonical_or(path));
-            // Record the shape of what is being approved while the bytes are
-            // still the approved ones. Re-approving replaces the record, so a
-            // human who deliberately changes a hook's event gets the new one.
-            if let Some(record) = hook_record(path, project_root) {
-                hooks.retain(|h| h.path != record.path);
-                hooks.push(record);
-                changed = true;
+        let record = Record {
+            v: RECORD_VERSION,
+            ts: unix_now(),
+            path: path.unwrap_or_default(),
+            sha256: shas.first().cloned(),
+            actor: if session_id.is_some() { Actor::Session } else { Actor::External },
+            session_id: session_id.map(str::to_string),
+            kind: Kind::Approval,
+            also: shas.iter().skip(1).cloned().collect(),
+            event: shape.as_ref().map(|h| h.event.clone()),
+            code: shape.map(|h| h.code).unwrap_or_default(),
+            prev: String::new(),
+        };
+        let (lines, head) = chain(vec![record], &verified.head)?;
+        append_chained(&dir, &lines, &head)
+    })
+}
+
+/// The comparable part of a remembered hook shape: what it gates on and what
+/// it runs. The path is the key, so it is not part of the answer.
+fn shape_of(hook: Option<&ApprovedHook>) -> Option<(&str, &[String])> {
+    hook.map(|h| (h.event.as_str(), h.code.as_slice()))
+}
+
+/// What `openmax --ledger-repair` did.
+pub struct Repair {
+    /// Where the unverifiable log (or unpinned tail) was moved, when one was.
+    pub quarantined: Option<PathBuf>,
+    /// Lines set aside, and how many of them were approvals.
+    pub records: usize,
+    pub approvals: usize,
+    /// True when the only problem was a crash-interrupted pin, now re-pinned.
+    pub repinned: bool,
+}
+
+/// What `--ledger-repair` would do, read-only, so a front end can show the
+/// stakes before asking a human to type the word that does it.
+pub enum RepairPlan {
+    Nothing,
+    /// An interrupted append of plain observations: re-pinning loses nothing
+    /// and grants nothing.
+    Repin,
+    /// An interrupted append whose tail grants or retires authority: repair
+    /// sets the tail aside rather than blessing bytes nobody vouched for.
+    /// The records are shown so the human knows what to re-approve.
+    QuarantineTail { tail: Vec<Record> },
+    /// An unverifiable log: quarantine sets the whole of it aside.
+    Quarantine { records: usize, approvals: usize },
+}
+
+pub fn repair_plan(data_dir: &Path, project_root: &Path) -> RepairPlan {
+    let dir = project_dir(data_dir, project_root);
+    match read_verified(&dir) {
+        Ok(v) if v.pin == Pin::Interrupted => {
+            if v.unpinned_authority().next().is_some() {
+                RepairPlan::QuarantineTail { tail: v.records[v.pinned..].to_vec() }
+            } else {
+                RepairPlan::Repin
             }
         }
-        if changed {
-            let file = ApprovedFile {
-                version: 1,
-                hashes: hashes.into_iter().collect(),
-                paths: paths.iter().map(|p| p.display().to_string()).collect(),
-                hooks,
-            };
-            let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-            crate::sessions::write_atomic(&approved_path(&dir), json)?;
+        Ok(_) => RepairPlan::Nothing,
+        Err(_) => {
+            let text = std::fs::read_to_string(log_path(&dir)).unwrap_or_default();
+            let approvals = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+                .filter(|r| !r.kind.is_change())
+                .count();
+            let records = text.lines().filter(|l| !l.trim().is_empty()).count();
+            RepairPlan::Quarantine { records, approvals }
         }
-        Ok(())
-    })();
-    let _ = fs2::FileExt::unlock(&lock);
-    result
+    }
+}
+
+/// The stated way back from an unverifiable ledger. Quarantine, never delete:
+/// the damaged log is evidence, and a repair that destroys it would hide the
+/// tampering it exists to reveal. Approvals live in the chain, so a
+/// quarantined log takes them with it - which is the fail-closed half of the
+/// deal, and why the outcome says how many a human has to grant again.
+///
+/// An interrupted append heals two ways: a change-only tail re-pins (records
+/// are observations; nothing gains authority), while a tail that grants or
+/// retires authority is quarantined back to the pinned prefix. Repair never
+/// blesses: the one way authority enters this ledger is a completed, pinned
+/// append from a guarded human path, so a forged tail buys its author
+/// nothing but this quarantine file.
+pub fn repair(data_dir: &Path, project_root: &Path) -> Result<Repair, String> {
+    let dir = project_dir(data_dir, project_root);
+    with_lock(&dir, || match read_verified(&dir) {
+        Ok(verified) if verified.pin == Pin::Interrupted => {
+            if verified.unpinned_authority().next().is_some() {
+                return quarantine_tail_locked(&dir, &verified);
+            }
+            crate::sessions::write_atomic(&chain_head_path(&dir), &verified.head)?;
+            let _ = std::fs::remove_file(pending_head_path(&dir));
+            Ok(Repair { quarantined: None, records: 0, approvals: 0, repinned: true })
+        }
+        Ok(_) => Ok(Repair { quarantined: None, records: 0, approvals: 0, repinned: false }),
+        Err(_) => {
+            let log = log_path(&dir);
+            // Counted without verifying: the whole point is that these lines
+            // cannot be trusted, but a human still deserves the size of what
+            // is being set aside.
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let parsed: Vec<Record> = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+                .collect();
+            let approvals = parsed.iter().filter(|r| r.kind == Kind::Approval).count();
+            let records = text.lines().filter(|l| !l.trim().is_empty()).count();
+            let quarantined = dir.join(format!("log.jsonl.unverified-{}", unix_now()));
+            if log.exists() {
+                std::fs::rename(&log, &quarantined)
+                    .map_err(|e| format!("cannot quarantine {}: {e}", log.display()))?;
+            }
+            let head = chain_head_path(&dir);
+            if head.exists() {
+                let _ = std::fs::rename(&head, dir.join("chain-head.unverified"));
+            }
+            let _ = std::fs::remove_file(pending_head_path(&dir));
+            Ok(Repair {
+                quarantined: log_exists_then(&quarantined),
+                records,
+                approvals,
+                repinned: false,
+            })
+        }
+    })
+}
+
+fn log_exists_then(path: &Path) -> Option<PathBuf> {
+    path.exists().then(|| path.to_path_buf())
+}
+
+/// Set an unpinned authority tail aside and restore the log to its pinned
+/// prefix. The stored chain head already names the prefix's final record, so
+/// it stays; only the pending receipt goes. Atomic on the log: the tail file
+/// is written first, so a crash between the two writes loses nothing.
+fn quarantine_tail_locked(dir: &Path, verified: &Verified) -> Result<Repair, String> {
+    let log = log_path(dir);
+    let text = std::fs::read_to_string(&log)
+        .map_err(|e| format!("cannot read {}: {e}", log.display()))?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = &lines[verified.pinned.min(lines.len())..];
+    let approvals = verified.unpinned_authority().count();
+    let quarantined = dir.join(format!("log.jsonl.unverified-{}", unix_now()));
+    let mut tail_text = tail.join("\n");
+    tail_text.push('\n');
+    crate::sessions::write_atomic(&quarantined, tail_text)?;
+    let mut prefix = lines[..verified.pinned.min(lines.len())].join("\n");
+    if !prefix.is_empty() {
+        prefix.push('\n');
+    }
+    crate::sessions::write_atomic(&log, prefix)?;
+    let _ = std::fs::remove_file(pending_head_path(dir));
+    Ok(Repair {
+        quarantined: Some(quarantined),
+        records: tail.len(),
+        approvals,
+        repinned: false,
+    })
+}
+
+/// Whether an object still holds the exact bytes it is named for. Rollback is
+/// `cp objects/<sha> <path>`, so a rewritten object is a backdoor with a
+/// documented delivery route; the write path re-verifies, and this is the
+/// read path doing the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectState {
+    Intact,
+    Missing,
+    Corrupt,
+}
+
+pub fn object_state(data_dir: &Path, project_root: &Path, sha: &str) -> ObjectState {
+    let path = project_dir(data_dir, project_root).join("objects").join(sha);
+    match std::fs::read(&path) {
+        Ok(bytes) if sha256_hex(&bytes) == sha => ObjectState::Intact,
+        Ok(_) => ObjectState::Corrupt,
+        Err(_) => ObjectState::Missing,
+    }
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MM:SSZ`. Raw epoch seconds are unreadable
+/// in an audit trail, and a date crate is not worth pulling in for one line.
+pub fn format_ts(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    // Civil-from-days (Howard Hinnant's algorithm), epoch shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
 }
 
 /// The approved shape of a hook file, read from the bytes being approved. A
@@ -542,43 +1239,41 @@ fn hook_record(path: &Path, project_root: &Path) -> Option<ApprovedHook> {
 /// Returns whether anything was remembered there. Only the path memory is
 /// dropped, never a content hash - approval binds bytes, and the same bytes
 /// arriving again at any path are still bytes a human read and blessed.
+/// Retirement is a chained record like the approval it ends: it removes
+/// enforcement, so it carries the same authentication and shows up in
+/// `openmax --ledger` with its time and actor.
 pub fn forget_capability(
     data_dir: &Path,
     project_root: &Path,
     path: &Path,
 ) -> Result<bool, String> {
     let dir = project_dir(data_dir, project_root);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path(&dir))
-        .map_err(|e| format!("cannot open ledger lock: {e}"))?;
-    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
-    let result = (|| {
-        let current = approvals(data_dir, project_root)?;
+    with_lock(&dir, || {
+        migrate_legacy_approvals_locked(&dir)?;
+        let verified = read_verified(&dir)?;
+        refuse_unpinned_authority(&verified)?;
+        let known = approvals_from(&verified.records[..verified.pinned]);
         let target = canonical_or(path);
-        let mut paths = current.paths;
-        if !paths.remove(&target) {
+        if !known.was_live(&target) {
             return Ok(false);
         }
-        // The remembered shape goes with the path it described.
-        let target_key = target.display().to_string();
-        let mut hooks = current.hooks;
-        hooks.retain(|h| h.path != target_key);
-        let file = ApprovedFile {
-            version: 1,
-            hashes: current.hashes.into_iter().collect(),
-            paths: paths.iter().map(|p| p.display().to_string()).collect(),
-            hooks,
+        let record = Record {
+            v: RECORD_VERSION,
+            ts: unix_now(),
+            path: target,
+            sha256: None,
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::PathRetired,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: String::new(),
         };
-        let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-        crate::sessions::write_atomic(&approved_path(&dir), json)?;
+        let (lines, head) = chain(vec![record], &verified.head)?;
+        append_chained(&dir, &lines, &head)?;
         Ok(true)
-    })();
-    let _ = fs2::FileExt::unlock(&lock);
-    result
+    })
 }
 
 /// Whether `sha` is human-approved. Any failure reads as unapproved: the
@@ -1022,8 +1717,20 @@ mod tests {
         assert!(is_approved(&data, &root, &sha));
         assert!(!is_approved(&data, &root, &sha256_hex(b"edited")), "new content, new approval");
 
-        // A malformed store approves nothing and says why.
-        std::fs::write(approved_path(&project_dir(&data, &root)), "{broken").unwrap();
+        // The approval is a chained record, and it shows up in the history
+        // an audit reads.
+        let records = history(&data, &root).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, Kind::Approval);
+        assert_eq!(records[0].sha256.as_deref(), Some(sha.as_str()));
+
+        // Approving the same content twice records it once.
+        approve_hash(&data, &root, &sha).unwrap();
+        assert_eq!(history(&data, &root).unwrap().len(), 1);
+
+        // An unverifiable ledger approves nothing and says why.
+        let dir = project_dir(&data, &root);
+        std::fs::write(log_path(&dir), "{broken\n").unwrap();
         assert!(!is_approved(&data, &root, &sha));
         assert!(approved_hashes(&data, &root).is_err());
         let _ = std::fs::remove_dir_all(&data);
@@ -1166,6 +1873,409 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// One approval act is one chained, auditable record: the manifest, the
+    /// code it runs, and the path a human granted it at, all in the line the
+    /// chain covers.
+    #[test]
+    fn an_approval_act_is_one_chained_record_carrying_every_hash() {
+        let data = temp("act-data");
+        let root = temp("act-proj");
+        let manifest = root.join("gate.toml");
+        std::fs::write(&manifest, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        let shas = vec![sha256_hex(b"manifest"), sha256_hex(b"script")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+
+        let records = history(&data, &root).unwrap();
+        assert_eq!(records.len(), 1, "one act, one record");
+        assert_eq!(records[0].kind, Kind::Approval);
+        assert_eq!(records[0].sha256.as_deref(), Some(shas[0].as_str()));
+        assert_eq!(records[0].also, vec![shas[1].clone()], "the bound code rides the same act");
+        assert_eq!(records[0].path, canonical_or(&manifest));
+
+        // Nothing new means no record, so re-approving unchanged content does
+        // not grow the log.
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        assert_eq!(history(&data, &root).unwrap().len(), 1);
+
+        // A rewritten script is a new hash, so it takes a new act - and the
+        // chain records that too.
+        let rewritten = vec![shas[0].clone(), sha256_hex(b"rewritten script")];
+        approve_capability(&data, &root, &manifest, &rewritten).unwrap();
+        let records = history(&data, &root).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].prev, sha256_hex(first_line(&data, &root).as_bytes()));
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn first_line(data: &Path, root: &Path) -> String {
+        let text = std::fs::read_to_string(log_path(&project_dir(data, root))).unwrap();
+        text.lines().next().unwrap().to_string()
+    }
+
+    /// The record has to carry what the approved bytes *were*, not just their
+    /// hash: reconciliation asks whether a modified hook used to gate, and the
+    /// file on disk is the part an edit controls. Storage that forgets this
+    /// reopens the demotion bypass with nothing else failing, so it is
+    /// asserted here at the record, not only through the hooks that read it.
+    #[test]
+    fn an_approved_hooks_shape_rides_the_chain_and_ends_with_it() {
+        let data = temp("shape-data");
+        let root = temp("shape-proj");
+        std::fs::write(root.join("gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        let manifest = root.join("gate.toml");
+        std::fs::write(&manifest, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        approve_capability(&data, &root, &manifest, &[sha256_hex(b"m")]).unwrap();
+
+        let records = history(&data, &root).unwrap();
+        assert_eq!(records[0].event.as_deref(), Some("pre_tool_use"), "the shape is in the line");
+        assert_eq!(records[0].code.len(), 1, "and the code those bytes named");
+        let approved = approvals(&data, &root).unwrap();
+        let hook = approved.approved_hook(&manifest).expect("the shape reads back");
+        assert!(hook.is_gate());
+        assert_eq!(hook.event(), "pre_tool_use");
+        assert_eq!(hook.code_paths().count(), 1);
+
+        // Demotion cannot rewrite the memory: the file now says observer, the
+        // chain still says gate.
+        std::fs::write(&manifest, "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        assert!(approvals(&data, &root).unwrap().approved_hook(&manifest).unwrap().is_gate());
+
+        // A human who means it re-approves, and the new shape replaces the old
+        // one rather than stacking behind it.
+        approve_capability(&data, &root, &manifest, &[sha256_hex(b"m2")]).unwrap();
+        let approved = approvals(&data, &root).unwrap();
+        assert_eq!(approved.approved_hook(&manifest).unwrap().event(), "post_tool_use");
+        assert!(!approved.approved_hook(&manifest).unwrap().is_gate());
+
+        // Re-approving the same shape and hashes again records nothing.
+        let before = history(&data, &root).unwrap().len();
+        approve_capability(&data, &root, &manifest, &[sha256_hex(b"m2")]).unwrap();
+        assert_eq!(history(&data, &root).unwrap().len(), before);
+
+        // Retiring the path retires the shape with it: a path nobody expects
+        // has no gate to have been demoted.
+        assert!(forget_capability(&data, &root, &manifest).unwrap());
+        let approved = approvals(&data, &root).unwrap();
+        assert!(approved.approved_hook(&manifest).is_none());
+        assert!(!approved.was_live(&manifest));
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The proven exploit: one unattended session, no human, the agent writes
+    /// a hook and appends its sha to the approvals store through `bash`.
+    /// Approvals live in the chain now, so a file dropped beside it is not an
+    /// approval - it is set aside, and the hook stays inert.
+    #[test]
+    fn a_forged_approvals_file_approves_nothing() {
+        let data = temp("forge-data");
+        let root = temp("forge-proj");
+        let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
+        sync(&data, &root, &files, Actor::External, None).unwrap();
+
+        let payload = sha256_hex(b"event = \"session_start\"\ncommand = \"/bin/sh\"\n");
+        let hook = root.join(".openmax/hooks/payload.toml");
+        let dir = project_dir(&data, &root);
+        // Both shapes of the old store, including the path set that decides
+        // whether a gate counts as installed.
+        std::fs::write(
+            legacy_approved_path(&dir),
+            serde_json::json!({
+                "version": 1,
+                "hashes": [payload],
+                "paths": [hook.display().to_string()],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!is_approved(&data, &root, &payload), "a forged store must approve nothing");
+        assert!(
+            !legacy_approved_path(&dir).exists(),
+            "the forgery is set aside, not left to be re-read"
+        );
+        let approved = approvals(&data, &root).unwrap();
+        assert!(approved.hashes.is_empty());
+        assert!(!approved.was_live(&hook), "a forged path claim is not an installed gate");
+
+        // Forging the record itself has to forge the chain, which is what the
+        // pin and the chain catch: appended without either, it does not read.
+        let head = std::fs::read_to_string(chain_head_path(&dir)).unwrap();
+        let record = Record {
+            v: RECORD_VERSION,
+            ts: 1,
+            path: PathBuf::new(),
+            sha256: Some(payload.clone()),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Approval,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: head.trim().to_string(),
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        let mut log = std::fs::OpenOptions::new().append(true).open(log_path(&dir)).unwrap();
+        log.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(log);
+        let err = history(&data, &root).unwrap_err();
+        assert!(err.contains("chain head"), "{err}");
+        assert!(!is_approved(&data, &root, &payload), "an unpinned append is not an approval");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every way of deleting evidence, one line each. `rm chain-head` and
+    /// `rm log.jsonl` used to read as a clean history and as a fresh project.
+    #[test]
+    fn every_tamper_shape_is_detected_and_first_run_still_works() {
+        type Tamper = fn(&Path);
+        let cases: [(&str, Tamper); 5] = [
+            ("truncate", |dir| truncate_log(dir, 2)),
+            ("truncate + rm chain-head", |dir| {
+                truncate_log(dir, 2);
+                std::fs::remove_file(chain_head_path(dir)).unwrap();
+            }),
+            ("rm log.jsonl", |dir| std::fs::remove_file(log_path(dir)).unwrap()),
+            ("empty log.jsonl", |dir| std::fs::write(log_path(dir), "").unwrap()),
+            ("rm chain-head", |dir| std::fs::remove_file(chain_head_path(dir)).unwrap()),
+        ];
+        for (name, tamper) in cases {
+            let data = temp("tamper-data");
+            let root = temp("tamper-proj");
+            for v in ["v1", "v2", "v3"] {
+                let files = vec![entry(&root, ".openmax/tools/a.toml", v)];
+                sync(&data, &root, &files, Actor::External, None).unwrap();
+            }
+            let dir = project_dir(&data, &root);
+            tamper(&dir);
+            let err = history(&data, &root).unwrap_err();
+            assert!(err.contains("--ledger-repair"), "{name}: no repair path in: {err}");
+            assert!(
+                sync(&data, &root, &[], Actor::External, None).is_err(),
+                "{name}: an unverifiable ledger must not append"
+            );
+            let _ = std::fs::remove_dir_all(&data);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // A project nobody has ever run is not tampering.
+        let data = temp("fresh-data");
+        let root = temp("fresh-proj");
+        assert!(history(&data, &root).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn truncate_log(dir: &Path, drop_last: usize) {
+        let text = std::fs::read_to_string(log_path(dir)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let keep: String =
+            lines[..lines.len() - drop_last].iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(log_path(dir), keep).unwrap();
+    }
+
+    /// A crash between the append and the pin is not tampering, and saying so
+    /// with certainty is how a power loss used to leave the ledger accusing
+    /// its user and refusing to write forever.
+    #[test]
+    fn an_interrupted_append_reads_as_recoverable_and_heals() {
+        let data = temp("crash-data");
+        let root = temp("crash-proj");
+        let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
+        sync(&data, &root, &files, Actor::External, None).unwrap();
+        let dir = project_dir(&data, &root);
+
+        // Exactly what a SIGKILL after the log write leaves behind: the
+        // pending pin named the head, the log has it, chain-head does not.
+        let text = std::fs::read_to_string(log_path(&dir)).unwrap();
+        let last = text.lines().next_back().unwrap();
+        let record = Record {
+            v: RECORD_VERSION,
+            ts: 2,
+            path: root.join(".openmax/tools/a.toml"),
+            sha256: Some(sha256_hex(b"v2")),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Change,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: sha256_hex(last.as_bytes()),
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        let new_head = sha256_hex(line.as_bytes());
+        let mut log = std::fs::OpenOptions::new().append(true).open(log_path(&dir)).unwrap();
+        log.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(log);
+        std::fs::write(pending_head_path(&dir), &new_head).unwrap();
+
+        let state = read(&data, &root).unwrap();
+        assert_eq!(state.records.len(), 2, "nothing was removed, so nothing is hidden");
+        assert!(state.interrupted_write, "the pin is behind the log, not the log behind the pin");
+
+        // The next sync re-pins, even with nothing new to record.
+        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v2")], Actor::External, None)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(chain_head_path(&dir)).unwrap(), new_head);
+        assert!(!pending_head_path(&dir).exists());
+        assert!(!read(&data, &root).unwrap().interrupted_write);
+
+        // The same tail without a pending pin is a forged append, not a
+        // crash: tolerating one must not launder the other.
+        let text = std::fs::read_to_string(log_path(&dir)).unwrap();
+        let record = Record {
+            prev: sha256_hex(text.lines().next_back().unwrap().as_bytes()),
+            ts: 3,
+            ..record
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        let mut log = std::fs::OpenOptions::new().append(true).open(log_path(&dir)).unwrap();
+        log.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(log);
+        assert!(history(&data, &root).is_err(), "an append with no pending pin is tampering");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A break must be recoverable by a stated command, not by folklore about
+    /// deleting the ledger directory.
+    #[test]
+    fn repair_quarantines_the_damage_and_restores_writes() {
+        let data = temp("repair-data");
+        let root = temp("repair-proj");
+        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
+            .unwrap();
+        approve_hash(&data, &root, &sha256_hex(b"v1")).unwrap();
+        let dir = project_dir(&data, &root);
+        truncate_log(&dir, 1);
+
+        let outcome = repair(&data, &root).unwrap();
+        let quarantined = outcome.quarantined.expect("the damaged log is kept as evidence");
+        assert!(quarantined.exists());
+        assert_eq!(outcome.records, 1);
+        assert!(!log_path(&dir).exists());
+        assert!(!chain_head_path(&dir).exists());
+        assert!(dir.join("objects").is_dir(), "rollback bytes survive a repair");
+
+        // Writes work again, and the quarantined approvals really are gone.
+        assert!(!is_approved(&data, &root, &sha256_hex(b"v1")));
+        let changes =
+            sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::Session, None)
+                .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].actor, Actor::Initial, "a repaired ledger starts a new baseline");
+        assert!(history(&data, &root).is_ok());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pre_chain_approvals_file_is_imported_once_and_only_from_an_old_ledger() {
+        let data = temp("migrate-data");
+        let root = temp("migrate-proj");
+        let dir = project_dir(&data, &root);
+        let sha = sha256_hex(b"old hook");
+
+        // A ledger written before approvals joined the chain: v1 records.
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Record {
+            v: 1,
+            ts: 1,
+            path: root.join(".openmax/tools/a.toml"),
+            sha256: Some(sha256_hex(b"v1")),
+            actor: Actor::Initial,
+            session_id: None,
+            kind: Kind::Change,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: String::new(),
+        };
+        let line = serde_json::to_string(&old).unwrap();
+        std::fs::write(log_path(&dir), format!("{line}\n")).unwrap();
+        std::fs::write(chain_head_path(&dir), sha256_hex(line.as_bytes())).unwrap();
+        let gate = root.join("gate.toml");
+        std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
+        let observer = root.join("watch.toml");
+        std::fs::write(&observer, "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
+        std::fs::write(
+            legacy_approved_path(&dir),
+            serde_json::json!({
+                "version": 1,
+                "hashes": [sha],
+                // A store old enough to remember no shape (the released one)
+                // alongside one written after shapes existed.
+                "paths": [
+                    canonical_or(&gate).display().to_string(),
+                    canonical_or(&observer).display().to_string(),
+                ],
+                "hooks": [{
+                    "path": canonical_or(&observer).display().to_string(),
+                    "event": "post_tool_use",
+                    "code": [],
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let inherited = approvals(&data, &root).unwrap();
+        assert!(inherited.contains(&sha), "an upgrade keeps the approvals it inherited");
+        assert!(inherited.was_live(&gate), "and the paths that say a gate was installed");
+        // A remembered shape is inherited exactly: an observer a human really
+        // installed must not come back as a gate that was demoted.
+        let watched = inherited.approved_hook(&observer).expect("the shape is inherited");
+        assert_eq!(watched.event(), "post_tool_use");
+        assert!(!watched.is_gate());
+        // A path whose shape was never recorded stays unremembered, which
+        // reconciliation reads as a gate: the safe answer to a question the
+        // old store cannot answer.
+        assert!(inherited.approved_hook(&gate).is_none());
+        assert!(!legacy_approved_path(&dir).exists(), "the imported file is removed");
+        let records = history(&data, &root).unwrap();
+        assert_eq!(records[1].kind, Kind::Approval);
+        assert_eq!(records[1].actor, Actor::Initial, "imported provenance is unknowable");
+        assert_eq!(records.last().unwrap().kind, Kind::ApprovalsImported);
+
+        // Recreating it afterwards imports nothing: the door is shut.
+        let forged = sha256_hex(b"forged hook");
+        std::fs::write(
+            legacy_approved_path(&dir),
+            serde_json::json!({ "version": 1, "hashes": [forged] }).to_string(),
+        )
+        .unwrap();
+        assert!(!is_approved(&data, &root, &forged));
+        assert!(is_approved(&data, &root, &sha), "the real import survives");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn objects_are_verified_on_read_and_timestamps_are_readable() {
+        let data = temp("objstate-data");
+        let root = temp("objstate-proj");
+        let (path, sha, bytes) = entry(&root, ".openmax/tools/a.toml", "authentic");
+        sync(&data, &root, &[(path, sha.clone(), bytes)], Actor::External, None).unwrap();
+        assert_eq!(object_state(&data, &root, &sha), ObjectState::Intact);
+
+        let object = project_dir(&data, &root).join("objects").join(&sha);
+        std::fs::write(&object, "### backdoor ###").unwrap();
+        assert_eq!(
+            object_state(&data, &root, &sha),
+            ObjectState::Corrupt,
+            "an object that does not hash to its name must never be restored"
+        );
+        std::fs::remove_file(&object).unwrap();
+        assert_eq!(object_state(&data, &root, &sha), ObjectState::Missing);
+
+        assert_eq!(format_ts(0), "1970-01-01 00:00:00Z");
+        assert_eq!(format_ts(1_785_471_295), "2026-07-31 04:14:55Z");
+        assert_eq!(format_ts(951_782_400), "2000-02-29 00:00:00Z", "leap day");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn malformed_ledger_is_an_error_not_an_empty_history() {
         let data = temp("bad-data");
@@ -1175,6 +2285,221 @@ mod tests {
         std::fs::write(log_path(&dir), "not json\n").unwrap();
         assert!(history(&data, &root).is_err());
         assert!(sync(&data, &root, &[], Actor::External, None).is_err());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Append one correctly chained record to the log and vouch for it with a
+    /// pending receipt: the exact bytes `append_chained` leaves when it dies
+    /// between the log write and the pin move - and the exact bytes a forger
+    /// writes on purpose, because they are the cheapest spelling of a planted
+    /// approval.
+    fn plant_pending_tail(dir: &Path, record: Record) -> String {
+        let text = std::fs::read_to_string(log_path(dir)).unwrap();
+        let last = text.lines().next_back().unwrap();
+        let record = Record { prev: sha256_hex(last.as_bytes()), ..record };
+        let line = serde_json::to_string(&record).unwrap();
+        let head = sha256_hex(line.as_bytes());
+        let mut log = std::fs::OpenOptions::new().append(true).open(log_path(dir)).unwrap();
+        log.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(log);
+        std::fs::write(pending_head_path(dir), &head).unwrap();
+        head
+    }
+
+    /// A forged approval in a pending tail must stay inert: reads honor only
+    /// the pinned prefix, every append refuses to move the pin past it, and
+    /// repair sets it aside instead of blessing it.
+    #[test]
+    fn a_pending_tail_grants_no_authority() {
+        let data = temp("tail-data");
+        let root = temp("tail-proj");
+        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
+            .unwrap();
+        approve_hash(&data, &root, &sha256_hex(b"blessed")).unwrap();
+        let dir = project_dir(&data, &root);
+
+        plant_pending_tail(&dir, Record {
+            v: RECORD_VERSION,
+            ts: 9,
+            path: root.join(".openmax/hooks/evil.toml"),
+            sha256: Some(sha256_hex(b"evil")),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Approval,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: String::new(),
+        });
+
+        // Inert on read: the real approval stands, the forged one does not.
+        let approved = approvals(&data, &root).unwrap();
+        assert!(approved.contains(&sha256_hex(b"blessed")));
+        assert!(!approved.contains(&sha256_hex(b"evil")), "an unpinned approval grants nothing");
+
+        // Refused on write: nothing may move the pin past the forgery.
+        let next = [entry(&root, ".openmax/tools/a.toml", "v2")];
+        let err = sync(&data, &root, &next, Actor::External, None).unwrap_err();
+        assert!(err.contains("approval-grade"), "{err}");
+        let err = approve_hash(&data, &root, &sha256_hex(b"more")).unwrap_err();
+        assert!(err.contains("approval-grade"), "{err}");
+
+        // Repair quarantines the tail instead of blessing it.
+        let outcome = repair(&data, &root).unwrap();
+        assert!(outcome.quarantined.is_some(), "the tail is evidence, not history");
+        assert_eq!(outcome.approvals, 1);
+        assert!(!outcome.repinned);
+        let approved = approvals(&data, &root).unwrap();
+        assert!(approved.contains(&sha256_hex(b"blessed")), "pinned history survives repair");
+        assert!(!approved.contains(&sha256_hex(b"evil")));
+        // And the ledger appends again.
+        sync(&data, &root, &next, Actor::External, None).unwrap();
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A change-only pending tail is a crashed sync, and crash recovery must
+    /// keep working exactly as before: reads see the records, the next sync
+    /// re-pins, nothing needs a human.
+    #[test]
+    fn a_change_only_pending_tail_still_heals_itself() {
+        let data = temp("healtail-data");
+        let root = temp("healtail-proj");
+        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
+            .unwrap();
+        let dir = project_dir(&data, &root);
+        let head = plant_pending_tail(&dir, Record {
+            v: RECORD_VERSION,
+            ts: 2,
+            path: root.join(".openmax/tools/a.toml"),
+            sha256: Some(sha256_hex(b"v2")),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Change,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: String::new(),
+        });
+        assert!(read(&data, &root).unwrap().interrupted_write);
+        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v2")], Actor::External, None)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(chain_head_path(&dir)).unwrap(), head);
+        assert!(!read(&data, &root).unwrap().interrupted_write);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A rewritten log carrying a pending receipt for its own new end is not
+    /// an interrupted append: the stored head names no record in it. That
+    /// distinction keeps the crash-recovery door from accepting a wholesale
+    /// forgery.
+    #[test]
+    fn a_rewritten_log_with_a_pending_receipt_reads_as_tamper() {
+        let data = temp("rewrite-data");
+        let root = temp("rewrite-proj");
+        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
+            .unwrap();
+        let dir = project_dir(&data, &root);
+
+        let record = Record {
+            v: RECORD_VERSION,
+            ts: 1,
+            path: root.join(".openmax/hooks/evil.toml"),
+            sha256: Some(sha256_hex(b"evil")),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Approval,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: String::new(),
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        std::fs::write(log_path(&dir), format!("{line}\n")).unwrap();
+        std::fs::write(pending_head_path(&dir), sha256_hex(line.as_bytes())).unwrap();
+
+        let err = approvals(&data, &root).unwrap_err();
+        assert!(err.contains("rewritten"), "{err}");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An upgraded project with no legacy file seals the import window at
+    /// first contact: an `approved.json` planted afterwards is set aside
+    /// unread, not imported as an heirloom.
+    #[test]
+    fn first_contact_seals_the_legacy_import_window() {
+        let data = temp("seal-data");
+        let root = temp("seal-proj");
+        let dir = project_dir(&data, &root);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A ledger written before approvals moved into the chain: v1 records,
+        // no import marker.
+        let record = Record {
+            v: 1,
+            ts: 1,
+            path: root.join(".openmax/tools/a.toml"),
+            sha256: Some(sha256_hex(b"v1")),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Change,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            prev: String::new(),
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        std::fs::write(log_path(&dir), format!("{line}\n")).unwrap();
+        std::fs::write(chain_head_path(&dir), sha256_hex(line.as_bytes())).unwrap();
+
+        let _ = approvals(&data, &root).unwrap();
+        assert!(
+            history(&data, &root).unwrap().iter().any(|r| r.kind == Kind::ApprovalsImported),
+            "first contact must seal the import window"
+        );
+
+        let planted = format!(
+            r#"{{"version":1,"hashes":["{}"],"paths":[]}}"#,
+            sha256_hex(b"planted")
+        );
+        std::fs::write(legacy_approved_path(&dir), planted).unwrap();
+        let approved = approvals(&data, &root).unwrap();
+        assert!(
+            !approved.contains(&sha256_hex(b"planted")),
+            "a planted legacy file walked into the chain"
+        );
+        assert!(!legacy_approved_path(&dir).exists(), "the planted file must be set aside");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Retiring a path is a chained record with the same authentication as
+    /// the approval it ends: the hash stays blessed, the path memory ends,
+    /// and the act is auditable in history.
+    #[test]
+    fn forget_appends_a_retirement_record() {
+        let data = temp("forget-data");
+        let root = temp("forget-proj");
+        std::fs::create_dir_all(root.join(".openmax/hooks")).unwrap();
+        let gate = root.join(".openmax/hooks/gate.toml");
+        std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/usr/bin/true\"\n").unwrap();
+        let sha = sha256_hex(&std::fs::read(&gate).unwrap());
+        approve_capability(&data, &root, &gate, std::slice::from_ref(&sha)).unwrap();
+        assert!(approvals(&data, &root).unwrap().was_live(&gate));
+
+        std::fs::remove_file(&gate).unwrap();
+        assert!(forget_capability(&data, &root, &gate).unwrap());
+        let approved = approvals(&data, &root).unwrap();
+        assert!(!approved.was_live(&gate), "the path memory must end");
+        assert!(approved.contains(&sha), "the content approval must survive");
+        assert!(!forget_capability(&data, &root, &gate).unwrap(), "nothing left to retire");
+        assert!(
+            history(&data, &root).unwrap().iter().any(|r| r.kind == Kind::PathRetired),
+            "retirement must be auditable"
+        );
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
