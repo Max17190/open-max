@@ -9,6 +9,10 @@ use crate::config::Settings;
 use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
+/// One extension generation exactly as a freeze captured it: for each file,
+/// its path, sha256, and bytes.
+pub type ExtensionGeneration = Vec<(PathBuf, String, Vec<u8>)>;
+
 /// In-memory state of one agent session.
 #[derive(Default, Clone)]
 pub struct SessionData {
@@ -37,12 +41,15 @@ pub struct SessionData {
     /// recorded - and the next mid-turn sync would sweep them up as the
     /// agent's own work.
     pub ledger_synced: bool,
-    /// The turn-start extension generation whose External reconciliation
-    /// failed, held so it lands - still as External - before any other sync
-    /// advances the ledger head past it. Once a Session record absorbs that
-    /// delta the misattribution is permanent, so every sync path settles this
-    /// first or does not run. Cleared the moment it lands.
-    pub pending_reconcile: Option<Vec<(PathBuf, String, Vec<u8>)>>,
+    /// Deferred ledger syncs, oldest first: (extension generation, actor). A
+    /// sync that cannot land is held here with the attribution it was owed,
+    /// and every sync path drains this queue in order before adding its own
+    /// claim - the head must never advance past an unlanded one, or its
+    /// changes get recorded later under whoever syncs next, and that
+    /// misattribution is permanent. Consecutive same-actor entries collapse
+    /// to the newest generation, so a ledger that stays broken holds at most
+    /// one entry per attribution stretch, not one per turn.
+    pub pending_syncs: Vec<(ExtensionGeneration, crate::ledger::Actor)>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous
