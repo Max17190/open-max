@@ -440,7 +440,7 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
     if tools::TOOL_NAMES.contains(&name) {
         tools::summarize_call(name, args)
     } else {
-        summarize_external(args)
+        summarize_external(name, args)
     }
 }
 
@@ -467,8 +467,11 @@ fn builtin_specs() -> Vec<ToolSpec> {
 }
 
 /// External tools have arbitrary parameter names, so summaries fall back to
-/// the most path/command-looking argument available.
-fn summarize_external(args: &Value) -> String {
+/// the most path/command-looking argument available, and finally to the tool's
+/// own name: a call whose arguments hold no strings at all (numbers, bools, or
+/// none) must still summarize to something, or an approval card renders as
+/// bare empty parens and the human is asked to approve a blank.
+fn summarize_external(name: &str, args: &Value) -> String {
     for key in ["command", "path", "pattern"] {
         if let Some(v) = args[key].as_str() {
             return v.to_string();
@@ -476,7 +479,7 @@ fn summarize_external(args: &Value) -> String {
     }
     args.as_object()
         .and_then(|o| o.values().find_map(|v| v.as_str()))
-        .unwrap_or("")
+        .unwrap_or(name)
         .to_string()
 }
 
@@ -729,6 +732,20 @@ mod tests {
             registry.tool_schemas_json().to_string(),
             tools::tool_schemas().to_string()
         );
+    }
+
+    /// Approval prompts and the headless refusal line are built from this
+    /// summary, so it must never come back empty: "declining danger ()" tells
+    /// a human nothing about what they are being asked to approve.
+    #[test]
+    fn external_summaries_never_come_back_empty() {
+        use serde_json::json;
+        assert_eq!(summarize_call("deploy", &json!({"command": "ship"})), "ship");
+        assert_eq!(summarize_call("deploy", &json!({"target": "prod"})), "prod");
+        // No string argument at all falls back to the tool's own name.
+        assert_eq!(summarize_call("danger", &json!({"count": 3})), "danger");
+        assert_eq!(summarize_call("danger", &json!({})), "danger");
+        assert_eq!(summarize_call("danger", &Value::Null), "danger");
     }
 
     #[test]

@@ -2083,14 +2083,21 @@ impl App {
                 summary,
                 detail,
                 reason,
+                source_path,
+                source_sha,
             } => {
                 // Interactive approvals show provenance at the moment it
-                // matters: the first run of unapproved capability content.
+                // matters: the first run of unapproved capability content,
+                // named by the file and the exact bytes being approved.
                 let detail = if reason == "unapproved_source" {
+                    let mut head = "first run of unapproved tool content".to_string();
+                    if !source_path.is_empty() {
+                        head.push_str(&format!(" · {source_path} ({source_sha})"));
+                    }
                     if detail.is_empty() {
-                        "first run of unapproved tool content".to_string()
+                        head
                     } else {
-                        format!("first run of unapproved tool content · {detail}")
+                        format!("{head} · {detail}")
                     }
                 } else {
                     detail
@@ -3654,6 +3661,8 @@ mod tests {
             name: "bash".into(),
             summary: "run tests".into(),
             detail: "cargo test".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
         });
 
         app.on_key(KeyEvent::new(
@@ -3915,6 +3924,8 @@ mod tests {
             name: "bash".into(),
             summary: "install dependencies".into(),
             detail: "cargo fetch".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
         });
         let pending = render_app(&mut app, 88, 16);
         let pending_text = buffer_text(&pending);
@@ -3953,6 +3964,8 @@ mod tests {
             name: "bash".into(),
             summary: "run tests".into(),
             detail: "cargo test".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
         });
         let buffer = render_app(&mut app, 64, 4);
         let rendered = rows(&buffer);

@@ -186,10 +186,14 @@ hashes a human has approved. Approval binds to content, never to a path: any
 edit produces a new hash and revokes itself. Two hard rules ride on it, with
 no rule language to widen them:
 
-- A mutating external tool whose defining TOML no human has approved always
-  prompts on its first run - even in `auto` mode, even under a permissions
-  `allow` rule, both of which the agent can write for itself. Approving that
-  run approves the exact content; later runs of the same bytes are unattended.
+- An external tool whose defining TOML no human has approved always prompts on
+  its first run - even in `auto` mode, even under a permissions `allow` rule,
+  both of which the agent can write for itself. Approving that run approves the
+  exact content; later runs of the same bytes are unattended. Every external
+  tool is covered, whatever its `mutating` field says: that field is metadata
+  the agent writes, while the call itself spawns a native host process with
+  openmax's environment, credentials, and network access. A read-only tool is
+  read-only by assertion, not by construction.
 - An unapproved hook file is inert. Hooks run with host authority on every
   matching call with no per-invocation gate, so they are the one capability
   file that never loads until approved. `openmax --check` names each one.

@@ -4,7 +4,7 @@
 //! speak line-delimited JSON (an editor plugin, an orchestrator, another
 //! openmax) can drive a complete interactive session, approvals included.
 //!
-//! Protocol (`openmax-stdio/1`), one JSON object per line. The normative
+//! Protocol (`openmax-stdio/3`), one JSON object per line. The normative
 //! reference (every field of every line) lives in README under "stdio
 //! protocol"; `crates/core/src/types.rs` golden tests pin the event wire.
 //!
@@ -17,7 +17,7 @@
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
 //! stdout lines:
-//!   {"type":"hello","proto":"openmax-stdio/1","protocol_version":1,"session_id":"...","version":"...","project":"..."}
+//!   {"type":"hello","proto":"openmax-stdio/3","protocol_version":3,"session_id":"...","version":"...","project":"..."}
 //!   AgentEvent envelopes exactly as `--print --json` emits them
 //!   {"type":"protocol_error","message":"..."}        bad input; session unharmed
 //!
@@ -45,11 +45,11 @@ use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-pub const PROTO: &str = "openmax-stdio/2";
+pub const PROTO: &str = "openmax-stdio/3";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).
@@ -435,7 +435,7 @@ fn transcript_value(
     })
 }
 
-/// Validate one JSONL line against the `openmax-stdio/1` contract using the
+/// Validate one JSONL line against the `openmax-stdio/3` contract using the
 /// authoritative types (`Command` for stdin, `AgentEvent` for stdout events),
 /// so there is no second schema to drift. Returns a short label on success
 /// (`cmd user`, `event token`, `hello`) or a human reason on failure.
@@ -520,8 +520,19 @@ pub fn validate_line(line: &str) -> Result<String, String> {
             if !obj.get("session_id").map(serde_json::Value::is_string).unwrap_or(false) {
                 return Err(format!("event '{ty}' missing string 'session_id'"));
             }
-            serde_json::from_value::<AgentEvent>(value.clone())
+            let event = serde_json::from_value::<AgentEvent>(value.clone())
                 .map_err(|e| format!("bad event '{ty}': {e}"))?;
+            // Well-typed is not enough for the one event a human must act on:
+            // an unapproved_source prompt without its file names no command
+            // anyone can run, which is the failure this field exists to fix.
+            if let AgentEvent::ApprovalRequest { reason, source_path, .. } = &event {
+                if reason == "unapproved_source" && source_path.is_empty() {
+                    return Err(
+                        "approval_request with reason 'unapproved_source' has an empty 'source_path'"
+                            .to_string(),
+                    );
+                }
+            }
             Ok(format!("event {ty}"))
         }
     }
@@ -657,6 +668,33 @@ mod tests {
         .is_err());
         assert!(validate_line(
             r#"{"type":"hello","proto":"openmax-stdio/1","protocol_version":99,"session_id":"s","version":"0","project":"/p"}"#
+        )
+        .is_err());
+
+        // An unapproved_source prompt is only conformant when it names the
+        // file to approve; the human boundary needs a runnable command.
+        assert_eq!(
+            validate_line(
+                r#"{"session_id":"s1","type":"approval_request","approval_id":"a","name":"danger","summary":"danger","detail":"","reason":"unapproved_source","source_path":".openmax/tools/danger.toml","source_sha":"0123456789ab"}"#
+            )
+            .unwrap(),
+            "event approval_request"
+        );
+        assert!(validate_line(
+            r#"{"session_id":"s1","type":"approval_request","approval_id":"a","name":"danger","summary":"danger","detail":"","reason":"unapproved_source","source_path":"","source_sha":""}"#
+        )
+        .is_err());
+        // The ordinary gate carries no file and stays valid without one.
+        assert_eq!(
+            validate_line(
+                r#"{"session_id":"s1","type":"approval_request","approval_id":"a","name":"bash","summary":"ls","detail":"ls","reason":"gate","source_path":"","source_sha":""}"#
+            )
+            .unwrap(),
+            "event approval_request"
+        );
+        // A pre-/3 line without the source fields is not this contract.
+        assert!(validate_line(
+            r#"{"session_id":"s1","type":"approval_request","approval_id":"a","name":"bash","summary":"ls","detail":"ls","reason":"gate"}"#
         )
         .is_err());
 

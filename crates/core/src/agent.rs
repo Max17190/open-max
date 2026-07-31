@@ -146,6 +146,8 @@ fn batchable_call(
     registry: &Registry,
     repeat_tracker: &RepeatCallTracker,
     permissions: &Permissions,
+    data_dir: &Path,
+    project_root: &Path,
 ) -> bool {
     let name = call.function.name.as_str();
     if name.is_empty() {
@@ -164,7 +166,17 @@ fn batchable_call(
         PermissionDecision::Allow | PermissionDecision::Default => {}
     }
     let args_key = canonicalize_args(&args);
-    !repeat_tracker.would_block(name, &args_key)
+    if repeat_tracker.would_block(name, &args_key) {
+        return false;
+    }
+    // Same principle as Ask: a tool whose content no human has approved needs
+    // the serial path, which is where the prompt and its actionable event live.
+    // This check is load-bearing rather than defensive - batching selects for
+    // external non-mutating tools, which is exactly the population the content
+    // gate exists to catch, so an unapproved tool called twice in one message
+    // would otherwise run unattended. Kept last because it is the only check
+    // that touches disk, and built-ins return before the ledger is read.
+    unapproved_capability(registry, data_dir, project_root, name).is_none()
 }
 
 /// Append cancel/error tool messages for any tool_call_ids on the last assistant
@@ -369,7 +381,10 @@ async fn execute_readonly_batch(
             name: name.into(),
             args: args.clone(),
         });
-        // hooks pre → permissions → (readonly tools skip approval_mode)
+        // hooks pre → permissions → content gate. approval_mode and
+        // snapshot_file are skipped because both only ever act on mutating
+        // tools, which batchable_call excludes: that exclusion is what makes
+        // the shorter sequence equivalent, not an assumption about intent.
         let block = match ctx
             .hooks
             .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
@@ -411,6 +426,20 @@ async fn execute_readonly_batch(
                 PermissionDecision::Allow | PermissionDecision::Default => None,
             },
         };
+        // Unapproved content is excluded from batching (see batchable_call) so
+        // the serial path can prompt; if one still lands here, block rather
+        // than run host code no human approved. The two sites share the one
+        // predicate, so the batch path cannot drift away from the gate again.
+        let block = block.or_else(|| {
+            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
+                |source| tools::ToolOutcome {
+                    ok: false,
+                    output: declined_message(Some(&source)),
+                    diff: None,
+                    ..Default::default()
+                },
+            )
+        });
         blocked.push(block);
     }
 
@@ -1315,10 +1344,23 @@ async fn run_loop(
         // True once any mutating call succeeded this iteration: only then can
         // extension files have changed, so only then is the fingerprint
         // re-checked before the next model request.
+        //
+        // Only the serial path sets this. A batched external tool is host code
+        // that could also write a capability file, so a mid-turn refreeze can
+        // be one iteration late after a pure batch; turn start always catches
+        // it. Not a gate hole - whatever such a tool writes is unapproved
+        // content, which asks on its own first call.
         let mut extensions_touched = false;
 
         let segments = partition_concurrent_runs(&tool_calls, |call| {
-            batchable_call(call, &registry, &repeat_tracker, &permissions)
+            batchable_call(
+                call,
+                &registry,
+                &repeat_tracker,
+                &permissions,
+                &core.data_dir,
+                project_root,
+            )
         });
 
         'calls: for segment in segments {
@@ -1451,20 +1493,14 @@ async fn run_loop(
                 // Readonly still blocks mutating tools regardless of Allow.
                 let force_allow = matches!(perm, PermissionDecision::Allow);
                 let force_ask = matches!(perm, PermissionDecision::Ask);
-                // A mutating external tool whose defining file no human has
-                // approved (by exact content hash) always prompts - even in
-                // auto mode, even under a permissions Allow rule, both of
-                // which the agent can write for itself. This is the invariant
-                // that makes same-turn self-extension safe: the agent can
-                // grow its own action space but cannot grant it unattended
-                // host authority.
-                let unapproved_source = registry.is_mutating(name)
-                    && registry.get(name).is_some_and(|spec| match &spec.kind {
-                        crate::registry::ToolKind::External(ext) => {
-                            !crate::ledger::is_approved(&core.data_dir, project_root, &ext.source_sha256)
-                        }
-                        crate::registry::ToolKind::Builtin => false,
-                    });
+                // An external tool whose defining file no human has approved
+                // (by exact content hash) always prompts - even in auto mode,
+                // even under a permissions Allow rule, both of which the agent
+                // can write for itself. This is the invariant that makes
+                // same-turn self-extension safe: the agent can grow its own
+                // action space but cannot grant it unattended host authority.
+                let unapproved_source =
+                    unapproved_capability(&registry, &core.data_dir, project_root, name);
                 let mut executed = false;
                 let mut prompt_approved = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
@@ -1473,41 +1509,38 @@ async fn run_loop(
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None, ..Default::default()
                     }, false)
-                } else if unapproved_source
+                } else if unapproved_source.is_some()
                     || (!force_allow
                         && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask)))
                 {
+                    let source = unapproved_source.as_ref();
                     let approval_reason =
-                        if unapproved_source { "unapproved_source" } else { "gate" };
-                    match request_approval(core, session_id, name, &args, approval_reason, &cancelled).await {
+                        if source.is_some() { "unapproved_source" } else { "gate" };
+                    match request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await {
                         ApprovalOutcome::Approved => {
                             executed = true;
                             prompt_approved = true;
                             // Approving the first run of an unapproved tool
                             // approves this exact content: later runs of the
                             // same bytes need no prompt, any edit revokes.
-                            if unapproved_source {
-                                if let Some(crate::registry::ToolKind::External(ext)) =
-                                    registry.get(name).map(|spec| &spec.kind)
-                                {
-                                    if let Err(e) = crate::ledger::approve_hash(
-                                        &core.data_dir,
-                                        project_root,
-                                        &ext.source_sha256,
-                                    ) {
-                                        core.send_agent(session_id, AgentEvent::Error {
-                                            message: format!(
-                                                "approval was granted but could not be recorded (the tool will ask again): {e}"
-                                            ),
-                                        });
-                                    }
+                            if let Some(source) = source {
+                                if let Err(e) = crate::ledger::approve_hash(
+                                    &core.data_dir,
+                                    project_root,
+                                    &source.sha256,
+                                ) {
+                                    core.send_agent(session_id, AgentEvent::Error {
+                                        message: format!(
+                                            "approval was granted but could not be recorded (the tool will ask again): {e}"
+                                        ),
+                                    });
                                 }
                             }
                             (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
-                            output: "The user declined this action. Ask them how to proceed instead of retrying.".into(),
+                            output: declined_message(source),
                             diff: None, ..Default::default()
                         }, false),
                         ApprovalOutcome::TimedOut => (tools::ToolOutcome {
@@ -1755,12 +1788,71 @@ impl Drop for MessageGuard {
     }
 }
 
+/// The capability file behind a tool whose exact content no human has
+/// approved: everything a prompt or a refusal needs to name the one action
+/// that unblocks the call.
+struct UnapprovedCapability {
+    /// Project-relative where possible, so it reads like the tree and can be
+    /// pasted straight into `openmax --approve` from the project root.
+    path: String,
+    sha256: String,
+}
+
+/// The unapproved capability file behind `name`, or None when the call needs
+/// no content approval.
+///
+/// Every external tool qualifies, not only the ones declaring `mutating`:
+/// `mutating` is metadata the agent writes for itself (`--spec tools`: "not a
+/// sandbox"), while any external call spawns a native host process that
+/// inherits Open Max's environment, credentials, and network access. A
+/// boundary conditioned on that field is one the agent can write away.
+/// Built-ins are core code with their own confinement and are never gated here.
+fn unapproved_capability(
+    registry: &crate::registry::Registry,
+    data_dir: &Path,
+    project_root: &Path,
+    name: &str,
+) -> Option<UnapprovedCapability> {
+    let crate::registry::ToolKind::External(ext) = &registry.get(name)?.kind else {
+        return None;
+    };
+    if crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+        return None;
+    }
+    let path = ext.source_path.strip_prefix(project_root).unwrap_or(&ext.source_path);
+    Some(UnapprovedCapability {
+        path: path.display().to_string(),
+        sha256: ext.source_sha256.clone(),
+    })
+}
+
+/// What the model is told when an approval comes back declined. The content
+/// gate is not a user decision, so saying "the user declined" would be false
+/// and would leave the agent with nothing to relay: name the boundary and the
+/// exact command that lifts it.
+fn declined_message(source: Option<&UnapprovedCapability>) -> String {
+    match source {
+        Some(source) => format!(
+            "This tool's content has not been approved by a human, so the harness declined the call. \
+             Tell the user to run: openmax --approve {}",
+            source.path
+        ),
+        None => "The user declined this action. Ask them how to proceed instead of retrying.".into(),
+    }
+}
+
+/// Short form of a capability hash for display, matching `openmax --approve`.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
 async fn request_approval(
     core: &Arc<Core>,
     session_id: &str,
     name: &str,
     args: &Value,
     reason: &str,
+    source: Option<&UnapprovedCapability>,
     cancelled: &Arc<CancelToken>,
 ) -> ApprovalOutcome {
     let approval_id = uuid::Uuid::new_v4().to_string();
@@ -1774,6 +1866,8 @@ async fn request_approval(
         summary,
         detail,
         reason: reason.to_string(),
+        source_path: source.map(|s| s.path.clone()).unwrap_or_default(),
+        source_sha: source.map(|s| short_sha(&s.sha256)).unwrap_or_default(),
     });
 
     let outcome = tokio::select! {
@@ -1958,6 +2052,64 @@ mod tests {
         )
     }
 
+    /// The human content boundary covers every agent-writable tool, not just
+    /// the ones that declare themselves mutating: `mutating` is a field the
+    /// agent writes, and an external call is a native host process either way.
+    /// Built-ins are core code and must never be gated, or every session would
+    /// open with an approval prompt for read_file.
+    #[test]
+    fn every_unapproved_external_tool_is_gated_whatever_mutating_says() {
+        let dir = std::env::temp_dir().join(format!("openmax-gate-{}", uuid::Uuid::new_v4()));
+        let data_dir = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/peek.toml"),
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/true\"\nmutating = false\n",
+        )
+        .unwrap();
+        let registry = crate::registry::Registry::build(&project);
+
+        let gated = unapproved_capability(&registry, &data_dir, &project, "peek")
+            .expect("a self-declared read-only external tool is still host code");
+        assert_eq!(gated.path, ".openmax/tools/peek.toml", "the path must be pasteable into --approve");
+        assert_eq!(gated.sha256.len(), 64);
+        assert!(unapproved_capability(&registry, &data_dir, &project, "read_file").is_none());
+        assert!(unapproved_capability(&registry, &data_dir, &project, "nonexistent").is_none());
+
+        // Once a human approves those exact bytes, the tool runs unprompted.
+        crate::ledger::approve_hash(&data_dir, &project, &gated.sha256).unwrap();
+        assert!(unapproved_capability(&registry, &data_dir, &project, "peek").is_none());
+
+        // Any edit is new content and revokes the approval.
+        std::fs::write(
+            project.join(".openmax/tools/peek.toml"),
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/sh\"\nmutating = false\n",
+        )
+        .unwrap();
+        let edited = crate::registry::Registry::build(&project);
+        assert!(unapproved_capability(&edited, &data_dir, &project, "peek").is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A content-gate refusal is not a user decision. The model must be told
+    /// what actually blocked the call and the exact command that lifts it, or
+    /// it can only guess (and retry).
+    #[test]
+    fn a_content_gate_refusal_names_the_approve_command() {
+        let source = UnapprovedCapability {
+            path: ".openmax/tools/danger.toml".into(),
+            sha256: "a".repeat(64),
+        };
+        let message = declined_message(Some(&source));
+        assert!(message.contains("openmax --approve .openmax/tools/danger.toml"), "{message}");
+        assert!(!message.contains("The user declined"), "{message}");
+        // A real user decline keeps its own wording.
+        assert!(declined_message(None).contains("The user declined this action"));
+        assert_eq!(short_sha(&source.sha256), "a".repeat(12));
+    }
+
     #[test]
     fn broken_native_calls_fall_back_to_markup() {
         let known = ["read_file".to_string(), "bash".to_string()];
@@ -2106,6 +2258,63 @@ mod tests {
         assert!(!complete_pending_tool_replies(&mut done, note));
     }
 
+    /// Built-in tools never reach the ledger inside `batchable_call`, so
+    /// partitioning fixtures need no real dirs; the content-gate test below
+    /// uses real ones.
+    fn nowhere() -> &'static Path {
+        Path::new("/nonexistent")
+    }
+
+    /// Concurrent batching selects for external non-mutating tools - exactly
+    /// the population the content gate exists to catch - and the batch path
+    /// has no approval UI. So an unapproved tool must never be batchable: two
+    /// consecutive calls to it have to fall to the serial path that prompts,
+    /// or the gate would only cover calls the model happens to emit alone.
+    #[test]
+    fn an_unapproved_external_tool_is_never_batchable() {
+        let dir = std::env::temp_dir().join(format!("openmax-batch-{}", uuid::Uuid::new_v4()));
+        let data_dir = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/peek.toml"),
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/true\"\nmutating = false\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&project);
+        let tracker = RepeatCallTracker::new();
+        let perms = Permissions::default();
+        let calls = vec![
+            tool_call("peek", r#"{"key":"a"}"#),
+            tool_call("peek", r#"{"key":"b"}"#),
+        ];
+
+        assert!(
+            !batchable_call(&calls[0], &registry, &tracker, &perms, &data_dir, &project),
+            "unapproved host code must not be eligible for the unattended batch path"
+        );
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &perms, &data_dir, &project)
+        });
+        assert_eq!(segments.len(), 2, "each call gets its own serial segment");
+        assert!(segments.iter().all(|s| !s.concurrent));
+
+        // Approved content is ordinary read-only work and batches again.
+        let sha = match &registry.get("peek").unwrap().kind {
+            crate::registry::ToolKind::External(ext) => ext.source_sha256.clone(),
+            crate::registry::ToolKind::Builtin => unreachable!("peek is external"),
+        };
+        crate::ledger::approve_hash(&data_dir, &project, &sha).unwrap();
+        assert!(batchable_call(&calls[0], &registry, &tracker, &perms, &data_dir, &project));
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &perms, &data_dir, &project)
+        });
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].concurrent, "approved read-only tools still batch");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn partition_splits_readonly_runs_and_breaks_on_mutating() {
         let registry = Registry::builtin_only();
@@ -2119,7 +2328,7 @@ mod tests {
         ];
         let empty_perms = Permissions::default();
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 3);
         assert!(segments[0].concurrent && segments[0].start == 0 && segments[0].end == 2);
@@ -2139,7 +2348,7 @@ mod tests {
             tool_call("grep", r#"{"pattern":"fn"}"#),
         ];
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 1);
         assert!(segments[0].concurrent);
@@ -2149,12 +2358,16 @@ mod tests {
             &registry,
             &tracker,
             &empty_perms,
+            nowhere(),
+            nowhere(),
         ));
         assert!(!batchable_call(
             &tool_call("nope", r#"{}"#),
             &registry,
             &tracker,
             &empty_perms,
+            nowhere(),
+            nowhere(),
         ));
     }
 
@@ -2235,7 +2448,7 @@ mod tests {
         let calls = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
         let empty_perms = Permissions::default();
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 1);
         assert!(!segments[0].concurrent);
@@ -2256,7 +2469,7 @@ mod tests {
         ];
         let empty_perms = Permissions::default();
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms)
+            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 3);
         assert!(!segments[0].concurrent);
