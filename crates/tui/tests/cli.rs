@@ -114,6 +114,29 @@ fn stdio_handshake_speaks_the_contract() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// Read one HTTP request (headers, then exactly Content-Length body bytes)
+/// off `stream`. False when the peer went away mid-request.
+fn read_request(stream: &mut std::net::TcpStream) -> bool {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => buf.push(byte[0]),
+            _ => return false,
+        }
+    }
+    let headers = String::from_utf8_lossy(&buf).to_string();
+    let content_length: usize = headers
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; content_length];
+    content_length == 0 || stream.read_exact(&mut body).is_ok()
+}
+
 /// Minimal OpenAI-compatible streaming endpoint: one canned SSE completion
 /// per request, enough for a whole print-mode turn.
 fn spawn_stub_server() -> (String, std::thread::JoinHandle<()>) {
@@ -123,25 +146,7 @@ fn spawn_stub_server() -> (String, std::thread::JoinHandle<()>) {
         // Serve a few requests then exit with the test.
         for _ in 0..4 {
             let Ok((mut stream, _)) = listener.accept() else { return };
-            // Read headers, then exactly Content-Length body bytes.
-            let mut buf = Vec::new();
-            let mut byte = [0u8; 1];
-            while !buf.ends_with(b"\r\n\r\n") {
-                match stream.read(&mut byte) {
-                    Ok(1) => buf.push(byte[0]),
-                    _ => return,
-                }
-            }
-            let headers = String::from_utf8_lossy(&buf).to_string();
-            let content_length: usize = headers
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
-                })
-                .unwrap_or(0);
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 && stream.read_exact(&mut body).is_err() {
+            if !read_request(&mut stream) {
                 return;
             }
 
@@ -156,6 +161,27 @@ fn spawn_stub_server() -> (String, std::thread::JoinHandle<()>) {
             );
             let _ = stream.write_all(response.as_bytes());
         }
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+/// A provider that dies mid-answer: a partial SSE body with no finish_reason
+/// chunk, no `[DONE]`, and no Content-Length, then the socket closes. The
+/// transfer is well-formed; only the completion signal never arrives.
+fn spawn_truncating_stub_server() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        if !read_request(&mut stream) {
+            return;
+        }
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+        );
+        let _ = stream.write_all(response.as_bytes());
+        // Dropping the socket ends the body part way through the answer.
     });
     (format!("http://{addr}/v1"), handle)
 }
@@ -203,4 +229,52 @@ fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
         lines.iter().any(|l| l["type"] == "message_done" && l["text"] == "stub says hi"),
         "{stdout}"
     );
+}
+
+/// A stream the provider abandons must never read as a finished answer: the
+/// partial text is kept (so the session resumes), but the turn reports an
+/// error, ends with stop_reason `truncated`, and print mode exits nonzero.
+#[test]
+fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
+    let (project, home) = fresh_dirs("truncated");
+    let (base_url, _server) = spawn_truncating_stub_server();
+    write_settings(&home, &base_url);
+
+    let out = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "say hi"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a cut-off answer must not exit 0: {stdout}");
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every stdout line is JSON"))
+        .collect();
+    // The turn terminator guarantee holds: exactly one done, and it is last.
+    assert_eq!(
+        lines.iter().filter(|l| l["type"] == "done").count(),
+        1,
+        "exactly one done per turn: {stdout}"
+    );
+    let last = lines.last().expect("at least one line");
+    assert_eq!(last["type"], "done", "{stdout}");
+    assert_eq!(last["stop_reason"], "truncated", "{stdout}");
+    assert!(
+        lines.iter().any(|l| l["type"] == "error"
+            && l["message"].as_str().is_some_and(|m| m.contains("incomplete"))),
+        "the truncation must be reported as an error: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l["type"] == "message_done" && l["text"] == "half an ans"),
+        "the partial answer must still be delivered: {stdout}"
+    );
+
+    // ...and it must survive on disk, or a resume would lose the partial turn.
+    let sessions = home.join(".openmax").join("sessions");
+    let saved: String = std::fs::read_dir(&sessions)
+        .expect("sessions dir")
+        .filter_map(|e| e.ok())
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect();
+    assert!(saved.contains("half an ans"), "partial reply must be persisted: {saved}");
 }

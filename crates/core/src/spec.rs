@@ -358,7 +358,9 @@ Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
 untrusted project) still gets one, with stop_reason `refused`, after the
 `protocol_error` that says why. A turn that dies unexpectedly reports
-`error` and then `done` with stop_reason `error`. The single exception is a
+`error` and then `done` with stop_reason `error`; a provider stream that ends
+mid-answer with no completion signal reports its partial `message_done`, then
+`error`, then `done` with stop_reason `truncated`. The single exception is a
 `user` sent while a turn is in flight: that is refused with a
 `protocol_error` and no `done`, because the running turn owns the next one.
 

@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::client::{ChatClient, StreamDelta};
+use crate::client::{ChatClient, StreamDelta, TRUNCATED};
 use crate::config::{ApprovalMode, Settings};
 use crate::fallback;
 use crate::hooks::{Hooks, PreToolResult};
@@ -1287,6 +1287,15 @@ async fn run_loop(
             break 'turns;
         }
         if tool_calls.is_empty() {
+            // The provider stopped writing without ever finishing the answer.
+            // The partial text above stays in the transcript (so the session
+            // resumes from it), but the turn must not report a clean stop:
+            // say so before the terminator every client waits on.
+            if result.finish_reason == TRUNCATED {
+                core.send_agent(session_id, AgentEvent::Error {
+                    message: "provider stream ended without a completion signal; the reply above is incomplete".into(),
+                });
+            }
             stop_reason = result.finish_reason;
             break 'turns;
         }
