@@ -306,42 +306,279 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     findings
 }
 
+/// One declared example and what running it proved. `path` is the tool file
+/// that declared it, so a refusal names the file to fix or approve.
+#[derive(Debug)]
+pub struct ExampleVerdict {
+    pub tool: String,
+    pub path: PathBuf,
+    pub result: Result<(), String>,
+}
+
+/// Newline-separated stack of project roots whose examples are already
+/// running. Every process an example spawns inherits it, so a tool whose
+/// example runs `openmax --check --run-examples` (its cwd is the project
+/// root, so it re-finds itself) refuses at the second level instead of
+/// forking a third.
+const RUN_EXAMPLES_STACK: &str = "OPENMAX_RUN_EXAMPLES";
+
+/// Characters of a failing example's output kept in its verdict.
+const EXAMPLE_DETAIL_CHARS: usize = 2_000;
+
+/// The gates a turn applies to a tool call, resolved once for the whole run.
+/// Nothing here can prompt, so a gate that would put the call in front of a
+/// person refuses it instead.
+struct ExampleGates {
+    hooks: crate::hooks::Hooks,
+    permissions: crate::permissions::Permissions,
+    approval_mode: crate::config::ApprovalMode,
+    /// True when the agent loop, not a person, started this process.
+    agent_spawned: bool,
+}
+
+impl ExampleGates {
+    /// The documented call order (hooks pre → permissions → approval_mode →
+    /// execute), evaluated with the same predicates the agent loop calls.
+    async fn admit(
+        &self,
+        spec: &crate::registry::ToolSpec,
+        ext: &crate::registry::ExternalTool,
+        args: &serde_json::Value,
+        project_root: &Path,
+        data_dir: &Path,
+        cancel: &std::sync::Arc<crate::state::CancelToken>,
+    ) -> Result<(), String> {
+        use crate::config::ApprovalMode;
+        use crate::hooks::PreToolResult;
+        use crate::permissions::PermissionDecision;
+
+        match self
+            .hooks
+            .pre_tool_use("check", &spec.name, args, project_root, cancel)
+            .await
+        {
+            PreToolResult::Allow => {}
+            PreToolResult::Block { reason } => {
+                return Err(format!("blocked by pre_tool_use: {reason}"))
+            }
+            PreToolResult::Cancelled => return Err("cancelled".into()),
+        }
+        if let PermissionDecision::Deny { reason } = self.permissions.evaluate(&spec.name, args) {
+            return Err(reason);
+        }
+        if spec.mutating && self.approval_mode == ApprovalMode::Readonly {
+            return Err("approval_mode is readonly; mutating tools are disabled".into());
+        }
+        // Running an example runs the file's command with host authority and
+        // no human on the other end of a prompt, so the exact bytes must be
+        // approved first. Content-bound, exactly like the in-session gate: any
+        // edit to the tool file revokes the approval.
+        if !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+            return Err(format!(
+                "unapproved source; run openmax --approve {}",
+                ext.source_path.display()
+            ));
+        }
+        // A turn in `ask` mode puts every mutating call in front of a person.
+        // The human who typed this command is that person; an agent-spawned
+        // process has nobody, so it refuses rather than running unattended.
+        if spec.mutating && self.approval_mode == ApprovalMode::Ask && self.agent_spawned {
+            return Err(
+                "approval_mode is ask and this process was started from an agent session; ask the user to run openmax --check --run-examples"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// `--check --run-examples`: prove each tool with an `[example]` actually
 /// runs, through the exact spawn path a session uses (stdin JSON, timeout,
-/// output caps). Returns (tool name, verdict) per declared example. This
-/// executes project commands: opt-in per invocation, never part of plain
-/// `--check`.
-pub async fn run_examples(project_root: &Path) -> Vec<(String, Result<(), String>)> {
+/// output caps) and behind the exact gates a session applies. `Err` means
+/// nothing ran at all. This executes project commands: opt-in per invocation,
+/// never part of plain `--check`.
+pub async fn run_examples(
+    project_root: &Path,
+    report: impl FnMut(&ExampleVerdict),
+) -> Result<Vec<ExampleVerdict>, String> {
+    run_examples_at(project_root, &crate::state::default_data_dir(), report).await
+}
+
+pub(crate) async fn run_examples_at(
+    project_root: &Path,
+    data_dir: &Path,
+    report: impl FnMut(&ExampleVerdict),
+) -> Result<Vec<ExampleVerdict>, String> {
+    let stack = std::env::var(RUN_EXAMPLES_STACK).unwrap_or_default();
+    run_examples_within(project_root, data_dir, &stack, report).await
+}
+
+/// `stack` is taken as an argument rather than read here so the recursion
+/// guard is testable without racing other tests over one process-wide var.
+async fn run_examples_within(
+    project_root: &Path,
+    data_dir: &Path,
+    stack: &str,
+    mut report: impl FnMut(&ExampleVerdict),
+) -> Result<Vec<ExampleVerdict>, String> {
     use crate::registry::{Registry, ToolKind};
+
+    let root_key = std::fs::canonicalize(project_root)
+        .unwrap_or_else(|_| project_root.to_path_buf())
+        .display()
+        .to_string();
+    if stack.lines().any(|root| root == root_key) {
+        return Err(format!(
+            "examples for {root_key} are already running in a parent process; an example must not invoke openmax --run-examples"
+        ));
+    }
+    // Examples execute repository code with the user's authority, exactly like
+    // a turn does, so they need the same trust decision. Plain --check only
+    // reads files and stays trust-free.
+    if !crate::trust::is_trusted(data_dir, project_root)? {
+        return Err(format!(
+            "project {} is not trusted; inspect it, then rerun with --trust-project",
+            project_root.display()
+        ));
+    }
+    // Fail closed like a session start: a malformed settings file is a
+    // configuration error, not a silent reset to defaults (and it carries the
+    // approval_mode this run has to honor).
+    let settings = crate::config::load(data_dir)?;
+    let caps = crate::tools::OutputCaps::from_settings(&settings);
+    let gates = ExampleGates {
+        hooks: crate::hooks::Hooks::discover(project_root, data_dir),
+        permissions: crate::permissions::Permissions::discover(project_root),
+        approval_mode: settings.approval_mode,
+        agent_spawned: std::env::var_os("OPENMAX_SESSION").is_some(),
+    };
+
     let registry = Registry::build(project_root);
-    let caps = crate::tools::OutputCaps::default();
+    let cancel = std::sync::Arc::new(crate::state::CancelToken::default());
+    watch_cancel_signals(cancel.clone());
+    // Published before the first spawn so every descendant inherits it, and
+    // restored when this level finishes: the marker names the levels that are
+    // running, and children captured it at spawn time.
+    let outer = std::env::var_os(RUN_EXAMPLES_STACK);
+    std::env::set_var(
+        RUN_EXAMPLES_STACK,
+        match stack.is_empty() {
+            true => root_key,
+            false => format!("{stack}\n{root_key}"),
+        },
+    );
+
     let mut results = Vec::new();
     for spec in &registry.tools {
         let ToolKind::External(ext) = &spec.kind else { continue };
         let Some(example) = &ext.example else { continue };
-        let cancel = std::sync::Arc::new(crate::state::CancelToken::default());
-        let outcome = registry
-            .execute(&spec.name, &example.args, project_root, caps, cancel)
-            .await;
-        let first_line = |s: &str| s.lines().next().unwrap_or("").to_string();
-        let verdict = if !outcome.ok {
-            Err(format!("example run failed: {}", first_line(&outcome.output)))
-        } else if let Some(pattern) = &example.expect_regex {
-            match regex::Regex::new(pattern) {
-                Ok(re) if re.is_match(&outcome.output) => Ok(()),
-                Ok(_) => Err(format!(
-                    "example output does not match expect_regex {pattern:?}: {}",
-                    first_line(&outcome.output)
-                )),
-                Err(e) => Err(format!("expect_regex failed to compile: {e}")),
+        let result = match gates
+            .admit(spec, ext, &example.args, project_root, data_dir, &cancel)
+            .await
+        {
+            Ok(()) => {
+                let outcome = registry
+                    .execute(&spec.name, &example.args, project_root, caps, cancel.clone())
+                    .await;
+                example_verdict(&outcome, example)
             }
-        } else {
-            Ok(())
+            Err(reason) => Err(reason),
         };
-        results.push((spec.name.clone(), verdict));
+        let verdict = ExampleVerdict {
+            tool: spec.name.clone(),
+            path: ext.source_path.clone(),
+            result,
+        };
+        report(&verdict);
+        results.push(verdict);
+        // A signal cancelled the run: the in-flight example's process group is
+        // already terminated and nothing new may start.
+        if cancel.is_cancelled() {
+            break;
+        }
     }
-    results
+    match outer {
+        Some(value) => std::env::set_var(RUN_EXAMPLES_STACK, value),
+        None => std::env::remove_var(RUN_EXAMPLES_STACK),
+    }
+    Ok(results)
 }
+
+fn example_verdict(
+    outcome: &crate::tools::ToolOutcome,
+    example: &crate::registry::ToolExample,
+) -> Result<(), String> {
+    if !outcome.ok {
+        return Err(format!("example run failed; got:\n{}", detail(&outcome.output)));
+    }
+    let Some(pattern) = &example.expect_regex else {
+        return Ok(());
+    };
+    // Tool parsing rejects an invalid expect_regex, so a mismatch is the only
+    // failure reachable here.
+    if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&outcome.output)) {
+        return Ok(());
+    }
+    Err(format!(
+        "want expect_regex {pattern:?}, got:\n{}",
+        detail(&outcome.output)
+    ))
+}
+
+/// The tail of a failing example's output, indented under its verdict line.
+/// A nonzero exit renders as `exit code N` followed by the output, so a
+/// first-line summary is structurally guaranteed to drop the diagnostic.
+fn detail(output: &str) -> String {
+    let text = output.trim_end();
+    if text.is_empty() {
+        return "        (no output)".to_string();
+    }
+    let start = text
+        .char_indices()
+        .rev()
+        .take(EXAMPLE_DETAIL_CHARS)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    if start > 0 {
+        lines.push("        ...".to_string());
+    }
+    lines.extend(text[start..].lines().map(|line| format!("        {line}")));
+    lines.join("\n")
+}
+
+/// A signal killing the checker must not orphan the example's process tree:
+/// `kill_on_drop` never runs when the parent dies from a signal, and every
+/// child is in its own process group. Cancelling instead routes the kill
+/// through the normal termination path, which signals the whole group.
+#[cfg(unix)]
+fn watch_cancel_signals(cancel: std::sync::Arc<crate::state::CancelToken>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut interrupt), Ok(mut terminate)) =
+        (signal(SignalKind::interrupt()), signal(SignalKind::terminate()))
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut fired = false;
+        loop {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            if fired {
+                // The operator insisting: stop waiting for the group to die.
+                std::process::exit(130);
+            }
+            fired = true;
+            cancel.cancel();
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn watch_cancel_signals(_: std::sync::Arc<crate::state::CancelToken>) {}
 
 /// Skill-library hygiene: extensions the usage record says are pure prompt
 /// tax, and near-duplicate skill descriptions that shadow each other in the
@@ -798,31 +1035,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Write one tool file and return its path.
+    fn tool_file(root: &Path, file: &str, body: &str) -> PathBuf {
+        let path = root.join(".openmax").join("tools").join(file);
+        write(path.clone(), body);
+        path
+    }
+
+    /// The state a human establishes before any example may run: the project
+    /// is trusted and the named tool files are approved by exact content.
+    fn approved_data_dir(root: &Path, tools: &[&Path]) -> PathBuf {
+        let data = temp_project();
+        crate::trust::trust_project(&data, root).unwrap();
+        for tool in tools {
+            let bytes = std::fs::read(tool).unwrap();
+            crate::ledger::approve_hash(&data, root, &crate::ledger::sha256_hex(&bytes)).unwrap();
+        }
+        data
+    }
+
+    async fn examples(root: &Path, data: &Path) -> Result<Vec<ExampleVerdict>, String> {
+        run_examples_at(root, data, |_| {}).await
+    }
+
+    fn verdict<'a>(results: &'a [ExampleVerdict], tool: &str) -> &'a ExampleVerdict {
+        results
+            .iter()
+            .find(|v| v.tool == tool)
+            .unwrap_or_else(|| panic!("no verdict for {tool}"))
+    }
+
     #[tokio::test]
     async fn run_examples_proves_tools_through_the_real_spawn_path() {
         let root = temp_project();
-        let tools_dir = root.join(".openmax").join("tools");
-        std::fs::create_dir_all(&tools_dir).unwrap();
         // Echoes its stdin JSON back: the example asserts the payload arrived.
-        std::fs::write(
-            tools_dir.join("echoer.toml"),
+        let echoer = tool_file(
+            &root,
+            "echoer.toml",
             "name = \"echoer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat\"]\n\n[example]\nexpect_regex = \"hello\"\n[example.args]\nmsg = \"hello\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            tools_dir.join("broken.toml"),
+        );
+        let broken = tool_file(
+            &root,
+            "broken.toml",
             "name = \"broken\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 3\"]\n\n[example]\n",
+        );
+        let data = approved_data_dir(&root, &[&echoer, &broken]);
+
+        let results = examples(&root, &data).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(verdict(&results, "echoer").result.is_ok());
+        let failure = verdict(&results, "broken").result.as_ref().unwrap_err();
+        assert!(failure.contains("example run failed"), "{failure}");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// An example is the tool's command with host authority, so the content
+    /// gate that makes same-turn self-extension safe applies here too: an
+    /// unapproved tool file must not spawn, and must say how to approve it.
+    #[tokio::test]
+    async fn an_unapproved_tool_file_never_runs_its_example() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let approved = tool_file(
+            &root,
+            "approved.toml",
+            "name = \"approved\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n\n[example]\n",
+        );
+        tool_file(
+            &root,
+            "pwn.toml",
+            &format!(
+                "name = \"pwn\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\nmutating = true\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        let data = approved_data_dir(&root, &[&approved]);
+
+        let results = examples(&root, &data).await.unwrap();
+        assert!(verdict(&results, "approved").result.is_ok());
+        let refusal = verdict(&results, "pwn").result.as_ref().unwrap_err();
+        assert!(refusal.contains("unapproved source"), "{refusal}");
+        assert!(refusal.contains("--approve"), "{refusal}");
+        assert!(!touched.exists(), "the refused example must not have run");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A cloned repository executes nothing under a validation flag: examples
+    /// need the same trust decision a turn needs.
+    #[tokio::test]
+    async fn an_untrusted_project_runs_no_examples() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let tool = tool_file(
+            &root,
+            "pwn.toml",
+            &format!(
+                "name = \"pwn\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        // Approved content, but nobody trusted the project it came with.
+        let data = temp_project();
+        let bytes = std::fs::read(&tool).unwrap();
+        crate::ledger::approve_hash(&data, &root, &crate::ledger::sha256_hex(&bytes)).unwrap();
+
+        let refusal = examples(&root, &data).await.unwrap_err();
+        assert!(refusal.contains("not trusted"), "{refusal}");
+        assert!(refusal.contains("--trust-project"), "{refusal}");
+        assert!(!touched.exists(), "nothing may run in an untrusted project");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Permission rules and approval_mode bind examples exactly as they bind
+    /// the same call inside a turn, including the malformed-file deny.
+    #[tokio::test]
+    async fn permissions_and_readonly_mode_refuse_examples() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let tool = tool_file(
+            &root,
+            "writer.toml",
+            &format!(
+                "name = \"writer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\nmutating = true\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        let data = approved_data_dir(&root, &[&tool]);
+
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"deny\"\ntool = \"writer\"\n",
+        );
+        let denied = examples(&root, &data).await.unwrap();
+        assert!(verdict(&denied, "writer").result.is_err());
+
+        // A malformed policy denies every tool; an example is not an exception.
+        write(root.join(".openmax/permissions.toml"), "not toml [[[\n");
+        let failed_closed = examples(&root, &data).await.unwrap();
+        let reason = verdict(&failed_closed, "writer").result.as_ref().unwrap_err();
+        assert!(reason.contains("malformed"), "{reason}");
+
+        std::fs::remove_file(root.join(".openmax/permissions.toml")).unwrap();
+        std::fs::write(
+            data.join("settings.json"),
+            r#"{"approval_mode":"readonly"}"#,
         )
         .unwrap();
+        let readonly = examples(&root, &data).await.unwrap();
+        let reason = verdict(&readonly, "writer").result.as_ref().unwrap_err();
+        assert!(reason.contains("readonly"), "{reason}");
 
-        let mut results = run_examples(&root).await;
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[1].0, "echoer");
-        assert!(results[1].1.is_ok(), "{:?}", results[1].1);
-        assert_eq!(results[0].0, "broken");
-        assert!(results[0].1.as_ref().unwrap_err().contains("failed"), "{:?}", results[0].1);
+        assert!(!touched.exists(), "no refused example may have run");
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// An approved `pre_tool_use` gate is a gate for examples too.
+    #[tokio::test]
+    async fn a_pre_tool_use_hook_can_block_an_example() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let tool = tool_file(
+            &root,
+            "writer.toml",
+            &format!(
+                "name = \"writer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        let hook = root.join(".openmax/hooks/deny.toml");
+        write(
+            hook.clone(),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo blocked by policy >&2; exit 2\"]\n",
+        );
+        let data = approved_data_dir(&root, &[&tool, &hook]);
+
+        let results = examples(&root, &data).await.unwrap();
+        let reason = verdict(&results, "writer").result.as_ref().unwrap_err();
+        assert!(reason.contains("pre_tool_use"), "{reason}");
+        assert!(!touched.exists(), "a blocked example must not have run");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// The verdict has to carry the reason the tool failed. On a nonzero exit
+    /// the first line is always `exit code N`, and a regex miss is useless
+    /// without the output it was matched against.
+    #[tokio::test]
+    async fn a_failing_example_reports_the_diagnostic_and_what_was_wanted() {
+        let root = temp_project();
+        let failer = tool_file(
+            &root,
+            "failer.toml",
+            "name = \"failer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo 'ERROR: config.yaml missing on line 42' >&2; exit 3\"]\n\n[example]\n",
+        );
+        let misser = tool_file(
+            &root,
+            "misser.toml",
+            "name = \"misser\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo actual-output\"]\n\n[example]\nexpect_regex = \"WANTED\"\n",
+        );
+        let data = approved_data_dir(&root, &[&failer, &misser]);
+
+        let results = examples(&root, &data).await.unwrap();
+        let failed = verdict(&results, "failer").result.as_ref().unwrap_err();
+        assert!(failed.contains("exit code 3"), "{failed}");
+        assert!(failed.contains("config.yaml missing on line 42"), "{failed}");
+        let missed = verdict(&results, "misser").result.as_ref().unwrap_err();
+        assert!(missed.contains("want expect_regex \"WANTED\""), "{missed}");
+        assert!(missed.contains("actual-output"), "{missed}");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A tool whose example runs the checker re-finds this project and forks a
+    /// level deeper every time. The inherited stack stops it at the second.
+    #[tokio::test]
+    async fn an_example_run_inside_an_example_run_is_refused() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let tool = tool_file(
+            &root,
+            "recurse.toml",
+            &format!(
+                "name = \"recurse\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        let data = approved_data_dir(&root, &[&tool]);
+        let stack = std::fs::canonicalize(&root).unwrap().display().to_string();
+
+        let refusal = run_examples_within(&root, &data, &stack, |_| {})
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("already running"), "{refusal}");
+        assert!(!touched.exists(), "the recursive level must not spawn");
+        // An unrelated project on the stack is not this project.
+        let other = format!("{}/elsewhere", stack);
+        assert!(run_examples_within(&root, &data, &other, |_| {}).await.is_ok());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
