@@ -4,15 +4,11 @@
 //! so the point is to make the cost of each component visible.
 
 use open_max_core::prompt::PromptBreakdown;
+use open_max_core::types::estimate_tokens as tok;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme;
-
-/// Same heuristic as the budget estimator: ~4 chars per token.
-fn tok(chars: usize) -> usize {
-    chars / 4
-}
 
 fn row(label: &str, tokens: usize, detail: &str) -> Line<'static> {
     let mut spans = vec![
@@ -90,6 +86,8 @@ pub fn context_block(
         ]));
     }
     if let Some((used, total)) = budget {
+        // Transcript plus the tool schemas above, the same total the budget
+        // enforces, so this row and compaction never disagree.
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<22}", "context used"), Style::default().fg(theme::ACCENT())),
             Span::raw(format!("~{used:>5} tok")),

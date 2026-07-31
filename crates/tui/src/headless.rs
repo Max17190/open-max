@@ -242,6 +242,15 @@ async fn run_turn_events(
                     );
                 }
             }
+            AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
+                // Advisory: the turn still runs, so the exit code is untouched.
+                if !json {
+                    let _ = writeln!(
+                        stderr,
+                        "openmax: tool schemas cost ~{schema_tokens} tokens of the ~{budget_tokens} this context window can spend; history is compacted early and turns may not fit at all. Remove tools (openmax --spec usage) or raise context_tokens"
+                    );
+                }
+            }
             AgentEvent::HookFailed { hook, event, detail } => {
                 if !json {
                     let _ = writeln!(stderr, "openmax: hook '{hook}' failed on {event}: {detail}");

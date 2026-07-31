@@ -307,6 +307,15 @@ impl Registry {
         self.schemas_wire.clone()
     }
 
+    /// Estimated tokens the frozen schemas add to *every* request in this
+    /// freeze window: fixed overhead the context budget must carry alongside
+    /// the transcript, or compaction fires too late and the request overruns
+    /// the real window. A refreeze rebuilds the registry, so this always
+    /// reports the generation currently on the wire.
+    pub fn schema_tokens(&self) -> usize {
+        crate::types::estimate_tokens(self.schemas_wire.len())
+    }
+
     pub async fn execute(
         &self,
         name: &str,

@@ -46,7 +46,8 @@ impl ChatMessage {
         Self { role: "tool".into(), content: Some(content.into()), tool_calls: None, tool_call_id: Some(tool_call_id.into()) }
     }
 
-    /// Rough size estimate used for context budgeting (~4 chars per token).
+    /// Rough size estimate used for context budgeting, plus a small constant
+    /// for the role/envelope bytes every message pays.
     pub fn estimated_tokens(&self) -> usize {
         let mut chars = self.content.as_deref().map(str::len).unwrap_or(0);
         if let Some(calls) = &self.tool_calls {
@@ -54,8 +55,16 @@ impl ChatMessage {
                 chars += c.function.name.len() + c.function.arguments.len() + 16;
             }
         }
-        chars / 4 + 8
+        estimate_tokens(chars) + 8
     }
+}
+
+/// The one token estimator (~4 chars per token) behind every context number:
+/// message sizes, the frozen tool schemas that ride on every request, and the
+/// /context display. Keeping it in one place is what makes what the budget
+/// enforces and what the UI shows the same quantity.
+pub fn estimate_tokens(chars: usize) -> usize {
+    chars / 4
 }
 
 /// Events streamed from the agent loop to the frontend. `Deserialize` makes
@@ -112,6 +121,14 @@ pub enum AgentEvent {
     /// ledger recorded, with who changed it ("tool.toml modified (external)"),
     /// so the action space never mutates silently.
     Refrozen { tools: usize, skills: usize, changes: Vec<String> },
+    /// The frozen tool schemas take most of what the window has to spend, so
+    /// the transcript is squeezed into what little they leave: compaction runs
+    /// early and hard, and once `schema_tokens` reaches `budget_tokens` it
+    /// stops entirely, because pruning messages cannot pay a fixed per-request
+    /// cost. Advisory, not fatal - the turn still runs, and it is emitted once
+    /// per session. The fix is the user's: uninstall tools, or raise
+    /// `context_tokens`.
+    SchemasOverBudget { schema_tokens: usize, budget_tokens: usize },
     /// An observe-only hook (post_tool_use, session_start, compaction,
     /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The
     /// turn proceeded - observe hooks are fail-open - but never silently.
@@ -244,6 +261,10 @@ mod tests {
                 changes: vec![".openmax/tools/deploy.toml added (session)".into()],
             }),
             r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added (session)"]}"#
+        );
+        assert_eq!(
+            env(AgentEvent::SchemasOverBudget { schema_tokens: 6800, budget_tokens: 2150 }),
+            r#"{"session_id":"s1","type":"schemas_over_budget","schema_tokens":6800,"budget_tokens":2150}"#
         );
 
         assert_eq!(
