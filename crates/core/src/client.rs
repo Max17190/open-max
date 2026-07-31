@@ -760,9 +760,10 @@ mod tests {
         assert_eq!(result.finish_reason, "stop");
     }
 
-    /// A truncated stream that already carried tool calls keeps handing them
-    /// back, so the existing per-call failure path (unparseable arguments
-    /// return an error to the model) is untouched by the new signal.
+    /// The client reports what arrived without hiding it: the calls come back
+    /// alongside the truncation, and refusing to dispatch them is the agent
+    /// loop's decision (a call from a stream the model never finished may not
+    /// be the call it meant to make).
     #[tokio::test]
     async fn a_truncated_stream_still_returns_the_tool_calls_it_carried() {
         let result = stream_once(

@@ -1286,16 +1286,28 @@ async fn run_loop(
             stop_reason = "cancelled".into();
             break 'turns;
         }
-        if tool_calls.is_empty() {
-            // The provider stopped writing without ever finishing the answer.
-            // The partial text above stays in the transcript (so the session
-            // resumes from it), but the turn must not report a clean stop:
-            // say so before the terminator every client waits on.
-            if result.finish_reason == TRUNCATED {
-                core.send_agent(session_id, AgentEvent::Error {
-                    message: "provider stream ended without a completion signal; the reply above is incomplete".into(),
-                });
+        // The provider stopped writing without ever finishing the answer, so
+        // this is broken output, not a response: there is no way to know
+        // whether more calls were coming or whether this one was still being
+        // revised. Nothing recovered from it is dispatched, native or
+        // markup-recovered (resolve_tool_calls ran above, so both are in
+        // `tool_calls` by now). The partial text stays in the transcript and
+        // any unrun call ids are stubbed after the loop, so resume replays
+        // cleanly; the turn ends here with an error before its single Done.
+        if result.finish_reason == TRUNCATED {
+            let mut message =
+                "provider stream ended without a completion signal; the reply above is incomplete"
+                    .to_string();
+            if !tool_calls.is_empty() {
+                let n = tool_calls.len();
+                let noun = if n == 1 { "tool call" } else { "tool calls" };
+                message.push_str(&format!(", so the {n} {noun} it carried did not run"));
             }
+            core.send_agent(session_id, AgentEvent::Error { message });
+            stop_reason = TRUNCATED.into();
+            break 'turns;
+        }
+        if tool_calls.is_empty() {
             stop_reason = result.finish_reason;
             break 'turns;
         }
@@ -1598,11 +1610,19 @@ async fn run_loop(
         save_messages(core, session_id, guard.messages(), refrozen).await;
     }
 
-    // Cancel mid-turn may leave the last assistant's tool_calls without tool
-    // role replies (siblings after an approval cancel, or cancel before tools
-    // ran). Stub them so resume templates stay well-formed.
-    if stop_reason == "cancelled" || cancelled.is_cancelled() {
-        let _ = complete_pending_tool_replies(guard.messages(), "The user cancelled this turn.");
+    // A turn can end with the last assistant's tool_calls persisted but never
+    // answered: cancel mid-turn (siblings after an approval cancel, or cancel
+    // before tools ran), or a truncated response whose calls were refused.
+    // Stub the orphans so resume templates stay well-formed.
+    let unanswered_note = if stop_reason == "cancelled" || cancelled.is_cancelled() {
+        Some("The user cancelled this turn.")
+    } else if stop_reason == TRUNCATED {
+        Some("The provider stream ended before this call could run; it was not executed.")
+    } else {
+        None
+    };
+    if let Some(note) = unanswered_note {
+        let _ = complete_pending_tool_replies(guard.messages(), note);
     }
 
     save_messages(core, session_id, guard.messages(), false).await;

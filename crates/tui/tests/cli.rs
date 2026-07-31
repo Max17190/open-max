@@ -28,12 +28,19 @@ fn fresh_dirs(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 fn write_settings(home: &Path, base_url: &str) {
+    write_settings_with_mode(home, base_url, "ask");
+}
+
+/// `auto` is what an unattended run uses: mutating tools execute without a
+/// human. Tests that must prove a call was refused for its own reason (not
+/// because the approval gate declined it) run in that mode.
+fn write_settings_with_mode(home: &Path, base_url: &str, approval_mode: &str) {
     let dir = home.join(".openmax");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("settings.json"),
         format!(
-            r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"ask"}}"#
+            r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"{approval_mode}"}}"#
         ),
     )
     .unwrap();
@@ -137,53 +144,60 @@ fn read_request(stream: &mut std::net::TcpStream) -> bool {
     content_length == 0 || stream.read_exact(&mut body).is_ok()
 }
 
-/// Minimal OpenAI-compatible streaming endpoint: one canned SSE completion
-/// per request, enough for a whole print-mode turn.
-fn spawn_stub_server() -> (String, std::thread::JoinHandle<()>) {
+/// One canned SSE completion per request, in script order. `finished` says
+/// whether the body is framed with a Content-Length (a complete response) or
+/// simply cut off by closing the socket, which is what a provider dying
+/// mid-answer looks like on the wire: a well-formed transfer whose completion
+/// signal never arrives.
+fn spawn_scripted_server(script: Vec<(String, bool)>) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
-        // Serve a few requests then exit with the test.
-        for _ in 0..4 {
+        for (sse, finished) in script {
             let Ok((mut stream, _)) = listener.accept() else { return };
             if !read_request(&mut stream) {
                 return;
             }
-
-            let sse = concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"stub says hi\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n",
-                "data: [DONE]\n\n",
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
-                sse.len(),
-            );
+            let response = if finished {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                    sse.len(),
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+                )
+            };
             let _ = stream.write_all(response.as_bytes());
         }
     });
     (format!("http://{addr}/v1"), handle)
 }
 
-/// A provider that dies mid-answer: a partial SSE body with no finish_reason
-/// chunk, no `[DONE]`, and no Content-Length, then the socket closes. The
-/// transfer is well-formed; only the completion signal never arrives.
-fn spawn_truncating_stub_server() -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        if !read_request(&mut stream) {
-            return;
-        }
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
-        );
-        let _ = stream.write_all(response.as_bytes());
-        // Dropping the socket ends the body part way through the answer.
-    });
-    (format!("http://{addr}/v1"), handle)
+/// A finished one-line answer.
+const HELLO_SSE: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"stub says hi\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// One syntactically complete `write_file` call: nothing is half-written, so
+/// only the missing completion signal distinguishes it from a real request.
+const WRITE_CALL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"side-effect.txt\\\",\\\"content\\\":\\\"written\\\"}\"}}]}}]}\n\n";
+
+/// The same call as markup leaking into `content`, the shape the fallback
+/// parser recovers (it deliberately accepts an unclosed final tag).
+const WRITE_CALL_MARKUP_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>{\\\"name\\\":\\\"write_file\\\",\\\"arguments\\\":{\\\"path\\\":\\\"side-effect.txt\\\",\\\"content\\\":\\\"written\\\"}}</tool_call>\"}}]}\n\n";
+
+const TOOL_CALLS_TERMINATOR: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Minimal OpenAI-compatible streaming endpoint: the same finished completion
+/// for a few requests, enough for a whole print-mode turn.
+fn spawn_stub_server() -> (String, std::thread::JoinHandle<()>) {
+    spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 4])
 }
 
 #[test]
@@ -231,26 +245,39 @@ fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
     );
 }
 
-/// A stream the provider abandons must never read as a finished answer: the
-/// partial text is kept (so the session resumes), but the turn reports an
-/// error, ends with stop_reason `truncated`, and print mode exits nonzero.
-#[test]
-fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
-    let (project, home) = fresh_dirs("truncated");
-    let (base_url, _server) = spawn_truncating_stub_server();
-    write_settings(&home, &base_url);
-
-    let out = cmd(&project, &home)
-        .args(["--trust-project", "--json", "-p", "say hi"])
+/// Run one print-mode turn as JSON and hand back the exit code, the parsed
+/// event lines, and the raw stdout for assertion messages.
+fn json_turn(
+    project: &Path,
+    home: &Path,
+    prompt: &str,
+) -> (Option<i32>, Vec<serde_json::Value>, String) {
+    let out = cmd(project, home)
+        .args(["--trust-project", "--json", "-p", prompt])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "a cut-off answer must not exit 0: {stdout}");
-    let lines: Vec<serde_json::Value> = stdout
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines = stdout
         .lines()
         .map(|l| serde_json::from_str(l).expect("every stdout line is JSON"))
         .collect();
-    // The turn terminator guarantee holds: exactly one done, and it is last.
+    (out.status.code(), lines, stdout)
+}
+
+/// Everything this HOME persisted about its sessions, as one blob.
+fn session_dump(home: &Path) -> String {
+    std::fs::read_dir(home.join(".openmax").join("sessions"))
+        .expect("sessions dir")
+        .filter_map(|e| e.ok())
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect()
+}
+
+/// However a truncated turn ends up truncated, it ends the same way: nonzero
+/// exit, one `error` naming the incomplete reply, and exactly one `done` (the
+/// terminator guarantee) carrying stop_reason `truncated` as the last line.
+fn assert_truncated_turn(code: Option<i32>, lines: &[serde_json::Value], stdout: &str) {
+    assert_eq!(code, Some(1), "a cut-off answer must not exit 0: {stdout}");
     assert_eq!(
         lines.iter().filter(|l| l["type"] == "done").count(),
         1,
@@ -264,17 +291,96 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
             && l["message"].as_str().is_some_and(|m| m.contains("incomplete"))),
         "the truncation must be reported as an error: {stdout}"
     );
+}
+
+/// A stream the provider abandons must never read as a finished answer: the
+/// partial text is kept (so the session resumes), but the turn reports an
+/// error, ends with stop_reason `truncated`, and print mode exits nonzero.
+#[test]
+fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
+    let (project, home) = fresh_dirs("truncated");
+    let partial =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+    let (base_url, _server) = spawn_scripted_server(vec![(partial.to_string(), false)]);
+    write_settings(&home, &base_url);
+
+    let (code, lines, stdout) = json_turn(&project, &home, "say hi");
+    assert_truncated_turn(code, &lines, &stdout);
     assert!(
         lines.iter().any(|l| l["type"] == "message_done" && l["text"] == "half an ans"),
         "the partial answer must still be delivered: {stdout}"
     );
 
     // ...and it must survive on disk, or a resume would lose the partial turn.
-    let sessions = home.join(".openmax").join("sessions");
-    let saved: String = std::fs::read_dir(&sessions)
-        .expect("sessions dir")
-        .filter_map(|e| e.ok())
-        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
-        .collect();
+    let saved = session_dump(&home);
     assert!(saved.contains("half an ans"), "partial reply must be persisted: {saved}");
+}
+
+/// The dangerous half of the same bug: the stream dies *after* a complete tool
+/// call, so the arguments parse and nothing looks broken. A stream with no
+/// completion signal is not a response the model asked to act on (more calls
+/// may have been coming, or this one may still have been under revision), so
+/// the call must not run. Both routes into `tool_calls` are covered: native
+/// deltas, and markup recovered from content by the fallback parser.
+#[test]
+fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
+    for (tag, body) in [("native", WRITE_CALL_SSE), ("markup", WRITE_CALL_MARKUP_SSE)] {
+        let (project, home) = fresh_dirs(&format!("truncated-call-{tag}"));
+        let (base_url, _server) = spawn_scripted_server(vec![(body.to_string(), false)]);
+        // auto, so a refusal here is the truncation and not the approval gate.
+        write_settings_with_mode(&home, &base_url, "auto");
+
+        let (code, lines, stdout) = json_turn(&project, &home, "write the file");
+        assert_truncated_turn(code, &lines, &stdout);
+        // The property that matters: no side effect.
+        assert!(
+            !project.join("side-effect.txt").exists(),
+            "{tag}: a call from an unterminated stream must not run: {stdout}"
+        );
+        assert!(
+            !lines.iter().any(|l| l["type"] == "tool_start"),
+            "{tag}: no tool may even be dispatched: {stdout}"
+        );
+        assert!(
+            lines.iter().any(|l| l["type"] == "error"
+                && l["message"].as_str().is_some_and(|m| m.contains("did not run"))),
+            "{tag}: the error must say the call was refused: {stdout}"
+        );
+        // The refused call was persisted before it was refused, so it needs a
+        // tool reply: an unanswered tool_call id breaks chat-template replay
+        // and would make the session unresumable.
+        let saved = session_dump(&home);
+        assert!(
+            saved.contains("\"role\":\"tool\"")
+                && saved.contains("The provider stream ended before this call could run"),
+            "{tag}: the refused call id must be answered on disk: {saved}"
+        );
+    }
+}
+
+/// Control for the refusals above: in the same unattended mode, that exact
+/// call does run once the stream finishes. Without this, the refusal test
+/// could pass for the wrong reason (a gate, or markup nothing recognized).
+#[test]
+fn a_finished_stream_still_runs_the_same_write_call() {
+    for (tag, body) in [("native", WRITE_CALL_SSE), ("markup", WRITE_CALL_MARKUP_SSE)] {
+        let (project, home) = fresh_dirs(&format!("finished-call-{tag}"));
+        let (base_url, _server) = spawn_scripted_server(vec![
+            (format!("{body}{TOOL_CALLS_TERMINATOR}"), true),
+            (HELLO_SSE.to_string(), true),
+        ]);
+        write_settings_with_mode(&home, &base_url, "auto");
+
+        let (code, lines, stdout) = json_turn(&project, &home, "write the file");
+        assert_eq!(code, Some(0), "{tag}: {stdout}");
+        assert!(
+            lines.iter().any(|l| l["type"] == "tool_start" && l["name"] == "write_file"),
+            "{tag}: the finished call must be dispatched: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("side-effect.txt")).unwrap_or_default(),
+            "written",
+            "{tag}: the finished call must run"
+        );
+    }
 }
