@@ -253,16 +253,27 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             .then(|| "its content is not approved".to_string())
                     });
                     match unapproved {
-                        Some(reason) => {
-                            let was_live = crate::ledger::approvals(data_dir, project_root)
-                                .map(|a| a.was_live(&path))
-                                .unwrap_or(false);
-                            let gate = matches!(
-                                h.event,
-                                crate::hooks::HookEvent::PreToolUse
-                                    | crate::hooks::HookEvent::UserPromptSubmit
-                            );
-                            if was_live && gate {
+                        Some(mut reason) => {
+                            let approvals = crate::ledger::approvals(data_dir, project_root).ok();
+                            let was_live =
+                                approvals.as_ref().is_some_and(|a| a.was_live(&path));
+                            let approved =
+                                approvals.as_ref().and_then(|a| a.approved_hook(&path));
+                            // The loop classifies a modified hook by the event
+                            // a human approved, so --check has to ask the same
+                            // question or it would report a demoted gate as a
+                            // harmless observer.
+                            let was_gate = approved.map(|a| a.is_gate()).unwrap_or(true);
+                            if let Some(approved) = approved {
+                                if approved.is_gate() && !h.event.is_gate() {
+                                    reason = format!(
+                                        "an approved {} gate was rewritten as a {} hook, which would stop it gating",
+                                        approved.event(),
+                                        h.event.as_str()
+                                    );
+                                }
+                            }
+                            if was_live && was_gate {
                                 Status::Err(format!(
                                     "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
                                     path.display()
@@ -1175,6 +1186,24 @@ mod tests {
             other => panic!("expected an error about the revoked gate: {other:?}"),
         }
         assert!(has_errors(&findings));
+
+        // A gate rewritten into an observe hook is still judged as the gate a
+        // human approved, and --check has to say which of the two happened.
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n",
+        );
+        let findings: Vec<Finding> = check_at(&root, &data)
+            .into_iter()
+            .filter(|f| f.path.starts_with(&root))
+            .collect();
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("rewritten as a post_tool_use hook"), "{reason}");
+                assert!(reason.contains("fails closed"), "{reason}");
+            }
+            other => panic!("a demoted gate must not read as an inert observer: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

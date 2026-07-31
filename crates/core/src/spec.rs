@@ -279,7 +279,13 @@ Fail closed, four ways, all reported by `openmax --check`:
 - A gate hook (`pre_tool_use`, `user_prompt_submit`) whose path was approved
   and whose content no longer is blocks every tool until the approved content
   is restored or a human re-approves it. Editing a live gate cannot turn it
-  off, and that includes a comment-only edit or a rewritten script.
+  off, and that includes a comment-only edit or a rewritten script. Whether a
+  modified hook counts as a gate is decided by the `event` a human approved,
+  never by the `event` the current file declares: rewriting an approved
+  `pre_tool_use` gate into an observe hook would otherwise stop it gating, so
+  it reads as a demoted gate and still fails closed. The repair carve-out is
+  scoped the same way, to the manifest plus the code the *approved* content
+  named, so a rewritten hook cannot hand itself an exemption for a new path.
 - A hook file a human approved that is *deleted* blocks every tool the same
   way. Deleting a gate is easier than rewriting one and leaves nothing on disk
   to notice, so what is enforced is reconciled against the approved paths, not

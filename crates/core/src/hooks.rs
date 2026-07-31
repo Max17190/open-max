@@ -62,6 +62,13 @@ impl HookEvent {
         }
     }
 
+    /// Whether this event gates calls. Dropping a gate is fail-open, which is
+    /// why the approved content's event, not the current file's, decides how a
+    /// modified hook is treated.
+    pub(crate) fn is_gate(self) -> bool {
+        matches!(self, HookEvent::PreToolUse | HookEvent::UserPromptSubmit)
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s.trim() {
             "pre_tool_use" => Some(HookEvent::PreToolUse),
@@ -274,7 +281,8 @@ impl Hooks {
                         .collect();
                     return true;
                 }
-                let reason = if approvals.contains(&spec.source_sha256) {
+                let approved = approvals.approved_hook(&spec.source_path);
+                let mut reason = if approvals.contains(&spec.source_sha256) {
                     let problem = code
                         .iter()
                         .find_map(|c| c.problem(&approvals))
@@ -283,11 +291,31 @@ impl Hooks {
                 } else {
                     format!("{}: its content changed since it was approved", spec.source_path.display())
                 };
-                let gate = matches!(spec.event, HookEvent::PreToolUse | HookEvent::UserPromptSubmit);
+                // Classify by what a human approved, never by what the file
+                // now claims to be. Reading `event` off the modified content
+                // would let an approved `pre_tool_use` gate rewrite itself
+                // into an observer and stop gating - deletion's trick in
+                // another form, demotion instead of removal. A path that was
+                // live but whose shape is not remembered is treated as a
+                // gate: the conservative answer to a question we cannot ask.
+                let was_gate = approved.map(|a| a.is_gate()).unwrap_or(true);
+                if let Some(approved) = approved {
+                    if approved.is_gate() && !spec.event.is_gate() {
+                        reason = format!(
+                            "{}: an approved {} gate was rewritten as a {} hook, which would stop it gating",
+                            spec.source_path.display(),
+                            approved.event(),
+                            spec.event.as_str()
+                        );
+                    }
+                }
                 if approvals.was_live(&spec.source_path) {
+                    // The exemption follows the approved content too: deriving
+                    // it from the current `command` would let a rewritten hook
+                    // hand itself a write exemption for a path nobody blessed.
                     repair_paths.push(spec.source_path.clone());
-                    repair_paths.extend(code.into_iter().map(|c| c.path));
-                    if gate {
+                    repair_paths.extend(approved.into_iter().flat_map(|a| a.code_paths()));
+                    if was_gate {
                         revoked_gates.push((spec.source_path.clone(), reason));
                         return false;
                     }
@@ -311,6 +339,11 @@ impl Hooks {
         self.invalid.retain(|(path, reason)| {
             if approvals.was_live(path) {
                 repair_paths.push(path.clone());
+                // A file that does not parse names nothing, so the code it
+                // used to run comes from the approval too.
+                if let Some(approved) = approvals.approved_hook(path) {
+                    repair_paths.extend(approved.code_paths());
+                }
                 return true;
             }
             notices.push(notice(
@@ -330,6 +363,9 @@ impl Hooks {
                 continue;
             }
             repair_paths.push(path.clone());
+            if let Some(approved) = approvals.approved_hook(path) {
+                repair_paths.extend(approved.code_paths());
+            }
             self.missing.push((
                 path.clone(),
                 format!(
@@ -1089,6 +1125,106 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(tmp);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// Demotion instead of deletion: the agent leaves the approved gate in
+    /// place and rewrites its `event` to an observe one. If reconciliation
+    /// asked the file what it is, it would answer "observer", be reported
+    /// rather than blocking, and the human's gate would stop gating. The
+    /// approved event is what decides, so it stays a gate.
+    #[tokio::test]
+    async fn an_approved_gate_cannot_demote_itself_to_an_observe_hook() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp, "gate.sh", "#!/bin/sh\nexit 1\n");
+        let toml = hooks_dir.join("gate.toml");
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        assert_eq!(Hooks::discover(&tmp, &data).pre_count(), 1);
+
+        // Same file, same script, one word changed.
+        std::fs::write(&toml, "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.post_count(), 0, "the rewritten content is not approved");
+        let cancel = Arc::new(CancelToken::default());
+        match hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("rewritten as a post_tool_use hook"), "{reason}");
+                assert!(reason.contains("stop it gating"), "{reason}");
+                assert!(reason.contains("gate.toml"), "{reason}");
+            }
+            other => panic!("a demoted gate must still fail closed: {other:?}"),
+        }
+
+        // A human who genuinely wants it as an observer re-approves, and then
+        // the new shape is the approved shape.
+        approve_hook_file(&tmp, &data, &toml);
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.post_count(), 1);
+        assert_eq!(
+            hooks.pre_tool_use("s", "bash", &serde_json::json!({}), &tmp, &cancel).await,
+            PreToolResult::Allow
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The repair carve-out follows the approved content as well. A revoked
+    /// hook rewritten to name a different script must not hand itself a write
+    /// exemption for that script - while the files a human did bless stay
+    /// restorable, which is the whole reason the exemption exists.
+    #[tokio::test]
+    async fn the_repair_exemption_follows_approved_paths_not_rewritten_ones() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        write_script(&tmp.join("scripts"), "gate.sh", "#!/bin/sh\nexit 1\n");
+        let toml = hooks_dir.join("gate.toml");
+        let approved_body = "event = \"pre_tool_use\"\ncommand = \"./scripts/gate.sh\"\n";
+        std::fs::write(&toml, approved_body).unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+
+        // The agent rewrites the hook to run a script of its own choosing.
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./scripts/evil.sh\"\n").unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        let cancel = Arc::new(CancelToken::default());
+        let write = |path: &str| serde_json::json!({"path": path, "content": "#!/bin/sh\nexit 0\n"});
+        assert!(matches!(
+            hooks.pre_tool_use("s", "write_file", &write("scripts/evil.sh"), &tmp, &cancel).await,
+            PreToolResult::Block { .. }
+        ), "a rewritten hook must not name its own repair exemption");
+
+        // What a human blessed stays repairable: the manifest, and the script
+        // the approved content ran.
+        assert_eq!(
+            hooks.pre_tool_use("s", "write_file", &write(".openmax/hooks/gate.toml"), &tmp, &cancel).await,
+            PreToolResult::Allow
+        );
+        assert_eq!(
+            hooks.pre_tool_use("s", "write_file", &write("scripts/gate.sh"), &tmp, &cancel).await,
+            PreToolResult::Allow
+        );
+
+        // And the full restore actually recovers the project, which is what
+        // narrowing the exemption could quietly have broken.
+        std::fs::write(&toml, approved_body).unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.pre_count(), 1, "restoring the approved bytes restores the gate");
+        assert!(hooks.is_empty() || hooks.pre_count() == 1);
+        match hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => assert!(!reason.contains("failing closed"), "{reason}"),
+            other => panic!("the restored gate must run and block on its own terms: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// The comment-only edit: byte-identical policy, brand-new hash. Before

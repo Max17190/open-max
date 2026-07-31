@@ -338,6 +338,45 @@ struct ApprovedFile {
     /// that was modified rather than a file that was never installed.
     #[serde(default)]
     paths: Vec<String>,
+    /// What the approved bytes at a hook path actually declared. Reconciling
+    /// a modified hook has to judge it by this and never by the file on disk:
+    /// the modified content is the part the agent controls, so reading its
+    /// `event` would let an approved gate rewrite itself into an observer and
+    /// stop gating, and reading its `command` would let it hand itself a
+    /// repair exemption for a path nobody blessed.
+    #[serde(default)]
+    hooks: Vec<ApprovedHook>,
+}
+
+/// One hook as a human approved it: the shape reconciliation must remember,
+/// because the file itself can no longer be trusted to describe it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedHook {
+    path: String,
+    /// The `event` the approved bytes declared.
+    event: String,
+    /// The project-local files the approved bytes named as code.
+    #[serde(default)]
+    code: Vec<String>,
+}
+
+impl ApprovedHook {
+    /// Whether what was approved gates calls. A gate that stops running is
+    /// fail-open, which is why this question is asked of the approved content
+    /// rather than of whatever now sits at the path.
+    pub fn is_gate(&self) -> bool {
+        matches!(self.event.as_str(), "pre_tool_use" | "user_prompt_submit")
+    }
+
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+
+    /// The code paths the approved content named, for the repair carve-out.
+    pub fn code_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.code.iter().map(PathBuf::from)
+    }
 }
 
 fn approved_path(dir: &Path) -> PathBuf {
@@ -350,6 +389,7 @@ fn approved_path(dir: &Path) -> PathBuf {
 pub struct Approvals {
     hashes: std::collections::HashSet<String>,
     paths: std::collections::HashSet<PathBuf>,
+    hooks: Vec<ApprovedHook>,
 }
 
 impl Approvals {
@@ -369,6 +409,14 @@ impl Approvals {
     /// entry to iterate, and absence is exactly the case that must not pass.
     pub fn live_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.paths.iter()
+    }
+
+    /// What the human approved at this hook path, if anything. The answer to
+    /// "was this a gate" and "what code did it run" has to come from here,
+    /// never from the current bytes: those are what an edit controls.
+    pub fn approved_hook(&self, path: &Path) -> Option<&ApprovedHook> {
+        let target = canonical_or(path);
+        self.hooks.iter().find(|h| Path::new(&h.path) == target)
     }
 
     /// Every bound code file is readable and approved. An unreadable one is
@@ -396,6 +444,7 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
     Ok(Approvals {
         hashes: file.hashes.into_iter().collect(),
         paths: file.paths.into_iter().map(PathBuf::from).collect(),
+        hooks: file.hooks,
     })
 }
 
@@ -442,18 +491,28 @@ fn approve(
         let current = approvals(data_dir, project_root)?;
         let mut hashes = current.hashes;
         let mut paths = current.paths;
+        let mut hooks = current.hooks;
         let mut changed = false;
         for sha in shas {
             changed |= hashes.insert(sha.clone());
         }
         if let Some(path) = path {
             changed |= paths.insert(canonical_or(path));
+            // Record the shape of what is being approved while the bytes are
+            // still the approved ones. Re-approving replaces the record, so a
+            // human who deliberately changes a hook's event gets the new one.
+            if let Some(record) = hook_record(path, project_root) {
+                hooks.retain(|h| h.path != record.path);
+                hooks.push(record);
+                changed = true;
+            }
         }
         if changed {
             let file = ApprovedFile {
                 version: 1,
                 hashes: hashes.into_iter().collect(),
                 paths: paths.iter().map(|p| p.display().to_string()).collect(),
+                hooks,
             };
             let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
             crate::sessions::write_atomic(&approved_path(&dir), json)?;
@@ -462,6 +521,21 @@ fn approve(
     })();
     let _ = fs2::FileExt::unlock(&lock);
     result
+}
+
+/// The approved shape of a hook file, read from the bytes being approved. A
+/// file that is not a hook manifest records nothing: tools and skills have no
+/// event to remember, and their code is bound by hash alone.
+fn hook_record(path: &Path, project_root: &Path) -> Option<ApprovedHook> {
+    let hook = crate::hooks::parse_hook_file(path).ok()?;
+    Some(ApprovedHook {
+        path: canonical_or(path).display().to_string(),
+        event: hook.event.as_str().to_string(),
+        code: bound_code(&hook.command, &hook.args, project_root)
+            .into_iter()
+            .map(|c| c.path.display().to_string())
+            .collect(),
+    })
 }
 
 /// Stop expecting a capability at `path`: the human removed it on purpose.
@@ -489,10 +563,15 @@ pub fn forget_capability(
         if !paths.remove(&target) {
             return Ok(false);
         }
+        // The remembered shape goes with the path it described.
+        let target_key = target.display().to_string();
+        let mut hooks = current.hooks;
+        hooks.retain(|h| h.path != target_key);
         let file = ApprovedFile {
             version: 1,
             hashes: current.hashes.into_iter().collect(),
             paths: paths.iter().map(|p| p.display().to_string()).collect(),
+            hooks,
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         crate::sessions::write_atomic(&approved_path(&dir), json)?;
