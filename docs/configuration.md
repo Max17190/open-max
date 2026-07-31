@@ -30,6 +30,32 @@ or sets an unrecognized `approval_mode` is a startup error (fail closed): Open
 Max exits with the parse reason instead of silently reverting your endpoint and
 approval policy to defaults.
 
+## Context window and compaction
+
+Four more settings shape the context budget; all are optional, and a named
+provider's per-model entries override the first two.
+
+- `context_tokens` (default 16384): the model's context window. Nothing is
+  queried from the server; set this to what your model actually has.
+- `max_tokens` (default 4096): the completion reserve, clamped so it never
+  eats the window (at most `context_tokens - 2048`).
+- `temperature` (default 0.2).
+- `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
+  keeps the tail and spills the full log to `~/.openmax/cmd-logs`.
+- `max_agent_iterations` (default 50): tool-call rounds one turn may take.
+
+Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
+plus the frozen tool schemas (estimated at ~4 chars per token). Over budget,
+compaction prunes hard to 70% of the budget in one pass and then leaves
+history untouched until it is crossed again, so the prompt prefix stays
+byte-stable between prunes and the server-side prompt cache stays warm. A
+prune truncates old tool outputs first, then drops the oldest exchanges;
+everything dropped is appended verbatim to
+`~/.openmax/sessions/<id>.archive.jsonl`, and the context note that replaces
+the dropped span names that path, so compaction stays reversible: the model
+summary (or its heuristic fallback) is the bounded view, the archive is the
+lossless record. The `compaction` hook observes each prune.
+
 ## Approvals
 
 `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use
