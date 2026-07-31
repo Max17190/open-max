@@ -121,11 +121,13 @@ pub enum AgentEvent {
     /// ledger recorded, with who changed it ("tool.toml modified (external)"),
     /// so the action space never mutates silently.
     Refrozen { tools: usize, skills: usize, changes: Vec<String> },
-    /// The frozen tool schemas alone cost more than the window has to spend,
-    /// so no amount of compaction can make a request fit: the harness stops
-    /// pruning (shredding the transcript every turn would buy nothing) and
-    /// says so once per session. Advisory, not fatal - the turn still runs.
-    /// The fix is the user's: uninstall tools, or raise `context_tokens`.
+    /// The frozen tool schemas take most of what the window has to spend, so
+    /// the transcript is squeezed into what little they leave: compaction runs
+    /// early and hard, and once `schema_tokens` reaches `budget_tokens` it
+    /// stops entirely, because pruning messages cannot pay a fixed per-request
+    /// cost. Advisory, not fatal - the turn still runs, and it is emitted once
+    /// per session. The fix is the user's: uninstall tools, or raise
+    /// `context_tokens`.
     SchemasOverBudget { schema_tokens: usize, budget_tokens: usize },
     /// An observe-only hook (post_tool_use, session_start, compaction,
     /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The

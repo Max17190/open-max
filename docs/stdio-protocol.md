@@ -66,7 +66,7 @@ key order is not significant: parse every line by field name.
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha` |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
-| `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas cost more than the window can spend, so compaction is paused: it cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
+| `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
 | `hook_failed` | `hook`, `event`, `detail` (an observe-only hook failed; the turn proceeded) |
 | `done` | `stop_reason` |
 | `error` | `message` |
@@ -141,11 +141,12 @@ bump.
 
 `budget.used_tokens` now counts the frozen tool schemas that ride on every
 request, not the transcript alone. The field's name and type are unchanged, but
-its value is larger — a zero-extension session reports ~1270 where `/2` reported
-~720 — and it is now exactly the total compaction enforces against
+its value is larger (a zero-extension session reports ~1270 where `/2` reported
+~720) and it is now exactly the total compaction enforces against
 `context_tokens`. A client that calibrated its own thresholds against the `/2`
 meaning must re-calibrate them; one that only renders the ratio needs no change.
 
 `schemas_over_budget` is a new event. It is advisory and additive: a client that
-ignores unknown types is unaffected, but while it holds, compaction is paused
-and `used_tokens` will not come down on its own.
+ignores unknown types is unaffected, but while it holds, `used_tokens` has a
+floor pruning cannot go below, and once `schema_tokens` reaches `budget_tokens`
+compaction stops entirely.

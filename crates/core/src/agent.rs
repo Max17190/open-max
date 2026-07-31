@@ -1978,12 +1978,34 @@ fn prune_target(budget: usize) -> usize {
     budget * PRUNE_TARGET_PCT / 100
 }
 
-/// True when the frozen schemas alone reach the prune target. The schema cost
-/// is constant per request, so in that state no achievable transcript brings a
-/// request inside the window: pruning would drop history to the floor, emit a
-/// digest, pay a summarization request, and still be over — every single turn.
-/// Compaction is the wrong tool; only removing tools or widening the window
-/// fixes it.
+/// The total (schemas plus transcript) one prune aims for. Normally
+/// PRUNE_TARGET_PCT of the window, which leaves a hysteresis gap so the turns
+/// after a prune can append instead of re-pruning. Once the schemas alone
+/// reach that, the usual target is unreachable at any transcript size, so aim
+/// at the same fraction of the headroom the schemas leave: the request fits
+/// under the window again, and the gap, smaller but real, still buys
+/// append-only turns instead of compacting every turn.
+fn achievable_target(budget: usize, schema_tokens: usize) -> usize {
+    let normal = prune_target(budget);
+    if schema_tokens < normal {
+        normal
+    } else {
+        schema_tokens + prune_target(budget.saturating_sub(schema_tokens))
+    }
+}
+
+/// True when the frozen schemas fill the window on their own. The schema cost
+/// is constant per request, so here no transcript fits, not even an empty
+/// one. Pruning is pure loss: it would drop history to the floor, emit a
+/// digest, pay a summarization request, and still be over, every single turn.
+fn schemas_exceed_budget(budget: usize, schema_tokens: usize) -> bool {
+    schema_tokens >= budget
+}
+
+/// True when the frozen schemas reach the normal prune target. Below the
+/// window they still leave room for a transcript, so compaction keeps working
+/// (against `achievable_target`); what is gone is the comfortable hysteresis
+/// gap. Either way the session is degraded and says so once.
 fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
     schema_tokens >= prune_target(budget)
 }
@@ -2005,13 +2027,14 @@ fn enforce_budget(
     if total <= budget {
         return (false, None);
     }
-    // Nothing this function can do reaches the target, so do nothing rather
-    // than thrash: keep the transcript (and the prompt cache) intact and let
-    // the caller report the condition the user can actually act on.
-    if schemas_outgrow_budget(budget, schema_tokens) {
+    // No transcript fits under overhead this large, so do nothing rather than
+    // thrash: keep the transcript (and the prompt cache) intact and let the
+    // caller report the condition the user can actually act on. Short of that
+    // pruning still works, so it still runs.
+    if schemas_exceed_budget(budget, schema_tokens) {
         return (false, None);
     }
-    let target = prune_target(budget);
+    let target = achievable_target(budget, schema_tokens);
     let keep_tail = messages.len().saturating_sub(6);
     let mut truncated = false;
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
@@ -3306,17 +3329,17 @@ mod tests {
         );
     }
 
-    /// Schemas are a fixed per-request cost, so when they alone reach the
-    /// prune target no transcript fits and compaction is futile. It must then
-    /// do nothing at all: pruning to the floor would drop history, emit a
-    /// digest, and pay a summarization request every turn while never fitting.
+    /// Schemas are a fixed per-request cost, so when they alone fill the window
+    /// no transcript fits and compaction is futile. It must then do nothing at
+    /// all: pruning to the floor would drop history, emit a digest, and pay a
+    /// summarization request every turn while never fitting.
     #[test]
-    fn budget_does_not_thrash_when_schemas_exceed_the_target() {
+    fn budget_does_not_thrash_when_schemas_exceed_the_window() {
         // A 8k-window model with a 4k completion reserve, and enough installed
         // tools to cost more than what is left: reachable at MAX_EXTERNAL_TOOLS.
         let budget = 8192usize.saturating_sub(4096 + 1024);
         let schema_tokens = 6800;
-        assert!(schemas_outgrow_budget(budget, schema_tokens));
+        assert!(schemas_exceed_budget(budget, schema_tokens));
 
         let mut messages = vec![msg("system", 200), msg("user", 200)];
         for turn in 0..4 {
@@ -3341,6 +3364,53 @@ mod tests {
         let workable = prune_target(budget) - 1;
         assert!(!schemas_outgrow_budget(budget, workable));
         assert!(enforce_budget(&mut messages, budget, workable).0);
+    }
+
+    /// Between the prune target and the window, schemas crowd the transcript
+    /// but do not lock it out: pruning still brings the request under budget,
+    /// so it must run. Skipping here would send an oversized request the
+    /// provider rejects: a turn that fails for no reason.
+    #[test]
+    fn budget_still_prunes_when_schemas_crowd_but_fit_the_window() {
+        let budget = 10_000;
+        // 80% of the window: past the 70% target, short of the window itself.
+        let schema_tokens = 8_000;
+        assert!(schemas_outgrow_budget(budget, schema_tokens), "degraded, so it must advise");
+        assert!(!schemas_exceed_budget(budget, schema_tokens), "but not hopeless");
+        // The reachable aim is the same fraction of what the schemas leave.
+        assert_eq!(achievable_target(budget, schema_tokens), 8_000 + 1_400);
+        // Same shape one order down: budget 1000 with 800 of schemas aims at
+        // 940, so a 500-token transcript pruned to ~140 fits where the old
+        // guard skipped and sent 1300.
+        assert_eq!(achievable_target(1_000, 800), 940);
+
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..12 {
+            messages.push(msg("assistant", 200));
+            messages.push(msg("tool", 4_000));
+        }
+        // Recent, cheap exchanges: the tail a prune is not allowed to touch.
+        for _ in 0..3 {
+            messages.push(msg("assistant", 100));
+            messages.push(msg("tool", 200));
+        }
+
+        let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens);
+        assert!(changed, "a prune that would work must not be skipped");
+        assert!(digest.is_some());
+        let total: usize =
+            schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        assert!(total <= budget, "the request must now fit: {total} of {budget}");
+        assert!(messages.len() > 6, "history is pruned, not shredded to the floor");
+
+        // And the reduced target still leaves a gap, so the next turns append
+        // instead of re-compacting: this is the thrash the skip guarded against.
+        assert!(
+            !enforce_budget(&mut messages, budget, schema_tokens).0,
+            "second pass must be a no-op"
+        );
+        let headroom = budget - total;
+        assert!(headroom > 0, "a hysteresis gap must survive, got {headroom}");
     }
 
     /// The condition holds on every turn once it holds at all, so the advisory

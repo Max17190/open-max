@@ -247,7 +247,7 @@ async fn run_turn_events(
                 if !json {
                     let _ = writeln!(
                         stderr,
-                        "openmax: tool schemas cost ~{schema_tokens} tokens, more than the ~{budget_tokens} this context window can spend; compaction is paused. Remove tools (openmax --spec usage) or raise context_tokens"
+                        "openmax: tool schemas cost ~{schema_tokens} tokens of the ~{budget_tokens} this context window can spend; history is compacted early and turns may not fit at all. Remove tools (openmax --spec usage) or raise context_tokens"
                     );
                 }
             }

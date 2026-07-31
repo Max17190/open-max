@@ -389,8 +389,9 @@ path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
 each recorded capability-file change and its actor), `schemas_over_budget`
-(schema_tokens, budget_tokens: the installed tools cost more than the window
-can spend, so compaction is paused; advisory, at most once per session),
+(schema_tokens, budget_tokens: the installed tools take most of what the
+window can spend, so compaction runs early and stops entirely once they
+reach it; advisory, at most once per session),
 `hook_failed` (hook, event, detail: an observe-only hook failed, the turn
 proceeded), `done` (stop_reason), `error` (message).
 
