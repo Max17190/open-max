@@ -855,11 +855,29 @@ pub async fn reload_session(
         core.sessions.lock().await.entry(session_id.to_string()).or_insert(built);
     }
 
+    let counts = (registry.tools.len(), registry.skills.len());
+    {
+        let mut sessions_map = core.sessions.lock().await;
+        let data = sessions_map
+            .get_mut(session_id)
+            .ok_or_else(|| "session state is unavailable; try /new".to_string())?;
+        // A turn that slipped past the running check owns the transcript
+        // (mem::take leaves it empty); refuse rather than clobber - and
+        // refuse before touching the ledger, whose state must not move for
+        // a reload that was never applied.
+        if data.messages.is_empty() {
+            return Err("a turn is in flight; run /reload after it finishes".into());
+        }
+        apply_freeze(core, session_id, data, registry, prompt, breakdown);
+    }
+
     // A forced reload observes whatever is on disk now; no turn was running,
     // so any delta since the last freeze is external to the session. Settled
-    // through the same queue as every other sync: a reload that advanced the
-    // head past claims a broken ledger left behind would mislabel them - or
-    // record their stale snapshots as backwards transitions - for good.
+    // through the same queue as every other sync - a reload that advanced
+    // the head past claims a broken ledger left behind would mislabel them -
+    // and only after the freeze applied, mirroring the turn-start refreeze:
+    // the claim is the snapshot this reload activated, never bytes a racing
+    // turn is writing.
     let (reload_receipt, _) = settle_ledger(
         core,
         session_id,
@@ -867,19 +885,7 @@ pub async fn reload_session(
         Some((files, crate::ledger::Actor::External)),
     )
     .await;
-    let counts = (registry.tools.len(), registry.skills.len(), reload_receipt);
-
-    let mut sessions_map = core.sessions.lock().await;
-    let data = sessions_map
-        .get_mut(session_id)
-        .ok_or_else(|| "session state is unavailable; try /new".to_string())?;
-    // A turn that slipped past the running check owns the transcript
-    // (mem::take leaves it empty); refuse rather than clobber.
-    if data.messages.is_empty() {
-        return Err("a turn is in flight; run /reload after it finishes".into());
-    }
-    apply_freeze(core, session_id, data, registry, prompt, breakdown);
-    Ok(counts)
+    Ok((counts.0, counts.1, reload_receipt))
 }
 
 /// Install a rebuilt registry + system prompt into a live session and persist
@@ -3564,6 +3570,64 @@ mod tests {
         assert!(
             core.sessions.lock().await.get("s").unwrap().pending_syncs.is_empty(),
             "nothing may stay queued after a successful reload"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A reload refused because a turn owns the transcript must refuse
+    /// before touching the ledger: settling first would drain queued claims
+    /// and mark the session reconciled for a registry generation that was
+    /// never applied - ledger state moving for a reload that did not happen.
+    #[tokio::test]
+    async fn refused_reload_leaves_the_ledger_untouched() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let deploy = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v1).unwrap();
+        {
+            let mut data = build_session_data(&core, "s", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("s".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+        let baseline = crate::ledger::history(&core.data_dir, &project).unwrap().len();
+
+        // A failed reconcile leaves a claim queued; the ledger then heals.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&deploy, v2).unwrap();
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+        {
+            let mut map = core.sessions.lock().await;
+            map.get_mut("s").unwrap().ledger_synced = false;
+        }
+        refreeze_if_extensions_changed(&core, "s", &project).await;
+        std::fs::write(&log, &intact).unwrap();
+
+        // A turn takes the transcript, then a reload races in: it must be
+        // refused with the queue and history exactly as they were.
+        {
+            let mut map = core.sessions.lock().await;
+            let _ = take_messages(map.get_mut("s").unwrap());
+        }
+        let err = reload_session(&core, "s", &project).await.unwrap_err();
+        assert!(err.contains("turn is in flight"), "{err}");
+        assert_eq!(
+            crate::ledger::history(&core.data_dir, &project).unwrap().len(),
+            baseline,
+            "a refused reload must not land claims"
+        );
+        assert!(
+            !core.sessions.lock().await.get("s").unwrap().pending_syncs.is_empty(),
+            "the queued claim must survive a refused reload"
         );
 
         let _ = std::fs::remove_dir_all(dir);
