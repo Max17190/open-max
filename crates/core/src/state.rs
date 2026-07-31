@@ -31,6 +31,12 @@ pub struct SessionData {
     /// context window. The condition holds on every turn once it holds at all,
     /// so the advisory is emitted once and not per turn.
     pub schemas_over_budget_reported: bool,
+    /// Whether the ledger has reconciled with the extension files this session
+    /// froze. False until the first turn start: a freeze reads disk directly,
+    /// so changes made while no session was running would otherwise never be
+    /// recorded - and the next mid-turn sync would sweep them up as the
+    /// agent's own work.
+    pub ledger_synced: bool,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous

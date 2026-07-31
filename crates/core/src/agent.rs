@@ -285,6 +285,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
+            ledger_synced: false,
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -309,6 +310,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
+            ledger_synced: false,
         }
     }
 }
@@ -935,16 +937,36 @@ async fn refreeze_if_extensions_changed(
     };
     let files = std::mem::take(&mut snapshot.files);
     let disk_fp = snapshot.fingerprint();
-    let stale = {
+    let (stale, unsynced) = {
         let sessions_map = core.sessions.lock().await;
-        sessions_map
-            .get(session_id)
-            .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+        match sessions_map.get(session_id) {
+            Some(d) => (
+                !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp,
+                !d.ledger_synced,
+            ),
+            None => (false, false),
+        }
     };
     if !stale {
-        // Nothing to activate, but a project the ledger has never seen still
-        // gets its baseline, so the next change is attributable.
-        let _ = crate::ledger::seed_if_empty(&core.data_dir, project_root, &files);
+        if unsynced {
+            // Nothing to activate, but the freeze read these files straight
+            // from disk, so the ledger has not necessarily met them: changes
+            // made while no session was running (a human, git, an installer)
+            // would stay unrecorded - and the first mid-turn sync would then
+            // sweep them up as this agent's work. Reconcile once, before any
+            // agent attribution is possible; on a project the ledger has
+            // never seen this same sync writes the initial baseline.
+            let _ = ledger_changes(
+                core,
+                project_root,
+                &files,
+                crate::ledger::Actor::External,
+                session_id,
+            );
+            if let Some(d) = core.sessions.lock().await.get_mut(session_id) {
+                d.ledger_synced = true;
+            }
+        }
         return;
     }
     let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
@@ -967,6 +989,7 @@ async fn refreeze_if_extensions_changed(
                 crate::ledger::Actor::External,
                 session_id,
             );
+            data.ledger_synced = true;
             core.send_agent(session_id, AgentEvent::Refrozen {
                 tools: counts.0,
                 skills: counts.1,
@@ -3043,6 +3066,76 @@ mod tests {
         let map = core.sessions.lock().await;
         assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &after), "must converge");
         drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Changes made while no session was running (a human, git, an installer)
+    /// are recorded at the next session's first turn start, as `external`.
+    /// The freeze reads disk directly, so without this reconciliation the
+    /// delta would either never be ledgered at all (the new registry's
+    /// fingerprint already matches disk, so no refreeze ever fires) or be
+    /// swept into the first mid-turn sync as the agent's own work.
+    #[tokio::test]
+    async fn first_turn_records_changes_made_between_sessions() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v1).unwrap();
+
+        // An earlier session's first turn writes the baseline (Initial, since
+        // the ledger has never seen this project).
+        {
+            let mut data = build_session_data(&core, "earlier", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("earlier".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "earlier", &project).await;
+        let baseline = crate::ledger::history(&core.data_dir, &project).unwrap();
+        assert!(
+            baseline.iter().any(|r| r.path.ends_with("deploy.toml")),
+            "first contact must write the baseline"
+        );
+
+        // Between sessions the file changes, with no harness running.
+        let v2 = "name = \"deploy\"\ndescription = \"ships it twice\"\ncommand = \"/bin/echo\"\n";
+        std::fs::write(&manifest, v2).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(v2.as_bytes());
+
+        // A fresh session freezes v2 straight from disk: fingerprints agree,
+        // so nothing refreezes - but the ledger must still meet v2.
+        {
+            let mut data = build_session_data(&core, "later", &project);
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert("later".into(), data);
+        }
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let change = records
+            .iter()
+            .rev()
+            .find(|r| r.path.ends_with("deploy.toml") && r.sha256.as_deref() == Some(v2_sha.as_str()))
+            .expect("the between-sessions change must be recorded");
+        assert_eq!(
+            change.actor,
+            crate::ledger::Actor::External,
+            "no turn was running, so the change is external, not the agent's"
+        );
+
+        // Reconciliation is once per session: the next turn start of the same
+        // session touches the ledger not at all.
+        let settled = records.len();
+        refreeze_if_extensions_changed(&core, "later", &project).await;
+        assert_eq!(
+            crate::ledger::history(&core.data_dir, &project).unwrap().len(),
+            settled,
+            "a synced session must not re-record on every turn start"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
