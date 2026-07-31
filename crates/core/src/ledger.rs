@@ -332,35 +332,96 @@ struct ApprovedFile {
     version: u32,
     #[serde(default)]
     hashes: Vec<String>,
+    /// Capability files a human has approved at least once, canonicalized.
+    /// What is enforced is still the hash set; this only remembers that a
+    /// path was live, so a later edit of an installed gate reads as a gate
+    /// that was modified rather than a file that was never installed.
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 fn approved_path(dir: &Path) -> PathBuf {
     dir.join("approved.json")
 }
 
-/// The sha256 set a human has approved for this project. Approval binds to
-/// content, not path: any edit changes the hash and revokes itself. Missing
-/// file means nothing approved; a malformed file is an error, and callers
-/// treat that as nothing approved (fail closed) while surfacing the reason.
-pub fn approved_hashes(
-    data_dir: &Path,
-    project_root: &Path,
-) -> Result<std::collections::HashSet<String>, String> {
+/// What a human has approved for this project: exact content hashes, plus the
+/// capability paths those approvals were granted at.
+#[derive(Debug, Default)]
+pub struct Approvals {
+    hashes: std::collections::HashSet<String>,
+    paths: std::collections::HashSet<PathBuf>,
+}
+
+impl Approvals {
+    pub fn contains(&self, sha: &str) -> bool {
+        self.hashes.contains(sha)
+    }
+
+    /// Whether this exact path ever held approved content. A file here was
+    /// live once, so its current unapproved content is a modification of
+    /// something a human installed, not an arrival nobody ever blessed.
+    pub fn was_live(&self, path: &Path) -> bool {
+        self.paths.contains(&canonical_or(path))
+    }
+
+    /// Every bound code file is readable and approved. An unreadable one is
+    /// never covered: a command named but not yet written has no bytes to
+    /// approve, and must not read as "nothing to bind".
+    pub fn covers_code(&self, code: &[BoundCode]) -> bool {
+        code.iter()
+            .all(|c| c.sha256.as_deref().is_some_and(|sha| self.contains(sha)))
+    }
+}
+
+/// Everything a human approved for this project. Approval binds to content,
+/// not path: any edit changes the hash and revokes itself. Missing file means
+/// nothing approved; a malformed file is an error, and callers treat that as
+/// nothing approved (fail closed) while surfacing the reason.
+pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, String> {
     let path = approved_path(&project_dir(data_dir, project_root));
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(std::collections::HashSet::new())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Approvals::default()),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
     let file: ApprovedFile = serde_json::from_str(&text)
         .map_err(|e| format!("{} is malformed ({e}); nothing is approved until it is fixed", path.display()))?;
-    Ok(file.hashes.into_iter().collect())
+    Ok(Approvals {
+        hashes: file.hashes.into_iter().collect(),
+        paths: file.paths.into_iter().map(PathBuf::from).collect(),
+    })
+}
+
+/// The approved sha256 set alone, for callers with no path question to ask.
+pub fn approved_hashes(
+    data_dir: &Path,
+    project_root: &Path,
+) -> Result<std::collections::HashSet<String>, String> {
+    approvals(data_dir, project_root).map(|a| a.hashes)
 }
 
 /// Record a human approval of exact content. Serialized under the ledger lock.
 pub fn approve_hash(data_dir: &Path, project_root: &Path, sha: &str) -> Result<(), String> {
+    approve(data_dir, project_root, &[sha.to_string()], None)
+}
+
+/// Record a human approval of a capability file: the hashes they blessed, and
+/// the path they blessed them at.
+pub fn approve_capability(
+    data_dir: &Path,
+    project_root: &Path,
+    path: &Path,
+    shas: &[String],
+) -> Result<(), String> {
+    approve(data_dir, project_root, shas, Some(path))
+}
+
+fn approve(
+    data_dir: &Path,
+    project_root: &Path,
+    shas: &[String],
+    path: Option<&Path>,
+) -> Result<(), String> {
     let dir = project_dir(data_dir, project_root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let lock = std::fs::OpenOptions::new()
@@ -371,9 +432,22 @@ pub fn approve_hash(data_dir: &Path, project_root: &Path, sha: &str) -> Result<(
         .map_err(|e| format!("cannot open ledger lock: {e}"))?;
     lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
     let result = (|| {
-        let mut hashes = approved_hashes(data_dir, project_root)?;
-        if hashes.insert(sha.to_string()) {
-            let file = ApprovedFile { version: 1, hashes: hashes.into_iter().collect() };
+        let current = approvals(data_dir, project_root)?;
+        let mut hashes = current.hashes;
+        let mut paths = current.paths;
+        let mut changed = false;
+        for sha in shas {
+            changed |= hashes.insert(sha.clone());
+        }
+        if let Some(path) = path {
+            changed |= paths.insert(canonical_or(path));
+        }
+        if changed {
+            let file = ApprovedFile {
+                version: 1,
+                hashes: hashes.into_iter().collect(),
+                paths: paths.iter().map(|p| p.display().to_string()).collect(),
+            };
             let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
             crate::sessions::write_atomic(&approved_path(&dir), json)?;
         }
@@ -389,6 +463,132 @@ pub fn is_approved(data_dir: &Path, project_root: &Path, sha: &str) -> bool {
     approved_hashes(data_dir, project_root)
         .map(|set| set.contains(sha))
         .unwrap_or(false)
+}
+
+// ---------- what a manifest actually executes ----------
+
+/// One file a capability manifest hands to the host: its resolved `command`,
+/// or an `args` entry naming a file. Only project-local files are listed -
+/// those are the ones the agent can rewrite after a human approved the
+/// manifest that names them.
+#[derive(Clone, Debug)]
+pub struct BoundCode {
+    pub path: PathBuf,
+    /// sha256 of the bytes on disk, or None when the file cannot be read.
+    pub sha256: Option<String>,
+}
+
+/// Every project-local file `command args...` will execute or interpret. This
+/// is what an approval has to cover: approving only the manifest binds a
+/// pointer, and the pointee sits at an ordinary project path the agent writes
+/// freely.
+///
+/// A command resolving outside the project root (a system binary, a PATH
+/// entry) contributes nothing: the human read that absolute path in the
+/// manifest they approved, and hashing host binaries would revoke on every OS
+/// upgrade. The threat here is the agent rewriting files it can write.
+pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<BoundCode> {
+    let mut out = Vec::new();
+    if let Some(path) = resolve_command(command.trim(), project_root) {
+        if inside_project(&path, project_root) {
+            out.push(read_code(path));
+        }
+    }
+    for arg in args {
+        // Fixed argv can name the script an interpreter runs
+        // (`command = "python3", args = ["scripts/tool.py"]`). Flags and
+        // inline program text are not paths and resolve to no file.
+        let arg = arg.trim();
+        if arg.is_empty() || arg.starts_with('-') {
+            continue;
+        }
+        let path = absolute_from(arg, project_root);
+        if path.is_file() && inside_project(&path, project_root) {
+            out.push(read_code(path));
+        }
+    }
+    out
+}
+
+/// The project-local code the capability manifest at `path` will execute,
+/// whichever surface it belongs to. Both manifest surfaces name a `command`
+/// plus fixed `args`; skills name none.
+pub fn manifest_code(path: &Path, project_root: &Path) -> Vec<BoundCode> {
+    if let Ok(hook) = crate::hooks::parse_hook_file(path) {
+        return bound_code(&hook.command, &hook.args, project_root);
+    }
+    if let Ok(spec) = crate::registry::parse_tool_file(path) {
+        if let crate::registry::ToolKind::External(ext) = &spec.kind {
+            return bound_code(&ext.command, &ext.args, project_root);
+        }
+    }
+    Vec::new()
+}
+
+fn read_code(path: PathBuf) -> BoundCode {
+    let sha256 = std::fs::read(&path).ok().map(|bytes| sha256_hex(&bytes));
+    BoundCode { path, sha256 }
+}
+
+/// Where `command` will spawn from, resolved the way the spawn resolves it: a
+/// path against the project root (processes run there), a bare name on PATH.
+fn resolve_command(command: &str, project_root: &Path) -> Option<PathBuf> {
+    if command.is_empty() {
+        return None;
+    }
+    if command.contains('/') {
+        return Some(absolute_from(command, project_root));
+    }
+    // Bare names are almost always system binaries, but resolving them anyway
+    // keeps a PATH entry inside the project from smuggling agent-written code
+    // past the check.
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| absolute_from(&dir.join(command).to_string_lossy(), project_root))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn absolute_from(path: &str, project_root: &Path) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        lexical_abs(path)
+    } else {
+        lexical_abs(&project_root.join(path))
+    }
+}
+
+/// Resolve `.` and `..` textually. Two spellings of one file must not decide
+/// the inside/outside question differently, and `..` must actually leave.
+fn lexical_abs(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn canonical_or(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| lexical_abs(path))
+}
+
+/// Whether `path` sits inside the project, and is therefore agent-writable.
+/// Judged both lexically and through symlinks: a symlink inside the project
+/// cannot carry its content out of the agent's reach, and one pointing in
+/// from outside still names content the agent can rewrite.
+fn inside_project(path: &Path, project_root: &Path) -> bool {
+    let root = canonical_or(project_root);
+    if path.starts_with(&root) || path.starts_with(project_root) {
+        return true;
+    }
+    canonical_or(path).starts_with(&root)
 }
 
 // ---------- usage accounting ----------
@@ -658,6 +858,96 @@ mod tests {
         std::fs::write(approved_path(&project_dir(&data, &root)), "{broken").unwrap();
         assert!(!is_approved(&data, &root, &sha));
         assert!(approved_hashes(&data, &root).is_err());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The binding rule itself: what a manifest runs from inside the project
+    /// is hashed, what it runs from outside is not.
+    #[test]
+    fn bound_code_covers_project_files_and_leaves_system_binaries_alone() {
+        let root = temp("bound-proj");
+        std::fs::write(root.join("run.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::write(root.join("tool.py"), "print(1)\n").unwrap();
+
+        // A system binary stays the human's reading of an absolute path.
+        assert!(bound_code("/bin/echo", &[], &root).is_empty());
+        assert!(bound_code("echo", &[], &root).is_empty(), "a PATH name is not project code");
+
+        // A project script binds, by either spelling the spawn accepts (a
+        // bare name is not one of them: that is a PATH lookup).
+        let sha = sha256_hex(b"#!/bin/sh\ntrue\n");
+        for spelling in ["./run.sh".to_string(), root.join("run.sh").display().to_string()] {
+            let bound = bound_code(&spelling, &[], &root);
+            assert_eq!(bound.len(), 1, "{spelling}");
+            assert_eq!(bound[0].sha256.as_deref(), Some(sha.as_str()), "{spelling}");
+        }
+
+        // An interpreter's script argument is code too; flags and inline
+        // program text are not paths and bind nothing.
+        let bound = bound_code("/usr/bin/env", &["python3".into(), "tool.py".into()], &root);
+        assert_eq!(bound.len(), 1);
+        assert!(bound[0].path.ends_with("tool.py"));
+        assert!(bound_code("/bin/sh", &["-c".into(), "echo hi".into()], &root).is_empty());
+
+        // A command named but not yet written has no bytes to approve, and
+        // must never read as "nothing to bind".
+        let missing = bound_code("./not-written-yet.sh", &[], &root);
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].sha256.is_none());
+        assert!(!Approvals::default().covers_code(&missing));
+
+        // `..` actually leaves the project, so it is not project code.
+        assert!(bound_code("../outside.sh", &[], &root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink cannot move a file to the other side of the inside/outside
+    /// line, in either direction: what matters is whether the agent can
+    /// rewrite what runs.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_do_not_move_code_out_of_the_project() {
+        let root = temp("link-proj");
+        let outside = temp("link-outside");
+        std::fs::write(outside.join("real.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::write(root.join("plain.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("real.sh"), root.join("alias.sh")).unwrap();
+        std::os::unix::fs::symlink(root.join("plain.sh"), outside.join("into.sh")).unwrap();
+
+        // A link inside the project is agent-writable whatever it points at.
+        let bound = bound_code("./alias.sh", &[], &root);
+        assert_eq!(bound.len(), 1);
+        assert!(bound[0].sha256.is_some(), "the bytes that run are what is bound");
+
+        // A link from outside that resolves back in is agent-writable too.
+        let bound = bound_code(&outside.join("into.sh").display().to_string(), &[], &root);
+        assert_eq!(bound.len(), 1, "a symlink pointing into the project still names project code");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The approval store remembers that a path was live, so a later edit of
+    /// an installed hook is distinguishable from a file nobody ever blessed.
+    #[test]
+    fn approving_a_capability_records_its_path_and_every_hash() {
+        let data = temp("cap-data");
+        let root = temp("cap-proj");
+        let manifest = root.join("gate.toml");
+        std::fs::write(&manifest, "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
+        let shas = vec![sha256_hex(b"manifest"), sha256_hex(b"script")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+
+        let recorded = approvals(&data, &root).unwrap();
+        assert!(recorded.contains(&shas[0]) && recorded.contains(&shas[1]));
+        assert!(recorded.was_live(&manifest));
+        assert!(!recorded.was_live(&root.join("other.toml")));
+
+        // A bare hash approval binds content without claiming a path was live.
+        approve_hash(&data, &root, &sha256_hex(b"loose")).unwrap();
+        let after = approvals(&data, &root).unwrap();
+        assert!(after.contains(&sha256_hex(b"loose")));
+        assert!(!after.was_live(&root.join("loose")));
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -184,6 +184,48 @@ fn run_examples_is_gated_and_reported_through_json() {
     );
 }
 
+/// `--approve` blesses a manifest and the code it runs in one act, and says
+/// so: a human cannot approve bytes they were not shown. A named command that
+/// does not exist is refused rather than half-approved.
+#[test]
+fn approve_names_every_file_it_blesses() {
+    let (project, home) = fresh_dirs("approve");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n",
+    )
+    .unwrap();
+
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "a missing command must not be half-approved");
+    assert!(stderr.contains("gate.sh"), "{stderr}");
+
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("approved .openmax/hooks/gate.toml"), "{stdout}");
+    assert!(stdout.contains("gate.sh"), "the code it runs must be named: {stdout}");
+
+    // The pair is live, and rewriting the script alone revokes it.
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("gate.sh"), "{stdout}");
+}
+
 #[test]
 fn stdio_handshake_speaks_the_contract() {
     let (project, home) = fresh_dirs("stdio");

@@ -106,10 +106,14 @@ streams carry verbatim. Nothing a hook prints changes what the model receives. H
 like external tools and `bash`, run as native host processes with inherited
 filesystem, environment, credentials, and network access.
 
-Unknown keys in a hook file are rejected, and a hook file that does not parse
-blocks every tool call until it is fixed or removed (fail closed, like
-permissions): a broken file might have been a gate, and `openmax --check`
-prints the reason.
+Unknown keys in a hook file are rejected, and a hook file that a human approved
+and that no longer parses blocks every tool call until it is fixed or removed
+(fail closed, like permissions): a broken file might have been a gate, and
+`openmax --check` prints the reason. A file no human ever approved never ran,
+so a broken one is inert instead of blocking - otherwise any write, including
+the write that would repair it, could brick the project. Rewriting the
+offending hook file (or the code it runs) stays available either way, the same
+repair carve-out `permissions.toml` has.
 
 ## Permissions
 
@@ -183,10 +187,29 @@ refusal prints the command that fixes it. An example that itself runs
 
 The ledger's approval store (`approved.json`, beside the log) holds sha256
 hashes a human has approved. Approval binds to content, never to a path: any
-edit produces a new hash and revokes itself. Two hard rules ride on it, with
-no rule language to widen them:
+edit produces a new hash and revokes itself.
 
-- An external tool whose defining TOML no human has approved always prompts on
+What gets hashed is the whole definition, not just the manifest. A tool or
+hook TOML is a pointer: the file its `command` names (or a path in its `args`)
+is what actually executes, and it sits at an ordinary project path the agent
+writes freely. So approval covers the manifest **and** every project-local
+file it hands to the host. A command that resolves outside the project root -
+an absolute path, a name on `PATH` - is covered by the manifest approval
+alone: that path is what the human read in the file they approved, and hashing
+host binaries would revoke on every OS upgrade. The threat model is the agent
+rewriting files it can write, not the system changing underneath. Paths are
+resolved before that decision, so neither `../` nor a symlink moves a file to
+the other side of it.
+
+A command that resolves to *no* file is a third case, and it refuses: an empty
+binding means "this is a system path the human read", never "nothing resolved,
+so there is nothing to check". A name that is not on `PATH`, a script that has
+not been written yet, or a spelling this platform does not parse as a path all
+leave the definition unapproved until the file exists.
+
+Three hard rules ride on this, with no rule language to widen them:
+
+- An external tool whose definition no human has approved always prompts on
   its first run - even in `auto` mode, even under a permissions `allow` rule,
   both of which the agent can write for itself. Approving that run approves the
   exact content; later runs of the same bytes are unattended. Every external
@@ -194,17 +217,33 @@ no rule language to widen them:
   the agent writes, while the call itself spawns a native host process with
   openmax's environment, credentials, and network access. A read-only tool is
   read-only by assertion, not by construction.
-- An unapproved hook file is inert. Hooks run with host authority on every
-  matching call with no per-invocation gate, so they are the one capability
-  file that never loads until approved. `openmax --check` names each one.
+- Once a definition is approved, an edit to the manifest or to the code it
+  runs makes the next call prompt again. Rewriting a blessed script is the same
+  act as rewriting the manifest, and it is caught on every path a call can take
+  - including the concurrent batch path, where read-only tools run unattended.
+- An unapproved hook is inert, and a *revoked* gate hook fails closed. Hooks
+  run with host authority on every matching call with no per-invocation gate,
+  so they never load until approved. Content nobody ever approved never ran,
+  so it stays inert and is reported every turn (a `hook_failed` note) as well
+  as by `openmax --check`. But content at a path a human did approve is a
+  modification of a live hook, and dropping a live `pre_tool_use` or
+  `user_prompt_submit` gate is fail-open - a comment-only edit would be enough
+  to switch it off - so those block every tool call until the approved content
+  is restored or a human re-approves. A hook's bound code is re-checked
+  immediately before every run, so a script rewritten between two calls of one
+  turn does not run either.
 
 Approvals happen two ways: a human approving an in-session `write_file` or
-`edit_file` into a capability path approves the resulting content
-automatically (the common case costs no extra prompt), and
-`openmax --approve <path>` approves a file that arrived from outside (a
-clone, an installer, an auto-mode write). Like `--trust-project`, `--approve`
-refuses inside agent-spawned processes: approvals are human actions. Skills
-have no enforcement; they are prose, and the tools they invoke are the gate.
+`edit_file` approves those exact bytes when they are part of a capability -
+the manifest, or a script an installed manifest runs - so writing the pair in
+either order costs no extra prompt, and `openmax --approve <path>` approves a
+file that arrived from outside (a clone, an installer, an auto-mode write).
+`--approve` on a manifest blesses the code it names in the same act and prints
+every path and hash it blessed, because a human cannot approve bytes they were
+not shown; it refuses when that code cannot be read. Like `--trust-project`,
+`--approve` refuses inside agent-spawned processes: approvals are human
+actions. Skills have no enforcement; they are prose, and the tools they invoke
+are the gate.
 
 ## The capability ledger
 

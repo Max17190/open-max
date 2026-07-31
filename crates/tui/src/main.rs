@@ -34,6 +34,7 @@ options:
                          envelopes on stdout; the custom-frontend protocol
       --ledger           print the capability-file history for this project
       --approve <path>   approve the exact current content of a capability file
+                         and of the project-local code it runs
       --run-examples     with --check, execute each tool's [example] once.
                          Unsandboxed: needs a trusted project and a tool file
                          approved with --approve, and honors permissions and
@@ -292,9 +293,36 @@ async fn main() -> std::io::Result<()> {
             }
         };
         let sha = open_max_core::ledger::sha256_hex(&bytes);
-        match open_max_core::ledger::approve_hash(&default_data_dir(), &project, &sha) {
+        // A manifest is a pointer: the file it names is the code that runs,
+        // and it sits at an ordinary project path the agent writes freely. So
+        // approving the manifest approves that code in the same act - and
+        // prints it, because a human cannot bless bytes they were not shown.
+        let code = open_max_core::ledger::manifest_code(file, &project);
+        let mut shas = vec![sha.clone()];
+        for entry in &code {
+            let Some(code_sha) = &entry.sha256 else {
+                eprintln!(
+                    "openmax: {path} runs {}, which cannot be read; create it first, then approve them together",
+                    entry.path.display()
+                );
+                std::process::exit(1);
+            };
+            shas.push(code_sha.clone());
+        }
+        match open_max_core::ledger::approve_capability(&default_data_dir(), &project, file, &shas) {
             Ok(()) => {
                 println!("approved {path} ({})", &sha[..12]);
+                for entry in &code {
+                    let code_sha = entry.sha256.clone().unwrap_or_default();
+                    println!(
+                        "  and the code it runs: {} ({})",
+                        entry.path.display(),
+                        &code_sha[..12.min(code_sha.len())]
+                    );
+                }
+                if !code.is_empty() {
+                    println!("editing either revokes this approval; re-run --approve after any change");
+                }
                 std::process::exit(0);
             }
             Err(e) => {
@@ -683,8 +711,17 @@ fn print_usage_economics() {
         .to_string()
         .len();
         let entry = usage.tools.get(&spec.name).cloned().unwrap_or_default();
-        let approved = if open_max_core::ledger::is_approved(&data_dir, &project, &ext.source_sha256)
-        {
+        // Approved means the whole definition: the manifest and the code it
+        // runs. A tool whose script was rewritten after approval is not
+        // approved, and must not read as if it were.
+        let approvals =
+            open_max_core::ledger::approvals(&data_dir, &project).unwrap_or_default();
+        let approved = if approvals.contains(&ext.source_sha256)
+            && approvals.covers_code(&open_max_core::ledger::bound_code(
+                &ext.command,
+                &ext.args,
+                &project,
+            )) {
             "yes"
         } else {
             "no"

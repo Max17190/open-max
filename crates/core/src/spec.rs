@@ -71,6 +71,16 @@ outside a session with `openmax --approve .openmax/tools/<name>.toml`, or by
 approving the write that created it. `openmax --spec usage` lists the approval
 state of every installed tool.
 
+What "the exact bytes" covers is the whole definition: the `.toml` *and* the
+project-local file its `command` (or a path in `args`) names, because that file
+is the code that actually runs and the agent can rewrite it after the fact.
+Editing the manifest or that script makes the next call ask again. A `command`
+outside the project root (an absolute path, a name on PATH) is covered by the
+manifest approval alone - that path is what the human read - while a command
+resolving to no file at all is covered by nothing, so the tool asks until it
+exists. `openmax --approve <tool.toml>` approves the pair up front and prints
+every path and hash it blessed.
+
 Example (`.openmax/tools/todo_scan.toml`):
 
 ```toml
@@ -251,10 +261,33 @@ Each run receives one JSON payload on stdin:
   persisted compaction digest.
 - turn_end: {"event", "session_id", "cwd", "stop_reason"}
 
-Fail closed: a hook file that exists but does not parse blocks every tool
-until it is fixed or removed (a broken file might have been a gate), unless a
-valid project file shadows its stem. Hooks are re-discovered every turn; no
-reload is needed.
+Approval: a hook is inert until a human approves its exact content - the
+`.toml` *and* the project-local file its `command` (or a path in `args`) names,
+because that file is the code that actually runs and the agent can rewrite it.
+`openmax --approve <hook.toml>` approves the pair and prints both; approving
+the in-session write of either file approves those bytes. A `command` outside
+the project root (an absolute path, a name on PATH) is covered by the manifest
+approval alone: that path is what the human read, and system binaries change
+on their own schedule. The bytes are re-checked before every run, so a script
+rewritten mid-turn does not run.
+
+Fail closed, three ways, all reported by `openmax --check`:
+- A hook file that exists but does not parse blocks every tool until it is
+  fixed or removed (a broken file might have been a gate), unless a valid
+  project file shadows its stem - or unless no human ever approved that path,
+  in which case it never ran and stays inert instead.
+- A gate hook (`pre_tool_use`, `user_prompt_submit`) whose path was approved
+  and whose content no longer is blocks every tool until the approved content
+  is restored or a human re-approves it. Editing a live gate cannot turn it
+  off, and that includes a comment-only edit or a rewritten script.
+- Either way, `write_file`/`edit_file` on the offending hook file or the code
+  it runs stays available, so the repair is possible from inside the session
+  (same carve-out as `permissions.toml`, and subject to `approval_mode`).
+
+A hook whose content was never approved is inert rather than blocking: it never
+ran, so it removes no policy. It is not silent - each turn reports it, and
+`openmax --check` names it. Hooks are re-discovered every turn; no reload is
+needed.
 
 Example (`.openmax/hooks/deny-rm.toml`):
 
@@ -392,15 +425,17 @@ each recorded capability-file change and its actor), `schemas_over_budget`
 (schema_tokens, budget_tokens: the installed tools take most of what the
 window can spend, so compaction runs early and stops entirely once they
 reach it; advisory, at most once per session),
-`hook_failed` (hook, event, detail: an observe-only hook failed, the turn
-proceeded), `done` (stop_reason), `error` (message).
+`hook_failed` (hook, event, detail: a hook did not run - an observe-only hook
+failed, or a hook file on disk is not loaded - and the turn proceeded), `done`
+(stop_reason), `error` (message).
 
 `approval_request.reason` is `gate` (approval_mode or a permission rule) or
-`unapproved_source`: the first call of an external tool whose exact bytes no
-human has approved. `unapproved_source` is the human boundary itself and must
-never be auto-approved; it carries `source_path` (project-relative where
-possible) and `source_sha` (first 12 hex chars), so a client that cannot
-prompt can print `openmax --approve <source_path>`. Both are empty on `gate`.
+`unapproved_source`: a call of an external tool whose exact bytes - the
+manifest, or the project-local code it runs - no human has approved.
+`unapproved_source` is the human boundary itself and must never be
+auto-approved; it carries `source_path` (project-relative where possible) and
+`source_sha` (first 12 hex chars), so a client that cannot prompt can print
+`openmax --approve <source_path>`. Both are empty on `gate`.
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
@@ -497,12 +532,18 @@ mod tests {
         write(".openmax/hooks/deny-rm.toml", &example(HOOKS));
         write(".openmax/permissions.toml", &example(PERMISSIONS));
 
-        // Hooks are inert until a human approves the exact content; the test
-        // stands in for the human, against a scoped data dir.
+        // Hooks are inert until a human approves the exact content - the file
+        // and the script it runs; the test stands in for the human, against a
+        // scoped data dir.
         let data = root.join("test-data");
-        let hook_bytes = std::fs::read(root.join(".openmax/hooks/deny-rm.toml")).unwrap();
-        crate::ledger::approve_hash(&data, &root, &crate::ledger::sha256_hex(&hook_bytes))
-            .unwrap();
+        let hook = root.join(".openmax/hooks/deny-rm.toml");
+        let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap())];
+        shas.extend(
+            crate::ledger::manifest_code(&hook, &root)
+                .into_iter()
+                .filter_map(|c| c.sha256),
+        );
+        crate::ledger::approve_capability(&data, &root, &hook, &shas).unwrap();
 
         let findings: Vec<_> = crate::doctor::check_at(&root, &data)
             .into_iter()
