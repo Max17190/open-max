@@ -1097,12 +1097,16 @@ mod tests {
     /// A command killed for running too long still printed something, and a
     /// hook that is told a process ran no bytes would draw the wrong
     /// conclusion about the turn.
+    ///
+    /// The timeout has to outlast shell startup by a wide margin: on a loaded
+    /// CI runner a one-second budget can expire before `echo` ever runs, and
+    /// then the harness correctly reports the zero bytes that were printed.
     #[tokio::test]
     async fn a_timed_out_command_still_reports_what_it_printed() {
         let root = temp_project();
         let out = bash_tool(
             &root,
-            &json!({"command": "echo before-the-timeout; sleep 30", "timeout_secs": 1}),
+            &json!({"command": "echo before-the-timeout; sleep 30", "timeout_secs": 5}),
             OutputCaps::default(),
             Arc::new(CancelToken::default()),
         )
