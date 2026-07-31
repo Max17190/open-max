@@ -91,6 +91,13 @@ pub enum AgentEvent {
         /// has approved). Unattended frontends must never auto-approve
         /// `unapproved_source`: that is the human boundary itself.
         reason: String,
+        /// The capability file whose exact content needs approving, and the
+        /// first 12 hex chars of its sha256. Both empty unless `reason` is
+        /// `unapproved_source`. A frontend that cannot prompt must print
+        /// `openmax --approve <source_path>`: without the path the refusal
+        /// names no action anyone can take.
+        source_path: String,
+        source_sha: String,
     },
     /// The approval waiter closed (approve, deny, timeout, cancel, or drop).
     /// Frontends must clear any pending approval UI matching `approval_id`.
@@ -138,7 +145,7 @@ mod tests {
 
     /// Golden wire format for every `AgentEvent`, wrapped in its envelope
     /// exactly as `--stdio` and `--print --json` emit it. These strings are
-    /// the `openmax-stdio/1` contract: session_id first, then the `type`
+    /// the `openmax-stdio/3` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     #[test]
@@ -204,8 +211,24 @@ mod tests {
                 summary: "run".into(),
                 detail: "ls".into(),
                 reason: "gate".into(),
+                source_path: String::new(),
+                source_sha: String::new(),
             }),
-            r#"{"session_id":"s1","type":"approval_request","approval_id":"ap1","name":"bash","summary":"run","detail":"ls","reason":"gate"}"#
+            r#"{"session_id":"s1","type":"approval_request","approval_id":"ap1","name":"bash","summary":"run","detail":"ls","reason":"gate","source_path":"","source_sha":""}"#
+        );
+        // An unapproved-content prompt carries the file to approve, so the
+        // frontend can name the exact command that unblocks the call.
+        assert_eq!(
+            env(AgentEvent::ApprovalRequest {
+                approval_id: "ap2".into(),
+                name: "danger".into(),
+                summary: "danger".into(),
+                detail: "{\"count\":3}".into(),
+                reason: "unapproved_source".into(),
+                source_path: ".openmax/tools/danger.toml".into(),
+                source_sha: "0123456789ab".into(),
+            }),
+            r#"{"session_id":"s1","type":"approval_request","approval_id":"ap2","name":"danger","summary":"danger","detail":"{\"count\":3}","reason":"unapproved_source","source_path":".openmax/tools/danger.toml","source_sha":"0123456789ab"}"#
         );
         assert_eq!(
             env(AgentEvent::ApprovalSettled {

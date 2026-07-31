@@ -52,8 +52,10 @@ Fields:
 - `command` (required): executable path or name, spawned in the project root.
 - `args` (optional): fixed argv strings appended to `command`.
 - `timeout_secs` (optional): default 60, clamped to 1..300.
-- `mutating` (optional, default false): routes calls through approval gating.
-  Trusted metadata for scheduling and UX, not a sandbox.
+- `mutating` (optional, default false): routes calls through the ordinary
+  approval_mode gate (snapshots, read-only sessions, prompts). Trusted
+  metadata for scheduling and UX, not a sandbox: it never widens or narrows
+  the human content approval below.
 
 Runtime contract: the harness spawns `command args...` in the project root,
 writes the call's JSON arguments to stdin, and returns stdout as the result.
@@ -61,6 +63,13 @@ Nonzero exit makes the result an error carrying `exit code N` plus output.
 Output is capped; overflow spills to `~/.openmax/cmd-logs`. The process is a
 native host process: it inherits the environment, credentials, and network
 access of Open Max.
+
+Human approval: because of that authority, the first call of any tool file -
+mutating or not - stops for a human, who approves the exact bytes. Later calls
+of identical bytes run unprompted; any edit revokes and asks again. Approve
+outside a session with `openmax --approve .openmax/tools/<name>.toml`, or by
+approving the write that created it. `openmax --spec usage` lists the approval
+state of every installed tool.
 
 Example (`.openmax/tools/todo_scan.toml`):
 
@@ -350,14 +359,14 @@ Activation: resolved at the next turn (settings edits apply without a
 restart). Verify with `openmax --check`.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/2)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/2","protocol_version":2,"session_id":"...","version":"...","project":"/abs/path"}.
+{"type":"hello","proto":"openmax-stdio/3","protocol_version":3,"session_id":"...","version":"...","project":"/abs/path"}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -376,10 +385,18 @@ Parse by field name, never by key order. Types: `token` (text), `thinking`
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
 (call_id, name, args), `tool_end` (call_id, ok, output), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
-detail), `approval_settled` (approval_id, outcome), `refrozen` (tools,
-skills, changes: the refreeze receipt naming each recorded capability-file
-change and its actor), `hook_failed` (hook, event, detail: an observe-only
-hook failed, the turn proceeded), `done` (stop_reason), `error` (message).
+detail, reason, source_path, source_sha), `approval_settled` (approval_id,
+outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
+each recorded capability-file change and its actor), `hook_failed` (hook,
+event, detail: an observe-only hook failed, the turn proceeded), `done`
+(stop_reason), `error` (message).
+
+`approval_request.reason` is `gate` (approval_mode or a permission rule) or
+`unapproved_source`: the first call of an external tool whose exact bytes no
+human has approved. `unapproved_source` is the human boundary itself and must
+never be auto-approved; it carries `source_path` (project-relative where
+possible) and `source_sha` (first 12 hex chars), so a client that cannot
+prompt can print `openmax --approve <source_path>`. Both are empty on `gate`.
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
@@ -519,6 +536,64 @@ mod tests {
             );
         }
         assert!(render("stdio").unwrap().contains("openmax --check --stdio"));
+    }
+
+    /// A frontend author reads `--spec stdio` and is then judged by
+    /// `openmax --check --stdio`, which parses events with the real
+    /// `AgentEvent`. Anything the wire carries but the printed contract omits
+    /// is a recipe for failing the harness's own conformance check, so every
+    /// event type and every field of it must appear here.
+    #[test]
+    fn stdio_spec_names_every_event_and_field_on_the_wire() {
+        use crate::types::AgentEvent;
+        let text = render("stdio").unwrap();
+        let samples = [
+            AgentEvent::Token { text: String::new() },
+            AgentEvent::Thinking { text: String::new() },
+            AgentEvent::MessageDone { text: String::new() },
+            AgentEvent::Budget { used_tokens: 0, context_tokens: 0 },
+            AgentEvent::Usage { prompt_tokens: 0, completion_tokens: 0, cached_tokens: None },
+            AgentEvent::ToolStart {
+                call_id: String::new(),
+                name: String::new(),
+                args: serde_json::Value::Null,
+            },
+            AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new() },
+            AgentEvent::Diff {
+                call_id: String::new(),
+                path: String::new(),
+                diff: String::new(),
+                added: 0,
+                removed: 0,
+            },
+            AgentEvent::ApprovalRequest {
+                approval_id: String::new(),
+                name: String::new(),
+                summary: String::new(),
+                detail: String::new(),
+                reason: String::new(),
+                source_path: String::new(),
+                source_sha: String::new(),
+            },
+            AgentEvent::ApprovalSettled { approval_id: String::new(), outcome: String::new() },
+            AgentEvent::Refrozen { tools: 0, skills: 0, changes: Vec::new() },
+            AgentEvent::HookFailed {
+                hook: String::new(),
+                event: String::new(),
+                detail: String::new(),
+            },
+            AgentEvent::Done { stop_reason: String::new() },
+            AgentEvent::Error { message: String::new() },
+        ];
+        for event in samples {
+            let value = serde_json::to_value(&event).expect("events serialize");
+            let obj = value.as_object().expect("an event is an object");
+            let ty = obj["type"].as_str().expect("events are tagged");
+            assert!(text.contains(&format!("`{ty}`")), "stdio spec never names `{ty}`");
+            for field in obj.keys().filter(|k| *k != "type") {
+                assert!(text.contains(field.as_str()), "stdio spec omits `{ty}.{field}`");
+            }
+        }
     }
 
 

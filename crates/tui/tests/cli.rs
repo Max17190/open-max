@@ -204,8 +204,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/2");
-    assert_eq!(hello["protocol_version"], 2);
+    assert_eq!(hello["proto"], "openmax-stdio/3");
+    assert_eq!(hello["protocol_version"], 3);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -338,6 +338,183 @@ fn a_print_turn_expands_a_prompt_template() {
     let sent = requests.lock().unwrap().join("\n");
     assert!(sent.contains("MARKER: greet world"), "the model must get the body: {sent}");
     assert!(!sent.contains("/greet world"), "the raw slash line must not be sent: {sent}");
+}
+
+/// One scripted SSE completion per request, and every request body appended to
+/// `record`, so a test can assert both what openmax did and what the model was
+/// told afterwards.
+fn spawn_recording_server(
+    bodies: Vec<String>,
+    record: PathBuf,
+) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        for sse in bodies {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => buf.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let headers = String::from_utf8_lossy(&buf).to_string();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&record)
+                .unwrap();
+            log.write_all(&body).unwrap();
+            log.write_all(b"\n").unwrap();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                sse.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+fn sse(chunks: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for chunk in chunks {
+        out.push_str(&format!("data: {chunk}\n\n"));
+    }
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+fn sse_tool_call(name: &str, args: serde_json::Value) -> String {
+    sse(&[
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": name, "arguments": args.to_string()}
+        }]},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+    ])
+}
+
+fn sse_text(text: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+    ])
+}
+
+/// The human content boundary covers every agent-written tool, not only the
+/// ones that declare `mutating` - that field is written by the agent, while the
+/// call itself is a native host process. The refusal must also be actionable:
+/// the event, the operator's stderr, and the model's own tool result all have
+/// to name the file and the command that unblocks it.
+#[test]
+fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
+    let (project, home) = fresh_dirs("unapproved-tool");
+    let record = project.parent().unwrap().join("requests.jsonl");
+    let (base_url, _server) = spawn_recording_server(
+        vec![
+            sse_tool_call("peek", serde_json::json!({"count": 3})),
+            sse_text("blocked"),
+            sse_tool_call("peek", serde_json::json!({"count": 3})),
+            sse_text("ran it"),
+        ],
+        record.clone(),
+    );
+    // auto mode: nothing but the content boundary can produce a prompt here.
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(
+        tools.join("peek.toml"),
+        // Declares itself read-only and takes no string arguments: the exact
+        // shape that used to bypass the gate and summarize as "".
+        "name = \"peek\"\ndescription = \"look something up\"\ncommand = \"/bin/sh\"\n\
+         args = [\"-c\", \"cat >/dev/null; echo ran > peeked.txt; echo looked\"]\nmutating = false\n\
+         \n[params]\ntype = \"object\"\n[params.properties.count]\ntype = \"number\"\n",
+    )
+    .unwrap();
+
+    let out = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "peek at it"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !project.join("peeked.txt").exists(),
+        "unapproved host code must not have run\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let events: Vec<serde_json::Value> =
+        stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let request = events
+        .iter()
+        .find(|e| e["type"] == "approval_request")
+        .unwrap_or_else(|| panic!("a read-only external tool must still ask: {stdout}"));
+    assert_eq!(request["reason"], "unapproved_source");
+    assert_eq!(request["source_path"], ".openmax/tools/peek.toml");
+    assert_eq!(request["source_sha"].as_str().unwrap().len(), 12);
+    assert_eq!(request["summary"], "peek", "a summary must never be empty");
+
+    // The operator running headless gets a command, not a placeholder.
+    assert!(
+        stderr.contains("openmax --approve .openmax/tools/peek.toml"),
+        "stderr must name the real file: {stderr}"
+    );
+    assert!(!stderr.contains("<its .toml>"), "{stderr}");
+
+    // And so does the model: the harness enforced a boundary, no user declined.
+    let sent = std::fs::read_to_string(&record).unwrap();
+    let last: serde_json::Value =
+        serde_json::from_str(sent.lines().nth(1).expect("a second request")).unwrap();
+    let tool_result = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("the declined call is reported back")["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        tool_result.contains("openmax --approve .openmax/tools/peek.toml"),
+        "the agent must be able to relay the exact command: {tool_result}"
+    );
+    assert!(!tool_result.contains("The user declined"), "{tool_result}");
+
+    // A human approves the exact bytes; the same call then runs unprompted.
+    let approve = cmd(&project, &home)
+        .args(["--approve", ".openmax/tools/peek.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(approve.status.code(), Some(0), "{}", String::from_utf8_lossy(&approve.stderr));
+
+    let out = cmd(&project, &home)
+        .args(["--json", "-p", "peek at it"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("approval_request"),
+        "approved content must not ask again: {stdout}"
+    );
+    assert!(project.join("peeked.txt").exists(), "the approved tool must run: {stdout}");
 }
 
 #[test]

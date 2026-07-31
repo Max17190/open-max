@@ -173,7 +173,7 @@ async fn run_turn_events(
             AgentEvent::ToolStart { name, args: tool_args, .. } => {
                 if !json {
                     let summary = open_max_core::registry::summarize_call(name, tool_args);
-                    let _ = writeln!(stderr, "→ {name} {summary}");
+                    let _ = writeln!(stderr, "→ {}", call_line(name, &summary));
                     let _ = stderr.flush();
                 }
             }
@@ -191,6 +191,8 @@ async fn run_turn_events(
                 summary,
                 detail: _,
                 reason,
+                source_path,
+                source_sha,
             } => {
                 let mode = core.settings.lock().unwrap().approval_mode;
                 // Unattended auto mode covers the ordinary mutating gate, but
@@ -200,12 +202,16 @@ async fn run_turn_events(
                 let approve = mode == open_max_core::config::ApprovalMode::Auto
                     && reason != "unapproved_source";
                 if !approve {
+                    // The path is the whole point of the line: a script's
+                    // operator has to be able to copy the command and run it.
                     let hint = if reason == "unapproved_source" {
-                        "a human must approve this tool's content first: openmax --approve <its .toml>"
+                        format!(
+                            "a human must approve this tool's content first: openmax --approve {source_path} ({source_sha})"
+                        )
                     } else {
-                        "set approval_mode to auto for unattended mutating tools"
+                        "set approval_mode to auto for unattended mutating tools".to_string()
                     };
-                    let _ = writeln!(stderr, "openmax: declining {name} ({summary}); {hint}");
+                    let _ = writeln!(stderr, "openmax: declining {}; {hint}", call_line(name, summary));
                 }
                 core.respond_approval(approval_id, approve);
             }
@@ -247,6 +253,16 @@ async fn run_turn_events(
             | AgentEvent::Diff { .. }
             | AgentEvent::ApprovalSettled { .. } => {}
         }
+    }
+}
+
+/// `name summary`, collapsed to just the name when the summary is the name
+/// again (an external call whose arguments held no string to describe).
+fn call_line(name: &str, summary: &str) -> String {
+    if summary.is_empty() || summary == name {
+        name.to_string()
+    } else {
+        format!("{name} {summary}")
     }
 }
 

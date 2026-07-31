@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/2`)
+# stdio protocol (`openmax-stdio/3`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -14,7 +14,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/2","protocol_version":2,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/3","protocol_version":3,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -63,7 +63,7 @@ key order is not significant: parse every line by field name.
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
-| `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve) |
+| `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha` |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
 | `hook_failed` | `hook`, `event`, `detail` (an observe-only hook failed; the turn proceeded) |
@@ -121,3 +121,12 @@ has already settled is answered with a `protocol_error` instead of being
 silently dropped: the client's picture of open gates is wrong and should say
 so. A successful `approval_mode` command is acknowledged with
 `{"type":"approval_mode","mode":"..."}` after the setting is persisted.
+
+`reason` `unapproved_source` is the human content boundary: the first call of
+an external (agent-writable) tool whose exact bytes no human has approved.
+Every external tool is gated, whatever its `mutating` field says, because the
+harness spawns it as a native host process with openmax's own authority. Such
+a request carries `source_path` (project-relative where possible) and
+`source_sha` (first 12 hex chars of the file's sha256); a client that cannot
+prompt a human must surface `openmax --approve <source_path>` rather than
+decline silently. Both fields are empty strings when `reason` is `gate`.
