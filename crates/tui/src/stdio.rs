@@ -793,12 +793,7 @@ mod tests {
 
     /// Drive the protocol loop in-process: commands in, emitted lines out.
     async fn drive_commands(commands: Vec<Command>) -> (Vec<serde_json::Value>, i32, Arc<Core>) {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("openmax-stdio-{}-{nonce}", std::process::id()));
+        let dir = crate::test_temp_dir("openmax-stdio");
         let (core, core_rx) = Core::new(dir.clone()).unwrap();
         let meta = sessions::create(&core, dir.display().to_string()).unwrap();
         let (tx, rx) = mpsc::channel(64);

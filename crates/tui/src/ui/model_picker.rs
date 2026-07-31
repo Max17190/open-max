@@ -258,11 +258,7 @@ mod tests {
     use std::fs;
 
     fn fixture() -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openmax-model-picker-{nonce}"));
+        let dir = crate::test_temp_dir("openmax-model-picker");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("providers.json"),

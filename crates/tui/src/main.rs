@@ -674,6 +674,24 @@ fn ensure_project_trust(
     Ok(())
 }
 
+/// A data directory no other test can be handed. Tests delete their directory
+/// when they finish, so a name two of them share makes one delete the other's
+/// fixture mid-run. A timestamp alone does not separate them: `SystemTime`
+/// advances in microsecond steps on macOS, and parallel test threads routinely
+/// read the same value. The counter is what actually guarantees uniqueness;
+/// pid and clock only keep leftovers from earlier runs out of the way.
+#[cfg(test)]
+pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nonce}-{seq}", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,11 +715,7 @@ mod tests {
     /// (OPENMAX_SESSION set), --trust-project must refuse rather than record.
     #[test]
     fn trust_project_refuses_under_an_agent_session() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openmax-trustgate-{nonce}"));
+        let dir = test_temp_dir("openmax-trustgate");
         std::fs::create_dir_all(&dir).unwrap();
         let cli = parse_args_from(["--trust-project"]).unwrap();
         std::env::set_var("OPENMAX_SESSION", "1");
