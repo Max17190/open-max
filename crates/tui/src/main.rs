@@ -34,7 +34,10 @@ options:
                          envelopes on stdout; the custom-frontend protocol
       --ledger           print the capability-file history for this project
       --approve <path>   approve the exact current content of a capability file
-      --run-examples     with --check, execute each tool's [example] once
+      --run-examples     with --check, execute each tool's [example] once.
+                         Unsandboxed: needs a trusted project and a tool file
+                         approved with --approve, and honors permissions and
+                         approval_mode exactly as a session does
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers) and exit; nonzero if
                          any is broken.
@@ -195,6 +198,7 @@ async fn main() -> std::io::Result<()> {
         && (cli.check
             || cli.stdio
             || cli.print
+            || cli.run_examples
             || cli.trust_project
             || cli.continue_session
             || cli.model.is_some()
@@ -202,6 +206,12 @@ async fn main() -> std::io::Result<()> {
             || !cli.prompts.is_empty())
     {
         eprintln!("openmax: --spec is a standalone operation; run other options separately\n\n{HELP}");
+        std::process::exit(2);
+    }
+    // Same reason: --run-examples only does anything under --check, and a run
+    // that executed no example must never exit 0 as if it had.
+    if cli.run_examples && !cli.check {
+        eprintln!("openmax: --run-examples requires --check\n\n{HELP}");
         std::process::exit(2);
     }
 
@@ -305,7 +315,7 @@ async fn main() -> std::io::Result<()> {
         let findings = open_max_core::doctor::check(&project);
         if cli.json {
             // Machine face of the same report: the agent parses this in-turn.
-            let array: Vec<serde_json::Value> = findings
+            let mut array: Vec<serde_json::Value> = findings
                 .iter()
                 .map(|f| {
                     serde_json::json!({
@@ -316,10 +326,21 @@ async fn main() -> std::io::Result<()> {
                     })
                 })
                 .collect();
+            let mut failed = open_max_core::doctor::has_errors(&findings);
+            if cli.run_examples {
+                // Examples belong in the machine report too: the consumer most
+                // likely to gate on it is an agent verifying a tool it just
+                // wrote, and all-green for a proof that never ran is a lie.
+                let (rows, failures) = tool_example_rows(&project).await;
+                array.extend(rows);
+                failed = failed || failures > 0;
+            }
             println!("{}", serde_json::Value::Array(array));
-            std::process::exit(if open_max_core::doctor::has_errors(&findings) { 1 } else { 0 });
+            std::process::exit(if failed { 1 } else { 0 });
         }
-        if findings.is_empty() {
+        // With --run-examples there is still a verdict to report (or a refusal
+        // to explain), and both faces have to agree on the exit code.
+        if findings.is_empty() && !cli.run_examples {
             println!(
                 "no extension files found (tools, skills, templates, hooks, permissions, providers)"
             );
@@ -341,7 +362,7 @@ async fn main() -> std::io::Result<()> {
         }
         let mut example_failures = 0usize;
         if cli.run_examples {
-            example_failures = run_tool_examples(&project).await;
+            example_failures = run_tool_examples(&project, &findings).await;
         }
         // Warnings do not fail the run: a shadowed global default and a rule
         // written before its tool are both normal.
@@ -533,23 +554,83 @@ impl<W: Write> Drop for FrameWriter<W> {
 }
 
 /// Print `openmax --check --run-examples` results; returns the failure count.
-async fn run_tool_examples(project: &std::path::Path) -> usize {
-    let results = open_max_core::doctor::run_examples(project).await;
-    if results.is_empty() {
-        println!("no tool declares an [example]");
-        return 0;
-    }
+async fn run_tool_examples(
+    project: &std::path::Path,
+    findings: &[open_max_core::doctor::Finding],
+) -> usize {
+    use open_max_core::doctor::Status;
     let mut failures = 0usize;
-    for (name, verdict) in results {
-        match verdict {
-            Ok(()) => println!("ok   example     {name}"),
+    let mut ran = 0usize;
+    // Each verdict prints as it lands: examples run serially with per-tool
+    // timeouts, so batching the report would look like a hang.
+    let result = open_max_core::doctor::run_examples(project, |verdict| {
+        ran += 1;
+        match &verdict.result {
+            Ok(()) => println!("ok   example     {}", verdict.tool),
             Err(reason) => {
                 failures += 1;
-                println!("err  example     {name}  {reason}");
+                println!("err  example     {}  {reason}", verdict.tool);
             }
         }
+        let _ = std::io::stdout().flush();
+    })
+    .await;
+    match result {
+        Err(reason) => {
+            println!("err  example     {}  {reason}", project.display());
+            failures += 1;
+        }
+        Ok(_) if ran == 0 => {
+            let unloadable = findings
+                .iter()
+                .filter(|f| f.kind == "tool" && matches!(f.status, Status::Err(_)))
+                .count();
+            match unloadable {
+                0 => println!("no tool declares an [example]"),
+                n => println!(
+                    "no tool declares a runnable [example] ({n} tool file(s) failed to load; see the err lines above)"
+                ),
+            }
+        }
+        Ok(_) => {}
     }
     failures
+}
+
+/// The same example verdicts as JSON rows, for `--check --json`. Returns the
+/// rows and the failure count.
+async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>, usize) {
+    let mut rows = Vec::new();
+    let mut failures = 0usize;
+    match open_max_core::doctor::run_examples(project, |_| {}).await {
+        Ok(verdicts) => {
+            for verdict in verdicts {
+                let (status, message) = match &verdict.result {
+                    Ok(()) => ("ok", format!("example for '{}' ran", verdict.tool)),
+                    Err(reason) => {
+                        failures += 1;
+                        ("err", reason.clone())
+                    }
+                };
+                rows.push(serde_json::json!({
+                    "surface": "example",
+                    "path": verdict.path.display().to_string(),
+                    "status": status,
+                    "message": message,
+                }));
+            }
+        }
+        Err(reason) => {
+            failures += 1;
+            rows.push(serde_json::json!({
+                "surface": "example",
+                "path": project.display().to_string(),
+                "status": "err",
+                "message": reason,
+            }));
+        }
+    }
+    (rows, failures)
 }
 
 /// `openmax --spec usage`: per-extension prompt cost joined with lifetime

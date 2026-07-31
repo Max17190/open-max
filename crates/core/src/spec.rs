@@ -97,7 +97,28 @@ path = "src"               # the JSON arguments for the example call
 
 `openmax --check --run-examples` executes each declared example through the
 real spawn path (stdin JSON, timeout, output caps): the call must exit 0 and
-match `expect_regex` when present. Plain `--check` never executes anything.
+match `expect_regex` when present. `expect_regex` is matched against the same
+capped rendering a tool call returns (the tail, once output exceeds the cap),
+so a token printed early by a noisy command can scroll out of the window.
+Plain `--check` never executes anything.
+
+An example is the tool's real command with the harness's full host authority,
+run in the project root with no sandbox and no snapshot: it can delete files
+and write outside the project. So it passes the same gates a turn applies, and
+runs only when all of them admit it:
+
+- the project is trusted (`openmax --trust-project`);
+- a human approved the tool file's exact bytes (`openmax --approve <path>`);
+  editing the file revokes that approval;
+- `pre_tool_use` hooks allow the call, and permission rules admit it: `deny`
+  refuses, and so does `ask`, because nothing here can prompt - write
+  `effect = "allow"` for a tool whose example should run unattended;
+- `approval_mode` is not `readonly` for a `mutating` tool. A `mutating`
+  example under `approval_mode = "ask"` needs a human to start the run, so it
+  is refused when the agent loop spawned the process.
+
+Each refusal names what to fix. An example must not itself run
+`openmax --check --run-examples`: that is refused rather than recursed into.
 "#;
 
 const SKILLS: &str = r#"# Skills

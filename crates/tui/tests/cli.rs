@@ -91,6 +91,98 @@ fn check_exit_codes_follow_findings() {
     assert!(stdout.contains("broken.toml"), "{stdout}");
 }
 
+/// `--check --run-examples` is the one path that executes project code, so it
+/// carries a session's gates: trust, then content approval. The JSON face
+/// reports the same verdicts, because the consumer most likely to parse it is
+/// an agent verifying a tool it just wrote.
+#[test]
+fn run_examples_is_gated_and_reported_through_json() {
+    let (project, home) = fresh_dirs("examples");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    // Echoes its stdin JSON back; its example proves the payload arrived.
+    std::fs::write(
+        tools.join("prover.toml"),
+        "name = \"prover\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat\"]\n\n[example]\nexpect_regex = \"hello\"\n[example.args]\nmsg = \"hello\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tools.join("failer.toml"),
+        "name = \"failer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo boom >&2; exit 3\"]\n\n[example]\n",
+    )
+    .unwrap();
+
+    let json = |out: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+    };
+    let messages = |value: &serde_json::Value| -> String {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["surface"] == "example")
+            .map(|row| format!("{} {}", row["status"], row["message"]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Untrusted: plain --check still passes (it only reads), examples do not.
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    let out = cmd(&project, &home)
+        .args(["--check", "--json", "--run-examples"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(messages(&json(&out)).contains("not trusted"), "{}", messages(&json(&out)));
+
+    // Trust it (the endpoint is dead, so the turn fails after trust is stored).
+    cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+
+    // Trusted but unapproved: still nothing runs, and the message says how.
+    let out = cmd(&project, &home)
+        .args(["--check", "--json", "--run-examples"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let reported = messages(&json(&out));
+    assert_eq!(reported.matches("unapproved source").count(), 2, "{reported}");
+    assert!(reported.contains("--approve"), "{reported}");
+
+    for tool in ["prover.toml", "failer.toml"] {
+        let out = cmd(&project, &home)
+            .args(["--approve", &format!(".openmax/tools/{tool}")])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // Approved: the passing example passes, the failing one fails the run and
+    // brings its diagnostic with it.
+    let out = cmd(&project, &home)
+        .args(["--check", "--json", "--run-examples"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value = json(&out);
+    let reported = messages(&value);
+    assert!(reported.contains("ok"), "{reported}");
+    assert!(reported.contains("boom"), "{reported}");
+    assert!(reported.contains("exit code 3"), "{reported}");
+
+    // Without --check the flag would be silently swallowed; that reads as
+    // success for work that never ran.
+    let out = cmd(&project, &home).arg("--run-examples").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--run-examples requires --check"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn stdio_handshake_speaks_the_contract() {
     let (project, home) = fresh_dirs("stdio");

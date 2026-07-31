@@ -26,6 +26,13 @@ openmax --stdio                       # full session over JSONL pipes
 `{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
 with the same exit code, so the agent can parse its own verification.
 
+`openmax --check --run-examples` adds one `example` surface row per declared
+`[example]`, in text and in JSON, and fails the check when one fails. It is
+the only `--check` mode that executes anything, so it needs a trusted project
+and a tool file approved with `openmax --approve <path>`, and it honors
+permission rules, `pre_tool_use` hooks, and `approval_mode` exactly as a turn
+does. See [extending](extending.md#proof-of-life).
+
 In print mode, text goes to stdout and tool progress to stderr. With `--json`,
 each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
 `approval_mode`; for unattended runs set `"approval_mode": "auto"`.
