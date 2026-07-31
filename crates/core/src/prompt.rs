@@ -136,7 +136,7 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - New tool: .openmax/tools/<name>.toml with name, description, params (JSON schema), command, args, mutating.\n\
 - New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
 - Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
-- Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end. Unapproved hooks are inert.\n\
+- Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end. Unapproved hooks are inert; approval covers the .toml and the code it runs, and editing either revokes it (a revoked live gate then blocks tools).\n\
 - Permission rules: .openmax/permissions.toml, one [[rules]] table per rule with effect = allow|deny|ask, tool = \"<tool name>\", optional arg_regex (unanchored). Any error in this file denies every tool, so write it exactly and check it.\n\
 - Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
 A tool or skill you write goes live before your next step: the harness re-freezes after a successful mutating call and at turn start (/reload also forces it). The harness records tool/skill file changes (actor + hash); bash: openmax --ledger lists history and restorable objects. Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check. Before writing a surface, read its full contract (fields, stdin payloads, activation) with bash: openmax --spec tools|skills|prompts|hooks|permissions|providers|stdio.\n\
@@ -407,15 +407,21 @@ mod tests {
 
     /// Budget gate for the frozen prompt prefix: base system prompt, the
     /// self-extension guide (now including the working-files contract), and
-    /// the serialized builtin tool array must stay within ~1150 tokens. The
+    /// the serialized builtin tool array must stay within ~1180 tokens. The
     /// cap is in chars (the core stays tokenizer-free): the pre-guide 3452
     /// chars including a 52-char project root measured 794 tokens on
     /// o200k_base and 775 on cl100k_base (2026-07-16); the guide adds ~360
     /// tokens. The interpolated root varies per machine, so it is excluded
-    /// here and the cap (4900) leaves room for a typical checkout path. If
-    /// this fails, re-measure with a real tokenizer before raising anything.
+    /// here and the cap leaves room for a typical checkout path. If this
+    /// fails, re-measure with a real tokenizer before raising anything.
     /// Only builtins count: external tools are the user's own budget, and
     /// grounding sections (AGENTS.md, layout map, skills) have their own caps.
+    ///
+    /// Raised from 4900 to 5020 (2026-07-30): what a hook approval covers is
+    /// now stated in the guide (+119 chars, ~30 tokens). The old line said
+    /// unapproved hooks are inert and stopped there, which taught the agent
+    /// that rewriting a hook's script was harmless - the exact belief the
+    /// approval binding exists to correct.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -442,8 +448,8 @@ mod tests {
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
         assert!(
-            total <= 4_900,
-            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 4900 ≈ 1150 tokens with a typical checkout path)",
+            total <= 5_020,
+            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5020 ≈ 1180 tokens with a typical checkout path)",
         );
         let _ = std::fs::remove_dir_all(dir);
     }

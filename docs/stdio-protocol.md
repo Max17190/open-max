@@ -67,7 +67,7 @@ key order is not significant: parse every line by field name.
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
-| `hook_failed` | `hook`, `event`, `detail` (an observe-only hook failed; the turn proceeded) |
+| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed, or a hook file on disk is not loaded; the turn proceeded) |
 | `done` | `stop_reason` |
 | `error` | `message` |
 

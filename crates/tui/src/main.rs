@@ -34,6 +34,9 @@ options:
                          envelopes on stdout; the custom-frontend protocol
       --ledger           print the capability-file history for this project
       --approve <path>   approve the exact current content of a capability file
+                         and of the project-local code it runs
+      --forget <path>    stop expecting an approved capability file to exist
+                         (after deliberately deleting one)
       --run-examples     with --check, execute each tool's [example] once.
                          Unsandboxed: needs a trusted project and a tool file
                          approved with --approve, and honors permissions and
@@ -71,6 +74,7 @@ struct CliArgs {
     check: bool,
     run_examples: bool,
     approve: Option<String>,
+    forget: Option<String>,
     ledger: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
@@ -100,6 +104,7 @@ where
         check: false,
         run_examples: false,
         approve: None,
+        forget: None,
         ledger: false,
         spec: None,
         trust_project: false,
@@ -125,6 +130,7 @@ where
             Long("check") => out.check = true,
             Long("run-examples") => out.run_examples = true,
             Long("approve") => out.approve = Some(parser.value()?.string()?),
+            Long("forget") => out.forget = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
@@ -292,10 +298,113 @@ async fn main() -> std::io::Result<()> {
             }
         };
         let sha = open_max_core::ledger::sha256_hex(&bytes);
-        match open_max_core::ledger::approve_hash(&default_data_dir(), &project, &sha) {
+        // A manifest is a pointer: the file it names is the code that runs,
+        // and it sits at an ordinary project path the agent writes freely. So
+        // approving the manifest approves that code in the same act - and
+        // prints it, because a human cannot bless bytes they were not shown.
+        let code = open_max_core::ledger::manifest_code(file, &project);
+        let mut shas = vec![sha.clone()];
+        for entry in &code {
+            let Some(code_sha) = &entry.sha256 else {
+                eprintln!(
+                    "openmax: {path} runs {}, which cannot be read; create it first, then approve them together",
+                    entry.path.display()
+                );
+                std::process::exit(1);
+            };
+            shas.push(code_sha.clone());
+        }
+        match open_max_core::ledger::approve_capability(&default_data_dir(), &project, file, &shas) {
             Ok(()) => {
                 println!("approved {path} ({})", &sha[..12]);
+                for entry in &code {
+                    let code_sha = entry.sha256.clone().unwrap_or_default();
+                    println!(
+                        "  and the code it runs: {} ({})",
+                        entry.path.display(),
+                        &code_sha[..12.min(code_sha.len())]
+                    );
+                }
+                if !code.is_empty() {
+                    println!("editing either revokes this approval; re-run --approve after any change");
+                }
                 std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openmax: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(path) = &cli.forget {
+        // Retiring an approval REMOVES a gate, which is why it is guarded
+        // harder than granting one. `--approve` and `--trust-project` add
+        // authority and leave an auditable artifact behind: a content hash
+        // pinned to bytes a human can read afterwards. This leaves nothing,
+        // so the session marker alone is too thin a wall - an agent holding
+        // `bash` clears an environment variable with `unset`.
+        //
+        // What the terminal check buys is cost, not impossibility, and the
+        // measured numbers are worth stating rather than implying. It removes
+        // the one-liner: `unset OPENMAX_SESSION; openmax --forget <path>` now
+        // exits 3. It does not stop an attacker who allocates a pty and
+        // answers this prompt - roughly twenty lines of Python, verified to
+        // still retire the approval. And it is not even the cheapest path
+        // left: `bash` is unconfined, so deleting the approval store outright
+        // clears every fail-closed state in one command, because that file
+        // carries no tamper-evidence of its own (unlike the ledger's chain).
+        //
+        // So this is a speed bump on the supported route, not a boundary.
+        // Without an OS sandbox that is the honest ceiling, the same one
+        // trust lives at; the marker check stays as the cheap first line.
+        if std::env::var_os("OPENMAX_SESSION").is_some() {
+            eprintln!(
+                "openmax: approvals are human actions: this process was started from an agent session; ask the user to run `openmax --forget {path}`"
+            );
+            std::process::exit(3);
+        }
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let file = std::path::Path::new(path);
+        let target = if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!(
+                "openmax: --forget retires a human-installed policy, so it only runs at an interactive terminal.\n\
+                 to retire {path} without one, restore the file instead, or remove its entry from {} by hand",
+                open_max_core::ledger::project_dir(&default_data_dir(), &project)
+                    .join("approved.json")
+                    .display()
+            );
+            std::process::exit(3);
+        }
+        println!("about to retire the approval recorded at {}", target.display());
+        println!(
+            "if that file was a gate, the policy it enforced stops being expected and stops being enforced."
+        );
+        print!("type the path exactly as given to confirm: ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            eprintln!("openmax: could not read a confirmation; nothing was changed");
+            std::process::exit(1);
+        }
+        if !forget_confirmed(&answer, path, &target) {
+            eprintln!("openmax: confirmation did not match; nothing was changed");
+            std::process::exit(1);
+        }
+        match open_max_core::ledger::forget_capability(&default_data_dir(), &project, &target) {
+            Ok(true) => {
+                println!("forgot {path}; the harness no longer expects a capability file there");
+                if target.exists() {
+                    println!(
+                        "note: the file is still on disk and its content approval still stands"
+                    );
+                }
+                std::process::exit(0);
+            }
+            Ok(false) => {
+                eprintln!("openmax: no approved capability is recorded at {path}");
+                std::process::exit(1);
             }
             Err(e) => {
                 eprintln!("openmax: {e}");
@@ -633,6 +742,16 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
     (rows, failures)
 }
 
+/// Whether the typed answer retires exactly the capability that was named.
+/// Either spelling the human has in front of them counts - the argument they
+/// passed, or the resolved path the prompt printed - and nothing else does:
+/// the point is that a person read which policy is going away, so "y" is not
+/// enough.
+fn forget_confirmed(answer: &str, given: &str, resolved: &std::path::Path) -> bool {
+    let answer = answer.trim();
+    !answer.is_empty() && (answer == given.trim() || answer == resolved.display().to_string())
+}
+
 /// `openmax --spec usage`: per-extension prompt cost joined with lifetime
 /// usage and approval state. Read-only; requires no trust or endpoint.
 fn print_usage_economics() {
@@ -683,8 +802,17 @@ fn print_usage_economics() {
         .to_string()
         .len();
         let entry = usage.tools.get(&spec.name).cloned().unwrap_or_default();
-        let approved = if open_max_core::ledger::is_approved(&data_dir, &project, &ext.source_sha256)
-        {
+        // Approved means the whole definition: the manifest and the code it
+        // runs. A tool whose script was rewritten after approval is not
+        // approved, and must not read as if it were.
+        let approvals =
+            open_max_core::ledger::approvals(&data_dir, &project).unwrap_or_default();
+        let approved = if approvals.contains(&ext.source_sha256)
+            && approvals.covers_code(&open_max_core::ledger::bound_code(
+                &ext.command,
+                &ext.args,
+                &project,
+            )) {
             "yes"
         } else {
             "no"
@@ -789,6 +917,24 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Retiring an approval takes the path typed back, not a keystroke: the
+    /// wall is that a person read which policy is being removed. Both
+    /// spellings they can see count, and nothing else does.
+    #[test]
+    fn retiring_an_approval_takes_the_path_typed_back() {
+        let resolved = std::path::Path::new("/proj/.openmax/hooks/gate.toml");
+        let given = ".openmax/hooks/gate.toml";
+        assert!(forget_confirmed(".openmax/hooks/gate.toml\n", given, resolved));
+        assert!(forget_confirmed("  /proj/.openmax/hooks/gate.toml  \n", given, resolved));
+
+        for answer in ["y\n", "yes\n", "\n", "  \n", "gate.toml\n", ".openmax/hooks/other.toml\n"] {
+            assert!(
+                !forget_confirmed(answer, given, resolved),
+                "{answer:?} must not retire a policy"
+            );
         }
     }
 

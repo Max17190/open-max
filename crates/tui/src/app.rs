@@ -2087,10 +2087,12 @@ impl App {
                 source_sha,
             } => {
                 // Interactive approvals show provenance at the moment it
-                // matters: the first run of unapproved capability content,
-                // named by the file and the exact bytes being approved.
+                // matters: capability content no human has approved - the
+                // tool's .toml, or the project code it runs, which can be
+                // rewritten after the .toml was blessed - named by the file
+                // and the exact bytes being approved.
                 let detail = if reason == "unapproved_source" {
-                    let mut head = "first run of unapproved tool content".to_string();
+                    let mut head = "unapproved tool content (its .toml or the code it runs)".to_string();
                     if !source_path.is_empty() {
                         head.push_str(&format!(" · {source_path} ({source_sha})"));
                     }

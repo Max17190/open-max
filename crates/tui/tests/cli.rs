@@ -184,6 +184,118 @@ fn run_examples_is_gated_and_reported_through_json() {
     );
 }
 
+/// `--approve` blesses a manifest and the code it runs in one act, and says
+/// so: a human cannot approve bytes they were not shown. A named command that
+/// does not exist is refused rather than half-approved.
+#[test]
+fn approve_names_every_file_it_blesses() {
+    let (project, home) = fresh_dirs("approve");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n",
+    )
+    .unwrap();
+
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "a missing command must not be half-approved");
+    assert!(stderr.contains("gate.sh"), "{stderr}");
+
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("approved .openmax/hooks/gate.toml"), "{stdout}");
+    assert!(stdout.contains("gate.sh"), "the code it runs must be named: {stdout}");
+
+    // The pair is live, and rewriting the script alone revokes it.
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("gate.sh"), "{stdout}");
+}
+
+/// Deleting an approved hook fails every tool call closed, so a human who
+/// meant the removal needs a way to say so. `--forget` is that way, and it is
+/// guarded harder than `--approve` because it removes a policy instead of
+/// adding one: an agent session is refused, and so is any run without an
+/// interactive terminal - which is what a `bash` subprocess inside a turn and
+/// this test harness both look like. Neither check is a sandbox; see the
+/// residual stated at the call site.
+#[test]
+fn forget_refuses_without_a_human_at_a_terminal() {
+    let (project, home) = fresh_dirs("forget");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+
+    std::fs::remove_file(hooks.join("gate.toml")).unwrap();
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a deleted gate must not read as a clean project: {stdout}");
+    assert!(stdout.contains("deleted"), "{stdout}");
+
+    // Agent-spawned processes cannot retire a human's approval.
+    let out = cmd(&project, &home)
+        .env("OPENMAX_SESSION", "1")
+        .args(["--forget", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("human actions"));
+
+    // And neither can anything else without a terminal, marker or not: the
+    // marker is one `unset` away from any shell the agent already has.
+    let out = cmd(&project, &home)
+        .args(["--forget", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(stderr.contains("interactive terminal"), "{stderr}");
+    // The refusal has to leave the human a way forward that does not need one.
+    assert!(stderr.contains("approved.json"), "{stderr}");
+
+    // Refused means refused: the gate is still expected, so tools still fail
+    // closed and --check still reports it.
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
+
+    // The path the refusal names does work: the file itself is the record, and
+    // restoring it is the repair the harness prefers.
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "restoring the approved bytes must clear the fail-closed state: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn stdio_handshake_speaks_the_contract() {
     let (project, home) = fresh_dirs("stdio");

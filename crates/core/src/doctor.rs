@@ -88,13 +88,31 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     id = Some(spec.name.clone());
                     external_names.push(spec.name.clone());
                     tool_meta.push((spec.name.clone(), path.clone()));
-                    let command = match &spec.kind {
-                        crate::registry::ToolKind::External(ext) => Some(ext.command.clone()),
+                    let external = match &spec.kind {
+                        crate::registry::ToolKind::External(ext) => Some(ext.clone()),
                         crate::registry::ToolKind::Builtin => None,
                     };
-                    match command.and_then(|c| missing_command_reason(&c, project_root)) {
-                        Some(reason) => Status::Warn(reason),
-                        None => Status::Ok(format!("tool '{}'", spec.name)),
+                    let missing = external
+                        .as_ref()
+                        .and_then(|ext| missing_command_reason(&ext.command, project_root));
+                    match (missing, external) {
+                        (Some(reason), _) => Status::Warn(reason),
+                        (None, Some(ext)) => match stale_code_reason(
+                            data_dir,
+                            project_root,
+                            &ext.source_sha256,
+                            &ext.command,
+                            &ext.args,
+                        ) {
+                            // The tool still runs; it asks again first, which
+                            // is the point. Silence here is what let a swapped
+                            // script read as a healthy tool.
+                            Some(changed) => Status::Warn(format!(
+                                "{changed}, so the next call asks for approval again"
+                            )),
+                            None => Status::Ok(format!("tool '{}'", spec.name)),
+                        },
+                        (None, None) => Status::Ok(format!("tool '{}'", spec.name)),
                     }
                 }
                 Err(reason) => Status::Err(reason),
@@ -220,19 +238,57 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         }
                     }
                     hook_events.push(Some(h.event.as_str()));
-                    if !crate::ledger::is_approved(data_dir, project_root, &h.source_sha256) {
-                        // Hooks run with host authority and no per-call gate,
-                        // so unapproved content is inert, and this is where
-                        // that inertness stops being silent.
-                        Status::Err(format!(
-                            "unapproved and inert: a human must approve this exact content with `openmax --approve {}` (an in-session write approval also counts)",
-                            path.display()
-                        ))
-                    } else {
-                        match missing_command_reason(&h.command, project_root) {
+                    // Hooks run with host authority and no per-call gate, so
+                    // content no human approved - the file or the code it runs
+                    // - is inert, and this is where that stops being silent.
+                    let unapproved = stale_code_reason(
+                        data_dir,
+                        project_root,
+                        &h.source_sha256,
+                        &h.command,
+                        &h.args,
+                    )
+                    .or_else(|| {
+                        (!crate::ledger::is_approved(data_dir, project_root, &h.source_sha256))
+                            .then(|| "its content is not approved".to_string())
+                    });
+                    match unapproved {
+                        Some(mut reason) => {
+                            let approvals = crate::ledger::approvals(data_dir, project_root).ok();
+                            let was_live =
+                                approvals.as_ref().is_some_and(|a| a.was_live(&path));
+                            let approved =
+                                approvals.as_ref().and_then(|a| a.approved_hook(&path));
+                            // The loop classifies a modified hook by the event
+                            // a human approved, so --check has to ask the same
+                            // question or it would report a demoted gate as a
+                            // harmless observer.
+                            let was_gate = approved.map(|a| a.is_gate()).unwrap_or(true);
+                            if let Some(approved) = approved {
+                                if approved.is_gate() && !h.event.is_gate() {
+                                    reason = format!(
+                                        "an approved {} gate was rewritten as a {} hook, which would stop it gating",
+                                        approved.event(),
+                                        h.event.as_str()
+                                    );
+                                }
+                            }
+                            if was_live && was_gate {
+                                Status::Err(format!(
+                                    "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
+                                    path.display()
+                                ))
+                            } else {
+                                Status::Err(format!(
+                                    "inert because {reason}: a human must approve this exact content with `openmax --approve {}` (an in-session write approval also counts)",
+                                    path.display()
+                                ))
+                            }
+                        }
+                        None => match missing_command_reason(&h.command, project_root) {
                             Some(reason) => Status::Warn(reason),
                             None => Status::Ok(format!("hook on {}", h.event.as_str())),
-                        }
+                        },
                     }
                 }
                 Err(reason) => {
@@ -257,6 +313,25 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
     findings.extend(hooks_found.into_iter().map(|(f, _)| f));
     findings.extend(hook_extras);
+    // A deleted hook file leaves nothing on disk to report against, so the
+    // approved paths are the source of truth for what should be there. This
+    // is the same reconciliation the loop fails closed on; --check is where a
+    // human finds out which file it means.
+    if let Ok(approvals) = crate::ledger::approvals(data_dir, project_root) {
+        for path in approvals.live_paths() {
+            if path.exists() || !crate::hooks::is_hook_manifest(path, project_root) {
+                continue;
+            }
+            findings.push(Finding {
+                kind: "hook",
+                path: path.clone(),
+                status: Status::Err(format!(
+                    "an approved hook file was deleted; every tool call fails closed until it is restored or retired with `openmax --forget {}`",
+                    path.display()
+                )),
+            });
+        }
+    }
 
     for path in crate::permissions::permission_files(project_root) {
         let Some(result) = crate::permissions::check_file(&path) else { continue };
@@ -724,6 +799,26 @@ fn unknown_tool_reason(
     ))
 }
 
+/// Why the code this manifest runs is not the code a human approved, if it is
+/// not. Only meaningful once the manifest itself is approved: before that the
+/// whole definition is unapproved, which each surface reports its own way.
+fn stale_code_reason(
+    data_dir: &Path,
+    project_root: &Path,
+    manifest_sha: &str,
+    command: &str,
+    args: &[String],
+) -> Option<String> {
+    let approvals = crate::ledger::approvals(data_dir, project_root).ok()?;
+    if !approvals.contains(manifest_sha) {
+        return None;
+    }
+    let problem = crate::ledger::bound_code(command, args, project_root)
+        .iter()
+        .find_map(|c| c.problem(&approvals))?;
+    Some(format!("the code it runs, {problem}"))
+}
+
 /// Why `command` will not spawn from this checkout, if it will not. A path
 /// (contains '/') resolves against the project root, exactly as the runtime
 /// spawns it; a bare name resolves on PATH. This warns rather than errors:
@@ -1021,6 +1116,131 @@ mod tests {
             .iter()
             .find(|f| f.path.to_string_lossy().contains(needle))
             .unwrap_or_else(|| panic!("no finding for {needle}"))
+    }
+
+    /// A capability whose script was rewritten after approval must not read
+    /// as healthy: `--check` is where a human looks to find out whether what
+    /// they blessed is what is installed.
+    #[test]
+    fn a_swapped_script_is_reported_for_both_surfaces() {
+        let root = temp_project();
+        let data = root.join("data");
+        write(
+            root.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\nmutating = true\n",
+        );
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n",
+        );
+        for script in ["deploy.sh", "gate.sh"] {
+            let path = root.join(script);
+            std::fs::write(&path, "#!/bin/sh\ntrue\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let approve = |rel: &str| {
+            let manifest = root.join(rel);
+            let mut shas =
+                vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
+            shas.extend(
+                crate::ledger::manifest_code(&manifest, &root)
+                    .into_iter()
+                    .filter_map(|c| c.sha256),
+            );
+            crate::ledger::approve_capability(&data, &root, &manifest, &shas).unwrap();
+        };
+        approve(".openmax/tools/deploy.toml");
+        approve(".openmax/hooks/gate.toml");
+
+        let findings: Vec<Finding> = check_at(&root, &data)
+            .into_iter()
+            .filter(|f| f.path.starts_with(&root))
+            .collect();
+        assert!(matches!(find(&findings, "deploy.toml").status, Status::Ok(_)));
+        assert!(matches!(find(&findings, "gate.toml").status, Status::Ok(_)));
+
+        std::fs::write(root.join("deploy.sh"), "#!/bin/sh\necho PWNED\n").unwrap();
+        std::fs::write(root.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let findings: Vec<Finding> = check_at(&root, &data)
+            .into_iter()
+            .filter(|f| f.path.starts_with(&root))
+            .collect();
+        // The tool still runs, but it asks again first, so this is a warning.
+        match &find(&findings, "deploy.toml").status {
+            Status::Warn(reason) => {
+                assert!(reason.contains("deploy.sh"), "{reason}");
+                assert!(reason.contains("asks for approval again"), "{reason}");
+            }
+            other => panic!("expected a warning about the swapped script: {other:?}"),
+        }
+        // The gate was live and is not: that is an error, and it fails closed.
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("gate.sh"), "{reason}");
+                assert!(reason.contains("fails closed"), "{reason}");
+            }
+            other => panic!("expected an error about the revoked gate: {other:?}"),
+        }
+        assert!(has_errors(&findings));
+
+        // A gate rewritten into an observe hook is still judged as the gate a
+        // human approved, and --check has to say which of the two happened.
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n",
+        );
+        let findings: Vec<Finding> = check_at(&root, &data)
+            .into_iter()
+            .filter(|f| f.path.starts_with(&root))
+            .collect();
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("rewritten as a post_tool_use hook"), "{reason}");
+                assert!(reason.contains("fails closed"), "{reason}");
+            }
+            other => panic!("a demoted gate must not read as an inert observer: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A deleted hook file has nothing on disk to report against, so it is
+    /// found by reconciling the approved paths. Without that, `--check` says
+    /// "no extension files found" about a project whose gate was removed.
+    #[test]
+    fn a_deleted_approved_hook_is_reported_and_can_be_retired() {
+        let root = temp_project();
+        let data = root.join("data");
+        let hook = root.join(".openmax/hooks/gate.toml");
+        // A command that really exists on every platform the harness runs on:
+        // one that does not is now uncovered on purpose, which is a different
+        // finding from the one under test.
+        write(hook.clone(), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n");
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap());
+        crate::ledger::approve_capability(&data, &root, &hook, &[sha]).unwrap();
+        assert!(!has_errors(&check_at(&root, &data)), "{:?}", check_at(&root, &data));
+
+        std::fs::remove_file(&hook).unwrap();
+        let findings = check_at(&root, &data);
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("deleted"), "{reason}");
+                assert!(reason.contains("--forget"), "the way out must be named: {reason}");
+            }
+            other => panic!("a deleted approved hook must be an error: {other:?}"),
+        }
+
+        // Retiring it is the human saying the removal was intended.
+        assert!(crate::ledger::forget_capability(&data, &root, &hook).unwrap());
+        assert!(!has_errors(&check_at(&root, &data)));
+        assert!(
+            !crate::ledger::forget_capability(&data, &root, &hook).unwrap(),
+            "forgetting twice reports that nothing was recorded"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

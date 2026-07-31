@@ -129,9 +129,12 @@ pub enum AgentEvent {
     /// per session. The fix is the user's: uninstall tools, or raise
     /// `context_tokens`.
     SchemasOverBudget { schema_tokens: usize, budget_tokens: usize },
-    /// An observe-only hook (post_tool_use, session_start, compaction,
-    /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The
-    /// turn proceeded - observe hooks are fail-open - but never silently.
+    /// A hook did not run, and the turn proceeded anyway: an observe-only hook
+    /// (post_tool_use, session_start, compaction, turn_end) failed with a
+    /// spawn error, nonzero exit, or timeout, or a hook file on disk is not
+    /// loaded (content no human approved). Both are fail-open, and neither is
+    /// allowed to be silent: a policy the user wrote down and is not getting
+    /// has to say so.
     HookFailed { hook: String, event: String, detail: String },
     /// Exactly one per turn, and the only guaranteed terminator. Carries the
     /// provider's `finish_reason` on a normal end, or one of the harness's own:

@@ -976,11 +976,18 @@ async fn refreeze_if_extensions_changed(
     }
 }
 
-/// After a human approved a write_file/edit_file into a capability path,
-/// record the resulting content as approved so the capability it defines is
-/// live without a second prompt. Anything else (auto-mode writes, bash
-/// heredocs, files arriving from outside) stays unapproved until a human
-/// acts.
+/// After a human approved a write_file/edit_file, record the resulting content
+/// as approved when those bytes are part of a capability: the manifest itself,
+/// or a script an installed manifest runs. The approval prompt shows the path
+/// and the head of the content, so what is blessed here is what the human just
+/// read. Anything else (auto-mode writes, bash heredocs, files arriving from
+/// outside) stays unapproved until a human acts.
+///
+/// The two cases are kept separate on purpose. Approving a manifest write
+/// blesses the manifest only - it names a command whose content the human was
+/// not shown - and approving a code write blesses that code only. Writing the
+/// pair in either order therefore costs no extra prompt, and neither approval
+/// covers bytes nobody looked at.
 fn record_capability_write_approval(
     core: &Arc<Core>,
     session_id: &str,
@@ -994,17 +1001,20 @@ fn record_capability_write_approval(
     let Some(rel) = args.get("path").and_then(|v| v.as_str()) else {
         return;
     };
-    let is_capability = rel.starts_with(".openmax/tools/")
+    let path = project_root.join(rel);
+    let is_manifest = rel.starts_with(".openmax/tools/")
         || rel.starts_with(".openmax/hooks/")
         || (rel.starts_with(".agents/skills/") && rel.ends_with("SKILL.md"));
-    if !is_capability {
+    if !is_manifest && !is_code_of_installed_manifest(&path, project_root) {
         return;
     }
-    let Ok(bytes) = std::fs::read(project_root.join(rel)) else {
+    let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
     let sha = crate::ledger::sha256_hex(&bytes);
-    if let Err(e) = crate::ledger::approve_hash(&core.data_dir, project_root, &sha) {
+    if let Err(e) =
+        crate::ledger::approve_capability(&core.data_dir, project_root, &path, &[sha])
+    {
         core.send_agent(
             session_id,
             AgentEvent::Error {
@@ -1012,6 +1022,34 @@ fn record_capability_write_approval(
             },
         );
     }
+}
+
+/// Whether some installed tool or hook manifest runs exactly this file. The
+/// manifest need not be approved yet: these bytes grant nothing on their own,
+/// and the file may well be written before the manifest that names it.
+fn is_code_of_installed_manifest(path: &Path, project_root: &Path) -> bool {
+    let Ok(target) = path.canonicalize() else {
+        return false;
+    };
+    let dirs = crate::hooks::hook_dirs(project_root)
+        .into_iter()
+        .chain(crate::registry::external_tool_dirs(project_root));
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let manifest = entry.path();
+            if manifest.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let runs_it = crate::ledger::manifest_code(&manifest, project_root)
+                .into_iter()
+                .any(|c| c.path.canonicalize().map(|p| p == target).unwrap_or(false));
+            if runs_it {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
@@ -1145,6 +1183,10 @@ async fn run_loop(
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
     let hooks = Hooks::discover(project_root, &core.data_dir);
+    // A hook that exists but did not load says so every turn. Inert is a
+    // policy the user wrote down and is not getting, so it must not be
+    // something they only discover by running `openmax --check`.
+    report_hook_failures(core, session_id, hooks.notices());
     match hooks
         .user_prompt_submit(session_id, &user_text, project_root, &cancelled)
         .await
@@ -1557,13 +1599,15 @@ async fn run_loop(
                             executed = true;
                             prompt_approved = true;
                             // Approving the first run of an unapproved tool
-                            // approves this exact content: later runs of the
-                            // same bytes need no prompt, any edit revokes.
+                            // approves this exact content - the manifest and
+                            // the code it runs: later runs of the same bytes
+                            // need no prompt, any edit to either revokes.
                             if let Some(source) = source {
-                                if let Err(e) = crate::ledger::approve_hash(
+                                if let Err(e) = crate::ledger::approve_capability(
                                     &core.data_dir,
                                     project_root,
-                                    &source.sha256,
+                                    &source.source_path,
+                                    &source.shas,
                                 ) {
                                     core.send_agent(session_id, AgentEvent::Error {
                                         message: format!(
@@ -1832,6 +1876,12 @@ struct UnapprovedCapability {
     /// pasted straight into `openmax --approve` from the project root.
     path: String,
     sha256: String,
+    /// The manifest as the approval store keys it, for recording the grant.
+    source_path: PathBuf,
+    /// Every hash one approval of this capability must record: the manifest's,
+    /// plus the project-local code it runs. Computed with the decision so the
+    /// grant covers exactly what the refusal was about.
+    shas: Vec<String>,
 }
 
 /// The unapproved capability file behind `name`, or None when the call needs
@@ -1843,6 +1893,13 @@ struct UnapprovedCapability {
 /// inherits Open Max's environment, credentials, and network access. A
 /// boundary conditioned on that field is one the agent can write away.
 /// Built-ins are core code with their own confinement and are never gated here.
+///
+/// "Content" is the manifest *and* the project-local code it runs, re-read per
+/// call. A manifest is a pointer: the file its `command` (or an `args` path)
+/// names is what actually executes, and it sits at an ordinary project path
+/// the agent rewrites freely, so binding the manifest alone binds the pointer
+/// and leaves the pointee swappable. Every caller goes through here, which is
+/// what keeps the serial path and the batch path from drifting apart.
 fn unapproved_capability(
     registry: &crate::registry::Registry,
     data_dir: &Path,
@@ -1852,13 +1909,21 @@ fn unapproved_capability(
     let crate::registry::ToolKind::External(ext) = &registry.get(name)?.kind else {
         return None;
     };
-    if crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+    let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
+    let code = crate::ledger::bound_code(&ext.command, &ext.args, project_root);
+    if approvals.contains(&ext.source_sha256) && approvals.covers_code(&code) {
         return None;
     }
     let path = ext.source_path.strip_prefix(project_root).unwrap_or(&ext.source_path);
+    // The manifest is what a human approves, whichever half went stale:
+    // `openmax --approve <manifest>` blesses the pair.
+    let mut shas = vec![ext.source_sha256.clone()];
+    shas.extend(code.into_iter().filter_map(|c| c.sha256));
     Some(UnapprovedCapability {
         path: path.display().to_string(),
         sha256: ext.source_sha256.clone(),
+        source_path: ext.source_path.clone(),
+        shas,
     })
 }
 
@@ -2111,14 +2176,114 @@ fn enforce_budget(
 mod tests {
     use super::*;
 
-    /// Hooks are inert until a human approves their exact content; tests
+    /// Hooks are inert until a human approves their exact content - the file
+    /// and the code it runs, exactly what `openmax --approve` blesses. Tests
     /// stand in for the human.
     fn approve_hook(core: &Arc<Core>, project: &Path, path: &Path) {
         let bytes = std::fs::read(path).unwrap();
-        crate::ledger::approve_hash(&core.data_dir, project, &crate::ledger::sha256_hex(&bytes))
-            .unwrap();
+        let mut shas = vec![crate::ledger::sha256_hex(&bytes)];
+        shas.extend(
+            crate::ledger::manifest_code(path, project)
+                .into_iter()
+                .filter_map(|c| c.sha256),
+        );
+        crate::ledger::approve_capability(&core.data_dir, project, path, &shas).unwrap();
     }
     use crate::types::{ToolCall, ToolCallFunction};
+
+    /// The tool half of the same invariant, through the one predicate every
+    /// path shares: a human approved a manifest that names `./danger.sh`, and
+    /// the agent then writes a different `danger.sh`. What runs is not what
+    /// was approved, so the call has to ask - even though the manifest's own
+    /// hash never moved.
+    ///
+    /// Asserted on the batch path too, and deliberately: batching selects for
+    /// external read-only tools, so a swapped payload that stopped being
+    /// batchable-blocked would execute unattended by being called twice in one
+    /// message. Composition is not inheritance; it is checked here.
+    #[test]
+    fn an_approved_tool_whose_script_was_swapped_asks_again_on_every_path() {
+        let dir = std::env::temp_dir().join(format!("openmax-toolsrc-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let manifest = project.join(".openmax/tools/danger.toml");
+        std::fs::write(
+            &manifest,
+            "name = \"danger\"\ndescription = \"d\"\ncommand = \"./danger.sh\"\nmutating = false\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("danger.sh"), "#!/bin/sh\necho benign\n").unwrap();
+        let registry = Registry::build(&project);
+        let tracker = RepeatCallTracker::new();
+        let perms = Permissions::default();
+        let calls = vec![
+            tool_call("danger", r#"{"key":"a"}"#),
+            tool_call("danger", r#"{"key":"b"}"#),
+        ];
+        let batchable =
+            || batchable_call(&calls[0], &registry, &tracker, &perms, &data, &project);
+        let gated = || unapproved_capability(&registry, &data, &project, "danger");
+
+        assert!(gated().is_some(), "nothing approved yet");
+        assert!(!batchable());
+
+        // A human approves the pair, as `openmax --approve` does.
+        let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
+        shas.extend(
+            crate::ledger::manifest_code(&manifest, &project)
+                .into_iter()
+                .filter_map(|c| c.sha256),
+        );
+        assert_eq!(shas.len(), 2, "the manifest and the script it runs");
+        crate::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
+        assert!(gated().is_none(), "the approved pair runs unattended");
+        assert!(batchable(), "approved read-only tools still batch");
+
+        // The agent rewrites the script. The manifest is untouched, so a
+        // manifest-only binding would see nothing at all here.
+        std::fs::write(project.join("danger.sh"), "#!/bin/sh\necho PWNED\n").unwrap();
+        let source = gated().expect("a swapped payload is unapproved content");
+        assert!(source.path.ends_with("danger.toml"), "{}", source.path);
+        assert!(
+            !batchable(),
+            "a swapped payload must not reach the unattended batch path by being called twice"
+        );
+        let segments = partition_concurrent_runs(&calls, |c| {
+            batchable_call(c, &registry, &tracker, &perms, &data, &project)
+        });
+        assert_eq!(segments.len(), 2, "each call gets its own serial segment");
+        assert!(segments.iter().all(|s| !s.concurrent));
+
+        // Approving again re-blesses the pair, so the grant covers exactly
+        // what the refusal was about.
+        crate::ledger::approve_capability(&data, &project, &source.source_path, &source.shas)
+            .unwrap();
+        assert!(gated().is_none(), "approving the prompt clears it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The two-file workflow in either order: a human-approved write of a
+    /// script an installed manifest runs approves those bytes, so writing the
+    /// pair never costs an extra prompt, and neither approval covers bytes
+    /// the human was not shown.
+    #[test]
+    fn a_script_an_installed_manifest_runs_is_recognized_as_capability_code() {
+        let project = std::env::temp_dir().join(format!("openmax-code-{}", uuid::Uuid::new_v4()));
+        let tools_dir = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(project.join("deploy.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::write(project.join("notes.md"), "not code\n").unwrap();
+        std::fs::write(
+            tools_dir.join("deploy.toml"),
+            "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n",
+        )
+        .unwrap();
+
+        assert!(is_code_of_installed_manifest(&project.join("deploy.sh"), &project));
+        assert!(!is_code_of_installed_manifest(&project.join("notes.md"), &project));
+        let _ = std::fs::remove_dir_all(project);
+    }
 
     fn msg(role: &str, len: usize) -> ChatMessage {
         ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None }
@@ -2143,6 +2308,11 @@ mod tests {
     /// agent writes, and an external call is a native host process either way.
     /// Built-ins are core code and must never be gated, or every session would
     /// open with an approval prompt for read_file.
+    ///
+    /// Fixtures here name `/bin/echo` rather than `/bin/true`: approval covers
+    /// the code a manifest runs, and a command that resolves to no file is
+    /// never covered - `/bin/true` exists on Linux but not macOS, which would
+    /// split these tests by platform.
     #[test]
     fn every_unapproved_external_tool_is_gated_whatever_mutating_says() {
         let dir = std::env::temp_dir().join(format!("openmax-gate-{}", uuid::Uuid::new_v4()));
@@ -2151,7 +2321,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/peek.toml"),
-            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/true\"\nmutating = false\n",
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/echo\"\nmutating = false\n",
         )
         .unwrap();
         let registry = crate::registry::Registry::build(&project);
@@ -2187,6 +2357,8 @@ mod tests {
         let source = UnapprovedCapability {
             path: ".openmax/tools/danger.toml".into(),
             sha256: "a".repeat(64),
+            source_path: PathBuf::from("/proj/.openmax/tools/danger.toml"),
+            shas: vec!["a".repeat(64)],
         };
         let message = declined_message(Some(&source));
         assert!(message.contains("openmax --approve .openmax/tools/danger.toml"), "{message}");
@@ -2364,7 +2536,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/peek.toml"),
-            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/true\"\nmutating = false\n",
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/echo\"\nmutating = false\n",
         )
         .unwrap();
         let registry = Registry::build(&project);
@@ -2668,7 +2840,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
-            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
         let original = crate::registry::Registry::build(&project);
@@ -2708,7 +2880,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
-            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
 
@@ -2772,7 +2944,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
-            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
         assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
@@ -2844,7 +3016,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
-            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
         refreeze_if_extensions_changed(&core, id, &project).await;
@@ -2905,7 +3077,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
-            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/true\"\nmutating = true\n",
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
 
