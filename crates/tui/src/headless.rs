@@ -9,6 +9,7 @@ use std::time::Duration;
 use open_max_core::agent;
 use open_max_core::sessions;
 use open_max_core::state::Core;
+use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use tokio::sync::mpsc;
 
@@ -60,11 +61,14 @@ pub async fn run(
             return 1;
         }
 
+        // Prompt templates belong to the harness, not to the terminal UI: a
+        // delegated `openmax -p "/greet world"` submits what the composer
+        // would, so hooks and the transcript see the expanded text.
         if let Err(e) = agent::start_turn(
             core.clone(),
             session_id.clone(),
             project.clone(),
-            prompt.clone(),
+            templates::expand_user_input(&project, prompt),
         ) {
             eprintln!("openmax: {e}");
             return 1;

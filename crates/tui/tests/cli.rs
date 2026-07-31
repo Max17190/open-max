@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 fn openmax_bin() -> &'static str {
     env!("CARGO_BIN_EXE_openmax")
@@ -214,14 +215,14 @@ fn stdio_handshake_speaks_the_contract() {
 }
 
 /// Read one HTTP request (headers, then exactly Content-Length body bytes)
-/// off `stream`. False when the peer went away mid-request.
-fn read_request(stream: &mut std::net::TcpStream) -> bool {
+/// off `stream`, returning the body. None when the peer went away mid-request.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
         match stream.read(&mut byte) {
             Ok(1) => buf.push(byte[0]),
-            _ => return false,
+            _ => return None,
         }
     }
     let headers = String::from_utf8_lossy(&buf).to_string();
@@ -233,23 +234,30 @@ fn read_request(stream: &mut std::net::TcpStream) -> bool {
         })
         .unwrap_or(0);
     let mut body = vec![0u8; content_length];
-    content_length == 0 || stream.read_exact(&mut body).is_ok()
+    if content_length > 0 && stream.read_exact(&mut body).is_err() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&body).to_string())
 }
 
 /// One canned SSE completion per request, in script order. `finished` says
 /// whether the body is framed with a Content-Length (a complete response) or
 /// simply cut off by closing the socket, which is what a provider dying
 /// mid-answer looks like on the wire: a well-formed transfer whose completion
-/// signal never arrives.
-fn spawn_scripted_server(script: Vec<(String, bool)>) -> (String, std::thread::JoinHandle<()>) {
+/// signal never arrives. Every request body is captured so a test can assert
+/// what the model was actually sent.
+fn spawn_scripted_server(
+    script: Vec<(String, bool)>,
+) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
     let handle = std::thread::spawn(move || {
         for (sse, finished) in script {
             let Ok((mut stream, _)) = listener.accept() else { return };
-            if !read_request(&mut stream) {
-                return;
-            }
+            let Some(body) = read_request(&mut stream) else { return };
+            seen.lock().unwrap().push(body);
             let response = if finished {
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
@@ -263,7 +271,7 @@ fn spawn_scripted_server(script: Vec<(String, bool)>) -> (String, std::thread::J
             let _ = stream.write_all(response.as_bytes());
         }
     });
-    (format!("http://{addr}/v1"), handle)
+    (format!("http://{addr}/v1"), requests, handle)
 }
 
 /// A finished one-line answer.
@@ -288,14 +296,14 @@ const TOOL_CALLS_TERMINATOR: &str = concat!(
 
 /// Minimal OpenAI-compatible streaming endpoint: the same finished completion
 /// for a few requests, enough for a whole print-mode turn.
-fn spawn_stub_server() -> (String, std::thread::JoinHandle<()>) {
+fn spawn_stub_server() -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
     spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 4])
 }
 
 #[test]
 fn a_print_turn_against_a_stub_server_reaches_stdout() {
     let (project, home) = fresh_dirs("turn");
-    let (base_url, _server) = spawn_stub_server();
+    let (base_url, _requests, _server) = spawn_stub_server();
     write_settings(&home, &base_url);
 
     let out = cmd(&project, &home)
@@ -308,10 +316,34 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
     assert!(stdout.contains("stub says hi"), "stdout: {stdout}\nstderr: {stderr}");
 }
 
+/// Prompt templates are a harness feature, not a TUI one: the delegate
+/// pattern (`openmax -p` in a child process) must send the model the template
+/// body, never the literal slash line.
+#[test]
+fn a_print_turn_expands_a_prompt_template() {
+    let (project, home) = fresh_dirs("template");
+    let (base_url, requests, _server) = spawn_stub_server();
+    write_settings(&home, &base_url);
+    let prompts = project.join(".agents").join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("greet.md"), "MARKER: greet $ARGUMENTS\n").unwrap();
+
+    let out = cmd(&project, &home)
+        .args(["--trust-project", "-p", "/greet world"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    let sent = requests.lock().unwrap().join("\n");
+    assert!(sent.contains("MARKER: greet world"), "the model must get the body: {sent}");
+    assert!(!sent.contains("/greet world"), "the raw slash line must not be sent: {sent}");
+}
+
 #[test]
 fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
     let (project, home) = fresh_dirs("json");
-    let (base_url, _server) = spawn_stub_server();
+    let (base_url, _requests, _server) = spawn_stub_server();
     write_settings(&home, &base_url);
 
     let out = cmd(&project, &home)
@@ -393,7 +425,7 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
     let (project, home) = fresh_dirs("truncated");
     let partial =
         "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
-    let (base_url, _server) = spawn_scripted_server(vec![(partial.to_string(), false)]);
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![(partial.to_string(), false)]);
     write_settings(&home, &base_url);
 
     let (code, lines, stdout) = json_turn(&project, &home, "say hi");
@@ -418,7 +450,7 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
 fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
     for (tag, body) in [("native", WRITE_CALL_SSE), ("markup", WRITE_CALL_MARKUP_SSE)] {
         let (project, home) = fresh_dirs(&format!("truncated-call-{tag}"));
-        let (base_url, _server) = spawn_scripted_server(vec![(body.to_string(), false)]);
+        let (base_url, _requests, _server) = spawn_scripted_server(vec![(body.to_string(), false)]);
         // auto, so a refusal here is the truncation and not the approval gate.
         write_settings_with_mode(&home, &base_url, "auto");
 
@@ -457,7 +489,7 @@ fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
 fn a_finished_stream_still_runs_the_same_write_call() {
     for (tag, body) in [("native", WRITE_CALL_SSE), ("markup", WRITE_CALL_MARKUP_SSE)] {
         let (project, home) = fresh_dirs(&format!("finished-call-{tag}"));
-        let (base_url, _server) = spawn_scripted_server(vec![
+        let (base_url, _requests, _server) = spawn_scripted_server(vec![
             (format!("{body}{TOOL_CALLS_TERMINATOR}"), true),
             (HELLO_SSE.to_string(), true),
         ]);

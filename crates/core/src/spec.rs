@@ -177,6 +177,12 @@ Templates are message content: re-read on every invocation, never frozen,
 zero prompt tax. They are user-invoked; the model does not call them (read
 the file directly if its content is needed).
 
+Every front end expands the same line: the TUI composer, `openmax -p
+"/<name> args"`, and a stdio `{"cmd":"user","text":"/<name> args"}`. So a
+delegated child process can invoke them too. Expansion is single-pass (a body
+starting with `/` is text, not another invocation), and in the TUI a built-in
+slash command with the same name wins.
+
 Example (`.agents/prompts/fix-issue.md`):
 
 ```markdown
