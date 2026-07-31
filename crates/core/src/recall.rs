@@ -157,30 +157,59 @@ fn hours_since(now: u64, ts: u64) -> u64 {
     now.saturating_sub(ts) / 3600
 }
 
+/// One chunk's scan contribution is capped so a single pathological message
+/// or memory file cannot spend the whole ceiling; the tail past the cap is
+/// still on disk at the cited address.
+const MAX_CHUNK_BYTES: usize = 512 * 1024;
+/// Memory files scan under their own sub-budget so even a pathological
+/// memory directory can never crowd session history out of the ceiling.
+const MEMORY_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
+fn bounded(text: String) -> String {
+    if text.len() <= MAX_CHUNK_BYTES {
+        return text;
+    }
+    let mut cut = MAX_CHUNK_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text[..cut].to_string()
+}
+
 /// Collect this project's chunks, newest sessions first, stopping at the
-/// scan-byte ceiling. The project key is the raw `Path::display` form -
-/// byte-identical to what session creation stores - because a canonicalized
-/// form would silently miss every session on platforms where the two differ
-/// (macOS /tmp vs /private/tmp).
+/// scan-byte ceiling. The ceiling is enforced before every read - memory
+/// files and mid-session alike - so "bounded" means bounded, not "checked
+/// once per session after the damage". The project key is the raw
+/// `Path::display` form - byte-identical to what session creation stores -
+/// because a canonicalized form would silently miss every session on
+/// platforms where the two differ (macOS /tmp vs /private/tmp).
 fn collect_chunks(
     core: &Core,
     project_root: &Path,
     now: u64,
+    scan_ceiling: usize,
 ) -> (Vec<Chunk>, usize, usize, usize) {
     let mut chunks = Vec::new();
     let mut bytes = 0usize;
     let root = project_root.display().to_string();
 
-    // Memory files first: the curated facts, small by contract.
+    // Memory files first: the curated facts, small by contract, and held to
+    // their own sub-budget so an oversized memory directory can never evict
+    // session history from the scan.
+    let memory_ceiling = scan_ceiling.min(MEMORY_SCAN_BYTES);
     let memory_dir = project_root.join(crate::memory::MEMORY_DIR);
     if let Ok(read_dir) = std::fs::read_dir(&memory_dir) {
         for entry in read_dir.flatten() {
+            if bytes >= memory_ceiling {
+                break;
+            }
             let path = entry.path();
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
             if path.extension().and_then(|e| e.to_str()) != Some("md") || name.starts_with('.') {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let text = bounded(text);
             let ts = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -207,7 +236,7 @@ fn collect_chunks(
     let mut scanned = 0usize;
     let mut skipped = 0usize;
     for meta in &metas {
-        if bytes >= MAX_SCAN_BYTES {
+        if bytes >= scan_ceiling {
             skipped += 1;
             continue;
         }
@@ -223,6 +252,9 @@ fn collect_chunks(
             paths: Vec::new(),
         });
         for msg in sessions::load_messages(core, &meta.id).unwrap_or_default() {
+            if bytes >= scan_ceiling {
+                break;
+            }
             if msg.role == "system" {
                 continue;
             }
@@ -230,6 +262,7 @@ fn collect_chunks(
             if content.trim().is_empty() {
                 continue;
             }
+            let content = bounded(content);
             bytes += content.len();
             chunks.push(Chunk {
                 kind: "message",
@@ -242,10 +275,14 @@ fn collect_chunks(
             });
         }
         for msg in sessions::load_archive(core, &meta.id) {
+            if bytes >= scan_ceiling {
+                break;
+            }
             let Some(content) = msg.content else { continue };
             if content.trim().is_empty() {
                 continue;
             }
+            let content = bounded(content);
             bytes += content.len();
             chunks.push(Chunk {
                 kind: "archive",
@@ -258,7 +295,10 @@ fn collect_chunks(
             });
         }
         for record in sessions::load_compaction(core, &meta.id) {
-            let text = format!("{} {}", record.digest, record.paths.join(" "));
+            if bytes >= scan_ceiling {
+                break;
+            }
+            let text = bounded(format!("{} {}", record.digest, record.paths.join(" ")));
             bytes += text.len();
             chunks.push(Chunk {
                 kind: "digest",
@@ -303,26 +343,61 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     let started = std::time::Instant::now();
     let query = parse_query(raw_query)?;
     let now = sessions::unix_now();
-    let (chunks, scanned, skipped, bytes) = collect_chunks(core, project_root, now);
+    let (chunks, scanned, skipped, bytes) = collect_chunks(core, project_root, now, MAX_SCAN_BYTES);
 
-    // Pass 1 statistics, query terms only: document frequency and lengths.
-    let n_docs = chunks.len().max(1) as f64;
+    // `path:` selects sessions, not individual chunks: the transcript around
+    // a file touch rarely repeats the literal path, so a session whose
+    // structured compaction paths (or any chunk text) match contributes all
+    // of its chunks - that is the hop. Session-less chunks (memories) pass on
+    // their own text or source. Multiple filters intersect at the session
+    // level, each possibly satisfied by a different chunk.
+    let path_pass: Vec<bool> = if query.path_filters.is_empty() {
+        vec![true; chunks.len()]
+    } else {
+        let mut matched: Option<std::collections::HashSet<String>> = None;
+        for filter in &query.path_filters {
+            let mut set = std::collections::HashSet::new();
+            for chunk in &chunks {
+                if let Some(id) = &chunk.session {
+                    if chunk.paths.iter().any(|p| p.to_lowercase().contains(filter))
+                        || chunk.text.to_lowercase().contains(filter)
+                        || chunk.source.to_lowercase().contains(filter)
+                    {
+                        set.insert(id.clone());
+                    }
+                }
+            }
+            matched = Some(match matched {
+                None => set,
+                Some(prev) => prev.intersection(&set).cloned().collect(),
+            });
+        }
+        let matched = matched.unwrap_or_default();
+        chunks
+            .iter()
+            .map(|chunk| match &chunk.session {
+                Some(id) => matched.contains(id),
+                None => query.path_filters.iter().all(|f| {
+                    chunk.text.to_lowercase().contains(f)
+                        || chunk.source.to_lowercase().contains(f)
+                }),
+            })
+            .collect()
+    };
+
+    // Pass 1 statistics, query terms only, over the filtered corpus: BM25's
+    // N, document frequencies, and average length must all describe the same
+    // universe or idf and length normalization skew against each other.
     let mut df: HashMap<&str, usize> = HashMap::new();
     let mut doc_tfs: Vec<Option<(HashMap<usize, usize>, usize)>> = Vec::with_capacity(chunks.len());
     let mut total_len = 0usize;
-    for chunk in &chunks {
-        if !query.path_filters.is_empty() {
-            let text_lower = chunk.text.to_lowercase();
-            let passes = query.path_filters.iter().all(|f| {
-                chunk.paths.iter().any(|p| p.to_lowercase().contains(f))
-                    || text_lower.contains(f)
-                    || chunk.source.to_lowercase().contains(f)
-            });
-            if !passes {
-                doc_tfs.push(None);
-                continue;
-            }
+    let mut candidates = 0usize;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if !path_pass[idx] {
+            doc_tfs.push(None);
+            continue;
         }
+        candidates += 1;
         let tokens = tokenize(&chunk.text);
         total_len += tokens.len();
         let mut tf: HashMap<usize, usize> = HashMap::new();
@@ -341,7 +416,8 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             doc_tfs.push(Some((tf, tokens.len())));
         }
     }
-    let avg_len = if chunks.is_empty() { 1.0 } else { (total_len as f64 / n_docs).max(1.0) };
+    let n_docs = candidates.max(1) as f64;
+    let avg_len = (total_len as f64 / n_docs).max(1.0);
 
     // Pass 2: score candidates. BM25 with the standard idf, then equal-weight
     // fusion with ACT-R recency after normalizing lexical scores to [0, 1].
@@ -579,7 +655,99 @@ mod tests {
             "path: must select only the session that touched the file: {:?}",
             report.hits
         );
+        // The hop's whole point: the transcript around a touch rarely repeats
+        // the literal path, so the session's messages must ride along with
+        // the digest that carried the structured path.
+        let hopped = recall(&core, &project, "touched path:nginx").unwrap();
+        assert!(
+            hopped.hits.iter().any(|h| h.kind == "message"),
+            "the hop must surface the touching session's transcript, not only its digest: {:?}",
+            hopped.hits
+        );
+        assert!(hopped.hits.iter().all(|h| h.session.as_deref() == Some(nginx_session.as_str())));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The scan ceiling means what it says: enforced before every read, with
+    /// a per-chunk cap and a memory sub-budget, so neither one pathological
+    /// message nor an oversized memory directory can spend the allowance or
+    /// evict session history.
+    #[test]
+    fn scan_stays_bounded_under_pathological_inputs() {
+        let (core, dir, project) = setup();
+        std::fs::create_dir_all(project.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            project.join(".openmax/memory/huge.md"),
+            format!("# huge memory\n{}", "m".repeat(5 * 1024 * 1024)),
+        )
+        .unwrap();
+        seed_session(&core, &project, "real work", vec![ChatMessage::user(
+            "the ceiling-needle survives the huge memory",
+        )]);
+        let (chunks, scanned, skipped, bytes) =
+            collect_chunks(&core, &project, sessions::unix_now(), MAX_SCAN_BYTES);
+        assert_eq!(scanned, 1, "the session must still be scanned");
+        assert_eq!(skipped, 0);
+        let memory_chunk = chunks.iter().find(|c| c.kind == "memory").unwrap();
+        assert!(
+            memory_chunk.text.len() <= MAX_CHUNK_BYTES,
+            "one chunk is capped, got {}",
+            memory_chunk.text.len()
+        );
+        assert!(bytes <= MEMORY_SCAN_BYTES + MAX_CHUNK_BYTES + 4096, "accounting stays near budget");
+        assert!(
+            recall(&core, &project, "ceiling-needle").unwrap().hits.iter().any(|h| h.kind == "message"),
+            "session content must remain findable next to a pathological memory"
+        );
+
+        // A tiny ceiling skips whole sessions, and every session is either
+        // scanned or counted skipped - the report never loses one silently.
+        seed_session(&core, &project, "second", vec![ChatMessage::user("x".repeat(4_000))]);
+        let (_, scanned, skipped, _) = collect_chunks(&core, &project, sessions::unix_now(), 1_000);
+        assert!(skipped >= 1, "a 1 KB ceiling must skip sessions, skipped {skipped}");
+        assert_eq!(scanned + skipped, 2, "every session is accounted for");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// BM25's universe must be the filtered corpus: adding sessions the
+    /// `path:` filter excludes must not move a candidate's score through
+    /// df, N, or average-length drift.
+    #[test]
+    fn filtered_out_noise_does_not_move_scores() {
+        let score_of = |noise: usize| -> f64 {
+            let (core, dir, project) = setup();
+            let id = seed_session(&core, &project, "target", vec![ChatMessage::user(
+                "wire the healthcheck probe",
+            )]);
+            sessions::append_compaction(&core, &id, &sessions::CompactionRecord {
+                ts: sessions::unix_now(),
+                message_count: 1,
+                tools: vec![],
+                paths: vec!["infra/nginx.conf".into()],
+                user_snippets: vec![],
+                digest: "[context note: probe wiring]".into(),
+            });
+            for i in 0..noise {
+                seed_session(&core, &project, &format!("noise {i}"), vec![ChatMessage::user(
+                    "healthcheck probe chatter with no path match",
+                )]);
+            }
+            let report = recall(&core, &project, "healthcheck probe path:nginx").unwrap();
+            let hit = report
+                .hits
+                .iter()
+                .find(|h| h.kind == "message")
+                .expect("target transcript hit")
+                .score;
+            let _ = std::fs::remove_dir_all(dir);
+            hit
+        };
+        let clean = score_of(0);
+        let noisy = score_of(10);
+        assert!(
+            (clean - noisy).abs() < 1e-9,
+            "excluded noise must not perturb BM25 statistics: {clean} vs {noisy}"
+        );
     }
 
     #[test]
