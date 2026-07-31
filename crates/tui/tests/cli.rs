@@ -226,6 +226,54 @@ fn approve_names_every_file_it_blesses() {
     assert!(stdout.contains("gate.sh"), "{stdout}");
 }
 
+/// Deleting an approved hook fails every tool call closed, so a human who
+/// meant the removal needs a way to say so. `--forget` is that way, and it is
+/// a human action with the same guard `--approve` has.
+#[test]
+fn forget_retires_a_deleted_capability() {
+    let (project, home) = fresh_dirs("forget");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+
+    std::fs::remove_file(hooks.join("gate.toml")).unwrap();
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a deleted gate must not read as a clean project: {stdout}");
+    assert!(stdout.contains("deleted"), "{stdout}");
+
+    // Agent-spawned processes cannot retire a human's approval.
+    let out = cmd(&project, &home)
+        .env("OPENMAX_SESSION", "1")
+        .args(["--forget", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+
+    let out = cmd(&project, &home)
+        .args(["--forget", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+
+    // Nothing recorded there any more.
+    let out = cmd(&project, &home)
+        .args(["--forget", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
 #[test]
 fn stdio_handshake_speaks_the_contract() {
     let (project, home) = fresh_dirs("stdio");

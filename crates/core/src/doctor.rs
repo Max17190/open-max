@@ -302,6 +302,25 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
     findings.extend(hooks_found.into_iter().map(|(f, _)| f));
     findings.extend(hook_extras);
+    // A deleted hook file leaves nothing on disk to report against, so the
+    // approved paths are the source of truth for what should be there. This
+    // is the same reconciliation the loop fails closed on; --check is where a
+    // human finds out which file it means.
+    if let Ok(approvals) = crate::ledger::approvals(data_dir, project_root) {
+        for path in approvals.live_paths() {
+            if path.exists() || !crate::hooks::is_hook_manifest(path, project_root) {
+                continue;
+            }
+            findings.push(Finding {
+                kind: "hook",
+                path: path.clone(),
+                status: Status::Err(format!(
+                    "an approved hook file was deleted; every tool call fails closed until it is restored or retired with `openmax --forget {}`",
+                    path.display()
+                )),
+            });
+        }
+    }
 
     for path in crate::permissions::permission_files(project_root) {
         let Some(result) = crate::permissions::check_file(&path) else { continue };
@@ -783,14 +802,10 @@ fn stale_code_reason(
     if !approvals.contains(manifest_sha) {
         return None;
     }
-    let code = crate::ledger::bound_code(command, args, project_root);
-    let changed = code
+    let problem = crate::ledger::bound_code(command, args, project_root)
         .iter()
-        .find(|c| !c.sha256.as_deref().is_some_and(|sha| approvals.contains(sha)))?;
-    Some(format!(
-        "the code it runs ({}) is not the content that was approved",
-        changed.path.display()
-    ))
+        .find_map(|c| c.problem(&approvals))?;
+    Some(format!("the code it runs, {problem}"))
 }
 
 /// Why `command` will not spawn from this checkout, if it will not. A path
@@ -1160,6 +1175,42 @@ mod tests {
             other => panic!("expected an error about the revoked gate: {other:?}"),
         }
         assert!(has_errors(&findings));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A deleted hook file has nothing on disk to report against, so it is
+    /// found by reconciling the approved paths. Without that, `--check` says
+    /// "no extension files found" about a project whose gate was removed.
+    #[test]
+    fn a_deleted_approved_hook_is_reported_and_can_be_retired() {
+        let root = temp_project();
+        let data = root.join("data");
+        let hook = root.join(".openmax/hooks/gate.toml");
+        // A command that really exists on every platform the harness runs on:
+        // one that does not is now uncovered on purpose, which is a different
+        // finding from the one under test.
+        write(hook.clone(), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n");
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap());
+        crate::ledger::approve_capability(&data, &root, &hook, &[sha]).unwrap();
+        assert!(!has_errors(&check_at(&root, &data)), "{:?}", check_at(&root, &data));
+
+        std::fs::remove_file(&hook).unwrap();
+        let findings = check_at(&root, &data);
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("deleted"), "{reason}");
+                assert!(reason.contains("--forget"), "the way out must be named: {reason}");
+            }
+            other => panic!("a deleted approved hook must be an error: {other:?}"),
+        }
+
+        // Retiring it is the human saying the removal was intended.
+        assert!(crate::ledger::forget_capability(&data, &root, &hook).unwrap());
+        assert!(!has_errors(&check_at(&root, &data)));
+        assert!(
+            !crate::ledger::forget_capability(&data, &root, &hook).unwrap(),
+            "forgetting twice reports that nothing was recorded"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

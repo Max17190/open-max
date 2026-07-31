@@ -271,7 +271,7 @@ approval alone: that path is what the human read, and system binaries change
 on their own schedule. The bytes are re-checked before every run, so a script
 rewritten mid-turn does not run.
 
-Fail closed, three ways, all reported by `openmax --check`:
+Fail closed, four ways, all reported by `openmax --check`:
 - A hook file that exists but does not parse blocks every tool until it is
   fixed or removed (a broken file might have been a gate), unless a valid
   project file shadows its stem - or unless no human ever approved that path,
@@ -280,9 +280,19 @@ Fail closed, three ways, all reported by `openmax --check`:
   and whose content no longer is blocks every tool until the approved content
   is restored or a human re-approves it. Editing a live gate cannot turn it
   off, and that includes a comment-only edit or a rewritten script.
-- Either way, `write_file`/`edit_file` on the offending hook file or the code
-  it runs stays available, so the repair is possible from inside the session
-  (same carve-out as `permissions.toml`, and subject to `approval_mode`).
+- A hook file a human approved that is *deleted* blocks every tool the same
+  way. Deleting a gate is easier than rewriting one and leaves nothing on disk
+  to notice, so what is enforced is reconciled against the approved paths, not
+  against the directory listing. Restore the file, or run
+  `openmax --forget <path>` if the removal was intended.
+- A `command` (or `args` path) that resolves to no file at all is not covered
+  by anything: there is nothing to approve, so the hook does not load. Install
+  or create it, then approve.
+- In every case, `write_file`/`edit_file` on the offending hook file or the
+  code it runs stays available, so the repair is possible from inside the
+  session (same carve-out as `permissions.toml`, and subject to
+  `approval_mode`). It resolves paths before comparing them, so a file that
+  does not exist yet can be recreated while `../` cannot be aimed outside.
 
 A hook whose content was never approved is inert rather than blocking: it never
 ran, so it removes no policy. It is not silent - each turn reports it, and

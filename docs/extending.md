@@ -113,7 +113,11 @@ and that no longer parses blocks every tool call until it is fixed or removed
 so a broken one is inert instead of blocking - otherwise any write, including
 the write that would repair it, could brick the project. Rewriting the
 offending hook file (or the code it runs) stays available either way, the same
-repair carve-out `permissions.toml` has.
+repair carve-out `permissions.toml` has - including recreating one that was
+deleted, since the file the session has to restore is exactly the one that does
+not exist. The carve-out resolves the target's parent before checking
+containment, so a missing file can be recreated while `../` and symlinked
+parents still cannot be aimed outside the project.
 
 ## Permissions
 
@@ -221,6 +225,13 @@ Three hard rules ride on this, with no rule language to widen them:
   runs makes the next call prompt again. Rewriting a blessed script is the same
   act as rewriting the manifest, and it is caught on every path a call can take
   - including the concurrent batch path, where read-only tools run unattended.
+- Deleting an approved hook file fails closed too, and is found by reconciling
+  the approved paths rather than the directory listing: a deleted file leaves
+  nothing to parse and nothing to report against, and `rm gate.toml` is easier
+  than rewriting it. Restore the file, or retire the approval with
+  `openmax --forget <path>` when the removal was intended. `--forget` drops
+  only the path memory, never a content hash: approval binds bytes, and the
+  same bytes are still bytes a human read.
 - An unapproved hook is inert, and a *revoked* gate hook fails closed. Hooks
   run with host authority on every matching call with no per-invocation gate,
   so they never load until approved. Content nobody ever approved never ran,

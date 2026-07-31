@@ -35,6 +35,8 @@ options:
       --ledger           print the capability-file history for this project
       --approve <path>   approve the exact current content of a capability file
                          and of the project-local code it runs
+      --forget <path>    stop expecting an approved capability file to exist
+                         (after deliberately deleting one)
       --run-examples     with --check, execute each tool's [example] once.
                          Unsandboxed: needs a trusted project and a tool file
                          approved with --approve, and honors permissions and
@@ -72,6 +74,7 @@ struct CliArgs {
     check: bool,
     run_examples: bool,
     approve: Option<String>,
+    forget: Option<String>,
     ledger: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
@@ -101,6 +104,7 @@ where
         check: false,
         run_examples: false,
         approve: None,
+        forget: None,
         ledger: false,
         spec: None,
         trust_project: false,
@@ -126,6 +130,7 @@ where
             Long("check") => out.check = true,
             Long("run-examples") => out.run_examples = true,
             Long("approve") => out.approve = Some(parser.value()?.string()?),
+            Long("forget") => out.forget = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
@@ -324,6 +329,40 @@ async fn main() -> std::io::Result<()> {
                     println!("editing either revokes this approval; re-run --approve after any change");
                 }
                 std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openmax: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(path) = &cli.forget {
+        // Retiring an approval is the same kind of act as granting one, so it
+        // has the same guard: a session cannot decide that the gate a human
+        // installed is no longer expected.
+        if std::env::var_os("OPENMAX_SESSION").is_some() {
+            eprintln!(
+                "openmax: approvals are human actions: this process was started from an agent session; ask the user to run `openmax --forget {path}`"
+            );
+            std::process::exit(3);
+        }
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let file = std::path::Path::new(path);
+        let target = if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
+        match open_max_core::ledger::forget_capability(&default_data_dir(), &project, &target) {
+            Ok(true) => {
+                println!("forgot {path}; the harness no longer expects a capability file there");
+                if target.exists() {
+                    println!(
+                        "note: the file is still on disk and its content approval still stands"
+                    );
+                }
+                std::process::exit(0);
+            }
+            Ok(false) => {
+                eprintln!("openmax: no approved capability is recorded at {path}");
+                std::process::exit(1);
             }
             Err(e) => {
                 eprintln!("openmax: {e}");

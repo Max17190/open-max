@@ -138,6 +138,12 @@ pub struct Hooks {
     /// approved. Dropping one silently is how a comment or a rewritten script
     /// turns a human gate off, so these fail closed instead.
     revoked_gates: Vec<(PathBuf, String)>,
+    /// Hook files a human approved that are no longer on disk. A deleted file
+    /// parses into nothing at all, so it is found by reconciling the approved
+    /// paths rather than by reading the directory. Its event is unknowable
+    /// once the file is gone, which is exactly the position an unparseable
+    /// file leaves us in, so it gets the same fail-closed answer.
+    missing: Vec<(PathBuf, String)>,
     /// Files whose rewrite is exempt from the fail-closed block: the broken or
     /// revoked hook files themselves and the code they name. Same repair path
     /// permissions already has, for the same reason - a hook the agent can
@@ -269,15 +275,11 @@ impl Hooks {
                     return true;
                 }
                 let reason = if approvals.contains(&spec.source_sha256) {
-                    let changed = code
+                    let problem = code
                         .iter()
-                        .find(|c| !c.sha256.as_deref().is_some_and(|s| approvals.contains(s)))
-                        .map(|c| c.path.display().to_string())
+                        .find_map(|c| c.problem(&approvals))
                         .unwrap_or_default();
-                    format!(
-                        "{}: the code it runs ({changed}) is not the content that was approved",
-                        spec.source_path.display()
-                    )
+                    format!("{}: the code it runs, {problem}", spec.source_path.display())
                 } else {
                     format!("{}: its content changed since it was approved", spec.source_path.display())
                 };
@@ -318,6 +320,24 @@ impl Hooks {
             ));
             false
         });
+        // Reconcile against what a human approved, not against what discovery
+        // found. A deleted hook file yields neither a spec nor an invalid
+        // entry, so nothing above ever sees it - and deleting a gate is
+        // strictly easier than rewriting one. Absence gets the same answer as
+        // a modification: the policy is not running, so nothing runs.
+        for path in approvals.live_paths() {
+            if path.exists() || !is_hook_manifest(path, project_root) {
+                continue;
+            }
+            repair_paths.push(path.clone());
+            self.missing.push((
+                path.clone(),
+                format!(
+                    "{}: an approved hook file was deleted",
+                    path.display()
+                ),
+            ));
+        }
         self.revoked_gates = revoked_gates;
         self.repair_paths = repair_paths;
         self.notices = notices;
@@ -339,6 +359,7 @@ impl Hooks {
             && self.turn_end.is_empty()
             && self.invalid.is_empty()
             && self.revoked_gates.is_empty()
+            && self.missing.is_empty()
     }
 
     /// Non-empty when a hook a human installed stopped being enforceable: its
@@ -360,6 +381,12 @@ impl Hooks {
                 describe(&self.revoked_gates)
             ));
         }
+        if !self.missing.is_empty() {
+            parts.push(format!(
+                "approved hook file(s) were deleted, failing closed until the file is restored or a human retires it (openmax --forget <path>): {}",
+                describe(&self.missing)
+            ));
+        }
         (!parts.is_empty()).then(|| parts.join("; "))
     }
 
@@ -377,8 +404,8 @@ impl Hooks {
         let Some(raw) = args["path"].as_str() else {
             return false;
         };
-        let (Ok(candidate), Ok(root)) = (
-            project_root.join(raw).canonicalize(),
+        let (Some(candidate), Ok(root)) = (
+            resolve_for_repair(&project_root.join(raw)),
             project_root.canonicalize(),
         ) else {
             return false;
@@ -387,7 +414,7 @@ impl Hooks {
             && self
                 .repair_paths
                 .iter()
-                .any(|p| p.canonicalize().map(|p| p == candidate).unwrap_or(false))
+                .any(|p| resolve_for_repair(p).is_some_and(|p| p == candidate))
     }
 
     pub fn pre_count(&self) -> usize {
@@ -556,6 +583,32 @@ impl Hooks {
         }
         failures
     }
+}
+
+/// Resolve a path for the repair comparison without requiring the file to
+/// exist: a deleted gate script is exactly what the session has to be able to
+/// recreate, and canonicalizing a missing path fails. The parent must exist
+/// and is canonicalized, so `..` and symlinked parents are resolved before the
+/// caller's containment check - the carve-out still cannot be aimed outside
+/// the project, and a path whose parent is missing too is refused rather than
+/// compared lexically.
+fn resolve_for_repair(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?.canonicalize().ok()?;
+    Some(parent.join(path.file_name()?))
+}
+
+/// Whether this path is a hook manifest: one of the two directories hooks load
+/// from, holding a `.toml`. Used to reconcile approved paths that are gone,
+/// where there is no file left to parse.
+pub(crate) fn is_hook_manifest(path: &Path, project_root: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+        return false;
+    }
+    let Some(parent) = path.parent() else { return false };
+    hook_dirs(project_root).iter().any(|dir| {
+        parent == dir
+            || dir.canonicalize().map(|dir| parent == dir).unwrap_or(false)
+    })
 }
 
 /// Hook files as "path: reason", for one fail-closed message.
@@ -902,6 +955,142 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// Deleting an approved gate is strictly easier than rewriting one, and
+    /// it leaves nothing on disk to iterate: no spec, no invalid entry. It is
+    /// caught by reconciling the approved paths, and lands in the same
+    /// fail-closed state a modification does - with a message that says
+    /// deleted, not changed, and a way back for either party.
+    #[tokio::test]
+    async fn deleting_an_approved_gate_fails_closed_and_says_so() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp, "gate.sh", "#!/bin/sh\nexit 1\n");
+        let toml = hooks_dir.join("gate.toml");
+        let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
+        std::fs::write(&toml, body).unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        assert_eq!(Hooks::discover(&tmp, &data).pre_count(), 1);
+
+        std::fs::remove_file(&toml).unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        let cancel = Arc::new(CancelToken::default());
+        match hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("deleted"), "deleted must not read as changed: {reason}");
+                assert!(reason.contains("gate.toml"), "{reason}");
+                assert!(reason.contains("openmax --forget"), "the way out must be named: {reason}");
+            }
+            other => panic!("a deleted gate must fail closed, not disappear: {other:?}"),
+        }
+
+        // Way back one: the session recreates the file it deleted.
+        let repair = serde_json::json!({"path": ".openmax/hooks/gate.toml", "content": body});
+        assert_eq!(
+            hooks.pre_tool_use("s", "write_file", &repair, &tmp, &cancel).await,
+            PreToolResult::Allow,
+            "a deleted hook must be recreatable from inside the session"
+        );
+        std::fs::write(&toml, body).unwrap();
+        assert_eq!(Hooks::discover(&tmp, &data).pre_count(), 1, "restored bytes are approved bytes");
+
+        // Way back two: the human meant it, and retires the approval.
+        std::fs::remove_file(&toml).unwrap();
+        assert!(crate::ledger::forget_capability(&data, &tmp, &toml).unwrap());
+        let hooks = Hooks::discover(&tmp, &data);
+        assert!(hooks.is_empty(), "a retired capability leaves no fail-closed state");
+        assert_eq!(
+            hooks.pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel).await,
+            PreToolResult::Allow
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A deleted bound script is the other half of the same problem: the gate
+    /// fails closed, and the file that has to come back does not exist, so a
+    /// repair check that canonicalizes the target can never match it.
+    #[tokio::test]
+    async fn a_deleted_bound_script_can_be_recreated_but_traversal_still_refuses() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        write_script(&tmp.join("scripts"), "gate.sh", "#!/bin/sh\nexit 1\n");
+        let toml = hooks_dir.join("gate.toml");
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./scripts/gate.sh\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        assert_eq!(Hooks::discover(&tmp, &data).pre_count(), 1);
+
+        std::fs::remove_file(tmp.join("scripts/gate.sh")).unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        let cancel = Arc::new(CancelToken::default());
+        assert!(matches!(
+            hooks.pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel).await,
+            PreToolResult::Block { .. }
+        ));
+        let recreate = serde_json::json!({"path": "scripts/gate.sh", "content": "#!/bin/sh\nexit 1\n"});
+        assert_eq!(
+            hooks.pre_tool_use("s", "write_file", &recreate, &tmp, &cancel).await,
+            PreToolResult::Allow,
+            "the missing script must be recreatable in session"
+        );
+
+        // The carve-out resolves paths before it compares them, so it still
+        // cannot be aimed anywhere but the files that are failing closed.
+        for escape in [
+            "../gate.sh",                    // traversal out of the project
+            "scripts/../../gate.sh",         // traversal through a real dir
+            "no-such-dir/gate.sh",           // parent does not exist either
+            "src/main.rs",                   // an ordinary file
+        ] {
+            let args = serde_json::json!({"path": escape, "content": "x"});
+            assert!(
+                matches!(
+                    hooks.pre_tool_use("s", "write_file", &args, &tmp, &cancel).await,
+                    PreToolResult::Block { .. }
+                ),
+                "the repair carve-out must refuse {escape}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A symlinked parent must not smuggle the repair target out of the
+    /// project: the parent is canonicalized before containment is judged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_repair_carve_out_resolves_symlinked_parents() {
+        let tmp = tempfile_dir();
+        let outside = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp, "gate.sh", "#!/bin/sh\nexit 1\n");
+        let toml = hooks_dir.join("gate.toml");
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n# edited\n").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.join("escape")).unwrap();
+
+        let hooks = Hooks::discover(&tmp, &data);
+        let cancel = Arc::new(CancelToken::default());
+        let args = serde_json::json!({"path": "escape/gate.toml", "content": "x"});
+        assert!(
+            matches!(
+                hooks.pre_tool_use("s", "write_file", &args, &tmp, &cancel).await,
+                PreToolResult::Block { .. }
+            ),
+            "a symlinked parent must not carry the carve-out outside the project"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
     /// The comment-only edit: byte-identical policy, brand-new hash. Before
     /// content binding this was inert; after it, dropping the hook silently
     /// would make a comment a way to switch a human gate off.
@@ -994,7 +1183,7 @@ mod tests {
         let hooks_dir = tmp.join(".openmax/hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let toml = hooks_dir.join("gate.toml");
-        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"/bin/false\"\n").unwrap();
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
         approve_hook_file(&tmp, &data, &toml);
         std::fs::write(&toml, "event = \n").unwrap();
 
@@ -1083,13 +1272,13 @@ mod tests {
         let tmp = tempfile_dir();
         let hooks_dir = tmp.join(".openmax").join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
-        let body_a = "event = \"pre_tool_use\"\ncommand = \"/bin/aaaa\"\n";
-        let body_b = "event = \"pre_tool_use\"\ncommand = \"/bin/bbbb\"\n";
+        let body_a = "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n";
+        let body_b = "event = \"pre_tool_use\"\ncommand = \"/bin/date\"\n";
         assert_eq!(body_a.len(), body_b.len());
         write_hook_toml(&hooks_dir, "gate.toml", body_a);
         let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre.len(), 1);
-        assert_eq!(hooks.pre[0].command, "/bin/aaaa");
+        assert_eq!(hooks.pre[0].command, "/bin/echo");
 
         // Same byte length, pinned mtime: a metadata fingerprint would keep
         // the obsolete policy live.
@@ -1102,7 +1291,7 @@ mod tests {
 
         let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre.len(), 1);
-        assert_eq!(hooks.pre[0].command, "/bin/bbbb");
+        assert_eq!(hooks.pre[0].command, "/bin/date");
     }
 
     #[test]
@@ -1110,14 +1299,19 @@ mod tests {
         let tmp = tempfile_dir();
         let hooks_dir = tmp.join(".openmax").join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
-        let gate = "event = \"pre_tool_use\"\ncommand = \"/bin/aaaa\"\n";
+        let gate = "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n";
         let path = hooks_dir.join("gate.toml");
 
         write_hook_toml(&hooks_dir, "gate.toml", gate);
         assert_eq!(discover_for_test(&tmp).pre.len(), 1);
 
         std::fs::remove_file(&path).unwrap();
-        assert!(discover_for_test(&tmp).is_empty(), "a removed gate must stop applying");
+        let hooks = discover_for_test(&tmp);
+        assert!(hooks.pre.is_empty(), "a removed gate must stop applying");
+        // Stopping is not the same as being forgotten: the removal of a gate
+        // a human installed is reconciled from the approved paths, so it
+        // fails closed rather than passing everything.
+        assert_eq!(hooks.missing.len(), 1, "{:?}", hooks.missing);
 
         // Restoring byte-identical content puts the policy back. Anything
         // that remembered the gap keyed by content would answer "no gate"
@@ -1125,7 +1319,7 @@ mod tests {
         write_hook_toml(&hooks_dir, "gate.toml", gate);
         let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.pre.len(), 1, "invalid: {:?}", hooks.invalid);
-        assert_eq!(hooks.pre[0].command, "/bin/aaaa");
+        assert_eq!(hooks.pre[0].command, "/bin/echo");
     }
 
     #[tokio::test]

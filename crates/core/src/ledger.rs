@@ -364,6 +364,13 @@ impl Approvals {
         self.paths.contains(&canonical_or(path))
     }
 
+    /// Every path a human approved a capability at. Reconciliation reads this
+    /// rather than the directory listing: a file that was deleted produces no
+    /// entry to iterate, and absence is exactly the case that must not pass.
+    pub fn live_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.paths.iter()
+    }
+
     /// Every bound code file is readable and approved. An unreadable one is
     /// never covered: a command named but not yet written has no bytes to
     /// approve, and must not read as "nothing to bind".
@@ -457,6 +464,44 @@ fn approve(
     result
 }
 
+/// Stop expecting a capability at `path`: the human removed it on purpose.
+/// Returns whether anything was remembered there. Only the path memory is
+/// dropped, never a content hash - approval binds bytes, and the same bytes
+/// arriving again at any path are still bytes a human read and blessed.
+pub fn forget_capability(
+    data_dir: &Path,
+    project_root: &Path,
+    path: &Path,
+) -> Result<bool, String> {
+    let dir = project_dir(data_dir, project_root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(&dir))
+        .map_err(|e| format!("cannot open ledger lock: {e}"))?;
+    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
+    let result = (|| {
+        let current = approvals(data_dir, project_root)?;
+        let target = canonical_or(path);
+        let mut paths = current.paths;
+        if !paths.remove(&target) {
+            return Ok(false);
+        }
+        let file = ApprovedFile {
+            version: 1,
+            hashes: current.hashes.into_iter().collect(),
+            paths: paths.iter().map(|p| p.display().to_string()).collect(),
+        };
+        let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+        crate::sessions::write_atomic(&approved_path(&dir), json)?;
+        Ok(true)
+    })();
+    let _ = fs2::FileExt::unlock(&lock);
+    result
+}
+
 /// Whether `sha` is human-approved. Any failure reads as unapproved: the
 /// enforcement this feeds must fail toward asking, never toward running.
 pub fn is_approved(data_dir: &Path, project_root: &Path, sha: &str) -> bool {
@@ -478,6 +523,23 @@ pub struct BoundCode {
     pub sha256: Option<String>,
 }
 
+impl BoundCode {
+    /// Why this entry is not covered, for the message a human has to act on.
+    /// A file that cannot be read is a different problem from a file whose
+    /// bytes moved, and telling them apart is the difference between
+    /// "install it" and "re-approve it".
+    pub fn problem(&self, approvals: &Approvals) -> Option<String> {
+        match &self.sha256 {
+            None => Some(format!("{} does not exist or cannot be read", self.path.display())),
+            Some(sha) if !approvals.contains(sha) => Some(format!(
+                "{} is not the content that was approved",
+                self.path.display()
+            )),
+            Some(_) => None,
+        }
+    }
+}
+
 /// Every project-local file `command args...` will execute or interpret. This
 /// is what an approval has to cover: approving only the manifest binds a
 /// pointer, and the pointee sits at an ordinary project path the agent writes
@@ -489,10 +551,19 @@ pub struct BoundCode {
 /// upgrade. The threat here is the agent rewriting files it can write.
 pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<BoundCode> {
     let mut out = Vec::new();
-    if let Some(path) = resolve_command(command.trim(), project_root) {
-        if inside_project(&path, project_root) {
-            out.push(read_code(path));
-        }
+    let command = command.trim();
+    match resolve_command(command, project_root) {
+        // Agent-writable: the bytes decide.
+        Some(path) if inside_project(&path, project_root) => out.push(read_code(path)),
+        // A real file outside the project: the absolute path the human read.
+        Some(path) if path.exists() => {}
+        // Resolved to nothing, or did not resolve at all. Either way there is
+        // no code to approve, and an empty binding must never read as "this
+        // command is covered": that is how an unrecognized path spelling, or
+        // a name that resolves only on some other machine, would run
+        // whatever eventually lands there.
+        Some(path) => out.push(BoundCode { path, sha256: None }),
+        None => out.push(BoundCode { path: PathBuf::from(command), sha256: None }),
     }
     for arg in args {
         // Fixed argv can name the script an interpreter runs
@@ -532,12 +603,18 @@ fn read_code(path: PathBuf) -> BoundCode {
 
 /// Where `command` will spawn from, resolved the way the spawn resolves it: a
 /// path against the project root (processes run there), a bare name on PATH.
+/// None means nothing resolves, which the caller treats as uncovered, not as
+/// nothing to cover.
+///
+/// A backslash counts as path syntax even though this harness targets unix:
+/// misreading `.\payload.cmd` as a bare name would leave agent-writable code
+/// with an empty binding, and no legitimate unix command name contains one.
 fn resolve_command(command: &str, project_root: &Path) -> Option<PathBuf> {
     if command.is_empty() {
         return None;
     }
-    if command.contains('/') {
-        return Some(absolute_from(command, project_root));
+    if command.contains('/') || command.contains('\\') {
+        return Some(absolute_from(&command.replace('\\', "/"), project_root));
     }
     // Bare names are almost always system binaries, but resolving them anyway
     // keeps a PATH entry inside the project from smuggling agent-written code
@@ -575,8 +652,20 @@ fn lexical_abs(path: &Path) -> PathBuf {
     out
 }
 
+/// One spelling per file, so two references to it compare equal. A path whose
+/// file is gone cannot be canonicalized at all, and that is the case
+/// reconciliation depends on, so its parent is canonicalized instead: a
+/// deleted capability still has to match the entry it was approved under.
 fn canonical_or(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| lexical_abs(path))
+    if let Ok(resolved) = path.canonicalize() {
+        return resolved;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(parent) = parent.canonicalize() {
+            return parent.join(name);
+        }
+    }
+    lexical_abs(path)
 }
 
 /// Whether `path` sits inside the project, and is therefore agent-writable.
@@ -897,8 +986,54 @@ mod tests {
         assert!(missing[0].sha256.is_none());
         assert!(!Approvals::default().covers_code(&missing));
 
-        // `..` actually leaves the project, so it is not project code.
-        assert!(bound_code("../outside.sh", &[], &root).is_empty());
+        // `..` actually leaves the project, so what it names is not project
+        // code - but a spelling that resolves to no file at all is still not
+        // covered, wherever it points.
+        let outside = root.parent().unwrap().join("outside-real.sh");
+        std::fs::write(&outside, "#!/bin/sh\ntrue\n").unwrap();
+        assert!(
+            bound_code(&format!("../{}", outside.file_name().unwrap().to_string_lossy()), &[], &root)
+                .is_empty(),
+            "a real file outside the project is the absolute path the human read"
+        );
+        assert!(!Approvals::default().covers_code(&bound_code("../nothing-here.sh", &[], &root)));
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The general form of the binding hole: an empty binding must mean "this
+    /// command is a system path the human read", never "nothing resolved, so
+    /// nothing to check". A name that resolves only on some other machine, or
+    /// in a spelling this platform does not parse as a path, is uncovered.
+    #[test]
+    fn a_command_that_resolves_to_nothing_is_never_covered() {
+        let root = temp("unresolved-proj");
+        let empty = Approvals::default();
+
+        for command in [
+            "definitely-not-a-real-binary-xyz",  // not on PATH anywhere
+            "./missing.sh",                      // project path, no file
+            "/opt/nowhere/missing.sh",           // absolute path, no file
+            ".\\payload.cmd",                    // backslash spelling
+            "subdir\\payload.sh",
+        ] {
+            let bound = bound_code(command, &[], &root);
+            assert_eq!(bound.len(), 1, "{command} must bind something to refuse");
+            assert!(bound[0].sha256.is_none(), "{command}");
+            assert!(!empty.covers_code(&bound), "{command} must not read as covered");
+        }
+
+        // A backslash path that does exist is bound by its bytes, not waved
+        // through: that is the case the whole check exists for.
+        std::fs::create_dir_all(root.join("subdir")).unwrap();
+        std::fs::write(root.join("subdir/payload.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        let bound = bound_code("subdir\\payload.sh", &[], &root);
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].sha256, Some(sha256_hex(b"#!/bin/sh\ntrue\n")));
+
+        // A genuine system binary is still covered by the manifest alone.
+        assert!(bound_code("/bin/echo", &[], &root).is_empty());
+        assert!(bound_code("sh", &[], &root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
