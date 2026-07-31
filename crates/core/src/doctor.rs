@@ -413,6 +413,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
 
     findings.extend(inline_program_findings(project_root));
+    findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));
     findings.extend(hygiene_findings(project_root, data_dir, &tool_meta, &skill_meta));
     findings
@@ -454,6 +455,53 @@ fn inline_program_findings(project_root: &Path) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Memory files are data, not capabilities, so nothing here is an Err: a file
+/// the index ignores is a Warn naming the reason and the fix, and a live one
+/// is an Ok saying whether the index currently shows it. The check answers
+/// the question the agent actually has after writing a memory: will a future
+/// session see this?
+fn memory_findings(project_root: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let dir = project_root.join(crate::memory::MEMORY_DIR);
+    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+        return findings;
+    };
+    let scan = crate::memory::scan(project_root, crate::memory::unix_now());
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        if path.is_dir() || name.starts_with('.') {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        if let Some(memory) = scan.entries.iter().find(|e| e.name == stem) {
+            let visibility = if memory.in_index {
+                "in the session index".to_string()
+            } else {
+                "faded from the index (unused; a read_file revives it)".to_string()
+            };
+            findings.push(Finding {
+                kind: "memory",
+                path,
+                status: Status::Ok(format!("memory '{stem}' — {visibility}")),
+            });
+            continue;
+        }
+        let reason = if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            "only .md files are memories; this file is never indexed".to_string()
+        } else if !stem.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || stem.is_empty()
+            || stem.len() > 64
+        {
+            "memory names are 1-64 chars of [a-z0-9-]; rename it to be indexed".to_string()
+        } else {
+            "no describable first line; give it one non-empty line to be indexed".to_string()
+        };
+        findings.push(Finding { kind: "memory", path, status: Status::Warn(reason) });
+    }
+    findings
 }
 
 /// One declared example and what running it proved. `path` is the tool file
@@ -2023,5 +2071,44 @@ mod tests {
         assert!(!near("tools", "tools"));
         assert!(!near("tools", "skills"));
         assert!(!near("write_file", "read_file"));
+    }
+
+    /// After writing a memory the agent's question is "will a future session
+    /// see this?" - so every file in the directory gets an answer: indexed,
+    /// faded, or ignored with the reason and the fix. Ignored files are
+    /// warnings, never errors: memory is data, and nothing here may fail a
+    /// check run.
+    #[test]
+    fn memory_files_report_index_visibility_and_ignore_reasons() {
+        let root = temp_project();
+        write(root.join(".openmax/memory/deploy-port.md"), "# port 7443\nbody");
+        write(root.join(".openmax/memory/Bad_Name.md"), "# x");
+        write(root.join(".openmax/memory/blank.md"), "\n\n");
+        write(root.join(".openmax/memory/notes.txt"), "# not markdown");
+        write(root.join(".openmax/memory/.access.jsonl"), "");
+
+        let findings = local(&root);
+        let live = find(&findings, "deploy-port.md");
+        assert!(matches!(live.status, Status::Ok(_)), "{:?}", live.status);
+        assert!(live.status.summary().contains("in the session index"));
+
+        let bad = find(&findings, "Bad_Name.md");
+        assert!(matches!(bad.status, Status::Warn(_)));
+        assert!(bad.status.summary().contains("[a-z0-9-]"));
+
+        let blank = find(&findings, "blank.md");
+        assert!(matches!(blank.status, Status::Warn(_)));
+        assert!(blank.status.summary().contains("first line"));
+
+        let txt = find(&findings, "notes.txt");
+        assert!(matches!(txt.status, Status::Warn(_)));
+        assert!(txt.status.summary().contains(".md"));
+
+        assert!(
+            !findings.iter().any(|f| f.path.to_string_lossy().contains(".access.jsonl")),
+            "the access log is not a memory and gets no finding"
+        );
+        assert!(!has_errors(&findings), "memory findings never fail a check");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

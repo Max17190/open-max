@@ -10,13 +10,14 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 8] = [
+pub const SURFACES: [&str; 9] = [
     "tools",
     "skills",
     "prompts",
     "hooks",
     "permissions",
     "providers",
+    "memory",
     "stdio",
     "usage",
 ];
@@ -30,6 +31,7 @@ pub fn render(surface: &str) -> Option<&'static str> {
         "hooks" => Some(HOOKS),
         "permissions" => Some(PERMISSIONS),
         "providers" => Some(PROVIDERS),
+        "memory" => Some(MEMORY),
         "stdio" => Some(STDIO),
         _ => None,
     }
@@ -430,6 +432,52 @@ Activation: resolved at the next turn (settings edits apply without a
 restart). Verify with `openmax --check`.
 "#;
 
+const MEMORY: &str = r#"# Project memory
+
+One durable fact per markdown file: `.openmax/memory/<name>.md`. The agent
+writes these with the ordinary file tools; the harness only scores, surfaces,
+and forgets them. There is no global memory tier and no database.
+
+Fields (the file IS the contract):
+- name: the file stem, 1-64 chars of [a-z0-9-]. Anything else is ignored.
+- first non-empty line: the description, shown as the memory's index line in
+  future sessions (leading `#` stripped, capped at 160 chars). A file with no
+  describable first line is ignored.
+- body: free-form markdown, any length, read on demand with read_file.
+
+Index: at session creation (and /reload or a re-freeze) live memories are
+ranked and injected as one line each - `- name: description - path` - under a
+1500-byte budget, strongest first, with a trailer counting what did not fit.
+No memories, no section, zero prompt cost.
+
+Scoring is ACT-R base-level activation, computed lazily from timestamps:
+each past access at age t hours contributes t^-0.5 (ages under one hour
+count as one hour), and activation is ln of the sum, so recency and
+frequency trade off in one number and one recall revives an old memory.
+Accesses are the file's mtime plus logged events in
+`.openmax/memory/.access.jsonl` (the harness appends `read` when read_file
+targets a memory path and `write` for write_file/edit_file, once per kind
+per turn). bash access is not tracked; prefer the file tools for recall.
+
+Forgetting is deliberate:
+- Below the activation of one access 21 days old, a memory leaves the index
+  (still on disk, still greppable).
+- Below the activation of one access 60 days old, the file is deleted at the
+  next session creation, leaving a `gc` tombstone line (name, sha256,
+  description) in the access log. Update or delete stale facts yourself
+  rather than letting them fade into the index of a future session.
+
+Supersede, do not duplicate: update the existing file when a fact changes
+(date-stamp facts that can go stale). Near-duplicate files split the access
+history that keeps a fact alive.
+
+Activation: the index refreshes at session creation, /reload, and any
+re-freeze; a memory written mid-session is already known to its author and
+enters the index from the next session. Verify what you wrote with
+`openmax --check` (it names every ignored file and why, and what the index
+currently shows).
+"#;
+
 const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
@@ -615,7 +663,7 @@ mod tests {
     /// every spec states when the file takes effect.
     #[test]
     fn specs_name_verification_and_activation() {
-        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers"] {
+        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory"] {
             let text = render(name).unwrap();
             assert!(text.contains("openmax --check"), "{name} spec must point at --check");
         }

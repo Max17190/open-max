@@ -303,6 +303,11 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             // would look like a self-modification and re-freeze for nothing.
             sessions::save_manifest(core, session_id, &registry.to_manifest());
         }
+        // Session creation is the one consolidation boundary: memories the
+        // decay law says are gone are deleted (tombstoned in the access log)
+        // before the index freezes into the prompt, and never mid-session,
+        // so a live prompt cannot index a file that no longer exists.
+        let _ = crate::memory::forget_faded(project_root, crate::memory::unix_now());
         let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
         SessionData {
             messages: vec![ChatMessage::system(prompt)],
@@ -335,13 +340,22 @@ struct ReadonlyBatchCtx<'a> {
     permissions: &'a Permissions,
     parallelism: usize,
     /// Turn-local usage accumulator, flushed once at turn end.
-    usage: &'a std::sync::Mutex<crate::ledger::UsageDelta>,
+    usage: &'a std::sync::Mutex<TurnUsage>,
 }
 
-/// Count what only the dispatcher sees: external tool calls (by outcome) and
-/// skill-body reads (a read_file whose path is a frozen skill's SKILL.md).
+/// Turn-local accumulators the dispatcher fills and turn end flushes: ledger
+/// usage feeds `--spec usage`, memory accesses feed the activation log.
+#[derive(Default)]
+struct TurnUsage {
+    ledger: crate::ledger::UsageDelta,
+    memory: Vec<(String, String)>,
+}
+
+/// Count what only the dispatcher sees: external tool calls (by outcome),
+/// skill-body reads (a read_file whose path is a frozen skill's SKILL.md),
+/// and memory accesses (file tools on `.openmax/memory/*.md`).
 fn count_usage(
-    usage: &std::sync::Mutex<crate::ledger::UsageDelta>,
+    usage: &std::sync::Mutex<TurnUsage>,
     registry: &Registry,
     project_root: &Path,
     name: &str,
@@ -353,18 +367,23 @@ fn count_usage(
         .get(name)
         .is_some_and(|spec| matches!(spec.kind, crate::registry::ToolKind::External(_)))
     {
-        delta.tools.push((name.to_string(), ok));
+        delta.ledger.tools.push((name.to_string(), ok));
         return;
     }
-    if name == "read_file" && ok {
+    if ok {
         if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
-            let absolute = project_root.join(rel);
-            if let Some(skill) = registry
-                .skills
-                .iter()
-                .find(|skill| skill.path == absolute || skill.path == Path::new(rel))
-            {
-                delta.skills.push(skill.name.clone());
+            if name == "read_file" {
+                let absolute = project_root.join(rel);
+                if let Some(skill) = registry
+                    .skills
+                    .iter()
+                    .find(|skill| skill.path == absolute || skill.path == Path::new(rel))
+                {
+                    delta.ledger.skills.push(skill.name.clone());
+                }
+            }
+            if let Some(event) = crate::memory::access_of(name, rel) {
+                delta.memory.push(event);
             }
         }
     }
@@ -1304,7 +1323,7 @@ async fn run_loop(
     let mut repeat_tracker = RepeatCallTracker::new();
     // What this turn used, merged into the project usage file at turn end so
     // the agent (via openmax --spec usage) can prune its own toolbox.
-    let turn_usage = std::sync::Mutex::new(crate::ledger::UsageDelta::default());
+    let turn_usage = std::sync::Mutex::new(TurnUsage::default());
     let context_tokens = endpoint.context_tokens;
     let max_tokens = endpoint.max_tokens;
     let max_iterations = settings.max_agent_iterations.max(1);
@@ -1755,7 +1774,8 @@ async fn run_loop(
     sessions::touch(core, session_id);
     {
         let delta = std::mem::take(&mut *turn_usage.lock().unwrap_or_else(|e| e.into_inner()));
-        let _ = crate::ledger::record_usage(&core.data_dir, project_root, &delta);
+        let _ = crate::ledger::record_usage(&core.data_dir, project_root, &delta.ledger);
+        crate::memory::record_accesses(project_root, &delta.memory);
     }
     report_hook_failures(
         &core,
@@ -3531,6 +3551,38 @@ mod tests {
         assert!(text.contains("read_file"), "{text}");
         assert!(text.contains("src/auth.rs"), "{text}");
         assert!(text.contains("Earlier goals"), "{text}");
+    }
+
+    /// The dispatcher is the only place that sees which file tool touched
+    /// which path, so it feeds the memory activation log: successful reads
+    /// and writes of memory paths count, failed calls and ordinary project
+    /// files do not.
+    #[test]
+    fn count_usage_records_memory_accesses_for_the_activation_log() {
+        let usage = std::sync::Mutex::new(TurnUsage::default());
+        let registry = Registry::builtin_only();
+        let root = Path::new("/tmp/p");
+        let memory_path = serde_json::json!({"path": ".openmax/memory/deploy-port.md"});
+        count_usage(&usage, &registry, root, "read_file", &memory_path, true);
+        count_usage(&usage, &registry, root, "edit_file", &memory_path, true);
+        count_usage(&usage, &registry, root, "write_file", &memory_path, false);
+        count_usage(
+            &usage,
+            &registry,
+            root,
+            "read_file",
+            &serde_json::json!({"path": "src/main.rs"}),
+            true,
+        );
+        let delta = usage.lock().unwrap();
+        assert_eq!(
+            delta.memory,
+            vec![
+                ("deploy-port".to_string(), "read".to_string()),
+                ("deploy-port".to_string(), "write".to_string()),
+            ],
+            "one read and one successful write; the failed write and the source file do not count"
+        );
     }
 
     /// After a prune that inserts a digest, token total must sit at or below

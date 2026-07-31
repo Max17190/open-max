@@ -48,13 +48,13 @@ options:
                          approved with --approve, and honors permissions and
                          approval_mode exactly as a session does
       --check            validate extension files (tools, skills, templates,
-                         hooks, permissions, providers) and exit; nonzero if
-                         any is broken.
+                         hooks, permissions, providers, memory) and exit;
+                         nonzero if any is broken.
                          with --stdio, validate a JSONL protocol stream on
                          stdin against the openmax-stdio contract instead
       --spec <surface>   print the authoring contract for one extension
                          surface and exit (tools, skills, prompts, hooks,
-                         permissions, providers, stdio)
+                         permissions, providers, memory, stdio)
       --trust-project    persist trust for this exact project root, then run
   -V, --version          print the version
   -h, --help             this help
