@@ -84,6 +84,12 @@ a run of `token` deltas is terminated by one `message_done`, but a turn that
 hits a provider-stream error emits an `error` line and then `done` with no
 `message_done`. A turn that dies unexpectedly reports `error` and then `done`
 with `stop_reason` `error`, so a crash is an event rather than a silent stall.
+A stream the provider abandons mid-answer still emits `message_done` (with the
+partial text, which is kept in the session), then an `error` line, then `done`
+with `stop_reason` `truncated`: an incomplete answer is never reported as a
+finished one. No tool call carried by such a stream is dispatched, even one
+whose arguments parse, because a stream with no completion signal never said
+which calls the model meant to make.
 
 A `user` command that starts no turn still terminates. Empty text, or a project
 that is not trusted, yields `{"type":"protocol_error","message":"..."}`
@@ -93,6 +99,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `stop_reason` | Meaning |
 | --- | --- |
 | provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
+| `truncated` | The provider stream ended with no completion signal; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `blocked` | A `user_prompt_submit` hook refused the prompt |
 | `cancelled` | A `cancel` command or shutdown stopped the turn |

@@ -97,9 +97,16 @@ pub enum StreamDelta {
     Reasoning(String),
 }
 
+/// `finish_reason` for a stream the server never terminated: no `[DONE]` line
+/// and no finish_reason chunk, just EOF part way through the answer. Reported
+/// instead of `stop` so a cut-off reply cannot pass for a finished one.
+pub const TRUNCATED: &str = "truncated";
+
 pub struct CompletionResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// The server's reason, or `cancelled` (we stopped reading) or
+    /// [`TRUNCATED`] (the server stopped writing without ever finishing).
     pub finish_reason: String,
     /// Server-reported token accounting, when the backend provides it.
     pub usage: Option<Usage>,
@@ -384,6 +391,10 @@ impl ChatClient {
         let mut content = String::new();
         let mut partials: Vec<PartialToolCall> = Vec::new();
         let mut finish_reason = String::from("stop");
+        // Did the server ever say it was done (a `[DONE]` line or a
+        // finish_reason chunk)? Without one, the stream ending means the
+        // connection dropped mid-answer, not that the model finished.
+        let mut saw_terminator = false;
         let mut usage: Option<Usage> = None;
         // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
         // conversion only happens on complete lines ('\n' is never part of a
@@ -412,6 +423,7 @@ impl ChatClient {
                 }
                 let data = strip_data_prefix(line);
                 if data == b"[DONE]" {
+                    saw_terminator = true;
                     break 'outer;
                 }
                 let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
@@ -422,6 +434,9 @@ impl ChatClient {
                 let Some(choice) = chunk.choices.into_iter().next() else { continue };
 
                 if let Some(reason) = choice.finish_reason {
+                    // Servers that end a stream here and never send `[DONE]`
+                    // are still finished: this is a terminator too.
+                    saw_terminator = true;
                     finish_reason = reason;
                 }
                 let delta = choice.delta;
@@ -463,6 +478,13 @@ impl ChatClient {
             }
         }
 
+        // The stream ran out without the server ever finishing it: report the
+        // truncation rather than the default "stop", which would make a
+        // cut-off answer indistinguishable from a complete one. Cancellation
+        // ends the stream from this side, so it keeps its own reason.
+        if !saw_terminator && finish_reason != "cancelled" {
+            finish_reason = TRUNCATED.into();
+        }
         let tool_calls = finalize_tool_calls(partials);
         if !tool_calls.is_empty() && finish_reason == "stop" {
             finish_reason = "tool_calls".into();
@@ -641,6 +663,116 @@ mod tests {
         let data = super::strip_data_prefix(trim_bytes(line));
         let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+    }
+
+    /// One-shot endpoint that answers with a close-delimited SSE body (no
+    /// Content-Length, so the body ends at EOF) and then drops the connection.
+    /// That is exactly what a provider dying mid-stream looks like on the wire:
+    /// the transfer is well-formed, only the completion signal is missing.
+    fn spawn_sse_once(sse: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            // Read headers, then the request body, so the client never sees a
+            // reset while it is still writing.
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => buf.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let headers = String::from_utf8_lossy(&buf).to_string();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+                )
+                .as_bytes(),
+            );
+            // Dropping the socket ends the body: the client sees a plain EOF.
+        });
+        format!("http://{addr}/v1")
+    }
+
+    async fn stream_once(sse: &'static str) -> CompletionResult {
+        let client = ChatClient::new(spawn_sse_once(sse), None, "m".into(), 0.0, 64);
+        client
+            .stream_chat(
+                &[ChatMessage::user("hi")],
+                "[]",
+                Arc::new(crate::state::CancelToken::default()),
+                |_| {},
+            )
+            .await
+            .expect("a close-delimited body is not a transport error")
+    }
+
+    /// The bug this guards: a server that dies mid-answer sends neither
+    /// `[DONE]` nor a finish_reason, and the partial reply used to come back
+    /// as a normal "stop": a cut-off answer no client could tell from a
+    /// finished one.
+    #[tokio::test]
+    async fn a_stream_that_ends_with_no_terminator_reports_truncation() {
+        let result = stream_once(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n",
+        )
+        .await;
+        assert_eq!(result.finish_reason, TRUNCATED);
+        // The partial text still comes back: it lands in the transcript so the
+        // session stays resumable.
+        assert_eq!(result.content, "half an ans");
+    }
+
+    /// Plenty of servers close right after the finish_reason chunk and never
+    /// send `[DONE]`. That is a finished answer, not a truncation.
+    #[tokio::test]
+    async fn an_explicit_finish_reason_is_a_clean_stop_without_done() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.content, "all of it");
+    }
+
+    #[tokio::test]
+    async fn done_without_a_finish_reason_chunk_is_a_clean_stop() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!(result.finish_reason, "stop");
+    }
+
+    /// The client reports what arrived without hiding it: the calls come back
+    /// alongside the truncation, and refusing to dispatch them is the agent
+    /// loop's decision (a call from a stream the model never finished may not
+    /// be the call it meant to make).
+    #[tokio::test]
+    async fn a_truncated_stream_still_returns_the_tool_calls_it_carried() {
+        let result = stream_once(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        )
+        .await;
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "read_file");
+        assert_eq!(result.finish_reason, TRUNCATED, "an unfinished stream is not a clean tool_calls stop");
     }
 
     #[test]

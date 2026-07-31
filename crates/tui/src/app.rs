@@ -2197,7 +2197,7 @@ impl App {
                 if !self.queued.is_empty() {
                     // An interrupted or failed turn returns the queue to the
                     // composer instead of firing blind into a broken state.
-                    if matches!(stop_reason.as_str(), "cancelled" | "error" | "blocked") {
+                    if matches!(stop_reason.as_str(), "cancelled" | "error" | "blocked" | "truncated") {
                         self.return_queue_to_composer();
                     } else {
                         self.flush_queue = true;

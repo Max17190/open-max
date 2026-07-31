@@ -109,6 +109,12 @@ pub enum AgentEvent {
     /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The
     /// turn proceeded - observe hooks are fail-open - but never silently.
     HookFailed { hook: String, event: String, detail: String },
+    /// Exactly one per turn, and the only guaranteed terminator. Carries the
+    /// provider's `finish_reason` on a normal end, or one of the harness's own:
+    /// `truncated` (the stream ended with no completion signal, so the reply is
+    /// incomplete and any tool calls it carried were refused; an `Error`
+    /// precedes it), `max_iterations`, `blocked`,
+    /// `cancelled`, `error`, `refused`.
     Done { stop_reason: String },
     Error { message: String },
 }
