@@ -338,9 +338,26 @@ async fn main() -> std::io::Result<()> {
     }
 
     if let Some(path) = &cli.forget {
-        // Retiring an approval is the same kind of act as granting one, so it
-        // has the same guard: a session cannot decide that the gate a human
-        // installed is no longer expected.
+        // Retiring an approval REMOVES a gate, which is why it is guarded
+        // harder than granting one. `--approve` and `--trust-project` add
+        // authority and leave an auditable artifact behind: a content hash
+        // pinned to bytes a human can read afterwards. This leaves nothing,
+        // so the session marker alone is too thin a wall - an agent holding
+        // `bash` clears an environment variable with `unset`.
+        //
+        // What the terminal check buys is cost, not impossibility, and the
+        // measured numbers are worth stating rather than implying. It removes
+        // the one-liner: `unset OPENMAX_SESSION; openmax --forget <path>` now
+        // exits 3. It does not stop an attacker who allocates a pty and
+        // answers this prompt - roughly twenty lines of Python, verified to
+        // still retire the approval. And it is not even the cheapest path
+        // left: `bash` is unconfined, so deleting the approval store outright
+        // clears every fail-closed state in one command, because that file
+        // carries no tamper-evidence of its own (unlike the ledger's chain).
+        //
+        // So this is a speed bump on the supported route, not a boundary.
+        // Without an OS sandbox that is the honest ceiling, the same one
+        // trust lives at; the marker check stays as the cheap first line.
         if std::env::var_os("OPENMAX_SESSION").is_some() {
             eprintln!(
                 "openmax: approvals are human actions: this process was started from an agent session; ask the user to run `openmax --forget {path}`"
@@ -350,6 +367,31 @@ async fn main() -> std::io::Result<()> {
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let file = std::path::Path::new(path);
         let target = if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!(
+                "openmax: --forget retires a human-installed policy, so it only runs at an interactive terminal.\n\
+                 to retire {path} without one, restore the file instead, or remove its entry from {} by hand",
+                open_max_core::ledger::project_dir(&default_data_dir(), &project)
+                    .join("approved.json")
+                    .display()
+            );
+            std::process::exit(3);
+        }
+        println!("about to retire the approval recorded at {}", target.display());
+        println!(
+            "if that file was a gate, the policy it enforced stops being expected and stops being enforced."
+        );
+        print!("type the path exactly as given to confirm: ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            eprintln!("openmax: could not read a confirmation; nothing was changed");
+            std::process::exit(1);
+        }
+        if !forget_confirmed(&answer, path, &target) {
+            eprintln!("openmax: confirmation did not match; nothing was changed");
+            std::process::exit(1);
+        }
         match open_max_core::ledger::forget_capability(&default_data_dir(), &project, &target) {
             Ok(true) => {
                 println!("forgot {path}; the harness no longer expects a capability file there");
@@ -700,6 +742,16 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
     (rows, failures)
 }
 
+/// Whether the typed answer retires exactly the capability that was named.
+/// Either spelling the human has in front of them counts - the argument they
+/// passed, or the resolved path the prompt printed - and nothing else does:
+/// the point is that a person read which policy is going away, so "y" is not
+/// enough.
+fn forget_confirmed(answer: &str, given: &str, resolved: &std::path::Path) -> bool {
+    let answer = answer.trim();
+    !answer.is_empty() && (answer == given.trim() || answer == resolved.display().to_string())
+}
+
 /// `openmax --spec usage`: per-extension prompt cost joined with lifetime
 /// usage and approval state. Read-only; requires no trust or endpoint.
 fn print_usage_economics() {
@@ -865,6 +917,24 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Retiring an approval takes the path typed back, not a keystroke: the
+    /// wall is that a person read which policy is being removed. Both
+    /// spellings they can see count, and nothing else does.
+    #[test]
+    fn retiring_an_approval_takes_the_path_typed_back() {
+        let resolved = std::path::Path::new("/proj/.openmax/hooks/gate.toml");
+        let given = ".openmax/hooks/gate.toml";
+        assert!(forget_confirmed(".openmax/hooks/gate.toml\n", given, resolved));
+        assert!(forget_confirmed("  /proj/.openmax/hooks/gate.toml  \n", given, resolved));
+
+        for answer in ["y\n", "yes\n", "\n", "  \n", "gate.toml\n", ".openmax/hooks/other.toml\n"] {
+            assert!(
+                !forget_confirmed(answer, given, resolved),
+                "{answer:?} must not retire a policy"
+            );
         }
     }
 

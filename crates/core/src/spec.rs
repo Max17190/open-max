@@ -284,7 +284,15 @@ Fail closed, four ways, all reported by `openmax --check`:
   way. Deleting a gate is easier than rewriting one and leaves nothing on disk
   to notice, so what is enforced is reconciled against the approved paths, not
   against the directory listing. Restore the file, or run
-  `openmax --forget <path>` if the removal was intended.
+  `openmax --forget <path>` if the removal was intended. `--forget` removes a
+  policy rather than adding one, so it refuses inside an agent session and
+  refuses without an interactive terminal, then asks for the path typed back.
+  Read that as a speed bump, not a boundary: it removes the one-command
+  bypass, but an attacker holding `bash` can still allocate a pty to answer
+  the prompt, and can more cheaply delete the approval store itself. Without
+  an OS sandbox nothing here survives an agent that is determined and has a
+  shell; what the harness guarantees is that the easy path is closed and the
+  state is visible.
 - A `command` (or `args` path) that resolves to no file at all is not covered
   by anything: there is nothing to approve, so the hook does not load. Install
   or create it, then approve.

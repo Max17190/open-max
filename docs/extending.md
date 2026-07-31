@@ -232,6 +232,20 @@ Three hard rules ride on this, with no rule language to widen them:
   `openmax --forget <path>` when the removal was intended. `--forget` drops
   only the path memory, never a content hash: approval binds bytes, and the
   same bytes are still bytes a human read.
+
+  `--forget` is the one command here that *removes* a protection, so it is
+  guarded harder than the ones that add one: it refuses inside an agent
+  session, refuses without an interactive terminal, and then asks for the
+  path typed back. Those are speed bumps, not a boundary, and the difference
+  matters. They close the one-command bypass (`unset OPENMAX_SESSION;
+  openmax --forget <path>`). They do not stop an attacker who allocates a pty
+  and answers the prompt, and they are not even the cheapest route left:
+  `bash` runs unconfined, so deleting `approved.json` clears every
+  fail-closed state at once. Nothing in this design survives an agent with a
+  shell that is determined to remove a gate - that is what an OS sandbox
+  would be for. What it does buy is that the removal cannot happen by
+  accident or in one step, and that every state it leaves behind is visible
+  in `openmax --check`.
 - An unapproved hook is inert, and a *revoked* gate hook fails closed. Hooks
   run with host authority on every matching call with no per-invocation gate,
   so they never load until approved. Content nobody ever approved never ran,

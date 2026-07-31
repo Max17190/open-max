@@ -228,9 +228,13 @@ fn approve_names_every_file_it_blesses() {
 
 /// Deleting an approved hook fails every tool call closed, so a human who
 /// meant the removal needs a way to say so. `--forget` is that way, and it is
-/// a human action with the same guard `--approve` has.
+/// guarded harder than `--approve` because it removes a policy instead of
+/// adding one: an agent session is refused, and so is any run without an
+/// interactive terminal - which is what a `bash` subprocess inside a turn and
+/// this test harness both look like. Neither check is a sandbox; see the
+/// residual stated at the call site.
 #[test]
-fn forget_retires_a_deleted_capability() {
+fn forget_refuses_without_a_human_at_a_terminal() {
     let (project, home) = fresh_dirs("forget");
     let hooks = project.join(".openmax").join("hooks");
     std::fs::create_dir_all(&hooks).unwrap();
@@ -257,21 +261,39 @@ fn forget_retires_a_deleted_capability() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("human actions"));
 
+    // And neither can anything else without a terminal, marker or not: the
+    // marker is one `unset` away from any shell the agent already has.
     let out = cmd(&project, &home)
         .args(["--forget", ".openmax/hooks/gate.toml"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(stderr.contains("interactive terminal"), "{stderr}");
+    // The refusal has to leave the human a way forward that does not need one.
+    assert!(stderr.contains("approved.json"), "{stderr}");
+
+    // Refused means refused: the gate is still expected, so tools still fail
+    // closed and --check still reports it.
     let out = cmd(&project, &home).arg("--check").output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
 
-    // Nothing recorded there any more.
-    let out = cmd(&project, &home)
-        .args(["--forget", ".openmax/hooks/gate.toml"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    // The path the refusal names does work: the file itself is the record, and
+    // restoring it is the repair the harness prefers.
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "restoring the approved bytes must clear the fail-closed state: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]
