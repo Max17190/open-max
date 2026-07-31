@@ -27,6 +27,10 @@ pub struct SessionData {
     /// only valid while this still matches the taker (guards against a newer
     /// turn or a recreated session reusing the id).
     pub take_seq: u64,
+    /// Whether this session already reported that its tool schemas outgrew the
+    /// context window. The condition holds on every turn once it holds at all,
+    /// so the advisory is emitted once and not per turn.
+    pub schemas_over_budget_reported: bool,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous

@@ -227,6 +227,33 @@ fn report_hook_failures(
     }
 }
 
+/// Tell the frontend, once per session, that the installed tool schemas cost
+/// more than the window can spend. It holds on every turn once it holds at
+/// all, so repeating it per turn would be noise; the turn still runs, because
+/// this is the user's configuration to fix, not a failure of this turn.
+async fn report_schemas_over_budget(
+    core: &Arc<Core>,
+    session_id: &str,
+    schema_tokens: usize,
+    budget_tokens: usize,
+) {
+    let first = {
+        let mut map = core.sessions.lock().await;
+        match map.get_mut(session_id) {
+            Some(data) => !std::mem::replace(&mut data.schemas_over_budget_reported, true),
+            // No live session state to dedupe against: say it rather than
+            // swallow it.
+            None => true,
+        }
+    };
+    if first {
+        core.send_agent(session_id, AgentEvent::SchemasOverBudget {
+            schema_tokens,
+            budget_tokens,
+        });
+    }
+}
+
 fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> SessionData {
     if let Some(mut messages) = sessions::load_messages(core, session_id) {
         // Resume: registry frozen at creation — manifest if present, else built-ins only.
@@ -257,6 +284,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             persisted_count,
             snapshots: Default::default(),
             take_seq: 0,
+            schemas_over_budget_reported: false,
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -280,6 +308,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             persisted_count: 0,
             snapshots: Default::default(),
             take_seq: 0,
+            schemas_over_budget_reported: false,
         }
     }
 }
@@ -1241,11 +1270,11 @@ async fn run_loop(
         // swaps the wire bytes, and the overhead must follow the current
         // generation, not the one this turn started with.
         let schema_tokens = estimate_tokens(schemas_wire.len());
-        let (budget_changed, compaction) = enforce_budget(
-            guard.messages(),
-            context_tokens.saturating_sub(max_tokens + 1024),
-            schema_tokens,
-        );
+        let budget = context_tokens.saturating_sub(max_tokens + 1024);
+        if schemas_outgrow_budget(budget, schema_tokens) {
+            report_schemas_over_budget(core, session_id, schema_tokens, budget).await;
+        }
+        let (budget_changed, compaction) = enforce_budget(guard.messages(), budget, schema_tokens);
         if let Some(digest) = compaction {
             // Upgrade the heuristic note to a model-written summary when the
             // endpoint cooperates; the note at index 2 was just inserted by
@@ -1945,6 +1974,20 @@ fn approval_detail(args: &Value) -> String {
 /// cache warm) until the budget is crossed again.
 const PRUNE_TARGET_PCT: usize = 70;
 
+fn prune_target(budget: usize) -> usize {
+    budget * PRUNE_TARGET_PCT / 100
+}
+
+/// True when the frozen schemas alone reach the prune target. The schema cost
+/// is constant per request, so in that state no achievable transcript brings a
+/// request inside the window: pruning would drop history to the floor, emit a
+/// digest, pay a summarization request, and still be over — every single turn.
+/// Compaction is the wrong tool; only removing tools or widening the window
+/// fixes it.
+fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
+    schema_tokens >= prune_target(budget)
+}
+
 /// `schema_tokens` is the frozen tool schema array's estimated cost: it is
 /// re-sent in full on every request, so it counts against the same window as
 /// the transcript. Ignoring it under-reports a zero-extension session by
@@ -1962,7 +2005,13 @@ fn enforce_budget(
     if total <= budget {
         return (false, None);
     }
-    let target = budget * PRUNE_TARGET_PCT / 100;
+    // Nothing this function can do reaches the target, so do nothing rather
+    // than thrash: keep the transcript (and the prompt cache) intact and let
+    // the caller report the condition the user can actually act on.
+    if schemas_outgrow_budget(budget, schema_tokens) {
+        return (false, None);
+    }
+    let target = prune_target(budget);
     let keep_tail = messages.len().saturating_sub(6);
     let mut truncated = false;
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
@@ -3255,6 +3304,73 @@ mod tests {
             pruned + schema_tokens <= target,
             "used total (messages {pruned} + schemas {schema_tokens}) must reach target {target}"
         );
+    }
+
+    /// Schemas are a fixed per-request cost, so when they alone reach the
+    /// prune target no transcript fits and compaction is futile. It must then
+    /// do nothing at all: pruning to the floor would drop history, emit a
+    /// digest, and pay a summarization request every turn while never fitting.
+    #[test]
+    fn budget_does_not_thrash_when_schemas_exceed_the_target() {
+        // A 8k-window model with a 4k completion reserve, and enough installed
+        // tools to cost more than what is left: reachable at MAX_EXTERNAL_TOOLS.
+        let budget = 8192usize.saturating_sub(4096 + 1024);
+        let schema_tokens = 6800;
+        assert!(schemas_outgrow_budget(budget, schema_tokens));
+
+        let mut messages = vec![msg("system", 200), msg("user", 200)];
+        for turn in 0..4 {
+            // Each turn appends an exchange, as a running session does.
+            messages.push(assistant_with_tools("read_file", r#"{"path":"src/a.rs"}"#));
+            messages.push(msg("tool", 4000));
+            let before = messages.clone();
+            let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens);
+            assert!(!changed, "turn {turn}: futile compaction must not run");
+            assert!(digest.is_none(), "turn {turn}: no digest, so no summarization request");
+            let unchanged: Vec<Option<String>> =
+                messages.iter().map(|m| m.content.clone()).collect();
+            let expected: Vec<Option<String>> = before.iter().map(|m| m.content.clone()).collect();
+            assert_eq!(unchanged, expected, "turn {turn}: transcript must survive intact");
+        }
+        assert!(
+            !messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX))),
+            "no digest may stack up across turns"
+        );
+
+        // Just under the target the normal machinery still runs.
+        let workable = prune_target(budget) - 1;
+        assert!(!schemas_outgrow_budget(budget, workable));
+        assert!(enforce_budget(&mut messages, budget, workable).0);
+    }
+
+    /// The condition holds on every turn once it holds at all, so the advisory
+    /// is a session-level fact, not a per-turn one: it fires exactly once.
+    #[tokio::test]
+    async fn schemas_over_budget_is_reported_once_per_session() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let id = "over-budget";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let data = build_session_data(&core, id, &project);
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+
+        for _ in 0..3 {
+            report_schemas_over_budget(&core, id, 6800, 3072).await;
+        }
+        let mut reports = Vec::new();
+        while let Ok(env) = rx.try_recv() {
+            if let AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } = env.event {
+                reports.push((schema_tokens, budget_tokens));
+            }
+        }
+        assert_eq!(reports, vec![(6800, 3072)], "advisory must fire once with the real numbers");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A mid-turn refreeze changes the wire schemas, so the overhead the

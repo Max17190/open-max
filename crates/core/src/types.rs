@@ -121,6 +121,12 @@ pub enum AgentEvent {
     /// ledger recorded, with who changed it ("tool.toml modified (external)"),
     /// so the action space never mutates silently.
     Refrozen { tools: usize, skills: usize, changes: Vec<String> },
+    /// The frozen tool schemas alone cost more than the window has to spend,
+    /// so no amount of compaction can make a request fit: the harness stops
+    /// pruning (shredding the transcript every turn would buy nothing) and
+    /// says so once per session. Advisory, not fatal - the turn still runs.
+    /// The fix is the user's: uninstall tools, or raise `context_tokens`.
+    SchemasOverBudget { schema_tokens: usize, budget_tokens: usize },
     /// An observe-only hook (post_tool_use, session_start, compaction,
     /// turn_end) failed to run: spawn error, nonzero exit, or timeout. The
     /// turn proceeded - observe hooks are fail-open - but never silently.
@@ -253,6 +259,10 @@ mod tests {
                 changes: vec![".openmax/tools/deploy.toml added (session)".into()],
             }),
             r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added (session)"]}"#
+        );
+        assert_eq!(
+            env(AgentEvent::SchemasOverBudget { schema_tokens: 6800, budget_tokens: 2150 }),
+            r#"{"session_id":"s1","type":"schemas_over_budget","schema_tokens":6800,"budget_tokens":2150}"#
         );
 
         assert_eq!(

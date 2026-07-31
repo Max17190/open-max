@@ -2146,6 +2146,15 @@ impl App {
                     plural(skills, "skill"),
                 ));
             }
+            AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
+                // Compaction is switched off while this holds, so say why:
+                // pruning the transcript cannot pay a fixed per-request cost.
+                self.note(&format!(
+                    "installed tool schemas cost ~{schema_tokens} tokens, more than the ~{budget_tokens} \
+                     this context window can spend: compaction is paused; remove tools (/tools, \
+                     openmax --spec usage) or raise context_tokens"
+                ));
+            }
             AgentEvent::HookFailed { hook, event, detail } => {
                 // Observe hooks are fail-open; the note keeps them honest.
                 self.note(&format!("hook '{hook}' failed on {event}: {detail}"));

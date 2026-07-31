@@ -388,9 +388,11 @@ the frozen tool schemas sent on every request, context_tokens),
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
-each recorded capability-file change and its actor), `hook_failed` (hook,
-event, detail: an observe-only hook failed, the turn proceeded), `done`
-(stop_reason), `error` (message).
+each recorded capability-file change and its actor), `schemas_over_budget`
+(schema_tokens, budget_tokens: the installed tools cost more than the window
+can spend, so compaction is paused; advisory, at most once per session),
+`hook_failed` (hook, event, detail: an observe-only hook failed, the turn
+proceeded), `done` (stop_reason), `error` (message).
 
 `approval_request.reason` is `gate` (approval_mode or a permission rule) or
 `unapproved_source`: the first call of an external tool whose exact bytes no
@@ -416,6 +418,13 @@ A command line over 8 MiB, or one that is not valid UTF-8, is refused with a
 While a client is live, approvals are forwarded and openmax waits for an
 `approve`; after quit or EOF, pending and later approvals are declined so
 shutdown drains promptly.
+
+What changed in openmax-stdio/3: `budget.used_tokens` now counts the frozen
+tool schemas sent on every request, not the transcript alone. Same field,
+same type, larger value (a zero-extension session reports ~1270 where /2
+reported ~720), and it is now exactly the total compaction enforces against
+`context_tokens`; thresholds calibrated against the /2 meaning must be
+re-calibrated. `schemas_over_budget` is new and additive.
 
 Validate a stream against the contract: `openmax --check --stdio` reads JSONL
 on stdin, reports each line, and exits nonzero on any violation.
