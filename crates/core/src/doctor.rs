@@ -339,6 +339,10 @@ struct ExampleGates {
 impl ExampleGates {
     /// The documented call order (hooks pre → permissions → approval_mode →
     /// execute), evaluated with the same predicates the agent loop calls.
+    ///
+    /// Every decision is matched exhaustively rather than tested for the one
+    /// variant that refuses: a gate whose default is "run it" turns the next
+    /// variant someone adds into a silent bypass.
     async fn admit(
         &self,
         spec: &crate::registry::ToolSpec,
@@ -363,12 +367,37 @@ impl ExampleGates {
             }
             PreToolResult::Cancelled => return Err("cancelled".into()),
         }
-        if let PermissionDecision::Deny { reason } = self.permissions.evaluate(&spec.name, args) {
-            return Err(reason);
+        match self.permissions.evaluate(&spec.name, args) {
+            PermissionDecision::Deny { reason } => return Err(reason),
+            // A rule that singles this tool out for a prompt cannot be honored
+            // in a batch, and a rule the user wrote for one tool is too
+            // specific to answer with "a human typed the command".
+            PermissionDecision::Ask => {
+                return Err(
+                    "permission rule requires human approval of this tool; examples cannot prompt (change the rule to effect = \"allow\" to run it unattended)"
+                        .into(),
+                )
+            }
+            // Allow is a user's "do not put this one in front of me" for the
+            // prompt a turn would raise. It deliberately does not answer the
+            // question below - whether a person is attached to this process -
+            // because permissions.toml is a file the agent can write for
+            // itself; trust and the content approval are the human decisions.
+            PermissionDecision::Allow | PermissionDecision::Default => {}
         }
-        if spec.mutating && self.approval_mode == ApprovalMode::Readonly {
-            return Err("approval_mode is readonly; mutating tools are disabled".into());
-        }
+        // One exhaustive read of approval_mode, in the turn's precedence:
+        // readonly is a hard block, ask needs a person, auto needs neither.
+        let needs_person = if spec.mutating {
+            match self.approval_mode {
+                ApprovalMode::Readonly => {
+                    return Err("approval_mode is readonly; mutating tools are disabled".into())
+                }
+                ApprovalMode::Ask => true,
+                ApprovalMode::Auto => false,
+            }
+        } else {
+            false
+        };
         // Running an example runs the file's command with host authority and
         // no human on the other end of a prompt, so the exact bytes must be
         // approved first. Content-bound, exactly like the in-session gate: any
@@ -382,7 +411,7 @@ impl ExampleGates {
         // A turn in `ask` mode puts every mutating call in front of a person.
         // The human who typed this command is that person; an agent-spawned
         // process has nobody, so it refuses rather than running unattended.
-        if spec.mutating && self.approval_mode == ApprovalMode::Ask && self.agent_spawned {
+        if needs_person && self.agent_spawned {
             return Err(
                 "approval_mode is ask and this process was started from an agent session; ask the user to run openmax --check --run-examples"
                     .into(),
@@ -1189,6 +1218,71 @@ mod tests {
         assert!(reason.contains("readonly"), "{reason}");
 
         assert!(!touched.exists(), "no refused example may have run");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// `effect = "ask"` singles a tool out for a prompt. A batch run has
+    /// nothing to prompt with, so it refuses - for a human-started run too,
+    /// since the CLI cannot stop mid-report to ask. The escape hatch is the
+    /// rule the user already knows how to write.
+    #[tokio::test]
+    async fn an_ask_permission_rule_refuses_the_example() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let tool = tool_file(
+            &root,
+            "writer.toml",
+            &format!(
+                "name = \"writer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        let data = approved_data_dir(&root, &[&tool]);
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"ask\"\ntool = \"writer\"\n",
+        );
+
+        // This process carries no OPENMAX_SESSION, so it is the human case.
+        let results = examples(&root, &data).await.unwrap();
+        let reason = verdict(&results, "writer").result.as_ref().unwrap_err();
+        assert!(reason.contains("cannot prompt"), "{reason}");
+        assert!(reason.contains("effect = \"allow\""), "{reason}");
+        assert!(!touched.exists(), "an ask rule must not reach a spawn");
+
+        // The rule the message names does let it run.
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"allow\"\ntool = \"writer\"\n",
+        );
+        let allowed = examples(&root, &data).await.unwrap();
+        assert!(verdict(&allowed, "writer").result.is_ok());
+        assert!(touched.exists());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// `auto` is the mode that runs mutating tools without a prompt, so an
+    /// approved mutating example runs unattended there and nowhere else.
+    #[tokio::test]
+    async fn auto_mode_runs_an_approved_mutating_example() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let tool = tool_file(
+            &root,
+            "writer.toml",
+            &format!(
+                "name = \"writer\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\nmutating = true\n\n[example]\n",
+                touched.display()
+            ),
+        );
+        let data = approved_data_dir(&root, &[&tool]);
+        std::fs::write(data.join("settings.json"), r#"{"approval_mode":"auto"}"#).unwrap();
+
+        let results = examples(&root, &data).await.unwrap();
+        assert!(verdict(&results, "writer").result.is_ok());
+        assert!(touched.exists());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }

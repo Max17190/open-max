@@ -168,8 +168,10 @@ freshly written tool actually runs.
 Running an example is running the tool: an unsandboxed host process in the
 project root with no snapshot taken. So it passes the same gates a turn
 applies - the project must be trusted, a human must have approved the tool
-file's exact bytes with `openmax --approve <path>`, `pre_tool_use` hooks and
-permission rules must admit the call, and `approval_mode` still governs
+file's exact bytes with `openmax --approve <path>`, `pre_tool_use` hooks must
+allow the call, permission rules must admit it (`deny` refuses, and so does
+`ask`: nothing here can prompt, so write `effect = "allow"` for a tool whose
+example should run unattended), and `approval_mode` still governs
 `mutating` tools (`readonly` refuses them; `ask` refuses them when the process
 was started from an agent session, because there is nobody to prompt). Each
 refusal prints the command that fixes it. An example that itself runs

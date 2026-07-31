@@ -110,8 +110,10 @@ runs only when all of them admit it:
 - the project is trusted (`openmax --trust-project`);
 - a human approved the tool file's exact bytes (`openmax --approve <path>`);
   editing the file revokes that approval;
-- `pre_tool_use` hooks allow the call, permission rules do not deny it, and
-  `approval_mode` is not `readonly` for a `mutating` tool. A `mutating`
+- `pre_tool_use` hooks allow the call, and permission rules admit it: `deny`
+  refuses, and so does `ask`, because nothing here can prompt - write
+  `effect = "allow"` for a tool whose example should run unattended;
+- `approval_mode` is not `readonly` for a `mutating` tool. A `mutating`
   example under `approval_mode = "ask"` needs a human to start the run, so it
   is refused when the agent loop spawned the process.
 
