@@ -1111,8 +1111,16 @@ fn print_usage_economics() {
             spec.name, "tool", chars, entry.calls, entry.ok, entry.err, ago(entry.last_used)
         );
     }
-    for skill in &registry.skills {
-        let chars = skill.name.len() + skill.description.len() + skill.path.as_os_str().len() + 6;
+    // The same accounting the frozen prompt uses: a skill the index byte cap
+    // dropped costs zero, and pricing it as carried would aim pruning at
+    // tokens nobody is paying.
+    let mut capped_out = 0usize;
+    for (skill, (_, chars)) in
+        registry.skills.iter().zip(open_max_core::prompt::skill_index_costs(&project, &registry.skills))
+    {
+        if chars == 0 {
+            capped_out += 1;
+        }
         let entry = usage.skills.get(&skill.name).cloned().unwrap_or_default();
         println!(
             "{:<24} {:<6} {:>12} {:>7} {:>5} {:>5} {:>10}  -",
@@ -1123,6 +1131,18 @@ fn print_usage_economics() {
         "\nprompt_chars are paid on every request while the extension is installed.\n{} recorded calls total. Delete what you do not use; openmax --ledger keeps the history restorable.",
         usage.total_calls
     );
+    if capped_out > 0 {
+        println!(
+            "{capped_out} skill(s) show 0 prompt_chars: past the index byte cap, so not in the frozen prompt and free until others shrink; the agent cannot see them either (openmax --check names them)."
+        );
+    }
+    if registry.skills_omitted > 0 {
+        println!(
+            "{} more skill(s) were discovered beyond the {}-skill index cap: not listed, not indexed, and costing nothing.",
+            registry.skills_omitted,
+            open_max_core::skills::MAX_SKILLS
+        );
+    }
 }
 
 fn ensure_project_trust(

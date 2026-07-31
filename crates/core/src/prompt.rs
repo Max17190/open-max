@@ -12,7 +12,7 @@ const MAX_MAP_BYTES: usize = 1_200;
 const MAX_MAP_DEPTH: usize = 2;
 /// The skills index is a name+description line per skill; past this it is a
 /// prompt tax, not an index.
-const MAX_SKILLS_BYTES: usize = 3_000;
+pub const MAX_SKILLS_BYTES: usize = 3_000;
 
 /// System prompt deliberately tuned for small local models: short, imperative,
 /// with explicit tool-use rules. Long "constitution"-style prompts measurably
@@ -44,27 +44,25 @@ pub struct PromptBreakdown {
 impl PromptBreakdown {
     /// For resumed sessions the persisted prompt is one opaque string; the
     /// per-tool/skill split still comes from the frozen registry.
-    pub fn from_persisted(system_chars: usize, registry: &Registry) -> Self {
+    pub fn from_persisted(system_chars: usize, registry: &Registry, project_root: &Path) -> Self {
         let mut breakdown = Self {
             components: vec![("system prompt (persisted)".into(), system_chars)],
             ..Default::default()
         };
-        breakdown.add_registry(registry);
+        breakdown.add_registry(registry, project_root);
         breakdown
     }
 
-    fn add_registry(&mut self, registry: &Registry) {
+    fn add_registry(&mut self, registry: &Registry, project_root: &Path) {
         if let Some(entries) = registry.tool_schemas_json().as_array() {
             for (entry, spec) in entries.iter().zip(&registry.tools) {
                 let external = !matches!(spec.kind, crate::registry::ToolKind::Builtin);
                 self.tools.push((spec.name.clone(), entry.to_string().len(), external));
             }
         }
-        for skill in &registry.skills {
-            // The per-skill cost is its index line; the body loads on demand.
-            let line = format!("- {}: {} — {}\n", skill.name, skill.description, skill.path.display());
-            self.skills.push((skill.name.clone(), line.len()));
-        }
+        // The per-skill cost is what the section actually carries: the index
+        // line for a skill under the byte cap, nothing for one past it.
+        self.skills = skill_index_costs(project_root, &registry.skills);
     }
 }
 
@@ -122,7 +120,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         ));
         breakdown.components.push(("tools trailer".into(), prompt.len() - before));
     }
-    breakdown.add_registry(registry);
+    breakdown.add_registry(registry, project_root);
     (prompt, breakdown)
 }
 
@@ -162,18 +160,12 @@ fn skills_section(project_root: &Path, skills: &[SkillSpec], beyond_cap: usize) 
     }
     let mut out = String::new();
     let mut omitted = beyond_cap;
-    for skill in skills {
-        let shown = skill
-            .path
-            .strip_prefix(project_root)
-            .unwrap_or(&skill.path)
-            .display();
-        let line = format!("- {}: {} — {}\n", skill.name, skill.description, shown);
-        if out.len() + line.len() > MAX_SKILLS_BYTES {
+    for (line, included) in skill_index_lines(project_root, skills) {
+        if included {
+            out.push_str(&line);
+        } else {
             omitted += 1;
-            continue;
         }
-        out.push_str(&line);
     }
     if omitted > 0 {
         out.push_str(&format!(
@@ -181,6 +173,59 @@ fn skills_section(project_root: &Path, skills: &[SkillSpec], beyond_cap: usize) 
         ));
     }
     Some(out)
+}
+
+/// One index line per indexed skill, with the byte cap applied exactly as the
+/// section applies it: (line, carried). The single source for both the prompt
+/// text and every cost display, so what is billed is what is spent.
+fn skill_index_lines(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, bool)> {
+    let mut spent = 0usize;
+    let mut out = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let line = format!(
+            "- {}: {} — {}\n",
+            skill.name,
+            skill.description,
+            skill_shown_path(project_root, &skill.path)
+        );
+        let included = spent + line.len() <= MAX_SKILLS_BYTES;
+        if included {
+            spent += line.len();
+        }
+        out.push((line, included));
+    }
+    out
+}
+
+/// The path as the index shows it: project-relative for a project-tier skill,
+/// absolute for a global one. When the root does not strip - a frozen
+/// registry being priced under a root that has since moved or is spelled
+/// differently - a project-tier path still carries its tier directory, which
+/// is exactly where the freeze-time rendering started; falling back to the
+/// absolute path instead would price a line the persisted prompt never held.
+fn skill_shown_path(project_root: &Path, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return relative.display().to_string();
+    }
+    let absolute = path.display().to_string();
+    match absolute.find("/.agents/skills/") {
+        Some(i) => absolute[i + 1..].to_string(),
+        None => absolute,
+    }
+}
+
+/// What the frozen prompt actually spends per indexed skill: the index line's
+/// bytes for a skill the section carries, zero for one the byte cap dropped
+/// (only the omission trailer mentions it). Pricing a dropped skill as if it
+/// were carried sends an agent pruning by cost after tokens nobody is paying.
+pub fn skill_index_costs(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, usize)> {
+    skill_index_lines(project_root, skills)
+        .into_iter()
+        .zip(skills)
+        .map(|((line, included), skill)| {
+            (skill.name.clone(), if included { line.len() } else { 0 })
+        })
+        .collect()
 }
 
 /// Project-level AGENTS.md, capped. The de facto convention for handing
@@ -363,6 +408,87 @@ mod tests {
             total,
             "shown ({shown}) + omitted ({trailer_count}) must cover all {total} skills"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Billing equals spending: a carried skill costs exactly the line the
+    /// prompt shows (project-relative path included), a byte-capped skill
+    /// costs zero, and the resumed-session breakdown agrees with the fresh
+    /// one. Before this held, cap-dropped skills were billed in full and
+    /// paths were priced absolute: +97% per skill, +300% aggregate, aimed at
+    /// an agent told to prune its toolbox by these very numbers.
+    #[test]
+    fn skill_costs_bill_exactly_what_the_index_carries() {
+        let dir = temp_project();
+        let total = 30;
+        for i in 0..total {
+            let skill_dir = dir.join(".agents/skills").join(format!("s{i:03}"));
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: skill-{i:03}\ndescription: {}\n---\nbody\n", "d".repeat(120)),
+            )
+            .unwrap();
+        }
+        let registry = Registry::build(&dir);
+        assert_eq!(registry.skills_omitted, 0, "all under the count cap");
+        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let shown = prompt.matches("\n- skill-").count();
+        assert!(shown > 0 && shown < total, "the byte cap must bite for this test to mean anything");
+
+        let costs = skill_index_costs(&dir, &registry.skills);
+        assert_eq!(breakdown.skills, costs, "the breakdown is the same accounting");
+        assert_eq!(
+            PromptBreakdown::from_persisted(prompt.len(), &registry, &dir).skills,
+            costs,
+            "a resumed session bills like a fresh one"
+        );
+
+        // Carried lines are billed at the exact bytes the prompt spends on
+        // them - relative path, trailing newline, nothing else.
+        let spent: usize =
+            prompt.lines().filter(|l| l.starts_with("- skill-")).map(|l| l.len() + 1).sum();
+        let billed: usize = costs.iter().map(|(_, c)| c).sum();
+        assert_eq!(billed, spent, "billed ({billed}) must equal spent ({spent})");
+        assert_eq!(costs.iter().filter(|(_, c)| *c > 0).count(), shown);
+
+        // A dropped skill is billed nothing and shown nowhere.
+        let (dropped, zero) = costs.last().expect("skills exist");
+        assert_eq!(*zero, 0, "the sorted tail falls past the byte cap");
+        assert!(!prompt.contains(&format!("- {dropped}:")));
+
+        // A carried skill's price is its relative-path line, not the
+        // absolute-path one the old accounting invented.
+        let first = &registry.skills[0];
+        let relative = first.path.strip_prefix(&dir).unwrap();
+        assert_eq!(
+            costs[0].1,
+            format!("- {}: {} — {}\n", first.name, first.description, relative.display()).len()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A frozen registry priced under a root that no longer matches its
+    /// paths (a moved or re-spelled project on resume) must reproduce the
+    /// persisted prompt's accounting, not re-derive different lines: a
+    /// project-tier path still carries `.agents/skills/`, which is where the
+    /// freeze-time rendering started.
+    #[test]
+    fn skill_costs_survive_a_moved_project_root() {
+        let dir = temp_project();
+        for i in 0..3 {
+            let skill_dir = dir.join(".agents/skills").join(format!("m{i}"));
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: moved-{i}\ndescription: d\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let registry = Registry::build(&dir);
+        let at_home = skill_index_costs(&dir, &registry.skills);
+        let moved = skill_index_costs(Path::new("/somewhere/else/entirely"), &registry.skills);
+        assert_eq!(at_home, moved, "pricing must not depend on where the project sits now");
         let _ = std::fs::remove_dir_all(dir);
     }
 
