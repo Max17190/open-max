@@ -1352,7 +1352,15 @@ async fn run_loop(
 
         let result = match result {
             Ok(r) => r,
-            Err(message) => {
+            Err(mut message) => {
+                // A knowingly oversized request that then fails owes the user
+                // the local accounting, not just the provider's opaque error.
+                if used > budget {
+                    message = format!(
+                        "{message}\n{}",
+                        over_budget_error_context(used, schema_tokens, budget, context_tokens)
+                    );
+                }
                 core.send_agent(session_id, AgentEvent::Error { message });
                 stop_reason = "error".into();
                 break 'turns;
@@ -2073,6 +2081,26 @@ fn schemas_exceed_budget(budget: usize, schema_tokens: usize) -> bool {
 /// gap. Either way the session is degraded and says so once.
 fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
     schema_tokens >= prune_target(budget)
+}
+
+/// The context joined to a provider error when the request that failed was
+/// already over budget by local accounting before it went out. A request can
+/// leave here oversized on purpose: `context_tokens` is the user's setting,
+/// not ground truth about the endpoint, so refusing locally would brick
+/// sessions whenever it is stale or conservative for requests the provider
+/// accepts. The price of sending anyway is owed here, where the bet failed:
+/// a raw provider error names nothing the user can act on, and the once-per-
+/// session advisory may be hundreds of turns gone. Phrased as context, not
+/// diagnosis - a dead network also lands in this branch.
+fn over_budget_error_context(
+    used_tokens: usize,
+    schema_tokens: usize,
+    budget: usize,
+    context_tokens: usize,
+) -> String {
+    format!(
+        "this request was over budget before it was sent: ~{used_tokens} tokens ({schema_tokens} of them frozen tool schemas re-sent every request) against a send budget of {budget} (context_tokens {context_tokens} minus response headroom). if the provider refused it for length: uninstall tools (`openmax --spec usage` ranks what each costs) or raise context_tokens to what the endpoint really serves"
+    )
 }
 
 /// `schema_tokens` is the frozen tool schema array's estimated cost: it is
@@ -3251,6 +3279,74 @@ mod tests {
                 .unwrap();
         assert_eq!(end["event"], "turn_end");
         assert_eq!(end["stop_reason"], "error");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A provider rejection of a request local accounting already knew was
+    /// oversized must carry the local numbers, not just the provider's text:
+    /// the once-per-session advisory may be long scrolled away, and "context
+    /// length exceeded" alone does not say which knob to turn.
+    #[tokio::test]
+    async fn provider_error_on_oversized_request_names_the_local_accounting() {
+        use crate::state::Core;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+
+        // A provider that refuses everything the way a too-small window does.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"error":{"message":"maximum context length exceeded"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+            // Small enough that the builtin schemas plus the system prompt
+            // exceed the send budget before the first user word.
+            s.context_tokens = 1200;
+        }
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        start_turn(core.clone(), "sess-overrun".into(), project, "hi".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut error = None;
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Error { message } => error = Some(message),
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let message = error.expect("the failed turn must surface an error");
+        assert!(message.contains("maximum context length exceeded"), "{message}");
+        assert!(message.contains("over budget before it was sent"), "{message}");
+        assert!(message.contains("frozen tool schemas"), "{message}");
+        assert!(message.contains("context_tokens 1200"), "{message}");
+        assert_eq!(stop.as_deref(), Some("error"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
