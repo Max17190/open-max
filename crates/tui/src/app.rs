@@ -1486,11 +1486,13 @@ impl App {
             let builtin = head == "exit"
                 || completion::COMMANDS.iter().any(|spec| spec.name == head);
             // Built-ins win; anything else may be a prompt template, whose
-            // expansion submits as a normal user message.
+            // expansion submits as a normal user message. The expansion itself
+            // is the same helper --print and --stdio submit through, so the
+            // three front ends cannot drift.
             let expanded = if builtin {
                 None
             } else {
-                open_max_core::templates::expand_invocation(&self.project, cmd)
+                open_max_core::templates::expand_slash_line(&self.project, &text)
             };
             match expanded {
                 Some(expanded) => expanded,

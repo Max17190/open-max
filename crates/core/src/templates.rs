@@ -79,6 +79,22 @@ pub fn expand_invocation(project_root: &Path, input: &str) -> Option<String> {
     Some(substitute(body_of(&text), args))
 }
 
+/// Expand a whole submitted line (`/name args...`). Some only when the line
+/// is a slash line naming a template; the front end decides what a None
+/// means (the TUI treats it as a slash command, the others as literal text).
+pub fn expand_slash_line(project_root: &Path, text: &str) -> Option<String> {
+    expand_invocation(project_root, text.strip_prefix('/')?)
+}
+
+/// Expand a leading `/name args` line into its template body, or return the
+/// input unchanged when it is not a slash line or names no template. The
+/// expansion is single-pass: a body that itself starts with `/` is message
+/// content, not another invocation. Every front end that has no slash
+/// commands of its own (`--print`, `--stdio`) submits through this.
+pub fn expand_user_input(project_root: &Path, text: &str) -> String {
+    expand_slash_line(project_root, text).unwrap_or_else(|| text.to_string())
+}
+
 /// Resolve one template by name with a direct path probe, project first.
 /// Never goes through the capped discovery list: MAX_TEMPLATES bounds the
 /// popup index, not which templates can be invoked.
@@ -270,6 +286,31 @@ mod tests {
         let expanded = expand_invocation(&root, "omx-test-issue 42").unwrap();
         assert_eq!(expanded, "Fix issue 42 now.\n");
         assert!(expand_invocation(&root, "omx-test-nosuch 42").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The front-end-agnostic entry point: same expansion in the composer, in
+    /// `--print`, and in a stdio `user` command.
+    #[test]
+    fn expand_user_input_handles_slash_lines_only_and_expands_once() {
+        let root = temp_dir("user-input");
+        let prompts = root.join(".agents").join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        write_template(&prompts, "omx-test-greet", "MARKER: greet $ARGUMENTS\n");
+        // A body that looks like another invocation stays message content.
+        write_template(&prompts, "omx-test-loop", "/omx-test-greet again\n");
+
+        assert_eq!(
+            expand_user_input(&root, "/omx-test-greet world"),
+            "MARKER: greet world\n"
+        );
+        assert_eq!(expand_user_input(&root, "/omx-test-loop"), "/omx-test-greet again\n");
+        // Not a template, not a slash line: unchanged either way.
+        assert_eq!(expand_user_input(&root, "/omx-test-nosuch x"), "/omx-test-nosuch x");
+        assert_eq!(expand_user_input(&root, "plain prompt"), "plain prompt");
+        assert_eq!(expand_user_input(&root, "path /omx-test-greet"), "path /omx-test-greet");
+        assert!(expand_slash_line(&root, "plain prompt").is_none());
+
         let _ = std::fs::remove_dir_all(root);
     }
 

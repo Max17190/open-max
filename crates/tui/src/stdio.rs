@@ -40,6 +40,7 @@ use std::sync::Arc;
 use open_max_core::agent;
 use open_max_core::sessions;
 use open_max_core::state::Core;
+use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -263,6 +264,10 @@ async fn drive<W: Write>(
                             protocol_error(out, "a turn is in flight; wait for done");
                             continue;
                         }
+                        // A `/name args` line expands here exactly as it does
+                        // in the composer: a frontend driving this protocol
+                        // gets the project's templates for free.
+                        let text = templates::expand_user_input(&project, &text);
                         match agent::start_turn(core.clone(), session_id.clone(), project.clone(), text) {
                             Ok(()) => running = true,
                             Err(e) => refuse(out, &session_id, &e),
@@ -793,8 +798,21 @@ mod tests {
 
     /// Drive the protocol loop in-process: commands in, emitted lines out.
     async fn drive_commands(commands: Vec<Command>) -> (Vec<serde_json::Value>, i32, Arc<Core>) {
+        let (lines, code, core, dir) = drive_in_project(|_| {}, commands).await;
+        let _ = std::fs::remove_dir_all(dir);
+        (lines, code, core)
+    }
+
+    /// Same loop, with `prepare` run against the project root (which is also
+    /// the data dir) before the session starts, so a test can plant trust or
+    /// extension files. The caller owns the directory's cleanup.
+    async fn drive_in_project(
+        prepare: impl FnOnce(&std::path::Path),
+        commands: Vec<Command>,
+    ) -> (Vec<serde_json::Value>, i32, Arc<Core>, PathBuf) {
         let dir = crate::test_temp_dir("openmax-stdio");
         let (core, core_rx) = Core::new(dir.clone()).unwrap();
+        prepare(&dir);
         let meta = sessions::create(&core, dir.display().to_string()).unwrap();
         let (tx, rx) = mpsc::channel(64);
         for cmd in commands {
@@ -808,8 +826,45 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
+        (lines, code, core, dir)
+    }
+
+    /// A `/name args` line submitted over the protocol reaches the model as
+    /// the template body, not as the literal slash line: the front end a
+    /// delegate or custom UI drives gets the project's templates too. The
+    /// turn dies at endpoint resolution (nothing is configured), but the
+    /// title is written from the submitted text before that, so it is the
+    /// proof of what was submitted.
+    #[tokio::test]
+    async fn a_template_invocation_expands_before_the_turn_starts() {
+        let (lines, _code, core, dir) = drive_in_project(
+            |root| {
+                open_max_core::trust::trust_project(root, root).unwrap();
+                let prompts = root.join(".agents").join("prompts");
+                std::fs::create_dir_all(&prompts).unwrap();
+                std::fs::write(
+                    prompts.join("omx-stdio-greet.md"),
+                    "MARKER: greet $ARGUMENTS\n",
+                )
+                .unwrap();
+            },
+            vec![Command::User { text: "/omx-stdio-greet world".into() }],
+        )
+        .await;
+
+        let title = sessions::latest(&core, &dir.display().to_string()).unwrap().title;
+        assert_eq!(title, "MARKER: greet world", "the raw slash line must not be submitted");
+        // The turn really started: the only error is the missing endpoint.
+        let errors: Vec<&str> = lines
+            .iter()
+            .filter(|l| l["type"] == "error")
+            .filter_map(|l| l["message"].as_str())
+            .collect();
+        assert!(
+            errors.iter().all(|m| m.contains("no model endpoint configured")),
+            "{errors:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
-        (lines, code, core)
     }
 
     #[tokio::test]
