@@ -182,12 +182,12 @@ fn skill_index_lines(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, 
     let mut spent = 0usize;
     let mut out = Vec::with_capacity(skills.len());
     for skill in skills {
-        let shown = skill
-            .path
-            .strip_prefix(project_root)
-            .unwrap_or(&skill.path)
-            .display();
-        let line = format!("- {}: {} — {}\n", skill.name, skill.description, shown);
+        let line = format!(
+            "- {}: {} — {}\n",
+            skill.name,
+            skill.description,
+            skill_shown_path(project_root, &skill.path)
+        );
         let included = spent + line.len() <= MAX_SKILLS_BYTES;
         if included {
             spent += line.len();
@@ -195,6 +195,23 @@ fn skill_index_lines(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, 
         out.push((line, included));
     }
     out
+}
+
+/// The path as the index shows it: project-relative for a project-tier skill,
+/// absolute for a global one. When the root does not strip - a frozen
+/// registry being priced under a root that has since moved or is spelled
+/// differently - a project-tier path still carries its tier directory, which
+/// is exactly where the freeze-time rendering started; falling back to the
+/// absolute path instead would price a line the persisted prompt never held.
+fn skill_shown_path(project_root: &Path, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return relative.display().to_string();
+    }
+    let absolute = path.display().to_string();
+    match absolute.find("/.agents/skills/") {
+        Some(i) => absolute[i + 1..].to_string(),
+        None => absolute,
+    }
 }
 
 /// What the frozen prompt actually spends per indexed skill: the index line's
@@ -448,6 +465,30 @@ mod tests {
             costs[0].1,
             format!("- {}: {} — {}\n", first.name, first.description, relative.display()).len()
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A frozen registry priced under a root that no longer matches its
+    /// paths (a moved or re-spelled project on resume) must reproduce the
+    /// persisted prompt's accounting, not re-derive different lines: a
+    /// project-tier path still carries `.agents/skills/`, which is where the
+    /// freeze-time rendering started.
+    #[test]
+    fn skill_costs_survive_a_moved_project_root() {
+        let dir = temp_project();
+        for i in 0..3 {
+            let skill_dir = dir.join(".agents/skills").join(format!("m{i}"));
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: moved-{i}\ndescription: d\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let registry = Registry::build(&dir);
+        let at_home = skill_index_costs(&dir, &registry.skills);
+        let moved = skill_index_costs(Path::new("/somewhere/else/entirely"), &registry.skills);
+        assert_eq!(at_home, moved, "pricing must not depend on where the project sits now");
         let _ = std::fs::remove_dir_all(dir);
     }
 
