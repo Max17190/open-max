@@ -275,7 +275,10 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
                 .and_then(|m| m.content.as_deref())
                 .map(str::len)
                 .unwrap_or(0);
-            (Arc::new(PromptBreakdown::from_persisted(system_chars, &registry)), count)
+            (
+                Arc::new(PromptBreakdown::from_persisted(system_chars, &registry, project_root)),
+                count,
+            )
         };
         SessionData {
             messages,

@@ -191,6 +191,25 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
     mark_shadowed(&mut skills_found, false);
+    mark_beyond_cap(&mut skills_found, crate::skills::MAX_SKILLS, |_| true, "skill cap");
+    // The index byte cap drops whole lines from the frozen prompt: a skill
+    // past it parses fine, but the model never sees its name, so nothing can
+    // ever invoke it. Reproduce the exact accounting the prompt uses, and
+    // name each dropped skill rather than let it read as healthy.
+    let indexed = crate::skills::discover(project_root);
+    for (name, chars) in crate::prompt::skill_index_costs(project_root, &indexed) {
+        if chars > 0 {
+            continue;
+        }
+        for (f, id) in skills_found.iter_mut() {
+            if id.as_deref() == Some(name.as_str()) && matches!(f.status, Status::Ok(_)) {
+                f.status = Status::Warn(format!(
+                    "'{name}' parses but is not in the frozen skills index: the {}-byte index budget fills before it, so the model cannot see or invoke it; shorten earlier descriptions or delete skills",
+                    crate::prompt::MAX_SKILLS_BYTES
+                ));
+            }
+        }
+    }
     findings.extend(skills_found.into_iter().map(|(f, _)| f));
 
     let mut templates_found: Vec<Entry> = Vec::new();
@@ -1240,6 +1259,42 @@ mod tests {
             !crate::ledger::forget_capability(&data, &root, &hook).unwrap(),
             "forgetting twice reports that nothing was recorded"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A skill the model cannot see must not read as healthy: past the count
+    /// cap it never loads (an error, like tools), and past the index byte cap
+    /// the model cannot name it to invoke it (a warning naming the budget
+    /// that filled first). Before this, both read as `ok` while the model
+    /// silently lacked them.
+    #[test]
+    fn skills_past_either_cap_are_named() {
+        let root = temp_project();
+        let total = crate::skills::MAX_SKILLS + 2;
+        for i in 0..total {
+            // `aaa-` sorts ahead of any global skill a developer machine may
+            // have, so the cap ranking below is deterministic everywhere.
+            write(
+                root.join(".agents/skills").join(format!("s{i:03}")).join("SKILL.md"),
+                &format!("---\nname: aaa-skill-{i:03}\ndescription: {}\n---\nbody\n", "d".repeat(120)),
+            );
+        }
+        let findings = local(&root);
+        match &find(&findings, "s000/SKILL.md").status {
+            Status::Ok(_) => {}
+            other => panic!("a carried skill stays healthy: {other:?}"),
+        }
+        match &find(&findings, "s025/SKILL.md").status {
+            Status::Warn(reason) => {
+                assert!(reason.contains("frozen skills index"), "{reason}");
+                assert!(reason.contains("cannot see or invoke"), "{reason}");
+            }
+            other => panic!("a byte-capped skill must warn: {other:?}"),
+        }
+        match &find(&findings, &format!("s{:03}/SKILL.md", total - 1)).status {
+            Status::Err(reason) => assert!(reason.contains("skill cap"), "{reason}"),
+            other => panic!("a count-capped skill must be an error: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
