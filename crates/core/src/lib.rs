@@ -14,6 +14,7 @@ pub mod memory;
 pub mod permissions;
 pub mod prompt;
 pub mod providers;
+pub mod recall;
 pub mod registry;
 pub mod sessions;
 pub mod skills;

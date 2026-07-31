@@ -478,6 +478,27 @@ re-freeze; a memory written mid-session is already known to its author and
 enters the index from the next session. Verify what you wrote with
 `openmax --check` (it names every ignored file and why, and what the index
 currently shows).
+
+## Recall
+
+`openmax --recall "<query>"` (run it with bash) searches this project's own
+history - session transcripts, compaction archives, compaction digests,
+session titles, and memory files - and prints ranked excerpts, each citing
+the file that holds the full record. Read-only and project-scoped: no
+session, no endpoint, no derived index. The stores on disk are scanned
+directly, newest sessions first, up to a 64 MB ceiling; anything skipped is
+counted in the report, never silent.
+
+Query syntax: plain terms, plus
+- `path:<substr>`: keep only history that touched a matching file path
+  (structured compaction-record paths, or a literal text/source match).
+- `k:<n>`: ranked results to print (default 8, max 50).
+- `budget:<tokens>`: output token cap (default 2000, max 20000).
+
+Ranking fuses BM25 lexical relevance with the same recency law the memory
+index uses (`age_hours^-0.5`), added with equal weight. System prompts never
+match, identical excerpts deduplicate, and `--json` emits the structured
+report for tooling.
 "#;
 
 const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)

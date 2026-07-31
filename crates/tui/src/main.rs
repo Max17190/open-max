@@ -32,6 +32,11 @@ options:
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
+      --recall <query>   search this project's past sessions, archives,
+                         compaction digests, and memories; prints ranked,
+                         cited excerpts. Query syntax: plain terms plus
+                         path:<substr>, k:<n>, budget:<tokens>; --json for
+                         structured output
       --ledger           print the capability-file history for this project
       --ledger-repair    quarantine an unverifiable ledger log (nothing is
                          deleted) and start a new chain; approvals in the
@@ -82,6 +87,9 @@ struct CliArgs {
     approve: Option<String>,
     forget: Option<String>,
     ledger: bool,
+    /// Query string for `--recall`: ranked search over this project's own
+    /// session history and memories.
+    recall: Option<String>,
     /// Quarantine an unverifiable ledger log and start a new chain.
     ledger_repair: bool,
     /// Adopt a pre-chain `approved.json` into the chain (a human act).
@@ -116,6 +124,7 @@ where
         approve: None,
         forget: None,
         ledger: false,
+        recall: None,
         ledger_repair: false,
         adopt_approvals: false,
         spec: None,
@@ -144,6 +153,7 @@ where
             Long("approve") => out.approve = Some(parser.value()?.string()?),
             Long("forget") => out.forget = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
+            Long("recall") => out.recall = Some(parser.value()?.string()?),
             Long("ledger-repair") => out.ledger_repair = true,
             Long("adopt-approvals") => out.adopt_approvals = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
@@ -199,8 +209,26 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    if cli.json && !cli.print && !cli.check {
-        eprintln!("openmax: --json requires --print or --check\n\n{HELP}");
+    if cli.json && !cli.print && !cli.check && cli.recall.is_none() {
+        eprintln!("openmax: --json requires --print, --check, or --recall\n\n{HELP}");
+        std::process::exit(2);
+    }
+    // --recall prints one report and exits, like --spec: swallowing another
+    // requested operation would look like success for work that never ran.
+    if cli.recall.is_some()
+        && (cli.check
+            || cli.stdio
+            || cli.print
+            || cli.run_examples
+            || cli.trust_project
+            || cli.continue_session
+            || cli.ledger
+            || cli.spec.is_some()
+            || cli.model.is_some()
+            || cli.provider.is_some()
+            || !cli.prompts.is_empty())
+    {
+        eprintln!("openmax: --recall is a standalone operation; run other options separately\n\n{HELP}");
         std::process::exit(2);
     }
     if cli.stdio && (cli.print || !cli.prompts.is_empty()) {
@@ -256,6 +284,37 @@ async fn main() -> std::io::Result<()> {
                     "openmax: unknown spec surface '{surface}'; available: {}",
                     open_max_core::spec::SURFACES.join(", ")
                 );
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if let Some(query) = &cli.recall {
+        // Read-only introspection, like --ledger: no session, no endpoint,
+        // no trust gate. Recall only ever surfaces this project's own history
+        // (the session index is keyed by project), and the project key is the
+        // same raw current_dir form session creation stores.
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match open_max_core::state::Core::new(default_data_dir()) {
+            Ok((core, _rx)) => match open_max_core::recall::recall(&core, &project, query) {
+                Ok(report) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&report).unwrap_or_else(|_| "{}".into())
+                        );
+                    } else {
+                        print!("{}", open_max_core::recall::render(&report));
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("openmax: {e}");
+                    std::process::exit(2);
+                }
+            },
+            Err(e) => {
+                eprintln!("openmax: {e}");
                 std::process::exit(2);
             }
         }

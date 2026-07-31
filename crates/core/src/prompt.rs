@@ -160,7 +160,7 @@ Working files (there is no built-in plan mode or todo list):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
 - TODO.md: the running task list; check items off as you finish.\n\
 - AGENTS.md: standing project instructions; keep it short (loads at session create and on /reload).\n\
-- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line becomes an index line in future sessions. Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory.";
+- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line becomes an index line in future sessions. Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -370,6 +370,7 @@ mod tests {
         assert!(prompt.contains(".openmax/memory/<name>.md"));
         assert!(prompt.contains("fade from the index"));
         assert!(prompt.contains("openmax --spec memory"));
+        assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
         assert!(prompt.contains("on /reload"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -579,6 +580,13 @@ mod tests {
     /// tracks ~1200 tokens. The old guide taught "there is no memory", which
     /// held the agent to AGENTS.md hand-editing; ~20 real tokens is the price
     /// of the index being discoverable at all.
+    ///
+    /// Raised from 5280 to 5360 (2026-07-31): the memory line now points at
+    /// `openmax --recall` (+79 chars). Re-measured: 1214 tokens on
+    /// o200k_base, 1191 on cl100k_base at 5312 path-free chars. Preserved
+    /// history the agent cannot find is a promise, not a capability; 18 real
+    /// tokens buys the pointer that makes archives and past sessions
+    /// searchable instead of merely stored.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -605,8 +613,8 @@ mod tests {
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
         assert!(
-            total <= 5_280,
-            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5280 ≈ 1200 tokens with a typical checkout path)",
+            total <= 5_360,
+            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5360 ≈ 1215 tokens with a typical checkout path)",
         );
         let _ = std::fs::remove_dir_all(dir);
     }

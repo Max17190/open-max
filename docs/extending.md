@@ -68,6 +68,16 @@ deleted at the next session creation, leaving a tombstone line (name, sha256,
 description) in the log. No memories, no section, zero prompt cost. Full
 contract: `openmax --spec memory`.
 
+Everything the harness preserves is also searchable:
+`openmax --recall "<query>"` scans this project's session transcripts,
+compaction archives, compaction digests, session titles, and memory files,
+and prints ranked excerpts, each citing the file that holds the full record.
+Ranking fuses BM25 lexical relevance with the same recency law the memory
+index uses; `path:<substr>` narrows to history that touched a file,
+`k:<n>` and `budget:<tokens>` bound the output, and `--json` emits the
+structured report. Read-only, project-scoped, no index to maintain: the
+stores on disk stay the single source of truth.
+
 ```
 .openmax/memory/deploy-port.md
 # The staging deploy port is 7443 (set 2026-07-31)
