@@ -81,6 +81,13 @@ resolving to no file at all is covered by nothing, so the tool asks until it
 exists. `openmax --approve <tool.toml>` approves the pair up front and prints
 every path and hash it blessed.
 
+Binding reaches the files a manifest *names*. A command handed a program on
+its own command line (`python3 -c "..."`, `sh -c "..."`) has that program text
+bound - it is part of the manifest - but anything the program opens while it
+runs is chosen at runtime and is not. Put the program in a project file and
+name it in `args`, and its bytes are covered too; `openmax --check` warns when
+inline text reads a project file.
+
 Example (`.openmax/tools/todo_scan.toml`):
 
 ```toml
@@ -269,7 +276,11 @@ the in-session write of either file approves those bytes. A `command` outside
 the project root (an absolute path, a name on PATH) is covered by the manifest
 approval alone: that path is what the human read, and system binaries change
 on their own schedule. The bytes are re-checked before every run, so a script
-rewritten mid-turn does not run.
+rewritten mid-turn does not run. Inline program text (`command = "sh", args =
+["-c", "..."]`) is bound as text and no further: what that program opens at
+runtime is not covered, so a gate written that way can be defanged by editing
+the file it sources. Name a script in `args` instead - `openmax --check` warns
+when inline text reads a project file.
 
 Fail closed, four ways, all reported by `openmax --check`:
 - A hook file that exists but does not parse blocks every tool until it is
@@ -295,10 +306,13 @@ Fail closed, four ways, all reported by `openmax --check`:
   refuses without an interactive terminal, then asks for the path typed back.
   Read that as a speed bump, not a boundary: it removes the one-command
   bypass, but an attacker holding `bash` can still allocate a pty to answer
-  the prompt, and can more cheaply delete the approval store itself. Without
-  an OS sandbox nothing here survives an agent that is determined and has a
-  shell; what the harness guarantees is that the easy path is closed and the
-  state is visible.
+  the prompt. What it can no longer do is edit the approval store: approvals
+  are records in the ledger's hash chain, so writing one outside the harness
+  reads as tamper and grants nothing. Erasing the whole ledger directory still
+  works, and surrenders every approval - fail closed, so gates stop running
+  rather than start. Without an OS sandbox nothing here survives an agent that
+  is determined and has a shell; what the harness guarantees is that the easy
+  path is closed and the state is visible.
 - A `command` (or `args` path) that resolves to no file at all is not covered
   by anything: there is nothing to approve, so the hook does not load. Install
   or create it, then approve.

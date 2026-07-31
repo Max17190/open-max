@@ -189,9 +189,28 @@ refusal prints the command that fixes it. An example that itself runs
 
 ## Content-bound approvals
 
-The ledger's approval store (`approved.json`, beside the log) holds sha256
-hashes a human has approved. Approval binds to content, never to a path: any
-edit produces a new hash and revokes itself.
+An approval is a record in the hash-chained ledger below, holding the sha256
+hashes a human approved and the path they approved them at. Approval binds to
+content, never to a path: any edit produces a new hash and revokes itself.
+Living in the chain is the point: an approval store beside the log, with none
+of the log's protection, would be approvable by anything that can append a
+line of JSON - including the agent's own `bash`. Forging one now means forging
+the chain, which reads as tampering, and every real approval shows up in
+`openmax --ledger` with its time and actor.
+
+Upgrading from a release that kept approvals in `approved.json` is therefore a
+one-time human step, not a silent conversion: a file carrying no evidence of
+its own is exactly what this design refuses to treat as authority, and the
+harness cannot tell an inherited store from one an agent wrote last night.
+Until you run `openmax --adopt-approvals` - which prints what the file claims,
+then asks at an interactive terminal, like `--forget` - nothing in it is in
+effect. Your confirmation binds to the exact bytes previewed (their sha256 is
+printed with the summary): a file rewritten while the prompt waits is a
+different store, and adoption refuses it rather than import bytes nobody saw. The interim is fail-closed rather than permissive: the paths it says
+held capabilities are still honored *as restrictions*, so a gate you installed
+before the upgrade blocks tool calls (and `openmax --check` says why) instead
+of quietly going inert. Deleting the file instead of adopting it is a complete
+answer too; re-approve whatever you still want with `openmax --approve`.
 
 What gets hashed is the whole definition, not just the manifest. A tool or
 hook TOML is a pointer: the file its `command` names (or a path in its `args`)
@@ -204,6 +223,19 @@ host binaries would revoke on every OS upgrade. The threat model is the agent
 rewriting files it can write, not the system changing underneath. Paths are
 resolved before that decision, so neither `../` nor a symlink moves a file to
 the other side of it.
+
+Binding reaches the files a manifest **names**, which is where its honesty
+ends. A command handed a program on its own command line - `python3 -c "..."`,
+`sh -c "..."` - has that program bound as text, because the text lives in the
+manifest a human read; but whatever the program opens while it runs is chosen
+at runtime and is not covered. `python3 -c "exec(open('payload.py').read())"`
+hashes completely and still executes bytes nobody approved. Parsing
+interpreter source to chase those reads would buy false confidence, so the
+harness does not pretend to: put the program in a project file and name it in
+`args`, and its bytes are bound like any other code. `openmax --check` warns
+when inline text names a project file that exists, which is the cheap and
+specific half of the problem; a program that computes its target at runtime is
+beyond what any static check can promise.
 
 A command that resolves to *no* file is a third case, and it refuses: an empty
 binding means "this is a system path the human read", never "nothing resolved,
@@ -242,13 +274,19 @@ Three hard rules ride on this, with no rule language to widen them:
   an agent cannot get past them.** They close the one-command bypass (`unset
   OPENMAX_SESSION; openmax --forget <path>`), and that is all they close. An
   attacker who allocates a pty and answers the prompt still retires the
-  approval - about twenty lines of Python, measured, not assumed. It is not
-  even the cheapest route left: `bash` runs unconfined, so deleting
-  `approved.json` clears every fail-closed state in one command. **Nothing in
-  this design survives an agent with a shell that is determined to remove a
-  gate; only an OS sandbox would.** What the guards buy is narrower and worth
-  stating exactly: removal cannot happen by accident or in a single step, and
-  every state it leaves behind is visible in `openmax --check`.
+  approval - about twenty lines of Python, measured, not assumed. What is no
+  longer cheaper than that is editing the approval store: approvals live in
+  the hash chain now, so appending, rewriting, or truncating one reads as
+  tamper and fails closed toward `--ledger-repair` rather than granting
+  anything. What a shell can still do outright is erase the whole ledger
+  directory, which is indistinguishable from a project the harness has never
+  seen: that surrenders every approval (fail closed, so gates stop running
+  rather than start) and costs the project the memory that a gate ever
+  existed. **Nothing in this design survives an agent with a shell that is
+  determined to remove a gate; only an OS sandbox would.** What the guards buy
+  is narrower and worth stating exactly: removal cannot happen by accident or
+  in a single step, and every state it leaves behind is visible in
+  `openmax --check`.
 - An unapproved hook is inert, and a *revoked* gate hook fails closed. Hooks
   run with host authority on every matching call with no per-invocation gate,
   so they never load until approved. Content nobody ever approved never ran,
@@ -285,11 +323,30 @@ ledger lives outside the project, where the confined file tools never write,
 and each record chains the hash of the previous one, so tampering through the
 shell is detectable.
 
+Beside the log sits `chain-head`, the hash of its final record. The chain
+alone proves internal order but not completeness - lopping off trailing
+records leaves a valid prefix - so the pin is what makes truncation
+detectable, and a log without one cannot be verified at all. Deleting either
+file therefore reads as tampering, not as a fresh project. An append writes a
+pending pin first, flushes the records, then moves the pin, so a crash
+mid-append leaves a state that reads as an interrupted write (nothing was
+removed) and re-pins itself on the next change, rather than an accusation.
+
 Every re-freeze announces a receipt - the `refrozen` event lists what changed
 and who changed it - so the agent's action space never mutates silently.
-`openmax --ledger` prints the history with object paths; restoring an earlier
-version is an ordinary `cp` from the objects directory. There is no rollback
-command: the core guarantees the history exists, using it stays file work.
+`openmax --ledger` prints the history with object paths, human times, the
+session that observed each change, and every approval; it verifies each object
+against its own hash, so a rewritten one is named instead of silently offered
+for restore. Restoring an earlier version is an ordinary `cp` from the objects
+directory. There is no rollback command: the core guarantees the history
+exists, using it stays file work.
+
+A ledger that cannot be verified stops appending (a chain nobody can trust
+must not be extended) and revokes every approval it held, but never blocks a
+turn: the failure rides the refreeze receipt. `openmax --ledger-repair` is the
+way back - a human action, refused inside agent-spawned processes, that
+quarantines the damaged log as evidence, keeps the objects, and starts a new
+chain. Approvals in that log go with it and have to be granted again.
 
 ## Self-measurement
 

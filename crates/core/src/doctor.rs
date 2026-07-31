@@ -376,9 +376,65 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         });
     }
 
+    // An inherited approval store explains, in one line, why a capability that
+    // worked yesterday now asks or fails closed. Without it the hook findings
+    // above read as "its content changed" for content nobody touched.
+    if let Some(pending) = crate::ledger::pending_legacy(data_dir, project_root) {
+        let status = if pending.malformed {
+            Status::Err(
+                "an inherited approval store that does not parse: nothing in it is in effect, and it cannot be adopted until it is fixed or deleted".into(),
+            )
+        } else {
+            Status::Err(format!(
+                "an approval store inherited from an older release: {} hash(es) and {} remembered hook shape(s) are NOT in effect, so approvals here ask again and a capability it says was installed fails closed. `openmax --adopt-approvals` inherits it after showing you what it claims; deleting the file discards it",
+                pending.hashes, pending.shapes
+            ))
+        };
+        findings.push(Finding { kind: "approvals", path: pending.path, status });
+    }
+
+    findings.extend(inline_program_findings(project_root));
     findings.extend(unread_paths(project_root));
     findings.extend(hygiene_findings(project_root, data_dir, &tool_meta, &skill_meta));
     findings
+}
+
+/// Warn where approval's reach ends: a manifest that hands an interpreter a
+/// program on the command line binds that text, but not the project file the
+/// text opens while it runs. Only flagged when the inline program actually
+/// names a file that exists here - a warning that fired on every `sh -c` would
+/// teach authors to skip warnings.
+fn inline_program_findings(project_root: &Path) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut warn = |kind: &'static str, path: PathBuf, command: &str, args: &[String]| {
+        if let Some(read) = crate::ledger::inline_program_read(command, args, project_root) {
+            let named = read.strip_prefix(project_root).unwrap_or(&read).display().to_string();
+            out.push(Finding {
+                kind,
+                path,
+                status: Status::Warn(format!(
+                    "its inline program reads {named} at runtime, and approval does not cover that file: only this manifest's text is bound. move the program into {named} and name it in `args` so its bytes are approved too"
+                )),
+            });
+        }
+    };
+    for dir in crate::registry::external_tool_dirs(project_root) {
+        for path in files_with_extension(&dir, "toml") {
+            if let Ok(spec) = crate::registry::parse_tool_file(&path) {
+                if let crate::registry::ToolKind::External(ext) = &spec.kind {
+                    warn("tool", path.clone(), &ext.command, &ext.args);
+                }
+            }
+        }
+    }
+    for dir in crate::hooks::hook_dirs(project_root) {
+        for path in files_with_extension(&dir, "toml") {
+            if let Ok(hook) = crate::hooks::parse_hook_file(&path) {
+                warn("hook", path.clone(), &hook.command, &hook.args);
+            }
+        }
+    }
+    out
 }
 
 /// One declared example and what running it proved. `path` is the tool file
