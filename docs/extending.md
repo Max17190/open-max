@@ -204,7 +204,9 @@ its own is exactly what this design refuses to treat as authority, and the
 harness cannot tell an inherited store from one an agent wrote last night.
 Until you run `openmax --adopt-approvals` - which prints what the file claims,
 then asks at an interactive terminal, like `--forget` - nothing in it is in
-effect. The interim is fail-closed rather than permissive: the paths it says
+effect. Your confirmation binds to the exact bytes previewed (their sha256 is
+printed with the summary): a file rewritten while the prompt waits is a
+different store, and adoption refuses it rather than import bytes nobody saw. The interim is fail-closed rather than permissive: the paths it says
 held capabilities are still honored *as restrictions*, so a gate you installed
 before the upgrade blocks tool calls (and `openmax --check` says why) instead
 of quietly going inert. Deleting the file instead of adopting it is a complete

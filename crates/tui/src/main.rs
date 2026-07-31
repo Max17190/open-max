@@ -587,6 +587,10 @@ async fn main() -> std::io::Result<()> {
             "nothing in it is in effect: {} content hash(es) and {} remembered hook shape(s) are waiting on you.",
             pending.hashes, pending.shapes
         );
+        println!(
+            "the file as shown is sha256 {}; adoption imports exactly these bytes or nothing.",
+            pending.sha256
+        );
         for path in &pending.paths {
             println!("  it says a capability was installed at {}", path.display());
         }
@@ -607,7 +611,7 @@ async fn main() -> std::io::Result<()> {
             eprintln!("openmax: confirmation did not match; nothing was adopted");
             std::process::exit(1);
         }
-        match open_max_core::ledger::adopt_legacy_approvals(&data_dir, &project) {
+        match open_max_core::ledger::adopt_legacy_approvals(&data_dir, &project, &pending.sha256) {
             Ok(adopted) => {
                 println!(
                     "adopted {} hash(es), {} path(s), {} hook shape(s) into the chain; `openmax --ledger` lists them",
