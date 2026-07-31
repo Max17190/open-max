@@ -198,6 +198,18 @@ line of JSON - including the agent's own `bash`. Forging one now means forging
 the chain, which reads as tampering, and every real approval shows up in
 `openmax --ledger` with its time and actor.
 
+Upgrading from a release that kept approvals in `approved.json` is therefore a
+one-time human step, not a silent conversion: a file carrying no evidence of
+its own is exactly what this design refuses to treat as authority, and the
+harness cannot tell an inherited store from one an agent wrote last night.
+Until you run `openmax --adopt-approvals` - which prints what the file claims,
+then asks at an interactive terminal, like `--forget` - nothing in it is in
+effect. The interim is fail-closed rather than permissive: the paths it says
+held capabilities are still honored *as restrictions*, so a gate you installed
+before the upgrade blocks tool calls (and `openmax --check` says why) instead
+of quietly going inert. Deleting the file instead of adopting it is a complete
+answer too; re-approve whatever you still want with `openmax --approve`.
+
 What gets hashed is the whole definition, not just the manifest. A tool or
 hook TOML is a pointer: the file its `command` names (or a path in its `args`)
 is what actually executes, and it sits at an ordinary project path the agent
@@ -209,6 +221,19 @@ host binaries would revoke on every OS upgrade. The threat model is the agent
 rewriting files it can write, not the system changing underneath. Paths are
 resolved before that decision, so neither `../` nor a symlink moves a file to
 the other side of it.
+
+Binding reaches the files a manifest **names**, which is where its honesty
+ends. A command handed a program on its own command line - `python3 -c "..."`,
+`sh -c "..."` - has that program bound as text, because the text lives in the
+manifest a human read; but whatever the program opens while it runs is chosen
+at runtime and is not covered. `python3 -c "exec(open('payload.py').read())"`
+hashes completely and still executes bytes nobody approved. Parsing
+interpreter source to chase those reads would buy false confidence, so the
+harness does not pretend to: put the program in a project file and name it in
+`args`, and its bytes are bound like any other code. `openmax --check` warns
+when inline text names a project file that exists, which is the cheap and
+specific half of the problem; a program that computes its target at runtime is
+beyond what any static check can promise.
 
 A command that resolves to *no* file is a third case, and it refuses: an empty
 binding means "this is a system path the human read", never "nothing resolved,

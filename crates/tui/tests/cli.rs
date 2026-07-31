@@ -296,6 +296,68 @@ fn forget_refuses_without_a_human_at_a_terminal() {
     );
 }
 
+/// An approval store inherited from a release that kept them in a plain file
+/// is not authority until a human says so: nothing in it takes effect, it
+/// survives being read, and adopting it is guarded like every other command
+/// that moves authority. The adoption itself is proven at the unit level,
+/// where no confirmation prompt stands in the way.
+#[test]
+fn an_inherited_approval_store_waits_for_a_human() {
+    use open_max_core::ledger::sha256_hex;
+    let (project, home) = fresh_dirs("adopt");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let gate = hooks.join("gate.toml");
+    std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/usr/bin/true\"\n").unwrap();
+    let sha = sha256_hex(&std::fs::read(&gate).unwrap());
+
+    // Seed this project's ledger so the test knows which directory is its
+    // own, then rewrite it into what the released build would have left: a
+    // v1 chained log plus a plain store beside it.
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let dir = std::fs::read_dir(home.join(".openmax").join("ledger"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join("log.jsonl").exists())
+        .expect("a seeded ledger");
+    let record = format!(
+        "{{\"v\":1,\"ts\":1,\"path\":{},\"sha256\":\"{sha}\",\"actor\":\"initial\",\"prev\":\"\"}}",
+        serde_json::to_string(&gate.display().to_string()).unwrap()
+    );
+    std::fs::write(dir.join("log.jsonl"), format!("{record}\n")).unwrap();
+    std::fs::write(dir.join("chain-head"), sha256_hex(record.as_bytes())).unwrap();
+    let _ = std::fs::remove_file(dir.join("chain-head.pending"));
+    std::fs::write(
+        dir.join("approved.json"),
+        format!("{{\"version\":1,\"hashes\":[\"{sha}\"],\"paths\":[]}}"),
+    )
+    .unwrap();
+
+    let out = cmd(&project, &home).arg("--check").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(out.status.code(), Some(1), "an unadopted store is not in effect: {stdout}");
+    assert!(stdout.contains("--adopt-approvals"), "the way in must be named: {stdout}");
+    assert!(dir.join("approved.json").exists(), "a read must not consume it");
+
+    let out = cmd(&project, &home)
+        .arg("--adopt-approvals")
+        .env("OPENMAX_SESSION", "s-1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "an agent session must not adopt");
+
+    let out = cmd(&project, &home).arg("--adopt-approvals").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "no terminal, no adoption: {stdout}");
+    assert!(stdout.contains("nothing in it is in effect"), "{stdout}");
+    assert!(dir.join("approved.json").exists(), "a refusal must not consume it either");
+}
+
 /// A ledger nobody can verify refuses to be read as history and names the
 /// way back - which is a human at an interactive terminal: agent sessions
 /// and terminal-less runs are both refused, and the fail-closed state

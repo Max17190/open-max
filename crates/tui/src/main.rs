@@ -36,6 +36,9 @@ options:
       --ledger-repair    quarantine an unverifiable ledger log (nothing is
                          deleted) and start a new chain; approvals in the
                          quarantined log must be granted again
+      --adopt-approvals  adopt an approval store inherited from a release that
+                         kept them in a plain file; until then nothing in it is
+                         in effect
       --approve <path>   approve the exact current content of a capability file
                          and of the project-local code it runs
       --forget <path>    stop expecting an approved capability file to exist
@@ -81,6 +84,8 @@ struct CliArgs {
     ledger: bool,
     /// Quarantine an unverifiable ledger log and start a new chain.
     ledger_repair: bool,
+    /// Adopt a pre-chain `approved.json` into the chain (a human act).
+    adopt_approvals: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
     trust_project: bool,
@@ -112,6 +117,7 @@ where
         forget: None,
         ledger: false,
         ledger_repair: false,
+        adopt_approvals: false,
         spec: None,
         trust_project: false,
         prompts: Vec::new(),
@@ -139,6 +145,7 @@ where
             Long("forget") => out.forget = Some(parser.value()?.string()?),
             Long("ledger") => out.ledger = true,
             Long("ledger-repair") => out.ledger_repair = true,
+            Long("adopt-approvals") => out.adopt_approvals = true,
             Long("spec") => out.spec = Some(parser.value()?.string()?),
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
@@ -258,6 +265,12 @@ async fn main() -> std::io::Result<()> {
         // Read-only history, like --check: no session, no endpoint, no trust.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let data_dir = default_data_dir();
+        if let Some(pending) = open_max_core::ledger::pending_legacy(&data_dir, &project) {
+            println!(
+                "{} holds approvals from a release that kept them in a plain file. nothing in it is in effect; `openmax --adopt-approvals` inherits it, deleting it discards it.\n",
+                pending.path.display()
+            );
+        }
         match open_max_core::ledger::read(&data_dir, &project) {
             Ok(history) if history.records.is_empty() => {
                 println!("no capability-file history for this project yet");
@@ -535,6 +548,71 @@ async fn main() -> std::io::Result<()> {
                 if !code.is_empty() {
                     println!("editing either revokes this approval; re-run --approve after any change");
                 }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openmax: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if cli.adopt_approvals {
+        // Adoption turns a file nobody can authenticate into records the chain
+        // vouches for. Only a human can make that claim - the store carries no
+        // evidence of its own - so it is guarded exactly like the other two
+        // commands that move authority, and for the same honest ceiling.
+        if std::env::var_os("OPENMAX_SESSION").is_some() {
+            eprintln!(
+                "openmax: adopting approvals is a human action: this process was started from an agent session; ask the user to run `openmax --adopt-approvals`"
+            );
+            std::process::exit(3);
+        }
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let data_dir = default_data_dir();
+        let Some(pending) = open_max_core::ledger::pending_legacy(&data_dir, &project) else {
+            println!("no inherited approval store is waiting for this project");
+            std::process::exit(0);
+        };
+        if pending.malformed {
+            eprintln!(
+                "openmax: {} does not parse, so there is nothing a human can vouch for; fix it or delete it",
+                pending.path.display()
+            );
+            std::process::exit(1);
+        }
+        // A human cannot vouch for bytes they were not shown, so show them.
+        println!("{} was written by a release that kept approvals in a plain file.", pending.path.display());
+        println!(
+            "nothing in it is in effect: {} content hash(es) and {} remembered hook shape(s) are waiting on you.",
+            pending.hashes, pending.shapes
+        );
+        for path in &pending.paths {
+            println!("  it says a capability was installed at {}", path.display());
+        }
+        println!(
+            "adopting copies all of it into this project's hash chain as `initial` - provenance it cannot prove."
+        );
+        println!("if you did not install these, delete that file instead; nothing is lost that a human can vouch for.");
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!(
+                "openmax: --adopt-approvals grants authority a file cannot prove, so it only runs at an interactive terminal"
+            );
+            std::process::exit(3);
+        }
+        print!("type `adopt` to confirm: ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "adopt" {
+            eprintln!("openmax: confirmation did not match; nothing was adopted");
+            std::process::exit(1);
+        }
+        match open_max_core::ledger::adopt_legacy_approvals(&data_dir, &project) {
+            Ok(adopted) => {
+                println!(
+                    "adopted {} hash(es), {} path(s), {} hook shape(s) into the chain; `openmax --ledger` lists them",
+                    adopted.hashes, adopted.paths, adopted.shapes
+                );
                 std::process::exit(0);
             }
             Err(e) => {
