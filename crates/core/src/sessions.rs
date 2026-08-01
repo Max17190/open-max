@@ -442,6 +442,17 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
 }
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
+    // Stop the session's work before removing its files. A frontend may
+    // delete the session it is currently running, and a turn that keeps going
+    // keeps writing: every sidecar here is opened with `create`, so an
+    // in-flight append recreates the file that was just deleted. Cancelling
+    // first is also the behaviour a user asking to delete a session expects.
+    //
+    // A request already on the wire can still land after this returns and
+    // append one record. That window is inherent to cooperative cancellation
+    // and predates the usage sidecar - the compaction and archive logs have
+    // always shared it - so it is narrowed here, not claimed closed.
+    core.cancel(id);
     with_index(core, |metas| metas.retain(|m| m.id != id))?;
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
@@ -619,6 +630,16 @@ mod tests {
         assert!(load_usage(&core, id).is_empty(), "usage sidecar must not outlive the session");
         assert!(load_compaction(&core, id).is_empty());
         assert!(load_archive(&core, id).is_empty());
+
+        // Deleting a session cancels its in-flight turn: a session that keeps
+        // running keeps writing, and every sidecar above is opened with
+        // `create`, so the files would come back.
+        let running = create(&core, "/tmp/p".into()).unwrap();
+        let token = std::sync::Arc::new(crate::state::CancelToken::default());
+        core.cancel_flags.lock().unwrap().insert(running.id.clone(), token.clone());
+        assert!(!token.is_cancelled());
+        delete(&core, &running.id).unwrap();
+        assert!(token.is_cancelled(), "delete must stop the work before removing the files");
         let _ = std::fs::remove_dir_all(dir);
     }
 
