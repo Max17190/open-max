@@ -19,6 +19,7 @@ openmax -p "summarize the top level layout of this repo"
 openmax -p --json "list public modules in crates/core"
 openmax --check                       # validate extension files
 openmax --spec hooks                  # print an extension surface's contract
+openmax --recall "deploy port"        # search past sessions and memories
 openmax --stdio                       # full session over JSONL pipes
 ```
 

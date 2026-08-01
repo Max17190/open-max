@@ -112,6 +112,16 @@ pub fn archive_display(core: &Core, id: &str) -> String {
     archive_path(core, id).display().to_string()
 }
 
+/// Absolute path of a session's transcript, for recall provenance.
+pub fn messages_display(core: &Core, id: &str) -> String {
+    messages_path(core, id).display().to_string()
+}
+
+/// Absolute path of a session's compaction record log, for recall provenance.
+pub fn compaction_display(core: &Core, id: &str) -> String {
+    compaction_path(core, id).display().to_string()
+}
+
 /// Append the messages a prune dropped (or truncated in place), oldest
 /// first, one JSON line each. The transcript rewrite that follows the prune
 /// is destructive; this file is the lossless record behind the digest note's
@@ -381,6 +391,17 @@ pub fn touch(core: &Core, id: &str) {
     let _ = with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             m.updated_at = now();
+        }
+    });
+}
+
+/// Test-only backdating: recency ranking needs sessions with known ages, and
+/// production code must never set `updated_at` to anything but now.
+#[cfg(test)]
+pub(crate) fn touch_at(core: &Core, id: &str, ts: u64) {
+    let _ = with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            m.updated_at = ts;
         }
     });
 }
