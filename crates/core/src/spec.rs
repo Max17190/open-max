@@ -501,8 +501,14 @@ Query syntax: plain terms, plus
 
 Ranking is BM25 lexical relevance with recency as a damped tiebreaker
 (0.25 x the memory index's `age_hours^-0.5` law): relevance dominates at any
-age, and age only reorders near-equals. Excerpts center on the rarest
-matched term. System prompts never match; identical excerpts deduplicate;
+age, and age only reorders near-equals. Long texts score as overlapping
+~1200-char pages so a fact inside a pasted log competes as a short document
+instead of losing to length normalization. Query terms drop English
+stopwords (kept if the query is nothing else), match plurals and >=5-char
+prefixes ("abandon" reaches "abandoned"), and scores carry an idf-weighted
+coverage factor so a page matching the query's informative terms beats a
+snippet matching two common ones. Excerpts center on the rarest matched
+term. System prompts never match; identical excerpts deduplicate;
 bare titles never displace content hits from their own session. The report
 is honest by construction: matches past k:/budget: are counted, sessions
 skipped past the scan cap are counted, index entries whose files are gone
