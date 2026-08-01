@@ -750,7 +750,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     let matched = scored.len();
     let mut hits = Vec::new();
     let mut seen_excerpts: Vec<String> = Vec::new();
-    let mut suppressed = 0usize;
+    let mut per_source: HashMap<String, usize> = HashMap::new();
     let mut spent = 0usize;
     for (score, i) in scored {
         if hits.len() >= query.k {
@@ -760,14 +760,20 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         if chunk.kind == "title" {
             if let Some(id) = chunk.session.as_deref() {
                 if sessions_with_content.contains(id) {
-                    suppressed += 1;
                     continue;
                 }
             }
         }
+        // Diversify across sources: a long paged document can match on many
+        // sibling pages, and letting them all through spends k and the token
+        // budget re-showing one file while other sources starve. Two pages
+        // per source keeps a log with two distinct relevant regions whole;
+        // the rest is one address away. Counted only on emission below.
+        if per_source.get(&chunk.source).copied().unwrap_or(0) >= 2 {
+            continue;
+        }
         let mut excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
         if seen_excerpts.iter().any(|e| e == &excerpt) {
-            suppressed += 1;
             continue;
         }
         let mut cost = estimate_tokens(excerpt.len() + chunk.source.len() + 48);
@@ -789,6 +795,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         }
         spent += cost;
         seen_excerpts.push(excerpt.clone());
+        *per_source.entry(chunk.source.clone()).or_insert(0) += 1;
         hits.push(RecallHit {
             score,
             kind: chunk.kind,
@@ -799,7 +806,10 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             excerpt,
         });
     }
-    let truncated = matched.saturating_sub(hits.len() + suppressed);
+    // Everything matched but not shown, whatever dropped it (k, the token
+    // budget, sibling-page collapsing, title suppression, twin excerpts):
+    // the report never claims "this is everything" when it is not.
+    let truncated = matched.saturating_sub(hits.len());
 
     Ok(RecallReport {
         query: raw_query.to_string(),
@@ -820,7 +830,7 @@ pub fn render(report: &RecallReport) -> String {
     let mut notes = String::new();
     if report.truncated > 0 {
         notes.push_str(&format!(
-            ", {} more match{} past k:/budget:",
+            ", {} more match{} not shown (raise k:/budget: or read the cited files)",
             report.truncated,
             if report.truncated == 1 { "" } else { "es" }
         ));
@@ -1317,6 +1327,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Sibling pages of one long source may not crowd out other sources: at
+    /// most two hits per source, so a repetitive log cannot spend the whole
+    /// result list re-showing itself while a distinct relevant session
+    /// starves.
+    #[test]
+    fn sibling_pages_do_not_crowd_out_other_sources() {
+        let (core, dir, project) = setup();
+        let log = "shared-needle appears again in this region of the log\n".repeat(400);
+        seed_session(&core, &project, "big log", vec![ChatMessage::tool("c1", log)]);
+        let other = seed_session(&core, &project, "other evidence", vec![ChatMessage::user(
+            "shared-needle confirmed independently in a second session",
+        )]);
+        let report = recall(&core, &project, "shared-needle k:8").unwrap();
+        let from_log =
+            report.hits.iter().filter(|h| h.title.as_deref() == Some("big log")).count();
+        assert!(from_log <= 2, "at most two sibling pages per source, got {from_log}");
+        assert!(
+            report.hits.iter().any(|h| h.session.as_deref() == Some(other.as_str())),
+            "the second source must appear despite the log's many matching pages: {:?}",
+            report.hits
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The documented budget cap holds even for a first hit that would
     /// overflow it: the hit survives, its excerpt shrinks to fit.
     #[test]
@@ -1371,9 +1405,18 @@ mod tests {
             (0..30).map(|i| ChatMessage::user(format!("countable fact number {i}"))).collect();
         seed_session(&core, &project, "many", messages);
         let report = recall(&core, &project, "countable fact k:3").unwrap();
-        assert_eq!(report.hits.len(), 3);
+        assert!(
+            (1..=3).contains(&report.hits.len()),
+            "k bounds hits (source collapsing may show fewer): {}",
+            report.hits.len()
+        );
         assert!(report.matched > 3);
         assert!(report.truncated > 0, "dropped matches must be counted");
+        assert_eq!(
+            report.truncated,
+            report.matched - report.hits.len(),
+            "truncated is everything matched but not shown, whatever dropped it"
+        );
         assert!(render(&report).contains("more match"), "{}", render(&report));
 
         let wide = recall(&core, &project, "countable fact k:3 excerpt:1200").unwrap();
