@@ -296,24 +296,27 @@ async fn main() -> std::io::Result<()> {
         // (the session index is keyed by project), and the project key is the
         // same raw current_dir form session creation stores.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        match open_max_core::state::Core::new(default_data_dir()) {
-            Ok((core, _rx)) => match open_max_core::recall::recall(&core, &project, query) {
-                Ok(report) => {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string(&report).unwrap_or_else(|_| "{}".into())
-                        );
-                    } else {
-                        print!("{}", open_max_core::recall::render(&report));
-                    }
-                    std::process::exit(0);
+        // Settings are how a turn reaches a provider and what it may spend;
+        // recall reads neither, so a settings file this process will never act
+        // on must not be able to hide the project's own history. Reported on
+        // stderr, so a `--json` consumer still gets clean output on stdout.
+        let (core, _rx, unreadable_settings) =
+            open_max_core::state::Core::read_only(default_data_dir());
+        if let Some(reason) = unreadable_settings {
+            eprintln!(
+                "openmax: {reason}\n  searching history anyway: recall never reads settings, \
+                 but every other command will refuse until this is fixed"
+            );
+        }
+        match open_max_core::recall::recall(&core, &project, query) {
+            Ok(report) => {
+                if cli.json {
+                    println!("{}", serde_json::to_string(&report).unwrap_or_else(|_| "{}".into()));
+                } else {
+                    print!("{}", open_max_core::recall::render(&report));
                 }
-                Err(e) => {
-                    eprintln!("openmax: {e}");
-                    std::process::exit(2);
-                }
-            },
+                std::process::exit(0);
+            }
             Err(e) => {
                 eprintln!("openmax: {e}");
                 std::process::exit(2);
