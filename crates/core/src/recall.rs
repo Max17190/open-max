@@ -243,8 +243,18 @@ fn tokenize(text: &str) -> Vec<String> {
     let mut current: Vec<char> = Vec::new();
     let mut flush = |run: &mut Vec<char>, out: &mut Vec<String>| {
         if run.len() >= 2 {
-            out.push(run.iter().collect::<String>().to_lowercase());
-            out.extend(camel_parts(run));
+            // The parts REPLACE the compound rather than joining it. Keeping
+            // both double-counts, and asymmetrically: the prefix rule reaches
+            // `streamingmarkdown` from "streaming" but never from "markdown",
+            // so one occurrence of the identifier would score tf=2 for its
+            // first part and tf=1 for the rest. A query for the whole
+            // compound still lands, through the same prefix rule.
+            let parts = camel_parts(run);
+            if parts.is_empty() {
+                out.push(run.iter().collect::<String>().to_lowercase());
+            } else {
+                out.extend(parts);
+            }
         }
         run.clear();
     };
@@ -1278,10 +1288,14 @@ mod tests {
     /// containment - and the guards that keep it from admitting noise.
     #[test]
     fn camel_case_compounds_index_their_parts_and_prose_is_untouched() {
-        assert_eq!(tokenize("StreamingMarkdown"), ["streamingmarkdown", "streaming", "markdown"]);
-        assert_eq!(tokenize("MessageDone"), ["messagedone", "message", "done"]);
+        // The parts replace the compound: keeping both would count one
+        // occurrence twice for the first part and once for the rest.
+        assert_eq!(tokenize("StreamingMarkdown"), ["streaming", "markdown"]);
+        assert_eq!(tokenize("MessageDone"), ["message", "done"]);
         // An acronym run ends where the next word begins.
-        assert_eq!(tokenize("HTTPServer"), ["httpserver", "http", "server"]);
+        assert_eq!(tokenize("HTTPServer"), ["http", "server"]);
+        // A query for the whole compound still reaches it via the prefix rule.
+        assert!(terms_match("streamingmarkdown", "streaming"));
         // Separators already split, so those runs have no case boundary left.
         assert_eq!(tokenize("keep_alive_msecs"), ["keep", "alive", "msecs"]);
         // Ordinary prose gains nothing: no boundary, no extra tokens.
