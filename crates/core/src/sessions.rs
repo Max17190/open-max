@@ -63,7 +63,8 @@ pub fn unix_now() -> u64 {
 
 /// Append a compaction event. Best-effort: failures surface as an agent warning.
 pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
-    if !still_indexed(core, id) {
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
         return;
     }
     let path = compaction_path(core, id);
@@ -112,7 +113,8 @@ pub struct TokenUsage {
 /// is a record of work already done, so a full disk must not fail the turn
 /// that succeeded.
 pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
-    if !still_indexed(core, id) {
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
         return;
     }
     let Ok(line) = serde_json::to_string(record) else { return };
@@ -203,7 +205,8 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
         return true;
     }
-    if !still_indexed(core, id) {
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
         return true;
     }
     let mut lines = String::new();
@@ -301,7 +304,11 @@ fn load_index(core: &Core) -> Vec<SessionMeta> {
 /// One small read per append. Compaction and archive appends happen at prune
 /// time, and a usage append happens once per request, next to a network round
 /// trip that costs several orders of magnitude more.
-fn still_indexed(core: &Core, id: &str) -> bool {
+/// Callers must already hold `sessions_lock`: an unlocked check is a
+/// time-of-check/time-of-use bug, because `delete` can remove the entry and
+/// the file between the check passing and the write landing, which recreates
+/// exactly the file that was deleted.
+fn still_indexed_locked(core: &Core, id: &str) -> bool {
     load_index(core).iter().any(|m| m.id == id)
 }
 
@@ -479,7 +486,13 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     // and predates the usage sidecar - the compaction and archive logs have
     // always shared it - so it is narrowed here, not claimed closed.
     core.cancel(id);
-    with_index(core, |metas| metas.retain(|m| m.id != id))?;
+    // The index entry and the files go under one lock. Dropping the entry
+    // first and the files second would let an append pass its check against
+    // the stale index and recreate what this call is removing.
+    let _guard = core.sessions_lock.lock().unwrap();
+    let mut metas = load_index(core);
+    metas.retain(|m| m.id != id);
+    save_index(core, &metas)?;
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
     let _ = std::fs::remove_file(compaction_path(core, id));
@@ -688,6 +701,41 @@ mod tests {
         assert!(load_usage(&core, &running.id).is_empty(), "a deleted session stays deleted");
         assert!(load_compaction(&core, &running.id).is_empty());
         assert!(load_archive(&core, &running.id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The fix is that an append and a delete cannot interleave, so this
+    /// tests exactly that: while `sessions_lock` is held, an append must
+    /// block rather than write. Racing threads against a delete and hoping
+    /// for the bad interleaving proves nothing - that version of this test
+    /// passed against the unserialized code too.
+    #[test]
+    fn an_append_is_serialized_against_the_session_lock() {
+        let dir = std::env::temp_dir().join(format!("openmax-race-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+
+        let guard = core.sessions_lock.lock().unwrap();
+        let writer = {
+            let core = core.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                append_usage(&core, &id, &TokenUsage {
+                    ts: 1,
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cached_tokens: Some(1),
+                });
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            load_usage(&core, &id).is_empty(),
+            "an append must wait for the lock delete holds, or it can write after the delete"
+        );
+        drop(guard);
+        writer.join().unwrap();
+        assert_eq!(load_usage(&core, &id).len(), 1, "and land once the lock is free");
         let _ = std::fs::remove_dir_all(dir);
     }
 
