@@ -446,6 +446,8 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
     let _ = std::fs::remove_file(compaction_path(core, id));
+    let _ = std::fs::remove_file(archive_path(core, id));
+    let _ = std::fs::remove_file(usage_path(core, id));
     Ok(())
 }
 
@@ -590,6 +592,33 @@ mod tests {
             "a session nobody reported on has no hit rate"
         );
         assert_eq!(cache_hit_totals(&[]), None);
+
+        // Deleting a session must take its sidecars with it: a recreated id
+        // would otherwise inherit a stranger's accounting.
+        append_archive(&core, id, &[ChatMessage::user("dropped")]);
+        append_compaction(&core, id, &CompactionRecord {
+            ts: 1,
+            message_count: 1,
+            tools: vec![],
+            paths: vec![],
+            user_snippets: vec![],
+            digest: "[context note: x]".into(),
+        });
+        create(&core, "/tmp/p".into()).ok();
+        with_index(&core, |m| {
+            m.push(SessionMeta {
+                id: id.into(),
+                project: "/tmp/p".into(),
+                title: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+            })
+        })
+        .unwrap();
+        delete(&core, id).unwrap();
+        assert!(load_usage(&core, id).is_empty(), "usage sidecar must not outlive the session");
+        assert!(load_compaction(&core, id).is_empty());
+        assert!(load_archive(&core, id).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

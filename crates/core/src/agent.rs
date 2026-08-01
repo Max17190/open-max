@@ -782,7 +782,14 @@ impl CompactionDigest {
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_SUMMARY_CHARS: usize = 1_200;
 
+/// `core` and `session_id` are taken only to bill this request: the
+/// summarizer is a real model call against the same endpoint, and a ledger
+/// that advertises what each request cost cannot quietly omit the one request
+/// the harness issues on its own behalf - which is also the one whose cost
+/// decides whether compacting was worth it at all.
 async fn summarize_compaction(
+    core: &Arc<Core>,
+    session_id: &str,
     client: &ChatClient,
     digest: &CompactionDigest,
     cancelled: &Arc<CancelToken>,
@@ -817,6 +824,14 @@ async fn summarize_compaction(
     .await
     .ok()?
     .ok()?;
+    if let Some(u) = result.usage {
+        sessions::append_usage(core, session_id, &sessions::TokenUsage {
+            ts: sessions::unix_now(),
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            cached_tokens: u.cached_tokens,
+        });
+    }
     let mut summary = result.content;
     if let Some(clean) = fallback::strip_leading_think(&summary) {
         summary = clean;
@@ -1588,7 +1603,7 @@ async fn run_loop(
                 // the endpoint cooperates; the note at index 2 was just
                 // inserted by enforce_budget, so replacing it here keeps one
                 // digest message.
-                let note = match summarize_compaction(&client, &digest, &cancelled).await {
+                let note = match summarize_compaction(core, session_id, &client, &digest, &cancelled).await {
                     Some(summary) => digest.format_with_summary(&summary, archive.as_deref()),
                     None => digest.format(archive.as_deref()),
                 };
