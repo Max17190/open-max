@@ -45,6 +45,12 @@ const EXCERPT_CHARS: usize = 480;
 /// Past this, older sessions are skipped and the report says how many.
 const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
 
+/// How hard partial episode coverage is penalized. The per-page coverage
+/// factor already uses a square root; the episode factor is a second, weaker
+/// multiplication, so it is deliberately gentler - an episode is context, not
+/// a claim about the page.
+const EPISODE_COV_P: f64 = 0.5;
+
 const BM25_K1: f64 = 1.2;
 /// Length normalization, tuned for a paged corpus: with long documents split
 /// into pages, length variance is bounded and the classic 0.75 over-rewards
@@ -263,6 +269,13 @@ fn find_ci(text: &str, needle_lower: &str) -> Option<usize> {
         }
     }
     lowered.find(needle_lower).map(|i| back[i])
+}
+
+/// The episode a chunk belongs to: its session, or - for a memory file, which
+/// has no session - its own address. Pages and records of one episode share
+/// this key; it is what document-level evidence is measured over.
+fn episode_key(chunk: &Chunk) -> &str {
+    chunk.session.as_deref().unwrap_or(chunk.source.as_str())
 }
 
 fn hours_since(now: u64, ts: u64) -> u64 {
@@ -669,6 +682,11 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     let mut doc_tfs: Vec<Option<(HashMap<usize, usize>, usize)>> = Vec::with_capacity(chunks.len());
     let mut total_len = 0usize;
     let mut candidates = 0usize;
+    // Which query terms each episode satisfies anywhere in its records. A
+    // session is one working episode and a memory file is one curated fact;
+    // both answer as a whole, and an answer split across four messages is
+    // still one answer.
+    let mut episode_terms: HashMap<&str, std::collections::HashSet<usize>> = HashMap::new();
     for (idx, chunk) in chunks.iter().enumerate() {
         if !path_pass[idx] {
             doc_tfs.push(None);
@@ -685,6 +703,10 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         }
         for &i in tf.keys() {
             *df.entry(query.terms[i].as_str()).or_insert(0) += 1;
+        }
+        if !tf.is_empty() {
+            let episode = episode_key(chunk);
+            episode_terms.entry(episode).or_default().extend(tf.keys().copied());
         }
         // Pure path: queries (no terms) treat every passing chunk as a hit.
         if tf.is_empty() && !query.terms.is_empty() {
@@ -715,6 +737,24 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         .collect();
     let idf_total: f64 = term_idf.iter().sum();
 
+    // Episode coverage: the same idf-weighted ratio as the per-page factor,
+    // measured over everything the episode said. A page is evidence from a
+    // conversation, not a standalone document, and an episode that answers
+    // three quarters of the query is a better place to be reading than one
+    // that echoes a single common word - even where the individual page
+    // carrying part of that answer matches only one term itself. This is
+    // what lets a four-message answer surface as four hits instead of one:
+    // each part scores weakly alone and is lifted by the company it keeps.
+    let episode_cov: HashMap<&str, f64> = episode_terms
+        .iter()
+        .map(|(episode, matched)| {
+            let idf_matched: f64 = matched.iter().map(|&i| term_idf[i]).sum();
+            let cov =
+                if idf_total > 0.0 { (idf_matched / idf_total).powf(EPISODE_COV_P) } else { 1.0 };
+            (*episode, cov)
+        })
+        .collect();
+
     let mut raw: Vec<(usize, f64)> = Vec::new();
     for (i, entry) in doc_tfs.iter().enumerate() {
         let Some((tf, len)) = entry else { continue };
@@ -733,6 +773,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         // root so partial coverage degrades gently rather than gating.
         if idf_total > 0.0 {
             lex *= (idf_matched / idf_total).sqrt();
+            lex *= episode_cov.get(episode_key(&chunks[i])).copied().unwrap_or(1.0);
         }
         raw.push((i, lex));
     }
@@ -1383,6 +1424,45 @@ mod tests {
 
     /// The documented budget cap holds even for a first hit that would
     /// overflow it: the hit survives, its excerpt shrinks to fit.
+    #[test]
+    fn a_weak_page_in_a_strong_episode_beats_the_same_page_alone() {
+        let (core, dir, project) = setup();
+        // Both candidates match exactly one query term ("changed") and nothing
+        // else. The difference is the company they keep: one sits in a session
+        // that answers the whole query across its other messages, the other in
+        // a session that answers nothing else. Without episode evidence the
+        // shorter, lonelier page wins on length normalization alone.
+        let answer = seed_session(&core, &project, "keepalive work", vec![
+            ChatMessage::user("what changed for the keepalive fix?"),
+            ChatMessage::assistant(
+                Some("first change: proxy.rs sets keep_alive_msecs to 25000".into()),
+                None,
+            ),
+        ]);
+        seed_session(&core, &project, "unrelated", vec![ChatMessage::assistant(
+            Some("nothing changed".into()),
+            None,
+        )]);
+        let report = recall(&core, &project, "changed keepalive fix").unwrap();
+        let rank_of = |needle: &str| {
+            report.hits.iter().position(|h| h.excerpt.contains(needle)).map(|i| i + 1)
+        };
+        let (part, lonely) = (rank_of("keep_alive_msecs"), rank_of("nothing changed"));
+        assert!(
+            part.is_some() && (lonely.is_none() || part < lonely),
+            "a partial answer from the answering session must outrank an isolated \
+             one-term match: {:?}",
+            report.hits
+        );
+        assert_eq!(
+            report.hits.first().and_then(|h| h.session.clone()),
+            Some(answer),
+            "the answering session leads: {:?}",
+            report.hits
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn distinct_records_in_one_session_all_survive_collapsing() {
         let (core, dir, project) = setup();
