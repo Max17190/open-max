@@ -2316,6 +2316,31 @@ fn approval_detail(args: &Value) -> String {
 /// cache warm) until the budget is crossed again.
 const PRUNE_TARGET_PCT: usize = 70;
 
+/// Bytes of an old tool output that survive truncation. Unchanged from when
+/// the slice was taken from the head: this is a budget, and moving it is a
+/// separate decision from choosing which bytes it holds.
+const TRUNCATED_WIDTH: usize = 160;
+
+/// The text a prune is keeping: the first user message (the standing request)
+/// and the tail that survives untouched. Used as the relevance signal for
+/// which slice of an old tool output to keep, so it must describe what the
+/// transcript will still contain, not what is being removed. Bounded: only
+/// the tail's own bytes, which the budget already caps.
+fn live_context(messages: &[ChatMessage], keep_tail: usize) -> String {
+    let mut out = String::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let keeps = i == 1 || i >= keep_tail;
+        if !keeps || msg.role == "system" {
+            continue;
+        }
+        if let Some(content) = &msg.content {
+            out.push_str(content);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn prune_target(budget: usize) -> usize {
     budget * PRUNE_TARGET_PCT / 100
 }
@@ -2398,6 +2423,11 @@ fn enforce_budget(
     }
     let target = achievable_target(budget, schema_tokens);
     let keep_tail = messages.len().saturating_sub(6);
+    // What the transcript will still be about once this prune is done: the
+    // original request plus the surviving tail. Truncation keeps the slice of
+    // each old tool output that speaks to *this*, so the bytes that stay are
+    // the ones the live conversation refers to.
+    let live_context = live_context(messages, keep_tail);
     let mut digest = CompactionDigest::new(dropped_text_cap(budget));
     let mut truncated = false;
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
@@ -2405,12 +2435,13 @@ fn enforce_budget(
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
                     digest.truncated.push(msg.clone());
-                    let mut cut = 160;
-                    while !c.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
+                    let window = crate::recall::salient_window(c, &live_context, TRUNCATED_WIDTH);
+                    let lead = if window.start > 0 { "…" } else { "" };
                     let old = msg.estimated_tokens();
-                    msg.content = Some(format!("{}\n…[older tool output truncated]", &c[..cut]));
+                    msg.content = Some(format!(
+                        "{lead}{}\n…[older tool output truncated]",
+                        &c[window.clone()]
+                    ));
                     total = total.saturating_sub(old).saturating_add(msg.estimated_tokens());
                     truncated = true;
                 }
@@ -4206,6 +4237,34 @@ mod tests {
         assert_eq!(messages.len(), 10, "nothing should be dropped, only truncated");
         let tool_len = messages[2].content.as_deref().unwrap().len();
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");
+    }
+
+    /// Truncation keeps the slice the conversation is about, not the slice
+    /// that happens to be first. The answer sits in the middle of a long tool
+    /// output, behind boilerplate the head would have spent its whole budget
+    /// on - which is the ordinary shape of a file read or a grep.
+    #[test]
+    fn truncation_keeps_the_slice_the_conversation_refers_to() {
+        let noise = "loading module cache entry, nothing to report here\n".repeat(60);
+        let answer = "checkout_timeout_msecs = 45000  // the value under discussion\n";
+        let mut messages = vec![
+            msg("system", 100),
+            ChatMessage::user("what is checkout_timeout_msecs set to?"),
+            ChatMessage::tool("c1", format!("{noise}{answer}{noise}")),
+            msg("assistant", 100),
+        ];
+        for _ in 0..3 {
+            messages.push(ChatMessage::user("still chasing checkout_timeout_msecs"));
+            messages.push(msg("assistant", 100));
+        }
+        let (changed, _) = enforce_budget(&mut messages, 700, 0);
+        assert!(changed);
+        let kept = messages[2].content.as_deref().unwrap();
+        assert!(
+            kept.contains("checkout_timeout_msecs = 45000"),
+            "the slice the conversation is about must survive, got: {kept}"
+        );
+        assert!(kept.len() < 500, "and it must still be a truncation: {}", kept.len());
     }
 
     /// One prune must buy headroom: after compaction the transcript *plus the
