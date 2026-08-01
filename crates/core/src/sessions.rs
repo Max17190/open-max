@@ -63,6 +63,9 @@ pub fn unix_now() -> u64 {
 
 /// Append a compaction event. Best-effort: failures surface as an agent warning.
 pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
+    if !still_indexed(core, id) {
+        return;
+    }
     let path = compaction_path(core, id);
     let Ok(line) = serde_json::to_string(record) else { return };
     let result = std::fs::OpenOptions::new()
@@ -109,6 +112,9 @@ pub struct TokenUsage {
 /// is a record of work already done, so a full disk must not fail the turn
 /// that succeeded.
 pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
+    if !still_indexed(core, id) {
+        return;
+    }
     let Ok(line) = serde_json::to_string(record) else { return };
     let _ = std::fs::OpenOptions::new()
         .create(true)
@@ -197,6 +203,9 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
         return true;
     }
+    if !still_indexed(core, id) {
+        return true;
+    }
     let mut lines = String::new();
     for msg in messages {
         let Ok(line) = serde_json::to_string(msg) else { continue };
@@ -277,6 +286,23 @@ fn load_index(core: &Core) -> Vec<SessionMeta> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Whether the session still exists, i.e. whether writing a sidecar for it is
+/// still meaningful.
+///
+/// Every sidecar here is opened with `create`, so a write that lands after
+/// `delete` recreates the file it just removed. Cancellation narrows that
+/// window but cannot close it: a request already on the wire settles when it
+/// settles, and its usage record arrives afterwards. Checking the index makes
+/// the write a no-op instead, which is what "deleted" has to mean if it is to
+/// mean anything.
+///
+/// One small read per append. Compaction and archive appends happen at prune
+/// time, and a usage append happens once per request, next to a network round
+/// trip that costs several orders of magnitude more.
+fn still_indexed(core: &Core, id: &str) -> bool {
+    load_index(core).iter().any(|m| m.id == id)
 }
 
 fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
@@ -570,7 +596,7 @@ mod tests {
     fn usage_records_append_and_aggregate_only_what_was_reported() {
         let dir = std::env::temp_dir().join(format!("openmax-usage-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "u1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         // A server that reports cache state, then one that does not.
         append_usage(&core, id, &TokenUsage {
             ts: 1,
@@ -640,6 +666,28 @@ mod tests {
         assert!(!token.is_cancelled());
         delete(&core, &running.id).unwrap();
         assert!(token.is_cancelled(), "delete must stop the work before removing the files");
+
+        // And the write that loses the race is a no-op rather than a
+        // resurrection: cancellation cannot stop a request already on the
+        // wire, so the append itself has to know the session is gone.
+        append_usage(&core, &running.id, &TokenUsage {
+            ts: 9,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cached_tokens: Some(1),
+        });
+        append_compaction(&core, &running.id, &CompactionRecord {
+            ts: 9,
+            message_count: 1,
+            tools: vec![],
+            paths: vec![],
+            user_snippets: vec![],
+            digest: "late".into(),
+        });
+        append_archive(&core, &running.id, &[ChatMessage::user("late")]);
+        assert!(load_usage(&core, &running.id).is_empty(), "a deleted session stays deleted");
+        assert!(load_compaction(&core, &running.id).is_empty());
+        assert!(load_archive(&core, &running.id).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -647,7 +695,7 @@ mod tests {
     fn compaction_records_append_and_load() {
         let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "c1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let rec = CompactionRecord {
             ts: 1,
             message_count: 3,
@@ -679,7 +727,7 @@ mod tests {
     fn last_compaction_parses_only_the_final_valid_line() {
         let dir = std::env::temp_dir().join(format!("openmax-lastcomp-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "lc1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         assert!(last_compaction(&core, id).is_none());
         for ts in [1u64, 2] {
             append_compaction(&core, id, &CompactionRecord {
@@ -707,7 +755,7 @@ mod tests {
     fn compaction_archive_appends_and_round_trips() {
         let dir = std::env::temp_dir().join(format!("openmax-archive-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "a1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         assert!(load_archive(&core, id).is_empty(), "no archive before any prune");
         append_archive(&core, id, &[]);
         assert!(
@@ -738,7 +786,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(loaded[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(loaded[3].content.as_deref(), Some("second prune"));
-        assert!(archive_display(&core, id).ends_with("a1.archive.jsonl"));
+        assert!(archive_display(&core, id).ends_with(&format!("{id}.archive.jsonl")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
