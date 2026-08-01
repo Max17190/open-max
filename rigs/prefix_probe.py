@@ -134,10 +134,25 @@ def main():
     }))
     env = dict(os.environ, HOME=str(home))
     env.pop("OPENMAX_SESSION", None)
-    subprocess.run([binary, "--trust-project", "-p", "first turn",
-                    "-p", "second turn", "-p", "third turn"],
-                   cwd=project, env=env, capture_output=True, text=True, timeout=120)
+    run = subprocess.run([binary, "--trust-project", "-p", "first turn",
+                          "-p", "second turn", "-p", "third turn"],
+                         cwd=project, env=env, capture_output=True, text=True, timeout=120)
     time.sleep(0.2)
+
+    # A run that never reached the endpoint has nothing to say about prefix
+    # stability, and "0 transitions, all append-only" reads exactly like a
+    # clean result. Fail loudly instead: a measurement tool that reports
+    # success when it measured nothing is worse than no tool.
+    if run.returncode != 0:
+        print(f"binary exited {run.returncode}; measured nothing\n{run.stderr[:800]}",
+              file=sys.stderr)
+        shutil.rmtree(root, ignore_errors=True)
+        return 1
+    if len(REQUESTS) < 2:
+        print(f"captured {len(REQUESTS)} request(s); need at least 2 to compare a "
+              f"prefix\n{run.stderr[:800]}", file=sys.stderr)
+        shutil.rmtree(root, ignore_errors=True)
+        return 1
 
     rows = analyse(REQUESTS)
     if "--json" in sys.argv:
@@ -156,7 +171,8 @@ def main():
         mean = sum(r["prefix_frac"] for r in rows) / len(rows) if rows else 1.0
         print(f"  mean reusable prefix: {mean*100:.1f}% of prompt bytes")
     shutil.rmtree(root, ignore_errors=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
