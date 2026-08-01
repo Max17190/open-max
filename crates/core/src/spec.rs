@@ -491,14 +491,25 @@ counted in the report, never silent.
 
 Query syntax: plain terms, plus
 - `path:<substr>`: keep only history that touched a matching file path
-  (structured compaction-record paths, or a literal text/source match).
+  (structured compaction-record paths or literal chunk text; the store's own
+  addresses never match).
+- `session:<id-prefix>`: scope to matching sessions - "more from the session
+  you just cited".
 - `k:<n>`: ranked results to print (default 8, max 50).
 - `budget:<tokens>`: output token cap (default 2000, max 20000).
+- `excerpt:<chars>`: excerpt window width (default 480, 120-2000).
 
-Ranking fuses BM25 lexical relevance with the same recency law the memory
-index uses (`age_hours^-0.5`), added with equal weight. System prompts never
-match, identical excerpts deduplicate, and `--json` emits the structured
-report for tooling.
+Ranking is BM25 lexical relevance with recency as a damped tiebreaker
+(0.25 x the memory index's `age_hours^-0.5` law): relevance dominates at any
+age, and age only reorders near-equals. Excerpts center on the rarest
+matched term. System prompts never match; identical excerpts deduplicate;
+bare titles never displace content hits from their own session. The report
+is honest by construction: matches past k:/budget: are counted, sessions
+skipped past the scan cap are counted, index entries whose files are gone
+are counted unreadable, and a session index that exists but cannot be
+parsed is a loud error, never an empty result. `--json` emits the
+structured report. Session citations are absolute paths (reach them with
+bash); memory citations are project-relative (reach them with read_file).
 "#;
 
 const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)
