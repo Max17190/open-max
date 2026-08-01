@@ -80,6 +80,70 @@ pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
     }
 }
 
+fn usage_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.usage.jsonl"))
+}
+
+/// What one request actually cost, as the server reported it.
+///
+/// The prompt cache is the largest lever a client has over cost and latency,
+/// and it is invisible from this side: the only evidence is `cached` coming
+/// back smaller than it should. A harness that never records it cannot tell a
+/// prefix it broke from a cache the provider evicted, and cannot notice
+/// either one regressing. So this is kept for the same reason the capability
+/// ledger is kept - the numbers are the product's claim.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub ts: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Server-reported cached prompt tokens. `None` means the endpoint said
+    /// nothing, which is not the same as zero: most OpenAI-compatible servers
+    /// simply omit the field, and reporting that as a 0% hit rate would be a
+    /// measurement the harness invented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+}
+
+/// Append one request's accounting. Best-effort and silent on failure: usage
+/// is a record of work already done, so a full disk must not fail the turn
+/// that succeeded.
+pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
+    let Ok(line) = serde_json::to_string(record) else { return };
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(usage_path(core, id))
+        .and_then(|mut f| writeln!(f, "{line}"));
+}
+
+/// Every recorded request for a session, oldest first (corrupt lines skipped).
+pub fn load_usage(core: &Core, id: &str) -> Vec<TokenUsage> {
+    let Ok(text) = std::fs::read_to_string(usage_path(core, id)) else {
+        return Vec::new();
+    };
+    text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// Prompt tokens served from cache over a whole session, as
+/// `(cached, prompt)`, counting only requests whose endpoint reported the
+/// field. Returns `None` when none did: a session against a server that never
+/// reports cache state has no hit rate, and showing 0% would be a lie about
+/// the server rather than a fact about the session.
+pub fn cache_hit_totals(records: &[TokenUsage]) -> Option<(u64, u64)> {
+    let mut cached = 0u64;
+    let mut prompt = 0u64;
+    let mut reported = false;
+    for record in records {
+        if let Some(c) = record.cached_tokens {
+            reported = true;
+            cached = cached.saturating_add(c);
+            prompt = prompt.saturating_add(record.prompt_tokens);
+        }
+    }
+    reported.then_some((cached, prompt))
+}
+
 /// The most recent compaction record, parsing only the final valid line:
 /// carry-forward wants one record, and re-parsing an append-only history
 /// that only ever grows would make every prune slower than the last.
@@ -488,6 +552,46 @@ mod tests {
     use super::*;
     use crate::state::Core;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn usage_records_append_and_aggregate_only_what_was_reported() {
+        let dir = std::env::temp_dir().join(format!("openmax-usage-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "u1";
+        // A server that reports cache state, then one that does not.
+        append_usage(&core, id, &TokenUsage {
+            ts: 1,
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            cached_tokens: Some(900),
+        });
+        append_usage(&core, id, &TokenUsage {
+            ts: 2,
+            prompt_tokens: 1200,
+            completion_tokens: 60,
+            cached_tokens: Some(1100),
+        });
+        append_usage(&core, id, &TokenUsage {
+            ts: 3,
+            prompt_tokens: 5000,
+            completion_tokens: 10,
+            cached_tokens: None,
+        });
+        let records = load_usage(&core, id);
+        assert_eq!(records.len(), 3, "append-only, oldest first");
+        assert_eq!(records[0].prompt_tokens, 1000);
+        // The unreported request contributes to neither side: counting its
+        // 5000 prompt tokens as a miss would report the server's silence as
+        // this session's cache behaviour.
+        assert_eq!(cache_hit_totals(&records), Some((2000, 2200)));
+        assert_eq!(
+            cache_hit_totals(&[TokenUsage { ts: 1, prompt_tokens: 9, ..Default::default() }]),
+            None,
+            "a session nobody reported on has no hit rate"
+        );
+        assert_eq!(cache_hit_totals(&[]), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn compaction_records_append_and_load() {

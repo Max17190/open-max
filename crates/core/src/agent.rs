@@ -1636,6 +1636,16 @@ async fn run_loop(
         };
 
         if let Some(u) = result.usage {
+            // Kept, not just broadcast: the live event tells the current
+            // frontend what this turn cost, and nothing else ever learns it.
+            // Prefix-cache behaviour is only visible in this number, and a
+            // regression in it is silent by construction.
+            sessions::append_usage(core, session_id, &sessions::TokenUsage {
+                ts: sessions::unix_now(),
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                cached_tokens: u.cached_tokens,
+            });
             core.send_agent(session_id, AgentEvent::Usage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
