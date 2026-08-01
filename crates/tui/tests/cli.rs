@@ -1046,3 +1046,98 @@ fn recall_reads_history_when_settings_are_unreadable() {
         String::from_utf8_lossy(&refused.stderr)
     );
 }
+
+/// The prompt prefix only ever grows within a turn.
+///
+/// Prefix caching keys on the token sequence the server renders, so the single
+/// most valuable cost property this harness has is that successive requests
+/// share a byte-identical leading prompt: cached input is an order of
+/// magnitude cheaper than uncached, and cache traffic dominates a coding
+/// agent's bill. A regression is silent by construction - it changes no
+/// output, only the invoice and the latency - so nothing but an assertion
+/// will catch it. A timestamp in the system prompt, a reordered tool schema,
+/// or a cwd rendered into the prefix would each fail here.
+#[test]
+fn the_prompt_prefix_only_grows_within_a_turn() {
+    let (project, home) = fresh_dirs("prefix-stable");
+    // Three tool round trips then an answer, so one turn spans four requests
+    // and every tool result has to append rather than rewrite.
+    let script = vec![
+        (sse_tool_calls(&[("list_dir", serde_json::json!({"path": "."}))]), true),
+        (sse_tool_calls(&[("list_dir", serde_json::json!({"path": "."}))]), true),
+        (sse_tool_calls(&[("list_dir", serde_json::json!({"path": "."}))]), true),
+        (sse_text("done"), true),
+    ];
+    let (base_url, requests, _server) = spawn_scripted_server(script);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "look around"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bodies = requests.lock().unwrap().clone();
+    assert!(bodies.len() >= 3, "expected several requests in one turn, got {}", bodies.len());
+    let parsed: Vec<serde_json::Value> =
+        bodies.iter().map(|b| serde_json::from_str(b).expect("request body is JSON")).collect();
+
+    for pair in parsed.windows(2) {
+        let (prev, cur) = (&pair[0], &pair[1]);
+        // Tools serialize into the prefix ahead of the conversation, so any
+        // change to them invalidates everything after.
+        assert_eq!(prev["tools"], cur["tools"], "tool schemas must not move within a turn");
+        let (pm, cm) = (
+            prev["messages"].as_array().expect("messages"),
+            cur["messages"].as_array().expect("messages"),
+        );
+        assert!(
+            cm.len() > pm.len(),
+            "a request must add to the conversation, not replace it: {} -> {}",
+            pm.len(),
+            cm.len()
+        );
+        for (i, old) in pm.iter().enumerate() {
+            assert_eq!(
+                old, &cm[i],
+                "message {i} was rewritten mid-turn; everything after it re-prefills"
+            );
+        }
+    }
+}
+
+/// Two sessions in the same project start from a byte-identical prefix, so
+/// the second one opens against a warm cache instead of paying to prefill a
+/// system prompt and tool schemas the provider already holds. Anything
+/// session-scoped rendered into the prompt - an id, a timestamp, a clock -
+/// would break this and cost a full prefill on every new session.
+#[test]
+fn a_new_session_reuses_the_previous_session_prefix() {
+    let (project, home) = fresh_dirs("prefix-cross");
+    let (base_url, requests, _server) =
+        spawn_scripted_server(vec![(sse_text("one").to_string(), true); 2]);
+    write_settings(&home, &base_url);
+
+    for prompt in ["first session", "second session"] {
+        let out = cmd(&project, &home).args(["--trust-project", "-p", prompt]).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let bodies = requests.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "one request per session");
+    let a: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let b: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    assert_eq!(a["tools"], b["tools"], "tool schemas must be identical across sessions");
+    assert_eq!(
+        a["messages"][0], b["messages"][0],
+        "the system prompt must be identical across sessions, or every new session \
+         pays a full prefill"
+    );
+}
