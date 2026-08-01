@@ -243,18 +243,26 @@ fn tokenize(text: &str) -> Vec<String> {
     let mut current: Vec<char> = Vec::new();
     let mut flush = |run: &mut Vec<char>, out: &mut Vec<String>| {
         if run.len() >= 2 {
-            // The parts REPLACE the compound rather than joining it. Keeping
-            // both double-counts, and asymmetrically: the prefix rule reaches
-            // `streamingmarkdown` from "streaming" but never from "markdown",
-            // so one occurrence of the identifier would score tf=2 for its
-            // first part and tf=1 for the rest. A query for the whole
-            // compound still lands, through the same prefix rule.
+            // The compound is kept only when no part can already reach it.
+            // Emitting both unconditionally double-counts, and does so
+            // asymmetrically: the prefix rule reaches `streamingmarkdown`
+            // from "streaming" but never from "markdown", so one occurrence
+            // would score tf=2 for the first part and tf=1 for the rest.
+            // Dropping it unconditionally is the opposite failure - the
+            // prefix rule needs five shared characters, so `ToString` and
+            // `IntoIterator` split into parts too short to lead back, and an
+            // exact lowercase search for the identifier would find nothing.
+            // Keeping it exactly when it is otherwise unreachable satisfies
+            // both: every surface form of one occurrence still counts once.
+            let whole = run.iter().collect::<String>().to_lowercase();
             let parts = camel_parts(run);
-            if parts.is_empty() {
-                out.push(run.iter().collect::<String>().to_lowercase());
-            } else {
-                out.extend(parts);
+            let reachable = parts
+                .iter()
+                .any(|p| p.chars().count() >= 5 && whole.starts_with(p.as_str()));
+            if parts.is_empty() || !reachable {
+                out.push(whole);
             }
+            out.extend(parts);
         }
         run.clear();
     };
@@ -1288,14 +1296,19 @@ mod tests {
     /// containment - and the guards that keep it from admitting noise.
     #[test]
     fn camel_case_compounds_index_their_parts_and_prose_is_untouched() {
-        // The parts replace the compound: keeping both would count one
-        // occurrence twice for the first part and once for the rest.
+        // The compound is dropped when a part already leads back to it, so
+        // one occurrence is never counted twice for its first part.
         assert_eq!(tokenize("StreamingMarkdown"), ["streaming", "markdown"]);
         assert_eq!(tokenize("MessageDone"), ["message", "done"]);
-        // An acronym run ends where the next word begins.
-        assert_eq!(tokenize("HTTPServer"), ["http", "server"]);
-        // A query for the whole compound still reaches it via the prefix rule.
-        assert!(terms_match("streamingmarkdown", "streaming"));
+        assert!(terms_match("streamingmarkdown", "streaming"), "the whole still leads back");
+        // An acronym run ends where the next word begins. "http" is four
+        // characters, one short of leading back, so the compound is kept -
+        // and cannot double-count, for exactly the same reason.
+        assert_eq!(tokenize("HTTPServer"), ["httpserver", "http", "server"]);
+        // Short leading parts cannot lead back (the prefix rule wants five
+        // shared characters), so the compound is kept and stays searchable.
+        assert_eq!(tokenize("ToString"), ["tostring", "to", "string"]);
+        assert_eq!(tokenize("IntoIterator"), ["intoiterator", "into", "iterator"]);
         // Separators already split, so those runs have no case boundary left.
         assert_eq!(tokenize("keep_alive_msecs"), ["keep", "alive", "msecs"]);
         // Ordinary prose gains nothing: no boundary, no extra tokens.
@@ -1312,8 +1325,12 @@ mod tests {
         let sid = seed_session(&core, &project, "input handling", vec![
             ChatMessage::tool("c1", "MouseEventKind::Drag(MouseButton::Left) => self.select(),"),
             ChatMessage::tool("c2", "events: mpsc::UnboundedSender<AgentEventEnvelope>,"),
+            ChatMessage::tool("c3", "impl ToString for Row { fn to_string(&self) -> String }"),
         ]);
-        for word in ["button", "sender", "envelope"] {
+        // "tostring" splits into parts too short to lead back to it, so the
+        // compound has to be kept or an exact search for the identifier -
+        // the most obvious thing a person types - would find nothing.
+        for word in ["button", "sender", "envelope", "tostring"] {
             let report = recall(&core, &project, word).unwrap();
             assert!(
                 report.hits.iter().any(|h| h.session.as_deref() == Some(sid.as_str())),
