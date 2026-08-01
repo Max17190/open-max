@@ -95,6 +95,13 @@ struct Chunk {
     title: Option<String>,
     age_hours: u64,
     source: String,
+    /// The record this chunk came from, as source plus record ordinal. Every
+    /// message in a session shares one `source` (the transcript file), so
+    /// sibling-page collapsing keyed on `source` cannot tell "page 2 of this
+    /// log" from "a different message that answers a different part of the
+    /// question". `doc` makes that distinction: pages of one record collapse,
+    /// distinct records do not.
+    doc: String,
     text: String,
     /// Structured paths (compaction records) for `path:` filtering beyond
     /// plain text match.
@@ -416,13 +423,16 @@ fn collect_chunks(
                 .map(|d| d.as_secs())
                 .unwrap_or(now);
             bytes += text.len();
+            let source = format!("{}/{name}", crate::memory::MEMORY_DIR);
             for page in pages(&text) {
                 chunks.push(Chunk {
                     kind: "memory",
                     session: None,
                     title: None,
                     age_hours: hours_since(now, ts),
-                    source: format!("{}/{name}", crate::memory::MEMORY_DIR),
+                    // One memory file is one record: its pages are siblings.
+                    doc: source.clone(),
+                    source: source.clone(),
                     text: page.to_string(),
                     paths: Vec::new(),
                 });
@@ -471,6 +481,7 @@ fn collect_chunks(
             session: Some(meta.id.clone()),
             title: Some(meta.title.clone()),
             age_hours: age,
+            doc: format!("{title_source}#title"),
             source: title_source.clone(),
             text: meta.title.clone(),
             paths: Vec::new(),
@@ -481,25 +492,34 @@ fn collect_chunks(
         // scanned session of its path evidence.
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let compaction_path = std::path::PathBuf::from(sessions::compaction_display(core, &meta.id));
-        for record in bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget) {
+        for (ord, record) in
+            bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget)
+                .into_iter()
+                .enumerate()
+        {
             if bytes >= scan_ceiling {
                 break;
             }
             let text = bounded(format!("{} {}", record.digest, record.paths.join(" ")));
             bytes += text.len();
+            let source = sessions::compaction_display(core, &meta.id);
             chunks.push(Chunk {
                 kind: "digest",
                 session: Some(meta.id.clone()),
                 title: Some(meta.title.clone()),
                 age_hours: hours_since(now, record.ts),
-                source: sessions::compaction_display(core, &meta.id),
+                doc: format!("{source}#{ord}"),
+                source,
                 text,
                 paths: record.paths,
             });
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
-        for msg in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget) {
+        for (ord, msg) in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget)
+            .into_iter()
+            .enumerate()
+        {
             if bytes >= scan_ceiling {
                 break;
             }
@@ -512,13 +532,15 @@ fn collect_chunks(
             }
             let content = bounded(content);
             bytes += content.len();
+            let source = sessions::messages_display(core, &meta.id);
             for page in pages(&content) {
                 chunks.push(Chunk {
                     kind: "message",
                     session: Some(meta.id.clone()),
                     title: Some(meta.title.clone()),
                     age_hours: age,
-                    source: sessions::messages_display(core, &meta.id),
+                    doc: format!("{source}#{ord}"),
+                    source: source.clone(),
                     text: page.to_string(),
                     paths: Vec::new(),
                 });
@@ -526,7 +548,10 @@ fn collect_chunks(
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
-        for msg in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget) {
+        for (ord, msg) in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget)
+            .into_iter()
+            .enumerate()
+        {
             if bytes >= scan_ceiling {
                 break;
             }
@@ -536,13 +561,15 @@ fn collect_chunks(
             }
             let content = bounded(content);
             bytes += content.len();
+            let source = sessions::archive_display(core, &meta.id);
             for page in pages(&content) {
                 chunks.push(Chunk {
                     kind: "archive",
                     session: Some(meta.id.clone()),
                     title: Some(meta.title.clone()),
                     age_hours: age,
-                    source: sessions::archive_display(core, &meta.id),
+                    doc: format!("{source}#{ord}"),
+                    source: source.clone(),
                     text: page.to_string(),
                     paths: Vec::new(),
                 });
@@ -750,7 +777,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     let matched = scored.len();
     let mut hits = Vec::new();
     let mut seen_excerpts: Vec<String> = Vec::new();
-    let mut per_source: HashMap<String, usize> = HashMap::new();
+    let mut per_doc: HashMap<String, usize> = HashMap::new();
     let mut spent = 0usize;
     for (score, i) in scored {
         if hits.len() >= query.k {
@@ -764,12 +791,15 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
                 }
             }
         }
-        // Diversify across sources: a long paged document can match on many
-        // sibling pages, and letting them all through spends k and the token
-        // budget re-showing one file while other sources starve. Two pages
-        // per source keeps a log with two distinct relevant regions whole;
-        // the rest is one address away. Counted only on emission below.
-        if per_source.get(&chunk.source).copied().unwrap_or(0) >= 2 {
+        // Collapse sibling pages, not sibling records. A long paged document
+        // can match on many of its own pages, and letting them all through
+        // spends k and the token budget re-showing one record while other
+        // evidence starves - but every message in a session shares one
+        // `source`, so capping on `source` also throws away the second,
+        // third and fourth message that each answer a different part of the
+        // question. Two pages per record keeps a log's two distinct relevant
+        // regions whole; distinct records compete on their own merit.
+        if per_doc.get(&chunk.doc).copied().unwrap_or(0) >= 2 {
             continue;
         }
         let mut excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
@@ -795,7 +825,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         }
         spent += cost;
         seen_excerpts.push(excerpt.clone());
-        *per_source.entry(chunk.source.clone()).or_insert(0) += 1;
+        *per_doc.entry(chunk.doc.clone()).or_insert(0) += 1;
         hits.push(RecallHit {
             score,
             kind: chunk.kind,
@@ -1353,6 +1383,54 @@ mod tests {
 
     /// The documented budget cap holds even for a first hit that would
     /// overflow it: the hit survives, its excerpt shrinks to fit.
+    #[test]
+    fn distinct_records_in_one_session_all_survive_collapsing() {
+        let (core, dir, project) = setup();
+        // Four separate messages, each answering a different part of the same
+        // question. They share one transcript file, so collapsing keyed on
+        // the source address would emit two of them and silently drop the
+        // rest - the answer would rank first and still arrive incomplete.
+        let sid = seed_session(
+            &core,
+            &project,
+            "keepalive fix landed",
+            vec![
+                ChatMessage::user("what changed for the keepalive fix?"),
+                ChatMessage::assistant(
+                    Some("first change: proxy.rs sets keep_alive_msecs to 25000".into()),
+                    None,
+                ),
+                ChatMessage::assistant(
+                    Some("second change: basket.ts adds the reaper_interval loop".into()),
+                    None,
+                ),
+                ChatMessage::assistant(
+                    Some("third change: upstream.conf raises upstream_timeout to 45s".into()),
+                    None,
+                ),
+                ChatMessage::assistant(
+                    Some("fourth change: charge.rs drops retry_budget to 2".into()),
+                    None,
+                ),
+            ],
+        );
+        let report = recall(&core, &project, "change k:8").unwrap();
+        let shown: String =
+            report.hits.iter().map(|h| h.excerpt.clone()).collect::<Vec<_>>().join(" ");
+        for needle in ["keep_alive_msecs", "reaper_interval", "upstream_timeout", "retry_budget"] {
+            assert!(
+                shown.contains(needle),
+                "every distinct answer must survive collapsing: {needle} missing from {shown}"
+            );
+        }
+        assert!(
+            report.hits.iter().filter(|h| h.session.as_deref() == Some(sid.as_str())).count() >= 4,
+            "four distinct records, not two pages of one: {:?}",
+            report.hits
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_fat_first_hit_shrinks_into_the_budget() {
         let (core, dir, project) = setup();
