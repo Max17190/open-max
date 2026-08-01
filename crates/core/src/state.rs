@@ -128,6 +128,42 @@ impl Core {
         Ok((core, rx))
     }
 
+    /// A core for read-only history operations: ones that read the stores and
+    /// never contact a provider, run a tool, or start a turn.
+    ///
+    /// Settings say how to reach an endpoint and what a turn may spend. A
+    /// history search uses neither, so an unreadable settings file - a key
+    /// from a newer build, a hand edit, a stray comma - must not also make the
+    /// project's own history unreadable. `--ledger` already reads its store
+    /// without loading settings at all; this puts `--recall` on the same
+    /// footing, and leaves the fail-closed rule exactly where it earns its
+    /// keep: the paths that spend money and run tools.
+    ///
+    /// The failure is returned, never swallowed. Degrading silently to
+    /// defaults would hide a real misconfiguration behind a working search;
+    /// the caller reports the reason and answers the question anyway.
+    pub fn read_only(
+        data_dir: PathBuf,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<AgentEventEnvelope>, Option<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = std::fs::create_dir_all(&data_dir);
+        let (settings, unreadable) = match crate::config::load(&data_dir) {
+            Ok(settings) => (settings, None),
+            Err(reason) => (crate::config::Settings::default(), Some(reason)),
+        };
+        let core = Arc::new(Self {
+            data_dir,
+            settings: Mutex::new(settings),
+            sessions: Default::default(),
+            running: Default::default(),
+            cancel_flags: Default::default(),
+            approvals: Default::default(),
+            sessions_lock: Default::default(),
+            events: tx,
+        });
+        (core, rx, unreadable)
+    }
+
     pub fn send_agent(&self, session_id: &str, event: AgentEvent) {
         let _ = self.events.send(AgentEventEnvelope {
             session_id: session_id.to_string(),

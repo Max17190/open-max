@@ -997,3 +997,52 @@ fn a_finished_stream_still_runs_the_same_write_call() {
         );
     }
 }
+
+/// A settings file this process will never act on must not be able to hide
+/// the project's own history. `--recall` reads no settings - it reaches an
+/// endpoint never and spends nothing - so it answers, and says plainly that
+/// the file is broken. The paths that do spend still refuse.
+#[test]
+fn recall_reads_history_when_settings_are_unreadable() {
+    let (project, home) = fresh_dirs("recall-bad-settings");
+    std::fs::create_dir_all(home.join(".openmax")).unwrap();
+    // A key from a newer build is the case that prompted this: real, valid
+    // JSON that this binary's schema does not know.
+    std::fs::write(
+        home.join(".openmax").join("settings.json"),
+        "{\n  \"model\": \"m\",\n  \"mlx_model\": \"mlx-community/gemma\"\n}\n",
+    )
+    .unwrap();
+
+    let searched = Command::new(openmax_bin())
+        .args(["--recall", "anything at all"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        searched.status.success(),
+        "recall must still answer: {}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    let warned = String::from_utf8_lossy(&searched.stderr);
+    assert!(
+        warned.contains("mlx_model") && warned.contains("searching history anyway"),
+        "the broken file must be reported, not swallowed: {warned}"
+    );
+
+    // Trusted, so the refusal below can only be the settings file: the trust
+    // gate runs first and would otherwise mask what this is asserting.
+    let refused = Command::new(openmax_bin())
+        .args(["--trust-project", "-p", "hello"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "a turn must still fail closed on unreadable settings");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("invalid settings file"),
+        "and for that reason: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
