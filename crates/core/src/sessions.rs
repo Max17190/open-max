@@ -194,6 +194,20 @@ pub fn load_manifest(core: &Core, id: &str) -> Option<crate::registry::RegistryM
         .filter(|m| m.version == crate::registry::MANIFEST_VERSION)
 }
 
+/// Some(reason) when a session index exists on disk but cannot be read as
+/// one. Callers that enumerate history (recall) fail loudly on this instead
+/// of reporting an empty past: `load_index`'s silent default is right for
+/// the agent loop, and exactly wrong for a tool whose answer is trusted
+/// when it says nothing was found.
+pub fn index_diagnostic(core: &Core) -> Option<String> {
+    let path = index_path(core);
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Vec<SessionMeta>>(&text) {
+        Ok(_) => None,
+        Err(e) => Some(format!("session index {} does not parse ({e})", path.display())),
+    }
+}
+
 fn load_index(core: &Core) -> Vec<SessionMeta> {
     std::fs::read_to_string(index_path(core))
         .ok()

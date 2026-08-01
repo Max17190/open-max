@@ -35,7 +35,8 @@ options:
       --recall <query>   search this project's past sessions, archives,
                          compaction digests, and memories; prints ranked,
                          cited excerpts. Query syntax: plain terms plus
-                         path:<substr>, k:<n>, budget:<tokens>; --json for
+                         path:<substr>, session:<id-prefix>, k:<n>,
+                         budget:<tokens>, excerpt:<chars>; --json for
                          structured output
       --ledger           print the capability-file history for this project
       --ledger-repair    quarantine an unverifiable ledger log (nothing is
