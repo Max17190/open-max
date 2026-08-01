@@ -176,6 +176,38 @@ fn bounded(text: String) -> String {
     text[..cut].to_string()
 }
 
+/// Read at most `io_budget` bytes of a JSONL file and parse what fits, one
+/// value per line, corrupt or truncated lines skipped. Peak memory follows
+/// the scan ceiling, not the file: a multi-gigabyte transcript costs at most
+/// the budget, and a single line longer than it is dropped, not ballooned -
+/// the cited address still holds the full record.
+fn bounded_jsonl<T: serde::de::DeserializeOwned>(path: &Path, io_budget: usize) -> Vec<T> {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if file.take(io_budget as u64).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    // Lossy, because the budget may cut inside a multi-byte char: the mangled
+    // final line fails to parse and is skipped like any other corrupt line.
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Read at most `MAX_CHUNK_BYTES` of a text file, lossy at the cut.
+fn bounded_text(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(MAX_CHUNK_BYTES as u64).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Collect this project's chunks, newest sessions first, stopping at the
 /// scan-byte ceiling. The ceiling is enforced before every read - memory
 /// files and mid-session alike - so "bounded" means bounded, not "checked
@@ -208,8 +240,7 @@ fn collect_chunks(
             if path.extension().and_then(|e| e.to_str()) != Some("md") || name.starts_with('.') {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let text = bounded(text);
+            let Some(text) = bounded_text(&path) else { continue };
             let ts = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -251,7 +282,31 @@ fn collect_chunks(
             text: meta.title.clone(),
             paths: Vec::new(),
         });
-        for msg in sessions::load_messages(core, &meta.id).unwrap_or_default() {
+        // Digests before bulk: they are tiny, and they carry the structured
+        // paths the session-level `path:` hop depends on. Collected last,
+        // a transcript that exhausts the ceiling would silently strip a
+        // scanned session of its path evidence.
+        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
+        let compaction_path = std::path::PathBuf::from(sessions::compaction_display(core, &meta.id));
+        for record in bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget) {
+            if bytes >= scan_ceiling {
+                break;
+            }
+            let text = bounded(format!("{} {}", record.digest, record.paths.join(" ")));
+            bytes += text.len();
+            chunks.push(Chunk {
+                kind: "digest",
+                session: Some(meta.id.clone()),
+                title: Some(meta.title.clone()),
+                age_hours: hours_since(now, record.ts),
+                source: sessions::compaction_display(core, &meta.id),
+                text,
+                paths: record.paths,
+            });
+        }
+        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
+        let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
+        for msg in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget) {
             if bytes >= scan_ceiling {
                 break;
             }
@@ -274,7 +329,9 @@ fn collect_chunks(
                 paths: Vec::new(),
             });
         }
-        for msg in sessions::load_archive(core, &meta.id) {
+        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
+        let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
+        for msg in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget) {
             if bytes >= scan_ceiling {
                 break;
             }
@@ -292,22 +349,6 @@ fn collect_chunks(
                 source: sessions::archive_display(core, &meta.id),
                 text: content,
                 paths: Vec::new(),
-            });
-        }
-        for record in sessions::load_compaction(core, &meta.id) {
-            if bytes >= scan_ceiling {
-                break;
-            }
-            let text = bounded(format!("{} {}", record.digest, record.paths.join(" ")));
-            bytes += text.len();
-            chunks.push(Chunk {
-                kind: "digest",
-                session: Some(meta.id.clone()),
-                title: Some(meta.title.clone()),
-                age_hours: hours_since(now, record.ts),
-                source: sessions::compaction_display(core, &meta.id),
-                text,
-                paths: record.paths,
             });
         }
     }
@@ -706,6 +747,39 @@ mod tests {
         let (_, scanned, skipped, _) = collect_chunks(&core, &project, sessions::unix_now(), 1_000);
         assert!(skipped >= 1, "a 1 KB ceiling must skip sessions, skipped {skipped}");
         assert_eq!(scanned + skipped, 2, "every session is accounted for");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Digests are collected before bulk content: a transcript that exhausts
+    /// the ceiling must not strip a scanned session of the structured path
+    /// evidence the `path:` hop depends on.
+    #[test]
+    fn path_evidence_survives_mid_session_exhaustion() {
+        let (core, dir, project) = setup();
+        let id = seed_session(&core, &project, "big", vec![
+            ChatMessage::user("a".repeat(4_000)),
+            ChatMessage::user("b".repeat(4_000)),
+        ]);
+        sessions::append_compaction(&core, &id, &sessions::CompactionRecord {
+            ts: sessions::unix_now(),
+            message_count: 1,
+            tools: vec![],
+            paths: vec!["infra/nginx.conf".into()],
+            user_snippets: vec![],
+            digest: "[context note: edited nginx]".into(),
+        });
+        let (chunks, scanned, _, _) = collect_chunks(&core, &project, sessions::unix_now(), 2_000);
+        assert_eq!(scanned, 1);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.kind == "digest" && c.paths.iter().any(|p| p.contains("nginx"))),
+            "the digest and its structured path must precede bulk collection"
+        );
+        assert!(
+            chunks.iter().filter(|c| c.kind == "message").count() < 2,
+            "the ceiling cut the bulk, not the evidence"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
