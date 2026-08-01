@@ -285,8 +285,10 @@ fn collect_chunks(
 
     // Memory files first: the curated facts, small by contract, and held to
     // their own sub-budget so an oversized memory directory can never evict
-    // session history from the scan.
-    let memory_ceiling = scan_ceiling.min(MEMORY_SCAN_BYTES);
+    // session history from the scan. A session:-scoped query skips them
+    // entirely: "more from this session" means this session.
+    let memory_ceiling =
+        if session_filters.is_empty() { scan_ceiling.min(MEMORY_SCAN_BYTES) } else { 0 };
     let memory_dir = project_root.join(crate::memory::MEMORY_DIR);
     if let Ok(read_dir) = std::fs::read_dir(&memory_dir) {
         for entry in read_dir.flatten() {
@@ -347,18 +349,20 @@ fn collect_chunks(
             sessions::archive_display(core, &meta.id),
             sessions::compaction_display(core, &meta.id),
         ];
-        if !stores.iter().any(|p| Path::new(p).exists()) {
+        let Some(title_source) = stores.iter().find(|p| Path::new(p).exists()) else {
             unreadable += 1;
             continue;
-        }
+        };
         scanned += 1;
         let age = hours_since(now, meta.updated_at);
+        // The title cites the first store that actually exists: an
+        // archive-only session must not hand out a dead transcript address.
         chunks.push(Chunk {
             kind: "title",
             session: Some(meta.id.clone()),
             title: Some(meta.title.clone()),
             age_hours: age,
-            source: sessions::messages_display(core, &meta.id),
+            source: title_source.clone(),
             text: meta.title.clone(),
             paths: Vec::new(),
         });
@@ -623,14 +627,27 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
                 }
             }
         }
-        let excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
+        let mut excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
         if seen_excerpts.iter().any(|e| e == &excerpt) {
             suppressed += 1;
             continue;
         }
-        let cost = estimate_tokens(excerpt.len() + chunk.source.len() + 48);
-        if spent + cost > query.budget_tokens && !hits.is_empty() {
-            break;
+        let mut cost = estimate_tokens(excerpt.len() + chunk.source.len() + 48);
+        if spent + cost > query.budget_tokens {
+            if !hits.is_empty() {
+                break;
+            }
+            // The first hit is never dropped for cost - a budget that returns
+            // nothing answers nothing - but the documented cap still holds:
+            // its excerpt shrinks to whatever width the budget leaves.
+            let width = (query.budget_tokens * 4).saturating_sub(chunk.source.len() + 192);
+            excerpt = excerpt_around(&chunk.text, &terms_by_rarity, width.max(40));
+            let mut cut = excerpt.len().min(width.max(40));
+            while cut > 0 && !excerpt.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            excerpt.truncate(cut);
+            cost = estimate_tokens(excerpt.len() + chunk.source.len() + 48);
         }
         spent += cost;
         seen_excerpts.push(excerpt.clone());
@@ -1049,11 +1066,63 @@ mod tests {
         let (core, dir, project) = setup();
         let a = seed_session(&core, &project, "a", vec![ChatMessage::user("shared fact alpha")]);
         seed_session(&core, &project, "b", vec![ChatMessage::user("shared fact beta")]);
+        // A matching memory file must not leak into a session-scoped query:
+        // "more from this session" means this session.
+        std::fs::create_dir_all(project.join(".openmax/memory")).unwrap();
+        std::fs::write(project.join(".openmax/memory/shared.md"), "# shared fact gamma").unwrap();
         let query = format!("shared fact session:{}", &a[..8]);
         let report = recall(&core, &project, &query).unwrap();
         assert!(!report.hits.is_empty());
-        assert!(report.hits.iter().all(|h| h.session.as_deref() == Some(a.as_str())));
+        assert!(
+            report.hits.iter().all(|h| h.session.as_deref() == Some(a.as_str())),
+            "memory or foreign-session hits leaked: {:?}",
+            report.hits
+        );
         assert_eq!(report.sessions_scanned, 1, "filtered sessions are not scanned at all");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An archive-only session (messages file gone, archive retained) must
+    /// cite a file that exists: a dead transcript address defeats the
+    /// citation-then-read pattern the feature is built on.
+    #[test]
+    fn citations_always_point_at_existing_files() {
+        let (core, dir, project) = setup();
+        let meta = sessions::create(&core, project.display().to_string()).unwrap();
+        sessions::set_title_if_new(&core, &meta.id, "archive only");
+        sessions::append_archive(&core, &meta.id, &[ChatMessage::user(
+            "orphaned-archive-fact retained after transcript loss",
+        )]);
+        let report = recall(&core, &project, "orphaned-archive-fact retained k:10").unwrap();
+        assert!(!report.hits.is_empty());
+        for hit in &report.hits {
+            assert!(
+                std::path::Path::new(&hit.source).exists()
+                    || hit.source.starts_with(".openmax/"),
+                "citation must resolve: {}",
+                hit.source
+            );
+        }
+        assert_eq!(report.sessions_scanned, 1);
+        assert_eq!(report.sessions_unreadable, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The documented budget cap holds even for a first hit that would
+    /// overflow it: the hit survives, its excerpt shrinks to fit.
+    #[test]
+    fn a_fat_first_hit_shrinks_into_the_budget() {
+        let (core, dir, project) = setup();
+        seed_session(&core, &project, "fat", vec![ChatMessage::user(format!(
+            "fat-needle {}",
+            "context ".repeat(600)
+        ))]);
+        let report = recall(&core, &project, "fat-needle budget:100").unwrap();
+        assert_eq!(report.hits.len(), 1, "the first hit is never dropped for cost");
+        let hit = &report.hits[0];
+        let spent = estimate_tokens(hit.excerpt.len() + hit.source.len() + 48);
+        assert!(spent <= 100, "shrunken hit must fit the documented cap, spent {spent}");
+        assert!(hit.excerpt.contains("fat-needle"), "the needle survives the shrink");
         let _ = std::fs::remove_dir_all(dir);
     }
 
