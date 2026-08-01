@@ -3159,7 +3159,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "manifest-only";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
@@ -3241,7 +3241,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let id = "midturn-refreeze";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
@@ -3319,7 +3319,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let id = "auto-refreeze";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {

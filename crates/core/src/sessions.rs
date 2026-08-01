@@ -253,6 +253,13 @@ pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::Registry
     let Ok(json) = serde_json::to_string_pretty(manifest) else {
         return;
     };
+    // The last of the five session files to take the rule. A refreeze can be
+    // in flight when the session is deleted, and cancellation is cooperative,
+    // so without this the manifest outlives everything it described.
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
+        return;
+    }
     if let Err(e) = write_atomic(&manifest_path(core, id), json) {
         core.send_agent(
             id,
@@ -752,6 +759,18 @@ mod tests {
         let mut persisted = 0usize;
         save_messages(&core, &id, &[ChatMessage::user("late")], &mut persisted, true);
         assert!(load_messages(&core, &id).is_none(), "a deleted transcript stays deleted");
+        save_manifest(&core, &id, &crate::registry::RegistryManifest {
+            version: 1,
+            external_tools: Vec::new(),
+            skills: Vec::new(),
+            ext_fingerprint: 0,
+        });
+        assert!(load_manifest(&core, &id).is_none(), "and so does its manifest");
+        // All five session-scoped files, so this cannot regress one at a time.
+        for suffix in ["messages.json", "manifest.json", "compaction.jsonl", "archive.jsonl", "usage.jsonl"] {
+            let path = sessions_dir(&core).join(format!("{id}.{suffix}"));
+            assert!(!path.exists(), "{suffix} came back after delete");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
