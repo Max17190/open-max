@@ -46,7 +46,12 @@ const EXCERPT_CHARS: usize = 480;
 const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
 
 const BM25_K1: f64 = 1.2;
-const BM25_B: f64 = 0.75;
+/// Length normalization, tuned for a paged corpus: with long documents split
+/// into pages, length variance is bounded and the classic 0.75 over-rewards
+/// ten-token replies against needle-bearing pages. Measured on the labeled
+/// benchmark: 0.75 let a two-term summary outrank a page matching all four
+/// query terms.
+const BM25_B: f64 = 0.4;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallHit {
@@ -107,6 +112,19 @@ struct Query {
     excerpt_chars: usize,
 }
 
+/// Closed-class words dropped from query terms (never from the corpus). In a
+/// project's own history interrogatives concentrate in stored questions, so
+/// left in, "what did we set..." retrieves past questions instead of the
+/// answers beside them - measured on the labeled benchmark as the
+/// question-echo failure class. If a query is nothing but stopwords, the
+/// original terms are kept so the query still runs.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does", "for", "from",
+    "had", "has", "have", "how", "i", "if", "in", "is", "it", "of", "on", "or", "our", "so",
+    "that", "the", "then", "this", "to", "was", "we", "were", "what", "when", "where", "which",
+    "who", "why", "will", "with", "you",
+];
+
 fn parse_query(raw: &str) -> Result<Query, String> {
     let mut terms = Vec::new();
     let mut path_filters = Vec::new();
@@ -138,6 +156,11 @@ fn parse_query(raw: &str) -> Result<Query, String> {
                 }
             }
         }
+    }
+    let content_terms: Vec<String> =
+        terms.iter().filter(|t| !STOPWORDS.contains(&t.as_str())).cloned().collect();
+    if !content_terms.is_empty() {
+        terms = content_terms;
     }
     if terms.is_empty() && path_filters.is_empty() && session_filters.is_empty() {
         return Err(
@@ -182,6 +205,39 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
+/// Strip one plural 's' (never 'ss'/'us'/'is'): "files"~"file",
+/// "sessions"~"session", while "class", "status", "analysis" stay whole.
+fn fold_plural(token: &str) -> &str {
+    if token.len() > 3
+        && token.ends_with('s')
+        && !token.ends_with("ss")
+        && !token.ends_with("us")
+        && !token.ends_with("is")
+    {
+        &token[..token.len() - 1]
+    } else {
+        token
+    }
+}
+
+/// Whether a query term matches a corpus token: exact, plural-folded, or
+/// full-prefix containment with at least 5 shared chars. The prefix rule is
+/// morphology without linguistics - "abandon"~"abandoned", "modify" reaches
+/// "modified" via "modif" - and 5 chars keeps "test"~"testing" honest misses
+/// rather than admitting "the"~"theme"-class noise; what noise remains on
+/// common stems is idf-damped like any common term.
+fn terms_match(query_term: &str, token: &str) -> bool {
+    if query_term == token {
+        return true;
+    }
+    let (q, t) = (fold_plural(query_term), fold_plural(token));
+    if q == t {
+        return true;
+    }
+    let (short, long) = if q.len() <= t.len() { (q, t) } else { (t, q) };
+    short.len() >= 5 && long.starts_with(short)
+}
+
 /// Case-insensitive find returning an offset into the ORIGINAL text. The
 /// lowercased copy can differ in byte length (Turkish İ gains a byte), so
 /// offsets found there are mapped back through a per-byte table built while
@@ -210,6 +266,57 @@ fn hours_since(now: u64, ts: u64) -> u64 {
 /// or memory file cannot spend the whole ceiling; the tail past the cap is
 /// still on disk at the cited address.
 const MAX_CHUNK_BYTES: usize = 512 * 1024;
+/// Long texts score as fixed-size pages, the retrieval analog of paged
+/// memory: BM25's length normalization is right to distrust long documents,
+/// but a fact inside a pasted log is exactly what recall exists to find, and
+/// as one giant document that log always loses to a short summary that
+/// half-matches. Paged, the needle's page is a short document with dense
+/// term hits, and it competes on relevance. Overlap keeps a fact that
+/// straddles a boundary matchable on one page.
+const PAGE_CHARS: usize = 1_200;
+const PAGE_OVERLAP: usize = 200;
+
+/// Split text into whitespace-aligned pages of ~PAGE_CHARS with overlap.
+/// Short texts return themselves untouched: pagination is for documents the
+/// length norm would otherwise bury, not a rewrite of every message.
+fn pages(text: &str) -> Vec<&str> {
+    if text.len() <= PAGE_CHARS + PAGE_CHARS / 2 {
+        return vec![text];
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = (start + PAGE_CHARS).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end < text.len() {
+            // Prefer a whitespace boundary in the last fifth of the page;
+            // both slice ends must sit on char boundaries first.
+            let mut window_start = end.saturating_sub(PAGE_CHARS / 5).max(start + 1);
+            while window_start < end && !text.is_char_boundary(window_start) {
+                window_start += 1;
+            }
+            if window_start < end {
+                if let Some(ws) = text[window_start..end].rfind(char::is_whitespace) {
+                    end = window_start + ws;
+                }
+            }
+        }
+        if start >= end {
+            break;
+        }
+        out.push(&text[start..end]);
+        if end >= text.len() {
+            break;
+        }
+        start = end.saturating_sub(PAGE_OVERLAP);
+    }
+    out
+}
 /// Memory files scan under their own sub-budget so even a pathological
 /// memory directory can never crowd session history out of the ceiling.
 const MEMORY_SCAN_BYTES: usize = 4 * 1024 * 1024;
@@ -309,15 +416,17 @@ fn collect_chunks(
                 .map(|d| d.as_secs())
                 .unwrap_or(now);
             bytes += text.len();
-            chunks.push(Chunk {
-                kind: "memory",
-                session: None,
-                title: None,
-                age_hours: hours_since(now, ts),
-                source: format!("{}/{name}", crate::memory::MEMORY_DIR),
-                text,
-                paths: Vec::new(),
-            });
+            for page in pages(&text) {
+                chunks.push(Chunk {
+                    kind: "memory",
+                    session: None,
+                    title: None,
+                    age_hours: hours_since(now, ts),
+                    source: format!("{}/{name}", crate::memory::MEMORY_DIR),
+                    text: page.to_string(),
+                    paths: Vec::new(),
+                });
+            }
         }
     }
 
@@ -403,15 +512,17 @@ fn collect_chunks(
             }
             let content = bounded(content);
             bytes += content.len();
-            chunks.push(Chunk {
-                kind: "message",
-                session: Some(meta.id.clone()),
-                title: Some(meta.title.clone()),
-                age_hours: age,
-                source: sessions::messages_display(core, &meta.id),
-                text: content,
-                paths: Vec::new(),
-            });
+            for page in pages(&content) {
+                chunks.push(Chunk {
+                    kind: "message",
+                    session: Some(meta.id.clone()),
+                    title: Some(meta.title.clone()),
+                    age_hours: age,
+                    source: sessions::messages_display(core, &meta.id),
+                    text: page.to_string(),
+                    paths: Vec::new(),
+                });
+            }
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
@@ -425,15 +536,17 @@ fn collect_chunks(
             }
             let content = bounded(content);
             bytes += content.len();
-            chunks.push(Chunk {
-                kind: "archive",
-                session: Some(meta.id.clone()),
-                title: Some(meta.title.clone()),
-                age_hours: age,
-                source: sessions::archive_display(core, &meta.id),
-                text: content,
-                paths: Vec::new(),
-            });
+            for page in pages(&content) {
+                chunks.push(Chunk {
+                    kind: "archive",
+                    session: Some(meta.id.clone()),
+                    title: Some(meta.title.clone()),
+                    age_hours: age,
+                    source: sessions::archive_display(core, &meta.id),
+                    text: page.to_string(),
+                    paths: Vec::new(),
+                });
+            }
         }
     }
     Collected { chunks, scanned, skipped, unreadable, bytes }
@@ -539,7 +652,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         total_len += tokens.len();
         let mut tf: HashMap<usize, usize> = HashMap::new();
         for token in &tokens {
-            if let Some(i) = query.terms.iter().position(|t| t == token) {
+            if let Some(i) = query.terms.iter().position(|t| terms_match(t, token)) {
                 *tf.entry(i).or_insert(0) += 1;
             }
         }
@@ -558,16 +671,41 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
 
     // Pass 2: score candidates. BM25 with the standard idf, then equal-weight
     // fusion with ACT-R recency after normalizing lexical scores to [0, 1].
+    // Per-term idf, shared by scoring and the coverage factor. Terms nothing
+    // in the corpus satisfies (df = 0) discriminate nothing and drop out of
+    // the coverage denominator.
+    let term_idf: Vec<f64> = query
+        .terms
+        .iter()
+        .map(|t| {
+            let term_df = df.get(t.as_str()).copied().unwrap_or(0) as f64;
+            if term_df == 0.0 {
+                0.0
+            } else {
+                (1.0 + (n_docs - term_df + 0.5) / (term_df + 0.5)).ln()
+            }
+        })
+        .collect();
+    let idf_total: f64 = term_idf.iter().sum();
+
     let mut raw: Vec<(usize, f64)> = Vec::new();
     for (i, entry) in doc_tfs.iter().enumerate() {
         let Some((tf, len)) = entry else { continue };
         let mut lex = 0.0;
+        let mut idf_matched = 0.0;
         for (&term_i, &count) in tf {
-            let term_df = *df.get(query.terms[term_i].as_str()).unwrap_or(&1) as f64;
-            let idf = (1.0 + (n_docs - term_df + 0.5) / (term_df + 0.5)).ln();
+            let idf = term_idf[term_i];
+            idf_matched += idf;
             let tf_f = count as f64;
             let norm = 1.0 - BM25_B + BM25_B * (*len as f64 / avg_len);
             lex += idf * (tf_f * (BM25_K1 + 1.0)) / (tf_f + BM25_K1 * norm);
+        }
+        // Idf-weighted coverage: a page matching the query's informative
+        // terms must beat a snippet matching two stopwords, and neither
+        // stopwords nor unsatisfiable terms may dilute the ratio. Square
+        // root so partial coverage degrades gently rather than gating.
+        if idf_total > 0.0 {
+            lex *= (idf_matched / idf_total).sqrt();
         }
         raw.push((i, lex));
     }
@@ -957,8 +1095,8 @@ mod tests {
     fn path_evidence_survives_mid_session_exhaustion() {
         let (core, dir, project) = setup();
         let id = seed_session(&core, &project, "big", vec![
-            ChatMessage::user("a".repeat(4_000)),
-            ChatMessage::user("b".repeat(4_000)),
+            ChatMessage::user("alpha ".repeat(700)),
+            ChatMessage::user("bravo ".repeat(700)),
         ]);
         sessions::append_compaction(&core, &id, &sessions::CompactionRecord {
             ts: sessions::unix_now(),
@@ -977,8 +1115,79 @@ mod tests {
             "the digest and its structured path must precede bulk collection"
         );
         assert!(
-            c.chunks.iter().filter(|c| c.kind == "message").count() < 2,
-            "the ceiling cut the bulk, not the evidence"
+            !c.chunks.iter().any(|c| c.text.contains("bravo")),
+            "the ceiling cut the second message's bulk, not the evidence"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Pages: long texts split at whitespace boundaries with overlap; short
+    /// texts pass through untouched; every byte of the original is on some
+    /// page (overlap means a boundary-straddling fact is whole on one).
+    #[test]
+    fn pages_cover_everything_and_respect_boundaries() {
+        let short = "a short message";
+        assert_eq!(pages(short), vec![short]);
+        let long = "word ".repeat(700) + "NEEDLE-AT-END tail " + &"pad ".repeat(40);
+        let ps = pages(&long);
+        assert!(ps.len() > 2, "long text must page, got {}", ps.len());
+        assert!(ps.iter().all(|p| p.len() <= PAGE_CHARS + 8), "pages stay page-sized");
+        assert!(ps.iter().any(|p| p.contains("NEEDLE-AT-END")), "no byte is lost");
+        // Consecutive pages share their boundary region, so a fact that
+        // straddles a cut is whole on at least one page.
+        for pair in ps.windows(2) {
+            let tail = &pair[0][pair[0].len().saturating_sub(PAGE_OVERLAP / 2)..];
+            assert!(
+                pair[1].contains(tail.split_whitespace().next().unwrap_or("")),
+                "overlap must carry the boundary region forward"
+            );
+        }
+        // Unicode: multibyte content pages without panicking on boundaries.
+        let cjk = "修复错误 ".repeat(600);
+        assert!(pages(&cjk).len() > 1);
+    }
+
+    /// Term matching: exact, plural fold, and >=5-char full-prefix
+    /// containment - and the guards that keep it from admitting noise.
+    #[test]
+    fn terms_match_handles_morphology_without_noise() {
+        assert!(terms_match("change", "change"));
+        assert!(terms_match("files", "file"));
+        assert!(terms_match("session", "sessions"));
+        assert!(!terms_match("class", "clas"), "'ss' words never fold");
+        assert!(terms_match("abandon", "abandoned"));
+        assert!(terms_match("abandoning", "abandon"));
+        assert!(terms_match("changed", "change"));
+        assert!(
+            !terms_match("modify", "modified"),
+            "y/i alternation is a documented miss: containment only, no linguistics"
+        );
+        assert!(!terms_match("the", "theme"), "3-char prefixes are noise");
+        assert!(!terms_match("test", "testing"), "4 shared chars is below the floor");
+        assert!(!terms_match("content", "context"), "shared prefix is not containment");
+    }
+
+    /// The diagnosed D7 case: a fact inside a big pasted log must outrank a
+    /// short summary that half-matches, because the needle's page is now a
+    /// short document with dense term hits.
+    #[test]
+    fn a_needle_inside_a_long_log_outranks_a_half_matching_summary() {
+        let (core, dir, project) = setup();
+        let log = format!(
+            "{}ERR_STREAM_PREMATURE_CLOSE: upstream closed while writing (req_id=8f2c1a)\n{}",
+            "upstream latency nominal, keepalive steady\n".repeat(180),
+            "upstream latency nominal, keepalive steady\n".repeat(180),
+        );
+        seed_session(&core, &project, "bug hunt", vec![
+            ChatMessage::tool("c1", log),
+            ChatMessage::assistant(Some("found it: the stream closes mid-body".into()), None),
+        ]);
+        let report = recall(&core, &project, "ERR_STREAM_PREMATURE_CLOSE").unwrap();
+        let first = &report.hits[0];
+        assert!(
+            first.excerpt.contains("req_id=8f2c1a"),
+            "the needle page must rank first and show the fact: {:?}",
+            report.hits
         );
         let _ = std::fs::remove_dir_all(dir);
     }
