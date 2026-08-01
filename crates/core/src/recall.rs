@@ -955,6 +955,9 @@ pub fn render(report: &RecallReport) -> String {
 }
 
 #[cfg(test)]
+mod quality;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
