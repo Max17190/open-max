@@ -1010,7 +1010,7 @@ fn recall_reads_history_when_settings_are_unreadable() {
     // JSON that this binary's schema does not know.
     std::fs::write(
         home.join(".openmax").join("settings.json"),
-        "{\n  \"model\": \"m\",\n  \"mlx_model\": \"mlx-community/gemma\"\n}\n",
+        "{\n  \"model\": \"m\",\n  \"reasoning_effort\": \"high\"\n}\n",
     )
     .unwrap();
 
@@ -1027,7 +1027,7 @@ fn recall_reads_history_when_settings_are_unreadable() {
     );
     let warned = String::from_utf8_lossy(&searched.stderr);
     assert!(
-        warned.contains("mlx_model") && warned.contains("searching history anyway"),
+        warned.contains("reasoning_effort") && warned.contains("searching history anyway"),
         "the broken file must be reported, not swallowed: {warned}"
     );
 

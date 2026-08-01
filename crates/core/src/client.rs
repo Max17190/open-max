@@ -124,7 +124,7 @@ pub struct Usage {
 }
 
 /// Minimal client for any OpenAI-compatible /v1/chat/completions endpoint
-/// (mlx-lm server, Ollama, LM Studio, vLLM, llama.cpp, cloud gateways...).
+/// (Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, private proxies).
 pub struct ChatClient {
     pub base_url: String,
     pub api_key: Option<String>,
@@ -323,8 +323,9 @@ impl ChatClient {
             for (name, value) in &self.headers {
                 req = req.header(name.as_str(), value.as_str());
             }
-            // Local models can spend a long time in prompt processing before the
-            // first byte arrives; keep cancellation responsive throughout.
+            // An endpoint can spend a long time in prompt processing before the
+            // first byte arrives, and a large prompt makes that worse wherever
+            // it runs; keep cancellation responsive throughout.
             let send_result = tokio::select! {
                 r = req.send() => r,
                 _ = cancelled.cancelled() => {
@@ -561,7 +562,7 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
 
 /// reqwest's `Display` stops at "error sending request for url (...)" and
 /// hides the cause underneath, which is the only part a user can act on:
-/// "connection refused" means the local model server is not running. Walk the
+/// "connection refused" means nothing is listening at base_url. Walk the
 /// source chain so that line survives into the transcript.
 fn describe_transport(e: &reqwest::Error) -> String {
     use std::error::Error;
