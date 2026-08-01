@@ -191,30 +191,91 @@ fn parse_query(raw: &str) -> Result<Query, String> {
     })
 }
 
-/// Lowercased alphanumeric runs, length 2..=64. One tokenizer for the query
-/// and the corpus, or scores drift. The upper cap keeps a base64 blob or a
-/// minified bundle from becoming one giant unmatchable token that bloats the
-/// term maps; content inside such a run is not lexically findable either way
-/// (the cited address is).
-fn tokenize(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            if current.chars().count() < 64 {
-                current.extend(ch.to_lowercase());
-            }
-        } else if !current.is_empty() {
-            if current.chars().count() >= 2 {
-                out.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
-            }
+/// The camel-case parts of one alphanumeric run, lowercased, longest-first
+/// order irrelevant to scoring. Two boundaries, the standard pair: a capital
+/// after a lowercase or digit (`streamingMarkdown`), and the last capital of
+/// a run of them when a lowercase follows (`HTTPServer` -> `http`, `server`).
+/// A run with no boundary returns nothing, so ordinary prose costs nothing.
+fn camel_parts(run: &[char]) -> Vec<String> {
+    let mut bounds = Vec::new();
+    for i in 1..run.len() {
+        let (prev, cur) = (run[i - 1], run[i]);
+        let acronym_end = prev.is_uppercase()
+            && cur.is_uppercase()
+            && run.get(i + 1).is_some_and(|n| n.is_lowercase());
+        if (cur.is_uppercase() && (prev.is_lowercase() || prev.is_numeric())) || acronym_end {
+            bounds.push(i);
         }
     }
-    if current.chars().count() >= 2 {
-        out.push(current);
+    if bounds.is_empty() {
+        return Vec::new();
     }
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    for &end in bounds.iter().chain(std::iter::once(&run.len())) {
+        if end - start >= 2 {
+            parts.push(run[start..end].iter().collect::<String>().to_lowercase());
+        }
+        start = end;
+    }
+    parts
+}
+
+/// Lowercased alphanumeric runs, length 2..=64, plus the camel-case parts of
+/// any run that has them. One tokenizer for the query and the corpus, or
+/// scores drift.
+///
+/// Identifiers are the vocabulary of a coding agent's history, and a compound
+/// one is a single alphanumeric run: `StreamingMarkdown` indexed whole meant a
+/// search for "streaming markdown" matched half of it - "streaming" through
+/// the prefix rule, "markdown" not at all - and lost to any page that happened
+/// to write `markdown::render`, where a separator had done the splitting.
+/// Measured on real transcripts, that cost the session actually holding the
+/// answer its first-place rank. Underscore, dot and slash forms already split,
+/// because those separators are not alphanumeric; case is the one boundary
+/// that was invisible.
+///
+/// The upper cap keeps a base64 blob or a minified bundle from becoming one
+/// giant unmatchable token that bloats the term maps; content inside such a
+/// run is not lexically findable either way (the cited address is).
+fn tokenize(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Vec<char> = Vec::new();
+    let mut flush = |run: &mut Vec<char>, out: &mut Vec<String>| {
+        if run.len() >= 2 {
+            // The compound is kept only when no part can already reach it.
+            // Emitting both unconditionally double-counts, and does so
+            // asymmetrically: the prefix rule reaches `streamingmarkdown`
+            // from "streaming" but never from "markdown", so one occurrence
+            // would score tf=2 for the first part and tf=1 for the rest.
+            // Dropping it unconditionally is the opposite failure - the
+            // prefix rule needs five shared characters, so `ToString` and
+            // `IntoIterator` split into parts too short to lead back, and an
+            // exact lowercase search for the identifier would find nothing.
+            // Keeping it exactly when it is otherwise unreachable satisfies
+            // both: every surface form of one occurrence still counts once.
+            let whole = run.iter().collect::<String>().to_lowercase();
+            let parts = camel_parts(run);
+            let reachable = parts
+                .iter()
+                .any(|p| p.chars().count() >= 5 && whole.starts_with(p.as_str()));
+            if parts.is_empty() || !reachable {
+                out.push(whole);
+            }
+            out.extend(parts);
+        }
+        run.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            if current.len() < 64 {
+                current.push(ch);
+            }
+        } else {
+            flush(&mut current, &mut out);
+        }
+    }
+    flush(&mut current, &mut out);
     out
 }
 
@@ -1233,6 +1294,53 @@ mod tests {
 
     /// Term matching: exact, plural fold, and >=5-char full-prefix
     /// containment - and the guards that keep it from admitting noise.
+    #[test]
+    fn camel_case_compounds_index_their_parts_and_prose_is_untouched() {
+        // The compound is dropped when a part already leads back to it, so
+        // one occurrence is never counted twice for its first part.
+        assert_eq!(tokenize("StreamingMarkdown"), ["streaming", "markdown"]);
+        assert_eq!(tokenize("MessageDone"), ["message", "done"]);
+        assert!(terms_match("streamingmarkdown", "streaming"), "the whole still leads back");
+        // An acronym run ends where the next word begins. "http" is four
+        // characters, one short of leading back, so the compound is kept -
+        // and cannot double-count, for exactly the same reason.
+        assert_eq!(tokenize("HTTPServer"), ["httpserver", "http", "server"]);
+        // Short leading parts cannot lead back (the prefix rule wants five
+        // shared characters), so the compound is kept and stays searchable.
+        assert_eq!(tokenize("ToString"), ["tostring", "to", "string"]);
+        assert_eq!(tokenize("IntoIterator"), ["intoiterator", "into", "iterator"]);
+        // Separators already split, so those runs have no case boundary left.
+        assert_eq!(tokenize("keep_alive_msecs"), ["keep", "alive", "msecs"]);
+        // Ordinary prose gains nothing: no boundary, no extra tokens.
+        assert_eq!(tokenize("the deploy port is 7443"), ["the", "deploy", "port", "is", "7443"]);
+    }
+
+    #[test]
+    fn a_word_inside_a_camel_case_identifier_is_findable() {
+        let (core, dir, project) = setup();
+        // "button" and "sender" never occur as their own words here, exactly
+        // as they never do in a real Rust transcript. The prefix rule cannot
+        // reach them: it only ever matches a compound's first part, so before
+        // this these queries returned nothing at all.
+        let sid = seed_session(&core, &project, "input handling", vec![
+            ChatMessage::tool("c1", "MouseEventKind::Drag(MouseButton::Left) => self.select(),"),
+            ChatMessage::tool("c2", "events: mpsc::UnboundedSender<AgentEventEnvelope>,"),
+            ChatMessage::tool("c3", "impl ToString for Row { fn to_string(&self) -> String }"),
+        ]);
+        // "tostring" splits into parts too short to lead back to it, so the
+        // compound has to be kept or an exact search for the identifier -
+        // the most obvious thing a person types - would find nothing.
+        for word in ["button", "sender", "envelope", "tostring"] {
+            let report = recall(&core, &project, word).unwrap();
+            assert!(
+                report.hits.iter().any(|h| h.session.as_deref() == Some(sid.as_str())),
+                "'{word}' lives only inside a compound and must still be findable: {:?}",
+                report.hits
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn terms_match_handles_morphology_without_noise() {
         assert!(terms_match("change", "change"));
