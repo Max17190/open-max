@@ -14,9 +14,10 @@ const MAX_MAP_DEPTH: usize = 2;
 /// prompt tax, not an index.
 pub const MAX_SKILLS_BYTES: usize = 3_000;
 
-/// System prompt deliberately tuned for small local models: short, imperative,
-/// with explicit tool-use rules. Long "constitution"-style prompts measurably
-/// degrade 7B–30B models, so every line here has to earn its place.
+/// System prompt: short, imperative, explicit about tool use, and every line
+/// has to earn its place. Long "constitution"-style prompts measurably degrade
+/// model performance, and the degradation starts well below the context limit,
+/// so brevity here is a quality decision before it is a token one.
 ///
 /// Grounding context (AGENTS.md, a shallow layout map) is appended here, once,
 /// at session creation: the prompt is persisted with the session, so the token

@@ -1,6 +1,6 @@
 [package]
 name = "open-max-core"
-description = "Open Max core: agent harness, native process supervision, and optional local model serve"
+description = "Open Max core: agent harness and native process supervision"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
