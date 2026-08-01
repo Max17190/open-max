@@ -26,6 +26,10 @@ pub fn context_block(
     frozen: bool,
     budget: Option<(usize, usize)>,
     cache_pct: Option<u8>,
+    // Cached and total prompt tokens over the whole session, when the
+    // endpoint reported them. The last turn alone cannot show a broken
+    // prefix: one cold request looks exactly like one evicted cache.
+    session_cache: Option<(u64, u64)>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let header = if frozen {
@@ -95,6 +99,20 @@ pub fn context_block(
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<22}", "cache hit (last turn)"), Style::default().fg(theme::ACCENT())),
             Span::raw(format!("{pct:>6} %")),
+        ]));
+    }
+    if let Some((cached, prompt)) = session_cache.filter(|(_, p)| *p > 0) {
+        let pct = (cached as f64 / prompt as f64 * 100.0).round() as u64;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<22}", "cache hit (session)"),
+                Style::default().fg(theme::ACCENT()),
+            ),
+            Span::raw(format!("{pct:>6} %")),
+            Span::styled(
+                format!("   {cached} of {prompt} prompt tok"),
+                Style::default().fg(theme::DIM()),
+            ),
         ]));
     }
     if let Some((used, total)) = budget {

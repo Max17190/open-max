@@ -63,6 +63,10 @@ pub fn unix_now() -> u64 {
 
 /// Append a compaction event. Best-effort: failures surface as an agent warning.
 pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
+        return;
+    }
     let path = compaction_path(core, id);
     let Ok(line) = serde_json::to_string(record) else { return };
     let result = std::fs::OpenOptions::new()
@@ -78,6 +82,74 @@ pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
             },
         );
     }
+}
+
+fn usage_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.usage.jsonl"))
+}
+
+/// What one request actually cost, as the server reported it.
+///
+/// The prompt cache is the largest lever a client has over cost and latency,
+/// and it is invisible from this side: the only evidence is `cached` coming
+/// back smaller than it should. A harness that never records it cannot tell a
+/// prefix it broke from a cache the provider evicted, and cannot notice
+/// either one regressing. So this is kept for the same reason the capability
+/// ledger is kept - the numbers are the product's claim.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub ts: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Server-reported cached prompt tokens. `None` means the endpoint said
+    /// nothing, which is not the same as zero: most OpenAI-compatible servers
+    /// simply omit the field, and reporting that as a 0% hit rate would be a
+    /// measurement the harness invented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+}
+
+/// Append one request's accounting. Best-effort and silent on failure: usage
+/// is a record of work already done, so a full disk must not fail the turn
+/// that succeeded.
+pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
+        return;
+    }
+    let Ok(line) = serde_json::to_string(record) else { return };
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(usage_path(core, id))
+        .and_then(|mut f| writeln!(f, "{line}"));
+}
+
+/// Every recorded request for a session, oldest first (corrupt lines skipped).
+pub fn load_usage(core: &Core, id: &str) -> Vec<TokenUsage> {
+    let Ok(text) = std::fs::read_to_string(usage_path(core, id)) else {
+        return Vec::new();
+    };
+    text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// Prompt tokens served from cache over a whole session, as
+/// `(cached, prompt)`, counting only requests whose endpoint reported the
+/// field. Returns `None` when none did: a session against a server that never
+/// reports cache state has no hit rate, and showing 0% would be a lie about
+/// the server rather than a fact about the session.
+pub fn cache_hit_totals(records: &[TokenUsage]) -> Option<(u64, u64)> {
+    let mut cached = 0u64;
+    let mut prompt = 0u64;
+    let mut reported = false;
+    for record in records {
+        if let Some(c) = record.cached_tokens {
+            reported = true;
+            cached = cached.saturating_add(c);
+            prompt = prompt.saturating_add(record.prompt_tokens);
+        }
+    }
+    reported.then_some((cached, prompt))
 }
 
 /// The most recent compaction record, parsing only the final valid line:
@@ -133,6 +205,10 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
         return true;
     }
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
+        return true;
+    }
     let mut lines = String::new();
     for msg in messages {
         let Ok(line) = serde_json::to_string(msg) else { continue };
@@ -177,6 +253,13 @@ pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::Registry
     let Ok(json) = serde_json::to_string_pretty(manifest) else {
         return;
     };
+    // The last of the five session files to take the rule. A refreeze can be
+    // in flight when the session is deleted, and cancellation is cooperative,
+    // so without this the manifest outlives everything it described.
+    let _guard = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(core, id) {
+        return;
+    }
     if let Err(e) = write_atomic(&manifest_path(core, id), json) {
         core.send_agent(
             id,
@@ -213,6 +296,27 @@ fn load_index(core: &Core) -> Vec<SessionMeta> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Whether the session still exists, i.e. whether writing a sidecar for it is
+/// still meaningful.
+///
+/// Every sidecar here is opened with `create`, so a write that lands after
+/// `delete` recreates the file it just removed. Cancellation narrows that
+/// window but cannot close it: a request already on the wire settles when it
+/// settles, and its usage record arrives afterwards. Checking the index makes
+/// the write a no-op instead, which is what "deleted" has to mean if it is to
+/// mean anything.
+///
+/// One small read per append. Compaction and archive appends happen at prune
+/// time, and a usage append happens once per request, next to a network round
+/// trip that costs several orders of magnitude more.
+/// Callers must already hold `sessions_lock`: an unlocked check is a
+/// time-of-check/time-of-use bug, because `delete` can remove the entry and
+/// the file between the check passing and the write landing, which recreates
+/// exactly the file that was deleted.
+fn still_indexed_locked(core: &Core, id: &str) -> bool {
+    load_index(core).iter().any(|m| m.id == id)
 }
 
 fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
@@ -378,10 +482,29 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
 }
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
-    with_index(core, |metas| metas.retain(|m| m.id != id))?;
+    // Stop the session's work before removing its files. A frontend may
+    // delete the session it is currently running, and a turn that keeps going
+    // keeps writing: every sidecar here is opened with `create`, so an
+    // in-flight append recreates the file that was just deleted. Cancelling
+    // first is also the behaviour a user asking to delete a session expects.
+    //
+    // A request already on the wire can still land after this returns and
+    // append one record. That window is inherent to cooperative cancellation
+    // and predates the usage sidecar - the compaction and archive logs have
+    // always shared it - so it is narrowed here, not claimed closed.
+    core.cancel(id);
+    // The index entry and the files go under one lock. Dropping the entry
+    // first and the files second would let an append pass its check against
+    // the stale index and recreate what this call is removing.
+    let _guard = core.sessions_lock.lock().unwrap();
+    let mut metas = load_index(core);
+    metas.retain(|m| m.id != id);
+    save_index(core, &metas)?;
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
     let _ = std::fs::remove_file(compaction_path(core, id));
+    let _ = std::fs::remove_file(archive_path(core, id));
+    let _ = std::fs::remove_file(usage_path(core, id));
     Ok(())
 }
 
@@ -450,6 +573,14 @@ pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
     let path = messages_path(core, id);
     let _guard = core.sessions_lock.lock().unwrap();
+    // Same rule as the sidecars, and for the same reason: cancellation is
+    // cooperative, so a turn keeps running for a while after `delete` and
+    // ends with an unconditional save. Without this the transcript of a
+    // deleted session comes back, which is the one file that made the
+    // deletion visible in the first place.
+    if !still_indexed_locked(core, id) {
+        return;
+    }
     // Never append onto a non-JSONL blob left on disk after a failed load.
     let needs_rewrite =
         rewrite || messages.len() < *persisted || must_rewrite_non_jsonl(&path);
@@ -490,10 +621,164 @@ mod tests {
     use crate::types::ChatMessage;
 
     #[test]
+    fn usage_records_append_and_aggregate_only_what_was_reported() {
+        let dir = std::env::temp_dir().join(format!("openmax-usage-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
+        // A server that reports cache state, then one that does not.
+        append_usage(&core, id, &TokenUsage {
+            ts: 1,
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            cached_tokens: Some(900),
+        });
+        append_usage(&core, id, &TokenUsage {
+            ts: 2,
+            prompt_tokens: 1200,
+            completion_tokens: 60,
+            cached_tokens: Some(1100),
+        });
+        append_usage(&core, id, &TokenUsage {
+            ts: 3,
+            prompt_tokens: 5000,
+            completion_tokens: 10,
+            cached_tokens: None,
+        });
+        let records = load_usage(&core, id);
+        assert_eq!(records.len(), 3, "append-only, oldest first");
+        assert_eq!(records[0].prompt_tokens, 1000);
+        // The unreported request contributes to neither side: counting its
+        // 5000 prompt tokens as a miss would report the server's silence as
+        // this session's cache behaviour.
+        assert_eq!(cache_hit_totals(&records), Some((2000, 2200)));
+        assert_eq!(
+            cache_hit_totals(&[TokenUsage { ts: 1, prompt_tokens: 9, ..Default::default() }]),
+            None,
+            "a session nobody reported on has no hit rate"
+        );
+        assert_eq!(cache_hit_totals(&[]), None);
+
+        // Deleting a session must take its sidecars with it: a recreated id
+        // would otherwise inherit a stranger's accounting.
+        append_archive(&core, id, &[ChatMessage::user("dropped")]);
+        append_compaction(&core, id, &CompactionRecord {
+            ts: 1,
+            message_count: 1,
+            tools: vec![],
+            paths: vec![],
+            user_snippets: vec![],
+            digest: "[context note: x]".into(),
+        });
+        create(&core, "/tmp/p".into()).ok();
+        with_index(&core, |m| {
+            m.push(SessionMeta {
+                id: id.into(),
+                project: "/tmp/p".into(),
+                title: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+            })
+        })
+        .unwrap();
+        delete(&core, id).unwrap();
+        assert!(load_usage(&core, id).is_empty(), "usage sidecar must not outlive the session");
+        assert!(load_compaction(&core, id).is_empty());
+        assert!(load_archive(&core, id).is_empty());
+
+        // Deleting a session cancels its in-flight turn: a session that keeps
+        // running keeps writing, and every sidecar above is opened with
+        // `create`, so the files would come back.
+        let running = create(&core, "/tmp/p".into()).unwrap();
+        let token = std::sync::Arc::new(crate::state::CancelToken::default());
+        core.cancel_flags.lock().unwrap().insert(running.id.clone(), token.clone());
+        assert!(!token.is_cancelled());
+        delete(&core, &running.id).unwrap();
+        assert!(token.is_cancelled(), "delete must stop the work before removing the files");
+
+        // And the write that loses the race is a no-op rather than a
+        // resurrection: cancellation cannot stop a request already on the
+        // wire, so the append itself has to know the session is gone.
+        append_usage(&core, &running.id, &TokenUsage {
+            ts: 9,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cached_tokens: Some(1),
+        });
+        append_compaction(&core, &running.id, &CompactionRecord {
+            ts: 9,
+            message_count: 1,
+            tools: vec![],
+            paths: vec![],
+            user_snippets: vec![],
+            digest: "late".into(),
+        });
+        append_archive(&core, &running.id, &[ChatMessage::user("late")]);
+        assert!(load_usage(&core, &running.id).is_empty(), "a deleted session stays deleted");
+        assert!(load_compaction(&core, &running.id).is_empty());
+        assert!(load_archive(&core, &running.id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The fix is that an append and a delete cannot interleave, so this
+    /// tests exactly that: while `sessions_lock` is held, an append must
+    /// block rather than write. Racing threads against a delete and hoping
+    /// for the bad interleaving proves nothing - that version of this test
+    /// passed against the unserialized code too.
+    #[test]
+    fn an_append_is_serialized_against_the_session_lock() {
+        let dir = std::env::temp_dir().join(format!("openmax-race-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+
+        let guard = core.sessions_lock.lock().unwrap();
+        let writer = {
+            let core = core.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                append_usage(&core, &id, &TokenUsage {
+                    ts: 1,
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cached_tokens: Some(1),
+                });
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            load_usage(&core, &id).is_empty(),
+            "an append must wait for the lock delete holds, or it can write after the delete"
+        );
+        drop(guard);
+        writer.join().unwrap();
+        assert_eq!(load_usage(&core, &id).len(), 1, "and land once the lock is free");
+
+        // The transcript is under the same rule. It is the file that made the
+        // deletion visible, so a late save recreating it is the worst version
+        // of this bug, not the mildest.
+        delete(&core, &id).unwrap();
+        let mut persisted = 0usize;
+        save_messages(&core, &id, &[ChatMessage::user("late")], &mut persisted, true);
+        assert!(load_messages(&core, &id).is_none(), "a deleted transcript stays deleted");
+        save_manifest(&core, &id, &crate::registry::RegistryManifest {
+            version: 1,
+            external_tools: Vec::new(),
+            skills: Vec::new(),
+            ext_fingerprint: 0,
+        });
+        assert!(load_manifest(&core, &id).is_none(), "and so does its manifest");
+        // All five session-scoped files, so this cannot regress one at a time.
+        for suffix in ["messages.json", "manifest.json", "compaction.jsonl", "archive.jsonl", "usage.jsonl"] {
+            let path = sessions_dir(&core).join(format!("{id}.{suffix}"));
+            assert!(!path.exists(), "{suffix} came back after delete");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn compaction_records_append_and_load() {
         let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "c1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let rec = CompactionRecord {
             ts: 1,
             message_count: 3,
@@ -525,7 +810,7 @@ mod tests {
     fn last_compaction_parses_only_the_final_valid_line() {
         let dir = std::env::temp_dir().join(format!("openmax-lastcomp-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "lc1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         assert!(last_compaction(&core, id).is_none());
         for ts in [1u64, 2] {
             append_compaction(&core, id, &CompactionRecord {
@@ -553,7 +838,7 @@ mod tests {
     fn compaction_archive_appends_and_round_trips() {
         let dir = std::env::temp_dir().join(format!("openmax-archive-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "a1";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         assert!(load_archive(&core, id).is_empty(), "no archive before any prune");
         append_archive(&core, id, &[]);
         assert!(
@@ -584,7 +869,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(loaded[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(loaded[3].content.as_deref(), Some("second prune"));
-        assert!(archive_display(&core, id).ends_with("a1.archive.jsonl"));
+        assert!(archive_display(&core, id).ends_with(&format!("{id}.archive.jsonl")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -592,7 +877,7 @@ mod tests {
     fn empty_or_corrupt_messages_file_loads_as_none() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "empty";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
 
         std::fs::write(messages_path(&core, id), "").unwrap();
         assert!(load_messages(&core, id).is_none());
@@ -607,7 +892,7 @@ mod tests {
     fn jsonl_append_only_writes_new_tail() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "test-session";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let initial = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
@@ -638,7 +923,7 @@ mod tests {
     fn array_payload_is_not_loaded() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "array-payload";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
         assert!(load_messages(&core, id).is_none());
@@ -649,7 +934,7 @@ mod tests {
     fn save_over_array_blob_rewrites_jsonl_not_append() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "array-then-save";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
         assert!(load_messages(&core, id).is_none());
@@ -675,7 +960,7 @@ mod tests {
     fn manifest_round_trips_without_rediscovery() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "with-tools";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
 
         let project = dir.join("project");
         let tools_dir = project.join(".openmax/tools");
@@ -708,7 +993,7 @@ mod tests {
     fn save_failure_does_not_advance_persisted_count() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "fail-save";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let initial = vec![ChatMessage::user("hello")];
@@ -738,7 +1023,7 @@ mod tests {
     fn multi_message_append_is_all_or_nothing_and_round_trips() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "multi-append";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let seed = vec![ChatMessage::system("sys")];
@@ -773,7 +1058,7 @@ mod tests {
     fn rewrite_leaves_complete_file_without_tmp() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "atomic-rewrite";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let initial = vec![
@@ -826,7 +1111,7 @@ mod tests {
     fn unknown_manifest_version_reads_as_no_manifest() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "future-manifest";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut manifest = crate::registry::Registry::builtin_only().to_manifest();
         save_manifest(&core, id, &manifest);
         assert!(load_manifest(&core, id).is_some());
@@ -841,7 +1126,7 @@ mod tests {
     fn save_manifest_writes_parseable_file_atomically() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "manifest-atomic";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
 
         let manifest = crate::registry::Registry::builtin_only().to_manifest();
         save_manifest(&core, id, &manifest);

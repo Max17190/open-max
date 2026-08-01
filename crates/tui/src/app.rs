@@ -1780,11 +1780,18 @@ impl App {
                         (b, false)
                     }
                 };
+                let session_cache = self
+                    .session_id
+                    .as_deref()
+                    .map(|id| open_max_core::sessions::load_usage(&self.core, id))
+                    .as_deref()
+                    .and_then(open_max_core::sessions::cache_hit_totals);
                 self.transcript.push(context::context_block(
                     &breakdown,
                     is_frozen,
                     self.budget,
                     self.cache_pct,
+                    session_cache,
                 ));
             }
             "tools" => {

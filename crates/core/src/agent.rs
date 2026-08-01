@@ -782,7 +782,14 @@ impl CompactionDigest {
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_SUMMARY_CHARS: usize = 1_200;
 
+/// `core` and `session_id` are taken only to bill this request: the
+/// summarizer is a real model call against the same endpoint, and a ledger
+/// that advertises what each request cost cannot quietly omit the one request
+/// the harness issues on its own behalf - which is also the one whose cost
+/// decides whether compacting was worth it at all.
 async fn summarize_compaction(
+    core: &Arc<Core>,
+    session_id: &str,
     client: &ChatClient,
     digest: &CompactionDigest,
     cancelled: &Arc<CancelToken>,
@@ -817,6 +824,14 @@ async fn summarize_compaction(
     .await
     .ok()?
     .ok()?;
+    if let Some(u) = result.usage {
+        sessions::append_usage(core, session_id, &sessions::TokenUsage {
+            ts: sessions::unix_now(),
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            cached_tokens: u.cached_tokens,
+        });
+    }
     let mut summary = result.content;
     if let Some(clean) = fallback::strip_leading_think(&summary) {
         summary = clean;
@@ -1588,7 +1603,7 @@ async fn run_loop(
                 // the endpoint cooperates; the note at index 2 was just
                 // inserted by enforce_budget, so replacing it here keeps one
                 // digest message.
-                let note = match summarize_compaction(&client, &digest, &cancelled).await {
+                let note = match summarize_compaction(core, session_id, &client, &digest, &cancelled).await {
                     Some(summary) => digest.format_with_summary(&summary, archive.as_deref()),
                     None => digest.format(archive.as_deref()),
                 };
@@ -1636,6 +1651,16 @@ async fn run_loop(
         };
 
         if let Some(u) = result.usage {
+            // Kept, not just broadcast: the live event tells the current
+            // frontend what this turn cost, and nothing else ever learns it.
+            // Prefix-cache behaviour is only visible in this number, and a
+            // regression in it is silent by construction.
+            sessions::append_usage(core, session_id, &sessions::TokenUsage {
+                ts: sessions::unix_now(),
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                cached_tokens: u.cached_tokens,
+            });
             core.send_agent(session_id, AgentEvent::Usage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
@@ -3165,7 +3190,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "manifest-only";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
@@ -3194,7 +3219,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "reload-live";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
@@ -3247,7 +3272,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let id = "midturn-refreeze";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
@@ -3325,7 +3350,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let id = "auto-refreeze";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
@@ -3915,7 +3940,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "resume-refreeze";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
 
@@ -4186,7 +4211,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "legacy-no-system";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
         sessions::save_messages(&core, id, &[ChatMessage::user("hello")], &mut persisted, false);
 
