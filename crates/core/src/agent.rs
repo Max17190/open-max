@@ -3188,7 +3188,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "reload-live";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
@@ -3909,7 +3909,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "resume-refreeze";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
 
@@ -4180,7 +4180,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "legacy-no-system";
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
         sessions::save_messages(&core, id, &[ChatMessage::user("hello")], &mut persisted, false);
 

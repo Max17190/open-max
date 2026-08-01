@@ -566,6 +566,14 @@ pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
     let path = messages_path(core, id);
     let _guard = core.sessions_lock.lock().unwrap();
+    // Same rule as the sidecars, and for the same reason: cancellation is
+    // cooperative, so a turn keeps running for a while after `delete` and
+    // ends with an unconditional save. Without this the transcript of a
+    // deleted session comes back, which is the one file that made the
+    // deletion visible in the first place.
+    if !still_indexed_locked(core, id) {
+        return;
+    }
     // Never append onto a non-JSONL blob left on disk after a failed load.
     let needs_rewrite =
         rewrite || messages.len() < *persisted || must_rewrite_non_jsonl(&path);
@@ -736,6 +744,14 @@ mod tests {
         drop(guard);
         writer.join().unwrap();
         assert_eq!(load_usage(&core, &id).len(), 1, "and land once the lock is free");
+
+        // The transcript is under the same rule. It is the file that made the
+        // deletion visible, so a late save recreating it is the worst version
+        // of this bug, not the mildest.
+        delete(&core, &id).unwrap();
+        let mut persisted = 0usize;
+        save_messages(&core, &id, &[ChatMessage::user("late")], &mut persisted, true);
+        assert!(load_messages(&core, &id).is_none(), "a deleted transcript stays deleted");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -842,7 +858,7 @@ mod tests {
     fn empty_or_corrupt_messages_file_loads_as_none() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "empty";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
 
         std::fs::write(messages_path(&core, id), "").unwrap();
         assert!(load_messages(&core, id).is_none());
@@ -857,7 +873,7 @@ mod tests {
     fn jsonl_append_only_writes_new_tail() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "test-session";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let initial = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
@@ -888,7 +904,7 @@ mod tests {
     fn array_payload_is_not_loaded() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "array-payload";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
         assert!(load_messages(&core, id).is_none());
@@ -899,7 +915,7 @@ mod tests {
     fn save_over_array_blob_rewrites_jsonl_not_append() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "array-then-save";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
         assert!(load_messages(&core, id).is_none());
@@ -925,7 +941,7 @@ mod tests {
     fn manifest_round_trips_without_rediscovery() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "with-tools";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
 
         let project = dir.join("project");
         let tools_dir = project.join(".openmax/tools");
@@ -958,7 +974,7 @@ mod tests {
     fn save_failure_does_not_advance_persisted_count() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "fail-save";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let initial = vec![ChatMessage::user("hello")];
@@ -988,7 +1004,7 @@ mod tests {
     fn multi_message_append_is_all_or_nothing_and_round_trips() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "multi-append";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let seed = vec![ChatMessage::system("sys")];
@@ -1023,7 +1039,7 @@ mod tests {
     fn rewrite_leaves_complete_file_without_tmp() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "atomic-rewrite";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut persisted = 0usize;
 
         let initial = vec![
@@ -1076,7 +1092,7 @@ mod tests {
     fn unknown_manifest_version_reads_as_no_manifest() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "future-manifest";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let mut manifest = crate::registry::Registry::builtin_only().to_manifest();
         save_manifest(&core, id, &manifest);
         assert!(load_manifest(&core, id).is_some());
@@ -1091,7 +1107,7 @@ mod tests {
     fn save_manifest_writes_parseable_file_atomically() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = "manifest-atomic";
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
 
         let manifest = crate::registry::Registry::builtin_only().to_manifest();
         save_manifest(&core, id, &manifest);
