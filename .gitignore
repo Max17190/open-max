@@ -11,6 +11,10 @@ target
 # Local planning notes (not shipped)
 /PLAN.md
 
+# Eval rig scratch (fixtures are generated, never committed)
+rigs/runs/
+rigs/__pycache__/
+
 # Editor and OS
 .idea
 .DS_Store
