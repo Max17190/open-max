@@ -324,6 +324,9 @@ pub struct App {
     /// keep a scrolled-up viewport stationary as the tail grows or collapses.
     last_tail_len: usize,
     last_content_w: u16,
+    /// Last state written into the terminal title (idle / working / needs
+    /// approval); writes are edge-triggered.
+    presence: Presence,
     approval_hits: [Option<Rect>; 3],
     perf_layout_ms: f64,
     perf_selection_ms: f64,
@@ -374,6 +377,8 @@ pub async fn run(
     let mut draw_deadline: Option<Instant> = None;
     draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL)?;
     app.dirty.clear();
+    // State the initial presence in the title; transitions are edge-driven.
+    app.emit_presence_title();
 
     loop {
         tokio::select! {
@@ -535,6 +540,7 @@ impl App {
             scrollbar_reserved: false,
             last_tail_len: 0,
             last_content_w: 0,
+            presence: Presence::Idle,
             approval_hits: [None; 3],
             perf_layout_ms: 0.0,
             perf_selection_ms: 0.0,
@@ -1670,6 +1676,7 @@ impl App {
         ) {
             Ok(()) => {
                 self.running = true;
+                self.set_presence(Presence::Working);
                 self.pending_submit = Some(text);
                 self.turn_started = Some(Instant::now());
                 self.first_token = None;
@@ -2267,6 +2274,7 @@ impl App {
                     detail
                 };
                 self.pending_approval = Some((approval_id, name, summary, detail));
+                self.set_presence(Presence::NeedsApproval);
                 self.completion = None;
                 self.dirty.mark_chrome();
             }
@@ -2280,6 +2288,8 @@ impl App {
                     .is_some_and(|(id, _, _, _)| id == &approval_id)
                 {
                     self.pending_approval = None;
+                    // The turn resumes; the needs-you state is over.
+                    self.set_presence(Presence::Working);
                     self.dirty.mark_chrome();
                     match outcome.as_str() {
                         "timed_out" => self.note("approval timed out · declined"),
@@ -2326,6 +2336,7 @@ impl App {
             }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
+                self.set_presence(Presence::Idle);
                 self.running_tool = None;
                 self.pending_approval = None;
                 // Spinner/status clear plus any transcript note/stats.
@@ -2397,6 +2408,28 @@ impl App {
 
     fn tick_armed(&self) -> bool {
         self.running
+    }
+
+    /// Announce a presence change in the terminal title (edge-triggered),
+    /// with a bell on the needs-you edge. Best-effort raw writes, same as
+    /// the OSC 52 clipboard path; never part of a frame.
+    fn set_presence(&mut self, presence: Presence) {
+        if self.presence == presence {
+            return;
+        }
+        self.presence = presence;
+        self.emit_presence_title();
+    }
+
+    fn emit_presence_title(&self) {
+        use std::io::Write;
+        let title = presence_title(self.presence, &self.project);
+        let mut seq = format!("\x1b]0;{title}\x07");
+        if self.presence == Presence::NeedsApproval {
+            seq.push('\x07');
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
     }
 
     /// Animation cadence: fluid while the user has nothing but the spinner
@@ -3149,6 +3182,29 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),
 ];
 
+/// What this session needs from the world, stated in the terminal title so
+/// tmux window lists, tab bars, and pane supervisors can read it without an
+/// orchestrator attached. The bell rings on the idle-hands edge (an approval
+/// arriving), which tmux monitor-bell and terminal urgency hints surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    Idle,
+    Working,
+    NeedsApproval,
+}
+
+fn presence_title(presence: Presence, project: &std::path::Path) -> String {
+    let base = project
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "openmax".into());
+    match presence {
+        Presence::Idle => format!("{base} · openmax"),
+        Presence::Working => format!("{base} · openmax · working"),
+        Presence::NeedsApproval => format!("{base} · openmax · needs approval"),
+    }
+}
+
 /// Elapsed-time label for the live tail: tenths below ten seconds so the
 /// silent wait visibly advances between whole seconds, whole seconds after.
 /// The boundary sits at exactly 10.0 so the display is monotonic: 9.9s,
@@ -3518,8 +3574,8 @@ mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
-        paint_text_selection, plural, rect_contains, save_model_selection, App, Dirty,
-        Focus, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
+        paint_text_selection, plural, presence_title, rect_contains, save_model_selection,
+        App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
     use crossterm::event::{
@@ -4189,6 +4245,52 @@ mod tests {
         assert!(rendered.iter().any(|row| row.contains("second streamed line")));
         assert!(rendered.iter().any(|row| row.contains("esc to cancel")));
         assert!(rendered.last().unwrap().starts_with('╰'));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn presence_titles_state_the_project_and_the_need() {
+        let project = std::path::Path::new("/home/max/things/open-max");
+        assert_eq!(
+            presence_title(Presence::Idle, project),
+            "open-max · openmax"
+        );
+        assert_eq!(
+            presence_title(Presence::Working, project),
+            "open-max · openmax · working"
+        );
+        assert_eq!(
+            presence_title(Presence::NeedsApproval, project),
+            "open-max · openmax · needs approval"
+        );
+    }
+
+    #[test]
+    fn presence_follows_the_turn_lifecycle() {
+        let (mut app, dir) = app_fixture();
+        assert_eq!(app.presence, Presence::Idle);
+
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "a1".into(),
+            name: "write_file".into(),
+            summary: "write x".into(),
+            detail: String::new(),
+            reason: "gate".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
+        });
+        assert_eq!(app.presence, Presence::NeedsApproval);
+
+        app.on_agent_event(AgentEvent::ApprovalSettled {
+            approval_id: "a1".into(),
+            outcome: "allowed".into(),
+        });
+        assert_eq!(app.presence, Presence::Working);
+
+        app.on_agent_event(AgentEvent::Done {
+            stop_reason: "stop".into(),
+        });
+        assert_eq!(app.presence, Presence::Idle);
         fs::remove_dir_all(dir).unwrap();
     }
 
