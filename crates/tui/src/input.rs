@@ -31,6 +31,24 @@ pub enum ComposerAction {
     Submit(String),
 }
 
+/// A mouse selection over the draft, endpoints inclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    anchor: Point,
+    head: Point,
+    /// Set by a word or line gesture, which picks a real range even when it is
+    /// one character wide. With inclusive endpoints a drag that has not moved
+    /// looks identical to a one-character selection; this tells them apart and
+    /// keeps a plain click from selecting.
+    explicit: bool,
+}
+
+impl Selection {
+    fn is_empty(&self) -> bool {
+        !self.explicit && self.anchor == self.head
+    }
+}
+
 /// One display row: a soft-wrapped slice `start..end` (char columns) of
 /// logical line `line`. `last` marks the row that ends the logical line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +69,10 @@ pub struct Composer {
     /// Whether the viewport tracks the cursor. The wheel detaches it; the
     /// next edit or cursor move re-attaches, so typing is never lost offscreen.
     follow: bool,
-    /// Mouse selection endpoints in logical coordinates; anchor may follow head.
-    selection: Option<(Point, Point)>,
+    /// Mouse selection in logical coordinates. Both endpoints are inclusive,
+    /// matching the transcript: what is highlighted is exactly what a copy
+    /// carries, down to the character under the release cell.
+    selection: Option<Selection>,
     /// Whether the mouse button is still down on that selection.
     dragging: bool,
     /// Ticks on every entry point that can change the text, via `touch`, so a
@@ -576,20 +596,56 @@ impl Composer {
         self.col = point.1;
         self.follow = true;
         self.hist_idx = None;
-        self.selection = Some((point, point));
+        self.selection = Some(Selection { anchor: point, head: point, explicit: false });
         self.dragging = true;
     }
 
     /// Extend an in-progress click selection to `(cell, row)`.
     pub fn drag_to(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
-        let Some((anchor, _)) = self.selection.filter(|_| self.dragging) else {
+        let Some(current) = self.selection.filter(|_| self.dragging) else {
             return;
         };
         let head = self.point_at(width, max_h, cell, row);
-        self.selection = Some((anchor, head));
+        self.selection = Some(Selection { head, ..current });
         self.row = head.0;
         self.col = head.1;
         self.follow = true;
+    }
+
+    /// Select the word under a double-click in the draft.
+    pub fn select_word_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) -> bool {
+        self.select_range_at(width, max_h, cell, row, text::word_bounds)
+    }
+
+    /// Select the logical line under a triple-click, even where it wraps.
+    pub fn select_line_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) -> bool {
+        self.select_range_at(width, max_h, cell, row, text::line_bounds)
+    }
+
+    fn select_range_at(
+        &mut self,
+        width: u16,
+        max_h: u16,
+        cell: u16,
+        row: u16,
+        bounds: fn(&str, usize) -> (usize, usize),
+    ) -> bool {
+        let point = self.point_at(width, max_h, cell, row);
+        let (start, end) = bounds(&self.lines[point.0], point.1);
+        if start >= end {
+            return false;
+        }
+        self.row = point.0;
+        self.col = end;
+        self.follow = true;
+        self.hist_idx = None;
+        self.selection = Some(Selection {
+            anchor: (point.0, start),
+            head: (point.0, end - 1),
+            explicit: true,
+        });
+        self.dragging = true;
+        true
     }
 
     /// Release the mouse button. A click that never moved leaves no highlight,
@@ -662,14 +718,14 @@ impl Composer {
 
     /// Selection as (low, high) logical points, or `None` when it is empty.
     fn selection_bounds(&self) -> Option<(Point, Point)> {
-        let (anchor, head) = self.selection?;
-        if anchor == head {
+        let selection = self.selection?;
+        if selection.is_empty() {
             return None;
         }
-        Some(if anchor <= head {
-            (anchor, head)
+        Some(if selection.anchor <= selection.head {
+            (selection.anchor, selection.head)
         } else {
-            (head, anchor)
+            (selection.head, selection.anchor)
         })
     }
 
@@ -684,7 +740,13 @@ impl Composer {
             let line = &self.lines[index];
             let chars = line.chars().count();
             let from = if index == lo.0 { lo.1.min(chars) } else { 0 };
-            let to = if index == hi.0 { hi.1.min(chars) } else { chars };
+            // Inclusive of the character under the release cell: a drag that
+            // ends ON the closing brace must copy the brace.
+            let to = if index == hi.0 {
+                hi.1.saturating_add(1).min(chars)
+            } else {
+                chars
+            };
             if index > lo.0 {
                 out.push('\n');
             }
@@ -752,6 +814,9 @@ fn wrap_cols(line: &str, width: usize) -> Vec<(usize, usize)> {
 
 /// Where a selection crosses one display row, as char columns of its line.
 fn row_selection(lo: Point, hi: Point, row: &Row) -> Option<(usize, usize)> {
+    // `hi` is inclusive; painting wants a half-open range, so the highlight
+    // covers exactly the characters a copy carries.
+    let hi = (hi.0, hi.1.saturating_add(1));
     let start = lo.max((row.line, row.start));
     let end = hi.min((row.line, row.end));
     if start >= end {
@@ -996,7 +1061,7 @@ mod tests {
         let (width, height) = (12, 6);
 
         composer.click_at(width, height, GUTTER as u16, 0);
-        composer.drag_to(width, height, GUTTER as u16 + 5, 1);
+        composer.drag_to(width, height, GUTTER as u16 + 4, 1);
         composer.finish_selection();
         assert_eq!(composer.selected_text().as_deref(), Some("hello world"));
 
@@ -1004,9 +1069,69 @@ mod tests {
         let mut composer = Composer::new(&std::env::temp_dir());
         composer.insert_str("alpha\nbeta");
         composer.click_at(40, height, GUTTER as u16 + 2, 0);
-        composer.drag_to(40, height, GUTTER as u16 + 3, 1);
+        composer.drag_to(40, height, GUTTER as u16 + 2, 1);
         composer.finish_selection();
         assert_eq!(composer.selected_text().as_deref(), Some("pha\nbet"));
+    }
+
+    /// Double-click grabs the whole token a developer meant, including the
+    /// one-character case that an inclusive endpoint alone cannot express.
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("see crates/tui/src/app.rs:42 now");
+        let (width, height) = (60, 6);
+
+        let at = |c: &mut Composer, cell: usize| {
+            c.select_word_at(width, height, (GUTTER + cell) as u16, 0);
+            c.finish_selection();
+            c.selected_text()
+        };
+        assert_eq!(at(&mut composer, 1).as_deref(), Some("see"));
+        assert_eq!(
+            at(&mut composer, 10).as_deref(),
+            Some("crates/tui/src/app.rs:42"),
+        );
+
+        // A one-character word is a real selection, not an empty one.
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("let x = 1");
+        assert_eq!(at(&mut composer, 4).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn triple_click_selects_the_logical_line_even_where_it_wraps() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("alpha\nhello world foo bar\nomega");
+        // Width 12 wraps the middle line across rows; a triple-click on any of
+        // them still means the whole logical line.
+        let (width, height) = (12, 6);
+        for row in [0u16, 1] {
+            let mut c = Composer::new(&std::env::temp_dir());
+            c.insert_str("hello world foo bar");
+            c.select_line_at(width, height, GUTTER as u16, row);
+            c.finish_selection();
+            assert_eq!(
+                c.selected_text().as_deref(),
+                Some("hello world foo bar"),
+                "row {row}",
+            );
+        }
+        // And it stops at the logical line, never running into the next.
+        composer.select_line_at(60, height, GUTTER as u16, 1);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("hello world foo bar"));
+    }
+
+    /// The guarantee #132 established for the transcript, now true here too.
+    #[test]
+    fn the_release_cell_is_carried_not_dropped() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("fn main() {}");
+        composer.click_at(40, 6, GUTTER as u16, 0);
+        composer.drag_to(40, 6, GUTTER as u16 + 11, 0);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("fn main() {}"));
     }
 
     /// A click that never moved leaves a cursor, not a highlight, so it can
@@ -1028,7 +1153,7 @@ mod tests {
         let mut composer = Composer::new(&std::env::temp_dir());
         composer.insert_str("alpha\nbeta");
         composer.click_at(40, 6, GUTTER as u16 + 2, 0);
-        composer.drag_to(40, 6, GUTTER as u16 + 3, 1);
+        composer.drag_to(40, 6, GUTTER as u16 + 2, 1);
         composer.finish_selection();
 
         let highlighted = |line: &Line<'static>| -> String {
@@ -1042,6 +1167,11 @@ mod tests {
         assert_eq!(plain(&lines[0]), "❯ alpha");
         assert_eq!(highlighted(&lines[0]), "pha");
         assert_eq!(highlighted(&lines[1]), "bet");
+        // The highlight is exactly the text a copy carries.
+        assert_eq!(
+            format!("{}\n{}", highlighted(&lines[0]), highlighted(&lines[1])),
+            composer.selected_text().unwrap(),
+        );
 
         // Editing drops the highlight rather than leaving a stale one.
         composer.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -1130,4 +1260,5 @@ mod tests {
             );
         }
     }
+
 }

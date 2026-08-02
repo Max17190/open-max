@@ -68,6 +68,18 @@ struct TextSelection {
     anchor: TextPoint,
     head: TextPoint,
     dragging: bool,
+    /// Set by a word or line gesture, which picks a real range even when it is
+    /// one character wide. Endpoints are inclusive, so a drag that has not
+    /// moved yet is indistinguishable from a one-character selection; this is
+    /// what tells them apart, and it keeps a plain click from selecting.
+    explicit: bool,
+}
+
+impl TextSelection {
+    /// Whether this covers any text at all.
+    fn is_empty(&self) -> bool {
+        !self.explicit && self.anchor == self.head
+    }
 }
 
 impl Block {
@@ -271,6 +283,7 @@ impl Transcript {
                     anchor: retreat(selection.anchor),
                     head: retreat(selection.head),
                     dragging: selection.dragging,
+                    explicit: selection.explicit,
                 });
             }
         }
@@ -750,7 +763,7 @@ impl Transcript {
 
     pub fn has_text_selection(&self) -> bool {
         self.text_selection
-            .is_some_and(|selection| selection.anchor != selection.head)
+            .is_some_and(|selection| !selection.is_empty())
     }
 
     pub fn clear_text_selection(&mut self) -> bool {
@@ -765,6 +778,43 @@ impl Transcript {
             anchor: point,
             head: point,
             dragging: true,
+            explicit: false,
+        });
+        true
+    }
+
+    /// Select the word under a double-click.
+    pub fn select_word_at(&mut self, line_idx: usize, x: usize) -> bool {
+        self.select_range_at(line_idx, x, crate::ui::text::word_bounds)
+    }
+
+    /// Select the logical line under a triple-click, even where it wraps.
+    pub fn select_line_at(&mut self, line_idx: usize, x: usize) -> bool {
+        self.select_range_at(line_idx, x, crate::ui::text::line_bounds)
+    }
+
+    fn select_range_at(
+        &mut self,
+        line_idx: usize,
+        x: usize,
+        bounds: fn(&str, usize) -> (usize, usize),
+    ) -> bool {
+        let Some(point) = self.hit_test(line_idx, x) else {
+            return false;
+        };
+        let Some(block) = self.blocks.get(point.block) else {
+            return false;
+        };
+        let (start, end) = bounds(&block.selectable, point.offset);
+        if start >= end {
+            return false;
+        }
+        self.text_selection = Some(TextSelection {
+            anchor: TextPoint { block: point.block, offset: start },
+            // Endpoints are inclusive, matching what a copy carries.
+            head: TextPoint { block: point.block, offset: end - 1 },
+            dragging: true,
+            explicit: true,
         });
         true
     }
@@ -783,7 +833,9 @@ impl Transcript {
     pub fn finish_text_selection(&mut self) {
         if let Some(selection) = &mut self.text_selection {
             selection.dragging = false;
-            if selection.anchor == selection.head {
+            // A click that never moved is not a selection; a word or line
+            // gesture is one even at a single character.
+            if selection.is_empty() {
                 self.text_selection = None;
             }
         }
@@ -805,10 +857,10 @@ impl Transcript {
     pub fn selection_columns(&mut self, line_idx: usize) -> Option<(usize, usize)> {
         self.ensure_flat();
         let selection = self.text_selection?;
-        let (start, end) = normalized_selection(selection);
-        if start == end {
+        if selection.is_empty() {
             return None;
         }
+        let (start, end) = normalized_selection(selection);
         let block = *self.line_block.get(line_idx)?;
         if block < start.block || block > end.block {
             return None;
@@ -841,8 +893,11 @@ impl Transcript {
 
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
+        if selection.is_empty() {
+            return None;
+        }
         let (start, end) = normalized_selection(selection);
-        if start == end || start.block >= self.blocks.len() || end.block >= self.blocks.len() {
+        if start.block >= self.blocks.len() || end.block >= self.blocks.len() {
             return None;
         }
         let mut parts = Vec::new();
@@ -1537,6 +1592,76 @@ mod tests {
         t.finish_text_selection();
         assert_eq!(t.selected_text().as_deref(), Some("delta"));
         assert_eq!(t.selection_columns(row), Some((2, 7)));
+    }
+
+    /// Double-click in the transcript is how a developer lifts a path out of
+    /// tool output; it has to come back whole.
+    #[test]
+    fn double_click_selects_the_whole_token() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push(vec![Line::from("edited crates/tui/src/app.rs:42 ok")]);
+        let row = 0;
+        let col = "edited cr".len();
+
+        assert!(t.select_word_at(row, col));
+        t.finish_text_selection();
+        assert_eq!(
+            t.selected_text().as_deref(),
+            Some("crates/tui/src/app.rs:42"),
+        );
+        // The highlight covers exactly those columns.
+        let (from, to) = t.selection_columns(row).expect("highlight");
+        assert_eq!(to - from, "crates/tui/src/app.rs:42".chars().count());
+    }
+
+    /// A one-character word survives the release-cell-inclusive endpoint,
+    /// which on its own cannot tell it from a click that never moved.
+    #[test]
+    fn double_click_selects_a_one_character_word() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push(vec![Line::from("let x = 1")]);
+        assert!(t.select_word_at(0, 4));
+        t.finish_text_selection();
+        assert!(t.has_text_selection());
+        assert_eq!(t.selected_text().as_deref(), Some("x"));
+    }
+
+    /// Triple-click means the logical line, even where it wraps on screen.
+    #[test]
+    fn triple_click_selects_the_logical_line_across_wraps() {
+        let mut t = Transcript::new();
+        t.set_width(16);
+        t.push(vec![
+            Line::from("first line here"),
+            Line::from("second line that wraps across rows"),
+        ]);
+        let rendered = text(t.lines());
+        let row = rendered
+            .iter()
+            .position(|r| r.contains("across"))
+            .expect("a continuation row of the second line");
+        assert!(row > 1, "the second line must actually wrap");
+
+        assert!(t.select_line_at(row, 2));
+        t.finish_text_selection();
+        assert_eq!(
+            t.selected_text().as_deref(),
+            Some("second line that wraps across rows"),
+        );
+    }
+
+    /// A plain click still selects nothing, or every click would copy.
+    #[test]
+    fn a_click_that_never_moved_is_not_a_selection() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push(vec![Line::from("hello there")]);
+        assert!(t.begin_text_selection_at(0, 3));
+        t.finish_text_selection();
+        assert!(!t.has_text_selection());
+        assert_eq!(t.selected_text(), None);
     }
 
     #[test]
