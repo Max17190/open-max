@@ -49,6 +49,9 @@ const TICK: Duration = Duration::from_millis(120);
 const WAIT_TICK: Duration = Duration::from_millis(50);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
+
+/// How close together two presses on a cell count as one multi-click gesture.
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
 /// leaves normal scheduler overhead inside a 144 Hz display interval without
 /// busy-spinning. The loop remains event-driven, so idle produces no frames.
@@ -315,6 +318,10 @@ pub struct App {
     /// Where the composer text last painted, so the wheel and the mouse can
     /// tell the prompt apart from the conversation above it.
     composer_draw_area: Rect,
+    /// Cell, time, and running count of the last left press. Terminals report
+    /// presses, never click counts, so double and triple clicks are derived
+    /// here rather than delivered.
+    last_click: Option<(u16, u16, Instant, u8)>,
     /// Whether the previous frame reserved the right-hand scrollbar column.
     /// Sticky so a steadily overflowing transcript wraps at one width per
     /// frame instead of re-deciding (and re-wrapping all history twice) on
@@ -537,6 +544,7 @@ impl App {
             chat_line_map: Vec::new(),
             chat_draw_area: Rect::default(),
             composer_draw_area: Rect::default(),
+            last_click: None,
             scrollbar_reserved: false,
             last_tail_len: 0,
             last_content_w: 0,
@@ -733,6 +741,7 @@ impl App {
                 if self.mode == Mode::Chat {
                     match m.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
+                            let clicks = self.count_click(m.column, m.row);
                             if let Some(choice) = self
                                 .approval_hits
                                 .iter()
@@ -746,7 +755,16 @@ impl App {
                                 self.focus = Focus::Composer;
                                 self.transcript.clear_text_selection();
                                 self.transcript.clear_selection();
-                                self.composer.click_at(area.width, area.height, cell, row);
+                                let (w, h) = (area.width, area.height);
+                                match clicks {
+                                    2 => {
+                                        self.composer.select_word_at(w, h, cell, row);
+                                    }
+                                    3 => {
+                                        self.composer.select_line_at(w, h, cell, row);
+                                    }
+                                    _ => self.composer.click_at(w, h, cell, row),
+                                }
                                 self.dirty.mark_chrome();
                                 self.dirty.mark_selection();
                             } else if let Some((line, x)) =
@@ -754,7 +772,17 @@ impl App {
                             {
                                 self.focus = Focus::Scrollback;
                                 self.composer.clear_selection();
-                                self.transcript.begin_text_selection_at(line, x);
+                                match clicks {
+                                    2 => {
+                                        self.transcript.select_word_at(line, x);
+                                    }
+                                    3 => {
+                                        self.transcript.select_line_at(line, x);
+                                    }
+                                    _ => {
+                                        self.transcript.begin_text_selection_at(line, x);
+                                    }
+                                }
                                 self.dirty.mark_selection();
                             } else {
                                 self.transcript.clear_text_selection();
@@ -1176,6 +1204,25 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// How many times this cell has been clicked in quick succession: 1, 2, or
+    /// 3, cycling so a fourth rapid click starts over rather than sticking.
+    ///
+    /// A one-cell tolerance keeps a slightly drifting hand on the same word.
+    fn count_click(&mut self, column: u16, row: u16) -> u8 {
+        let count = match self.last_click {
+            Some((cx, cy, at, n))
+                if cy == row
+                    && cx.abs_diff(column) <= 1
+                    && at.elapsed() <= MULTI_CLICK_WINDOW =>
+            {
+                (n % 3) + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some((column, row, Instant::now(), count));
+        count
     }
 
     /// Cell and row of `(column, row)` inside the composer text area, or
@@ -3304,6 +3351,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("wheel · pgup/pgdn", "scroll the conversation · over the prompt, the draft"),
     ("click in the prompt", "put the cursor there in a wrapped draft"),
     ("mouse drag", "select transcript or prompt text · y or ctrl+c copies"),
+    ("double / triple click", "select the word · the whole line"),
     ("ctrl+o / o", "expand the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
@@ -4066,24 +4114,101 @@ mod tests {
         assert_eq!(buffer[(7, 0)].bg, theme::USER_BG());
     }
 
-    /// The composer paints its own background, so a prompt selection has to
-    /// survive onto the real buffer, not just into the spans.
+    /// What is highlighted is exactly what a copy carries, on the real buffer
+    /// and not just in the spans. #132 made that true of the transcript; the
+    /// prompt was still dropping the character under the release cell.
     #[tokio::test]
-    async fn prompt_selection_changes_only_selected_composer_cells() {
+    async fn the_prompt_highlight_is_exactly_what_a_copy_carries() {
         let (mut app, dir) = app_fixture();
         app.composer.load("hello world");
         render_app(&mut app, 60, 24);
         let area = app.composer_draw_area;
-        app.composer.click_at(area.width, area.height, 2, 0);
-        app.composer.drag_to(area.width, area.height, 7, 0);
-        app.composer.finish_selection();
-        let buffer = render_app(&mut app, 60, 24);
 
-        let row = area.y;
-        assert_eq!(buffer[(area.x + 1, row)].bg, theme::COMPOSER_BG());
-        assert_eq!(buffer[(area.x + 2, row)].bg, theme::SELECT());
-        assert_eq!(buffer[(area.x + 6, row)].bg, theme::SELECT());
-        assert_eq!(buffer[(area.x + 7, row)].bg, theme::COMPOSER_BG());
+        for release in [3u16, 5, 7, 12] {
+            app.composer.click_at(area.width, area.height, 2, 0);
+            app.composer.drag_to(area.width, area.height, release, 0);
+            app.composer.finish_selection();
+            let buffer = render_app(&mut app, 60, 24);
+
+            let row = area.y;
+            let highlighted: String = (area.x..area.right())
+                .filter(|x| buffer[(*x, row)].bg == theme::SELECT())
+                .map(|x| buffer[(x, row)].symbol().to_string())
+                .collect();
+            assert_eq!(
+                highlighted,
+                app.composer.selected_text().unwrap_or_default(),
+                "highlight and copy disagree at release cell {release}",
+            );
+            // The release cell itself is carried, never dropped.
+            assert_eq!(buffer[(area.x + release, row)].bg, theme::SELECT());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Terminals report presses, never click counts, so the gesture only
+    /// works if the derivation does. Driven through the real event path.
+    #[tokio::test]
+    async fn repeated_presses_become_word_and_line_gestures() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("see crates/tui/src/app.rs:42 now");
+        render_app(&mut app, 60, 24);
+        let area = app.composer_draw_area;
+        // Over the "crates/..." token.
+        let (col, row) = (area.x + 2 + 8, area.y);
+        let press = |c, r| mouse(MouseEventKind::Down(MouseButton::Left), c, r);
+        let release = |c, r| mouse(MouseEventKind::Up(MouseButton::Left), c, r);
+
+        app.on_term_event(press(col, row)).await.unwrap();
+        app.on_term_event(release(col, row)).await.unwrap();
+        assert_eq!(app.composer.selected_text(), None, "one press selects nothing");
+
+        app.on_term_event(press(col, row)).await.unwrap();
+        app.on_term_event(release(col, row)).await.unwrap();
+        assert_eq!(
+            app.composer.selected_text().as_deref(),
+            Some("crates/tui/src/app.rs:42"),
+            "the second press did not become a word gesture",
+        );
+
+        app.on_term_event(press(col, row)).await.unwrap();
+        app.on_term_event(release(col, row)).await.unwrap();
+        assert_eq!(
+            app.composer.selected_text().as_deref(),
+            Some("see crates/tui/src/app.rs:42 now"),
+            "the third press did not become a line gesture",
+        );
+
+        // A fourth starts over rather than sticking on the line.
+        app.on_term_event(press(col, row)).await.unwrap();
+        app.on_term_event(release(col, row)).await.unwrap();
+        assert_eq!(app.composer.selected_text(), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Presses far apart in space are separate gestures even back to back.
+    #[tokio::test]
+    async fn presses_on_different_cells_do_not_compound() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("alpha beta gamma");
+        render_app(&mut app, 60, 24);
+        let area = app.composer_draw_area;
+        let press = |c, r| mouse(MouseEventKind::Down(MouseButton::Left), c, r);
+
+        app.on_term_event(press(area.x + 2, area.y)).await.unwrap();
+        app.on_term_event(press(area.x + 10, area.y)).await.unwrap();
+        app.on_term_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + 10,
+            area.y,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.composer.selected_text(),
+            None,
+            "two presses on different cells became a word gesture",
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4392,7 +4517,7 @@ mod tests {
         render_app(&mut app, 60, 24);
         let area = app.composer_draw_area;
         app.composer.click_at(area.width, area.height, 2, 0);
-        app.composer.drag_to(area.width, area.height, 6, 0);
+        app.composer.drag_to(area.width, area.height, 5, 0);
         app.composer.finish_selection();
         assert_eq!(app.composer.selected_text().as_deref(), Some("copy"));
 

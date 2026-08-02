@@ -50,6 +50,7 @@ and one openmax driving another (see the `delegate` skill). It is specified in
 | **/** | Slash commands · **Tab** or **Enter** completes |
 | **@** | Mention a project file |
 | Mouse drag | Select transcript or prompt text |
+| Double / triple click | Select the word under the pointer · the whole logical line |
 | **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
