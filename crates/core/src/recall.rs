@@ -62,7 +62,7 @@ const BM25_B: f64 = 0.4;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallHit {
     pub score: f64,
-    /// `memory` | `message` | `archive` | `digest` | `title`
+    /// `memory` | `message` | `archive` | `digest`
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
@@ -678,25 +678,21 @@ fn collect_chunks(
             sessions::archive_display(core, &meta.id),
             sessions::compaction_display(core, &meta.id),
         ];
-        let Some(title_source) = stores.iter().find(|p| Path::new(p).exists()) else {
+        // An index entry whose files are all gone is listed history that
+        // cannot be read: reported as unreadable, never as scanned.
+        if !stores.iter().any(|p| Path::new(p).exists()) {
             unreadable += 1;
             continue;
-        };
+        }
         scanned += 1;
         let age = hours_since(now, meta.updated_at);
-        // The title cites the first store that actually exists: an
-        // archive-only session must not hand out a dead transcript address.
-        chunks.push(Chunk {
-            kind: "title",
-            session: Some(meta.id.clone()),
-            title: Some(meta.title.clone()),
-            age_hours: age,
-            doc: format!("{title_source}#title"),
-            source: title_source.clone(),
-            line: None,
-            text: meta.title.clone(),
-            paths: Vec::new(),
-        });
+        // No title chunk. A title is the first 48 characters of the first
+        // user message (agent.rs sets it there), and budget enforcement never
+        // drops that message, so anything a title could match the transcript
+        // matches too - with more of it, and with an address that resolves.
+        // Where a title hit did fire it cited a file that does not contain
+        // the title, because the name lives in the session index. The name
+        // still travels on every hit as `title`.
         // Digests before bulk: they are tiny, and they carry the structured
         // paths the session-level `path:` hop depends on. Collected last,
         // a transcript that exhausts the ceiling would silently strip a
@@ -992,15 +988,6 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             .then_with(|| a.1.cmp(&b.1))
     });
 
-    // A bare title is a very short BM25 document that outranks its own
-    // session's content while carrying none: a title hit only survives when
-    // its session offers nothing better among the candidates.
-    let sessions_with_content: std::collections::HashSet<&str> = scored
-        .iter()
-        .filter(|(_, i)| chunks[*i].kind != "title")
-        .filter_map(|(_, i)| chunks[*i].session.as_deref())
-        .collect();
-
     // Excerpts center on the rarest matched term: rarity carries the signal.
     let mut terms_by_rarity: Vec<&str> = query.terms.iter().map(String::as_str).collect();
     terms_by_rarity.sort_by_key(|t| df.get(t).copied().unwrap_or(usize::MAX));
@@ -1018,13 +1005,6 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             break;
         }
         let chunk = &chunks[i];
-        if chunk.kind == "title" {
-            if let Some(id) = chunk.session.as_deref() {
-                if sessions_with_content.contains(id) {
-                    continue;
-                }
-            }
-        }
         // Collapse sibling pages, not sibling records. A long paged document
         // can match on many of its own pages, and letting them all through
         // spends k and the token budget re-showing one record while other
@@ -1036,18 +1016,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         if per_doc.get(&chunk.doc).copied().unwrap_or(0) >= 2 {
             continue;
         }
-        let mut excerpt = if chunk.kind == "title" {
-            // A title is not quoted from the cited file - it lives in the
-            // session index - so presenting it as an excerpt invites an agent
-            // to grep the transcript for text that was never in it. Title
-            // suppression above means a title hit only survives when nothing
-            // else in that session matched, so say exactly that. The name
-            // itself is already in `title`, and the address still points at
-            // the session, which is the thing worth opening.
-            "matched this session's title; nothing inside the session matched".to_string()
-        } else {
-            excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars)
-        };
+        let mut excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
         if seen_excerpts.iter().any(|e| e == &excerpt) {
             continue;
         }
@@ -1407,26 +1376,26 @@ mod tests {
         let mem = report.hits.iter().find(|h| h.kind == "memory").expect("memory hit");
         assert_eq!(mem.line, None, "the file is the record; a line would be noise");
 
-        // A title lives in the session index, not in the cited transcript, so
-        // it must not be served as if it were quoted from there.
+        // A title is not a record. It is the first 48 characters of the first
+        // user message, so the transcript already carries the same words with
+        // more around them and an address that resolves; emitting the title
+        // separately spent a slot to cite a file that does not contain it.
         let titled = seed_session(&core, &project, "quokka census plan", vec![
-            ChatMessage::user("body text mentioning nothing relevant"),
+            ChatMessage::user("quokka census plan, and the body that follows it"),
         ]);
-        let report = recall(&core, &project, "quokka").unwrap();
-        let hit = report.hits.iter().find(|h| h.kind == "title").expect("a title hit");
-        assert_eq!(hit.session.as_deref(), Some(titled.as_str()));
-        assert_eq!(hit.title.as_deref(), Some("quokka census plan"), "the name is a field");
-        assert!(hit.line.is_none(), "there is no line to cite");
-        let cited = std::fs::read_to_string(&hit.source).unwrap();
+        let report = recall(&core, &project, "quokka k:20").unwrap();
         assert!(
-            cited.contains(&hit.excerpt) || !cited.contains("quokka census plan"),
-            "whatever is shown as an excerpt must be findable at the address shown"
+            report.hits.iter().all(|h| h.kind != "title"),
+            "a title is not an addressable record: {:?}",
+            report.hits
         );
-        assert!(
-            !hit.excerpt.contains("quokka census plan"),
-            "the title must not be served as a quotation from a file that lacks it: {}",
-            hit.excerpt
-        );
+        let hit = report
+            .hits
+            .iter()
+            .find(|h| h.session.as_deref() == Some(titled.as_str()))
+            .expect("the session is still findable by the words in its title");
+        assert!(hit.line.is_some(), "and it is found at a line that resolves");
+        assert_eq!(hit.title.as_deref(), Some("quokka census plan"), "the name still travels");
         let _ = std::fs::remove_dir_all(dir);
     }
 
