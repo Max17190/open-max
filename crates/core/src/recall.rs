@@ -1198,11 +1198,21 @@ pub fn render(report: &RecallReport) -> String {
         ));
     }
     if report.hits.is_empty() {
-        // Name the half that failed. A filter that excluded everything is not
-        // a vocabulary problem, and telling the reader to change terms sends
-        // them to fix the part that was working.
+        // Name the half that failed, and only when it is the half that
+        // failed. Three different things produce an empty result and each
+        // sends the reader somewhere different: history that could not be
+        // read, a filter that selected none of it, or terms that matched
+        // nothing in what the filter kept. Blaming the filter for a corpus
+        // nobody could open is the same misdiagnosis as blaming the terms.
         let filtered = filters_in(&report.query);
-        if report.candidates == 0 && !filtered.is_empty() {
+        if report.sessions_scanned == 0 && report.sessions_unreadable > 0 {
+            out.push_str(&format!(
+                "nothing matched: {} session{} listed for this project but none could \
+                 be read (their files are gone). This is not a query problem.\n",
+                report.sessions_unreadable,
+                if report.sessions_unreadable == 1 { " is" } else { "s are" },
+            ));
+        } else if report.candidates == 0 && !filtered.is_empty() {
             out.push_str(&format!(
                 "nothing matched: {filtered} selected no history in this project. \
                  path: keeps history that touched a matching file path; \
@@ -1432,7 +1442,7 @@ mod tests {
     #[test]
     fn an_empty_result_says_which_half_failed() {
         let (core, dir, project) = setup();
-        seed_session(&core, &project, "work", vec![ChatMessage::user(
+        let only = seed_session(&core, &project, "work", vec![ChatMessage::user(
             "the marmot telemetry pipeline was rewired",
         )]);
 
@@ -1450,6 +1460,28 @@ mod tests {
             render(&missing).contains("try fewer or different terms"),
             "a real vocabulary miss still says so"
         );
+
+        // History that cannot be read is a third case, and must not be
+        // reported as the filter's doing: the filter may be perfectly good.
+        let ghost = seed_session(&core, &project, "gone", vec![ChatMessage::user("marmot")]);
+        for path in [
+            sessions::messages_display(&core, &ghost),
+            sessions::archive_display(&core, &ghost),
+            sessions::compaction_display(&core, &ghost),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(sessions::messages_display(&core, &only));
+        let unreadable = recall(&core, &project, "marmot path:src/nowhere").unwrap();
+        assert_eq!(unreadable.sessions_scanned, 0, "nothing could be opened");
+        assert!(unreadable.sessions_unreadable > 0);
+        let text = render(&unreadable);
+        assert!(text.contains("none could be read"), "say the files are gone: {text}");
+        assert!(
+            !text.contains("selected no history"),
+            "an unopenable corpus is not the filter's doing: {text}"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
