@@ -1612,6 +1612,28 @@ impl App {
                         .iter()
                         .map(|spec| help_line(&spec.usage(), spec.description)),
                 );
+                // The user's own templates are commands too; a help screen
+                // that omits them hides exactly the capability this harness
+                // exists to grow. Same shadowing rule as the popup: a
+                // template that collides with a built-in name never
+                // dispatches, so advertising it here would be a lie.
+                let templates = self.templates.iter().filter(|(name, _)| {
+                    !completion::COMMANDS.iter().any(|spec| spec.name == *name)
+                });
+                let mut first = true;
+                for (name, desc) in templates {
+                    if first {
+                        block.push(Line::default());
+                        first = false;
+                    }
+                    let usage = format!("/{name}");
+                    let desc: &str = if desc.is_empty() {
+                        "prompt template"
+                    } else {
+                        desc
+                    };
+                    block.push(help_line(&usage, desc));
+                }
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
@@ -4316,6 +4338,23 @@ mod tests {
             "switch appearance",
         );
         assert!(line_text(&line).contains("catppuccin switch appearance"));
+    }
+
+    #[tokio::test]
+    async fn help_lists_the_users_own_templates() {
+        let (mut app, dir) = app_fixture();
+        app.templates = vec![
+            ("deploy".to_string(), "ship it".to_string()),
+            // Shadowed by the /new built-in: dispatch would never reach it,
+            // so help must not advertise it.
+            ("new".to_string(), "never invocable".to_string()),
+        ];
+        app.slash("help").await;
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(text.contains("/deploy"));
+        assert!(text.contains("ship it"));
+        assert!(!text.contains("never invocable"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
