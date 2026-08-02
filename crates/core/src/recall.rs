@@ -1198,43 +1198,39 @@ pub fn render(report: &RecallReport) -> String {
         ));
     }
     if report.hits.is_empty() {
-        // Name the half that failed, and only when it is the half that
-        // failed. Three different things produce an empty result and each
-        // sends the reader somewhere different: history that could not be
-        // read, a filter that selected none of it, or terms that matched
-        // nothing in what the filter kept. Blaming the filter for a corpus
-        // nobody could open is the same misdiagnosis as blaming the terms.
+        // Two separate facts, never one guess. Emptiness has several
+        // independent causes - a filter that matched nothing, terms that
+        // matched nothing, history that could not be opened, history past
+        // the scan cap - and earlier versions of this message picked one and
+        // asserted it. Each time the guess was wrong for a corpus somebody
+        // could construct. So: say what the search found nothing in, then say
+        // what was not searched, and let those be true separately.
         let filtered = filters_in(&report.query);
-        if report.sessions_scanned == 0 && report.sessions_unreadable > 0 {
+        if report.candidates == 0 && !filtered.is_empty() {
             out.push_str(&format!(
-                "nothing matched: {} session{} listed for this project but none could \
-                 be read (their files are gone). This is not a query problem.\n",
-                report.sessions_unreadable,
-                if report.sessions_unreadable == 1 { " is" } else { "s are" },
-            ));
-        } else if report.candidates == 0 && !filtered.is_empty() {
-            // Unreadable sessions were never searched, so a filter that came
-            // up empty may still be right about history nobody could open.
-            let caveat = match report.sessions_unreadable {
-                0 => String::new(),
-                n => format!(
-                    " {n} further session{} listed but unreadable, so {} not searched at all.",
-                    if n == 1 { " is" } else { "s are" },
-                    if n == 1 { "it was" } else { "they were" },
-                ),
-            };
-            out.push_str(&format!(
-                "nothing matched: {filtered} selected no readable history in this \
-                 project. path: keeps history that touched a matching file path; \
-                 session: takes an id prefix. Drop the filter to search \
-                 everything.{caveat}\n"
+                "nothing matched: {filtered} selected none of what was searched. \
+                 path: keeps history that touched a matching file path; \
+                 session: takes an id prefix. Drop the filter to search everything."
             ));
         } else {
             out.push_str(
                 "nothing matched; try fewer or different terms, or read the addresses \
-                 under ~/.openmax/sessions\n",
+                 under ~/.openmax/sessions",
             );
         }
+        // Whatever the reason, anything the scan did not reach is disclosed -
+        // the answer may be sitting in it.
+        let mut omitted = Vec::new();
+        if report.sessions_unreadable > 0 {
+            omitted.push(format!("{} listed but unreadable", report.sessions_unreadable));
+        }
+        if report.sessions_skipped > 0 {
+            omitted.push(format!("{} past the scan cap", report.sessions_skipped));
+        }
+        if !omitted.is_empty() {
+            out.push_str(&format!(" Not searched: {}.", omitted.join(", ")));
+        }
+        out.push('\n');
     }
     out
 }
@@ -1447,34 +1443,35 @@ mod tests {
     /// cap from the end of a record, cannot resolve an address whose base it
     /// was never told, and will raise limits in a loop if told that is how to
     /// read one record whole. All three were measured on the real store.
-    /// An empty result must name the half that failed. A filter that selected
-    /// nothing is not a vocabulary problem, and "try different terms" sends
-    /// the reader to change the part that was working.
+    /// An empty result states two separate facts and guesses at neither:
+    /// what the search found nothing in, and what it never reached. Every
+    /// earlier version of this message picked a single cause and asserted it,
+    /// and each guess was wrong for some corpus - a filter blamed for an
+    /// unreadable store, an unreadable store declared when memory was
+    /// searchable, a filter blamed for sessions past the scan cap.
     #[test]
-    fn an_empty_result_says_which_half_failed() {
+    fn an_empty_result_states_what_was_searched_and_what_was_not() {
         let (core, dir, project) = setup();
         let only = seed_session(&core, &project, "work", vec![ChatMessage::user(
             "the marmot telemetry pipeline was rewired",
         )]);
 
+        // A filter that kept nothing names itself, scoped to what was searched.
         let filtered = recall(&core, &project, "marmot path:src/nowhere").unwrap();
         assert!(filtered.hits.is_empty());
-        assert_eq!(filtered.candidates, 0, "the filter emptied the corpus");
+        assert_eq!(filtered.candidates, 0);
         let text = render(&filtered);
         assert!(text.contains("path:src/nowhere"), "name the filter: {text}");
-        assert!(!text.contains("try fewer or different terms"), "do not blame the terms: {text}");
+        assert!(text.contains("none of what was searched"), "scope the claim: {text}");
+        assert!(!text.contains("try fewer or different terms"), "do not blame terms: {text}");
+        assert!(!text.contains("Not searched"), "nothing was omitted here: {text}");
 
+        // Terms that match nothing still say so.
         let missing = recall(&core, &project, "zzzznotaword").unwrap();
-        assert!(missing.hits.is_empty());
         assert!(missing.candidates > 0, "the corpus was searchable");
-        assert!(
-            render(&missing).contains("try fewer or different terms"),
-            "a real vocabulary miss still says so"
-        );
+        assert!(render(&missing).contains("try fewer or different terms"));
 
-        // A partly-unreadable corpus must not let the filter take the blame
-        // alone: the sessions nobody could open were never searched, so the
-        // filter may be right about everything that was.
+        // Anything the scan could not reach is disclosed, whichever branch ran.
         let ghost = seed_session(&core, &project, "ghost", vec![ChatMessage::user("marmot")]);
         for path in [
             sessions::messages_display(&core, &ghost),
@@ -1483,32 +1480,31 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(path);
         }
-        let mixed = recall(&core, &project, "marmot path:src/nowhere").unwrap();
-        assert!(mixed.sessions_scanned > 0 && mixed.sessions_unreadable > 0, "mixed corpus");
-        let text = render(&mixed);
-        assert!(text.contains("not searched at all"), "own up to what was skipped: {text}");
-
-        // History that cannot be read is a third case, and must not be
-        // reported as the filter's doing: the filter may be perfectly good.
-        let ghost = seed_session(&core, &project, "gone", vec![ChatMessage::user("marmot")]);
-        for path in [
-            sessions::messages_display(&core, &ghost),
-            sessions::archive_display(&core, &ghost),
-            sessions::compaction_display(&core, &ghost),
-        ] {
-            let _ = std::fs::remove_file(path);
+        for query in ["marmot path:src/nowhere", "zzzznotaword"] {
+            let report = recall(&core, &project, query).unwrap();
+            let text = render(&report);
+            assert!(
+                text.contains("Not searched: 1 listed but unreadable"),
+                "{query} must own what it skipped: {text}"
+            );
         }
-        let _ = std::fs::remove_file(sessions::messages_display(&core, &only));
-        let unreadable = recall(&core, &project, "marmot path:src/nowhere").unwrap();
-        assert_eq!(unreadable.sessions_scanned, 0, "nothing could be opened");
-        assert!(unreadable.sessions_unreadable > 0);
-        let text = render(&unreadable);
-        assert!(text.contains("none could be read"), "say the files are gone: {text}");
-        assert!(
-            !text.contains("selected no history"),
-            "an unopenable corpus is not the filter's doing: {text}"
-        );
 
+        // Memory is searchable even with every session gone, so an unopenable
+        // session set must not be reported as the whole corpus failing.
+        let _ = std::fs::remove_file(sessions::messages_display(&core, &only));
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        std::fs::write(
+            project.join(crate::memory::MEMORY_DIR).join("fact.md"),
+            "# the marmot pipeline is documented here\n",
+        )
+        .unwrap();
+        let memory_only = recall(&core, &project, "zzzznotaword").unwrap();
+        assert_eq!(memory_only.sessions_scanned, 0, "no session could be opened");
+        assert!(memory_only.candidates > 0, "but memory was searched");
+        assert!(
+            render(&memory_only).contains("try fewer or different terms"),
+            "readable memory means the terms really did miss"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
