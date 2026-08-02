@@ -171,10 +171,6 @@ impl Block {
         self.cache.clear();
         self.cache_maps.clear();
     }
-
-    fn selectable_text(&self) -> &str {
-        &self.selectable
-    }
 }
 
 /// A content position in the wrapped transcript that survives re-wraps.
