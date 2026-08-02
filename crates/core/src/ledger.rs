@@ -175,32 +175,40 @@ fn claims_dir(dir: &Path) -> PathBuf {
 }
 
 /// Persist one queued claim as a content-addressed file whose name sorts in
-/// arrival order across sessions and processes. Best-effort by contract.
+/// arrival order across sessions and processes. Arrival order comes from a
+/// counter file incremented under the ledger's flock, never from the wall
+/// clock: a same-millisecond race would tie-break arbitrarily and a clock
+/// stepped backward would replay generations reversed, landing an older
+/// head over a newer one. Best-effort by contract; must never be called
+/// while the ledger lock is already held.
 pub fn persist_queued_claim(
     data_dir: &Path,
     project_root: &Path,
     claim: &QueuedClaim,
 ) -> Result<PathBuf, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = claims_dir(&project_dir(data_dir, project_root));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let ledger = project_dir(data_dir, project_root);
+    let dir = claims_dir(&ledger);
     let body = serde_json::to_vec(&ClaimFile {
         actor: claim.1,
         files: claim.0.clone(),
     })
     .map_err(|e| e.to_string())?;
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = format!("{millis:013}-{seq:06}-{}.json", &sha256_hex(&body)[..12]);
-    let path = dir.join(name);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(path)
+    with_lock(&ledger, || {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let seq_path = dir.join("claims.seq");
+        let seq: u64 = std::fs::read_to_string(&seq_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        std::fs::write(&seq_path, format!("{}", seq + 1)).map_err(|e| e.to_string())?;
+        let name = format!("{seq:012}-{}.json", &sha256_hex(&body)[..12]);
+        let path = dir.join(name);
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(path)
+    })
 }
 
 /// Every persisted claim for this project, oldest first. Unreadable or
@@ -1842,17 +1850,20 @@ mod tests {
             Actor::External,
         );
         let path_a = persist_queued_claim(&data_dir, &project, &a).unwrap();
-        let _path_b = persist_queued_claim(&data_dir, &project, &b).unwrap();
+        let path_b = persist_queued_claim(&data_dir, &project, &b).unwrap();
+        // Arrival order comes from the locked counter, not the clock, so
+        // the second file always sorts after the first.
+        assert!(path_b.file_name().unwrap() > path_a.file_name().unwrap());
         // Corruption sorts first and must be skipped in place, not deleted
         // and not allowed to block the readable claims behind it.
         let claims = path_a.parent().unwrap().to_path_buf();
-        std::fs::write(claims.join("0000000000000-000000-garbage.json"), "not json").unwrap();
+        std::fs::write(claims.join("000000000000-garbage.json"), "not json").unwrap();
 
         let loaded = load_queued_claims(&data_dir, &project);
         assert_eq!(loaded.len(), 2, "corrupt file must not block real claims");
         assert_eq!(loaded[0].1 .1, Actor::Session);
         assert_eq!(loaded[1].1 .1, Actor::External);
-        assert!(claims.join("0000000000000-000000-garbage.json").exists());
+        assert!(claims.join("000000000000-garbage.json").exists());
 
         remove_claim_file(&loaded[0].0);
         let loaded = load_queued_claims(&data_dir, &project);
