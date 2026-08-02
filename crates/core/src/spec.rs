@@ -497,7 +497,9 @@ Query syntax: plain terms, plus
   you just cited".
 - `k:<n>`: ranked results to print (default 8, max 50).
 - `budget:<tokens>`: output token cap (default 2000, max 20000).
-- `excerpt:<chars>`: excerpt window width (default 480, 120-2000).
+- `excerpt:<chars>`: excerpt window width (default 480, 120-1200). One page
+  is the largest excerpt; ask for more and the report says it was capped.
+  Read a hit's `path:line` address for the whole record.
 
 Ranking is BM25 lexical relevance with recency as a damped tiebreaker
 (0.25 x the memory index's `age_hours^-0.5` law): relevance dominates at any
