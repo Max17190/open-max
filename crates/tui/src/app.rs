@@ -1597,6 +1597,21 @@ impl App {
                         .iter()
                         .map(|spec| help_line(&spec.usage(), spec.description)),
                 );
+                // The user's own templates are commands too; a help screen
+                // that omits them hides exactly the capability this harness
+                // exists to grow.
+                if !self.templates.is_empty() {
+                    block.push(Line::default());
+                    block.extend(self.templates.iter().map(|(name, desc)| {
+                        let usage = format!("/{name}");
+                        let desc: &str = if desc.is_empty() {
+                            "prompt template"
+                        } else {
+                            desc
+                        };
+                        help_line(&usage, desc)
+                    }));
+                }
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
@@ -4201,6 +4216,17 @@ mod tests {
             "switch appearance",
         );
         assert!(line_text(&line).contains("catppuccin switch appearance"));
+    }
+
+    #[tokio::test]
+    async fn help_lists_the_users_own_templates() {
+        let (mut app, dir) = app_fixture();
+        app.templates = vec![("deploy".to_string(), "ship it".to_string())];
+        app.slash("help").await;
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(text.contains("/deploy"));
+        assert!(text.contains("ship it"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
