@@ -311,6 +311,10 @@ pub struct App {
     /// frame instead of re-deciding (and re-wrapping all history twice) on
     /// every paint.
     scrollbar_reserved: bool,
+    /// Live-tail line count and content width at the previous frame, used to
+    /// keep a scrolled-up viewport stationary as the tail grows or collapses.
+    last_tail_len: usize,
+    last_content_w: u16,
     approval_hits: [Option<Rect>; 3],
     perf_layout_ms: f64,
     perf_selection_ms: f64,
@@ -510,6 +514,8 @@ impl App {
             chat_line_map: Vec::new(),
             chat_draw_area: Rect::default(),
             scrollbar_reserved: false,
+            last_tail_len: 0,
+            last_content_w: 0,
             approval_hits: [None; 3],
             perf_layout_ms: 0.0,
             perf_selection_ms: 0.0,
@@ -631,6 +637,8 @@ impl App {
         self.chat_line_map.clear();
         self.chat_draw_area = Rect::default();
         self.scrollbar_reserved = false;
+        self.last_tail_len = 0;
+        self.last_content_w = 0;
         self.approval_hits = [None; 3];
         self.transcript.follow();
         self.dirty.mark_chat();
@@ -989,13 +997,17 @@ impl App {
         }
 
         if key.code == KeyCode::Esc {
-            if self.running {
+            if self.transcript.offset() > 0 {
+                // Reading comes first: from a scrolled-up view Esc returns
+                // to the live tail, never destroys the running turn the
+                // user was still reading. A second Esc at the bottom
+                // cancels.
+                self.transcript.follow();
+                self.focus = Focus::Composer;
+            } else if self.running {
                 if let Some(id) = &self.session_id {
                     self.core.cancel(id);
                 }
-            } else if self.transcript.offset() > 0 {
-                self.transcript.follow();
-                self.focus = Focus::Composer;
             } else if self.focus == Focus::Scrollback {
                 self.focus = Focus::Composer;
                 self.transcript.clear_selection();
@@ -2573,6 +2585,17 @@ impl App {
             hist_len = self.transcript.len();
             total = hist_len + tail_len;
         }
+        // Keep a scrolled-up reader stationary as the live tail changes.
+        // History pushes already bump the offset; the tail below history
+        // must be compensated the same way, or streaming drags the view
+        // forward and a collapsing tail flings it to the top. Skipped on a
+        // width change, where the whole line mapping is rebuilt anyway.
+        if content_w == self.last_content_w {
+            self.transcript
+                .compensate_tail_delta(tail_len as isize - self.last_tail_len as isize);
+        }
+        self.last_content_w = content_w;
+        self.last_tail_len = tail_len;
         if total == 0 && self.pending_approval.is_none() {
             self.chat_buf.clear();
             self.chat_line_map.clear();
@@ -2893,10 +2916,12 @@ impl App {
             "↑↓ select · enter/tab accept · esc close"
         } else if self.focus == Focus::Scrollback {
             "j/k block · enter fold · y copy"
+        } else if self.transcript.offset() > 0 {
+            // Scrolled-up wins over running: while reading, Esc follows
+            // (it does not cancel), and the hint must say so.
+            "esc follow · pgup/pgdn scroll"
         } else if self.running {
             "enter queue · esc cancel"
-        } else if self.transcript.offset() > 0 {
-            "esc follow · pgup/pgdn scroll"
         } else if self.quit_armed {
             "ctrl+c again to quit"
         } else {
@@ -2941,7 +2966,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("ctrl+r", "search prompt history"),
     ("ctrl+f", "find in conversation"),
     ("n / N after find", "next or previous match in scrollback"),
-    ("esc", "cancel turn · follow latest · return to composer"),
+    ("esc", "follow latest · cancel turn · return to composer"),
     ("wheel · pgup/pgdn", "scroll the conversation"),
     ("mouse drag", "select transcript text · y or ctrl+shift+c copies"),
     ("ctrl+o / o", "expand the last tool block"),
@@ -3984,6 +4009,101 @@ mod tests {
         assert_eq!(app.transcript.rewraps, reserved + 1);
         render_app(&mut app, 40, 30);
         assert_eq!(app.transcript.rewraps, reserved + 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_appends_keep_a_scrolled_view_pinned() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..30 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index:02}"))]);
+        }
+        render_app(&mut app, 40, 10);
+        app.transcript.scroll_up(12);
+        let before = rows(&render_app(&mut app, 40, 10));
+
+        // The live tail grows line by line below history; the content the
+        // reader is anchored on must not move.
+        for index in 0..8 {
+            app.on_agent_event(AgentEvent::Token {
+                text: format!("stream line {index}\n"),
+            });
+            render_app(&mut app, 40, 10);
+        }
+        let after = rows(&render_app(&mut app, 40, 10));
+        assert_eq!(top_history_row(&before), top_history_row(&after));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// First visible transcript row (skips header/chrome rows), the line a
+    /// scrolled-up reader is anchored on.
+    fn top_history_row(rendered: &[String]) -> String {
+        rendered
+            .iter()
+            .find(|row| row.contains("history line"))
+            .cloned()
+            .expect("no history row visible")
+    }
+
+    #[test]
+    fn finished_tail_does_not_fling_a_scrolled_view_to_the_top() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..30 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index:02}"))]);
+        }
+        render_app(&mut app, 40, 10);
+        let reply = (0..10)
+            .map(|i| format!("reply line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.on_agent_event(AgentEvent::Token { text: reply.clone() });
+        render_app(&mut app, 40, 10);
+        app.transcript.scroll_up(20);
+        let before = rows(&render_app(&mut app, 40, 10));
+
+        // The turn ends: the tail collapses into a history block. The view
+        // must stay where the reader was, not jump to the transcript top.
+        app.on_agent_event(AgentEvent::MessageDone { text: reply });
+        let after = rows(&render_app(&mut app, 40, 10));
+        assert_eq!(top_history_row(&before), top_history_row(&after));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn esc_while_scrolled_follows_the_live_view_instead_of_cancelling() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..30 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index:02}"))]);
+        }
+        render_app(&mut app, 40, 10);
+        app.running = true;
+        app.transcript.scroll_up(12);
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+        assert_eq!(app.transcript.offset(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scrolled_hint_outranks_the_running_hint() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..30 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index:02}"))]);
+        }
+        render_app(&mut app, 40, 10);
+        app.running = true;
+        app.transcript.scroll_up(5);
+        assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
         fs::remove_dir_all(dir).unwrap();
     }
 
