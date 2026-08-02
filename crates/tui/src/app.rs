@@ -613,8 +613,16 @@ impl App {
                             // text carries the counts: a replayed edit card
                             // keeps its +N −N badge instead of demoting to a
                             // bare checkmark.
+                            // Only tools that actually mutate files may wear
+                            // a diff badge: a read whose CONTENT happens to
+                            // contain "(+N −N)" must never present fabricated
+                            // modification evidence.
+                            let mutating = matches!(
+                                call.function.name.as_str(),
+                                "write_file" | "edit_file"
+                            );
                             let path = args["path"].as_str().unwrap_or("");
-                            let badge = if path.is_empty() {
+                            let badge = if !mutating || path.is_empty() {
                                 None
                             } else {
                                 parse_change_counts(content).map(|(added, removed)| {
@@ -4429,6 +4437,46 @@ mod tests {
             stop_reason: "stop".into(),
         });
         assert_eq!(app.presence, Presence::Idle);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replay_never_badges_a_read_only_tool() {
+        let (mut app, dir) = app_fixture();
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        let messages = vec![
+            open_max_core::types::ChatMessage::user("read the changelog"),
+            open_max_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: Some(vec![open_max_core::types::ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: open_max_core::types::ToolCallFunction {
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"CHANGELOG.md\"}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            // File content that happens to look like an edit summary.
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some("1 release notes (+3 −0) overall".into()),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+        ];
+        let mut persisted = 0usize;
+        open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
+        app.replay(&meta.id);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(text.contains("CHANGELOG.md"), "{text}");
+        assert!(!text.contains("+3"), "read card wears a diff badge: {text}");
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -492,6 +492,41 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
     load_index(core).into_iter().find(|m| m.id == id)
 }
 
+/// Keep resume boundaries pointing at the same messages across a transcript
+/// prune that removed a net `removed` messages above the pinned prefix
+/// (system plus first user). Points inside the removed region collapse onto
+/// its floor; duplicates that result are dropped.
+pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
+    if removed == 0 {
+        return;
+    }
+    let _ = with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            let mut shifted: Vec<u64> = m
+                .resume_points
+                .iter()
+                .map(|&p| if p <= 2 { p } else { p.saturating_sub(removed).max(2) })
+                .collect();
+            shifted.sort_unstable();
+            shifted.dedup();
+            m.resume_points = shifted;
+        }
+    });
+}
+
+/// A system message was inserted at the front of the transcript (legacy
+/// sessions saved before the prompt lived at index zero); every absolute
+/// boundary moves down by one.
+pub fn shift_resume_points_for_system_insert(core: &Core, id: &str) {
+    let _ = with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            for p in &mut m.resume_points {
+                *p = p.saturating_add(1);
+            }
+        }
+    });
+}
+
 /// Record that a new sitting resumed this session with `message_index`
 /// messages already on disk. Index zero is an empty session, not a
 /// boundary; repeats (resuming again before any new turn) are deduplicated.
@@ -644,6 +679,27 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_shifts_resume_points_and_collapses_onto_the_floor() {
+        let dir = std::env::temp_dir().join(format!("openmax-resume-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
+        record_resume_point(&core, id, 2);
+        record_resume_point(&core, id, 4);
+        record_resume_point(&core, id, 10);
+
+        // A prune removed a net 3 messages above the pinned prefix: the
+        // deep boundary shifts, the shallow one collapses onto the floor,
+        // and the pinned-prefix boundary is untouched.
+        shift_resume_points_for_prune(&core, id, 3);
+        assert_eq!(meta(&core, id).unwrap().resume_points, vec![2, 7]);
+
+        // A legacy system-prompt insert moves every boundary down one.
+        shift_resume_points_for_system_insert(&core, id);
+        assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 8]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn old_index_entries_without_resume_points_still_parse() {

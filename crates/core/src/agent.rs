@@ -1033,6 +1033,8 @@ fn apply_freeze(
         data.messages[0] = ChatMessage::system(prompt);
     } else {
         data.messages.insert(0, ChatMessage::system(prompt));
+        // Every absolute index just moved down one, boundaries included.
+        sessions::shift_resume_points_for_system_insert(core, session_id);
     }
     data.registry = Arc::new(registry);
     data.prompt_breakdown = Arc::new(breakdown);
@@ -1582,7 +1584,14 @@ async fn run_loop(
         if schemas_outgrow_budget(budget, schema_tokens) {
             report_schemas_over_budget(core, session_id, schema_tokens, budget).await;
         }
+        let before_len = guard.messages().len() as u64;
         let (budget_changed, compaction) = enforce_budget(guard.messages(), budget, schema_tokens);
+        // The prune rewrote absolute message indices; resume boundaries in
+        // the session meta must follow or replay dividers drift.
+        let after_len = guard.messages().len() as u64;
+        if after_len < before_len {
+            sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
+        }
         if let Some(mut digest) = compaction {
             // The lossless record behind the note's address, written before
             // the transcript rewrite below makes the edits permanent: both
