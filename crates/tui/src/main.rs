@@ -33,8 +33,9 @@ options:
                          ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
                          envelopes on stdout; the custom-frontend protocol
       --recall <query>   search this project's past sessions, archives,
-                         compaction digests, and memories; prints ranked,
-                         cited excerpts. Query syntax: plain terms plus
+                         compaction digests, and memories; prints ranked
+                         excerpts, each cited as file:line so the full record
+                         reads back exactly. Query syntax: plain terms plus
                          path:<substr>, session:<id-prefix>, k:<n>,
                          budget:<tokens>, excerpt:<chars>; --json for
                          structured output
