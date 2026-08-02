@@ -429,6 +429,12 @@ async fn web_search_tool(args: &Value, cancel: Arc<CancelToken>) -> ToolOutcome 
     }
 }
 
+/// Final byte bound on the formatted results. The per-field caps are in
+/// characters, so ten results of maximal multibyte metadata could still
+/// reach ~26 KB of bytes; history budgeting works in bytes, so the bound
+/// must too.
+const MAX_WEB_SEARCH_BYTES: usize = 12_000;
+
 /// Compact plain-text rendering of search results: rank, title, url, and a
 /// whitespace-collapsed snippet. Plain lines instead of the provider's JSON
 /// because every byte here is re-prefilled on each later turn.
@@ -453,6 +459,17 @@ fn format_web_results(web: &Value) -> Result<String, String> {
         let snippet = collapse_snippet(r["description"].as_str().unwrap_or(""), 240);
         if !snippet.is_empty() {
             out.push_str(&format!("   {snippet}\n"));
+        }
+        if out.len() > MAX_WEB_SEARCH_BYTES {
+            // Cut on a char boundary at the entry that crossed the line and
+            // say so; whole trailing entries are dropped, never split.
+            let mut cut = MAX_WEB_SEARCH_BYTES.min(out.len());
+            while !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+            out.push_str("\n…[results truncated]");
+            break;
         }
     }
     Ok(out)
@@ -1121,6 +1138,24 @@ mod tests {
         assert!(text.len() < 10_000, "unbounded output: {} bytes", text.len());
         assert!(!text.contains("11. "), "more entries than the request cap");
         assert!(text.contains("10. "));
+
+        // Character caps are not byte caps: maximal multibyte metadata must
+        // still land under the byte bound.
+        let wide = "\u{1F980}".repeat(50_000); // 4 bytes per char
+        let wide_entry = json!({
+            "url": format!("https://e.example/{wide}"),
+            "title": wide,
+            "description": wide,
+            "position": 1
+        });
+        let many_wide: Vec<_> = (0..50).map(|_| wide_entry.clone()).collect();
+        let text = format_web_results(&json!(many_wide)).unwrap();
+        assert!(
+            text.len() <= MAX_WEB_SEARCH_BYTES + 64,
+            "multibyte metadata escaped the byte bound: {} bytes",
+            text.len()
+        );
+        assert!(text.contains("…[results truncated]"));
     }
 
     /// One canned Firecrawl endpoint serving a single response; the receiver
