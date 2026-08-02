@@ -155,6 +155,84 @@ fn log_path(dir: &Path) -> PathBuf {
     dir.join("log.jsonl")
 }
 
+/// A settlement claim that outlives its process (#103): the ordered
+/// (generation, actor) queue every sync path maintains is about the
+/// project's ledger, not about any one session, so claims persist beside
+/// the ledger and are adopted by whichever session next attempts
+/// settlement. The common corruption case (an unverifiable log) leaves
+/// this directory writable; when it is not, callers degrade to the
+/// in-memory queue exactly as before.
+pub type QueuedClaim = (Vec<(PathBuf, String, Vec<u8>)>, Actor);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaimFile {
+    actor: Actor,
+    files: Vec<(PathBuf, String, Vec<u8>)>,
+}
+
+fn claims_dir(dir: &Path) -> PathBuf {
+    dir.join("claims")
+}
+
+/// Persist one queued claim as a content-addressed file whose name sorts in
+/// arrival order across sessions and processes. Best-effort by contract.
+pub fn persist_queued_claim(
+    data_dir: &Path,
+    project_root: &Path,
+    claim: &QueuedClaim,
+) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = claims_dir(&project_dir(data_dir, project_root));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let body = serde_json::to_vec(&ClaimFile {
+        actor: claim.1,
+        files: claim.0.clone(),
+    })
+    .map_err(|e| e.to_string())?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!("{millis:013}-{seq:06}-{}.json", &sha256_hex(&body)[..12]);
+    let path = dir.join(name);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Every persisted claim for this project, oldest first. Unreadable or
+/// corrupt files are skipped in place: they stay on disk as evidence
+/// rather than being deleted or blocking settlement.
+pub fn load_queued_claims(data_dir: &Path, project_root: &Path) -> Vec<(PathBuf, QueuedClaim)> {
+    let dir = claims_dir(&project_dir(data_dir, project_root));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let parsed: ClaimFile = serde_json::from_slice(&bytes).ok()?;
+            Some((path.clone(), (parsed.files, parsed.actor)))
+        })
+        .collect()
+}
+
+/// Remove a landed claim's file. Best-effort: a claim that cannot be
+/// removed re-adopts later and re-lands as a no-op delta.
+pub fn remove_claim_file(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
 fn lock_path(dir: &Path) -> PathBuf {
     dir.join("ledger.lock")
 }
@@ -1746,6 +1824,42 @@ pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn queued_claims_round_trip_in_order_and_skip_corruption() {
+        let dir = std::env::temp_dir().join(format!("openmax-claims-{}", uuid::Uuid::new_v4()));
+        let data_dir = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let a: QueuedClaim = (
+            vec![(project.join("a.toml"), sha256_hex(b"a"), b"a".to_vec())],
+            Actor::Session,
+        );
+        let b: QueuedClaim = (
+            vec![(project.join("b.toml"), sha256_hex(b"b"), b"b".to_vec())],
+            Actor::External,
+        );
+        let path_a = persist_queued_claim(&data_dir, &project, &a).unwrap();
+        let _path_b = persist_queued_claim(&data_dir, &project, &b).unwrap();
+        // Corruption sorts first and must be skipped in place, not deleted
+        // and not allowed to block the readable claims behind it.
+        let claims = path_a.parent().unwrap().to_path_buf();
+        std::fs::write(claims.join("0000000000000-000000-garbage.json"), "not json").unwrap();
+
+        let loaded = load_queued_claims(&data_dir, &project);
+        assert_eq!(loaded.len(), 2, "corrupt file must not block real claims");
+        assert_eq!(loaded[0].1 .1, Actor::Session);
+        assert_eq!(loaded[1].1 .1, Actor::External);
+        assert!(claims.join("0000000000000-000000-garbage.json").exists());
+
+        remove_claim_file(&loaded[0].0);
+        let loaded = load_queued_claims(&data_dir, &project);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1 .1, Actor::External);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("openmax-ledger-{tag}-{}", uuid::Uuid::new_v4()));
