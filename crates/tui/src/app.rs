@@ -4224,7 +4224,10 @@ mod tests {
                    "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
             )
             .unwrap();
-            open_max_core::providers::invalidate_providers_cache();
+            // No cache invalidation needed: the providers cache is keyed on
+            // (data_dir, content hash) and this fixture's dir is unique, so
+            // the read always misses. Touching global state from a test is
+            // how the older races here started.
             app.model_picker = Some(crate::ui::model_picker::ModelPickerState::load(
                 &dir,
                 Some("alpha"),
