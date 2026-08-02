@@ -15,6 +15,11 @@ pub struct SessionMeta {
     pub title: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Message indices where a later sitting resumed this session. The TUI
+    /// renders a divider at each on replay, so weeks of sittings stay
+    /// distinguishable instead of collapsing into one stream.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_points: Vec<u64>,
 }
 
 pub const UNTITLED: &str = "New session";
@@ -475,10 +480,32 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
         title: UNTITLED.into(),
         created_at: now(),
         updated_at: now(),
+        resume_points: Vec::new(),
     };
     let m = meta.clone();
     with_index(core, move |metas| metas.push(m))?;
     Ok(meta)
+}
+
+/// One session's index entry, if it exists.
+pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
+    load_index(core).into_iter().find(|m| m.id == id)
+}
+
+/// Record that a new sitting resumed this session with `message_index`
+/// messages already on disk. Index zero is an empty session, not a
+/// boundary; repeats (resuming again before any new turn) are deduplicated.
+pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
+    if message_index == 0 {
+        return;
+    }
+    let _ = with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            if !m.resume_points.contains(&message_index) {
+                m.resume_points.push(message_index);
+            }
+        }
+    });
 }
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
@@ -617,6 +644,16 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_index_entries_without_resume_points_still_parse() {
+        let m: SessionMeta = serde_json::from_str(
+            r#"{"id":"x","project":"/p","title":"t","created_at":1,"updated_at":2}"#,
+        )
+        .unwrap();
+        assert!(m.resume_points.is_empty());
+    }
+
     use crate::state::Core;
     use crate::types::ChatMessage;
 
@@ -677,6 +714,7 @@ mod tests {
                 title: "t".into(),
                 created_at: 0,
                 updated_at: 0,
+                resume_points: Vec::new(),
             })
         })
         .unwrap();
