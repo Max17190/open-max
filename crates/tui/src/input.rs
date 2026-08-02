@@ -631,20 +631,27 @@ impl Composer {
         bounds: fn(&str, usize) -> (usize, usize),
     ) -> bool {
         let point = self.point_at(width, max_h, cell, row);
+        // A press replaces whatever was selected, including with nothing. An
+        // empty line has no word and no line to take, and leaving the old
+        // highlight standing would make it lie about what a copy carries, so
+        // this falls back to exactly what a plain press does.
+        self.row = point.0;
+        self.col = point.1;
+        self.follow = true;
+        self.hist_idx = None;
+        self.selection = Some(Selection { anchor: point, head: point, explicit: false });
+        self.dragging = true;
+
         let (start, end) = bounds(&self.lines[point.0], point.1);
         if start >= end {
             return false;
         }
-        self.row = point.0;
         self.col = end;
-        self.follow = true;
-        self.hist_idx = None;
         self.selection = Some(Selection {
             anchor: (point.0, start),
             head: (point.0, end - 1),
             explicit: true,
         });
-        self.dragging = true;
         true
     }
 
@@ -1121,6 +1128,31 @@ mod tests {
         composer.select_line_at(60, height, GUTTER as u16, 1);
         composer.finish_selection();
         assert_eq!(composer.selected_text().as_deref(), Some("hello world foo bar"));
+    }
+
+    /// A gesture that finds nothing has to clear, not leave the last
+    /// highlight standing: the highlight would then lie about what a copy
+    /// carries, which is the one thing this surface promises.
+    #[test]
+    fn a_gesture_on_an_empty_line_clears_the_previous_selection() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("alpha\n\nbeta");
+        let (width, height) = (40, 6);
+
+        composer.select_word_at(width, height, GUTTER as u16, 0);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("alpha"));
+
+        // Row 1 is the empty logical line.
+        assert!(!composer.select_word_at(width, height, GUTTER as u16, 1));
+        assert_eq!(composer.selected_text(), None, "stale word selection");
+        assert!(!composer.has_selection());
+
+        composer.select_word_at(width, height, GUTTER as u16, 0);
+        composer.finish_selection();
+        assert!(composer.has_selection());
+        assert!(!composer.select_line_at(width, height, GUTTER as u16, 1));
+        assert_eq!(composer.selected_text(), None, "stale line selection");
     }
 
     /// The guarantee #132 established for the transcript, now true here too.

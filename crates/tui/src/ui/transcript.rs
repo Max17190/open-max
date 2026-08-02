@@ -799,9 +799,21 @@ impl Transcript {
         x: usize,
         bounds: fn(&str, usize) -> (usize, usize),
     ) -> bool {
+        // A press replaces whatever was selected, including with nothing. An
+        // empty line has no word and no line to take, and leaving the old
+        // highlight standing would make it lie about what a copy carries.
+        self.text_selection = None;
         let Some(point) = self.hit_test(line_idx, x) else {
             return false;
         };
+        // Fall back to what a plain press does, so the gesture still places an
+        // anchor a drag can extend from.
+        self.text_selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+            dragging: true,
+            explicit: false,
+        });
         let Some(block) = self.blocks.get(point.block) else {
             return false;
         };
@@ -1650,6 +1662,25 @@ mod tests {
             t.selected_text().as_deref(),
             Some("second line that wraps across rows"),
         );
+    }
+
+    /// Same rule in the transcript: a gesture with nothing to take clears.
+    #[test]
+    fn a_gesture_on_a_blank_line_clears_the_previous_selection() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push(vec![
+            Line::from("alpha beta"),
+            Line::from(""),
+            Line::from("gamma"),
+        ]);
+        assert!(t.select_word_at(0, 0));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("alpha"));
+
+        assert!(!t.select_line_at(1, 0));
+        assert_eq!(t.selected_text(), None, "stale selection after a blank line");
+        assert!(!t.has_text_selection());
     }
 
     /// A plain click still selects nothing, or every click would copy.
