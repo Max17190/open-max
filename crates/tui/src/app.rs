@@ -2560,6 +2560,19 @@ impl App {
         if self.scrollbar_reserved && area.width > 1 {
             content_w = area.width - 1;
         }
+        // A width change re-wraps every block, and the bottom-anchored
+        // offset would resolve to different content afterward. Anchor the
+        // history line at the viewport bottom by content and restore it
+        // after the re-wrap; positions inside the live tail keep the
+        // numeric offset, which the tail compensation self-corrects.
+        let resize_anchor = {
+            let from_bottom = self.transcript.offset().saturating_sub(self.last_tail_len);
+            if content_w != self.last_content_w && from_bottom > 0 {
+                self.transcript.anchor_at(from_bottom)
+            } else {
+                None
+            }
+        };
         self.transcript.set_width(content_w);
         let mut tail_len = self.rebuild_tail(content_w);
 
@@ -2593,6 +2606,9 @@ impl App {
         if content_w == self.last_content_w {
             self.transcript
                 .compensate_tail_delta(tail_len as isize - self.last_tail_len as isize);
+        } else if let Some(anchor) = resize_anchor {
+            let from_bottom = self.transcript.resolve_anchor(anchor);
+            self.transcript.set_offset(from_bottom + tail_len);
         }
         self.last_content_w = content_w;
         self.last_tail_len = tail_len;
@@ -4069,6 +4085,39 @@ mod tests {
         let after = rows(&render_app(&mut app, 40, 10));
         assert_eq!(top_history_row(&before), top_history_row(&after));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resize_keeps_the_scrolled_view_on_the_same_content() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..30 {
+            app.transcript.push(vec![Line::from(format!(
+                "history line {index:02} padded so it wraps at the narrow width"
+            ))]);
+        }
+        render_app(&mut app, 40, 10);
+        app.transcript.scroll_up(20);
+        let before = rows(&render_app(&mut app, 40, 10));
+
+        // Growing the terminal re-wraps every block (two rows collapse to
+        // one). The block at the viewport bottom must stay the same block,
+        // not whatever a stale numeric offset happens to land on.
+        let after = rows(&render_app(&mut app, 90, 10));
+        assert_eq!(bottom_history_label(&before), bottom_history_label(&after));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Label ("history line NN") of the last visible transcript row that
+    /// carries one, the content a scrolled reader is anchored on.
+    fn bottom_history_label(rendered: &[String]) -> String {
+        rendered
+            .iter()
+            .rev()
+            .find_map(|row| {
+                let start = row.find("history line")?;
+                Some(row[start..start + 15].to_string())
+            })
+            .expect("no history row visible")
     }
 
     #[tokio::test]
