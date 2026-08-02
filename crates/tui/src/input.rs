@@ -160,12 +160,15 @@ impl Composer {
             KeyCode::Char('u') if ctrl => {
                 self.lines[self.row].clear();
                 self.col = 0;
-                // Collapse the emptied row so every press makes visible
-                // progress: without this a pasted multi-line draft was a
-                // dead end (ctrl+u on an empty middle line did nothing).
-                if self.row > 0 {
+                // Collapse the emptied row from any cursor position so
+                // every press makes visible progress: without this a
+                // pasted multi-line draft was a dead end (ctrl+u on an
+                // empty line did nothing, including on the first row).
+                if self.lines.len() > 1 {
                     self.lines.remove(self.row);
-                    self.row -= 1;
+                    if self.row >= self.lines.len() {
+                        self.row = self.lines.len() - 1;
+                    }
                     self.col = self.lines[self.row].chars().count();
                 }
             }
@@ -451,11 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_u_clears_a_multi_line_draft_line_by_line() {
+    fn ctrl_u_clears_a_multi_line_draft_from_any_row() {
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+
+        // From the last row: presses walk the draft upward to empty.
         let mut composer = Composer::new(&std::env::temp_dir());
         composer.insert_str("first\nsecond\nthird");
-
-        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "first\nsecond");
         composer.handle_key(ctrl_u);
@@ -463,6 +467,19 @@ mod tests {
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "");
         // One more press on the empty draft stays a no-op, never a panic.
+        composer.handle_key(ctrl_u);
+        assert_eq!(composer.text(), "");
+
+        // From the top row: presses consume downward, no stuck state.
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("first\nsecond\nthird");
+        composer.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        composer.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(composer.row, 0);
+        composer.handle_key(ctrl_u);
+        assert_eq!(composer.text(), "second\nthird");
+        composer.handle_key(ctrl_u);
+        assert_eq!(composer.text(), "third");
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "");
     }
