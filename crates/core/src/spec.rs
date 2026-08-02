@@ -524,8 +524,9 @@ is honest by construction: matches past k:/budget: are counted, sessions
 skipped past the scan cap are counted, index entries whose files are gone
 are counted unreadable, and a session index that exists but cannot be
 parsed is a loud error, never an empty result. `--json` emits the
-structured report. Session citations are absolute paths (reach them with
-bash); memory citations are project-relative (reach them with read_file).
+structured report. Every citation is an absolute path, whatever store it
+came from, so an address keeps working wherever it is resolved; JSONL
+records carry the line too, as `path:line`.
 "#;
 
 const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)

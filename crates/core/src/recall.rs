@@ -1213,10 +1213,21 @@ pub fn render(report: &RecallReport) -> String {
                 if report.sessions_unreadable == 1 { " is" } else { "s are" },
             ));
         } else if report.candidates == 0 && !filtered.is_empty() {
+            // Unreadable sessions were never searched, so a filter that came
+            // up empty may still be right about history nobody could open.
+            let caveat = match report.sessions_unreadable {
+                0 => String::new(),
+                n => format!(
+                    " {n} further session{} listed but unreadable, so {} not searched at all.",
+                    if n == 1 { " is" } else { "s are" },
+                    if n == 1 { "it was" } else { "they were" },
+                ),
+            };
             out.push_str(&format!(
-                "nothing matched: {filtered} selected no history in this project. \
-                 path: keeps history that touched a matching file path; \
-                 session: takes an id prefix. Drop the filter to search everything.\n"
+                "nothing matched: {filtered} selected no readable history in this \
+                 project. path: keeps history that touched a matching file path; \
+                 session: takes an id prefix. Drop the filter to search \
+                 everything.{caveat}\n"
             ));
         } else {
             out.push_str(
@@ -1460,6 +1471,22 @@ mod tests {
             render(&missing).contains("try fewer or different terms"),
             "a real vocabulary miss still says so"
         );
+
+        // A partly-unreadable corpus must not let the filter take the blame
+        // alone: the sessions nobody could open were never searched, so the
+        // filter may be right about everything that was.
+        let ghost = seed_session(&core, &project, "ghost", vec![ChatMessage::user("marmot")]);
+        for path in [
+            sessions::messages_display(&core, &ghost),
+            sessions::archive_display(&core, &ghost),
+            sessions::compaction_display(&core, &ghost),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        let mixed = recall(&core, &project, "marmot path:src/nowhere").unwrap();
+        assert!(mixed.sessions_scanned > 0 && mixed.sessions_unreadable > 0, "mixed corpus");
+        let text = render(&mixed);
+        assert!(text.contains("not searched at all"), "own up to what was skipped: {text}");
 
         // History that cannot be read is a third case, and must not be
         // reported as the filter's doing: the filter may be perfectly good.
