@@ -182,33 +182,19 @@ pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, 
     None
 }
 
-/// Filtered slash-command items for `query` (text after the `/`): built-in
-/// commands first, then prompt templates (name, description). A template that
-/// shadows a built-in name is dropped; built-ins always win at dispatch too.
+/// Filtered slash-command items for `query` (text after the `/`): prompt
+/// templates first, then built-in commands. Templates are capability the
+/// user authored, and the popup shows only MAX_VISIBLE rows, so listing the
+/// thirteen memorizable built-ins first made every template invisible until
+/// its name was already known. A template that shadows a built-in name is
+/// dropped; built-ins always win at dispatch too.
 pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
-    let mut items: Vec<Item> = COMMANDS
+    let mut items: Vec<Item> = templates
         .iter()
-        .filter(|spec| spec.name.starts_with(query))
-        .map(|spec| Item {
-            insert: if spec.submits {
-                format!("/{}", spec.name)
-            } else {
-                format!("/{} ", spec.name)
-            },
-            label: format!("/{}", spec.name),
-            detail: if spec.args.is_empty() {
-                spec.description.to_string()
-            } else {
-                format!("{} · {}", spec.args, spec.description)
-            },
-            submits: spec.submits,
+        .filter(|(name, _)| {
+            name.starts_with(query) && !COMMANDS.iter().any(|spec| spec.name == *name)
         })
-        .collect();
-    for (name, desc) in templates {
-        if !name.starts_with(query) || COMMANDS.iter().any(|spec| spec.name == name) {
-            continue;
-        }
-        items.push(Item {
+        .map(|(name, desc)| Item {
             // Templates may take arguments, so accepting never auto-submits.
             insert: format!("/{name} "),
             label: format!("/{name}"),
@@ -218,8 +204,27 @@ pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
                 format!("{desc} · template")
             },
             submits: false,
-        });
-    }
+        })
+        .collect();
+    items.extend(
+        COMMANDS
+            .iter()
+            .filter(|spec| spec.name.starts_with(query))
+            .map(|spec| Item {
+                insert: if spec.submits {
+                    format!("/{}", spec.name)
+                } else {
+                    format!("/{} ", spec.name)
+                },
+                label: format!("/{}", spec.name),
+                detail: if spec.args.is_empty() {
+                    spec.description.to_string()
+                } else {
+                    format!("{} · {}", spec.args, spec.description)
+                },
+                submits: spec.submits,
+            }),
+    );
     items
 }
 
@@ -454,6 +459,16 @@ mod tests {
         assert!(!slash_items("zz", &templates)
             .iter()
             .any(|i| i.label == "/fix-issue"));
+    }
+
+    #[test]
+    fn templates_lead_the_browse_list() {
+        let templates = vec![("deploy".to_string(), "ship it".to_string())];
+        let items = slash_items("", &templates);
+        // The user's own capability is visible inside the MAX_VISIBLE
+        // window without already knowing its name; built-ins follow.
+        assert_eq!(items[0].label, "/deploy");
+        assert!(items.iter().skip(1).any(|i| i.label == "/help"));
     }
 
     #[test]
