@@ -96,6 +96,13 @@ impl CancelToken {
 pub struct Core {
     pub data_dir: PathBuf,
     pub settings: Mutex<Settings>,
+    /// Approval mode for this run only, set by a front end's cycle key or an
+    /// "allow for run" answer. Deliberately outside [`Settings`]: every save
+    /// path serializes that whole struct, so a run-scoped widening kept there
+    /// would ride along on the next unrelated `/model` or `/provider` write
+    /// and outlive the run it was promised to. Read through
+    /// [`Core::approval_mode`], never off `settings` directly.
+    run_approval_mode: Mutex<Option<crate::config::ApprovalMode>>,
     /// Live sessions keyed by session id; hydrated from disk on first use.
     pub sessions: tokio::sync::Mutex<HashMap<String, SessionData>>,
     /// Sessions with an agent turn currently in flight.
@@ -109,6 +116,42 @@ pub struct Core {
 }
 
 impl Core {
+    /// The approval mode in force: a run-scoped override if one is set,
+    /// otherwise what `settings.json` says. Every gate reads this, so where a
+    /// mode came from never changes what it means.
+    ///
+    /// Takes the `settings` lock on the fallback path, so never call it while
+    /// already holding that lock: it is a plain non-reentrant mutex.
+    pub fn approval_mode(&self) -> crate::config::ApprovalMode {
+        self.run_approval_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|| {
+                self.settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .approval_mode
+            })
+    }
+
+    /// Set the mode for this run without touching what is on disk.
+    pub fn set_run_approval_mode(&self, mode: crate::config::ApprovalMode) {
+        *self
+            .run_approval_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(mode);
+    }
+
+    /// Drop the run override so the persisted mode governs again. Callers that
+    /// write `settings.approval_mode` must call this, or the explicit,
+    /// persisted choice would stay masked by a stale run-scoped one.
+    pub fn clear_run_approval_mode(&self) {
+        *self
+            .run_approval_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     pub fn new(
         data_dir: PathBuf,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<AgentEventEnvelope>), String> {
@@ -118,6 +161,7 @@ impl Core {
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
+            run_approval_mode: Mutex::new(None),
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
@@ -154,6 +198,7 @@ impl Core {
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
+            run_approval_mode: Mutex::new(None),
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),

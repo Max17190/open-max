@@ -959,7 +959,7 @@ impl App {
                     self.core.respond_approval(&id, false);
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.core.settings.lock().unwrap().approval_mode = config::ApprovalMode::Auto;
+                    self.core.set_run_approval_mode(config::ApprovalMode::Auto);
                     self.core.respond_approval(&id, true);
                     self.note("approvals set to auto for this run (change with /approvals)");
                 }
@@ -1256,12 +1256,8 @@ impl App {
     /// the run and the acknowledgement says exactly that. This mirrors the
     /// approval card's "allow for run", which is already run-scoped.
     fn cycle_approval_mode(&mut self) {
-        let mode = {
-            let mut settings = self.core.settings.lock().unwrap();
-            let next = settings.approval_mode.next();
-            settings.approval_mode = next;
-            next
-        };
+        let mode = self.core.approval_mode().next();
+        self.core.set_run_approval_mode(mode);
         // Terse on purpose: cycling to the mode you want costs one line per
         // press, and the status line already carries the live value. It stays
         // a transcript note because below 54 columns the status line drops the
@@ -1283,7 +1279,7 @@ impl App {
         match choice {
             0 => self.core.respond_approval(&id, true),
             1 => {
-                self.core.settings.lock().unwrap().approval_mode = config::ApprovalMode::Auto;
+                self.core.set_run_approval_mode(config::ApprovalMode::Auto);
                 self.core.respond_approval(&id, true);
                 self.note("approvals set to auto for this run (change with /approvals)");
             }
@@ -2007,6 +2003,9 @@ impl App {
                         s.approval_mode = mode;
                         let _ = config::save(&self.core.data_dir, &s);
                     }
+                    // An explicit persisted choice outranks a run override,
+                    // which would otherwise keep masking it.
+                    self.core.clear_run_approval_mode();
                     self.note(&format!("approvals: {}", mode.as_str()));
                 }
                 None => self.note("usage: /approvals auto|ask|readonly"),
@@ -2180,7 +2179,7 @@ impl App {
                     kv("model", &model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
-                    kv("approvals", s.approval_mode.as_str()),
+                    kv("approvals", self.core.approval_mode().as_str()),
                     kv("context", &format!("{ctx} of {} tokens", context_tokens)),
                     kv("cache", &cache),
                     kv("ttft", &ttft),
@@ -3200,10 +3199,10 @@ impl App {
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
         if self.dirty.chrome || self.status_width != area.width {
             self.status_width = area.width;
-            let (model, approvals) = {
-                let s = self.core.settings.lock().unwrap();
-                (s.model.clone(), s.approval_mode.as_str().to_string())
-            };
+            // Read the mode before taking the settings lock: the accessor
+            // takes it too, and this mutex is not reentrant.
+            let approvals = self.core.approval_mode().as_str().to_string();
+            let model = self.core.settings.lock().unwrap().model.clone();
             let width = area.width as usize;
             let hint = self.status_hint();
             let left = if hint.is_empty() {
@@ -4126,7 +4125,7 @@ mod tests {
     async fn shift_tab_cycles_approvals_in_both_encodings() {
         for key in shift_tab_events() {
             let (mut app, dir) = app_fixture();
-            let mode = |app: &App| app.core.settings.lock().unwrap().approval_mode;
+            let mode = |app: &App| app.core.approval_mode();
             assert_eq!(mode(&app), config::ApprovalMode::Ask, "fixture default");
 
             app.on_key(key).await.unwrap();
@@ -4156,7 +4155,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.core.settings.lock().unwrap().approval_mode,
+            app.core.approval_mode(),
             config::ApprovalMode::Auto,
             "the run should see the new mode",
         );
@@ -4187,7 +4186,7 @@ mod tests {
                 "shift+tab did not wrap to the last item",
             );
             assert_eq!(
-                app.core.settings.lock().unwrap().approval_mode,
+                app.core.approval_mode(),
                 config::ApprovalMode::Ask,
                 "an open popup let the key through to the trust boundary",
             );
@@ -4203,7 +4202,7 @@ mod tests {
             ));
             app.on_key(key).await.unwrap();
             assert_eq!(
-                app.core.settings.lock().unwrap().approval_mode,
+                app.core.approval_mode(),
                 config::ApprovalMode::Ask,
                 "shift+tab changed approvals out from under a pending card",
             );
@@ -4247,6 +4246,87 @@ mod tests {
         }
     }
 
+    /// The leak this design exists to prevent: every save path serializes the
+    /// whole `Settings`, so a run-scoped mode kept there would ride along on
+    /// the next unrelated write and outlive the run.
+    #[tokio::test]
+    async fn an_unrelated_save_cannot_persist_the_run_scoped_mode() {
+        let (mut app, dir) = app_fixture();
+        {
+            let settings = app.core.settings.lock().unwrap().clone();
+            config::save(&dir, &settings).unwrap();
+        }
+
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Auto);
+
+        // Any later write of the shared settings: picking a model.
+        app.persist_model_selection(Some("alpha".into()), "some/model".into());
+
+        assert_eq!(
+            config::load(&dir).unwrap().approval_mode,
+            config::ApprovalMode::Ask,
+            "a model save carried the run-scoped approval mode to disk",
+        );
+        assert_eq!(
+            app.core.approval_mode(),
+            config::ApprovalMode::Auto,
+            "the run should still see its own mode",
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The approval card's "allow for run" is run-scoped for the same reason.
+    #[tokio::test]
+    async fn allow_for_run_does_not_reach_disk_either() {
+        let (mut app, dir) = app_fixture();
+        {
+            let settings = app.core.settings.lock().unwrap().clone();
+            config::save(&dir, &settings).unwrap();
+        }
+        app.pending_approval =
+            Some(("id".into(), "bash".into(), "sum".into(), "detail".into()));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Auto);
+
+        app.persist_model_selection(None, "some/model".into());
+        assert_eq!(
+            config::load(&dir).unwrap().approval_mode,
+            config::ApprovalMode::Ask,
+            "allow-for-run reached disk through an unrelated save",
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A typed, persisted choice has to outrank a run override, or it would
+    /// stay masked for the rest of the session.
+    #[tokio::test]
+    async fn typed_approvals_command_outranks_a_run_override() {
+        let (mut app, dir) = app_fixture();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Auto);
+
+        app.handle_submit("/approvals readonly".into()).await.unwrap();
+
+        assert_eq!(
+            app.core.approval_mode(),
+            config::ApprovalMode::Readonly,
+            "the run override kept masking the typed choice",
+        );
+        assert_eq!(
+            config::load(&dir).unwrap().approval_mode,
+            config::ApprovalMode::Readonly,
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Plain Tab keeps its own job.
     #[tokio::test]
     async fn plain_tab_still_toggles_focus() {
@@ -4256,10 +4336,7 @@ mod tests {
             .await
             .unwrap();
         assert!(app.focus == Focus::Scrollback);
-        assert_eq!(
-            app.core.settings.lock().unwrap().approval_mode,
-            config::ApprovalMode::Ask,
-        );
+        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Ask);
         fs::remove_dir_all(dir).unwrap();
     }
 

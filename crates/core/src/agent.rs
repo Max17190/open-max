@@ -1876,7 +1876,7 @@ async fn run_loop(
 
                 // Read live so "[a]lways" during an approval prompt takes effect
                 // for the rest of this turn, not just the next one.
-                let approval_mode = core.settings.lock().unwrap().approval_mode;
+                let approval_mode = core.approval_mode();
                 // Allow skips the approval prompt; Ask forces it (even in auto).
                 // Readonly still blocks mutating tools regardless of Allow.
                 let force_allow = matches!(perm, PermissionDecision::Allow);
