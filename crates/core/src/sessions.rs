@@ -494,8 +494,10 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 
 /// Keep resume boundaries pointing at the same messages across a transcript
 /// prune that removed a net `removed` messages above the pinned prefix
-/// (system plus first user). Points inside the removed region collapse onto
-/// its floor; duplicates that result are dropped.
+/// (system plus first user). The prune that removes messages also inserts
+/// its digest note at index 2, and that digest summarizes the dropped
+/// earlier sittings, so a boundary that collapses lands AFTER the digest
+/// (index 3), never on or before it; duplicates that result are dropped.
 pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
     if removed == 0 {
         return;
@@ -505,7 +507,7 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
             let mut shifted: Vec<u64> = m
                 .resume_points
                 .iter()
-                .map(|&p| if p <= 2 { p } else { p.saturating_sub(removed).max(2) })
+                .map(|&p| if p < 2 { p } else { p.saturating_sub(removed).max(3) })
                 .collect();
             shifted.sort_unstable();
             shifted.dedup();
@@ -693,11 +695,13 @@ mod tests {
         // deep boundary shifts, the shallow one collapses onto the floor,
         // and the pinned-prefix boundary is untouched.
         shift_resume_points_for_prune(&core, id, 3);
-        assert_eq!(meta(&core, id).unwrap().resume_points, vec![2, 7]);
+        // The prune that fires this shift also inserted its digest note at
+        // index 2; collapsed boundaries land after it, never on it.
+        assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 7]);
 
         // A legacy system-prompt insert moves every boundary down one.
         shift_resume_points_for_system_insert(&core, id);
-        assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 8]);
+        assert_eq!(meta(&core, id).unwrap().resume_points, vec![4, 8]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
