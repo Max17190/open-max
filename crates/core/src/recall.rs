@@ -101,6 +101,11 @@ pub struct RecallReport {
     /// cannot tell a policy limit from the shape of its own data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub clamped: Vec<Clamp>,
+    /// Chunks that survived `path:`/`session:` filtering. Zero with filters
+    /// present means the filters emptied the corpus, which is a different
+    /// failure from terms that matched nothing - and pointing at the terms
+    /// sends the reader to fix the half that was working.
+    pub candidates: usize,
     pub bytes_scanned: usize,
     pub elapsed_ms: u128,
 }
@@ -1103,9 +1108,20 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         sessions_skipped: skipped,
         sessions_unreadable: unreadable,
         clamped: query.clamped.clone(),
+        candidates,
         bytes_scanned: bytes,
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+/// The filter words of a query, for an error that names what excluded the
+/// corpus rather than blaming the search terms.
+fn filters_in(query: &str) -> String {
+    let parts: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| w.starts_with("path:") || w.starts_with("session:"))
+        .collect();
+    parts.join(" ")
 }
 
 /// Human rendering: one block per hit, provenance first, numbers in the
@@ -1182,7 +1198,22 @@ pub fn render(report: &RecallReport) -> String {
         ));
     }
     if report.hits.is_empty() {
-        out.push_str("nothing matched; try fewer or different terms, or read the addresses under ~/.openmax/sessions\n");
+        // Name the half that failed. A filter that excluded everything is not
+        // a vocabulary problem, and telling the reader to change terms sends
+        // them to fix the part that was working.
+        let filtered = filters_in(&report.query);
+        if report.candidates == 0 && !filtered.is_empty() {
+            out.push_str(&format!(
+                "nothing matched: {filtered} selected no history in this project. \
+                 path: keeps history that touched a matching file path; \
+                 session: takes an id prefix. Drop the filter to search everything.\n"
+            ));
+        } else {
+            out.push_str(
+                "nothing matched; try fewer or different terms, or read the addresses \
+                 under ~/.openmax/sessions\n",
+            );
+        }
     }
     out
 }
@@ -1395,6 +1426,33 @@ mod tests {
     /// cap from the end of a record, cannot resolve an address whose base it
     /// was never told, and will raise limits in a loop if told that is how to
     /// read one record whole. All three were measured on the real store.
+    /// An empty result must name the half that failed. A filter that selected
+    /// nothing is not a vocabulary problem, and "try different terms" sends
+    /// the reader to change the part that was working.
+    #[test]
+    fn an_empty_result_says_which_half_failed() {
+        let (core, dir, project) = setup();
+        seed_session(&core, &project, "work", vec![ChatMessage::user(
+            "the marmot telemetry pipeline was rewired",
+        )]);
+
+        let filtered = recall(&core, &project, "marmot path:src/nowhere").unwrap();
+        assert!(filtered.hits.is_empty());
+        assert_eq!(filtered.candidates, 0, "the filter emptied the corpus");
+        let text = render(&filtered);
+        assert!(text.contains("path:src/nowhere"), "name the filter: {text}");
+        assert!(!text.contains("try fewer or different terms"), "do not blame the terms: {text}");
+
+        let missing = recall(&core, &project, "zzzznotaword").unwrap();
+        assert!(missing.hits.is_empty());
+        assert!(missing.candidates > 0, "the corpus was searchable");
+        assert!(
+            render(&missing).contains("try fewer or different terms"),
+            "a real vocabulary miss still says so"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn recall_reports_its_own_limits_instead_of_quietly_applying_them() {
         let (core, dir, project) = setup();

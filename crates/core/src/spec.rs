@@ -10,7 +10,7 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 9] = [
+pub const SURFACES: [&str; 10] = [
     "tools",
     "skills",
     "prompts",
@@ -18,6 +18,7 @@ pub const SURFACES: [&str; 9] = [
     "permissions",
     "providers",
     "memory",
+    "recall",
     "stdio",
     "usage",
 ];
@@ -32,6 +33,7 @@ pub fn render(surface: &str) -> Option<&'static str> {
         "permissions" => Some(PERMISSIONS),
         "providers" => Some(PROVIDERS),
         "memory" => Some(MEMORY),
+        "recall" => Some(RECALL),
         "stdio" => Some(STDIO),
         _ => None,
     }
@@ -479,12 +481,18 @@ enters the index from the next session. Verify what you wrote with
 `openmax --check` (it names every ignored file and why, and what the index
 currently shows).
 
-## Recall
+## Searching what was kept
+
+`openmax --spec recall` documents the search over this project's own history.
+"#;
+
+const RECALL: &str = r#"# Recall
 
 `openmax --recall "<query>"` (run it with bash) searches this project's own
-history - session transcripts, compaction archives, compaction digests,
-session titles, and memory files - and prints ranked excerpts, each citing
-the file that holds the full record. Read-only and project-scoped: no
+history - session transcripts, compaction archives, compaction digests, and
+memory files - and prints ranked excerpts, each citing `path:line` for the
+record that holds it, so `sed -n '<line>p'` reads it back exactly and
+`head -c` bounds how much. Read-only and project-scoped: no
 session, no endpoint, no derived index. The stores on disk are scanned
 directly, newest sessions first, up to a 64 MB ceiling; anything skipped is
 counted in the report, never silent.

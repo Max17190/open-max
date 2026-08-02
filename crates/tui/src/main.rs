@@ -38,7 +38,8 @@ options:
                          reads back exactly. Query syntax: plain terms plus
                          path:<substr>, session:<id-prefix>, k:<n>,
                          budget:<tokens>, excerpt:<chars>; --json for
-                         structured output
+                         structured output. Full contract:
+                         --spec recall
       --ledger           print the capability-file history for this project
       --ledger-repair    quarantine an unverifiable ledger log (nothing is
                          deleted) and start a new chain; approvals in the
@@ -59,9 +60,9 @@ options:
                          nonzero if any is broken.
                          with --stdio, validate a JSONL protocol stream on
                          stdin against the openmax-stdio contract instead
-      --spec <surface>   print the authoring contract for one extension
-                         surface and exit (tools, skills, prompts, hooks,
-                         permissions, providers, memory, stdio)
+      --spec <surface>   print the authoring contract for one surface and
+                         exit (tools, skills, prompts, hooks, permissions,
+                         providers, memory, recall, stdio, usage)
       --trust-project    persist trust for this exact project root, then run
   -V, --version          print the version
   -h, --help             this help
