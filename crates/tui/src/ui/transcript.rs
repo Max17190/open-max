@@ -667,7 +667,7 @@ impl Transcript {
             // Tool output is already the exact bytes; never transform it.
             return Some(out.clone());
         }
-        Some(strip_code_rails(&lines_to_plain(&b.raw)))
+        Some(copy_text_without_chrome(&b.raw))
     }
 
     /// Plain text for scrollback find (user/assistant/tool/system).
@@ -852,7 +852,6 @@ impl Transcript {
         let mut parts = Vec::new();
         for block_index in start.block..=end.block {
             let block = &self.blocks[block_index];
-            let text = block.selectable_text();
             let char_len = block.selectable_chars;
             let from = if block_index == start.block {
                 start.offset.min(char_len)
@@ -866,9 +865,9 @@ impl Transcript {
             } else {
                 char_len
             };
-            parts.push(slice_chars(text, from, to));
+            parts.push(slice_block_chars(block, from, to));
         }
-        Some(strip_code_rails(&parts.join("\n\n")))
+        Some(parts.join("\n\n"))
     }
 
     /// Index of the nearest user block whose start is above `view_start_line`.
@@ -928,12 +927,59 @@ fn line_is_blank(l: &Line<'_>) -> bool {
     l.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
-/// The clipboard must carry exact bytes: rendered code lines carry a
-/// decorative fence gutter ("│ ") that would otherwise be pasted into the
-/// user's editor on every line.
-fn strip_code_rails(text: &str) -> String {
-    text.lines()
-        .map(|line| line.strip_prefix("│ ").unwrap_or(line))
+/// A renderer-added fence gutter is exactly a line whose FIRST span is the
+/// two-character "│ " glyph followed by the code span (markdown::render_line
+/// builds fence lines that way). Literal content that merely begins with the
+/// same characters arrives as a single span and is never treated as chrome,
+/// so the clipboard keeps it.
+fn is_rail_line(line: &Line<'static>) -> bool {
+    line.spans.len() >= 2 && line.spans[0].content.as_ref() == "│ "
+}
+
+/// Character slice of a block's selectable text, identical to slicing the
+/// joined text except that the two gutter characters at the start of a fence
+/// line are dropped when the slice covers them. The clipboard carries the
+/// code, never the chrome.
+fn slice_block_chars(block: &Block, from: usize, to: usize) -> String {
+    let rails: Vec<bool> = block.source_lines().iter().map(is_rail_line).collect();
+    let mut out = String::new();
+    let mut pos = 0usize;
+    for (i, line) in block.selectable.split('\n').enumerate() {
+        if i > 0 {
+            // The separating newline occupies one character position.
+            if pos >= from && pos < to {
+                out.push('\n');
+            }
+            pos += 1;
+        }
+        let rail = rails.get(i).copied().unwrap_or(false);
+        let mut count = 0usize;
+        for (j, ch) in line.chars().enumerate() {
+            count += 1;
+            let p = pos + j;
+            if p >= from && p < to && !(rail && j < 2) {
+                out.push(ch);
+            }
+        }
+        pos += count;
+    }
+    out
+}
+
+/// Full-content copy with renderer chrome (the fence gutter span) excluded.
+/// The clipboard must carry exact bytes: pasting code with a rail character
+/// on every line makes the paste useless.
+fn copy_text_without_chrome(lines: &[Line<'static>]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            let skip = usize::from(is_rail_line(line));
+            line.spans
+                .iter()
+                .skip(skip)
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1243,13 +1289,6 @@ fn char_offset_to_display_column(text: &str, offset: usize) -> usize {
     text[..byte].width()
 }
 
-fn slice_chars(text: &str, start: usize, end: usize) -> String {
-    text.chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
-}
-
 fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
@@ -1305,6 +1344,27 @@ mod tests {
         t.set_width(24);
         let index = t.wrapped.len() - t.resolve_anchor(anchor);
         assert_eq!(t.line_block[index], block);
+    }
+
+    #[test]
+    fn literal_rail_prefixed_content_is_not_chrome() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        // A single-span line that merely begins with the same characters as
+        // the fence gutter is content, not renderer chrome; the clipboard
+        // must keep it intact on both copy paths.
+        t.push_assistant(vec![Line::from("│ literal table border")]);
+        t.select_prev();
+        assert_eq!(
+            t.selected_copy_text().as_deref(),
+            Some("│ literal table border")
+        );
+
+        t.ensure_flat();
+        assert!(t.begin_text_selection_at(0, 0));
+        assert!(t.update_text_selection_at(0, 21));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("│ literal table border"));
     }
 
     #[test]
