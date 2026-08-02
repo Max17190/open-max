@@ -62,15 +62,22 @@ const BM25_B: f64 = 0.4;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallHit {
     pub score: f64,
-    /// `memory` | `message` | `archive` | `digest` | `title`
+    /// `memory` | `message` | `archive` | `digest`
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub age_hours: u64,
-    /// The address the agent can read for the full record.
+    /// The file holding the full record.
     pub source: String,
+    /// 1-based line of `source` for the full record, when the store is a JSONL
+    /// log. With it the address is exact and bounded - `sed -n '<line>p'`,
+    /// piped through `head -c` for as much as is wanted - instead of a grep
+    /// for a guessed phrase that returns however many bytes the record happens
+    /// to be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
     pub excerpt: String,
 }
 
@@ -101,6 +108,10 @@ struct Chunk {
     title: Option<String>,
     age_hours: u64,
     source: String,
+    /// 1-based line of `source` holding this record, where the store is a
+    /// JSONL log. `None` where the file is the record (a memory file) or the
+    /// text does not live in the file at all (a session title).
+    line: Option<usize>,
     /// The record this chunk came from, as source plus record ordinal. Every
     /// message in a session shares one `source` (the transcript file), so
     /// sibling-page collapsing keyed on `source` cannot tell "page 2 of this
@@ -534,7 +545,14 @@ fn bounded(text: String) -> String {
 /// the scan ceiling, not the file: a multi-gigabyte transcript costs at most
 /// the budget, and a single line longer than it is dropped, not ballooned -
 /// the cited address still holds the full record.
-fn bounded_jsonl<T: serde::de::DeserializeOwned>(path: &Path, io_budget: usize) -> Vec<T> {
+/// Returns each parsed value with the 1-based line it came from. Enumerated
+/// before the filters, not after: a blank line or one corrupt record would
+/// otherwise shift every number below it, and an address that is usually
+/// right is worse than no address at all.
+fn bounded_jsonl<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    io_budget: usize,
+) -> Vec<(usize, T)> {
     use std::io::Read as _;
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
@@ -547,8 +565,9 @@ fn bounded_jsonl<T: serde::de::DeserializeOwned>(path: &Path, io_budget: usize) 
     // final line fails to parse and is skipped like any other corrupt line.
     String::from_utf8_lossy(&buf)
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .filter_map(|(i, l)| serde_json::from_str(l).ok().map(|value| (i + 1, value)))
         .collect()
 }
 
@@ -623,6 +642,7 @@ fn collect_chunks(
                     // One memory file is one record: its pages are siblings.
                     doc: source.clone(),
                     source: source.clone(),
+                    line: None,
                     text: page.to_string(),
                     paths: Vec::new(),
                 });
@@ -658,34 +678,29 @@ fn collect_chunks(
             sessions::archive_display(core, &meta.id),
             sessions::compaction_display(core, &meta.id),
         ];
-        let Some(title_source) = stores.iter().find(|p| Path::new(p).exists()) else {
+        // An index entry whose files are all gone is listed history that
+        // cannot be read: reported as unreadable, never as scanned.
+        if !stores.iter().any(|p| Path::new(p).exists()) {
             unreadable += 1;
             continue;
-        };
+        }
         scanned += 1;
         let age = hours_since(now, meta.updated_at);
-        // The title cites the first store that actually exists: an
-        // archive-only session must not hand out a dead transcript address.
-        chunks.push(Chunk {
-            kind: "title",
-            session: Some(meta.id.clone()),
-            title: Some(meta.title.clone()),
-            age_hours: age,
-            doc: format!("{title_source}#title"),
-            source: title_source.clone(),
-            text: meta.title.clone(),
-            paths: Vec::new(),
-        });
+        // No title chunk. A title is the first 48 characters of the first
+        // user message (agent.rs sets it there), and budget enforcement never
+        // drops that message, so anything a title could match the transcript
+        // matches too - with more of it, and with an address that resolves.
+        // Where a title hit did fire it cited a file that does not contain
+        // the title, because the name lives in the session index. The name
+        // still travels on every hit as `title`.
         // Digests before bulk: they are tiny, and they carry the structured
         // paths the session-level `path:` hop depends on. Collected last,
         // a transcript that exhausts the ceiling would silently strip a
         // scanned session of its path evidence.
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let compaction_path = std::path::PathBuf::from(sessions::compaction_display(core, &meta.id));
-        for (ord, record) in
+        for (line, record) in
             bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget)
-                .into_iter()
-                .enumerate()
         {
             if bytes >= scan_ceiling {
                 break;
@@ -698,18 +713,16 @@ fn collect_chunks(
                 session: Some(meta.id.clone()),
                 title: Some(meta.title.clone()),
                 age_hours: hours_since(now, record.ts),
-                doc: format!("{source}#{ord}"),
+                doc: format!("{source}#{line}"),
                 source,
+                line: Some(line),
                 text,
                 paths: record.paths,
             });
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
-        for (ord, msg) in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget)
-            .into_iter()
-            .enumerate()
-        {
+        for (line, msg) in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget) {
             if bytes >= scan_ceiling {
                 break;
             }
@@ -729,8 +742,9 @@ fn collect_chunks(
                     session: Some(meta.id.clone()),
                     title: Some(meta.title.clone()),
                     age_hours: age,
-                    doc: format!("{source}#{ord}"),
+                    doc: format!("{source}#{line}"),
                     source: source.clone(),
+                    line: Some(line),
                     text: page.to_string(),
                     paths: Vec::new(),
                 });
@@ -738,10 +752,7 @@ fn collect_chunks(
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
-        for (ord, msg) in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget)
-            .into_iter()
-            .enumerate()
-        {
+        for (line, msg) in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget) {
             if bytes >= scan_ceiling {
                 break;
             }
@@ -758,8 +769,9 @@ fn collect_chunks(
                     session: Some(meta.id.clone()),
                     title: Some(meta.title.clone()),
                     age_hours: age,
-                    doc: format!("{source}#{ord}"),
+                    doc: format!("{source}#{line}"),
                     source: source.clone(),
+                    line: Some(line),
                     text: page.to_string(),
                     paths: Vec::new(),
                 });
@@ -976,15 +988,6 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             .then_with(|| a.1.cmp(&b.1))
     });
 
-    // A bare title is a very short BM25 document that outranks its own
-    // session's content while carrying none: a title hit only survives when
-    // its session offers nothing better among the candidates.
-    let sessions_with_content: std::collections::HashSet<&str> = scored
-        .iter()
-        .filter(|(_, i)| chunks[*i].kind != "title")
-        .filter_map(|(_, i)| chunks[*i].session.as_deref())
-        .collect();
-
     // Excerpts center on the rarest matched term: rarity carries the signal.
     let mut terms_by_rarity: Vec<&str> = query.terms.iter().map(String::as_str).collect();
     terms_by_rarity.sort_by_key(|t| df.get(t).copied().unwrap_or(usize::MAX));
@@ -1002,13 +1005,6 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             break;
         }
         let chunk = &chunks[i];
-        if chunk.kind == "title" {
-            if let Some(id) = chunk.session.as_deref() {
-                if sessions_with_content.contains(id) {
-                    continue;
-                }
-            }
-        }
         // Collapse sibling pages, not sibling records. A long paged document
         // can match on many of its own pages, and letting them all through
         // spends k and the token budget re-showing one record while other
@@ -1047,6 +1043,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         hits.push(RecallHit {
             score,
             kind: chunk.kind,
+            line: chunk.line,
             session: chunk.session.clone(),
             title: chunk.title.clone(),
             age_hours: chunk.age_hours,
@@ -1115,18 +1112,24 @@ pub fn render(report: &RecallReport) -> String {
             }
             _ => "project memory".to_string(),
         };
+        // `path:line` is the address convention every editor, grep and agent
+        // already understands, so the citation needs no explaining.
+        let address = match hit.line {
+            Some(line) => format!("{}:{line}", hit.source),
+            None => hit.source.clone(),
+        };
         out.push_str(&format!(
             "\n[{}] {} {} ({} ago) — {}\n    {}\n",
             i + 1,
             hit.kind,
             who,
             age,
-            hit.source,
+            address,
             hit.excerpt
         ));
     }
     if report.hits.is_empty() {
-        out.push_str("nothing matched; try fewer or different terms, or grep the addresses under ~/.openmax/sessions\n");
+        out.push_str("nothing matched; try fewer or different terms, or read the addresses under ~/.openmax/sessions\n");
     }
     out
 }
@@ -1330,6 +1333,72 @@ mod tests {
     /// One invalid-UTF-8 line must skip like any other corrupt line, not
     /// discard the transcript around it: the reader is lossy at the byte
     /// level and per-line at the parse level.
+    /// A citation has to resolve. The line is what makes the address exact and
+    /// bounded - `sed -n '<line>p'` piped through `head -c` - instead of a grep
+    /// for a phrase guessed out of the excerpt, which returns whatever the
+    /// record happens to weigh. So the number must survive the things a real
+    /// log contains: blank lines and records that do not parse.
+    #[test]
+    fn a_citation_names_the_line_that_holds_the_record() {
+        let (core, dir, project) = setup();
+        let id = seed_session(&core, &project, "addressing", vec![ChatMessage::user("seed")]);
+        let path = sessions::messages_display(&core, &id);
+        // line 1 valid, 2 blank, 3 corrupt, 4 the record wanted.
+        std::fs::write(
+            &path,
+            "{\"role\":\"user\",\"content\":\"first record\"}\n\n\
+             {not json at all\n\
+             {\"role\":\"assistant\",\"content\":\"ANSWER zebrafish protocol\"}\n",
+        )
+        .unwrap();
+
+        let report = recall(&core, &project, "zebrafish").unwrap();
+        let hit = report.hits.iter().find(|h| h.excerpt.contains("zebrafish")).expect("found");
+        let line = hit.line.expect("a JSONL record is addressable by line");
+
+        // Resolve it the way an agent would, and check the bytes agree.
+        let text = std::fs::read_to_string(&hit.source).unwrap();
+        let cited = text.lines().nth(line - 1).expect("the cited line exists");
+        assert!(
+            cited.contains("zebrafish"),
+            "line {line} must hold the cited record, got: {cited}"
+        );
+        assert_eq!(line, 4, "blank and unparseable lines must not shift the number");
+
+        // A memory file is its own address; there is no line to give.
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        std::fs::write(
+            project.join(crate::memory::MEMORY_DIR).join("fact.md"),
+            "# zebrafish protocol lives in docs\n",
+        )
+        .unwrap();
+        let report = recall(&core, &project, "zebrafish k:20").unwrap();
+        let mem = report.hits.iter().find(|h| h.kind == "memory").expect("memory hit");
+        assert_eq!(mem.line, None, "the file is the record; a line would be noise");
+
+        // A title is not a record. It is the first 48 characters of the first
+        // user message, so the transcript already carries the same words with
+        // more around them and an address that resolves; emitting the title
+        // separately spent a slot to cite a file that does not contain it.
+        let titled = seed_session(&core, &project, "quokka census plan", vec![
+            ChatMessage::user("quokka census plan, and the body that follows it"),
+        ]);
+        let report = recall(&core, &project, "quokka k:20").unwrap();
+        assert!(
+            report.hits.iter().all(|h| h.kind != "title"),
+            "a title is not an addressable record: {:?}",
+            report.hits
+        );
+        let hit = report
+            .hits
+            .iter()
+            .find(|h| h.session.as_deref() == Some(titled.as_str()))
+            .expect("the session is still findable by the words in its title");
+        assert!(hit.line.is_some(), "and it is found at a line that resolves");
+        assert_eq!(hit.title.as_deref(), Some("quokka census plan"), "the name still travels");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn invalid_utf8_line_skips_only_itself() {
         let (core, dir, project) = setup();
