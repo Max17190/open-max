@@ -1059,6 +1059,11 @@ fn wrap_lines_mapped(
             continue;
         }
         let indent = hanging_indent(&chars, width);
+        // A fence line's continuation keeps the rail glyph itself, in the
+        // rail's own style, so a wrapped code block still reads as one block
+        // at narrow widths instead of dissolving into prose. The rail is
+        // non-ASCII, so only the Unicode path below ever sees one.
+        let rail = chars.len() >= 2 && chars[0].0 == '│' && chars[1].0 == ' ';
         if chars.iter().all(|(ch, _)| ch.is_ascii()) {
             // Coding-agent transcripts are overwhelmingly ASCII. Preserve the
             // original scalar loop here so Unicode safety has no tax on the
@@ -1151,7 +1156,11 @@ fn wrap_lines_mapped(
                 };
                 let mut row = rebuild(&chars[from_char..to_char]);
                 if !first_row && indent > 0 {
-                    row.spans.insert(0, Span::raw(" ".repeat(indent)));
+                    if rail && indent == 2 {
+                        row.spans.insert(0, Span::styled("│ ", chars[0].1));
+                    } else {
+                        row.spans.insert(0, Span::raw(" ".repeat(indent)));
+                    }
                 }
                 out.push(row);
                 maps.push(Some(CachedLineMap {
@@ -1182,6 +1191,8 @@ fn hanging_indent(chars: &[(char, Style)], width: usize) -> usize {
     }
     let marker = match chars.get(i).map(|c| c.0) {
         Some('•' | '-' | '*') if chars.get(i + 1).map(|c| c.0) == Some(' ') => 2,
+        // The code-fence rail: continuations stay inside the fence column.
+        Some('│') if chars.get(i + 1).map(|c| c.0) == Some(' ') => 2,
         Some(d) if d.is_ascii_digit() => {
             let mut j = i;
             while j < chars.len() && chars[j].0.is_ascii_digit() {
@@ -1340,6 +1351,27 @@ mod tests {
         t.set_width(24);
         let index = t.wrapped.len() - t.resolve_anchor(anchor);
         assert_eq!(t.line_block[index], block);
+    }
+
+    #[test]
+    fn wrapped_code_lines_keep_the_fence_rail() {
+        let mut t = Transcript::new();
+        t.set_width(30);
+        t.push_assistant(crate::ui::markdown::render(
+            "```rust\nlet value = a_deliberately_long_identifier_that_wraps + another_long_identifier;\n```",
+        ));
+        let rows = text(t.lines());
+        let code_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("identifier") || row.contains("let value"))
+            .collect();
+        assert!(code_rows.len() >= 2, "expected a wrapped fence: {rows:?}");
+        for row in code_rows {
+            assert!(
+                row.starts_with("│ "),
+                "a fence row escaped the rail: {row:?}"
+            );
+        }
     }
 
     #[test]
