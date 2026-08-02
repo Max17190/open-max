@@ -2939,11 +2939,8 @@ impl App {
             let track_h = area.height as usize;
             let max_off = total - visible;
             let from_top = max_off.saturating_sub(offset);
-            let marker_y = if max_off == 0 {
-                0
-            } else {
-                (from_top * track_h.saturating_sub(1)) / max_off
-            };
+            let marker_y =
+                (from_top * track_h.saturating_sub(1)).checked_div(max_off).unwrap_or(0);
             if let Some(cell) = frame.buffer_mut().cell_mut((
                 area.x + area.width.saturating_sub(1),
                 area.y + marker_y as u16,

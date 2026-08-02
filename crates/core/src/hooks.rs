@@ -1389,7 +1389,7 @@ mod tests {
                 "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n",
             );
         }
-        let hooks = discover_in_dirs(&[dir.clone()]);
+        let hooks = discover_in_dirs(std::slice::from_ref(&dir));
         assert_eq!(hooks.post.len(), MAX_HOOKS_PER_EVENT);
         // Other events are unaffected by post_tool_use volume.
         assert!(hooks.pre.is_empty());
@@ -1911,7 +1911,7 @@ command = "{}"
             "audit.toml",
             "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 7\"]\n",
         );
-        let hooks = discover_in_dirs(&[dir.clone()]);
+        let hooks = discover_in_dirs(std::slice::from_ref(&dir));
         let outcome = crate::tools::ToolOutcome::ok("fine".into());
         let failures = hooks
             .post_tool_use(
