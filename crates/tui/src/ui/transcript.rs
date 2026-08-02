@@ -177,6 +177,14 @@ impl Block {
     }
 }
 
+/// A content position in the wrapped transcript that survives re-wraps.
+/// See [`Transcript::anchor_at`].
+#[derive(Clone, Copy, Debug)]
+pub struct WrapAnchor {
+    block: usize,
+    lines_into_block: usize,
+}
+
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
@@ -313,6 +321,50 @@ impl Transcript {
             self.ensure_flat();
             self.offset = self.offset.min(self.wrapped.len());
         }
+    }
+
+    /// Capture the content at `lines_from_bottom` so it can be found again
+    /// after a re-wrap. Wrapped-line indices are meaningless across widths;
+    /// the block plus the distance into it survives, approximate across
+    /// widths but bounded by one block's height. None when history is empty
+    /// or the position is not above the bottom.
+    pub fn anchor_at(&mut self, lines_from_bottom: usize) -> Option<WrapAnchor> {
+        self.ensure_flat();
+        if lines_from_bottom == 0 || self.wrapped.is_empty() {
+            return None;
+        }
+        let index = self
+            .wrapped
+            .len()
+            .saturating_sub(lines_from_bottom)
+            .min(self.wrapped.len() - 1);
+        let block = *self.line_block.get(index)?;
+        Some(WrapAnchor {
+            block,
+            lines_into_block: index - self.block_starts[block],
+        })
+    }
+
+    /// Wrapped-line distance from the bottom of history to the anchored
+    /// content, after any re-wraps since capture.
+    pub fn resolve_anchor(&mut self, anchor: WrapAnchor) -> usize {
+        self.ensure_flat();
+        let Some(&start) = self.block_starts.get(anchor.block) else {
+            return 0;
+        };
+        let end = self
+            .block_starts
+            .get(anchor.block + 1)
+            .copied()
+            .unwrap_or(self.wrapped.len());
+        let index = (start + anchor.lines_into_block).min(end.saturating_sub(1));
+        self.wrapped.len() - index
+    }
+
+    /// Place the view at an absolute distance from the bottom; the draw
+    /// path clamps it against the current total as usual.
+    pub fn set_offset(&mut self, lines_from_bottom: usize) {
+        self.offset = lines_from_bottom;
     }
 
     /// Theme changes affect cached line surfaces even when content and width
@@ -1212,6 +1264,33 @@ fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchor_finds_the_same_block_after_a_rewrap() {
+        let mut t = Transcript::new();
+        t.set_width(30);
+        for i in 0..20 {
+            t.push_user(vec![Line::from(format!(
+                "block {i:02} body long enough to wrap at thirty columns"
+            ))]);
+        }
+        let anchor = t.anchor_at(10).unwrap();
+        assert_eq!(t.resolve_anchor(anchor), 10);
+        let block = t.line_block[t.wrapped.len() - 10];
+
+        // Wider wrap: every block collapses to fewer lines, all indices
+        // shift, but the anchor still resolves into the same block.
+        t.set_width(120);
+        let from_bottom = t.resolve_anchor(anchor);
+        assert!(from_bottom >= 1);
+        let index = t.wrapped.len() - from_bottom;
+        assert_eq!(t.line_block[index], block);
+
+        // And back: still the same block after a narrow re-wrap.
+        t.set_width(24);
+        let index = t.wrapped.len() - t.resolve_anchor(anchor);
+        assert_eq!(t.line_block[index], block);
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines
