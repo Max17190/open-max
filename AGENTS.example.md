@@ -18,7 +18,7 @@ Native Rust coding-agent harness: one focused loop, small tools, fast TUI, exten
 
 ## What ships
 
-Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
+Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`, `web_search` (Firecrawl, keyless; `FIRECRAWL_API_KEY` raises limits, `FIRECRAWL_API_URL` self-hosts).
 
 - Tools: `.openmax/tools/*.toml` or `~/.openmax/tools/`
 - Skills: `.agents/skills/*/SKILL.md` or `~/.openmax/skills/` (index only; read body on demand)

@@ -114,8 +114,9 @@ pub fn is_mutating(name: &str) -> bool {
 
 /// Every built-in tool name. Order matches `tool_schemas()` so the frozen
 /// schema array and registry stay in lockstep.
-pub const TOOL_NAMES: &[&str] =
-    &["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"];
+pub const TOOL_NAMES: &[&str] = &[
+    "list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash", "web_search",
+];
 
 pub fn tool_names() -> Vec<String> {
     TOOL_NAMES.iter().map(|s| s.to_string()).collect()
@@ -125,6 +126,7 @@ pub fn tool_names() -> Vec<String> {
 pub fn summarize_call(name: &str, args: &Value) -> String {
     match name {
         "bash" => args["command"].as_str().unwrap_or("?").to_string(),
+        "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
         "write_file" | "edit_file" | "read_file" | "list_dir" => {
             args["path"].as_str().unwrap_or("?").to_string()
         }
@@ -245,6 +247,21 @@ pub fn tool_schemas() -> &'static Value {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the public web (Firecrawl); returns titles, urls, snippets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "integer", "description": "1-10, default 5" }
+                    },
+                    "required": ["query"]
+                }
+            }
         }
     ])
     })
@@ -294,6 +311,9 @@ pub async fn execute(
     if name == "bash" {
         return bash_tool(root, args, caps, cancel).await;
     }
+    if name == "web_search" {
+        return web_search_tool(args, cancel).await;
+    }
     if cancel.is_cancelled() {
         return ToolOutcome::err("tool cancelled by user");
     }
@@ -318,6 +338,126 @@ pub async fn execute(
             )),
         }) => result.unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}"))),
     }
+}
+
+/// Where `web_search` sends queries: a self-hosted Firecrawl when
+/// FIRECRAWL_API_URL is set, otherwise the keyless cloud endpoint. Public so
+/// /status can disclose the exact network destination.
+pub fn web_search_base() -> String {
+    std::env::var("FIRECRAWL_API_URL")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "https://api.firecrawl.dev".to_string())
+}
+
+/// True when a FIRECRAWL_API_KEY is set; /status reports keyless vs keyed.
+pub fn web_search_has_key() -> bool {
+    std::env::var("FIRECRAWL_API_KEY").map(|k| !k.trim().is_empty()).unwrap_or(false)
+}
+
+/// Search the public web via Firecrawl's search API.
+///
+/// Zero setup by design: the cloud endpoint answers without credentials
+/// (Firecrawl Keyless), so a fresh install can ground itself immediately.
+/// Two plain env vars are the entire upgrade surface: FIRECRAWL_API_KEY for
+/// higher limits, FIRECRAWL_API_URL for a self-hosted instance. Read-only,
+/// so it runs without an approval prompt like grep; permissions rules can
+/// still deny or gate it by name, and /status discloses the destination.
+/// The request carries the query and nothing else.
+async fn web_search_tool(args: &Value, cancel: Arc<CancelToken>) -> ToolOutcome {
+    let Some(query) = args["query"].as_str().map(str::trim).filter(|q| !q.is_empty()) else {
+        return ToolOutcome::err("web_search needs a non-empty query");
+    };
+    let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 10);
+
+    // One pooled client for the process lifetime, same reason as ChatClient:
+    // rebuilding the pool would redo the TLS handshake on every search.
+    static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+    let http = HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build http client")
+    });
+
+    let mut request = http
+        .post(format!("{}/v2/search", web_search_base()))
+        .json(&json!({ "query": query, "limit": limit }));
+    if web_search_has_key() {
+        if let Ok(key) = std::env::var("FIRECRAWL_API_KEY") {
+            request = request.bearer_auth(key.trim());
+        }
+    }
+
+    let response = tokio::select! {
+        _ = cancel.cancelled() => return ToolOutcome::err("tool cancelled by user"),
+        r = request.send() => r,
+    };
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => return ToolOutcome::err(format!("web search failed: {e}")),
+    };
+    let status = response.status();
+    if status.as_u16() == 429 {
+        return ToolOutcome::err(
+            "web search rate-limited (keyless tier); retry later or set FIRECRAWL_API_KEY for higher limits",
+        );
+    }
+    let body: Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return ToolOutcome::err(format!(
+                "web search returned unreadable JSON (HTTP {status}): {e}"
+            ))
+        }
+    };
+    if !status.is_success() || body["success"] != Value::Bool(true) {
+        let detail = body["error"].as_str().unwrap_or("unknown error");
+        return ToolOutcome::err(format!("web search failed (HTTP {status}): {detail}"));
+    }
+    match format_web_results(&body["data"]["web"]) {
+        Ok(text) => ToolOutcome::ok(text),
+        Err(e) => ToolOutcome::err(e),
+    }
+}
+
+/// Compact plain-text rendering of search results: rank, title, url, and a
+/// whitespace-collapsed snippet. Plain lines instead of the provider's JSON
+/// because every byte here is re-prefilled on each later turn.
+fn format_web_results(web: &Value) -> Result<String, String> {
+    let Some(results) = web.as_array() else {
+        return Err("web search response had no results array".into());
+    };
+    if results.is_empty() {
+        return Ok("no results".into());
+    }
+    let mut out = String::new();
+    for (i, r) in results.iter().enumerate() {
+        let title = r["title"].as_str().unwrap_or("(untitled)").trim();
+        let url = r["url"].as_str().unwrap_or("").trim();
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
+        let snippet = collapse_snippet(r["description"].as_str().unwrap_or(""), 240);
+        if !snippet.is_empty() {
+            out.push_str(&format!("   {snippet}\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// Collapse runs of whitespace to single spaces and cap the length on a char
+/// boundary, so a markdown-y description becomes one honest line.
+fn collapse_snippet(text: &str, max_chars: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(max_chars).collect();
+    format!("{cut}…")
 }
 
 fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
@@ -907,6 +1047,181 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<Canc
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn web_search_is_read_only_and_named() {
+        assert!(!is_mutating("web_search"));
+        assert!(TOOL_NAMES.contains(&"web_search"));
+        assert_eq!(
+            summarize_call("web_search", &json!({"query": "ratatui rendering"})),
+            "ratatui rendering"
+        );
+    }
+
+    #[test]
+    fn web_results_format_compactly_from_the_recorded_shape() {
+        // Shape recorded from a live keyless POST to /v2/search.
+        let web = json!([
+            {
+                "url": "https://ratatui.rs/concepts/rendering/",
+                "title": "Rendering",
+                "description": "# Rendering\nemploys the immediate mode rendering approach for TUI development.\n\n## What is",
+                "position": 1
+            },
+            {"url": "https://example.com/two", "title": "Two", "position": 2}
+        ]);
+        let text = format_web_results(&web).unwrap();
+        assert_eq!(
+            text,
+            "1. Rendering\n   https://ratatui.rs/concepts/rendering/\n   # Rendering employs the immediate mode rendering approach for TUI development. ## What is\n\n2. Two\n   https://example.com/two\n"
+        );
+        assert_eq!(format_web_results(&json!([])).unwrap(), "no results");
+        assert!(format_web_results(&json!(null)).is_err());
+    }
+
+    #[test]
+    fn snippets_collapse_and_cap_on_char_boundaries() {
+        assert_eq!(collapse_snippet("a\n\n  b\tc", 100), "a b c");
+        assert_eq!(collapse_snippet("héllo wörld", 5), "héllo…");
+        assert_eq!(collapse_snippet("", 10), "");
+    }
+
+    /// One canned Firecrawl endpoint serving a single response; the receiver
+    /// yields the captured raw request (head plus body) so auth headers and
+    /// payload can be asserted from the wire, not from intent.
+    fn canned_firecrawl(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let mut read = 0usize;
+            // Read until the JSON body closes; requests here are small.
+            loop {
+                let n = stream.read(&mut buf[read..]).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                read += n;
+                let text = String::from_utf8_lossy(&buf[..read]);
+                if let Some(body_at) = text.find("\r\n\r\n") {
+                    let header = &text[..body_at];
+                    let length = header
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .or_else(|| {
+                            header.lines().find_map(|l| l.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if read >= body_at + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf[..read]).to_string());
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        (base, rx)
+    }
+
+    #[tokio::test]
+    async fn web_search_speaks_keyless_then_keyed_and_reports_limits() {
+        // Env is process-global: this one test owns both FIRECRAWL vars and
+        // restores them before returning, so no sibling can race it.
+        let saved_url = std::env::var("FIRECRAWL_API_URL").ok();
+        let saved_key = std::env::var("FIRECRAWL_API_KEY").ok();
+        let root = temp_project();
+        let ok_body = r#"{"success":true,"data":{"web":[{"url":"https://a.example","title":"A","description":"alpha  beta","position":1}]}}"#;
+
+        // Keyless: no Authorization header leaves the process.
+        let (base, rx) = canned_firecrawl("200 OK", ok_body);
+        std::env::set_var("FIRECRAWL_API_URL", &base);
+        std::env::remove_var("FIRECRAWL_API_KEY");
+        let out = execute(
+            "web_search",
+            &json!({"query": "q", "limit": 3}),
+            &root,
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output, "1. A\n   https://a.example\n   alpha beta\n");
+        let request = rx.recv().unwrap();
+        assert!(!request.to_lowercase().contains("authorization:"), "{request}");
+        assert!(request.contains("\"query\":\"q\""));
+        assert!(request.contains("\"limit\":3"));
+
+        // Keyed: the same call carries the bearer token.
+        let (base, rx) = canned_firecrawl("200 OK", ok_body);
+        std::env::set_var("FIRECRAWL_API_URL", &base);
+        std::env::set_var("FIRECRAWL_API_KEY", "fc-test-key");
+        let out = execute(
+            "web_search",
+            &json!({"query": "q"}),
+            &root,
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        let request = rx.recv().unwrap();
+        assert!(
+            request.contains("authorization: Bearer fc-test-key")
+                || request.contains("Authorization: Bearer fc-test-key"),
+            "{request}"
+        );
+
+        // Rate limit: the error names the keyless tier and the upgrade path.
+        let (base, _rx) = canned_firecrawl("429 Too Many Requests", "{}");
+        std::env::set_var("FIRECRAWL_API_URL", &base);
+        std::env::remove_var("FIRECRAWL_API_KEY");
+        let out = execute(
+            "web_search",
+            &json!({"query": "q"}),
+            &root,
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("FIRECRAWL_API_KEY"), "{}", out.output);
+
+        // Provider-reported failure is surfaced verbatim, never invented.
+        let err_body = r#"{"success":false,"error":"query too long"}"#;
+        let (base, _rx) = canned_firecrawl("200 OK", err_body);
+        std::env::set_var("FIRECRAWL_API_URL", &base);
+        let out = execute(
+            "web_search",
+            &json!({"query": "q"}),
+            &root,
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("query too long"), "{}", out.output);
+
+        match saved_url {
+            Some(v) => std::env::set_var("FIRECRAWL_API_URL", v),
+            None => std::env::remove_var("FIRECRAWL_API_URL"),
+        }
+        match saved_key {
+            Some(v) => std::env::set_var("FIRECRAWL_API_KEY", v),
+            None => std::env::remove_var("FIRECRAWL_API_KEY"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn temp_project() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("openmax-tools-{}", uuid::Uuid::new_v4()));
