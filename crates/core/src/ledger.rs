@@ -564,7 +564,7 @@ fn sync_locked(
     }
     // Removals: paths the ledger knows as present that this generation lacks.
     for (path, last) in &known {
-        if last.is_some() && !seen.iter().any(|p| *p == path) {
+        if last.is_some() && !seen.contains(&path) {
             let record = Record {
                 v: RECORD_VERSION,
                 ts,
