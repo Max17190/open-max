@@ -64,6 +64,13 @@ pub struct RecallHit {
     pub score: f64,
     /// `memory` | `message` | `archive` | `digest`
     pub kind: &'static str,
+    /// Who produced the record: `user`, `assistant` or `tool` for a transcript
+    /// or archive hit, `None` for a store that has no speaker (a memory file,
+    /// a compaction digest). Without it every hit reads as "message" and a
+    /// prompt that restates the question is indistinguishable from the answer
+    /// to it - which is the ranking's hardest case and the reader's easiest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +121,8 @@ pub struct RecallReport {
 /// session title, or a memory file.
 struct Chunk {
     kind: &'static str,
+    /// The record's speaker, where the store has one. See `RecallHit::role`.
+    role: Option<String>,
     session: Option<String>,
     title: Option<String>,
     age_hours: u64,
@@ -679,6 +688,7 @@ fn collect_chunks(
             for page in pages(&text) {
                 chunks.push(Chunk {
                     kind: "memory",
+                    role: None,
                     session: None,
                     title: None,
                     age_hours: hours_since(now, ts),
@@ -753,6 +763,7 @@ fn collect_chunks(
             let source = sessions::compaction_display(core, &meta.id);
             chunks.push(Chunk {
                 kind: "digest",
+                    role: None,
                 session: Some(meta.id.clone()),
                 title: Some(meta.title.clone()),
                 age_hours: hours_since(now, record.ts),
@@ -782,6 +793,7 @@ fn collect_chunks(
             for page in pages(&content) {
                 chunks.push(Chunk {
                     kind: "message",
+                    role: Some(msg.role.clone()),
                     session: Some(meta.id.clone()),
                     title: Some(meta.title.clone()),
                     age_hours: age,
@@ -809,6 +821,7 @@ fn collect_chunks(
             for page in pages(&content) {
                 chunks.push(Chunk {
                     kind: "archive",
+                    role: Some(msg.role.clone()),
                     session: Some(meta.id.clone()),
                     title: Some(meta.title.clone()),
                     age_hours: age,
@@ -1089,6 +1102,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         hits.push(RecallHit {
             score,
             kind: chunk.kind,
+            role: chunk.role.clone(),
             line: chunk.line,
             session: chunk.session.clone(),
             title: chunk.title.clone(),
@@ -1190,10 +1204,17 @@ pub fn render(report: &RecallReport) -> String {
             Some(line) => format!("{}:{line}", hit.source),
             None => hit.source.clone(),
         };
+        // `message/user` rather than `message`: the reader decides whether a
+        // hit is the question or the answer to it before spending a read on
+        // the address.
+        let what = match &hit.role {
+            Some(role) => format!("{}/{role}", hit.kind),
+            None => hit.kind.to_string(),
+        };
         out.push_str(&format!(
-            "\n[{}] {} {} ({} ago) — {}\n    {}\n",
+            "\n[{}] {} {} ({} ago) - {}\n    {}\n",
             i + 1,
-            hit.kind,
+            what,
             who,
             age,
             address,
@@ -1478,12 +1499,18 @@ mod tests {
         assert!(std::path::Path::new(&memory.source).is_absolute(), "absolute, every store");
         assert!(jsonl.line.is_some(), "a JSONL record is cited path:line");
         assert!(memory.line.is_none(), "a memory file is its own record");
+        assert_eq!(jsonl.role.as_deref(), Some("user"), "a transcript hit names its speaker");
+        assert_eq!(memory.role, None, "a memory file has no speaker to name");
 
         let spec = crate::spec::render("recall").expect("recall is a documented surface");
         assert!(spec.contains("absolute path"), "the contract must say addresses are absolute");
         assert!(
             spec.contains("no line to give"),
             "the contract must say memory hits carry no line, or an agent will look for one"
+        );
+        assert!(
+            spec.contains("message/user"),
+            "the contract must show how a speaker renders, or the field is invisible"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1994,6 +2021,48 @@ mod tests {
             "the second source must appear despite the log's many matching pages: {:?}",
             report.hits
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_hit_says_whether_it_is_the_question_or_the_answer() {
+        // The real shape of the miss this exists for: a prompt that assigns
+        // the work and a reply that does it share the topic's words, so
+        // lexical ranking cannot separate them and the short prompt often
+        // wins. Ranking is not the fix - both records genuinely match - but
+        // the reader can act on the difference the moment it is labelled.
+        let (core, dir, project) = setup();
+        seed_session(
+            &core,
+            &project,
+            "audit",
+            vec![
+                ChatMessage::user("audit the renderer and report which files are hot paths"),
+                ChatMessage::assistant(
+                    Some(
+                        "the hot paths are src/draw.rs and src/layout.rs, both \
+                         re-highlighting on every frame"
+                            .to_string(),
+                    ),
+                    None,
+                ),
+                ChatMessage::tool("c1", "hot paths scan complete"),
+            ],
+        );
+        let report = recall(&core, &project, "hot paths k:20").unwrap();
+
+        let roles: Vec<_> = report.hits.iter().filter_map(|h| h.role.as_deref()).collect();
+        for expected in ["user", "assistant", "tool"] {
+            assert!(
+                roles.contains(&expected),
+                "every speaker must be reported, missing {expected}: {roles:?}"
+            );
+        }
+        // The distinction has to survive into what an agent actually reads,
+        // not just the JSON.
+        let text = render(&report);
+        assert!(text.contains("message/user"), "the rendered hit must name the speaker: {text}");
+        assert!(text.contains("message/assistant"), "and distinguish it from the reply: {text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
