@@ -41,6 +41,12 @@ enum Focus {
 }
 
 const TICK: Duration = Duration::from_millis(120);
+/// Faster tick for the silent wait before the first token, where the spinner
+/// and elapsed counter are the only signs of life. 50 ms reads as fluid
+/// animation; once content streams, paints follow the token cadence and the
+/// relaxed tick suffices. Draws in that state are tail-only and sub-ms, so
+/// the cost is a fraction of a percent of one core, and only while waiting.
+const WAIT_TICK: Duration = Duration::from_millis(50);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
 /// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
@@ -353,6 +359,7 @@ pub async fn run(
 
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick_period = TICK;
 
     // Paint pacing: at most one frame per MIN_DRAW_INTERVAL. A redraw that
     // arrives too early is deferred to `draw_deadline` and coalesced with
@@ -408,6 +415,14 @@ pub async fn run(
         }
         if app.should_quit {
             break;
+        }
+        // Animation cadence follows state; the interval is recreated only on
+        // transitions (turn start, first token, turn end), not per loop.
+        let desired_tick = app.tick_period();
+        if desired_tick != tick_period {
+            tick_period = desired_tick;
+            tick = tokio::time::interval(desired_tick);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
         if app.dirty.any() {
             let now = Instant::now();
@@ -2263,6 +2278,16 @@ impl App {
         self.running
     }
 
+    /// Animation cadence: fluid while the user has nothing but the spinner
+    /// to watch, relaxed once content is flowing or the app is idle.
+    fn tick_period(&self) -> Duration {
+        if self.running && self.first_token.is_none() {
+            WAIT_TICK
+        } else {
+            TICK
+        }
+    }
+
     async fn on_tick(&mut self) {
         self.tick_i += 1;
         if self.running {
@@ -2818,9 +2843,9 @@ impl App {
             self.tail_buf.push(tool_card::running_line(name, summary));
         }
         if self.running {
-            let elapsed = self.turn_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            let elapsed = self.turn_started.map(|t| t.elapsed()).unwrap_or_default();
             let toks = self.tok_per_sec();
-            let mut meta = format!(" {}s", elapsed);
+            let mut meta = format!(" {}", elapsed_label(elapsed));
             if toks > 0.0 {
                 meta.push_str(&format!(" · {toks:.0} tok/s"));
             }
@@ -2974,6 +2999,19 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
     ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),
 ];
+
+/// Elapsed-time label for the live tail: tenths below ten seconds so the
+/// silent wait visibly advances between whole seconds, whole seconds after.
+/// The boundary sits at exactly 10.0 so the display is monotonic: 9.9s,
+/// then 10.0s (the tenths branch rounds up), then 10s, never backward.
+fn elapsed_label(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}s", elapsed.as_secs())
+    }
+}
 
 fn help_line(key: &str, description: &str) -> Line<'static> {
     Line::from(vec![
@@ -3330,10 +3368,11 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
-        conversation_layout, header_path_line, help_line, home_shortened, kv,
+        conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         paint_text_selection, plural, rect_contains, save_model_selection, App, Dirty,
-        Focus, TermEvent, MIN_DRAW_INTERVAL,
+        Focus, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
+    use std::time::Duration;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use open_max_core::config;
     use open_max_core::state::Core;
@@ -3840,6 +3879,33 @@ mod tests {
         assert!(rendered.iter().any(|row| row.contains("second streamed line")));
         assert!(rendered.iter().any(|row| row.contains("esc to cancel")));
         assert!(rendered.last().unwrap().starts_with('╰'));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn elapsed_label_shows_tenths_only_while_short() {
+        assert_eq!(elapsed_label(Duration::from_millis(400)), "0.4s");
+        assert_eq!(elapsed_label(Duration::from_millis(3940)), "3.9s");
+        assert_eq!(elapsed_label(Duration::from_millis(9940)), "9.9s");
+        // Around the boundary the display must never move backward:
+        // 9.9s, 10.0s, 10s.
+        assert_eq!(elapsed_label(Duration::from_millis(9960)), "10.0s");
+        assert_eq!(elapsed_label(Duration::from_millis(10_400)), "10s");
+        assert_eq!(elapsed_label(Duration::from_secs(12)), "12s");
+    }
+
+    #[test]
+    fn tick_runs_fluid_only_during_the_pre_token_wait() {
+        let (mut app, dir) = app_fixture();
+        // Idle: relaxed cadence.
+        assert_eq!(app.tick_period(), TICK);
+        // Waiting on the model with nothing streamed yet: the spinner is
+        // the only sign of life, so animation runs fluid.
+        app.running = true;
+        assert_eq!(app.tick_period(), WAIT_TICK);
+        // Content is flowing: paints follow tokens, cadence relaxes.
+        app.first_token = Some(std::time::Instant::now());
+        assert_eq!(app.tick_period(), TICK);
         fs::remove_dir_all(dir).unwrap();
     }
 
