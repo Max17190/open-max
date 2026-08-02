@@ -1210,7 +1210,8 @@ pub fn render(report: &RecallReport) -> String {
             out.push_str(&format!(
                 "nothing matched: {filtered} selected none of what was searched. \
                  path: keeps history that touched a matching file path; \
-                 session: takes an id prefix. Drop the filter to search everything."
+                 session: takes an id prefix. Without it the search widens to \
+                 everything scanned."
             ));
         } else {
             out.push_str(
@@ -1500,6 +1501,10 @@ mod tests {
         assert!(text.contains("none of what was searched"), "scope the claim: {text}");
         assert!(!text.contains("try fewer or different terms"), "do not blame terms: {text}");
         assert!(!text.contains("Not searched"), "nothing was omitted here: {text}");
+        assert!(
+            !text.contains("search everything"),
+            "dropping the filter reaches what was scanned, not what the cap skipped: {text}"
+        );
 
         // Terms that match nothing still say so.
         let missing = recall(&core, &project, "zzzznotaword").unwrap();
