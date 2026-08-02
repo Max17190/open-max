@@ -664,9 +664,10 @@ impl Transcript {
         let i = self.selected?;
         let b = self.blocks.get(i)?;
         if let Some(out) = &b.full_output {
+            // Tool output is already the exact bytes; never transform it.
             return Some(out.clone());
         }
-        Some(lines_to_plain(&b.raw))
+        Some(strip_code_rails(&lines_to_plain(&b.raw)))
     }
 
     /// Plain text for scrollback find (user/assistant/tool/system).
@@ -824,7 +825,9 @@ impl Transcript {
             0
         };
         let range_end = if block == end.block {
-            end.offset
+            // Inclusive of the release cell, matching selected_text: the
+            // highlight must cover exactly what a copy would carry.
+            end.offset.saturating_add(1).min(block_len)
         } else {
             block_len
         };
@@ -857,13 +860,15 @@ impl Transcript {
                 0
             };
             let to = if block_index == end.block {
-                end.offset.min(char_len)
+                // Inclusive of the character under the release cell: a drag
+                // that ends ON the closing brace must copy the brace.
+                end.offset.saturating_add(1).min(char_len)
             } else {
                 char_len
             };
             parts.push(slice_chars(text, from, to));
         }
-        Some(parts.join("\n\n"))
+        Some(strip_code_rails(&parts.join("\n\n")))
     }
 
     /// Index of the nearest user block whose start is above `view_start_line`.
@@ -921,6 +926,16 @@ impl Transcript {
 
 fn line_is_blank(l: &Line<'_>) -> bool {
     l.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// The clipboard must carry exact bytes: rendered code lines carry a
+/// decorative fence gutter ("│ ") that would otherwise be pasted into the
+/// user's editor on every line.
+fn strip_code_rails(text: &str) -> String {
+    text.lines()
+        .map(|line| line.strip_prefix("│ ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn lines_to_plain(lines: &[Line<'static>]) -> String {
@@ -1290,6 +1305,46 @@ mod tests {
         t.set_width(24);
         let index = t.wrapped.len() - t.resolve_anchor(anchor);
         assert_eq!(t.line_block[index], block);
+    }
+
+    #[test]
+    fn copied_block_carries_no_fence_rails() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(crate::ui::markdown::render(
+            "Intro.\n\n```rust\nfn a() -> u32 { 1 }\nfn b() -> u32 { 2 }\n```\n\nOutro.",
+        ));
+        t.select_prev();
+        let copied = t.selected_copy_text().unwrap();
+        assert!(copied.contains("fn a() -> u32 { 1 }"), "{copied}");
+        assert!(copied.contains("Outro."));
+        assert!(!copied.contains('│'), "rail leaked into clipboard: {copied}");
+    }
+
+    #[test]
+    fn mouse_selection_is_release_inclusive_and_rail_free() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(crate::ui::markdown::render("```rust\nfn a() -> u32 { 1 }\n```"));
+        t.ensure_flat();
+        let li = text(&t.wrapped)
+            .iter()
+            .position(|l| l.contains("fn a"))
+            .unwrap();
+
+        // Drag from the first code character to the closing brace: the
+        // character under the release cell is part of the selection.
+        assert!(t.begin_text_selection_at(li, 2));
+        assert!(t.update_text_selection_at(li, 20));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().unwrap(), "fn a() -> u32 { 1 }");
+
+        // Drag from column zero: the fence rail is display chrome and must
+        // not reach the clipboard.
+        assert!(t.begin_text_selection_at(li, 0));
+        assert!(t.update_text_selection_at(li, 20));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().unwrap(), "fn a() -> u32 { 1 }");
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
@@ -1710,7 +1765,8 @@ mod tests {
         t.set_width(40);
         t.push_user(vec![Line::from("héllo world")]);
         assert!(t.begin_text_selection_at(0, 2));
-        assert!(t.update_text_selection_at(0, 7));
+        // Release ON the final 'o': the cell under the cursor is included.
+        assert!(t.update_text_selection_at(0, 6));
         t.finish_text_selection();
         assert_eq!(t.selected_text().as_deref(), Some("héllo"));
         assert_eq!(t.selection_columns(0), Some((2, 7)));
@@ -1723,7 +1779,8 @@ mod tests {
         t.push_user(vec![Line::from("alpha beta")]);
         t.push_assistant(vec![Line::from("gamma delta")]);
         assert!(t.begin_text_selection_at(0, 8));
-        assert!(t.update_text_selection_at(2, 5));
+        // Release ON the final 'a' of gamma; the release cell is included.
+        assert!(t.update_text_selection_at(2, 4));
         t.finish_text_selection();
         assert_eq!(t.selected_text().as_deref(), Some("beta\n\ngamma"));
         t.set_width(10);
