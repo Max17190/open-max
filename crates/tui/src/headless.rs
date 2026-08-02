@@ -194,7 +194,7 @@ async fn run_turn_events(
                 source_path,
                 source_sha,
             } => {
-                let mode = core.settings.lock().unwrap().approval_mode;
+                let mode = core.approval_mode();
                 // Unattended auto mode covers the ordinary mutating gate, but
                 // never the human boundary itself: the first run of
                 // capability content no human has approved always needs a

@@ -33,6 +33,17 @@ impl ApprovalMode {
             _ => None,
         }
     }
+
+    /// The next mode when cycling through all three, ordered by how much the
+    /// agent is allowed to do: readonly, ask, auto, and back. One source of
+    /// truth so a front end offering a cycle key cannot invent its own order.
+    pub fn next(self) -> Self {
+        match self {
+            ApprovalMode::Readonly => ApprovalMode::Ask,
+            ApprovalMode::Ask => ApprovalMode::Auto,
+            ApprovalMode::Auto => ApprovalMode::Readonly,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,6 +226,32 @@ mod tests {
         assert_eq!(s.approval_mode, ApprovalMode::Readonly);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""approval_mode":"readonly""#), "{json}");
+    }
+
+    /// Cycling has to reach every mode and come back, or a front end that
+    /// only offers the cycle key would strand the user in a subset of them.
+    #[test]
+    fn cycling_approval_modes_visits_each_one_and_returns() {
+        let start = ApprovalMode::Ask;
+        let mut seen = vec![start];
+        let mut mode = start;
+        for _ in 0..2 {
+            mode = mode.next();
+            assert!(!seen.contains(&mode), "cycle repeats before it closes");
+            seen.push(mode);
+        }
+        assert_eq!(mode.next(), start, "cycle does not close");
+        // Ordered by how much the agent may do, so the key reads as one
+        // direction rather than an arbitrary rotation.
+        assert_eq!(
+            seen,
+            vec![
+                ApprovalMode::Ask,
+                ApprovalMode::Auto,
+                ApprovalMode::Readonly
+            ],
+        );
+        assert_eq!(ApprovalMode::Readonly.next(), ApprovalMode::Ask);
     }
 
     #[test]

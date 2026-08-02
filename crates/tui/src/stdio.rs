@@ -215,6 +215,10 @@ async fn drive<W: Write>(
                                 match saved {
                                     Ok(()) => {
                                         core.settings.lock().unwrap().approval_mode = parsed;
+                                        // Any write to the persisted mode drops
+                                        // a run override, or the explicit choice
+                                        // would stay masked.
+                                        core.clear_run_approval_mode();
                                         emit(
                                             out,
                                             &serde_json::json!({

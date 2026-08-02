@@ -63,6 +63,10 @@ lossless record. The `compaction` hook observes each prune.
 permissions decide whether Open Max dispatches a tool call; they are not OS
 isolation.
 
+`/approvals auto|ask|readonly` writes the mode to `settings.json`. **Shift+Tab**
+cycles the three for the current run only, so a keystroke never widens what
+future sessions in the project may do.
+
 ## Multiple providers
 
 For several servers, define them in `~/.openmax/providers.json`. `/model` opens
