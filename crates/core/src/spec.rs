@@ -530,6 +530,13 @@ structured report. Every citation is an absolute path, whatever store it
 came from, so an address keeps working wherever it is resolved. Hits from
 a JSONL store also carry `line` (rendered `path:line`); memory hits carry
 no line, because the file is the record.
+
+A transcript or archive hit also names its speaker: `role` is `user`,
+`assistant` or `tool`, rendered after the kind as `message/user`. Memory
+files and compaction digests have no speaker and carry no role. Use it to
+tell a prompt that restates the question from the answer to it before
+spending a read on the address - lexical ranking cannot separate those two,
+because they are about the same thing in the same words.
 "#;
 
 const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)
