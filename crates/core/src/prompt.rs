@@ -613,9 +613,12 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
+        // Cap raised 5360 -> 5650 for web_search: 287 schema chars (~66
+        // tokens) buys zero-setup keyless grounding, paid once per session
+        // into a prefix the cache then reuses. Measured, not estimated.
         assert!(
-            total <= 5_360,
-            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5360 ≈ 1215 tokens with a typical checkout path)",
+            total <= 5_650,
+            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5650 ≈ 1299 tokens with a typical checkout path)",
         );
         let _ = std::fs::remove_dir_all(dir);
     }
