@@ -189,6 +189,11 @@ pub struct Transcript {
     selected: Option<usize>,
     text_selection: Option<TextSelection>,
     dirty: bool,
+    /// Full re-wraps performed (every block invalidated by a width change).
+    /// Oracle for the draw path's promise that steady-state frames never
+    /// re-wrap history.
+    #[cfg(test)]
+    pub(crate) rewraps: u64,
 }
 
 impl Transcript {
@@ -296,6 +301,10 @@ impl Transcript {
 
     pub fn set_width(&mut self, width: u16) {
         if width != self.width {
+            #[cfg(test)]
+            {
+                self.rewraps += 1;
+            }
             self.width = width;
             for b in &mut self.blocks {
                 b.invalidate();
