@@ -1537,7 +1537,7 @@ async fn run_loop(
             }
             guard.commit().await;
             report_hook_failures(
-                &core,
+                core,
                 session_id,
                 hooks.turn_end(session_id, project_root, "error").await,
             );
@@ -1556,7 +1556,7 @@ async fn run_loop(
     // (fresh session or a resume that only had its system prompt).
     if first_turn {
         report_hook_failures(
-            &core,
+            core,
             session_id,
             hooks.session_start(session_id, project_root, &cancelled).await,
         );
@@ -1616,7 +1616,7 @@ async fn run_loop(
                 if let Ok(value) = serde_json::to_value(&record) {
                     let failures =
                         hooks.compaction(session_id, project_root, &value, &cancelled).await;
-                    report_hook_failures(&core, session_id, failures);
+                    report_hook_failures(core, session_id, failures);
                 }
             }
         }
@@ -1969,7 +1969,7 @@ async fn run_loop(
                             &cancelled,
                         )
                         .await;
-                    report_hook_failures(&core, session_id, failures);
+                    report_hook_failures(core, session_id, failures);
                 }
 
                 if let Some(diff) = &outcome.diff {
@@ -2049,7 +2049,7 @@ async fn run_loop(
         crate::memory::record_accesses(project_root, &delta.memory);
     }
     report_hook_failures(
-        &core,
+        core,
         session_id,
         hooks.turn_end(session_id, project_root, &stop_reason).await,
     );
