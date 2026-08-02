@@ -27,6 +27,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The zero-warning baseline is only real if something checks it. It was
+      # set deliberately, then drifted back to three warnings because nothing
+      # did.
+      - name: Clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       - name: Skill script tests
         run: .agents/skills/delegate/scripts/test-openmax-tmux
 

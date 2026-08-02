@@ -1582,7 +1582,7 @@ mod tests {
     fn recall_reports_its_own_limits_instead_of_quietly_applying_them() {
         let (core, dir, project) = setup();
         seed_session(&core, &project, "long", vec![ChatMessage::user(
-            &"the quokka census figure appears here. ".repeat(200),
+            "the quokka census figure appears here. ".repeat(200),
         )]);
         std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
         std::fs::write(
