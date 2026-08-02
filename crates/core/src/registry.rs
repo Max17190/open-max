@@ -879,7 +879,7 @@ mutatng = true
     }
 
     #[test]
-    fn eight_builtins() {
+    fn seven_builtins() {
         let names = Registry::builtin_only().tool_names();
         assert_eq!(
             names,
@@ -891,7 +891,6 @@ mutatng = true
                 "glob",
                 "grep",
                 "bash",
-                "web_search",
             ]
         );
         assert!(!names.iter().any(|n| n == "task"));

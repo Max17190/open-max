@@ -2192,19 +2192,9 @@ impl App {
                         Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
                     )),
                     kv("  dest", &endpoint),
-                    kv("  web search", &{
-                        let base = open_max_core::tools::web_search_base();
-                        let host = extensions::endpoint_host(&base).unwrap_or(base);
-                        let auth = if open_max_core::tools::web_search_has_key() {
-                            "api key"
-                        } else {
-                            "keyless"
-                        };
-                        format!("{host} · {auth} · only when the model calls web_search")
-                    }),
                     kv(
                         "  privacy",
-                        "no telemetry · sessions stay local · web_search sends only the query · external tools may use the network",
+                        "no telemetry · sessions stay local · external tools may use the network",
                     ),
                 ];
                 self.transcript.push(block);
