@@ -459,7 +459,7 @@ pub fn list(core: &Core, project: &str) -> Vec<SessionMeta> {
         .into_iter()
         .filter(|m| m.project == project)
         .collect();
-    metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
     metas
 }
 

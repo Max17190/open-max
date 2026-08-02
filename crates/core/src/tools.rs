@@ -682,7 +682,7 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
             hits.push((mtime, rel));
         }
     }
-    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.sort_by_key(|h| std::cmp::Reverse(h.0));
     let total = hits.len();
     let listed: Vec<String> = hits.into_iter().take(MAX_RESULTS).map(|(_, p)| p).collect();
     if listed.is_empty() {

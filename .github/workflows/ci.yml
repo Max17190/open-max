@@ -30,9 +30,20 @@ jobs:
       # The zero-warning baseline is only real if something checks it. It was
       # set deliberately, then drifted back to three warnings because nothing
       # did.
+      #
+      # Pinned, unlike the test toolchain above: clippy adds lints in every
+      # release, so a floating `stable` here fails an unrelated PR on the day
+      # Rust ships, and the author who has to fix it is whoever pushed next.
+      # Bumping this is a deliberate commit that carries its own fixes.
+      - name: Clippy toolchain
+        if: matrix.os == 'ubuntu-latest'
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Skill script tests
         run: .agents/skills/delegate/scripts/test-openmax-tmux
