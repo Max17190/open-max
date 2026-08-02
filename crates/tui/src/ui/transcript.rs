@@ -432,6 +432,23 @@ impl Transcript {
         self.selected = None;
     }
 
+    /// Shift a scrolled-up offset by the live-tail line delta so the visible
+    /// content stays stationary. The offset is measured from the bottom, so
+    /// a growing tail would otherwise drag the view forward line by line
+    /// while the reader is anchored on older content, and a collapsing tail
+    /// (cancel, message done) would fling the view to the top once the stale
+    /// offset hits the clamp. No-op while following.
+    pub fn compensate_tail_delta(&mut self, delta: isize) {
+        if self.offset == 0 || delta == 0 {
+            return;
+        }
+        if delta > 0 {
+            self.offset = self.offset.saturating_add(delta as usize);
+        } else {
+            self.offset = self.offset.saturating_sub(delta.unsigned_abs());
+        }
+    }
+
     pub fn clamp_offset(&mut self, max: usize) {
         self.offset = self.offset.min(max);
     }
