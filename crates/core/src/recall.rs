@@ -101,6 +101,11 @@ pub struct RecallReport {
     /// cannot tell a policy limit from the shape of its own data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub clamped: Vec<Clamp>,
+    /// Chunks that survived `path:`/`session:` filtering. Zero with filters
+    /// present means the filters emptied the corpus, which is a different
+    /// failure from terms that matched nothing - and pointing at the terms
+    /// sends the reader to fix the half that was working.
+    pub candidates: usize,
     pub bytes_scanned: usize,
     pub elapsed_ms: u128,
 }
@@ -1103,9 +1108,20 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         sessions_skipped: skipped,
         sessions_unreadable: unreadable,
         clamped: query.clamped.clone(),
+        candidates,
         bytes_scanned: bytes,
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+/// The filter words of a query, for an error that names what excluded the
+/// corpus rather than blaming the search terms.
+fn filters_in(query: &str) -> String {
+    let parts: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| w.starts_with("path:") || w.starts_with("session:"))
+        .collect();
+    parts.join(" ")
 }
 
 /// Human rendering: one block per hit, provenance first, numbers in the
@@ -1182,7 +1198,40 @@ pub fn render(report: &RecallReport) -> String {
         ));
     }
     if report.hits.is_empty() {
-        out.push_str("nothing matched; try fewer or different terms, or read the addresses under ~/.openmax/sessions\n");
+        // Two separate facts, never one guess. Emptiness has several
+        // independent causes - a filter that matched nothing, terms that
+        // matched nothing, history that could not be opened, history past
+        // the scan cap - and earlier versions of this message picked one and
+        // asserted it. Each time the guess was wrong for a corpus somebody
+        // could construct. So: say what the search found nothing in, then say
+        // what was not searched, and let those be true separately.
+        let filtered = filters_in(&report.query);
+        if report.candidates == 0 && !filtered.is_empty() {
+            out.push_str(&format!(
+                "nothing matched: {filtered} selected none of what was searched. \
+                 path: keeps history that touched a matching file path; \
+                 session: takes an id prefix. Without it the search widens to \
+                 everything scanned."
+            ));
+        } else {
+            out.push_str(
+                "nothing matched; try fewer or different terms, or read the addresses \
+                 under ~/.openmax/sessions",
+            );
+        }
+        // Whatever the reason, anything the scan did not reach is disclosed -
+        // the answer may be sitting in it.
+        let mut omitted = Vec::new();
+        if report.sessions_unreadable > 0 {
+            omitted.push(format!("{} listed but unreadable", report.sessions_unreadable));
+        }
+        if report.sessions_skipped > 0 {
+            omitted.push(format!("{} past the scan cap", report.sessions_skipped));
+        }
+        if !omitted.is_empty() {
+            out.push_str(&format!(" Not searched: {}.", omitted.join(", ")));
+        }
+        out.push('\n');
     }
     out
 }
@@ -1395,6 +1444,110 @@ mod tests {
     /// cap from the end of a record, cannot resolve an address whose base it
     /// was never told, and will raise limits in a loop if told that is how to
     /// read one record whole. All three were measured on the real store.
+    /// An empty result states two separate facts and guesses at neither:
+    /// what the search found nothing in, and what it never reached. Every
+    /// earlier version of this message picked a single cause and asserted it,
+    /// and each guess was wrong for some corpus - a filter blamed for an
+    /// unreadable store, an unreadable store declared when memory was
+    /// searchable, a filter blamed for sessions past the scan cap.
+    /// The contract is read by agents that cannot check it against the code,
+    /// so it has to be checked here instead. Every claim below was wrong at
+    /// some point in this stack: citations went absolute while the spec still
+    /// said relative, and the spec promised `path:line` for every hit after
+    /// memory files stopped having a line to give.
+    #[test]
+    fn the_recall_contract_describes_what_recall_actually_returns() {
+        let (core, dir, project) = setup();
+        seed_session(&core, &project, "work", vec![ChatMessage::user("wombat protocol")]);
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        std::fs::write(
+            project.join(crate::memory::MEMORY_DIR).join("fact.md"),
+            "# the wombat protocol is documented here\n",
+        )
+        .unwrap();
+
+        let report = recall(&core, &project, "wombat k:20").unwrap();
+        let jsonl = report.hits.iter().find(|h| h.kind == "message").expect("a JSONL hit");
+        let memory = report.hits.iter().find(|h| h.kind == "memory").expect("a memory hit");
+
+        // What the contract promises, asserted against what recall returns.
+        assert!(std::path::Path::new(&jsonl.source).is_absolute(), "absolute, every store");
+        assert!(std::path::Path::new(&memory.source).is_absolute(), "absolute, every store");
+        assert!(jsonl.line.is_some(), "a JSONL record is cited path:line");
+        assert!(memory.line.is_none(), "a memory file is its own record");
+
+        let spec = crate::spec::render("recall").expect("recall is a documented surface");
+        assert!(spec.contains("absolute path"), "the contract must say addresses are absolute");
+        assert!(
+            spec.contains("no line to give"),
+            "the contract must say memory hits carry no line, or an agent will look for one"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_empty_result_states_what_was_searched_and_what_was_not() {
+        let (core, dir, project) = setup();
+        let only = seed_session(&core, &project, "work", vec![ChatMessage::user(
+            "the marmot telemetry pipeline was rewired",
+        )]);
+
+        // A filter that kept nothing names itself, scoped to what was searched.
+        let filtered = recall(&core, &project, "marmot path:src/nowhere").unwrap();
+        assert!(filtered.hits.is_empty());
+        assert_eq!(filtered.candidates, 0);
+        let text = render(&filtered);
+        assert!(text.contains("path:src/nowhere"), "name the filter: {text}");
+        assert!(text.contains("none of what was searched"), "scope the claim: {text}");
+        assert!(!text.contains("try fewer or different terms"), "do not blame terms: {text}");
+        assert!(!text.contains("Not searched"), "nothing was omitted here: {text}");
+        assert!(
+            !text.contains("search everything"),
+            "dropping the filter reaches what was scanned, not what the cap skipped: {text}"
+        );
+
+        // Terms that match nothing still say so.
+        let missing = recall(&core, &project, "zzzznotaword").unwrap();
+        assert!(missing.candidates > 0, "the corpus was searchable");
+        assert!(render(&missing).contains("try fewer or different terms"));
+
+        // Anything the scan could not reach is disclosed, whichever branch ran.
+        let ghost = seed_session(&core, &project, "ghost", vec![ChatMessage::user("marmot")]);
+        for path in [
+            sessions::messages_display(&core, &ghost),
+            sessions::archive_display(&core, &ghost),
+            sessions::compaction_display(&core, &ghost),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        for query in ["marmot path:src/nowhere", "zzzznotaword"] {
+            let report = recall(&core, &project, query).unwrap();
+            let text = render(&report);
+            assert!(
+                text.contains("Not searched: 1 listed but unreadable"),
+                "{query} must own what it skipped: {text}"
+            );
+        }
+
+        // Memory is searchable even with every session gone, so an unopenable
+        // session set must not be reported as the whole corpus failing.
+        let _ = std::fs::remove_file(sessions::messages_display(&core, &only));
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        std::fs::write(
+            project.join(crate::memory::MEMORY_DIR).join("fact.md"),
+            "# the marmot pipeline is documented here\n",
+        )
+        .unwrap();
+        let memory_only = recall(&core, &project, "zzzznotaword").unwrap();
+        assert_eq!(memory_only.sessions_scanned, 0, "no session could be opened");
+        assert!(memory_only.candidates > 0, "but memory was searched");
+        assert!(
+            render(&memory_only).contains("try fewer or different terms"),
+            "readable memory means the terms really did miss"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn recall_reports_its_own_limits_instead_of_quietly_applying_them() {
         let (core, dir, project) = setup();

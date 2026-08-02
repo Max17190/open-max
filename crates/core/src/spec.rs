@@ -10,7 +10,7 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 9] = [
+pub const SURFACES: [&str; 10] = [
     "tools",
     "skills",
     "prompts",
@@ -18,6 +18,7 @@ pub const SURFACES: [&str; 9] = [
     "permissions",
     "providers",
     "memory",
+    "recall",
     "stdio",
     "usage",
 ];
@@ -32,6 +33,7 @@ pub fn render(surface: &str) -> Option<&'static str> {
         "permissions" => Some(PERMISSIONS),
         "providers" => Some(PROVIDERS),
         "memory" => Some(MEMORY),
+        "recall" => Some(RECALL),
         "stdio" => Some(STDIO),
         _ => None,
     }
@@ -479,15 +481,23 @@ enters the index from the next session. Verify what you wrote with
 `openmax --check` (it names every ignored file and why, and what the index
 currently shows).
 
-## Recall
+## Searching what was kept
+
+`openmax --spec recall` documents the search over this project's own history.
+"#;
+
+const RECALL: &str = r#"# Recall
 
 `openmax --recall "<query>"` (run it with bash) searches this project's own
-history - session transcripts, compaction archives, compaction digests,
-session titles, and memory files - and prints ranked excerpts, each citing
-the file that holds the full record. Read-only and project-scoped: no
-session, no endpoint, no derived index. The stores on disk are scanned
-directly, newest sessions first, up to a 64 MB ceiling; anything skipped is
-counted in the report, never silent.
+history - session transcripts, compaction archives, compaction digests, and
+memory files - and prints ranked excerpts, each citing an absolute path.
+A record inside a JSONL store is cited `path:line`, so `sed -n '<line>p'`
+reads it back exactly and `head -c` bounds how much; a memory file is its
+own record and is cited as a bare path, with no line to give.
+
+Read-only and project-scoped: no session, no endpoint, no derived index.
+The stores on disk are scanned directly, newest sessions first, up to a
+64 MB ceiling; anything skipped is counted in the report, never silent.
 
 Query syntax: plain terms, plus
 - `path:<substr>`: keep only history that touched a matching file path
@@ -499,7 +509,7 @@ Query syntax: plain terms, plus
 - `budget:<tokens>`: output token cap (default 2000, max 20000).
 - `excerpt:<chars>`: excerpt window width (default 480, 120-1200). One page
   is the largest excerpt; ask for more and the report says it was capped.
-  Read a hit's `path:line` address for the whole record.
+  Read a hit's cited address for the whole record.
 
 Ranking is BM25 lexical relevance with recency as a damped tiebreaker
 (0.25 x the memory index's `age_hours^-0.5` law): relevance dominates at any
@@ -516,8 +526,10 @@ is honest by construction: matches past k:/budget: are counted, sessions
 skipped past the scan cap are counted, index entries whose files are gone
 are counted unreadable, and a session index that exists but cannot be
 parsed is a loud error, never an empty result. `--json` emits the
-structured report. Session citations are absolute paths (reach them with
-bash); memory citations are project-relative (reach them with read_file).
+structured report. Every citation is an absolute path, whatever store it
+came from, so an address keeps working wherever it is resolved. Hits from
+a JSONL store also carry `line` (rendered `path:line`); memory hits carry
+no line, because the file is the record.
 "#;
 
 const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)
