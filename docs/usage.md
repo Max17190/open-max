@@ -49,8 +49,10 @@ and one openmax driving another (see the `delegate` skill). It is specified in
 | **Enter** | Send (queues if the agent is busy) |
 | **/** | Slash commands · **Tab** or **Enter** completes |
 | **@** | Mention a project file |
-| Mouse drag | Select transcript text |
-| **y** or **Ctrl+Shift+C** | Copy selected text |
+| Mouse drag | Select transcript or prompt text |
+| **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
+| Click in the prompt | Put the cursor there in a wrapped draft |
+| Wheel | Scroll the conversation · over the prompt, a long draft |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** twice | Quit |
 

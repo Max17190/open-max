@@ -278,10 +278,11 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(close) = find(&chars, i + 1, "`") {
                 flush(&mut buf, &mut spans);
                 let code: String = chars[i + 1..close].iter().collect();
-                spans.push(Span::styled(
-                    code,
-                    base.fg(theme::CODE()).add_modifier(Modifier::REVERSED),
-                ));
+                // Colour only. Reverse video paints a filled block behind
+                // every `--flag` and `PLAN.md`, which reads as a heavier
+                // emphasis than the prose it is quoted inside and breaks up
+                // a paragraph you are trying to read straight through.
+                spans.push(Span::styled(code, base.fg(theme::CODE())));
                 i = close + 1;
                 continue;
             }
@@ -359,14 +360,35 @@ mod tests {
     fn inline_styles_do_not_lose_text() {
         let lines = render("mix of `code`, **bold**, *italic*, and plain");
         assert_eq!(plain(&lines)[0], "mix of code, bold, italic, and plain");
-        assert!(lines[0]
+        let code = lines[0]
             .spans
             .iter()
             .find(|span| span.content == "code")
-            .unwrap()
-            .style
-            .add_modifier
-            .contains(Modifier::REVERSED));
+            .unwrap();
+        assert_eq!(code.style.fg, Some(theme::CODE()));
+        assert!(code.style.bg.is_none());
+    }
+
+    /// Inline code is quoted inside prose, so it must never carry a heavier
+    /// weight than the emphasis markers around it: no reverse-video plate, no
+    /// bold. Colour alone separates it from the surrounding text.
+    #[test]
+    fn inline_code_is_lighter_than_the_prose_it_sits_in() {
+        let lines = render("run `--recall` before reading `PLAN.md`");
+        for name in ["--recall", "PLAN.md"] {
+            let span = lines[0]
+                .spans
+                .iter()
+                .find(|span| span.content == name)
+                .unwrap_or_else(|| panic!("no span for {name}"));
+            assert!(
+                !span.style.add_modifier.intersects(
+                    Modifier::REVERSED | Modifier::BOLD | Modifier::UNDERLINED
+                ),
+                "{name} carries heavy emphasis: {:?}",
+                span.style,
+            );
+        }
     }
 
     #[test]

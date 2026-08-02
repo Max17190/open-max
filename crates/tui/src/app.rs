@@ -312,6 +312,9 @@ pub struct App {
     /// Absolute transcript line for each rendered row in `chat_buf`.
     chat_line_map: Vec<Option<usize>>,
     chat_draw_area: Rect,
+    /// Where the composer text last painted, so the wheel and the mouse can
+    /// tell the prompt apart from the conversation above it.
+    composer_draw_area: Rect,
     /// Whether the previous frame reserved the right-hand scrollbar column.
     /// Sticky so a steadily overflowing transcript wraps at one width per
     /// frame instead of re-deciding (and re-wrapping all history twice) on
@@ -528,6 +531,7 @@ impl App {
             hist_reuse_key: None,
             chat_line_map: Vec::new(),
             chat_draw_area: Rect::default(),
+            composer_draw_area: Rect::default(),
             scrollbar_reserved: false,
             last_tail_len: 0,
             last_content_w: 0,
@@ -651,6 +655,7 @@ impl App {
         self.hist_reuse_key = None;
         self.chat_line_map.clear();
         self.chat_draw_area = Rect::default();
+        self.composer_draw_area = Rect::default();
         self.scrollbar_reserved = false;
         self.last_tail_len = 0;
         self.last_content_w = 0;
@@ -689,10 +694,21 @@ impl App {
                                 .position(|hit| hit.is_some_and(|rect| rect_contains(rect, m.column, m.row)))
                             {
                                 self.respond_approval_choice(choice);
+                            } else if let Some((cell, row)) =
+                                self.composer_position(m.column, m.row)
+                            {
+                                let area = self.composer_draw_area;
+                                self.focus = Focus::Composer;
+                                self.transcript.clear_text_selection();
+                                self.transcript.clear_selection();
+                                self.composer.click_at(area.width, area.height, cell, row);
+                                self.dirty.mark_chrome();
+                                self.dirty.mark_selection();
                             } else if let Some((line, x)) =
                                 self.transcript_position(m.column, m.row)
                             {
                                 self.focus = Focus::Scrollback;
+                                self.composer.clear_selection();
                                 self.transcript.begin_text_selection_at(line, x);
                                 self.dirty.mark_selection();
                             } else {
@@ -701,7 +717,12 @@ impl App {
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
-                            if let Some((line, x)) =
+                            if self.composer.is_dragging() {
+                                let area = self.composer_draw_area;
+                                let (cell, row) = self.composer_drag_target(m.column, m.row);
+                                self.composer.drag_to(area.width, area.height, cell, row);
+                                self.dirty.mark_chrome();
+                            } else if let Some((line, x)) =
                                 self.transcript_position(m.column, m.row)
                             {
                                 self.transcript.update_text_selection_at(line, x);
@@ -709,21 +730,38 @@ impl App {
                             }
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
-                            if let Some((line, x)) =
-                                self.transcript_position(m.column, m.row)
-                            {
-                                self.transcript.update_text_selection_at(line, x);
+                            if self.composer.is_dragging() {
+                                self.composer.finish_selection();
+                                self.dirty.mark_chrome();
+                            } else {
+                                if let Some((line, x)) =
+                                    self.transcript_position(m.column, m.row)
+                                {
+                                    self.transcript.update_text_selection_at(line, x);
+                                }
+                                self.transcript.finish_text_selection();
+                                self.dirty.mark_selection();
                             }
-                            self.transcript.finish_text_selection();
-                            self.dirty.mark_selection();
                         }
                         MouseEventKind::ScrollUp => {
-                            self.transcript.scroll_up(WHEEL_LINES);
-                            self.dirty.mark_chat();
+                            if self.composer_position(m.column, m.row).is_some() {
+                                let area = self.composer_draw_area;
+                                self.composer.scroll_by(area.width, area.height, -1);
+                                self.dirty.mark_chrome();
+                            } else {
+                                self.transcript.scroll_up(WHEEL_LINES);
+                                self.dirty.mark_chat();
+                            }
                         }
                         MouseEventKind::ScrollDown => {
-                            self.transcript.scroll_down(WHEEL_LINES);
-                            self.dirty.mark_chat();
+                            if self.composer_position(m.column, m.row).is_some() {
+                                let area = self.composer_draw_area;
+                                self.composer.scroll_by(area.width, area.height, 1);
+                                self.dirty.mark_chrome();
+                            } else {
+                                self.transcript.scroll_down(WHEEL_LINES);
+                                self.dirty.mark_chat();
+                            }
                         }
                         _ => {}
                     }
@@ -737,19 +775,33 @@ impl App {
 
     async fn on_key(&mut self, key: KeyEvent) -> std::io::Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-            let _ = self.copy_text_selection();
-            return Ok(());
-        }
-        if key.code == KeyCode::Esc && self.transcript.clear_text_selection() {
+        // Non-short-circuiting `|`: Esc clears both selections, not whichever
+        // one happens to be checked first.
+        if key.code == KeyCode::Esc
+            && (self.composer.clear_selection() | self.transcript.clear_text_selection())
+        {
+            self.dirty.mark_chrome();
             self.dirty.mark_selection();
             return Ok(());
         }
 
-        // Ctrl+C: cancel a running turn, otherwise quit on the second press.
+        // Ctrl+C copies a live selection, then cancels a running turn, and
+        // quits on the second press. Ctrl+Shift+C is indistinguishable from
+        // Ctrl+C unless the terminal speaks the kitty keyboard protocol, so
+        // copy cannot hang off the shift alone: the selection is what makes
+        // the press mean copy. Copying drops it, so the next press cancels.
         if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            if self.copy_selection() {
+                self.quit_armed = false;
+                return Ok(());
+            }
+            // On a terminal that does report the shift, Ctrl+Shift+C is a
+            // distinct key that has only ever meant copy. With nothing
+            // selected it stays a no-op instead of becoming the quit binding.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                return Ok(());
+            }
             if self.running {
                 if let Some(id) = &self.session_id {
                     self.core.cancel(id);
@@ -1048,6 +1100,33 @@ impl App {
         Ok(())
     }
 
+    /// Cell and row of `(column, row)` inside the composer text area, or
+    /// `None` when the pointer is anywhere else (including its border).
+    fn composer_position(&self, column: u16, row: u16) -> Option<(u16, u16)> {
+        if !rect_contains(self.composer_draw_area, column, row) {
+            return None;
+        }
+        Some((
+            column - self.composer_draw_area.x,
+            row - self.composer_draw_area.y,
+        ))
+    }
+
+    /// Drag target clamped into the composer, so a selection started in the
+    /// prompt keeps tracking the pointer once it leaves the box.
+    fn composer_drag_target(&self, column: u16, row: u16) -> (u16, u16) {
+        let area = self.composer_draw_area;
+        let cell = column
+            .max(area.x)
+            .min(area.right().saturating_sub(1))
+            .saturating_sub(area.x);
+        let row = row
+            .max(area.y)
+            .min(area.bottom().saturating_sub(1))
+            .saturating_sub(area.y);
+        (cell, row)
+    }
+
     fn transcript_position(&self, column: u16, row: u16) -> Option<(usize, usize)> {
         if !rect_contains(self.chat_draw_area, column, row) {
             return None;
@@ -1058,16 +1137,36 @@ impl App {
         Some((line, x))
     }
 
+    /// Copy whichever text selection is live, prompt first. Returns false when
+    /// nothing is selected, so the caller can fall through to its own binding.
+    fn copy_selection(&mut self) -> bool {
+        if let Some(text) = self.composer.selected_text() {
+            self.composer.clear_selection();
+            self.dirty.mark_chrome();
+            self.note_copied(&text);
+            return true;
+        }
+        self.copy_text_selection()
+    }
+
     fn copy_text_selection(&mut self) -> bool {
         let Some(text) = self.transcript.selected_text() else {
             return false;
         };
-        if clipboard::copy_text(&text) {
+        // Dropping the highlight is what keeps a selection from swallowing
+        // the next Ctrl+C: press once to copy, again to cancel or quit.
+        self.transcript.clear_text_selection();
+        self.dirty.mark_selection();
+        self.note_copied(&text);
+        true
+    }
+
+    fn note_copied(&mut self, text: &str) {
+        if clipboard::copy_text(text) {
             self.note("copied selection");
         } else {
             self.note("copy failed (terminal may block OSC 52)");
         }
-        true
     }
 
     /// Approval hit regions use the fixed order allow once, allow for run,
@@ -2385,10 +2484,15 @@ impl App {
 
         // The composer and approval card share the bottom band. Approvals
         // temporarily own it instead of stacking more chrome.
+        // The composer soft-wraps inside its border, so how many rows it wants
+        // depends on the width it will get: the area less the two border cells.
         let desired_input_h = if self.pending_approval.is_some() {
             5
         } else {
-            self.composer.height().saturating_add(2).max(3)
+            self.composer
+                .height(area.width.saturating_sub(2))
+                .saturating_add(2)
+                .max(3)
         };
         let desired_queue_h = if self.queued.is_empty() {
             0
@@ -2473,6 +2577,7 @@ impl App {
             }
         }
 
+        self.composer_draw_area = Rect::default();
         if self.pending_approval.is_some() {
             self.draw_approval(frame, layout.input);
         } else if layout.input.height >= 3 {
@@ -2488,7 +2593,8 @@ impl App {
                 .style(Style::default().bg(theme::COMPOSER_BG()));
             let inner = block.inner(layout.input);
             block.render(layout.input, frame.buffer_mut());
-            let (composer_lines, cx, cy) = self.composer.render(inner.height);
+            let (composer_lines, cx, cy) = self.composer.render(inner.width, inner.height);
+            self.composer_draw_area = inner;
             Paragraph::new(composer_lines)
                 .style(Style::default().bg(theme::COMPOSER_BG()))
                 .render(inner, frame.buffer_mut());
@@ -2501,13 +2607,15 @@ impl App {
         } else if layout.input.height > 0 {
             // Below three rows a box has no interior. Keep the prompt usable
             // by dropping only the border and bottom-aligning its visible rows.
-            let (composer_lines, cx, cy) = self.composer.render(layout.input.height);
+            let (composer_lines, cx, cy) =
+                self.composer.render(layout.input.width, layout.input.height);
             let composer_h = (composer_lines.len() as u16).min(layout.input.height);
             let composer_area = Rect {
                 y: layout.input.bottom().saturating_sub(composer_h),
                 height: composer_h,
                 ..layout.input
             };
+            self.composer_draw_area = composer_area;
             Paragraph::new(composer_lines)
                 .style(Style::default().bg(theme::COMPOSER_BG()))
                 .render(composer_area, frame.buffer_mut());
@@ -2965,10 +3073,12 @@ impl App {
     }
 
     fn status_hint(&self) -> &'static str {
-        if self.transcript.has_text_selection() && self.focus == Focus::Scrollback {
+        if self.composer.has_selection() {
+            "ctrl+c copy selection · esc clear"
+        } else if self.transcript.has_text_selection() && self.focus == Focus::Scrollback {
             "y copy selection · esc clear"
         } else if self.transcript.has_text_selection() {
-            "ctrl+shift+c copy selection · esc clear"
+            "ctrl+c copy selection · esc clear"
         } else if self.pending_approval.is_some() {
             "y allow once · a allow for run · n deny"
         } else if self.history_search.is_some() {
@@ -3030,8 +3140,9 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("ctrl+f", "find in conversation"),
     ("n / N after find", "next or previous match in scrollback"),
     ("esc", "follow latest · cancel turn · return to composer"),
-    ("wheel · pgup/pgdn", "scroll the conversation"),
-    ("mouse drag", "select transcript text · y or ctrl+shift+c copies"),
+    ("wheel · pgup/pgdn", "scroll the conversation · over the prompt, the draft"),
+    ("click in the prompt", "put the cursor there in a wrapped draft"),
+    ("mouse drag", "select transcript or prompt text · y or ctrl+c copies"),
     ("ctrl+o / o", "expand the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
@@ -3411,7 +3522,9 @@ mod tests {
         Focus, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use open_max_core::config;
     use open_max_core::state::Core;
     use open_max_core::types::AgentEvent;
@@ -3743,6 +3856,27 @@ mod tests {
         assert_eq!(buffer[(7, 0)].bg, theme::USER_BG());
     }
 
+    /// The composer paints its own background, so a prompt selection has to
+    /// survive onto the real buffer, not just into the spans.
+    #[tokio::test]
+    async fn prompt_selection_changes_only_selected_composer_cells() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("hello world");
+        render_app(&mut app, 60, 24);
+        let area = app.composer_draw_area;
+        app.composer.click_at(area.width, area.height, 2, 0);
+        app.composer.drag_to(area.width, area.height, 7, 0);
+        app.composer.finish_selection();
+        let buffer = render_app(&mut app, 60, 24);
+
+        let row = area.y;
+        assert_eq!(buffer[(area.x + 1, row)].bg, theme::COMPOSER_BG());
+        assert_eq!(buffer[(area.x + 2, row)].bg, theme::SELECT());
+        assert_eq!(buffer[(area.x + 6, row)].bg, theme::SELECT());
+        assert_eq!(buffer[(area.x + 7, row)].bg, theme::COMPOSER_BG());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn retained_text_selection_does_not_swallow_composer_y() {
         let (mut app, dir) = app_fixture();
@@ -3759,6 +3893,144 @@ mod tests {
 
         assert_eq!(app.composer.text(), "y");
         assert!(app.transcript.has_text_selection());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> TermEvent {
+        TermEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Ctrl+Shift+C only reaches the app on terminals that speak the kitty
+    /// keyboard protocol; everywhere else it arrives as a plain Ctrl+C. A live
+    /// selection is what makes the press a copy, and copying clears it so the
+    /// press after it still cancels or quits.
+    #[tokio::test]
+    async fn ctrl_c_copies_a_live_selection_before_it_arms_quit() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("copy me please");
+        render_app(&mut app, 60, 24);
+        let area = app.composer_draw_area;
+        app.composer.click_at(area.width, area.height, 2, 0);
+        app.composer.drag_to(area.width, area.height, 6, 0);
+        app.composer.finish_selection();
+        assert_eq!(app.composer.selected_text().as_deref(), Some("copy"));
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_c).await.unwrap();
+        assert!(!app.composer.has_selection(), "copy left a stale highlight");
+        assert!(!app.quit_armed, "copying must not arm quit");
+
+        app.on_key(ctrl_c).await.unwrap();
+        assert!(app.quit_armed, "a copy must not disarm the quit binding");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Terminals that do report the shift send a distinct Ctrl+Shift+C, which
+    /// has only ever meant copy. With nothing selected it must stay a no-op.
+    #[tokio::test]
+    async fn ctrl_shift_c_never_becomes_the_quit_binding() {
+        let (mut app, dir) = app_fixture();
+
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .await
+        .unwrap();
+        assert!(!app.quit_armed);
+
+        // A plain Ctrl+C is still the cancel and quit binding.
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.quit_armed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_copies_a_transcript_selection_too() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(20);
+        app.transcript.push_user(vec![Line::from("selected text")]);
+        assert!(app.transcript.begin_text_selection_at(0, 2));
+        assert!(app.transcript.update_text_selection_at(0, 10));
+        app.transcript.finish_text_selection();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(!app.transcript.has_text_selection());
+        assert!(!app.quit_armed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The wheel belongs to whatever is under the pointer: a long draft
+    /// scrolls inside the prompt, the conversation scrolls above it.
+    #[tokio::test]
+    async fn the_wheel_scrolls_whichever_surface_is_under_the_pointer() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(58);
+        for i in 0..40 {
+            app.transcript.push_user(vec![Line::from(format!("turn {i}"))]);
+        }
+        let mut draft = String::new();
+        for i in 0..20 {
+            draft.push_str(&format!("line {i:02}\n"));
+        }
+        app.composer.load(&draft);
+        render_app(&mut app, 60, 24);
+
+        let prompt = app.composer_draw_area;
+        let first_visible = |app: &mut App| {
+            let area = app.composer_draw_area;
+            let (lines, _, _) = app.composer.render(area.width, area.height);
+            line_text(&lines[0])
+        };
+        let tail = first_visible(&mut app);
+
+        app.on_term_event(mouse(MouseEventKind::ScrollUp, prompt.x, prompt.y))
+            .await
+            .unwrap();
+        assert_ne!(first_visible(&mut app), tail, "the draft did not scroll");
+        assert_eq!(app.transcript.offset(), 0, "the conversation moved instead");
+
+        // Over the conversation the wheel goes back to the transcript.
+        let scrolled = first_visible(&mut app);
+        app.on_term_event(mouse(MouseEventKind::ScrollUp, 1, app.chat_draw_area.y))
+            .await
+            .unwrap();
+        assert!(app.transcript.offset() > 0, "the conversation did not scroll");
+        assert_eq!(first_visible(&mut app), scrolled, "the draft moved instead");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A click in the prompt is an edit gesture, not a transcript selection.
+    #[tokio::test]
+    async fn clicking_the_prompt_moves_the_cursor_and_takes_focus() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(58);
+        app.transcript.push_user(vec![Line::from("earlier turn")]);
+        app.composer.load("hello world");
+        app.focus = Focus::Scrollback;
+        render_app(&mut app, 60, 24);
+
+        let prompt = app.composer_draw_area;
+        app.on_term_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            prompt.x + 4,
+            prompt.y,
+        ))
+        .await
+        .unwrap();
+
+        assert!(app.focus == Focus::Composer);
+        assert_eq!(app.composer.cursor_context().1, 2);
+        assert!(!app.transcript.has_text_selection());
         fs::remove_dir_all(dir).unwrap();
     }
 
