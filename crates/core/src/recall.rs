@@ -1036,7 +1036,18 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         if per_doc.get(&chunk.doc).copied().unwrap_or(0) >= 2 {
             continue;
         }
-        let mut excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
+        let mut excerpt = if chunk.kind == "title" {
+            // A title is not quoted from the cited file - it lives in the
+            // session index - so presenting it as an excerpt invites an agent
+            // to grep the transcript for text that was never in it. Title
+            // suppression above means a title hit only survives when nothing
+            // else in that session matched, so say exactly that. The name
+            // itself is already in `title`, and the address still points at
+            // the session, which is the thing worth opening.
+            "matched this session's title; nothing inside the session matched".to_string()
+        } else {
+            excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars)
+        };
         if seen_excerpts.iter().any(|e| e == &excerpt) {
             continue;
         }
@@ -1395,6 +1406,27 @@ mod tests {
         let report = recall(&core, &project, "zebrafish k:20").unwrap();
         let mem = report.hits.iter().find(|h| h.kind == "memory").expect("memory hit");
         assert_eq!(mem.line, None, "the file is the record; a line would be noise");
+
+        // A title lives in the session index, not in the cited transcript, so
+        // it must not be served as if it were quoted from there.
+        let titled = seed_session(&core, &project, "quokka census plan", vec![
+            ChatMessage::user("body text mentioning nothing relevant"),
+        ]);
+        let report = recall(&core, &project, "quokka").unwrap();
+        let hit = report.hits.iter().find(|h| h.kind == "title").expect("a title hit");
+        assert_eq!(hit.session.as_deref(), Some(titled.as_str()));
+        assert_eq!(hit.title.as_deref(), Some("quokka census plan"), "the name is a field");
+        assert!(hit.line.is_none(), "there is no line to cite");
+        let cited = std::fs::read_to_string(&hit.source).unwrap();
+        assert!(
+            cited.contains(&hit.excerpt) || !cited.contains("quokka census plan"),
+            "whatever is shown as an excerpt must be findable at the address shown"
+        );
+        assert!(
+            !hit.excerpt.contains("quokka census plan"),
+            "the title must not be served as a quotation from a file that lacks it: {}",
+            hit.excerpt
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
