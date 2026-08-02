@@ -1,5 +1,9 @@
 //! The composer: a small multiline input with history. Enter submits;
 //! Shift+Enter (kitty protocol terminals) or Alt+Enter inserts a newline.
+//!
+//! Logical lines are the edit model; what you see is a soft-wrapped view of
+//! them. A draft longer than the box scrolls inside it, the wheel and the
+//! mouse reach every row, and dragging selects text for [`Composer::selected_text`].
 
 use std::path::PathBuf;
 
@@ -9,12 +13,32 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
+use crate::ui::text;
 
 const MAX_HISTORY: usize = 200;
+
+/// Cells the `❯ `/`… ` gutter takes from every rendered row.
+const GUTTER: usize = 2;
+
+/// Rows the composer may occupy before a draft starts scrolling inside it.
+const MAX_VISIBLE_ROWS: usize = 6;
+
+/// A cursor or selection endpoint as (logical line, char column).
+type Point = (usize, usize);
 
 pub enum ComposerAction {
     None,
     Submit(String),
+}
+
+/// One display row: a soft-wrapped slice `start..end` (char columns) of
+/// logical line `line`. `last` marks the row that ends the logical line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Row {
+    line: usize,
+    start: usize,
+    end: usize,
+    last: bool,
 }
 
 pub struct Composer {
@@ -22,6 +46,21 @@ pub struct Composer {
     /// Cursor as (row, char column).
     row: usize,
     col: usize,
+    /// First visible display row.
+    scroll: usize,
+    /// Whether the viewport tracks the cursor. The wheel detaches it; the
+    /// next edit or cursor move re-attaches, so typing is never lost offscreen.
+    follow: bool,
+    /// Mouse selection endpoints in logical coordinates; anchor may follow head.
+    selection: Option<(Point, Point)>,
+    /// Whether the mouse button is still down on that selection.
+    dragging: bool,
+    /// Ticks on every entry point that can change the text. Every mutation in
+    /// this type funnels through `on_edit`, so a wrap cached against a
+    /// generation cannot outlive the text it describes.
+    generation: u64,
+    /// Wrapped rows for one `(text width, generation)` pair.
+    wrap_cache: Option<(usize, u64, Vec<Row>)>,
     history: Vec<String>,
     hist_idx: Option<usize>,
     stash: String,
@@ -39,6 +78,12 @@ impl Composer {
             lines: vec![String::new()],
             row: 0,
             col: 0,
+            scroll: 0,
+            follow: true,
+            selection: None,
+            dragging: false,
+            generation: 0,
+            wrap_cache: None,
             history,
             hist_idx: None,
             stash: String::new(),
@@ -68,6 +113,7 @@ impl Composer {
     /// Replace `len` chars starting at char index `start` in the current row
     /// and leave the cursor after the replacement. Used to accept completions.
     pub fn replace_token(&mut self, start: usize, len: usize, replacement: &str) {
+        self.on_edit();
         let line = &mut self.lines[self.row];
         let from = char_to_byte(line, start);
         let to = char_to_byte(line, start + len);
@@ -93,11 +139,15 @@ impl Composer {
         text
     }
 
-    pub fn height(&self) -> u16 {
-        self.lines.len().min(6) as u16
+    /// Rows the draft needs at `width` cells, capped so the composer never
+    /// eats the conversation. `width` is the full render width, gutter included.
+    pub fn height(&mut self, width: u16) -> u16 {
+        self.ensure_rows(text_width(width));
+        self.cached_rows().len().clamp(1, MAX_VISIBLE_ROWS) as u16
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.on_edit();
         for c in s.chars() {
             if c == '\n' {
                 self.newline();
@@ -105,6 +155,15 @@ impl Composer {
                 self.insert_char(c);
             }
         }
+    }
+
+    /// Any edit or cursor move drops the mouse selection and re-attaches the
+    /// viewport to the cursor.
+    fn on_edit(&mut self) {
+        self.selection = None;
+        self.dragging = false;
+        self.follow = true;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn insert_char(&mut self, c: char) {
@@ -127,7 +186,9 @@ impl Composer {
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
+        self.scroll = 0;
         self.hist_idx = None;
+        self.on_edit();
     }
 
     fn set_text(&mut self, text: &str) {
@@ -137,9 +198,12 @@ impl Composer {
         }
         self.row = self.lines.len() - 1;
         self.col = self.lines[self.row].chars().count();
+        self.scroll = 0;
+        self.on_edit();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
+        self.on_edit();
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -319,17 +383,101 @@ impl Composer {
         }
     }
 
-    /// Lines to draw plus the cursor position (x, y) within them. `max_h` is
-    /// the height actually granted by the caller, which can be smaller than
-    /// `height()` on tiny terminals.
-    pub fn render(&self, max_h: u16) -> (Vec<Line<'static>>, u16, u16) {
+    // ---------- display layout ----------
+
+    /// Cache the wrap for `text_width`, reusing it while the text and width
+    /// hold. Wrapping is O(draft), and a frame asks for it twice; a 100 KB
+    /// paste costs about 3 ms to wrap, so recomputing it per paint would put
+    /// the composer alone over the whole frame budget.
+    fn ensure_rows(&mut self, text_width: usize) {
+        let fresh = self
+            .wrap_cache
+            .as_ref()
+            .is_some_and(|(w, rev, _)| *w == text_width && *rev == self.generation);
+        if !fresh {
+            let rows = self.wrap(text_width);
+            self.wrap_cache = Some((text_width, self.generation, rows));
+        }
+        // Release test runs (the measurement path) skip this; every ordinary
+        // debug test run pays for it.
+        #[cfg(all(test, debug_assertions))]
+        {
+            // Prove the generation actually covers every mutation instead of
+            // trusting that it does.
+            assert_eq!(
+                self.cached_rows(),
+                self.wrap(text_width).as_slice(),
+                "composer wrap cache went stale",
+            );
+        }
+    }
+
+    fn cached_rows(&self) -> &[Row] {
+        self.wrap_cache
+            .as_ref()
+            .map(|(_, _, rows)| rows.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Soft-wrap every logical line into display rows at `text_width` cells.
+    fn wrap(&self, text_width: usize) -> Vec<Row> {
         let mut out = Vec::new();
-        // Show the last rows that fit the height budget, sliding up when the
-        // cursor moves into rows that would otherwise be scrolled out.
-        let visible = (self.height().min(max_h.max(1))) as usize;
-        let first = self.lines.len().saturating_sub(visible).min(self.row);
-        for (i, line) in self.lines.iter().enumerate().skip(first).take(visible) {
-            let prefix = if i == 0 {
+        for (line, text) in self.lines.iter().enumerate() {
+            let cols = wrap_cols(text, text_width);
+            let last = cols.len() - 1;
+            out.extend(cols.into_iter().enumerate().map(|(i, (start, end))| Row {
+                line,
+                start,
+                end,
+                last: i == last,
+            }));
+        }
+        out
+    }
+
+    /// Display row holding the cursor. A wrap point belongs to the row that
+    /// starts there, so typing at a boundary shows up where the text will land.
+    fn cursor_row(&self, rows: &[Row]) -> usize {
+        rows.iter()
+            .position(|r| {
+                r.line == self.row
+                    && self.col >= r.start
+                    && (self.col < r.end || (r.last && self.col <= r.end))
+            })
+            .unwrap_or_else(|| rows.len().saturating_sub(1))
+    }
+
+    /// Rows shown at once: the granted height, never more than the cap.
+    fn visible(rows: usize, max_h: u16) -> usize {
+        rows.min(max_h.max(1) as usize).clamp(1, MAX_VISIBLE_ROWS)
+    }
+
+    /// Lines to draw plus the cursor position (x, y) within them. `width` and
+    /// `max_h` are the render area actually granted by the caller, which can
+    /// be smaller than [`Self::height`] asked for on tiny terminals.
+    pub fn render(&mut self, width: u16, max_h: u16) -> (Vec<Line<'static>>, u16, u16) {
+        self.ensure_rows(text_width(width));
+        let total = self.cached_rows().len();
+        let visible = Self::visible(total, max_h);
+        let cursor_row = self.cursor_row(self.cached_rows());
+
+        if self.follow {
+            if cursor_row < self.scroll {
+                self.scroll = cursor_row;
+            } else if cursor_row >= self.scroll + visible {
+                self.scroll = cursor_row + 1 - visible;
+            }
+        }
+        self.scroll = self.scroll.min(total.saturating_sub(visible));
+
+        let selection = self.selection_bounds();
+        let rows = self.cached_rows();
+        let mut out = Vec::with_capacity(visible);
+        for row in rows.iter().skip(self.scroll).take(visible) {
+            // The prompt caret marks the true start of the draft, so a
+            // continuation gutter on the top row is the signal that there is
+            // more text scrolled above.
+            let prefix = if row.line == 0 && row.start == 0 {
                 Span::styled(
                     "❯ ",
                     Style::default()
@@ -339,7 +487,7 @@ impl Composer {
             } else {
                 Span::styled("… ", Style::default().fg(theme::DIM()))
             };
-            if i == 0 && self.is_empty() {
+            if self.is_empty() {
                 out.push(Line::from(vec![
                     prefix,
                     Span::styled(
@@ -349,16 +497,230 @@ impl Composer {
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
-            } else {
-                out.push(Line::from(vec![prefix, Span::raw(line.clone())]));
+                continue;
+            }
+            let mut spans = vec![prefix];
+            let text = &self.lines[row.line];
+            let selected = selection.and_then(|(lo, hi)| row_selection(lo, hi, row));
+            let (sel_start, sel_end) = selected.unwrap_or((row.start, row.start));
+            for (from, to, style) in [
+                (row.start, sel_start, Style::default()),
+                (sel_start, sel_end, Style::default().bg(theme::SELECT())),
+                (sel_end, row.end, Style::default()),
+            ] {
+                if from >= to {
+                    continue;
+                }
+                let slice = &text[char_to_byte(text, from)..char_to_byte(text, to)];
+                spans.push(Span::styled(slice.to_string(), style));
+            }
+            out.push(Line::from(spans));
+        }
+
+        // Clamp into the box: while the wheel holds the view away from the
+        // cursor there is no on-screen cell for it, and a terminal cursor
+        // outside the composer would land on unrelated chrome.
+        let cursor_y = cursor_row.saturating_sub(self.scroll).min(visible - 1) as u16;
+        let line = &self.lines[self.row];
+        let anchor = rows.get(cursor_row).map(|r| r.start).unwrap_or(0);
+        let to = char_to_byte(line, self.col);
+        let from = char_to_byte(line, anchor).min(to);
+        let cursor_x = (GUTTER + text::width(&line[from..to])) as u16;
+        (out, cursor_x.min(width.saturating_sub(1)), cursor_y)
+    }
+
+    // ---------- mouse ----------
+
+    /// Move the cursor to a click at `(cell, row)` relative to the render
+    /// area, and start a selection there.
+    pub fn click_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
+        let point = self.point_at(width, max_h, cell, row);
+        self.row = point.0;
+        self.col = point.1;
+        self.follow = true;
+        self.hist_idx = None;
+        self.selection = Some((point, point));
+        self.dragging = true;
+    }
+
+    /// Extend an in-progress click selection to `(cell, row)`.
+    pub fn drag_to(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
+        let Some((anchor, _)) = self.selection.filter(|_| self.dragging) else {
+            return;
+        };
+        let head = self.point_at(width, max_h, cell, row);
+        self.selection = Some((anchor, head));
+        self.row = head.0;
+        self.col = head.1;
+        self.follow = true;
+    }
+
+    /// Release the mouse button. A click that never moved leaves no highlight,
+    /// only a cursor, so the next drag in the transcript is not swallowed.
+    pub fn finish_selection(&mut self) {
+        self.dragging = false;
+        if self.selection_bounds().is_none() {
+            self.selection = None;
+        }
+    }
+
+    /// Whether a click started in the prompt and the button is still down.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    /// Scroll the draft inside the box without moving the cursor.
+    pub fn scroll_by(&mut self, width: u16, max_h: u16, delta: i32) {
+        self.ensure_rows(text_width(width));
+        let rows = self.cached_rows().len();
+        let max_scroll = rows.saturating_sub(Self::visible(rows, max_h)) as i32;
+        self.scroll = (self.scroll as i32 + delta).clamp(0, max_scroll) as usize;
+        self.follow = false;
+    }
+
+    /// Logical position under `(cell, row)` of the render area. Rows below the
+    /// draft clamp to its end; columns past a row's text clamp to that row so
+    /// a click never jumps the cursor to a line you did not point at.
+    fn point_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) -> Point {
+        self.ensure_rows(text_width(width));
+        let rows = self.cached_rows();
+        let visible = Self::visible(rows.len(), max_h);
+        let scroll = self.scroll.min(rows.len().saturating_sub(visible));
+        let index = (scroll + row as usize).min(rows.len().saturating_sub(1));
+        let Some(target) = rows.get(index) else {
+            return (0, 0);
+        };
+        let text = &self.lines[target.line];
+        let cell = (cell as usize).saturating_sub(GUTTER);
+        let mut col = target.start;
+        let mut used = 0usize;
+        let from = char_to_byte(text, target.start);
+        let to = char_to_byte(text, target.end);
+        for grapheme in text[from..to].graphemes(true) {
+            let cells = text::width(grapheme);
+            if used + cells > cell {
+                break;
+            }
+            used += cells;
+            col += grapheme.chars().count();
+        }
+        let end = if target.last {
+            target.end
+        } else {
+            target.end.saturating_sub(1).max(target.start)
+        };
+        (target.line, col.min(end))
+    }
+
+    // ---------- selection ----------
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_bounds().is_some()
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        self.dragging = false;
+        self.selection.take().is_some()
+    }
+
+    /// Selection as (low, high) logical points, or `None` when it is empty.
+    fn selection_bounds(&self) -> Option<(Point, Point)> {
+        let (anchor, head) = self.selection?;
+        if anchor == head {
+            return None;
+        }
+        Some(if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        })
+    }
+
+    /// The highlighted text, newline-joined across logical lines.
+    pub fn selected_text(&self) -> Option<String> {
+        let (lo, hi) = self.selection_bounds()?;
+        if lo.0 >= self.lines.len() {
+            return None;
+        }
+        let mut out = String::new();
+        for index in lo.0..=hi.0.min(self.lines.len() - 1) {
+            let line = &self.lines[index];
+            let chars = line.chars().count();
+            let from = if index == lo.0 { lo.1.min(chars) } else { 0 };
+            let to = if index == hi.0 { hi.1.min(chars) } else { chars };
+            if index > lo.0 {
+                out.push('\n');
+            }
+            out.push_str(&line[char_to_byte(line, from)..char_to_byte(line, to)]);
+        }
+        Some(out)
+    }
+}
+
+/// Cells left for text once the `❯ `/`… ` gutter is paid for.
+fn text_width(width: u16) -> usize {
+    (width as usize).saturating_sub(GUTTER).max(1)
+}
+
+/// Soft-wrap one logical line into `(start, end)` char-column ranges of at
+/// most `width` cells, breaking at the last space that fits and hard-breaking
+/// words too long for a row. Always returns at least one range.
+fn wrap_cols(line: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    // (first char column, cells, is a break opportunity) per grapheme cluster.
+    let mut marks: Vec<(usize, usize, bool)> = Vec::new();
+    let mut chars = 0usize;
+    for grapheme in line.graphemes(true) {
+        marks.push((
+            chars,
+            text::width(grapheme),
+            grapheme.chars().all(char::is_whitespace),
+        ));
+        chars += grapheme.chars().count();
+    }
+    if marks.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < marks.len() {
+        let mut used = 0usize;
+        let mut j = i;
+        let mut last_break: Option<usize> = None;
+        while j < marks.len() {
+            if used + marks[j].1 > width {
+                break;
+            }
+            used += marks[j].1;
+            j += 1;
+            if marks[j - 1].2 {
+                last_break = Some(j);
             }
         }
-        let cursor_y = (self.row - first) as u16;
-        let cursor_byte = char_to_byte(&self.lines[self.row], self.col);
-        let cursor_x =
-            2 + crate::ui::text::width(&self.lines[self.row][..cursor_byte]) as u16;
-        (out, cursor_x, cursor_y)
+        let cut = if j == marks.len() {
+            j
+        } else {
+            match last_break {
+                Some(brk) if brk > i => brk,
+                _ => j.max(i + 1),
+            }
+        };
+        let end = marks.get(cut).map(|m| m.0).unwrap_or(chars);
+        out.push((marks[i].0, end));
+        i = cut;
     }
+    out
+}
+
+/// Where a selection crosses one display row, as char columns of its line.
+fn row_selection(lo: Point, hi: Point, row: &Row) -> Option<(usize, usize)> {
+    let start = lo.max((row.line, row.start));
+    let end = hi.min((row.line, row.end));
+    if start >= end {
+        return None;
+    }
+    Some((start.1, end.1))
 }
 
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
@@ -413,8 +775,8 @@ mod tests {
 
     #[test]
     fn empty_composer_uses_single_purposeful_placeholder() {
-        let composer = Composer::new(&std::env::temp_dir());
-        let (lines, cursor_x, cursor_y) = composer.render(3);
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let (lines, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!(lines.len(), 1);
         assert_eq!(plain(&lines[0]), "❯ Describe a task");
         assert_eq!((cursor_x, cursor_y), (2, 0));
@@ -424,7 +786,7 @@ mod tests {
     fn multiline_composer_keeps_distinct_continuation_gutter() {
         let mut composer = Composer::new(&std::env::temp_dir());
         composer.insert_str("first\nsecond");
-        let (lines, cursor_x, cursor_y) = composer.render(3);
+        let (lines, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!(plain(&lines[0]), "❯ first");
         assert_eq!(plain(&lines[1]), "… second");
         assert_eq!((cursor_x, cursor_y), (8, 1));
@@ -449,8 +811,167 @@ mod tests {
     fn composer_cursor_uses_terminal_cell_width() {
         let mut composer = Composer::new(&std::env::temp_dir());
         composer.insert_str("漢e\u{301}👩‍💻");
-        let (_, cursor_x, cursor_y) = composer.render(3);
+        let (_, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!((cursor_x, cursor_y), (7, 0));
+    }
+
+    /// A pasted paragraph is one logical line. Without soft wrapping it drew
+    /// as a single clipped row and the cursor ran off past the box edge, so
+    /// most of the draft was neither visible nor reachable.
+    #[test]
+    fn a_long_line_wraps_into_rows_instead_of_running_past_the_box() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str(&"word ".repeat(20)); // 100 cells on one line
+        let width = 20;
+
+        assert_eq!(composer.height(width), 6);
+        let (lines, cursor_x, cursor_y) = composer.render(width, 6);
+        assert_eq!(lines.len(), 6);
+        for line in &lines {
+            assert!(
+                text::width(&plain(line)) <= width as usize,
+                "row overflows the box: {:?}",
+                plain(line),
+            );
+        }
+        // The cursor is at the end of the draft, inside the box on both axes.
+        assert!(cursor_x < width, "cursor escaped to x={cursor_x}");
+        assert_eq!(cursor_y, 5);
+    }
+
+    /// Wrapping is by whole words, matching how the transcript above wraps.
+    #[test]
+    fn wrapping_breaks_on_words_and_hard_breaks_only_unbreakable_ones() {
+        assert_eq!(wrap_cols("hello world foo", 10), vec![(0, 6), (6, 15)]);
+        assert_eq!(wrap_cols("", 10), vec![(0, 0)]);
+        // A token longer than the row still has to fit somewhere.
+        assert_eq!(wrap_cols("abcdefgh", 4), vec![(0, 4), (4, 8)]);
+        // Double-width cells are counted as cells, not as chars.
+        assert_eq!(wrap_cols("漢字漢字", 4), vec![(0, 2), (2, 4)]);
+    }
+
+    /// The wheel reaches rows scrolled above the window, and the next key
+    /// press snaps back so typing never happens off screen.
+    #[test]
+    fn the_wheel_reaches_rows_above_the_window_and_typing_snaps_back() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        for i in 0..20 {
+            composer.insert_str(&format!("line {i:02}\n"));
+        }
+        let (width, height) = (20, 6);
+
+        let visible = |c: &mut Composer| {
+            c.render(width, height)
+                .0
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>()
+        };
+        // The tail is what a fresh draft shows.
+        assert_eq!(visible(&mut composer)[0], "… line 15");
+
+        composer.scroll_by(width, height, -8);
+        assert_eq!(visible(&mut composer)[0], "… line 07");
+
+        // Scrolling stops at the top rather than running off the draft.
+        composer.scroll_by(width, height, -50);
+        assert_eq!(visible(&mut composer)[0], "❯ line 00");
+
+        composer.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(visible(&mut composer)[0], "… line 15");
+    }
+
+    /// Clicking lands the cursor on the character pointed at, in the wrapped
+    /// row pointed at, not on whatever logical line happens to be last.
+    #[test]
+    fn a_click_lands_the_cursor_on_the_row_and_column_pointed_at() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("hello world foo");
+        let (width, height) = (12, 6);
+        // Rows are "hello " and "world foo"; the gutter costs two cells.
+        composer.click_at(width, height, GUTTER as u16 + 3, 1);
+        assert_eq!((composer.row, composer.col), (0, 9));
+
+        // Past the end of a wrapped row, the cursor stays on that row.
+        composer.click_at(width, height, 60, 0);
+        assert_eq!((composer.row, composer.col), (0, 5));
+
+        // Below the draft it clamps to the end, never out of bounds.
+        composer.click_at(width, height, 60, 40);
+        assert_eq!((composer.row, composer.col), (0, 15));
+    }
+
+    #[test]
+    fn a_click_respects_double_width_cells() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("漢字ab");
+        // Cell 2 is the second half of 漢: the cursor goes before it.
+        composer.click_at(40, 6, GUTTER as u16 + 1, 0);
+        assert_eq!(composer.col, 0);
+        composer.click_at(40, 6, GUTTER as u16 + 2, 0);
+        assert_eq!(composer.col, 1);
+    }
+
+    /// Dragging over the prompt yields exactly the source text under it,
+    /// across wrapped rows and across logical lines.
+    #[test]
+    fn dragging_selects_the_source_text_under_the_pointer() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("hello world foo");
+        let (width, height) = (12, 6);
+
+        composer.click_at(width, height, GUTTER as u16, 0);
+        composer.drag_to(width, height, GUTTER as u16 + 5, 1);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("hello world"));
+
+        // Across logical lines the newline comes with it.
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("alpha\nbeta");
+        composer.click_at(40, height, GUTTER as u16 + 2, 0);
+        composer.drag_to(40, height, GUTTER as u16 + 3, 1);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("pha\nbet"));
+    }
+
+    /// A click that never moved leaves a cursor, not a highlight, so it can
+    /// never swallow the Ctrl+C that follows it.
+    #[test]
+    fn a_click_without_a_drag_leaves_no_selection() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("hello");
+        composer.click_at(40, 6, GUTTER as u16 + 2, 0);
+        assert!(composer.is_dragging());
+        composer.finish_selection();
+        assert!(!composer.is_dragging());
+        assert!(!composer.has_selection());
+        assert_eq!(composer.selected_text(), None);
+    }
+
+    #[test]
+    fn only_the_selected_cells_are_highlighted() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("alpha\nbeta");
+        composer.click_at(40, 6, GUTTER as u16 + 2, 0);
+        composer.drag_to(40, 6, GUTTER as u16 + 3, 1);
+        composer.finish_selection();
+
+        let highlighted = |line: &Line<'static>| -> String {
+            line.spans
+                .iter()
+                .filter(|span| span.style.bg == Some(theme::SELECT()))
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let (lines, _, _) = composer.render(40, 6);
+        assert_eq!(plain(&lines[0]), "❯ alpha");
+        assert_eq!(highlighted(&lines[0]), "pha");
+        assert_eq!(highlighted(&lines[1]), "bet");
+
+        // Editing drops the highlight rather than leaving a stale one.
+        composer.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let (lines, _, _) = composer.render(40, 6);
+        assert!(lines.iter().all(|line| highlighted(line).is_empty()));
     }
 
     #[test]
@@ -482,5 +1003,48 @@ mod tests {
         assert_eq!(composer.text(), "third");
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "");
+    }
+
+    /// Wrap cost for a draft the size of a real paste. Not a correctness
+    /// test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_wrap
+    #[test]
+    #[ignore]
+    fn measure_wrap_cost_per_frame() {
+        use std::time::Instant;
+
+        for (label, text) in [
+            ("one-line-prompt", "explain the ledger reconciliation".to_string()),
+            ("paste-10k", "let value = compute(input, &config).unwrap_or_default();\n".repeat(180)),
+            ("paste-100k", "let value = compute(input, &config).unwrap_or_default();\n".repeat(1800)),
+        ] {
+            let mut composer = Composer::new(&std::env::temp_dir());
+            composer.insert_str(&text);
+            // A frame asks twice: once to size the box, once to fill it.
+            let frame = |c: &mut Composer| {
+                std::hint::black_box(c.height(80));
+                std::hint::black_box(c.render(80, 6));
+            };
+            frame(&mut composer);
+
+            let t0 = Instant::now();
+            for _ in 0..200 {
+                frame(&mut composer);
+            }
+            let cached_us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
+
+            let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+            let t0 = Instant::now();
+            for _ in 0..50 {
+                composer.handle_key(key);
+                frame(&mut composer);
+            }
+            let edit_us = t0.elapsed().as_secs_f64() * 1e6 / 50.0;
+
+            eprintln!(
+                "MEASURE {label} bytes={} cached_frame_us={cached_us:.1} frame_after_edit_us={edit_us:.1}",
+                text.len(),
+            );
+        }
     }
 }
