@@ -1061,9 +1061,13 @@ fn wrap_lines_mapped(
         let indent = hanging_indent(&chars, width);
         // A fence line's continuation keeps the rail glyph itself, in the
         // rail's own style, so a wrapped code block still reads as one block
-        // at narrow widths instead of dissolving into prose. The rail is
-        // non-ASCII, so only the Unicode path below ever sees one.
-        let rail = chars.len() >= 2 && chars[0].0 == '│' && chars[1].0 == ' ';
+        // at narrow widths instead of dissolving into prose. Rail detection
+        // is structural (the renderer's dedicated gutter span), the same
+        // rule the copy paths use: literal content that merely begins with
+        // the rail characters arrives as a single span and gets the plain
+        // space indent like any other line. The rail is non-ASCII, so only
+        // the Unicode path below ever sees one.
+        let rail = is_rail_line(line);
         if chars.iter().all(|(ch, _)| ch.is_ascii()) {
             // Coding-agent transcripts are overwhelmingly ASCII. Preserve the
             // original scalar loop here so Unicode safety has no tax on the
@@ -1157,7 +1161,7 @@ fn wrap_lines_mapped(
                 let mut row = rebuild(&chars[from_char..to_char]);
                 if !first_row && indent > 0 {
                     if rail && indent == 2 {
-                        row.spans.insert(0, Span::styled("│ ", chars[0].1));
+                        row.spans.insert(0, Span::styled("│ ", line.spans[0].style));
                     } else {
                         row.spans.insert(0, Span::raw(" ".repeat(indent)));
                     }
@@ -1351,6 +1355,28 @@ mod tests {
         t.set_width(24);
         let index = t.wrapped.len() - t.resolve_anchor(anchor);
         assert_eq!(t.line_block[index], block);
+    }
+
+    #[test]
+    fn literal_rail_content_wraps_without_fabricated_fence_chrome() {
+        let mut t = Transcript::new();
+        t.set_width(24);
+        // A single-span line that merely begins with the rail characters is
+        // content: its continuations get the plain space indent, never an
+        // injected rail that would present prose as fenced code.
+        t.push_assistant(vec![Line::from(
+            "│ a literal border line long enough to wrap at this width",
+        )]);
+        let rows = text(t.lines());
+        let wrapped: Vec<&String> = rows.iter().filter(|r| !r.trim().is_empty()).collect();
+        assert!(wrapped.len() >= 2, "expected a wrap: {rows:?}");
+        assert!(wrapped[0].starts_with("│ "));
+        for row in &wrapped[1..] {
+            assert!(
+                !row.trim_start().starts_with('│'),
+                "fabricated rail on literal content: {row:?}"
+            );
+        }
     }
 
     #[test]
