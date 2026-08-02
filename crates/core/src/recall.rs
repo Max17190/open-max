@@ -96,11 +96,11 @@ pub struct RecallReport {
     /// Index entries whose files are gone: listed history that cannot be
     /// read is reported, not counted as scanned.
     pub sessions_unreadable: usize,
-    /// Set when `excerpt:` asked for more than one page can hold. Silently
-    /// returning less is the failure this whole surface is built against: an
-    /// agent cannot tell a policy cap from the end of a record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub excerpt_capped_to: Option<usize>,
+    /// Knobs whose requested value was not honoured. Silently substituting a
+    /// number is the failure this whole surface is built against: an agent
+    /// cannot tell a policy limit from the shape of its own data.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clamped: Vec<Clamp>,
     pub bytes_scanned: usize,
     pub elapsed_ms: u128,
 }
@@ -139,9 +139,9 @@ struct Query {
     k: usize,
     budget_tokens: usize,
     excerpt_chars: usize,
-    /// What the query asked for, before clamping, so the report can say when
-    /// it could not be honoured.
-    excerpt_requested: usize,
+    /// Every knob whose request could not be honoured, so the report can say
+    /// so rather than quietly substituting its own number.
+    clamped: Vec<Clamp>,
 }
 
 /// Closed-class words dropped from query terms (never from the corpus). In a
@@ -157,7 +157,33 @@ const STOPWORDS: &[&str] = &[
     "who", "why", "will", "with", "you",
 ];
 
+/// One knob whose request was not honoured. Both directions matter: a value
+/// raised to a floor is as silently substituted as one cut to a ceiling, and
+/// an agent that asked for `excerpt:0` and got 120 has been answered by a
+/// number it never chose.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Clamp {
+    pub knob: &'static str,
+    pub requested: usize,
+    pub applied: usize,
+}
+
+fn clamp_reported(
+    knob: &'static str,
+    requested: usize,
+    low: usize,
+    high: usize,
+    out: &mut Vec<Clamp>,
+) -> usize {
+    let applied = requested.clamp(low, high);
+    if applied != requested {
+        out.push(Clamp { knob, requested, applied });
+    }
+    applied
+}
+
 fn parse_query(raw: &str) -> Result<Query, String> {
+    let mut clamped: Vec<Clamp> = Vec::new();
     let mut terms = Vec::new();
     let mut path_filters = Vec::new();
     let mut session_filters = Vec::new();
@@ -204,10 +230,10 @@ fn parse_query(raw: &str) -> Result<Query, String> {
         terms,
         path_filters,
         session_filters,
-        k: k.clamp(1, MAX_K),
-        budget_tokens: budget.clamp(100, MAX_BUDGET_TOKENS),
-        excerpt_chars: excerpt.clamp(120, PAGE_CHARS),
-        excerpt_requested: excerpt,
+        k: clamp_reported("k", k, 1, MAX_K, &mut clamped),
+        budget_tokens: clamp_reported("budget", budget, 100, MAX_BUDGET_TOKENS, &mut clamped),
+        excerpt_chars: clamp_reported("excerpt", excerpt, 120, PAGE_CHARS, &mut clamped),
+        clamped,
     })
 }
 
@@ -1076,8 +1102,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         sessions_scanned: scanned,
         sessions_skipped: skipped,
         sessions_unreadable: unreadable,
-        excerpt_capped_to: (query.excerpt_requested > query.excerpt_chars)
-            .then_some(query.excerpt_chars),
+        clamped: query.clamped.clone(),
         bytes_scanned: bytes,
         elapsed_ms: started.elapsed().as_millis(),
     })
@@ -1087,11 +1112,15 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
 /// header line so cost and coverage are never adjectives.
 pub fn render(report: &RecallReport) -> String {
     let mut notes = String::new();
-    if let Some(cap) = report.excerpt_capped_to {
+    for c in &report.clamped {
         notes.push_str(&format!(
-            ", excerpt capped at {cap} (one page is the largest excerpt; read a hit's \
-             address for the whole record)"
+            ", {}:{} answered as {}",
+            c.knob, c.requested, c.applied
         ));
+        if c.knob == "excerpt" && c.applied < c.requested {
+            notes.push_str(" (one page is the largest excerpt; read a hit's address \
+                            for the whole record)");
+        }
     }
     if report.truncated > 0 {
         notes.push_str(&format!(
@@ -1379,24 +1408,25 @@ mod tests {
         )
         .unwrap();
 
-        // Asking for more than a page can hold is answered, and said out loud.
-        let report = recall(&core, &project, "quokka excerpt:2000").unwrap();
-        assert_eq!(
-            report.excerpt_capped_to,
-            Some(PAGE_CHARS),
-            "a request past the achievable ceiling must be reported, not silently shrunk"
-        );
-        assert!(render(&report).contains("excerpt capped at"), "and it must reach the reader");
+        // Every knob reports a request it could not honour, in both
+        // directions: a value raised to a floor is as substituted as one cut
+        // to a ceiling.
+        let report = recall(&core, &project, "quokka excerpt:2000 k:0 budget:5").unwrap();
+        let by = |knob: &str| report.clamped.iter().find(|c| c.knob == knob).cloned();
+        assert_eq!(by("excerpt").map(|c| c.applied), Some(PAGE_CHARS), "cut to the ceiling");
+        assert_eq!(by("k").map(|c| (c.requested, c.applied)), Some((0, 1)), "raised to the floor");
+        assert_eq!(by("budget").map(|c| (c.requested, c.applied)), Some((5, 100)));
+        let text = render(&report);
+        for shown in ["excerpt:2000 answered as 1200", "k:0 answered as 1", "budget:5 answered as 100"] {
+            assert!(text.contains(shown), "the reader must be told: {shown} missing from {text}");
+        }
         for hit in &report.hits {
-            assert!(
-                hit.excerpt.chars().count() <= PAGE_CHARS + 2,
-                "the cap it reports is the cap it applies"
-            );
+            assert!(hit.excerpt.chars().count() <= PAGE_CHARS + 2, "the cap it reports is applied");
         }
 
-        // Asking for what is achievable says nothing.
-        let ok = recall(&core, &project, "quokka excerpt:400").unwrap();
-        assert_eq!(ok.excerpt_capped_to, None, "no note when the request was honoured");
+        // A request that fits reports nothing.
+        let ok = recall(&core, &project, "quokka excerpt:400 k:5").unwrap();
+        assert!(ok.clamped.is_empty(), "no note when every request was honoured");
 
         // Every address resolves the same way, whatever the store.
         for hit in &ok.hits {
