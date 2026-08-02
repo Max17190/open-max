@@ -1351,14 +1351,38 @@ impl App {
                 self.scroll_search = None;
             }
             KeyCode::Enter => {
+                let has_match = self
+                    .scroll_search
+                    .as_ref()
+                    .is_some_and(|(_, _, matches)| !matches.is_empty());
                 if let Some((q, _, _)) = &self.scroll_search {
                     if !q.is_empty() {
                         self.scroll_search_last = Some(q.clone());
                     }
                 }
-                self.focus_scroll_match();
+                if has_match {
+                    self.focus_scroll_match();
+                    self.scroll_search = None;
+                    self.focus = Focus::Scrollback;
+                } else {
+                    // Nothing to jump to: land back at the prompt. Dropping
+                    // into scrollback focus after a failed search left the
+                    // next typed prompt feeding silent nav bindings.
+                    self.scroll_search = None;
+                    self.focus = Focus::Composer;
+                }
+            }
+            KeyCode::Tab => {
+                // The explicit way OUT of the find bar and into typing:
+                // every other printable key feeds the query, so a prompt
+                // typed here would vanish into it.
+                if let Some((q, _, _)) = &self.scroll_search {
+                    if !q.is_empty() {
+                        self.scroll_search_last = Some(q.clone());
+                    }
+                }
                 self.scroll_search = None;
-                self.focus = Focus::Scrollback;
+                self.focus = Focus::Composer;
             }
             // Next / previous match while the find bar is open.
             // (n/N step the last query after Enter, from scrollback focus, so
@@ -4189,6 +4213,50 @@ mod tests {
         assert!(rendered.iter().any(|row| row.contains("second streamed line")));
         assert!(rendered.iter().any(|row| row.contains("esc to cancel")));
         assert!(rendered.last().unwrap().starts_with('╰'));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tab_leaves_the_find_bar_at_the_composer() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.push(vec![Line::from("some history")]);
+        app.scroll_search = Some(("hist".into(), 0, vec![0]));
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert!(app.scroll_search.is_none());
+        assert!(matches!(app.focus, Focus::Composer));
+
+        // The next keystroke is a prompt in the composer, not a swallowed
+        // nav binding or a find-query character.
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert_eq!(app.composer.text(), "g");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn find_with_no_matches_closes_at_the_composer() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.push(vec![Line::from("some history")]);
+        app.scroll_search = Some(("zzznotfound".into(), 0, vec![]));
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert!(app.scroll_search.is_none());
+        assert!(matches!(app.focus, Focus::Composer));
         fs::remove_dir_all(dir).unwrap();
     }
 
