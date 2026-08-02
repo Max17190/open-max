@@ -1036,6 +1036,11 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('y') => {
+                    // G follows the bottom without selecting a block; y must
+                    // still mean "copy the block I am looking at".
+                    if self.transcript.selected().is_none() {
+                        self.transcript.select_prev();
+                    }
                     if let Some(text) = self.transcript.selected_copy_text() {
                         if clipboard::copy_text(&text) {
                             self.note("copied block");
@@ -3893,6 +3898,29 @@ mod tests {
 
         assert_eq!(app.composer.text(), "y");
         assert!(app.transcript.has_text_selection());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn y_after_g_copies_the_last_block_instead_of_no_op() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(40);
+        app.transcript.push_user(vec![Line::from("a question")]);
+        app.transcript
+            .push_assistant(vec![Line::from("the final answer")]);
+        app.focus = Focus::Scrollback;
+
+        // G follows the bottom and clears any block selection; y right
+        // after must still copy the block at the bottom, not no-op.
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let rendered = buffer_text(&render_app(&mut app, 60, 14));
+        assert!(rendered.contains("copied"), "{rendered}");
         fs::remove_dir_all(dir).unwrap();
     }
 
