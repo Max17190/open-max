@@ -682,7 +682,10 @@ impl App {
         self.scroll_search = None;
         self.scroll_search_last = None;
         self.focus = Focus::Composer;
-        self.queued.clear();
+        // Typed-ahead work was never bound to the old session; the careful
+        // esc path restores it, and silently clearing it here was the one
+        // path that destroyed it.
+        self.return_queue_to_composer();
         self.flush_queue = false;
         self.stream_wrapped.clear();
         self.stream_stable_len = 0;
@@ -1126,6 +1129,17 @@ impl App {
                 self.focus = Focus::Composer;
                 self.transcript.clear_selection();
             }
+            return Ok(());
+        }
+
+        // Up in an empty composer pulls the newest queued message back for
+        // editing, mirroring up-to-edit-history: the only other way to
+        // amend a queued message is cancelling the whole turn.
+        if key.code == KeyCode::Up && self.composer.is_empty() && !self.queued.is_empty() {
+            if let Some(text) = self.queued.pop() {
+                self.composer.load(&text);
+            }
+            self.dirty.mark_chrome();
             return Ok(());
         }
 
@@ -4537,6 +4551,34 @@ mod tests {
         assert!(text.contains("−0"), "{text}");
         // The sitting boundary renders as a divider.
         assert!(text.contains("• resumed"), "{text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_session_returns_queued_input_to_the_composer() {
+        let (mut app, dir) = app_fixture();
+        app.queued = vec!["first queued".into(), "second queued".into()];
+        app.reset_for_new_session();
+        assert_eq!(app.composer.text(), "first queued\nsecond queued");
+        assert!(app.queued.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn up_in_an_empty_composer_pulls_back_the_newest_queued_message() {
+        let (mut app, dir) = app_fixture();
+        app.running = true;
+        app.queued = vec!["first".into(), "second".into()];
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+        assert_eq!(app.composer.text(), "second");
+        assert_eq!(app.queued, vec!["first".to_string()]);
         fs::remove_dir_all(dir).unwrap();
     }
 
