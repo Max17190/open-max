@@ -55,12 +55,16 @@ pub struct Composer {
     selection: Option<(Point, Point)>,
     /// Whether the mouse button is still down on that selection.
     dragging: bool,
-    /// Ticks on every entry point that can change the text. Every mutation in
-    /// this type funnels through `on_edit`, so a wrap cached against a
-    /// generation cannot outlive the text it describes.
+    /// Ticks on every entry point that can change the text, via `touch`, so a
+    /// wrap cached against a generation cannot outlive the text it describes.
+    /// A `cfg(test)` check in `ensure_rows` proves no mutation path skips it.
     generation: u64,
     /// Wrapped rows for one `(text width, generation)` pair.
     wrap_cache: Option<(usize, u64, Vec<Row>)>,
+    /// Cache misses, i.e. how many times the draft was actually re-wrapped.
+    /// The oracle for "moving the cursor must not re-wrap".
+    #[cfg(test)]
+    wraps: usize,
     history: Vec<String>,
     hist_idx: Option<usize>,
     stash: String,
@@ -84,6 +88,8 @@ impl Composer {
             dragging: false,
             generation: 0,
             wrap_cache: None,
+            #[cfg(test)]
+            wraps: 0,
             history,
             hist_idx: None,
             stash: String::new(),
@@ -113,7 +119,8 @@ impl Composer {
     /// Replace `len` chars starting at char index `start` in the current row
     /// and leave the cursor after the replacement. Used to accept completions.
     pub fn replace_token(&mut self, start: usize, len: usize, replacement: &str) {
-        self.on_edit();
+        self.on_input();
+        self.touch();
         let line = &mut self.lines[self.row];
         let from = char_to_byte(line, start);
         let to = char_to_byte(line, start + len);
@@ -147,7 +154,8 @@ impl Composer {
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        self.on_edit();
+        self.on_input();
+        self.touch();
         for c in s.chars() {
             if c == '\n' {
                 self.newline();
@@ -157,13 +165,32 @@ impl Composer {
         }
     }
 
-    /// Any edit or cursor move drops the mouse selection and re-attaches the
+    /// A new input gesture: drop the mouse selection and re-attach the
     /// viewport to the cursor.
-    fn on_edit(&mut self) {
+    fn on_input(&mut self) {
         self.selection = None;
         self.dragging = false;
         self.follow = true;
+    }
+
+    /// The text may have changed, so the wrap cached against the current
+    /// generation no longer describes it.
+    fn touch(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Whether a key only moves the cursor. Erring toward invalidation is
+    /// safe, so this lists what is known harmless rather than trying to
+    /// enumerate every edit; `set_text` covers the history keys, which do
+    /// replace the draft from row 0.
+    fn is_cursor_only(key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => true,
+            KeyCode::Home | KeyCode::End => true,
+            KeyCode::Char('a') | KeyCode::Char('e') if ctrl => true,
+            _ => false,
+        }
     }
 
     fn insert_char(&mut self, c: char) {
@@ -188,7 +215,8 @@ impl Composer {
         self.col = 0;
         self.scroll = 0;
         self.hist_idx = None;
-        self.on_edit();
+        self.on_input();
+        self.touch();
     }
 
     fn set_text(&mut self, text: &str) {
@@ -199,11 +227,16 @@ impl Composer {
         self.row = self.lines.len() - 1;
         self.col = self.lines[self.row].chars().count();
         self.scroll = 0;
-        self.on_edit();
+        self.on_input();
+        self.touch();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
-        self.on_edit();
+        self.on_input();
+        // Navigating a long pasted draft must not cost a re-wrap of it.
+        if !Self::is_cursor_only(&key) {
+            self.touch();
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -397,6 +430,10 @@ impl Composer {
         if !fresh {
             let rows = self.wrap(text_width);
             self.wrap_cache = Some((text_width, self.generation, rows));
+            #[cfg(test)]
+            {
+                self.wraps += 1;
+            }
         }
         // Release test runs (the measurement path) skip this; every ordinary
         // debug test run pays for it.
@@ -839,6 +876,44 @@ mod tests {
         assert_eq!(cursor_y, 5);
     }
 
+    /// Walking a long pasted draft with the cursor keys must not re-wrap it:
+    /// the wrap only depends on the text and the width, neither of which a
+    /// cursor move touches.
+    #[test]
+    fn moving_the_cursor_does_not_re_wrap_the_draft() {
+        // A unique directory that is never created: the composer only reads
+        // history.json, so this test is isolated from every other one's history.
+        let mut composer = Composer::new(&crate::test_temp_dir("openmax-composer-wraps"));
+        composer.insert_str(&"word ".repeat(200));
+        composer.render(40, 6);
+        let base = composer.wraps;
+        assert!(base > 0, "the first paint has to wrap once");
+
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            composer.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            composer.render(40, 6);
+        }
+        for code in [KeyCode::Char('a'), KeyCode::Char('e')] {
+            composer.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+            composer.render(40, 6);
+        }
+        assert_eq!(composer.wraps, base, "cursor movement re-wrapped the draft");
+
+        // A width change and an edit both still do.
+        composer.render(30, 6);
+        assert_eq!(composer.wraps, base + 1);
+        composer.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        composer.render(30, 6);
+        assert_eq!(composer.wraps, base + 2);
+    }
+
     /// Wrapping is by whole words, matching how the transcript above wraps.
     #[test]
     fn wrapping_breaks_on_words_and_hard_breaks_only_unbreakable_ones() {
@@ -1033,6 +1108,14 @@ mod tests {
             }
             let cached_us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
 
+            let arrow = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+            let t0 = Instant::now();
+            for _ in 0..50 {
+                composer.handle_key(arrow);
+                frame(&mut composer);
+            }
+            let move_us = t0.elapsed().as_secs_f64() * 1e6 / 50.0;
+
             let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
             let t0 = Instant::now();
             for _ in 0..50 {
@@ -1042,7 +1125,7 @@ mod tests {
             let edit_us = t0.elapsed().as_secs_f64() * 1e6 / 50.0;
 
             eprintln!(
-                "MEASURE {label} bytes={} cached_frame_us={cached_us:.1} frame_after_edit_us={edit_us:.1}",
+                "MEASURE {label} bytes={} cached_frame_us={cached_us:.1} frame_after_cursor_move_us={move_us:.1} frame_after_edit_us={edit_us:.1}",
                 text.len(),
             );
         }
