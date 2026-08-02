@@ -3002,9 +3002,11 @@ const HELP_KEYS: &[(&str, &str)] = &[
 
 /// Elapsed-time label for the live tail: tenths below ten seconds so the
 /// silent wait visibly advances between whole seconds, whole seconds after.
+/// The boundary sits at exactly 10.0 so the display is monotonic: 9.9s,
+/// then 10.0s (the tenths branch rounds up), then 10s, never backward.
 fn elapsed_label(elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64();
-    if secs < 9.95 {
+    if secs < 10.0 {
         format!("{secs:.1}s")
     } else {
         format!("{}s", elapsed.as_secs())
@@ -3885,6 +3887,10 @@ mod tests {
         assert_eq!(elapsed_label(Duration::from_millis(400)), "0.4s");
         assert_eq!(elapsed_label(Duration::from_millis(3940)), "3.9s");
         assert_eq!(elapsed_label(Duration::from_millis(9940)), "9.9s");
+        // Around the boundary the display must never move backward:
+        // 9.9s, 10.0s, 10s.
+        assert_eq!(elapsed_label(Duration::from_millis(9960)), "10.0s");
+        assert_eq!(elapsed_label(Duration::from_millis(10_400)), "10s");
         assert_eq!(elapsed_label(Duration::from_secs(12)), "12s");
     }
 
