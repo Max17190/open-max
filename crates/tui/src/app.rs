@@ -796,6 +796,12 @@ impl App {
                 self.quit_armed = false;
                 return Ok(());
             }
+            // On a terminal that does report the shift, Ctrl+Shift+C is a
+            // distinct key that has only ever meant copy. With nothing
+            // selected it stays a no-op instead of becoming the quit binding.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                return Ok(());
+            }
             if self.running {
                 if let Some(id) = &self.session_id {
                     self.core.cancel(id);
@@ -3921,6 +3927,28 @@ mod tests {
 
         app.on_key(ctrl_c).await.unwrap();
         assert!(app.quit_armed, "a copy must not disarm the quit binding");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Terminals that do report the shift send a distinct Ctrl+Shift+C, which
+    /// has only ever meant copy. With nothing selected it must stay a no-op.
+    #[tokio::test]
+    async fn ctrl_shift_c_never_becomes_the_quit_binding() {
+        let (mut app, dir) = app_fixture();
+
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .await
+        .unwrap();
+        assert!(!app.quit_armed);
+
+        // A plain Ctrl+C is still the cancel and quit binding.
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.quit_armed);
         fs::remove_dir_all(dir).unwrap();
     }
 
