@@ -982,11 +982,12 @@ fn init_terminal() -> std::io::Result<ui::transcript::Term> {
         pop_title();
         hook(info);
     }));
-    // The session states its presence in the tab title while it runs (see
-    // app::Presence); save the shell's title first and hand it back on every
-    // exit path.
-    push_title();
     enable_raw_mode()?;
+    // The session states its presence in the tab title while it runs (see
+    // app::Presence); save the shell's title and hand it back on every exit
+    // path. Pushed only after raw mode succeeds, so an early error cannot
+    // leave an orphaned entry on the terminal's title stack.
+    push_title();
     let init = || -> std::io::Result<ui::transcript::Term> {
         let mut out = FrameWriter::new(std::io::stdout(), 256 * 1024);
         execute!(out, EnterAlternateScreen)?;
