@@ -449,28 +449,27 @@ fn format_web_results(web: &Value) -> Result<String, String> {
     // Every field here is provider-controlled bytes headed for re-prefilled
     // history: cap all of them, and never render more entries than the tool
     // can be asked for, whatever the response claims.
+    const TRUNCATION_MARKER: &str = "\n…[results truncated]";
     for (i, r) in results.iter().take(10).enumerate() {
         let title = collapse_snippet(r["title"].as_str().unwrap_or("(untitled)"), 120);
         let url = cap_chars(r["url"].as_str().unwrap_or("").trim(), 300);
+        let mut entry = String::new();
         if i > 0 {
-            out.push('\n');
+            entry.push('\n');
         }
-        out.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
+        entry.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
         let snippet = collapse_snippet(r["description"].as_str().unwrap_or(""), 240);
         if !snippet.is_empty() {
-            out.push_str(&format!("   {snippet}\n"));
+            entry.push_str(&format!("   {snippet}\n"));
         }
-        if out.len() > MAX_WEB_SEARCH_BYTES {
-            // Cut on a char boundary at the entry that crossed the line and
-            // say so; whole trailing entries are dropped, never split.
-            let mut cut = MAX_WEB_SEARCH_BYTES.min(out.len());
-            while !out.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            out.truncate(cut);
-            out.push_str("\n…[results truncated]");
+        // Entries are atomic: an entry that would cross the byte bound is
+        // dropped whole (a half URL reads as a real one), and the marker's
+        // own bytes are reserved so the bound holds strictly.
+        if out.len() + entry.len() > MAX_WEB_SEARCH_BYTES - TRUNCATION_MARKER.len() {
+            out.push_str(TRUNCATION_MARKER);
             break;
         }
+        out.push_str(&entry);
     }
     Ok(out)
 }
@@ -1151,11 +1150,17 @@ mod tests {
         let many_wide: Vec<_> = (0..50).map(|_| wide_entry.clone()).collect();
         let text = format_web_results(&json!(many_wide)).unwrap();
         assert!(
-            text.len() <= MAX_WEB_SEARCH_BYTES + 64,
+            text.len() <= MAX_WEB_SEARCH_BYTES,
             "multibyte metadata escaped the byte bound: {} bytes",
             text.len()
         );
         assert!(text.contains("…[results truncated]"));
+        // Entries are atomic: the last one before the marker is complete
+        // (its snippet line made it in), never a mid-field cut.
+        let before_marker = text.split("…[results truncated]").next().unwrap();
+        assert!(before_marker.trim_end().ends_with('…') || before_marker.trim_end().ends_with('\u{1F980}'));
+        assert!(text.contains("4. "), "expected four complete wide entries");
+        assert!(!text.contains("5. "));
     }
 
     /// One canned Firecrawl endpoint serving a single response; the receiver
