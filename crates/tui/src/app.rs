@@ -306,6 +306,11 @@ pub struct App {
     /// Absolute transcript line for each rendered row in `chat_buf`.
     chat_line_map: Vec<Option<usize>>,
     chat_draw_area: Rect,
+    /// Whether the previous frame reserved the right-hand scrollbar column.
+    /// Sticky so a steadily overflowing transcript wraps at one width per
+    /// frame instead of re-deciding (and re-wrapping all history twice) on
+    /// every paint.
+    scrollbar_reserved: bool,
     approval_hits: [Option<Rect>; 3],
     perf_layout_ms: f64,
     perf_selection_ms: f64,
@@ -504,6 +509,7 @@ impl App {
             hist_reuse_key: None,
             chat_line_map: Vec::new(),
             chat_draw_area: Rect::default(),
+            scrollbar_reserved: false,
             approval_hits: [None; 3],
             perf_layout_ms: 0.0,
             perf_selection_ms: 0.0,
@@ -624,6 +630,7 @@ impl App {
         self.hist_reuse_key = None;
         self.chat_line_map.clear();
         self.chat_draw_area = Rect::default();
+        self.scrollbar_reserved = false;
         self.approval_hits = [None; 3];
         self.transcript.follow();
         self.dirty.mark_chat();
@@ -2533,19 +2540,38 @@ impl App {
         }
         let chat_dirty = self.dirty.chat;
 
+        // Start from the previous frame's scrollbar decision. Re-deciding
+        // from the full width on every paint re-wrapped the entire
+        // transcript twice per frame once history overflowed (the width
+        // oscillated between W and W-1), so frame cost grew with session
+        // length exactly when a long reply was streaming.
+        if self.scrollbar_reserved && area.width > 1 {
+            content_w = area.width - 1;
+        }
         self.transcript.set_width(content_w);
         let mut tail_len = self.rebuild_tail(content_w);
 
-        let hist_len = self.transcript.len();
+        let mut hist_len = self.transcript.len();
         let mut total = hist_len + tail_len;
         let visible = area.height as usize;
-        // Reclaim the scrollbar column while the transcript fits. Once
-        // overflow begins, rewrap with a dedicated one-cell track.
-        if total > visible && area.width > 1 {
+        if total > visible && content_w == area.width && area.width > 1 {
+            // Overflow began: rewrap once with a dedicated one-cell track.
+            self.scrollbar_reserved = true;
             content_w = area.width - 1;
             self.transcript.set_width(content_w);
             tail_len = self.rebuild_tail(content_w);
-            total = self.transcript.len() + tail_len;
+            hist_len = self.transcript.len();
+            total = hist_len + tail_len;
+        } else if total <= visible && content_w < area.width {
+            // Fits again at the narrowed width, so it also fits at the full
+            // width (a wider wrap never yields more lines): reclaim the
+            // scrollbar column for content.
+            self.scrollbar_reserved = false;
+            content_w = area.width;
+            self.transcript.set_width(content_w);
+            tail_len = self.rebuild_tail(content_w);
+            hist_len = self.transcript.len();
+            total = hist_len + tail_len;
         }
         if total == 0 && self.pending_approval.is_none() {
             self.chat_buf.clear();
@@ -3912,6 +3938,52 @@ mod tests {
             .sum::<usize>();
 
         assert_eq!(marker_count, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn steady_overflow_frames_never_rewrap_history() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..12 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index}"))]);
+        }
+        // The first frame discovers overflow and re-wraps once to reserve
+        // the scrollbar column.
+        let first = rows(&render_app(&mut app, 40, 6));
+        assert!(first.iter().any(|row| row.contains('▐')));
+        let settled = app.transcript.rewraps;
+
+        // Steady state: replies land, frames repaint, history never
+        // re-wraps. Before the sticky scrollbar decision every paint
+        // re-wrapped the whole transcript twice (W → W-1 oscillation).
+        for index in 0..5 {
+            app.on_agent_event(AgentEvent::MessageDone {
+                text: format!("reply {index}"),
+            });
+            render_app(&mut app, 40, 6);
+        }
+        assert_eq!(app.transcript.rewraps, settled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn growing_taller_releases_the_scrollbar_column_with_one_rewrap() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..12 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index}"))]);
+        }
+        render_app(&mut app, 40, 6);
+        let reserved = app.transcript.rewraps;
+
+        // Tall enough to fit: the column is released with exactly one
+        // re-wrap and later frames stay settled at the full width.
+        let tall = rows(&render_app(&mut app, 40, 30));
+        assert!(tall.iter().all(|row| !row.contains('▐')));
+        assert_eq!(app.transcript.rewraps, reserved + 1);
+        render_app(&mut app, 40, 30);
+        assert_eq!(app.transcript.rewraps, reserved + 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
