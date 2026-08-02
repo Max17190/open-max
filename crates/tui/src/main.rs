@@ -951,7 +951,21 @@ async fn main() -> std::io::Result<()> {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
     ratatui::restore();
+    pop_title();
     result
+}
+
+/// XTWINOPS title stack: save the shell's tab title on entry, restore it on
+/// every exit path. Terminals without the stack ignore both writes and are
+/// left with the last presence title, which at exit reads "project · openmax".
+fn push_title() {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[22;0t").and_then(|_| out.flush());
+}
+
+fn pop_title() {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[23;0t").and_then(|_| out.flush());
 }
 
 /// `ratatui::init` with one change: frame output goes through a 256 KiB
@@ -965,16 +979,25 @@ fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
+        pop_title();
         hook(info);
     }));
     enable_raw_mode()?;
+    // The session states its presence in the tab title while it runs (see
+    // app::Presence); save the shell's title and hand it back on every exit
+    // path. Pushed only after raw mode succeeds, so an early error cannot
+    // leave an orphaned entry on the terminal's title stack.
+    push_title();
     let init = || -> std::io::Result<ui::transcript::Term> {
         let mut out = FrameWriter::new(std::io::stdout(), 256 * 1024);
         execute!(out, EnterAlternateScreen)?;
         out.flush()?;
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
     };
-    init().inspect_err(|_| ratatui::restore())
+    init().inspect_err(|_| {
+        ratatui::restore();
+        pop_title();
+    })
 }
 
 /// A frame-sized `BufWriter` that discards, rather than flushes, its buffered
