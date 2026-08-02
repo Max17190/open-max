@@ -980,8 +980,17 @@ impl App {
         // Completion popup: navigation and acceptance take priority over the
         // composer; anything else falls through and refilters afterwards.
         if self.completion.is_some() {
+            // Shift+Tab steps back through the list here rather than cycling
+            // approval modes: an open popup owns the keyboard, and the reverse
+            // of "Tab picks the next item" is the only reading of it on screen.
+            if is_shift_tab(&key) {
+                if let Some(popup) = &mut self.completion {
+                    popup.prev();
+                }
+                return Ok(());
+            }
             match key.code {
-                KeyCode::Up | KeyCode::BackTab => {
+                KeyCode::Up => {
                     if let Some(popup) = &mut self.completion {
                         popup.prev();
                     }
@@ -1018,6 +1027,14 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // Shift+Tab cycles how much the agent may do without asking. It lands
+        // here, after every modal surface has had the key, because those own
+        // the keyboard while they are open.
+        if is_shift_tab(&key) {
+            self.cycle_approval_mode();
+            return Ok(());
         }
 
         // Dual focus: Tab toggles composer ↔ scrollback.
@@ -1230,6 +1247,33 @@ impl App {
         }
     }
 
+    /// Cycle how much the agent may do without asking, for this run.
+    ///
+    /// Deliberately not persisted. `/approvals` is the path that writes
+    /// settings.json, because widening the trust boundary for every future
+    /// session in a project should cost a typed command. A key one slip away
+    /// from `auto` must not do it quietly, so the change lives and dies with
+    /// the run and the acknowledgement says exactly that. This mirrors the
+    /// approval card's "allow for run", which is already run-scoped.
+    fn cycle_approval_mode(&mut self) {
+        let mode = {
+            let mut settings = self.core.settings.lock().unwrap();
+            let next = settings.approval_mode.next();
+            settings.approval_mode = next;
+            next
+        };
+        // Terse on purpose: cycling to the mode you want costs one line per
+        // press, and the status line already carries the live value. It stays
+        // a transcript note because below 54 columns the status line drops the
+        // mode entirely, and a widened trust boundary must never be silent.
+        self.note(&format!(
+            "approvals: {} for this run (/approvals persists)",
+            mode.as_str(),
+        ));
+        // The status line carries the live mode; nothing else repaints.
+        self.dirty.mark_chrome();
+    }
+
     /// Approval hit regions use the fixed order allow once, allow for run,
     /// deny. Keyboard handling remains the authoritative path.
     fn respond_approval_choice(&mut self, choice: usize) {
@@ -1249,12 +1293,20 @@ impl App {
     }
 
     fn on_model_picker_key(&mut self, key: KeyEvent) {
+        // Before the Tab arm below: where the terminal reports Shift+Tab as a
+        // shifted Tab, matching on the code alone would step forward.
+        if is_shift_tab(&key) {
+            if let Some(picker) = &mut self.model_picker {
+                picker.prev();
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Chat;
                 self.model_picker = None;
             }
-            KeyCode::Up | KeyCode::BackTab => {
+            KeyCode::Up => {
                 if let Some(picker) = &mut self.model_picker {
                     picker.prev();
                 }
@@ -3250,6 +3302,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "queue the message for after this turn"),
     ("tab", "focus conversation ↔ composer"),
+    ("shift+tab", "cycle approvals for this run: ask → auto → readonly"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
     ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
@@ -3669,12 +3722,24 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
+/// Whether a key event is Shift+Tab.
+///
+/// Terminals disagree on the wire: most send CSI Z, which crossterm reports as
+/// `BackTab` with no modifier, while the kitty keyboard protocol reports a Tab
+/// carrying an explicit shift. Both are the same keystroke to the person at
+/// the keyboard, so every binding has to read them the same way.
+fn is_shift_tab(key: &KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
-        paint_text_selection, parse_change_counts, plural, presence_title, rect_contains, save_model_selection,
+        is_shift_tab, paint_text_selection, parse_change_counts, plural, presence_title,
+        rect_contains, save_model_selection,
         App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
@@ -4030,6 +4095,168 @@ mod tests {
         assert_eq!(buffer[(area.x + 2, row)].bg, theme::SELECT());
         assert_eq!(buffer[(area.x + 6, row)].bg, theme::SELECT());
         assert_eq!(buffer[(area.x + 7, row)].bg, theme::COMPOSER_BG());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn shift_tab_events() -> [KeyEvent; 2] {
+        [
+            // What most terminals send (CSI Z), reported with no modifier.
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            // What the kitty keyboard protocol sends.
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        ]
+    }
+
+    #[test]
+    fn shift_tab_is_recognised_in_both_terminal_encodings() {
+        for key in shift_tab_events() {
+            assert!(is_shift_tab(&key), "not recognised: {key:?}");
+        }
+        // A plain Tab is the focus toggle, not the cycle.
+        assert!(!is_shift_tab(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!is_shift_tab(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    /// Both encodings have to drive the same cycle, or the binding works on
+    /// one half of the terminals and silently does something else on the rest.
+    #[tokio::test]
+    async fn shift_tab_cycles_approvals_in_both_encodings() {
+        for key in shift_tab_events() {
+            let (mut app, dir) = app_fixture();
+            let mode = |app: &App| app.core.settings.lock().unwrap().approval_mode;
+            assert_eq!(mode(&app), config::ApprovalMode::Ask, "fixture default");
+
+            app.on_key(key).await.unwrap();
+            assert_eq!(mode(&app), config::ApprovalMode::Auto);
+            app.on_key(key).await.unwrap();
+            assert_eq!(mode(&app), config::ApprovalMode::Readonly);
+            app.on_key(key).await.unwrap();
+            assert_eq!(mode(&app), config::ApprovalMode::Ask, "cycle did not close");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// The trust boundary only widens for every future session through a typed
+    /// command. A keystroke must not write settings.json.
+    #[tokio::test]
+    async fn shift_tab_does_not_persist_the_widened_mode() {
+        let (mut app, dir) = app_fixture();
+        let on_disk = {
+            let settings = app.core.settings.lock().unwrap().clone();
+            config::save(&dir, &settings).unwrap();
+            config::load(&dir).unwrap().approval_mode
+        };
+        assert_eq!(on_disk, config::ApprovalMode::Ask);
+
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.core.settings.lock().unwrap().approval_mode,
+            config::ApprovalMode::Auto,
+            "the run should see the new mode",
+        );
+        assert_eq!(
+            config::load(&dir).unwrap().approval_mode,
+            config::ApprovalMode::Ask,
+            "a keystroke persisted a wider approval mode",
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Modal surfaces own the keyboard while they are open, so Shift+Tab means
+    /// "previous item" there, never a change to the trust boundary behind it.
+    #[tokio::test]
+    async fn open_surfaces_keep_shift_tab_for_themselves() {
+        for key in shift_tab_events() {
+            // Completion popup: steps back through the list.
+            let (mut app, dir) = app_fixture();
+            app.composer.load("/");
+            app.sync_completion();
+            let count = app.completion.as_ref().unwrap().items.len();
+            assert!(count > 1, "need a list to step through");
+
+            app.on_key(key).await.unwrap();
+            assert_eq!(
+                app.completion.as_ref().unwrap().selected,
+                count - 1,
+                "shift+tab did not wrap to the last item",
+            );
+            assert_eq!(
+                app.core.settings.lock().unwrap().approval_mode,
+                config::ApprovalMode::Ask,
+                "an open popup let the key through to the trust boundary",
+            );
+            fs::remove_dir_all(dir).unwrap();
+
+            // A pending approval swallows keys until it is answered.
+            let (mut app, dir) = app_fixture();
+            app.pending_approval = Some((
+                "id".into(),
+                "write_file".into(),
+                "summary".into(),
+                "detail".into(),
+            ));
+            app.on_key(key).await.unwrap();
+            assert_eq!(
+                app.core.settings.lock().unwrap().approval_mode,
+                config::ApprovalMode::Ask,
+                "shift+tab changed approvals out from under a pending card",
+            );
+            fs::remove_dir_all(dir).unwrap();
+
+        }
+    }
+
+    /// The picker matched `Down | Tab` for "next", so on a terminal that
+    /// reports Shift+Tab as a shifted Tab it stepped the wrong way.
+    #[tokio::test]
+    async fn shift_tab_steps_back_in_the_model_picker() {
+        for key in shift_tab_events() {
+            let (mut app, dir) = app_fixture();
+            fs::write(
+                dir.join("providers.json"),
+                r#"{"providers":{"alpha":{"base_url":"http://alpha/v1",
+                   "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+            )
+            .unwrap();
+            open_max_core::providers::invalidate_providers_cache();
+            app.model_picker = Some(crate::ui::model_picker::ModelPickerState::load(
+                &dir,
+                Some("alpha"),
+                "one",
+            ));
+            let listed = app.model_picker.as_ref().unwrap().filtered.len();
+            assert!(listed > 1, "need a list to step through");
+
+            app.on_model_picker_key(key);
+
+            assert_eq!(
+                app.model_picker.as_ref().unwrap().selected,
+                listed - 1,
+                "shift+tab stepped forward instead of back",
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Plain Tab keeps its own job.
+    #[tokio::test]
+    async fn plain_tab_still_toggles_focus() {
+        let (mut app, dir) = app_fixture();
+        assert!(app.focus == Focus::Composer);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.focus == Focus::Scrollback);
+        assert_eq!(
+            app.core.settings.lock().unwrap().approval_mode,
+            config::ApprovalMode::Ask,
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5129,4 +5356,5 @@ mod tests {
         assert_eq!(plural(0, "skill"), "0 skills");
         assert_eq!(plural(8, "tool"), "8 tools");
     }
+
 }

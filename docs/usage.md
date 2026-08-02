@@ -53,6 +53,7 @@ and one openmax driving another (see the `delegate` skill). It is specified in
 | **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
+| **Shift+Tab** | Cycle approvals for this run: `ask` → `auto` → `readonly` (`/approvals` persists) |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** twice | Quit |
 
