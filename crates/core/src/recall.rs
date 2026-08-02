@@ -1449,6 +1449,41 @@ mod tests {
     /// and each guess was wrong for some corpus - a filter blamed for an
     /// unreadable store, an unreadable store declared when memory was
     /// searchable, a filter blamed for sessions past the scan cap.
+    /// The contract is read by agents that cannot check it against the code,
+    /// so it has to be checked here instead. Every claim below was wrong at
+    /// some point in this stack: citations went absolute while the spec still
+    /// said relative, and the spec promised `path:line` for every hit after
+    /// memory files stopped having a line to give.
+    #[test]
+    fn the_recall_contract_describes_what_recall_actually_returns() {
+        let (core, dir, project) = setup();
+        seed_session(&core, &project, "work", vec![ChatMessage::user("wombat protocol")]);
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        std::fs::write(
+            project.join(crate::memory::MEMORY_DIR).join("fact.md"),
+            "# the wombat protocol is documented here\n",
+        )
+        .unwrap();
+
+        let report = recall(&core, &project, "wombat k:20").unwrap();
+        let jsonl = report.hits.iter().find(|h| h.kind == "message").expect("a JSONL hit");
+        let memory = report.hits.iter().find(|h| h.kind == "memory").expect("a memory hit");
+
+        // What the contract promises, asserted against what recall returns.
+        assert!(std::path::Path::new(&jsonl.source).is_absolute(), "absolute, every store");
+        assert!(std::path::Path::new(&memory.source).is_absolute(), "absolute, every store");
+        assert!(jsonl.line.is_some(), "a JSONL record is cited path:line");
+        assert!(memory.line.is_none(), "a memory file is its own record");
+
+        let spec = crate::spec::render("recall").expect("recall is a documented surface");
+        assert!(spec.contains("absolute path"), "the contract must say addresses are absolute");
+        assert!(
+            spec.contains("no line to give"),
+            "the contract must say memory hits carry no line, or an agent will look for one"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn an_empty_result_states_what_was_searched_and_what_was_not() {
         let (core, dir, project) = setup();
