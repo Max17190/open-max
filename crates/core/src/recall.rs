@@ -25,7 +25,7 @@
 //! cannot be parsed is a loud error - "nothing matched" over unread history
 //! is the one lie a memory tool can never afford.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::sessions;
@@ -1041,22 +1041,25 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     let matched = scored.len();
     let mut hits = Vec::new();
     let mut seen_excerpts: Vec<String> = Vec::new();
-    let mut per_doc: HashMap<String, usize> = HashMap::new();
+    let mut per_doc: HashSet<String> = HashSet::new();
     let mut spent = 0usize;
     for (score, i) in scored {
         if hits.len() >= query.k {
             break;
         }
         let chunk = &chunks[i];
-        // Collapse sibling pages, not sibling records. A long paged document
-        // can match on many of its own pages, and letting them all through
-        // spends k and the token budget re-showing one record while other
-        // evidence starves - but every message in a session shares one
-        // `source`, so capping on `source` also throws away the second,
-        // third and fourth message that each answer a different part of the
-        // question. Two pages per record keeps a log's two distinct relevant
-        // regions whole; distinct records compete on their own merit.
-        if per_doc.get(&chunk.doc).copied().unwrap_or(0) >= 2 {
+        // One page per record. A long paged document can match on many of its
+        // own pages, and every extra page spends a slot and a share of the
+        // token budget to show more of a record the reader is already looking
+        // at - while a second, unrelated source gets nothing. This collapses
+        // pages, not records: every message in a session shares one `source`,
+        // so capping on `source` instead would throw away the second and third
+        // message that each answer a different part of the question.
+        //
+        // A single page is enough because the hit carries the record's address
+        // and the whole record is readable from it. Showing a second page
+        // spends a slot on what one read already returns.
+        if per_doc.contains(&chunk.doc) {
             continue;
         }
         let mut excerpt = excerpt_around(&chunk.text, &terms_by_rarity, query.excerpt_chars);
@@ -1082,7 +1085,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         }
         spent += cost;
         seen_excerpts.push(excerpt.clone());
-        *per_doc.entry(chunk.doc.clone()).or_insert(0) += 1;
+        per_doc.insert(chunk.doc.clone());
         hits.push(RecallHit {
             score,
             kind: chunk.kind,
@@ -1985,11 +1988,44 @@ mod tests {
         let report = recall(&core, &project, "shared-needle k:8").unwrap();
         let from_log =
             report.hits.iter().filter(|h| h.title.as_deref() == Some("big log")).count();
-        assert!(from_log <= 2, "at most two sibling pages per source, got {from_log}");
+        assert_eq!(from_log, 1, "one page per record, got {from_log}");
         assert!(
             report.hits.iter().any(|h| h.session.as_deref() == Some(other.as_str())),
             "the second source must appear despite the log's many matching pages: {:?}",
             report.hits
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_one_page_shown_addresses_the_record_it_came_from() {
+        // Collapsing sibling pages is only safe because the surviving hit says
+        // where the record lives: the reader gets the rest with one read
+        // instead of a second slot. If the address ever stops resolving, the
+        // cap above is silently discarding evidence.
+        let (core, dir, project) = setup();
+        let mut log = String::new();
+        for i in 0..400 {
+            log.push_str(&format!("line {i}: paged-needle in this region of the log\n"));
+        }
+        let session = seed_session(&core, &project, "paged log", vec![ChatMessage::tool("c1", log)]);
+        let report = recall(&core, &project, "paged-needle k:8").unwrap();
+        let hit = report
+            .hits
+            .iter()
+            .find(|h| h.session.as_deref() == Some(session.as_str()))
+            .expect("the paged record must be found");
+        let line = hit.line.expect("a transcript hit must carry its line");
+        let text = std::fs::read_to_string(&hit.source)
+            .unwrap_or_else(|e| panic!("cited path {} must be readable: {e}", hit.source));
+        let cited = text
+            .lines()
+            .nth(line - 1)
+            .unwrap_or_else(|| panic!("line {line} must exist in {}", hit.source));
+        assert!(
+            cited.contains("line 399: paged-needle"),
+            "the cited line must hold the whole record, including the pages that were \
+             collapsed, so one read replaces the slot they would have taken"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
