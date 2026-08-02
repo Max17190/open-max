@@ -391,32 +391,38 @@ async fn web_search_tool(args: &Value, cancel: Arc<CancelToken>) -> ToolOutcome 
         }
     }
 
-    let response = tokio::select! {
-        _ = cancel.cancelled() => return ToolOutcome::err("tool cancelled by user"),
-        r = request.send() => r,
-    };
-    let response = match response {
-        Ok(r) => r,
-        Err(e) => return ToolOutcome::err(format!("web search failed: {e}")),
-    };
-    let status = response.status();
-    if status.as_u16() == 429 {
-        return ToolOutcome::err(
-            "web search rate-limited (keyless tier); retry later or set FIRECRAWL_API_KEY for higher limits",
-        );
-    }
-    let body: Value = match response.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return ToolOutcome::err(format!(
-                "web search returned unreadable JSON (HTTP {status}): {e}"
-            ))
+    // One cancellation race over the WHOLE exchange: headers can arrive
+    // quickly while the body trickles, and Esc must win over the body read
+    // too, not just over connect and send.
+    let exchange = async {
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("web search failed: {e}"))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(
+                "web search rate-limited (keyless tier); retry later or set FIRECRAWL_API_KEY for higher limits"
+                    .to_string(),
+            );
         }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("web search returned unreadable JSON (HTTP {status}): {e}"))?;
+        if !status.is_success() || body["success"] != Value::Bool(true) {
+            let detail = body["error"].as_str().unwrap_or("unknown error");
+            return Err(format!("web search failed (HTTP {status}): {detail}"));
+        }
+        Ok(body)
     };
-    if !status.is_success() || body["success"] != Value::Bool(true) {
-        let detail = body["error"].as_str().unwrap_or("unknown error");
-        return ToolOutcome::err(format!("web search failed (HTTP {status}): {detail}"));
-    }
+    let body = tokio::select! {
+        _ = cancel.cancelled() => return ToolOutcome::err("tool cancelled by user"),
+        r = exchange => match r {
+            Ok(body) => body,
+            Err(e) => return ToolOutcome::err(e),
+        },
+    };
     match format_web_results(&body["data"]["web"]) {
         Ok(text) => ToolOutcome::ok(text),
         Err(e) => ToolOutcome::err(e),
@@ -434,9 +440,12 @@ fn format_web_results(web: &Value) -> Result<String, String> {
         return Ok("no results".into());
     }
     let mut out = String::new();
-    for (i, r) in results.iter().enumerate() {
-        let title = r["title"].as_str().unwrap_or("(untitled)").trim();
-        let url = r["url"].as_str().unwrap_or("").trim();
+    // Every field here is provider-controlled bytes headed for re-prefilled
+    // history: cap all of them, and never render more entries than the tool
+    // can be asked for, whatever the response claims.
+    for (i, r) in results.iter().take(10).enumerate() {
+        let title = collapse_snippet(r["title"].as_str().unwrap_or("(untitled)"), 120);
+        let url = cap_chars(r["url"].as_str().unwrap_or("").trim(), 300);
         if i > 0 {
             out.push('\n');
         }
@@ -447,6 +456,15 @@ fn format_web_results(web: &Value) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// Char-boundary cap without whitespace collapsing (URLs have none).
+fn cap_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max_chars).collect();
+    format!("{cut}…")
 }
 
 /// Collapse runs of whitespace to single spaces and cap the length on a char
@@ -1084,6 +1102,25 @@ mod tests {
         assert_eq!(collapse_snippet("a\n\n  b\tc", 100), "a b c");
         assert_eq!(collapse_snippet("héllo wörld", 5), "héllo…");
         assert_eq!(collapse_snippet("", 10), "");
+    }
+
+    #[test]
+    fn hostile_result_metadata_is_bounded() {
+        // Provider-controlled bytes: a degenerate response with giant
+        // fields and more entries than the tool can be asked for must
+        // still render bounded.
+        let giant = "x".repeat(50_000);
+        let entry = json!({
+            "url": format!("https://e.example/{giant}"),
+            "title": giant,
+            "description": giant,
+            "position": 1
+        });
+        let many: Vec<_> = (0..50).map(|_| entry.clone()).collect();
+        let text = format_web_results(&json!(many)).unwrap();
+        assert!(text.len() < 10_000, "unbounded output: {} bytes", text.len());
+        assert!(!text.contains("11. "), "more entries than the request cap");
+        assert!(text.contains("10. "));
     }
 
     /// One canned Firecrawl endpoint serving a single response; the receiver
