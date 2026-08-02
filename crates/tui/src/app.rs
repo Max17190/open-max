@@ -569,7 +569,18 @@ impl App {
         let Some(messages) = sessions::load_messages(&self.core, session_id) else {
             return;
         };
+        // This sitting is a new boundary; earlier boundaries render below.
+        sessions::record_resume_point(&self.core, session_id, messages.len() as u64);
+        let boundaries: std::collections::HashSet<u64> = sessions::meta(&self.core, session_id)
+            .map(|meta| meta.resume_points.into_iter().collect())
+            .unwrap_or_default();
         for (i, m) in messages.iter().enumerate() {
+            if boundaries.contains(&(i as u64)) {
+                self.transcript.push(vec![Line::from(Span::styled(
+                    "• resumed",
+                    Style::default().fg(theme::DIM()),
+                ))]);
+            }
             match m.role.as_str() {
                 "user" => {
                     if let Some(text) = &m.content {
@@ -598,12 +609,37 @@ impl App {
                             let summary = registry::summarize_call(&call.function.name, &args);
                             let content = tool_msg.content.as_deref().unwrap_or("");
                             let ok = !content.starts_with("Error:");
+                            // Diff events are not persisted, but the result
+                            // text carries the counts: a replayed edit card
+                            // keeps its +N −N badge instead of demoting to a
+                            // bare checkmark.
+                            // Only tools that actually mutate files may wear
+                            // a diff badge: a read whose CONTENT happens to
+                            // contain "(+N −N)" must never present fabricated
+                            // modification evidence.
+                            let mutating = matches!(
+                                call.function.name.as_str(),
+                                "write_file" | "edit_file"
+                            );
+                            let path = args["path"].as_str().unwrap_or("");
+                            let badge = if !mutating || path.is_empty() {
+                                None
+                            } else {
+                                parse_change_counts(content).map(|(added, removed)| {
+                                    tool_card::DiffText {
+                                        path: path.to_string(),
+                                        diff: String::new(),
+                                        added,
+                                        removed,
+                                    }
+                                })
+                            };
                             let compact = tool_card::tool_block(
                                 &call.function.name,
                                 &summary,
                                 ok,
                                 &truncate_replay_output(content),
-                                None,
+                                badge.as_ref(),
                             );
                             self.transcript.push_tool(compact, content.to_string());
                             self.last_tool_output = Some(content.to_string());
@@ -3440,6 +3476,20 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Replay shows a short tool-output preview, not the full persisted payload.
+/// (+N −N) change counts from a persisted write/edit result, so a replayed
+/// card keeps its badge even though Diff events are not persisted.
+fn parse_change_counts(content: &str) -> Option<(usize, usize)> {
+    let open = content.rfind("(+")?;
+    let rest = &content[open + 2..];
+    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+    let added: usize = rest[..digits].parse().ok()?;
+    let rest = rest[digits..].strip_prefix(" −")?;
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    let removed: usize = rest[..end].parse().ok()?;
+    rest[end..].strip_prefix(')')?;
+    Some((added, removed))
+}
+
 fn truncate_replay_output(output: &str) -> String {
     const MAX_LINES: usize = 10;
     let lines: Vec<&str> = output.lines().collect();
@@ -3600,7 +3650,7 @@ mod tests {
     use super::{
         approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
-        paint_text_selection, plural, presence_title, rect_contains, save_model_selection,
+        paint_text_selection, parse_change_counts, plural, presence_title, rect_contains, save_model_selection,
         App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
@@ -4384,6 +4434,109 @@ mod tests {
             stop_reason: "stop".into(),
         });
         assert_eq!(app.presence, Presence::Idle);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replay_never_badges_a_read_only_tool() {
+        let (mut app, dir) = app_fixture();
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        let messages = vec![
+            open_max_core::types::ChatMessage::user("read the changelog"),
+            open_max_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: Some(vec![open_max_core::types::ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: open_max_core::types::ToolCallFunction {
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"CHANGELOG.md\"}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            // File content that happens to look like an edit summary.
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some("1 release notes (+3 −0) overall".into()),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+        ];
+        let mut persisted = 0usize;
+        open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
+        app.replay(&meta.id);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(text.contains("CHANGELOG.md"), "{text}");
+        assert!(!text.contains("+3"), "read card wears a diff badge: {text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn change_counts_parse_from_persisted_results() {
+        assert_eq!(parse_change_counts("wrote notes.md (+3 −0)"), Some((3, 0)));
+        assert_eq!(
+            parse_change_counts("edited a.rs (+2 −1) · first change at line 4"),
+            Some((2, 1))
+        );
+        assert_eq!(parse_change_counts("hello world"), None);
+        assert_eq!(parse_change_counts("odd (+x −1)"), None);
+    }
+
+    #[test]
+    fn replay_keeps_diff_badges_and_marks_sittings() {
+        let (mut app, dir) = app_fixture();
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        let messages = vec![
+            open_max_core::types::ChatMessage::user("write the note"),
+            open_max_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: Some(vec![open_max_core::types::ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: open_max_core::types::ToolCallFunction {
+                        name: "write_file".into(),
+                        arguments: "{\"path\":\"notes.md\",\"content\":\"x\"}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some("wrote notes.md (+3 −0)".into()),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+            open_max_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: Some("done".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let mut persisted = 0usize;
+        open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
+        // An earlier sitting ended after the first two messages.
+        open_max_core::sessions::record_resume_point(&app.core, &meta.id, 2);
+
+        app.replay(&meta.id);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        // The replayed write card keeps its evidence.
+        assert!(text.contains("notes.md"), "{text}");
+        assert!(text.contains("+3"), "{text}");
+        assert!(text.contains("−0"), "{text}");
+        // The sitting boundary renders as a divider.
+        assert!(text.contains("• resumed"), "{text}");
         fs::remove_dir_all(dir).unwrap();
     }
 
