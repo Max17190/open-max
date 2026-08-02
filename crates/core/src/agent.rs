@@ -1283,13 +1283,40 @@ async fn settle_ledger(
     project_root: &Path,
     next: Option<(crate::state::ExtensionGeneration, crate::ledger::Actor)>,
 ) -> (Vec<String>, bool) {
-    let mut queue = {
+    let memory_queue = {
         let mut map = core.sessions.lock().await;
         match map.get_mut(session_id) {
             Some(d) => std::mem::take(&mut d.pending_syncs),
             None => Vec::new(),
         }
     };
+    // Adopt claims persisted by sessions that exited while the ledger was
+    // broken (#103): project-scoped, oldest first, ahead of everything this
+    // session queued. A memory claim identical to an adopted one is this
+    // session's own persisted mirror and is dropped in favor of the copy
+    // that knows its file, so landing can remove it; anything an earlier
+    // settle already recorded re-lands as a no-op delta by design.
+    let same_claim = |(gen_a, actor_a): &(crate::state::ExtensionGeneration, crate::ledger::Actor),
+                      (gen_b, actor_b): &(crate::state::ExtensionGeneration, crate::ledger::Actor)| {
+        actor_a == actor_b
+            && gen_a.len() == gen_b.len()
+            && gen_a
+                .iter()
+                .zip(gen_b)
+                .all(|((path_a, sha_a, _), (path_b, sha_b, _))| path_a == path_b && sha_a == sha_b)
+    };
+    let mut queue: Vec<(
+        (crate::state::ExtensionGeneration, crate::ledger::Actor),
+        Option<std::path::PathBuf>,
+    )> = crate::ledger::load_queued_claims(&core.data_dir, project_root)
+        .into_iter()
+        .map(|(path, claim)| (claim, Some(path)))
+        .collect();
+    for claim in memory_queue {
+        if !queue.iter().any(|(queued, _)| same_claim(queued, &claim)) {
+            queue.push((claim, None));
+        }
+    }
     if let Some((files, actor)) = next {
         // Only an identical generation is dropped: landing the earlier claim
         // records these exact hashes, so the newcomer's delta is empty.
@@ -1297,7 +1324,7 @@ async fn settle_ledger(
         // create-then-delete or change-then-revert observed across a broken
         // window is history the ledger promised to keep, and collapsing it
         // would erase the intermediate content from the record for good.
-        let duplicate = queue.last().is_some_and(|(gen, _)| {
+        let duplicate = queue.last().is_some_and(|((gen, _), _)| {
             gen.len() == files.len()
                 && gen
                     .iter()
@@ -1307,24 +1334,38 @@ async fn settle_ledger(
                     })
         });
         if !duplicate {
-            queue.push((files, actor));
+            queue.push(((files, actor), None));
         }
     }
     let mut receipt = Vec::new();
     let mut landed_all = true;
     let mut remaining = std::collections::VecDeque::from(queue);
-    while let Some((files, actor)) = remaining.front() {
+    while let Some(((files, actor), source)) = remaining.front() {
         let (lines, landed) = ledger_changes(core, project_root, files, *actor, session_id);
         receipt.extend(lines);
         if !landed {
             landed_all = false;
             break;
         }
+        if let Some(path) = source {
+            crate::ledger::remove_claim_file(path);
+        }
         remaining.pop_front();
+    }
+    // Unlanded claims must survive this process (#103). Ones adopted from
+    // disk still have their files; persist the rest. An unwritable ledger
+    // directory degrades to the in-memory queue exactly as before.
+    for (claim, source) in remaining.iter_mut() {
+        if source.is_none() {
+            if let Ok(path) = crate::ledger::persist_queued_claim(&core.data_dir, project_root, claim)
+            {
+                *source = Some(path);
+            }
+        }
     }
     let mut map = core.sessions.lock().await;
     if let Some(d) = map.get_mut(session_id) {
-        d.pending_syncs = remaining.into();
+        d.pending_syncs = remaining.into_iter().map(|(claim, _)| claim).collect();
         d.ledger_synced = landed_all;
     }
     (receipt, landed_all)
@@ -3097,6 +3138,134 @@ mod tests {
         assert!(!segments[0].concurrent);
         assert!(!segments[1].concurrent);
         assert!(!segments[2].concurrent);
+    }
+
+    #[tokio::test]
+    async fn queued_claims_survive_a_process_exit_with_their_actor() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        {
+            let data = build_session_data(&core, "dying", &project);
+            core.sessions.lock().await.insert("dying".into(), data);
+        }
+        let tool = project.join(".openmax/tools/deploy.toml");
+        let v1 = b"name = \"deploy\"\ncommand = \"/bin/echo\"\n".to_vec();
+        std::fs::write(&tool, &v1).unwrap();
+        let gen_v1 = vec![(tool.clone(), crate::ledger::sha256_hex(&v1), v1.clone())];
+        let (_r, landed) =
+            settle_ledger(&core, "dying", &project, Some((gen_v1, crate::ledger::Actor::External)))
+                .await;
+        assert!(landed, "baseline must land");
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+
+        // An agent-authored change fails to land and queues as Session; the
+        // claim must also reach disk.
+        let v2 = b"name = \"deploy\"\ndescription = \"agent work\"\ncommand = \"/bin/echo\"\n"
+            .to_vec();
+        std::fs::write(&tool, &v2).unwrap();
+        let gen_v2 = vec![(tool.clone(), crate::ledger::sha256_hex(&v2), v2.clone())];
+        let (_r, landed) =
+            settle_ledger(&core, "dying", &project, Some((gen_v2, crate::ledger::Actor::Session)))
+                .await;
+        assert!(!landed);
+        assert_eq!(
+            crate::ledger::load_queued_claims(&core.data_dir, &project).len(),
+            1,
+            "the unlanded claim must be persisted"
+        );
+
+        // The process dies with the claim queued; the ledger heals; a brand
+        // new process starts a fresh session and reconciles as External,
+        // exactly the restart sweep the issue describes.
+        drop(core);
+        std::fs::write(&log, &intact).unwrap();
+        let (core2, _rx2) = Core::new(dir.clone()).unwrap();
+        {
+            let data = build_session_data(&core2, "fresh", &project);
+            core2.sessions.lock().await.insert("fresh".into(), data);
+        }
+        let gen_sweep = vec![(tool.clone(), crate::ledger::sha256_hex(&v2), v2.clone())];
+        let (_r, landed) = settle_ledger(
+            &core2,
+            "fresh",
+            &project,
+            Some((gen_sweep, crate::ledger::Actor::External)),
+        )
+        .await;
+        assert!(landed);
+
+        // The dead session's work stays recorded as the agent's, never
+        // swept up as a human's, and the landed claim's file is gone.
+        let records = crate::ledger::history(&core2.data_dir, &project).unwrap();
+        let v2_sha = crate::ledger::sha256_hex(&v2);
+        let change = records
+            .iter()
+            .find(|r| r.sha256.as_deref() == Some(v2_sha.as_str()))
+            .expect("the dead session's change must land");
+        assert_eq!(change.actor, crate::ledger::Actor::Session);
+        assert!(crate::ledger::load_queued_claims(&core2.data_dir, &project).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_live_sessions_persisted_mirror_is_not_double_queued() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        {
+            let data = build_session_data(&core, "s", &project);
+            core.sessions.lock().await.insert("s".into(), data);
+        }
+        let tool = project.join(".openmax/tools/deploy.toml");
+        let v1 = b"name = \"deploy\"\ncommand = \"/bin/echo\"\n".to_vec();
+        std::fs::write(&tool, &v1).unwrap();
+        let gen_v1 = vec![(tool.clone(), crate::ledger::sha256_hex(&v1), v1.clone())];
+        let (_r, landed) =
+            settle_ledger(&core, "s", &project, Some((gen_v1, crate::ledger::Actor::External)))
+                .await;
+        assert!(landed);
+        let log = crate::ledger::project_dir(&core.data_dir, &project).join("log.jsonl");
+        let intact = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{intact}not json")).unwrap();
+
+        let v2 = b"name = \"deploy\"\ndescription = \"twice\"\ncommand = \"/bin/echo\"\n".to_vec();
+        std::fs::write(&tool, &v2).unwrap();
+        let gen_v2 = vec![(tool.clone(), crate::ledger::sha256_hex(&v2), v2.clone())];
+        let (_r, landed) =
+            settle_ledger(&core, "s", &project, Some((gen_v2, crate::ledger::Actor::Session)))
+                .await;
+        assert!(!landed);
+
+        // Same session, ledger healed: the persisted file and the in-memory
+        // mirror are one claim, land once, and the claims dir empties.
+        std::fs::write(&log, &intact).unwrap();
+        let (_r, landed) = settle_ledger(&core, "s", &project, None).await;
+        assert!(landed);
+        assert!(crate::ledger::load_queued_claims(&core.data_dir, &project).is_empty());
+        let v2_sha = crate::ledger::sha256_hex(&v2);
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.sha256.as_deref() == Some(v2_sha.as_str()))
+                .count(),
+            1,
+            "the mirrored claim must land exactly once"
+        );
+        assert!(
+            core.sessions.lock().await.get("s").unwrap().pending_syncs.is_empty(),
+            "nothing may stay queued after a clean settle"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
