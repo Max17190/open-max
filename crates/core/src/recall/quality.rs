@@ -376,8 +376,23 @@ struct Row {
     tokens: usize,
 }
 
-#[test]
-fn recall_quality_gate() {
+/// One scored run of the whole corpus, plus the labels it resolved, so a
+/// broken fixture and a ranking regression can be told apart.
+struct Measured {
+    rows: Vec<Row>,
+    /// Cases whose gold session label did not resolve to a seeded session.
+    /// Non-empty means the CORPUS is broken, not the ranker: `is_gold` would
+    /// answer false for every hit, every rank would read as 0, and the gate
+    /// would report a ranking collapse that never happened.
+    unresolved: Vec<&'static str>,
+    hit1: f64,
+    hit3: f64,
+    mrr: f64,
+    coverage: f64,
+    tokens: f64,
+}
+
+fn measure() -> Measured {
     let dir = std::env::temp_dir().join(format!("openmax-recall-quality-{}", uuid::Uuid::new_v4()));
     let project: PathBuf = dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -385,10 +400,17 @@ fn recall_quality_gate() {
     let labels = build(&core, &project);
 
     let mut rows = Vec::new();
+    let mut unresolved = Vec::new();
     for case in CASES {
         let report = recall(&core, &project, case.query).unwrap();
         let gold = match case.gold {
-            Gold::Session(label) => labels.get(label).cloned(),
+            Gold::Session(label) => {
+                let id = labels.get(label).cloned();
+                if id.is_none() {
+                    unresolved.push(case.query);
+                }
+                id
+            }
             Gold::Memory => None,
         };
         let is_gold = |hit: &super::RecallHit| match (&case.gold, &gold) {
@@ -411,9 +433,14 @@ fn recall_quality_gate() {
             rank,
             coverage: found as f64 / case.needles.len() as f64,
             needles: case.needles.len(),
-            tokens: report.hits.iter().map(|h| crate::types::estimate_tokens(h.excerpt.len() + h.source.len() + 48)).sum(),
+            tokens: report
+                .hits
+                .iter()
+                .map(|h| crate::types::estimate_tokens(h.excerpt.len() + h.source.len() + 48))
+                .sum(),
         });
     }
+    let _ = std::fs::remove_dir_all(&dir);
 
     let n = rows.len() as f64;
     let hit1 = rows.iter().filter(|r| r.rank == 1).count() as f64 / n;
@@ -431,29 +458,66 @@ fn recall_quality_gate() {
     );
     for row in &rows {
         let rank = if row.rank == 0 { "-".to_string() } else { row.rank.to_string() };
-        println!(
-            "  rank {rank:>2}  cover {:.2}  {:14} {}",
-            row.coverage, row.class, row.query
-        );
+        println!("  rank {rank:>2}  cover {:.2}  {:14} {}", row.coverage, row.class, row.query);
     }
 
+    Measured { rows, unresolved, hit1, hit3, mrr, coverage, tokens }
+}
+
+/// Checked first and on its own, because every other number here is computed
+/// against these labels. A corpus that failed to seed makes every query look
+/// unranked, which reads exactly like the ranker collapsing - so it has to be
+/// a separate, differently worded failure or the next person debugs the wrong
+/// thing.
+#[test]
+fn recall_quality_fixture_resolves_every_gold() {
+    let m = measure();
+    assert!(
+        m.unresolved.is_empty(),
+        "the corpus is broken, not the ranking: {} case(s) name a gold session that was never \
+         seeded: {:?}",
+        m.unresolved.len(),
+        m.unresolved
+    );
+}
+
+/// The aggregate floors: how the ranker does across the whole labeled set.
+#[test]
+fn recall_quality_gate() {
+    let m = measure();
+    assert!(m.unresolved.is_empty(), "fixture is broken; see the fixture test");
     let mut failures = Vec::new();
-    if hit1 < MIN_HIT_AT_1 {
-        failures.push(format!("hit@1 {hit1:.3} < {MIN_HIT_AT_1:.2}"));
+    if m.hit1 < MIN_HIT_AT_1 {
+        failures.push(format!("hit@1 {:.3} < {MIN_HIT_AT_1:.2}", m.hit1));
     }
-    if hit3 < MIN_HIT_AT_3 {
-        failures.push(format!("hit@3 {hit3:.3} < {MIN_HIT_AT_3:.2}"));
+    if m.hit3 < MIN_HIT_AT_3 {
+        failures.push(format!("hit@3 {:.3} < {MIN_HIT_AT_3:.2}", m.hit3));
     }
-    if mrr < MIN_MRR {
-        failures.push(format!("MRR {mrr:.3} < {MIN_MRR:.2}"));
+    if m.mrr < MIN_MRR {
+        failures.push(format!("MRR {:.3} < {MIN_MRR:.2}", m.mrr));
     }
-    if coverage < MIN_COVERAGE {
-        failures.push(format!("coverage {coverage:.3} < {MIN_COVERAGE:.2}"));
+    if m.coverage < MIN_COVERAGE {
+        failures.push(format!("coverage {:.3} < {MIN_COVERAGE:.2}", m.coverage));
     }
-    if tokens > MAX_MEAN_TOKENS {
-        failures.push(format!("mean tokens {tokens:.0} > {MAX_MEAN_TOKENS:.0}"));
+    if m.tokens > MAX_MEAN_TOKENS {
+        failures.push(format!("mean tokens {:.0} > {MAX_MEAN_TOKENS:.0}", m.tokens));
     }
-    for row in &rows {
+    assert!(
+        failures.is_empty(),
+        "recall quality regressed in aggregate: {}\nper-query detail above (cargo test -- --nocapture)",
+        failures.join("; ")
+    );
+}
+
+/// The per-query floors, separate from the aggregate: an average can stay
+/// healthy while one class falls off entirely, and that is the failure a
+/// labeled set exists to catch.
+#[test]
+fn recall_quality_per_query_floors() {
+    let m = measure();
+    assert!(m.unresolved.is_empty(), "fixture is broken; see the fixture test");
+    let mut failures = Vec::new();
+    for row in &m.rows {
         if row.rank == 0 || row.rank > MAX_QUERY_RANK {
             let rank = if row.rank == 0 { "unranked".to_string() } else { row.rank.to_string() };
             failures.push(format!("[{}] \"{}\" rank {rank}", row.class, row.query));
@@ -468,10 +532,9 @@ fn recall_quality_gate() {
             ));
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         failures.is_empty(),
-        "recall quality regressed: {}\nper-query detail above (cargo test -- --nocapture)",
+        "individual queries regressed: {}\nper-query detail above (cargo test -- --nocapture)",
         failures.join("; ")
     );
 }

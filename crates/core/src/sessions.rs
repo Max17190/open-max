@@ -1,3 +1,19 @@
+//! The on-disk session store: transcripts, manifests, compaction digests,
+//! archives, and token accounting, plus the index that lists them.
+//!
+//! Every store is append-only JSONL beside a small JSON index, because the
+//! properties that matter here are recoverability and addressability, not
+//! query power. A record keeps its line number for the life of the file, which
+//! is what lets `recall` cite `path:line` and have that address still resolve
+//! later.
+//!
+//! Writes are best-effort and loud: a failed append surfaces as an agent
+//! warning rather than aborting a turn, since losing accounting must not cost
+//! the user their work. The one thing that is not best-effort is ordering
+//! against deletion. Every writer re-checks under `sessions_lock` that the
+//! session is still indexed, so a session deleted mid-turn cannot be
+//! resurrected by an append that was already in flight.
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

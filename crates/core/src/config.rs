@@ -1,3 +1,17 @@
+//! `settings.json`: the resolved configuration for a data dir.
+//!
+//! Parsing is strict and fail-closed. An unknown key, an unparseable value, or
+//! an unrecognized `approval_mode` is an error that stops the run, never a
+//! silent fallback to a default. The reason is asymmetric risk: a typo in
+//! `approval_mode` that quietly became `auto` would hand the agent authority
+//! the user believed they had withheld, and they would not find out until
+//! something ran.
+//!
+//! For the same reason there is no default endpoint. An empty `base_url` is a
+//! hard resolve error rather than a guess at localhost, so a misconfigured
+//! install fails at startup instead of silently talking to whatever happens to
+//! be listening.
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,21 @@
+//! Assembly of the frozen system prompt.
+//!
+//! Seven labeled components in a fixed order: base rules, the self-extension
+//! guide, `AGENTS.md`, the memory index, the project layout map, the skills
+//! index, and the tools trailer. `system_prompt_with_breakdown` reports the
+//! size of each, which is what `/context` and `--spec usage` show.
+//!
+//! Every variable-length component is capped in bytes (`AGENTS.md` 2,000, the
+//! layout map 1,200 at depth 2, skills 3,000) and says so when it truncates.
+//! Without caps the prompt would grow with the repository, and this text is
+//! the most expensive bytes in the system: it is resent on every request for
+//! the life of the session, and a test fails the build if the base prompt plus
+//! built-in schemas exceeds its budget.
+//!
+//! The guide itself is an index, not a manual. It names the extension surfaces
+//! and their paths in a few hundred tokens; the full authoring contract for
+//! each lives in `spec` and costs nothing until the agent asks for it.
+
 use std::path::Path;
 
 use crate::registry::Registry;
