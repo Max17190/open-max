@@ -1,11 +1,18 @@
 //! The on-disk session store: transcripts, manifests, compaction digests,
 //! archives, and token accounting, plus the index that lists them.
 //!
-//! Every store is append-only JSONL beside a small JSON index, because the
-//! properties that matter here are recoverability and addressability, not
-//! query power. A record keeps its line number for the life of the file, which
-//! is what lets `recall` cite `path:line` and have that address still resolve
-//! later.
+//! The sidecars - compaction digests, the archive, and usage - are strictly
+//! append-only JSONL, so a record there keeps its line number for the life of
+//! the file. That stability is what lets `recall` cite `path:line` and have
+//! the address still resolve later.
+//!
+//! The live transcript is weaker on purpose and the difference matters. It
+//! appends new tail lines when it can, but a prune that trims or drops
+//! messages rewrites the whole file, so line numbers in `*.messages.json`
+//! survive appends and not compaction. The index and manifest are small JSON
+//! documents replaced atomically rather than appended at all. Nothing is lost
+//! when the transcript is rewritten: whatever a prune removed was already
+//! appended to the archive, which is append-only.
 //!
 //! Writes are best-effort and loud: a failed append surfaces as an agent
 //! warning rather than aborting a turn, since losing accounting must not cost

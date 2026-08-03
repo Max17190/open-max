@@ -17,8 +17,12 @@
 //! 4. Per tool call: permissions, then `approval_mode`, then the human, then
 //!    execution. Assistant messages carrying `tool_calls` are persisted BEFORE
 //!    the tools run, so a cancel or crash cannot leave a call with no record.
-//! 5. `turn_end` hooks fire on every exit path, including cancel, because a
-//!    session left marked running is a spinner that never stops.
+//! 5. `turn_end` hooks fire on every exit path of a STARTED turn, including
+//!    cancel and provider failure, because a session left marked running is a
+//!    spinner that never stops. A `user_prompt_submit` gate that denies or is
+//!    cancelled returns before the turn starts, so no title is written, no
+//!    `session_start` fires, and no `turn_end` fires either: there was no turn
+//!    to end.
 //!
 //! Read-only calls batch and run concurrently; anything mutating serializes.
 //! Refreezing mid-turn is allowed between iterations but never inside one, so
