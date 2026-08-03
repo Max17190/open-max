@@ -1135,7 +1135,7 @@ fn print_usage_economics() {
     use open_max_core::registry::ToolKind;
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let data_dir = default_data_dir();
-    let registry = open_max_core::registry::Registry::build(&project);
+    let registry = open_max_core::registry::Registry::build(&data_dir, &project);
     let usage = open_max_core::ledger::load_usage(&data_dir, &project).unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

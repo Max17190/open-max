@@ -287,12 +287,13 @@ fn rel_display(root: &Path, path: &Path) -> String {
 pub async fn execute(
     name: &str,
     args: &Value,
+    data_dir: &Path,
     root: &Path,
     caps: OutputCaps,
     cancel: Arc<CancelToken>,
 ) -> ToolOutcome {
     if name == "bash" {
-        return bash_tool(root, args, caps, cancel).await;
+        return bash_tool(data_dir, root, args, caps, cancel).await;
     }
     if cancel.is_cancelled() {
         return ToolOutcome::err("tool cancelled by user");
@@ -854,7 +855,13 @@ pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) ->
     }
 }
 
-async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<CancelToken>) -> ToolOutcome {
+async fn bash_tool(
+    data_dir: &Path,
+    root: &Path,
+    args: &Value,
+    caps: OutputCaps,
+    cancel: Arc<CancelToken>,
+) -> ToolOutcome {
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
     };
@@ -873,7 +880,7 @@ async fn bash_tool(root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<Canc
         capture: CaptureSpec {
             head_bytes: 0,
             tail_bytes: caps.command_bytes,
-            spill_dir: Some(crate::state::default_data_dir().join("cmd-logs")),
+            spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
     };
@@ -1066,6 +1073,7 @@ mod tests {
     async fn a_successful_command_reports_what_it_produced() {
         let root = temp_project();
         let out = bash_tool(
+            &root.join("data"),
             &root,
             &json!({"command": "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done"}),
             OutputCaps::default(),
@@ -1078,6 +1086,7 @@ mod tests {
         assert!(out.process_truncated, "and it says so, without parsing the notice");
 
         let quiet = bash_tool(
+            &root.join("data"),
             &root,
             &json!({"command": "printf 'hi\\n'"}),
             OutputCaps::default(),
@@ -1105,6 +1114,7 @@ mod tests {
     async fn a_timed_out_command_still_reports_what_it_printed() {
         let root = temp_project();
         let out = bash_tool(
+            &root.join("data"),
             &root,
             &json!({"command": "echo before-the-timeout; sleep 30", "timeout_secs": 5}),
             OutputCaps::default(),
@@ -1129,6 +1139,7 @@ mod tests {
         // 40k+ bytes of output with the failure marker at the very end.
         let cmd = "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done; echo THE_REAL_FAILURE; exit 3";
         let out = bash_tool(
+            &root.join("data"),
             &root,
             &json!({"command": cmd}),
             OutputCaps::default(),
@@ -1255,7 +1266,7 @@ mod tests {
         let cancel = Arc::new(CancelToken::default());
         cancel.cancel();
         let root = temp_project();
-        let out = execute("glob", &json!({"pattern": "**/*.rs"}), &root, OutputCaps::default(), cancel).await;
+        let out = execute("glob", &json!({"pattern": "**/*.rs"}), &root.join("data"), &root, OutputCaps::default(), cancel).await;
         assert!(!out.ok, "{}", out.output);
         assert!(out.output.contains("cancelled"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);

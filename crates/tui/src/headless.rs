@@ -68,7 +68,7 @@ pub async fn run(
             core.clone(),
             session_id.clone(),
             project.clone(),
-            templates::expand_user_input(&project, prompt),
+            templates::expand_user_input(&core.data_dir, &project, prompt),
         ) {
             eprintln!("openmax: {e}");
             return 1;

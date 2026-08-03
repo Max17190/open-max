@@ -271,7 +271,7 @@ async fn drive<W: Write>(
                         // A `/name args` line expands here exactly as it does
                         // in the composer: a frontend driving this protocol
                         // gets the project's templates for free.
-                        let text = templates::expand_user_input(&project, &text);
+                        let text = templates::expand_user_input(&core.data_dir, &project, &text);
                         match agent::start_turn(core.clone(), session_id.clone(), project.clone(), text) {
                             Ok(()) => running = true,
                             Err(e) => refuse(out, &session_id, &e),

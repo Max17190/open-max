@@ -26,14 +26,14 @@ pub struct TemplateSpec {
 
 /// Discover templates for a project: global first, project overwrites on
 /// name collision. Malformed or oddly named files are skipped, never fatal.
-pub fn discover(project_root: &Path) -> Vec<TemplateSpec> {
-    discover_in(&template_dirs(project_root))
+pub fn discover(data_dir: &Path, project_root: &Path) -> Vec<TemplateSpec> {
+    discover_in(&template_dirs(data_dir, project_root))
 }
 
 /// Global then project template dirs; later dirs win on name collision.
-pub(crate) fn template_dirs(project_root: &Path) -> [PathBuf; 2] {
+pub(crate) fn template_dirs(data_dir: &Path, project_root: &Path) -> [PathBuf; 2] {
     [
-        crate::state::default_data_dir().join("prompts"),
+        data_dir.join("prompts"),
         project_root.join(".agents").join("prompts"),
     ]
 }
@@ -63,7 +63,7 @@ pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<TemplateSpec> {
 /// Expand a composer invocation (`name args...`, no leading slash) against
 /// the discovered templates. Returns the substituted user message, or None
 /// when no template matches the head token.
-pub fn expand_invocation(project_root: &Path, input: &str) -> Option<String> {
+pub fn expand_invocation(data_dir: &Path, project_root: &Path, input: &str) -> Option<String> {
     let input = input.trim_start();
     let (head, args) = match input.find(char::is_whitespace) {
         Some(i) => (&input[..i], input[i..].trim()),
@@ -72,7 +72,7 @@ pub fn expand_invocation(project_root: &Path, input: &str) -> Option<String> {
     if head.is_empty() {
         return None;
     }
-    let spec = resolve(project_root, head)?;
+    let spec = resolve(data_dir, project_root, head)?;
     // Re-read at invocation time: templates are message content, not frozen
     // session state, so an edit applies to the very next use.
     let text = std::fs::read_to_string(&spec.path).ok()?;
@@ -82,8 +82,8 @@ pub fn expand_invocation(project_root: &Path, input: &str) -> Option<String> {
 /// Expand a whole submitted line (`/name args...`). Some only when the line
 /// is a slash line naming a template; the front end decides what a None
 /// means (the TUI treats it as a slash command, the others as literal text).
-pub fn expand_slash_line(project_root: &Path, text: &str) -> Option<String> {
-    expand_invocation(project_root, text.strip_prefix('/')?)
+pub fn expand_slash_line(data_dir: &Path, project_root: &Path, text: &str) -> Option<String> {
+    expand_invocation(data_dir, project_root, text.strip_prefix('/')?)
 }
 
 /// Expand a leading `/name args` line into its template body, or return the
@@ -91,20 +91,20 @@ pub fn expand_slash_line(project_root: &Path, text: &str) -> Option<String> {
 /// expansion is single-pass: a body that itself starts with `/` is message
 /// content, not another invocation. Every front end that has no slash
 /// commands of its own (`--print`, `--stdio`) submits through this.
-pub fn expand_user_input(project_root: &Path, text: &str) -> String {
-    expand_slash_line(project_root, text).unwrap_or_else(|| text.to_string())
+pub fn expand_user_input(data_dir: &Path, project_root: &Path, text: &str) -> String {
+    expand_slash_line(data_dir, project_root, text).unwrap_or_else(|| text.to_string())
 }
 
 /// Resolve one template by name with a direct path probe, project first.
 /// Never goes through the capped discovery list: MAX_TEMPLATES bounds the
 /// popup index, not which templates can be invoked.
-fn resolve(project_root: &Path, name: &str) -> Option<TemplateSpec> {
+fn resolve(data_dir: &Path, project_root: &Path, name: &str) -> Option<TemplateSpec> {
     if !valid_name(name) {
         return None;
     }
     let dirs = [
         project_root.join(".agents").join("prompts"),
-        crate::state::default_data_dir().join("prompts"),
+        data_dir.join("prompts"),
     ];
     dirs.iter()
         .map(|dir| dir.join(format!("{name}.md")))
@@ -279,13 +279,13 @@ mod tests {
     #[test]
     fn expand_invocation_matches_head_and_strips_frontmatter() {
         let root = temp_dir("exp");
+        let data = root.join("data");
         let prompts = root.join(".agents").join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
-        // Unique name so a real template in ~/.openmax/prompts cannot collide.
         write_template(&prompts, "omx-test-issue", "---\ndescription: d\n---\nFix issue $1 now.\n");
-        let expanded = expand_invocation(&root, "omx-test-issue 42").unwrap();
+        let expanded = expand_invocation(&data, &root, "omx-test-issue 42").unwrap();
         assert_eq!(expanded, "Fix issue 42 now.\n");
-        assert!(expand_invocation(&root, "omx-test-nosuch 42").is_none());
+        assert!(expand_invocation(&data, &root, "omx-test-nosuch 42").is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -294,6 +294,7 @@ mod tests {
     #[test]
     fn expand_user_input_handles_slash_lines_only_and_expands_once() {
         let root = temp_dir("user-input");
+        let data = root.join("data");
         let prompts = root.join(".agents").join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         write_template(&prompts, "omx-test-greet", "MARKER: greet $ARGUMENTS\n");
@@ -301,15 +302,15 @@ mod tests {
         write_template(&prompts, "omx-test-loop", "/omx-test-greet again\n");
 
         assert_eq!(
-            expand_user_input(&root, "/omx-test-greet world"),
+            expand_user_input(&data, &root, "/omx-test-greet world"),
             "MARKER: greet world\n"
         );
-        assert_eq!(expand_user_input(&root, "/omx-test-loop"), "/omx-test-greet again\n");
+        assert_eq!(expand_user_input(&data, &root, "/omx-test-loop"), "/omx-test-greet again\n");
         // Not a template, not a slash line: unchanged either way.
-        assert_eq!(expand_user_input(&root, "/omx-test-nosuch x"), "/omx-test-nosuch x");
-        assert_eq!(expand_user_input(&root, "plain prompt"), "plain prompt");
-        assert_eq!(expand_user_input(&root, "path /omx-test-greet"), "path /omx-test-greet");
-        assert!(expand_slash_line(&root, "plain prompt").is_none());
+        assert_eq!(expand_user_input(&data, &root, "/omx-test-nosuch x"), "/omx-test-nosuch x");
+        assert_eq!(expand_user_input(&data, &root, "plain prompt"), "plain prompt");
+        assert_eq!(expand_user_input(&data, &root, "path /omx-test-greet"), "path /omx-test-greet");
+        assert!(expand_slash_line(&data, &root, "plain prompt").is_none());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -325,6 +326,7 @@ mod tests {
     #[test]
     fn invocation_is_independent_of_the_discovery_cap() {
         let root = temp_dir("cap-inv");
+        let data = root.join("data");
         let prompts = root.join(".agents").join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         for i in 0..MAX_TEMPLATES {
@@ -334,7 +336,7 @@ mod tests {
         let discovered = discover_in(std::slice::from_ref(&prompts));
         assert_eq!(discovered.len(), MAX_TEMPLATES);
         assert!(!discovered.iter().any(|t| t.name == "zzz-omx-tail"), "sorted past the cap");
-        assert_eq!(expand_invocation(&root, "zzz-omx-tail hello").unwrap(), "Tail says hello.\n");
+        assert_eq!(expand_invocation(&data, &root, "zzz-omx-tail hello").unwrap(), "Tail says hello.\n");
         let _ = std::fs::remove_dir_all(root);
     }
 

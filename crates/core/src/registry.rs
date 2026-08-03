@@ -123,13 +123,13 @@ impl ExtensionSnapshot {
 /// tool TOMLs and skill SKILL.mds, global first and project second. Contents
 /// (not mtimes) detect same-length rewrites. Only parsed specs survive the
 /// scan, so peak memory is bounded by one source file plus the frozen registry.
-pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
+pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> ExtensionSnapshot {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
     let mut external_by_name: HashMap<String, ToolSpec> = HashMap::new();
-    for dir in external_tool_dirs(project_root) {
+    for dir in external_tool_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -156,7 +156,7 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
         }
     }
     let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
-    for dir in skills::skill_dirs(project_root) {
+    for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -209,15 +209,15 @@ pub(crate) fn capture_extensions(project_root: &Path) -> ExtensionSnapshot {
 
 /// Compatibility helper for diagnostics and tests that only need the content
 /// identity. Activation paths should retain and parse the full snapshot.
-pub fn extensions_fingerprint(project_root: &Path) -> u64 {
-    capture_extensions(project_root).fingerprint
+pub fn extensions_fingerprint(data_dir: &Path, project_root: &Path) -> u64 {
+    capture_extensions(data_dir, project_root).fingerprint
 }
 
 impl Registry {
     /// Discover external tools and skills for a project and freeze the
     /// registry, stamped with the fingerprint of what was read.
-    pub fn build(project_root: &Path) -> Self {
-        Self::from_snapshot(capture_extensions(project_root))
+    pub fn build(data_dir: &Path, project_root: &Path) -> Self {
+        Self::from_snapshot(capture_extensions(data_dir, project_root))
     }
 
     pub(crate) fn from_snapshot(snapshot: ExtensionSnapshot) -> Self {
@@ -320,13 +320,16 @@ impl Registry {
         &self,
         name: &str,
         args: &Value,
+        data_dir: &Path,
         root: &Path,
         caps: tools::OutputCaps,
         cancel: Arc<CancelToken>,
     ) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
-            Some(ToolKind::Builtin) => tools::execute(name, args, root, caps, cancel).await,
-            Some(ToolKind::External(tool)) => spawn_external(name, &tool, args, root, caps, cancel).await,
+            Some(ToolKind::Builtin) => tools::execute(name, args, data_dir, root, caps, cancel).await,
+            Some(ToolKind::External(tool)) => {
+                spawn_external(name, &tool, args, data_dir, root, caps, cancel).await
+            }
             None => ToolOutcome::err(format!(
                 "unknown tool: {name}; the available tools are {}",
                 self.tool_names().join(", ")
@@ -536,9 +539,13 @@ struct ExampleFile {
 }
 
 /// Global then project tool dirs; later dirs win on name collision.
-pub(crate) fn external_tool_dirs(project_root: &Path) -> [PathBuf; 2] {
+/// Global then project tool dirs. The global one is derived from the session's
+/// own `data_dir`, not from `$HOME`: approvals, sessions and trust all live in
+/// `data_dir`, so discovering capabilities from somewhere else means a tool can
+/// be found in one place and its approval recorded in another.
+pub(crate) fn external_tool_dirs(data_dir: &Path, project_root: &Path) -> [PathBuf; 2] {
     [
-        crate::state::default_data_dir().join("tools"),
+        data_dir.join("tools"),
         project_root.join(".openmax").join("tools"),
     ]
 }
@@ -672,6 +679,7 @@ async fn spawn_external(
     name: &str,
     tool: &ExternalTool,
     args: &Value,
+    data_dir: &Path,
     root: &Path,
     caps: tools::OutputCaps,
     cancel: Arc<CancelToken>,
@@ -685,7 +693,7 @@ async fn spawn_external(
         capture: CaptureSpec {
             head_bytes: 0,
             tail_bytes: caps.command_bytes,
-            spill_dir: Some(crate::state::default_data_dir().join("cmd-logs")),
+            spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
     };
@@ -770,13 +778,55 @@ mod tests {
     fn build_with_no_config_matches_builtin_only() {
         let dir = std::env::temp_dir().join(format!("omx-reg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let registry = Registry::build(&dir);
+        let registry = Registry::build(&dir.join("data"), &dir);
         assert_eq!(
             registry.tool_schemas_json().to_string(),
             Registry::builtin_only().tool_schemas_json().to_string()
         );
         assert!(registry.skills.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_capabilities_come_from_the_session_data_dir_not_the_home_dir() {
+        // Approvals, sessions and trust all live in `data_dir`. Discovering
+        // capabilities from `$HOME` instead meant a tool could be found in one
+        // place and its approval recorded in another, and it made the suite
+        // fail for anyone who installed a global tool the documented way.
+        let root = std::env::temp_dir().join(format!("omx-dd-{}", uuid::Uuid::new_v4()));
+        let data_dir = root.join("data");
+        let other_dir = root.join("elsewhere");
+        let project = root.join("project");
+        for dir in [data_dir.join("tools"), other_dir.join("tools"), project.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let manifest = |name: &str| {
+            format!("name = \"{name}\"\ndescription = \"probe\"\ncommand = \"/bin/echo\"\n")
+        };
+        std::fs::write(data_dir.join("tools").join("mine.toml"), manifest("from_data_dir")).unwrap();
+        std::fs::write(other_dir.join("tools").join("theirs.toml"), manifest("from_elsewhere"))
+            .unwrap();
+
+        let names = Registry::build(&data_dir, &project).tool_names();
+        assert!(
+            names.iter().any(|n| n == "from_data_dir"),
+            "a tool under the session's own data dir must be found: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "from_elsewhere"),
+            "a tool under a different data dir must NOT leak in: {names:?}"
+        );
+
+        // The same directory decides the fingerprint, or a refreeze would miss
+        // a change to the very files it just loaded.
+        let before = extensions_fingerprint(&data_dir, &project);
+        std::fs::write(data_dir.join("tools").join("mine.toml"), manifest("renamed")).unwrap();
+        assert_ne!(
+            before,
+            extensions_fingerprint(&data_dir, &project),
+            "an edit under the data dir must move the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A skill sorted past MAX_SKILLS is dropped from the index but never
@@ -793,7 +843,7 @@ mod tests {
             )
             .unwrap();
         }
-        let registry = Registry::build(&project);
+        let registry = Registry::build(&project.join("data"), &project);
         assert_eq!(registry.skills.len(), crate::skills::MAX_SKILLS);
         assert_eq!(registry.skills_omitted, 3);
         let _ = std::fs::remove_dir_all(project);
@@ -844,7 +894,7 @@ mod tests {
             )
             .unwrap();
         }
-        let snapshot = capture_extensions(&project);
+        let snapshot = capture_extensions(&project.join("data"), &project);
         assert!(snapshot.external.len() <= MAX_EXTERNAL_TOOLS);
         assert!(snapshot.tools_omitted >= 2, "{}", snapshot.tools_omitted);
         // The sorted head loads: the lexicographically first names survive.
@@ -913,7 +963,7 @@ mutatng = true
     async fn unknown_tool_error_lists_names() {
         let registry = Registry::builtin_only();
         let out = registry
-            .execute("nope", &serde_json::json!({}), Path::new("."), tools::OutputCaps::default(), no_cancel())
+            .execute("nope", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), Path::new("."), tools::OutputCaps::default(), no_cancel())
             .await;
         assert!(!out.ok);
         assert!(out.output.contains("bash"), "should list valid tools: {}", out.output);
@@ -996,7 +1046,7 @@ mutatng = true
         )
         .unwrap();
 
-        let snapshot = capture_extensions(&project);
+        let snapshot = capture_extensions(&project.join("data"), &project);
         let first_fingerprint = snapshot.fingerprint();
         std::fs::write(
             &path,
@@ -1008,7 +1058,7 @@ mutatng = true
         assert_eq!(frozen.ext_fingerprint, first_fingerprint);
         assert_eq!(frozen.get("generation").unwrap().description, "first");
 
-        let current = Registry::build(&project);
+        let current = Registry::build(&project.join("data"), &project);
         assert_ne!(current.ext_fingerprint, first_fingerprint);
         assert_eq!(current.get("generation").unwrap().description, "later");
         let _ = std::fs::remove_dir_all(project);
@@ -1052,7 +1102,7 @@ mutatng = true
         );
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
         let out = registry
-            .execute("echo_args", &serde_json::json!({"message": "hi"}), &project, tools::OutputCaps::default(), no_cancel())
+            .execute("echo_args", &serde_json::json!({"message": "hi"}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel())
             .await;
         assert!(out.ok, "{}", out.output);
         assert!(out.output.contains("got: {\"message\":\"hi\"}"), "{}", out.output);
@@ -1081,7 +1131,7 @@ mutatng = true
         );
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
         let out = registry
-            .execute("noisy", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel())
+            .execute("noisy", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel())
             .await;
 
         assert!(out.ok, "{}", out.output);
@@ -1102,16 +1152,16 @@ mutatng = true
         write_tool(&tools_dir, "fail.toml", &format!("name = \"fail\"\ndescription = \"f\"\ncommand = \"{}\"\n", fail.display()));
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
 
-        let out = registry.execute("slow", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
+        let out = registry.execute("slow", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.contains("timed out after 1s"), "{}", out.output);
 
-        let out = registry.execute("fail", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
+        let out = registry.execute("fail", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.starts_with("exit code 3"), "{}", out.output);
         assert!(out.output.contains("[stderr]") && out.output.contains("oops"), "{}", out.output);
 
-        let out = registry.execute("missing_binary", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
+        let out = registry.execute("missing_binary", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok && out.output.contains("unknown tool"));
         let _ = std::fs::remove_dir_all(project);
     }
@@ -1123,7 +1173,7 @@ mutatng = true
         std::fs::create_dir_all(&tools_dir).unwrap();
         write_tool(&tools_dir, "ghost.toml", "name = \"ghost\"\ndescription = \"g\"\ncommand = \"/nonexistent/binary\"\n");
         let registry = Registry::assemble(discover_external_in(std::slice::from_ref(&tools_dir)), Vec::new());
-        let out = registry.execute("ghost", &serde_json::json!({}), &project, tools::OutputCaps::default(), no_cancel()).await;
+        let out = registry.execute("ghost", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
         assert!(out.output.contains("ghost") && out.output.contains("/nonexistent/binary"), "{}", out.output);
         assert!(out.output.contains("ghost.toml"), "must point at the defining file: {}", out.output);

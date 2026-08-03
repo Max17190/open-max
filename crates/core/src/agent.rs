@@ -297,7 +297,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         let (registry, had_manifest) = if let Some(manifest) = sessions::load_manifest(core, session_id) {
             (Arc::new(Registry::from_manifest(manifest)), true)
         } else {
-            (Arc::new(Registry::build(project_root)), false)
+            (Arc::new(Registry::build(&core.data_dir, project_root)), false)
         };
         if !had_manifest {
             // Always persisted (even builtin-only) so the extension
@@ -514,7 +514,7 @@ async fn execute_readonly_batch(
                 if let Some(outcome) = blocked_outcome {
                     return outcome;
                 }
-                registry.execute(&name, &args, &root, caps, cancel).await
+                registry.execute(&name, &args, &ctx.core.data_dir, &root, caps, cancel).await
             }
         })
         .collect();
@@ -962,8 +962,10 @@ pub async fn reload_session(
         return Err("a turn is in flight; run /reload after it finishes".into());
     }
     let root = project_root.to_path_buf();
-    let mut snapshot = tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root))
-        .await
+    let dd = core.data_dir.clone();
+    let mut snapshot =
+        tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&dd, &root))
+            .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
     let files = std::mem::take(&mut snapshot.files);
     let registry = Registry::from_snapshot(snapshot);
@@ -1080,7 +1082,9 @@ async fn refreeze_if_extensions_changed(
 ) {
     let mut snapshot = {
         let root = project_root.to_path_buf();
-        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
+        let dd = core.data_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&dd, &root)).await
+        {
             Ok(snapshot) => snapshot,
             Err(_) => return,
         }
@@ -1200,7 +1204,7 @@ fn record_capability_write_approval(
     let is_manifest = rel.starts_with(".openmax/tools/")
         || rel.starts_with(".openmax/hooks/")
         || (rel.starts_with(".agents/skills/") && rel.ends_with("SKILL.md"));
-    if !is_manifest && !is_code_of_installed_manifest(&path, project_root) {
+    if !is_manifest && !is_code_of_installed_manifest(&core.data_dir, &path, project_root) {
         return;
     }
     let Ok(bytes) = std::fs::read(&path) else {
@@ -1222,13 +1226,13 @@ fn record_capability_write_approval(
 /// Whether some installed tool or hook manifest runs exactly this file. The
 /// manifest need not be approved yet: these bytes grant nothing on their own,
 /// and the file may well be written before the manifest that names it.
-fn is_code_of_installed_manifest(path: &Path, project_root: &Path) -> bool {
+fn is_code_of_installed_manifest(data_dir: &Path, path: &Path, project_root: &Path) -> bool {
     let Ok(target) = path.canonicalize() else {
         return false;
     };
     let dirs = crate::hooks::hook_dirs(project_root)
         .into_iter()
-        .chain(crate::registry::external_tool_dirs(project_root));
+        .chain(crate::registry::external_tool_dirs(data_dir, project_root));
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
@@ -1392,7 +1396,9 @@ async fn refreeze_between_iterations(
 ) -> bool {
     let mut snapshot = {
         let root = project_root.to_path_buf();
-        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&root)).await {
+        let dd = core.data_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&dd, &root)).await
+        {
             Ok(snapshot) => snapshot,
             Err(_) => return false,
         }
@@ -1967,7 +1973,12 @@ async fn run_loop(
                                     });
                                 }
                             }
-                            (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                            (
+                                registry
+                                    .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
+                                    .await,
+                                false,
+                            )
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
@@ -1987,7 +1998,12 @@ async fn run_loop(
                     }
                 } else {
                     executed = true;
-                    (registry.execute(name, &args, project_root, caps, cancelled.clone()).await, false)
+                    (
+                                registry
+                                    .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
+                                    .await,
+                                false,
+                            )
                 };
 
                 if turn_cancelled {
@@ -2619,7 +2635,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(project.join("danger.sh"), "#!/bin/sh\necho benign\n").unwrap();
-        let registry = Registry::build(&project);
+        let registry = Registry::build(&project.join("data"), &project);
         let tracker = RepeatCallTracker::new();
         let perms = Permissions::default();
         let calls = vec![
@@ -2685,8 +2701,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(is_code_of_installed_manifest(&project.join("deploy.sh"), &project));
-        assert!(!is_code_of_installed_manifest(&project.join("notes.md"), &project));
+        assert!(is_code_of_installed_manifest(&project.join("data"), &project.join("deploy.sh"), &project));
+        assert!(!is_code_of_installed_manifest(&project.join("data"), &project.join("notes.md"), &project));
         let _ = std::fs::remove_dir_all(project);
     }
 
@@ -2729,7 +2745,7 @@ mod tests {
             "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/echo\"\nmutating = false\n",
         )
         .unwrap();
-        let registry = crate::registry::Registry::build(&project);
+        let registry = crate::registry::Registry::build(&project.join("data"), &project);
 
         let gated = unapproved_capability(&registry, &data_dir, &project, "peek")
             .expect("a self-declared read-only external tool is still host code");
@@ -2748,7 +2764,7 @@ mod tests {
             "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/sh\"\nmutating = false\n",
         )
         .unwrap();
-        let edited = crate::registry::Registry::build(&project);
+        let edited = crate::registry::Registry::build(&project.join("data"), &project);
         assert!(unapproved_capability(&edited, &data_dir, &project, "peek").is_some());
 
         let _ = std::fs::remove_dir_all(dir);
@@ -2944,7 +2960,7 @@ mod tests {
             "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/echo\"\nmutating = false\n",
         )
         .unwrap();
-        let registry = Registry::build(&project);
+        let registry = Registry::build(&project.join("data"), &project);
         let tracker = RepeatCallTracker::new();
         let perms = Permissions::default();
         let calls = vec![
@@ -3376,7 +3392,7 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
-        let original = crate::registry::Registry::build(&project);
+        let original = crate::registry::Registry::build(&project.join("data"), &project);
         sessions::save_manifest(&core, id, &original.to_manifest());
         std::fs::remove_dir_all(project.join(".openmax/tools")).unwrap();
 

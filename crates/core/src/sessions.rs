@@ -1069,7 +1069,7 @@ mod tests {
         )
         .unwrap();
 
-        let original = crate::registry::Registry::build(&project);
+        let original = crate::registry::Registry::build(&project.join("data"), &project);
         assert!(original.has_extensions());
         save_manifest(&core, id, &original.to_manifest());
 

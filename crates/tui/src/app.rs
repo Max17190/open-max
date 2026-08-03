@@ -1697,7 +1697,7 @@ impl App {
                 if kind == completion::Kind::Slash && self.completion.is_none() {
                     // A fresh `/` rescans templates (two small dirs) so one
                     // the agent just wrote shows up immediately.
-                    self.templates = open_max_core::templates::discover(&self.project)
+                    self.templates = open_max_core::templates::discover(&self.core.data_dir, &self.project)
                         .into_iter()
                         .map(|t| (t.name, t.description))
                         .collect();
@@ -1805,7 +1805,7 @@ impl App {
             let expanded = if builtin {
                 None
             } else {
-                open_max_core::templates::expand_slash_line(&self.project, &text)
+                open_max_core::templates::expand_slash_line(&self.core.data_dir, &self.project, &text)
             };
             match expanded {
                 Some(expanded) => expanded,
@@ -2109,9 +2109,10 @@ impl App {
                     Some(b) => (b, true),
                     None => {
                         let project = self.project.clone();
+                        let dd = self.core.data_dir.clone();
                         let registry = tokio::task::spawn_blocking({
                             let project = project.clone();
-                            move || registry::Registry::build(&project)
+                            move || registry::Registry::build(&dd, &project)
                         })
                         .await
                         .unwrap_or_else(|_| registry::Registry::builtin_only());
@@ -2148,7 +2149,8 @@ impl App {
                     lines
                 } else {
                     let project = self.project.clone();
-                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&project))
+                    let dd = self.core.data_dir.clone();
+                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&dd, &project))
                         .await
                         .unwrap_or_else(|_| registry::Registry::builtin_only());
                     extensions::tools_block(&reg, false)
@@ -2168,7 +2170,8 @@ impl App {
                     lines
                 } else {
                     let project = self.project.clone();
-                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&project))
+                    let dd = self.core.data_dir.clone();
+                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&dd, &project))
                         .await
                         .unwrap_or_else(|_| registry::Registry::builtin_only());
                     extensions::skills_block(&reg.skills, &self.project, false)
