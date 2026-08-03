@@ -1,3 +1,17 @@
+//! The wire types and the event stream, shared by every frontend.
+//!
+//! Two unrelated vocabularies live here because both are contracts. The first
+//! is the OpenAI chat wire format (`ChatMessage`, `ToolCall`), serialized
+//! exactly as a provider expects; `content` is optional because an assistant
+//! message carrying only tool calls has none.
+//!
+//! The second is `AgentEvent`, the single channel `core` speaks to any
+//! frontend over. It is the whole public surface of a running turn, which is
+//! what lets the TUI, `--print`, and `--stdio` be three renderers of one
+//! stream rather than three implementations of one loop. `--stdio` serializes
+//! these envelopes verbatim, so a variant added or renamed here is a protocol
+//! change and bumps `openmax-stdio`.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

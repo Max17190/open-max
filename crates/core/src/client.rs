@@ -1,3 +1,21 @@
+//! The HTTP client for OpenAI-compatible chat completions.
+//!
+//! One streaming call, `stream_chat`, plus the compat knobs real gateways
+//! need: `max_tokens` versus `max_completion_tokens`, optional
+//! `stream_options`, and provider-specific headers. The request body is
+//! serialized once before the retry loop so a retry resends identical bytes.
+//!
+//! Retries are deliberately narrow: connect failures, timeouts, and 429 only,
+//! and only BEFORE the first token arrives. Once a stream has produced output,
+//! retrying would duplicate text the caller already saw, so a mid-stream
+//! failure is reported instead.
+//!
+//! There is no overall request timeout, only a connect timeout. A local or
+//! slow endpoint can legitimately take minutes to generate, and a deadline
+//! here would look like a bug in the model rather than a policy in the client.
+//! A stream that ends without `[DONE]` and without a `finish_reason` is
+//! reported as truncated rather than treated as a complete reply.
+
 use std::sync::Arc;
 
 use futures_util::StreamExt;

@@ -1,3 +1,33 @@
+//! The turn loop: everything that happens between a user message and the
+//! model falling silent.
+//!
+//! Two entry points, `start_turn` and `reload_session`, in front of ~2.5k
+//! lines. That ratio is deliberate: a turn has a fixed order that callers must
+//! not be able to reach into and reorder.
+//!
+//! The order, and why each step sits where it does:
+//!
+//! 1. Trust, then `user_prompt_submit` hooks, which can refuse the text.
+//! 2. Refreeze if extension files changed on disk since the last freeze, so a
+//!    capability the agent wrote in the previous turn is usable in this one
+//!    without `/reload`.
+//! 3. Budget enforcement, which truncates old tool output and then drops whole
+//!    exchanges, always keeping `[system, first user]` so the cache prefix and
+//!    the original request survive.
+//! 4. Per tool call: permissions, then `approval_mode`, then the human, then
+//!    execution. Assistant messages carrying `tool_calls` are persisted BEFORE
+//!    the tools run, so a cancel or crash cannot leave a call with no record.
+//! 5. `turn_end` hooks fire on every exit path of a STARTED turn, including
+//!    cancel and provider failure, because a session left marked running is a
+//!    spinner that never stops. A `user_prompt_submit` gate that denies or is
+//!    cancelled returns before the turn starts, so no title is written, no
+//!    `session_start` fires, and no `turn_end` fires either: there was no turn
+//!    to end.
+//!
+//! Read-only calls batch and run concurrently; anything mutating serializes.
+//! Refreezing mid-turn is allowed between iterations but never inside one, so
+//! the schemas a model was shown are the schemas its reply is checked against.
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};

@@ -1,3 +1,21 @@
+//! The seven built-in tools and their wire schemas.
+//!
+//! `TOOL_NAMES` and `tool_schemas()` are fixed and asserted in lockstep by
+//! `registry`, because this array is serialized into every request for the
+//! life of a session: a tool added here is paid for by every user on every
+//! request, forever. That is the bar for entry, and it is why the set stops at
+//! reading, writing, searching, and running commands. Optional capability goes
+//! on the tool-file surface instead, where only the projects that install it
+//! pay.
+//!
+//! Schemas are kept deliberately small and strict. Fewer, simpler parameters
+//! measurably help smaller models, and every character is prompt cost.
+//!
+//! Output is bounded rather than trusted: a command that prints a gigabyte is
+//! captured to a cap, tail-first, and the remainder spills to a file under the
+//! session's data dir with a breadcrumb in the result. Truncation always says
+//! so, so the model can tell a short answer from a clipped one.
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 

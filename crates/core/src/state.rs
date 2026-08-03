@@ -1,3 +1,22 @@
+//! Shared process state: `Core`, the handle every entry point takes.
+//!
+//! `Core` owns the data dir, resolved settings, the per-session event
+//! channels, the set of running sessions, and their cancel tokens. It is the
+//! only thing a frontend needs, which is what keeps `core` UI-free: the TUI,
+//! `--print`, and `--stdio` are three consumers of one `AgentEvent` stream.
+//!
+//! `SessionData` is the in-memory half of a session. Two of its fields are
+//! load-bearing rather than incidental: the frozen `registry`, whose
+//! serialized schemas are part of the prompt-cache prefix and must not change
+//! mid-session, and `take_seq`, which makes restoring a taken message vector
+//! safe only for the turn that took it, so a newer turn or a recreated session
+//! reusing an id cannot clobber it.
+//!
+//! `default_data_dir()` lives here, and it belongs only at entry points.
+//! Discovery paths take a data dir as an argument; reading `$HOME` deep in the
+//! call graph is how capabilities came to be found in one directory and
+//! approved in another.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
