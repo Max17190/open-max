@@ -76,7 +76,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     #[allow(unused_assignments)]
     let mut external_names: Vec<String> = Vec::new();
     let mut tool_meta: Vec<(String, PathBuf)> = Vec::new();
-    for dir in crate::registry::external_tool_dirs(project_root) {
+    for dir in crate::registry::external_tool_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "toml") {
             let parsed = crate::registry::parse_tool_file(&path);
             let mut id = None;
@@ -141,7 +141,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 
     let mut skills_found: Vec<Entry> = Vec::new();
     let mut skill_meta: Vec<(String, String, PathBuf)> = Vec::new();
-    for dir in crate::skills::skill_dirs(project_root) {
+    for dir in crate::skills::skill_dirs(data_dir, project_root) {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         dirs.sort();
@@ -196,7 +196,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // past it parses fine, but the model never sees its name, so nothing can
     // ever invoke it. Reproduce the exact accounting the prompt uses, and
     // name each dropped skill rather than let it read as healthy.
-    let indexed = crate::skills::discover(project_root);
+    let indexed = crate::skills::discover(data_dir, project_root);
     for (name, chars) in crate::prompt::skill_index_costs(project_root, &indexed) {
         if chars > 0 {
             continue;
@@ -213,7 +213,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     findings.extend(skills_found.into_iter().map(|(f, _)| f));
 
     let mut templates_found: Vec<Entry> = Vec::new();
-    for dir in crate::templates::template_dirs(project_root) {
+    for dir in crate::templates::template_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "md") {
             let mut id = None;
             let status = match crate::templates::parse_template(&path) {
@@ -412,7 +412,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         findings.push(Finding { kind: "approvals", path: pending.path, status });
     }
 
-    findings.extend(inline_program_findings(project_root));
+    findings.extend(inline_program_findings(data_dir, project_root));
     findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));
     findings.extend(hygiene_findings(project_root, data_dir, &tool_meta, &skill_meta));
@@ -424,7 +424,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 /// text opens while it runs. Only flagged when the inline program actually
 /// names a file that exists here - a warning that fired on every `sh -c` would
 /// teach authors to skip warnings.
-fn inline_program_findings(project_root: &Path) -> Vec<Finding> {
+fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut warn = |kind: &'static str, path: PathBuf, command: &str, args: &[String]| {
         if let Some(read) = crate::ledger::inline_program_read(command, args, project_root) {
@@ -438,7 +438,7 @@ fn inline_program_findings(project_root: &Path) -> Vec<Finding> {
             });
         }
     };
-    for dir in crate::registry::external_tool_dirs(project_root) {
+    for dir in crate::registry::external_tool_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "toml") {
             if let Ok(spec) = crate::registry::parse_tool_file(&path) {
                 if let crate::registry::ToolKind::External(ext) = &spec.kind {
@@ -680,7 +680,7 @@ async fn run_examples_within(
         agent_spawned: std::env::var_os("OPENMAX_SESSION").is_some(),
     };
 
-    let registry = Registry::build(project_root);
+    let registry = Registry::build(data_dir, project_root);
     let cancel = std::sync::Arc::new(crate::state::CancelToken::default());
     watch_cancel_signals(cancel.clone());
     // Published before the first spawn so every descendant inherits it, and
@@ -705,7 +705,7 @@ async fn run_examples_within(
         {
             Ok(()) => {
                 let outcome = registry
-                    .execute(&spec.name, &example.args, project_root, caps, cancel.clone())
+                    .execute(&spec.name, &example.args, data_dir, project_root, caps, cancel.clone())
                     .await;
                 example_verdict(&outcome, example)
             }

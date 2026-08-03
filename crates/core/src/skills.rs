@@ -29,14 +29,14 @@ pub struct SkillSpec {
 
 /// Discover skills for a project: global first, project overwrites on name
 /// collision. Malformed skill files are skipped, never fatal.
-pub fn discover(project_root: &Path) -> Vec<SkillSpec> {
-    discover_in(&skill_dirs(project_root))
+pub fn discover(data_dir: &Path, project_root: &Path) -> Vec<SkillSpec> {
+    discover_in(&skill_dirs(data_dir, project_root))
 }
 
 /// Global then project skill dirs; later dirs win on name collision.
-pub(crate) fn skill_dirs(project_root: &Path) -> [PathBuf; 2] {
+pub(crate) fn skill_dirs(data_dir: &Path, project_root: &Path) -> [PathBuf; 2] {
     [
-        crate::state::default_data_dir().join("skills"),
+        data_dir.join("skills"),
         project_root.join(".agents").join("skills"),
     ]
 }

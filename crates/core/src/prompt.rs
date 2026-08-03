@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn zero_extensions_prompt_is_byte_identical() {
         let dir = temp_project();
-        let discovered = system_prompt(&dir, &Registry::build(&dir));
+        let discovered = system_prompt(&dir, &Registry::build(&dir.join("data"), &dir));
         assert_eq!(discovered, builtin_prompt(&dir));
         assert!(!discovered.contains("Skills"));
         let _ = std::fs::remove_dir_all(dir);
@@ -417,7 +417,7 @@ mod tests {
             )
             .unwrap();
         }
-        let registry = Registry::build(&dir);
+        let registry = Registry::build(&dir.join("data"), &dir);
         assert_eq!(registry.skills_omitted, 4);
         let prompt = system_prompt(&dir, &registry);
         let shown = prompt.matches("\n- skill-").count();
@@ -455,7 +455,7 @@ mod tests {
             )
             .unwrap();
         }
-        let registry = Registry::build(&dir);
+        let registry = Registry::build(&dir.join("data"), &dir);
         assert_eq!(registry.skills_omitted, 0, "all under the count cap");
         let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
         let shown = prompt.matches("\n- skill-").count();
@@ -510,7 +510,7 @@ mod tests {
             )
             .unwrap();
         }
-        let registry = Registry::build(&dir);
+        let registry = Registry::build(&dir.join("data"), &dir);
         let at_home = skill_index_costs(&dir, &registry.skills);
         let moved = skill_index_costs(Path::new("/somewhere/else/entirely"), &registry.skills);
         assert_eq!(at_home, moved, "pricing must not depend on where the project sits now");
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
-        let registry = crate::registry::Registry::build(&dir);
+        let registry = crate::registry::Registry::build(&dir.join("data"), &dir);
         let (_, breakdown) = system_prompt_with_breakdown(&dir, &registry);
         let base_chars = breakdown
             .components
@@ -628,7 +628,7 @@ mod tests {
     #[ignore]
     fn dump_frozen_prompt_payload_for_tokenizer() {
         let dir = temp_project();
-        let registry = crate::registry::Registry::build(&dir);
+        let registry = crate::registry::Registry::build(&dir.join("data"), &dir);
         let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
         let base_chars: usize = breakdown
             .components
