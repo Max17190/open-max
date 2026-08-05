@@ -1147,6 +1147,18 @@ pub async fn reload_session(
 /// caller's loop because the note upgrade is a real model request; the
 /// receipt arrives as a `Compacted` event, failures as `Error`. Claims the
 /// session exactly like a turn so the two can never interleave.
+/// The numbers one forced compaction reports. Built inside the guarded task,
+/// emitted by the wrapper only after the claim releases: the receipt is the
+/// frontend's cue to resume (queued prompts fire on it), so a receipt sent
+/// while the claim is still held would race the very start_turn it invites
+/// into a spurious "already working" refusal.
+struct CompactReceipt {
+    tokens_before: usize,
+    tokens_after: usize,
+    compacted_messages: usize,
+    context_tokens: usize,
+}
+
 pub fn compact_session(
     core: &Arc<Core>,
     session_id: &str,
@@ -1188,25 +1200,40 @@ pub fn compact_session(
         };
         // Guarded like a turn: a panic inside must still release the claim
         // and say something, or the session looks busy forever.
-        match work.await {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => core.send_agent(&session_id, AgentEvent::Error { message }),
+        let outcome = match work.await {
+            Ok(outcome) => outcome,
             Err(join) => {
                 let detail = if join.is_cancelled() {
                     "the compaction task was dropped".to_string()
                 } else {
                     panic_detail(join.into_panic())
                 };
-                core.send_agent(&session_id, AgentEvent::Error {
-                    message: format!("compaction ended unexpectedly: {detail}"),
+                Err(format!("compaction ended unexpectedly: {detail}"))
+            }
+        };
+        {
+            // Released together, under the same outer lock the claim took
+            // them with, for the same reason spawn_guarded_turn does; and
+            // strictly before the receipt below, because the receipt is the
+            // frontend's cue to submit queued input against this session.
+            let mut running = core.running.lock().unwrap();
+            core.cancel_flags.lock().unwrap().remove(&session_id);
+            running.remove(&session_id);
+        }
+        match outcome {
+            Ok(receipt) => {
+                core.send_agent(&session_id, AgentEvent::Budget {
+                    used_tokens: receipt.tokens_after,
+                    context_tokens: receipt.context_tokens,
+                });
+                core.send_agent(&session_id, AgentEvent::Compacted {
+                    tokens_before: receipt.tokens_before,
+                    tokens_after: receipt.tokens_after,
+                    compacted_messages: receipt.compacted_messages,
                 });
             }
+            Err(message) => core.send_agent(&session_id, AgentEvent::Error { message }),
         }
-        // Released together, under the same outer lock the claim took them
-        // with, for the same reason spawn_guarded_turn does.
-        let mut running = core.running.lock().unwrap();
-        core.cancel_flags.lock().unwrap().remove(&session_id);
-        running.remove(&session_id);
     });
     Ok(())
 }
@@ -1214,13 +1241,14 @@ pub fn compact_session(
 /// The compaction cycle `/compact` forces: one iteration of the turn loop's
 /// budget block minus the completion request. Hydrates, takes the transcript
 /// under a guard, prunes to the trigger's target, settles the digest, and
-/// persists with a rewrite (the prune edited history).
+/// persists with a rewrite (the prune edited history). Returns the receipt
+/// rather than emitting it: the wrapper owns event order against the claim.
 async fn run_compact(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
     cancelled: &Arc<CancelToken>,
-) -> Result<(), String> {
+) -> Result<CompactReceipt, String> {
     ensure_session_hydrated(core, session_id, project_root).await;
     let settings = core.settings.lock().unwrap().clone();
     let endpoint =
@@ -1258,13 +1286,13 @@ async fn run_compact(
     if tokens_before <= achievable_target(trigger, schema_tokens) {
         // Nothing above the target: say so through the same receipt rather
         // than pruning history that already fits.
-        core.send_agent(session_id, AgentEvent::Compacted {
+        guard.commit().await;
+        return Ok(CompactReceipt {
             tokens_before,
             tokens_after: tokens_before,
             compacted_messages: 0,
+            context_tokens: endpoint.context_tokens,
         });
-        guard.commit().await;
-        return Ok(());
     }
     let before_len = guard.messages().len() as u64;
     let (_, compaction) =
@@ -1290,18 +1318,14 @@ async fn run_compact(
     let tokens_after =
         schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
     save_messages(core, session_id, guard.messages(), true).await;
-    core.send_agent(session_id, AgentEvent::Budget {
-        used_tokens: tokens_after,
-        context_tokens: endpoint.context_tokens,
-    });
-    core.send_agent(session_id, AgentEvent::Compacted {
+    sessions::touch(core, session_id);
+    guard.commit().await;
+    Ok(CompactReceipt {
         tokens_before,
         tokens_after,
         compacted_messages,
-    });
-    sessions::touch(core, session_id);
-    guard.commit().await;
-    Ok(())
+        context_tokens: endpoint.context_tokens,
+    })
 }
 
 /// Install a rebuilt registry + system prompt into a live session and persist
@@ -5401,8 +5425,10 @@ mod tests {
 
     /// The forced path owes everything the budget path owes: the archive,
     /// the record, the digest note, the on-disk rewrite, the receipt event,
-    /// and the release of the session claim.
-    #[tokio::test]
+    /// and the release of the session claim. Multi-threaded on purpose: the
+    /// receipt-only-after-release ordering is exactly what a parallel event
+    /// consumer observes, and a current-thread runtime cannot see the gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compact_session_prunes_records_persists_and_releases() {
         use crate::state::Core;
 
@@ -5445,6 +5471,12 @@ mod tests {
             {
                 match env.event {
                     AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
+                        // The receipt is the cue frontends submit queued
+                        // prompts on, so the claim must already be free.
+                        assert!(
+                            !core.is_running(&id),
+                            "the receipt must arrive only after the claim releases"
+                        );
                         receipt = Some((tokens_before, tokens_after, compacted_messages));
                         break;
                     }
