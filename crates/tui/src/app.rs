@@ -675,6 +675,10 @@ impl App {
         self.session_id = None;
         self.transcript = Transcript::new();
         self.running = false;
+        // Session-scoped like `running`: the old session's receipt is
+        // filtered out once the id changes, so a flag left armed here would
+        // misroute the next session's first Error into the compaction branch.
+        self.compacting = false;
         self.stream_text.clear();
         self.thinking_chars = 0;
         self.thinking_tail.clear();
@@ -3897,6 +3901,23 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    /// A /new issued mid-compaction must not leave the compaction flag
+    /// armed: the old session's receipt is filtered out after the id
+    /// changes, and a stale flag would misroute the next session's first
+    /// Error into the compaction branch, clearing `running` while the core
+    /// still owns a turn (whose next prompt then skips the queue).
+    #[test]
+    fn a_session_reset_clears_the_compaction_flag_with_the_running_one() {
+        let (mut app, dir) = app_fixture();
+        app.session_id = Some("old".into());
+        app.running = true;
+        app.compacting = true;
+        app.reset_for_new_session();
+        assert!(!app.running);
+        assert!(!app.compacting, "compaction state is session-scoped, like running");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
