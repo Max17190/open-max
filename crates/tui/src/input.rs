@@ -17,7 +17,9 @@ use crate::ui::text;
 
 const MAX_HISTORY: usize = 200;
 
-/// Cells the `❯ `/`… ` gutter takes from every rendered row.
+/// Cells the gutter takes from every rendered row: `❯ ` on the first row of
+/// the draft, `… ` on a top row that is scrolled off its start, blank on
+/// every other row.
 const GUTTER: usize = 2;
 
 /// Rows the composer may occupy before a draft starts scrolling inside it.
@@ -530,10 +532,14 @@ impl Composer {
         let selection = self.selection_bounds();
         let rows = self.cached_rows();
         let mut out = Vec::with_capacity(visible);
-        for row in rows.iter().skip(self.scroll).take(visible) {
-            // The prompt caret marks the true start of the draft, so a
-            // continuation gutter on the top row is the signal that there is
-            // more text scrolled above.
+        for (seen, row) in rows.iter().skip(self.scroll).take(visible).enumerate() {
+            // The caret marks the true start of the draft. Every other row of
+            // the same draft pays the gutter in blank cells: a glyph per
+            // continuation row is noise on every multi-line prompt, and the
+            // transcript already renders a wrapped user message this way. The
+            // one row that earns a glyph is a top row that is not the start of
+            // the draft, where `…` is the only signal that the view is
+            // scrolled and there is more text above.
             let prefix = if row.line == 0 && row.start == 0 {
                 Span::styled(
                     "❯ ",
@@ -541,8 +547,10 @@ impl Composer {
                         .fg(theme::ACCENT())
                         .add_modifier(Modifier::BOLD),
                 )
-            } else {
+            } else if seen == 0 {
                 Span::styled("… ", Style::default().fg(theme::DIM()))
+            } else {
+                Span::raw("  ")
             };
             if self.is_empty() {
                 out.push(Line::from(vec![
@@ -763,7 +771,7 @@ impl Composer {
     }
 }
 
-/// Cells left for text once the `❯ `/`… ` gutter is paid for.
+/// Cells left for text once the gutter is paid for.
 fn text_width(width: u16) -> usize {
     (width as usize).saturating_sub(GUTTER).max(1)
 }
@@ -891,14 +899,36 @@ mod tests {
         assert_eq!((cursor_x, cursor_y), (2, 0));
     }
 
+    /// A multi-line draft pays the gutter in blank cells, not in a glyph per
+    /// row: the text stays aligned under the caret and nothing competes with
+    /// it for the eye. The transcript renders a wrapped user message the same
+    /// way, so a draft and its echo line up column for column.
     #[test]
-    fn multiline_composer_keeps_distinct_continuation_gutter() {
+    fn multiline_composer_indents_continuation_rows_with_blank_cells() {
         let mut composer = Composer::new(&std::env::temp_dir());
         composer.insert_str("first\nsecond");
         let (lines, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!(plain(&lines[0]), "❯ first");
-        assert_eq!(plain(&lines[1]), "… second");
+        assert_eq!(plain(&lines[1]), "  second");
         assert_eq!((cursor_x, cursor_y), (8, 1));
+    }
+
+    /// The one row that still earns a glyph: a top row that is not the start
+    /// of the draft, where `…` is the only thing saying the view is scrolled
+    /// and there is text above. Rows under it stay blank.
+    #[test]
+    fn only_a_scrolled_top_row_marks_the_gutter() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        for i in 0..10 {
+            composer.insert_str(&format!("line {i:02}\n"));
+        }
+        let (width, height) = (20, 4);
+        let rows: Vec<String> = composer.render(width, height).0.iter().map(plain).collect();
+        assert_eq!(rows[0], "… line 07");
+        assert!(
+            rows[1..].iter().all(|row| row.starts_with("  ")),
+            "a row below the top should not repeat the scroll mark: {rows:?}",
+        );
     }
 
     #[test]
