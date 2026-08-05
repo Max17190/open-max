@@ -810,9 +810,13 @@ impl App {
                                 if let Some((line, x)) =
                                     self.transcript_position(m.column, m.row)
                                 {
-                                    self.transcript.update_text_selection_at(line, x);
+                                    // The release of a gesture's own click
+                                    // must not shrink the word or line it
+                                    // picked; end_text_selection_at knows.
+                                    self.transcript.end_text_selection_at(line, x);
+                                } else {
+                                    self.transcript.finish_text_selection();
                                 }
-                                self.transcript.finish_text_selection();
                                 self.dirty.mark_selection();
                             }
                         }

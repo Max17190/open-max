@@ -73,6 +73,10 @@ struct TextSelection {
     /// moved yet is indistinguishable from a one-character selection; this is
     /// what tells them apart, and it keeps a plain click from selecting.
     explicit: bool,
+    /// Whether the pointer moved while the button was down. A gesture's own
+    /// release lands back on the pressed cell, and only this distinguishes it
+    /// from a drag that ended there on purpose.
+    moved: bool,
 }
 
 impl TextSelection {
@@ -284,6 +288,7 @@ impl Transcript {
                     head: retreat(selection.head),
                     dragging: selection.dragging,
                     explicit: selection.explicit,
+                    moved: selection.moved,
                 });
             }
         }
@@ -779,6 +784,7 @@ impl Transcript {
             head: point,
             dragging: true,
             explicit: false,
+            moved: false,
         });
         true
     }
@@ -813,6 +819,7 @@ impl Transcript {
             head: point,
             dragging: true,
             explicit: false,
+            moved: false,
         });
         let Some(block) = self.blocks.get(point.block) else {
             return false;
@@ -827,6 +834,7 @@ impl Transcript {
             head: TextPoint { block: point.block, offset: end - 1 },
             dragging: true,
             explicit: true,
+            moved: false,
         });
         true
     }
@@ -839,7 +847,23 @@ impl Transcript {
             return false;
         };
         selection.head = point;
+        selection.moved = true;
         true
+    }
+
+    /// The button came up at `(line_idx, x)`. A selection that was dragged
+    /// takes the character under the release cell (release-inclusive), and a
+    /// plain press always tracks it. A word or line gesture that never moved
+    /// keeps the range the gesture picked: its own release lands back on the
+    /// pressed cell, and snapping the head there would shrink the highlight
+    /// to a fragment of the word the user was shown.
+    pub fn end_text_selection_at(&mut self, line_idx: usize, x: usize) {
+        if let Some(selection) = &self.text_selection {
+            if selection.moved || !selection.explicit {
+                self.update_text_selection_at(line_idx, x);
+            }
+        }
+        self.finish_text_selection();
     }
 
     pub fn finish_text_selection(&mut self) {
@@ -1526,6 +1550,59 @@ mod tests {
         assert!(t.update_text_selection_at(li, 20));
         t.finish_text_selection();
         assert_eq!(t.selected_text().unwrap(), "fn a() -> u32 { 1 }");
+    }
+
+    /// A terminal double- or triple-click is Down, Up, Down, Up: the second
+    /// Down picks the word or line, and the second Up lands back on the
+    /// pressed cell. That release must not drag the head to the click point,
+    /// or the copy carries a fragment of what the highlight promised.
+    #[test]
+    fn a_gesture_survives_its_own_release() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(vec![Line::from("alpha beta gamma")]);
+        t.ensure_flat();
+
+        // Double-click on the middle of "beta", release on the same cell.
+        assert!(t.select_word_at(0, 7));
+        t.end_text_selection_at(0, 7);
+        assert_eq!(t.selected_text().unwrap(), "beta");
+
+        // Triple-click mid-line, release on the same cell.
+        assert!(t.select_line_at(0, 7));
+        t.end_text_selection_at(0, 7);
+        assert_eq!(t.selected_text().unwrap(), "alpha beta gamma");
+    }
+
+    /// A gesture the user then actually drags is a drag: the release cell
+    /// joins the selection, exactly like any other drag.
+    #[test]
+    fn a_dragged_gesture_still_takes_the_release_cell() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(vec![Line::from("alpha beta gamma")]);
+        t.ensure_flat();
+
+        assert!(t.select_word_at(0, 7));
+        assert!(t.update_text_selection_at(0, 12));
+        t.end_text_selection_at(0, 12);
+        // Endpoints are inclusive: the release cell's character comes along.
+        assert_eq!(t.selected_text().unwrap(), "beta ga");
+    }
+
+    /// A plain press whose motion the terminal coalesced away still selects
+    /// press-to-release: with no gesture in play the release cell always
+    /// carries the head.
+    #[test]
+    fn a_plain_press_selects_to_the_release_cell_without_drag_events() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(vec![Line::from("alpha beta gamma")]);
+        t.ensure_flat();
+
+        assert!(t.begin_text_selection_at(0, 0));
+        t.end_text_selection_at(0, 9);
+        assert_eq!(t.selected_text().unwrap(), "alpha beta");
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
