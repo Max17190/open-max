@@ -43,6 +43,10 @@ struct Selection {
     /// looks identical to a one-character selection; this tells them apart and
     /// keeps a plain click from selecting.
     explicit: bool,
+    /// The inclusive range the press picked: the word or line under a
+    /// gesture, the character under a plain press. A drag extends from it
+    /// but never shrinks the selection below it, matching the transcript.
+    origin: (Point, Point),
 }
 
 impl Selection {
@@ -604,7 +608,12 @@ impl Composer {
         self.col = point.1;
         self.follow = true;
         self.hist_idx = None;
-        self.selection = Some(Selection { anchor: point, head: point, explicit: false });
+        self.selection = Some(Selection {
+            anchor: point,
+            head: point,
+            explicit: false,
+            origin: (point, point),
+        });
         self.dragging = true;
     }
 
@@ -613,8 +622,19 @@ impl Composer {
         let Some(current) = self.selection.filter(|_| self.dragging) else {
             return;
         };
-        let head = self.point_at(width, max_h, cell, row);
-        self.selection = Some(Selection { head, ..current });
+        let point = self.point_at(width, max_h, cell, row);
+        // The selection grows from the origin range and never shrinks below
+        // it: past either edge the far edge anchors and the pointer leads;
+        // inside it the selection is exactly the range the press picked.
+        let (lo, hi) = current.origin;
+        let (anchor, head) = if point > hi {
+            (lo, point)
+        } else if point < lo {
+            (hi, point)
+        } else {
+            (lo, hi)
+        };
+        self.selection = Some(Selection { anchor, head, ..current });
         self.row = head.0;
         self.col = head.1;
         self.follow = true;
@@ -647,7 +667,12 @@ impl Composer {
         self.col = point.1;
         self.follow = true;
         self.hist_idx = None;
-        self.selection = Some(Selection { anchor: point, head: point, explicit: false });
+        self.selection = Some(Selection {
+            anchor: point,
+            head: point,
+            explicit: false,
+            origin: (point, point),
+        });
         self.dragging = true;
 
         let (start, end) = bounds(&self.lines[point.0], point.1);
@@ -655,10 +680,12 @@ impl Composer {
             return false;
         }
         self.col = end;
+        let (lo, hi) = ((point.0, start), (point.0, end - 1));
         self.selection = Some(Selection {
-            anchor: (point.0, start),
-            head: (point.0, end - 1),
+            anchor: lo,
+            head: hi,
             explicit: true,
+            origin: (lo, hi),
         });
         true
     }
@@ -1183,6 +1210,36 @@ mod tests {
         assert!(composer.has_selection());
         assert!(!composer.select_line_at(width, height, GUTTER as u16, 1));
         assert_eq!(composer.selected_text(), None, "stale line selection");
+    }
+
+    /// A drag extends a gesture from the range it picked and never shrinks
+    /// the selection below it: dragging inside the double-clicked word keeps
+    /// the word, dragging past it leads with the pointer. The transcript
+    /// clamps the same way.
+    #[test]
+    fn a_composer_gesture_drag_never_shrinks_below_the_word() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("alpha beta gamma");
+        let (width, height) = (40, 6);
+        let cell = |col: usize| (GUTTER + col) as u16;
+
+        // Word gesture on "beta", then a drag that stays inside the word.
+        composer.select_word_at(width, height, cell(7), 0);
+        composer.drag_to(width, height, cell(8), 0);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("beta"));
+
+        // A drag past the word extends from its far edge, inclusive.
+        composer.select_word_at(width, height, cell(7), 0);
+        composer.drag_to(width, height, cell(12), 0);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("beta ga"));
+
+        // A drag before the word anchors on its end.
+        composer.select_word_at(width, height, cell(7), 0);
+        composer.drag_to(width, height, cell(2), 0);
+        composer.finish_selection();
+        assert_eq!(composer.selected_text().as_deref(), Some("pha beta"));
     }
 
     /// The guarantee #132 established for the transcript, now true here too.
