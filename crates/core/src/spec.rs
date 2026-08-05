@@ -571,7 +571,10 @@ outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
 each recorded capability-file change and its actor), `schemas_over_budget`
 (schema_tokens, budget_tokens: the installed tools take most of what the
 window can spend, so compaction runs early and stops entirely once they
-reach it; advisory, at most once per session),
+reach it; advisory, at most once per session), `compacted` (tokens_before,
+tokens_after, compacted_messages: the receipt of a forced compaction;
+compacted_messages of 0 means the transcript was already at or under the
+prune target and nothing changed),
 `hook_failed` (hook, event, detail: a hook did not run - an observe-only hook
 failed, or a hook file on disk is not loaded - and the turn proceeded), `done`
 (stop_reason), `error` (message).
@@ -607,7 +610,8 @@ tool schemas sent on every request, not the transcript alone. Same field,
 same type, larger value (a zero-extension session reports ~1270 where /2
 reported ~720), and it is now exactly the total compaction enforces against
 `context_tokens`; thresholds calibrated against the /2 meaning must be
-re-calibrated. `schemas_over_budget` is new and additive.
+re-calibrated. `schemas_over_budget` is new and additive, and so is
+`compacted`.
 
 Validate a stream against the contract: `openmax --check --stdio` reads JSONL
 on stdin, reports each line, and exits nonzero on any violation.
@@ -776,6 +780,7 @@ mod tests {
             },
             AgentEvent::ApprovalSettled { approval_id: String::new(), outcome: String::new() },
             AgentEvent::Refrozen { tools: 0, skills: 0, changes: Vec::new() },
+            AgentEvent::Compacted { tokens_before: 0, tokens_after: 0, compacted_messages: 0 },
             AgentEvent::HookFailed {
                 hook: String::new(),
                 event: String::new(),

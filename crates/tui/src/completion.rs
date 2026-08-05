@@ -79,6 +79,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         true,
     ),
     command(
+        "compact",
+        "",
+        "prune history to the compacted target now",
+        true,
+    ),
+    command(
         "context",
         "",
         "prompt token costs, cache hits, and budget",

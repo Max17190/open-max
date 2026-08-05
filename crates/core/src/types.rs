@@ -135,6 +135,12 @@ pub enum AgentEvent {
     /// ledger recorded, with who changed it ("tool.toml modified (external)"),
     /// so the action space never mutates silently.
     Refrozen { tools: usize, skills: usize, changes: Vec<String> },
+    /// A forced compaction (`/compact`) finished. The automatic budget prune
+    /// speaks through the digest note it leaves in the transcript; the forced
+    /// path has no following turn to carry that note to, so the receipt is an
+    /// event. `compacted_messages` of 0 means the transcript was already at
+    /// or under the prune target and nothing changed.
+    Compacted { tokens_before: usize, tokens_after: usize, compacted_messages: usize },
     /// The frozen tool schemas take most of what the window has to spend, so
     /// the transcript is squeezed into what little they leave: compaction runs
     /// early and hard, and once `schema_tokens` reaches `budget_tokens` it

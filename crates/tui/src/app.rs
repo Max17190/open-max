@@ -2085,6 +2085,19 @@ impl App {
                     }
                 }
             },
+            "compact" => match &self.session_id {
+                None => self.note("no session yet; nothing to compact"),
+                Some(id) => {
+                    let id = id.clone();
+                    // Spawned by the core: the summary upgrade is a real model
+                    // request, and the event loop must keep painting under it.
+                    // The receipt arrives as a Compacted event.
+                    match agent::compact_session(&self.core, &id, &self.project) {
+                        Ok(()) => self.note("compacting…"),
+                        Err(e) => self.error(&e),
+                    }
+                }
+            },
             "new" => {
                 let old_id = self.session_id.clone();
                 self.reset_for_new_session();
@@ -2503,6 +2516,19 @@ impl App {
                     plural(tools, "tool"),
                     plural(skills, "skill"),
                 ));
+            }
+            AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
+                if compacted_messages == 0 {
+                    self.note(&format!(
+                        "already compact: ~{tokens_before} tokens is at or under the prune target"
+                    ));
+                } else {
+                    self.note(&format!(
+                        "compacted: ~{tokens_before} to ~{tokens_after} tokens, {} archived \
+                         (prompt cache will re-prefill once)",
+                        plural(compacted_messages, "message"),
+                    ));
+                }
             }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Says what it costs and what to do, not how compaction reacts:
