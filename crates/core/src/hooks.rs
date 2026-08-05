@@ -151,6 +151,15 @@ pub struct Hooks {
     /// once the file is gone, which is exactly the position an unparseable
     /// file leaves us in, so it gets the same fail-closed answer.
     missing: Vec<(PathBuf, String)>,
+    /// Why the approval store could not be read, when it could not. Every
+    /// bucket above keys on what a human approved, so with the ledger
+    /// unreadable there is no verdict to sort by: an approved gate cannot be
+    /// told from content nobody blessed. The error fires exactly when the
+    /// chain's tamper detection works (a rewritten record, a partial line
+    /// from an interrupted append, a deleted log with a surviving pin), so
+    /// it gets the revoked-gate answer - nothing runs, tools block - never
+    /// the inert one.
+    ledger_error: Option<String>,
     /// Files whose rewrite is exempt from the fail-closed block: the broken or
     /// revoked hook files themselves and the code they name. Same repair path
     /// permissions already has, for the same reason - a hook the agent can
@@ -260,7 +269,41 @@ impl Hooks {
     /// hook, and dropping a gate is how an edit turns a human gate off, so a
     /// revoked gate fails closed until it is restored or re-approved.
     fn retain_approved(&mut self, data_dir: &Path, project_root: &Path) {
-        let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
+        let approvals = match crate::ledger::approvals(data_dir, project_root) {
+            Ok(approvals) => approvals,
+            Err(reason) => {
+                // An unreadable ledger is a detected state, not an empty
+                // store. Defaulting here would reclassify every approved
+                // gate as "unapproved and inert" - the one bucket that does
+                // not block - so one appended byte in log.jsonl would turn
+                // every human gate off. Nothing unverifiable runs, tool
+                // execution fails closed, and there is no repair carve-out:
+                // the fix lives outside the project (openmax
+                // --ledger-repair), not in any file the agent writes.
+                for list in [
+                    &mut self.pre,
+                    &mut self.post,
+                    &mut self.user_prompt,
+                    &mut self.session_start,
+                    &mut self.compaction,
+                    &mut self.turn_end,
+                ] {
+                    list.clear();
+                }
+                // Loud at turn start, and pointedly not `--approve`: that
+                // command reads the same broken chain and fails with the
+                // same error, so prescribing it would name a dead end.
+                self.notices.push(HookFailure {
+                    hook: "capability ledger".into(),
+                    event: "all events",
+                    detail: format!(
+                        "no hook approval can be verified, failing closed until the ledger is repaired (openmax --ledger-repair): {reason}"
+                    ),
+                });
+                self.ledger_error = Some(reason);
+                return;
+            }
+        };
         let mut revoked_gates = Vec::new();
         let mut repair_paths = Vec::new();
         let mut notices = Vec::new();
@@ -396,6 +439,7 @@ impl Hooks {
             && self.invalid.is_empty()
             && self.revoked_gates.is_empty()
             && self.missing.is_empty()
+            && self.ledger_error.is_none()
     }
 
     /// Non-empty when a hook a human installed stopped being enforceable: its
@@ -405,6 +449,9 @@ impl Hooks {
     /// that policy silently.
     fn fail_closed_reason(&self) -> Option<String> {
         let mut parts = Vec::new();
+        if let Some(reason) = self.ledger_fail_closed_reason() {
+            parts.push(reason);
+        }
         if !self.invalid.is_empty() {
             parts.push(format!(
                 "invalid hook file(s), failing closed until fixed or removed (see openmax --check): {}",
@@ -424,6 +471,21 @@ impl Hooks {
             ));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// The one fail-closed state that also blocks prompt submission, kept in
+    /// one place so both gates give the same reason. Broken or revoked hook
+    /// files keep submission open on purpose: their repair carve-out writes
+    /// project files from inside a turn, so a turn must be able to start.
+    /// The ledger is repaired from the shell, outside any turn, and an
+    /// approved user_prompt_submit gate not running means the text reaches
+    /// the model endpoint and the transcript, which no later block undoes.
+    fn ledger_fail_closed_reason(&self) -> Option<String> {
+        self.ledger_error.as_ref().map(|err| {
+            format!(
+                "the capability ledger cannot be read, so no hook approval can be verified; failing closed until a human repairs it (openmax --ledger-repair): {err}"
+            )
+        })
     }
 
     /// True when this call rewrites one of the files that is failing closed
@@ -527,6 +589,9 @@ impl Hooks {
         cwd: &Path,
         cancel: &Arc<CancelToken>,
     ) -> PreToolResult {
+        if let Some(reason) = self.ledger_fail_closed_reason() {
+            return PreToolResult::Block { reason };
+        }
         for hook in &self.user_prompt {
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
@@ -1340,6 +1405,71 @@ mod tests {
             hooks.pre_tool_use("s", "write_file", &elsewhere, &tmp, &cancel).await,
             PreToolResult::Block { .. }
         ));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The ledger erroring is a verdict, not an empty store: it fires exactly
+    /// when tamper detection works (a rewritten chain, a partial line from an
+    /// interrupted append, a deleted log with a surviving pin). An approved
+    /// gate must fail closed on that verdict, the same answer a revoked gate
+    /// gets, never be reclassified as content nobody blessed - "unapproved
+    /// and inert" is the one bucket that does not block, so collapsing the
+    /// error into it lets one bash append to log.jsonl turn every human gate
+    /// off.
+    #[tokio::test]
+    async fn an_unreadable_ledger_fails_closed_instead_of_unapproving_gates() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let toml = hooks_dir.join("gate.toml");
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        assert_eq!(Hooks::discover(&tmp, &data).pre.len(), 1, "healthy chain: the gate loads");
+
+        // One garbage byte through bash is enough to break the chain read.
+        let log = crate::ledger::project_dir(&data, &tmp).join("log.jsonl");
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        text.push_str("{\"v\":1,");
+        std::fs::write(&log, text).unwrap();
+
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.pre.len(), 0, "nothing unverifiable runs");
+        let cancel = Arc::new(CancelToken::default());
+        let blocked = hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        match blocked {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("--ledger-repair"), "the block must name the repair: {reason}");
+            }
+            other => panic!("tool execution must fail closed on an unreadable ledger, got {other:?}"),
+        }
+        // No carve-out: the repair lives outside the project, so no project
+        // write is exempt from the block.
+        let repair = serde_json::json!({"path": ".openmax/hooks/gate.toml", "content": "x"});
+        assert!(matches!(
+            hooks.pre_tool_use("s", "write_file", &repair, &tmp, &cancel).await,
+            PreToolResult::Block { .. }
+        ));
+        // The prompt gate fails closed too: an approved user_prompt_submit
+        // hook (a secret or PII screen) not running means the text would
+        // reach the model endpoint and the transcript, which no later block
+        // can undo.
+        let submitted = hooks.user_prompt_submit("s", "the prompt", &tmp, &cancel).await;
+        match submitted {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("--ledger-repair"), "{reason}");
+            }
+            other => panic!("prompt submission must fail closed on an unreadable ledger, got {other:?}"),
+        }
+        // Loud at turn start, and the notice must not prescribe --approve,
+        // which fails under the same broken chain.
+        let notices = hooks.notices();
+        assert!(
+            notices.iter().any(|n| n.detail.contains("--ledger-repair")),
+            "{notices:?}"
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 
