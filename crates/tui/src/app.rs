@@ -1044,14 +1044,23 @@ impl App {
                         .completion
                         .as_ref()
                         .is_some_and(|p| p.selected_item().is_some());
-                    if has_item {
+                    // A command typed out in full is finished, not half-typed:
+                    // accepting it would replace the token with itself and
+                    // reopen the popup, so Enter looped as a no-op and the
+                    // bare form of /provider, /approvals, or a template was
+                    // unreachable without Esc. Enter on an exact match closes
+                    // the popup and submits as typed; Tab keeps completing.
+                    if key.code == KeyCode::Enter && self.completion_is_typed_exactly() {
+                        self.completion = None;
+                    } else if has_item {
                         if let Some(command) = self.accept_completion() {
                             self.handle_submit(command).await?;
                         }
                         return Ok(());
+                    } else {
+                        // "No matches": close and let Enter submit as typed.
+                        self.completion = None;
                     }
-                    // "No matches": close and let Enter submit as typed.
-                    self.completion = None;
                 }
                 KeyCode::Esc => {
                     self.completion = None;
@@ -1669,6 +1678,26 @@ impl App {
 
     /// Accept the selected completion into the composer. Returns a command to
     /// submit immediately for no-argument slash commands.
+    /// Whether the selected completion is already typed out in full, so
+    /// accepting it could only add its argument-positioning trailing space.
+    /// The token under the cursor is compared to the item's insert text with
+    /// that trailing space ignored.
+    fn completion_is_typed_exactly(&self) -> bool {
+        let Some(popup) = &self.completion else {
+            return false;
+        };
+        let Some(item) = popup.selected_item() else {
+            return false;
+        };
+        let (_, _, line) = self.composer.cursor_context();
+        let token: String = line
+            .chars()
+            .skip(popup.token_start)
+            .take(popup.token_len)
+            .collect();
+        token == item.insert.trim_end()
+    }
+
     fn accept_completion(&mut self) -> Option<String> {
         let popup = self.completion.take()?;
         let item = popup.selected_item()?.clone();
@@ -4655,6 +4684,49 @@ mod tests {
 
         assert!(app.completion.is_none());
         assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A command that takes arguments (`submits: false`) typed out in full:
+    /// Enter must run its bare form, not re-accept the completion. Accepting
+    /// replaced the token with itself and reopened the popup, so Enter looped
+    /// and bare /provider, /approvals, or a template was unreachable
+    /// without Esc.
+    #[tokio::test]
+    async fn enter_on_a_fully_typed_argument_command_submits_its_bare_form() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("/provider");
+        app.sync_completion();
+        assert!(app.completion.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.completion.is_none());
+        assert!(app.composer.is_empty(), "draft: {:?}", app.composer.text());
+        assert!(
+            app.transcript.block_count() > 0,
+            "the bare command should have produced output"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tab on the same exact match keeps its completing semantics: it inserts
+    /// the argument-positioning trailing space, and nothing submits.
+    #[tokio::test]
+    async fn tab_on_a_fully_typed_argument_command_does_not_submit() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("/provider");
+        app.sync_completion();
+        assert!(app.completion.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.composer.text(), "/provider ");
+        assert_eq!(app.transcript.block_count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
