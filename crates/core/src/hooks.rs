@@ -258,9 +258,10 @@ impl Hooks {
     /// Keep only hooks whose exact content a human approved - the TOML *and*
     /// the project-local code it runs. Hooks run with host authority on every
     /// matching call with no per-invocation gate, so they are the one
-    /// capability file that is inert until approved: via
-    /// `openmax --approve <path>`, or automatically when a human approves the
-    /// in-session writes that created the file and its script.
+    /// capability file that is inert until approved: `openmax --approve
+    /// <path>`, a human act from outside any agent turn. An in-session
+    /// write approval approves the write and nothing more - the card shows
+    /// a clipped preview, and a preview is not shown bytes.
     ///
     /// What happens to the rest depends on whether the path was ever live,
     /// because the two cases are opposites. Content nobody approved never
@@ -983,8 +984,8 @@ mod tests {
     }
 
     /// The approval boundary itself: an unapproved hook never runs, and the
-    /// same content approved (as `openmax --approve` or an in-session write
-    /// approval would) is live on the next discovery.
+    /// same content approved (as `openmax --approve` would) is live on the
+    /// next discovery.
     #[test]
     fn unapproved_hooks_are_inert_until_their_content_is_approved() {
         let tmp = tempfile_dir();

@@ -275,8 +275,8 @@ Each run receives one JSON payload on stdin:
 Approval: a hook is inert until a human approves its exact content - the
 `.toml` *and* the project-local file its `command` (or a path in `args`) names,
 because that file is the code that actually runs and the agent can rewrite it.
-`openmax --approve <hook.toml>` approves the pair and prints both; approving
-the in-session write of either file approves those bytes. A `command` outside
+`openmax --approve <hook.toml>` approves the pair and prints both; an
+in-session write approval never stands in for it. A `command` outside
 the project root (an absolute path, a name on PATH) is covered by the manifest
 approval alone: that path is what the human read, and system binaries change
 on their own schedule. The bytes are re-checked before every run, so a script

@@ -1493,82 +1493,6 @@ async fn refreeze_if_extensions_changed(
     }
 }
 
-/// After a human approved a write_file/edit_file, record the resulting content
-/// as approved when those bytes are part of a capability: the manifest itself,
-/// or a script an installed manifest runs. The approval prompt shows the path
-/// and the head of the content, so what is blessed here is what the human just
-/// read. Anything else (auto-mode writes, bash heredocs, files arriving from
-/// outside) stays unapproved until a human acts.
-///
-/// The two cases are kept separate on purpose. Approving a manifest write
-/// blesses the manifest only - it names a command whose content the human was
-/// not shown - and approving a code write blesses that code only. Writing the
-/// pair in either order therefore costs no extra prompt, and neither approval
-/// covers bytes nobody looked at.
-fn record_capability_write_approval(
-    core: &Arc<Core>,
-    session_id: &str,
-    project_root: &Path,
-    tool: &str,
-    args: &serde_json::Value,
-) {
-    if tool != "write_file" && tool != "edit_file" {
-        return;
-    }
-    let Some(rel) = args.get("path").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let path = project_root.join(rel);
-    let is_manifest = rel.starts_with(".openmax/tools/")
-        || rel.starts_with(".openmax/hooks/")
-        || (rel.starts_with(".agents/skills/") && rel.ends_with("SKILL.md"));
-    if !is_manifest && !is_code_of_installed_manifest(&core.data_dir, &path, project_root) {
-        return;
-    }
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
-    };
-    let sha = crate::ledger::sha256_hex(&bytes);
-    if let Err(e) =
-        crate::ledger::approve_capability(&core.data_dir, project_root, &path, &[sha])
-    {
-        core.send_agent(
-            session_id,
-            AgentEvent::Error {
-                message: format!("write approval could not be recorded for {rel}: {e}"),
-            },
-        );
-    }
-}
-
-/// Whether some installed tool or hook manifest runs exactly this file. The
-/// manifest need not be approved yet: these bytes grant nothing on their own,
-/// and the file may well be written before the manifest that names it.
-fn is_code_of_installed_manifest(data_dir: &Path, path: &Path, project_root: &Path) -> bool {
-    let Ok(target) = path.canonicalize() else {
-        return false;
-    };
-    let dirs = crate::hooks::hook_dirs(project_root)
-        .into_iter()
-        .chain(crate::registry::external_tool_dirs(data_dir, project_root));
-    for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for entry in rd.flatten() {
-            let manifest = entry.path();
-            if manifest.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-            let runs_it = crate::ledger::manifest_code(&manifest, project_root)
-                .into_iter()
-                .any(|c| c.path.canonicalize().map(|p| p == target).unwrap_or(false));
-            if runs_it {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
 /// ledger failure never blocks activation, but it is reported in the receipt
 /// rather than swallowed. The flag says whether the sync actually landed:
@@ -2231,7 +2155,6 @@ async fn run_loop(
                 let unapproved_source =
                     unapproved_capability(&registry, &core.data_dir, project_root, name);
                 let mut executed = false;
-                let mut prompt_approved = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
                     (tools::ToolOutcome {
                         ok: false,
@@ -2248,7 +2171,6 @@ async fn run_loop(
                     match request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await {
                         ApprovalOutcome::Approved => {
                             executed = true;
-                            prompt_approved = true;
                             // Approving the first run of an unapproved tool
                             // approves this exact content - the manifest and
                             // the code it runs: later runs of the same bytes
@@ -2309,13 +2231,6 @@ async fn run_loop(
                     guard.messages().push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
                     stop_reason = "cancelled".into();
                     break 'turns;
-                }
-
-                if prompt_approved && outcome.ok {
-                    // An in-session approval of a capability-file write is a
-                    // human content approval: record the resulting hash so
-                    // the file is live without a second prompt.
-                    record_capability_write_approval(core, session_id, project_root, name, &args);
                 }
 
                 if executed {
@@ -3051,26 +2966,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The two-file workflow in either order: a human-approved write of a
-    /// script an installed manifest runs approves those bytes, so writing the
-    /// pair never costs an extra prompt, and neither approval covers bytes
-    /// the human was not shown.
+    /// Approving a write approves that write and nothing more: a capability
+    /// manifest the agent writes stays gated by unapproved_source on its
+    /// first call, whatever prompt let the bytes onto disk. The write card
+    /// clips args to a short preview, so a standing content bless riding on
+    /// it covered bytes no human was shown. Content approval happens where
+    /// the content is named: the unapproved_source prompt, or --approve.
     #[test]
-    fn a_script_an_installed_manifest_runs_is_recognized_as_capability_code() {
-        let project = std::env::temp_dir().join(format!("openmax-code-{}", uuid::Uuid::new_v4()));
-        let tools_dir = project.join(".openmax/tools");
-        std::fs::create_dir_all(&tools_dir).unwrap();
-        std::fs::write(project.join("deploy.sh"), "#!/bin/sh\ntrue\n").unwrap();
-        std::fs::write(project.join("notes.md"), "not code\n").unwrap();
+    fn an_approved_manifest_write_never_blesses_its_content() {
+        let dir = std::env::temp_dir().join(format!("openmax-bless-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let args = serde_json::json!({
+            "path": ".openmax/tools/peek.toml",
+            "content": "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/echo\"\nmutating = false\n",
+        });
+        // The bytes land exactly as the approved write_file call lands them.
         std::fs::write(
-            tools_dir.join("deploy.toml"),
-            "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n",
+            project.join(".openmax/tools/peek.toml"),
+            args["content"].as_str().unwrap(),
         )
         .unwrap();
-
-        assert!(is_code_of_installed_manifest(&project.join("data"), &project.join("deploy.sh"), &project));
-        assert!(!is_code_of_installed_manifest(&project.join("data"), &project.join("notes.md"), &project));
-        let _ = std::fs::remove_dir_all(project);
+        let registry = crate::registry::Registry::build(&project.join("data"), &project);
+        assert!(
+            unapproved_capability(&registry, &core.data_dir, &project, "peek").is_some(),
+            "the first call must still raise unapproved_source"
+        );
+        assert!(
+            crate::ledger::approved_hashes(&core.data_dir, &project).unwrap().is_empty(),
+            "no write may leave a standing content approval behind"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn msg(role: &str, len: usize) -> ChatMessage {
