@@ -1270,8 +1270,18 @@ async fn run_compact(
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
     let schema_tokens = estimate_tokens(registry.schemas_wire_arc().len());
     let budget = endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024);
-    let trigger =
-        compaction_trigger(budget, schema_tokens, settings.compaction_tokens, guard.messages());
+    // Manual semantics: aim at the configured trigger itself, not through
+    // `compaction_trigger`, whose tail-feasibility fallback exists to stop
+    // the budget path refiring every iteration. A one-shot user command
+    // cannot thrash, and inheriting the fallback made /compact answer
+    // "already compact" at 27k against a 20k setting whenever two fat
+    // messages sat in the protected tail (measured in the pty rig), while
+    // the next turn's automatic pass compacted the same transcript. The
+    // schema futility guard below still applies to both paths.
+    let trigger = settings
+        .compaction_tokens
+        .map(|requested| requested.max(COMPACTION_TOKENS_FLOOR).min(budget))
+        .unwrap_or(budget);
     let tokens_before =
         schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
     if schemas_exceed_budget(trigger, schema_tokens) {
@@ -5421,6 +5431,74 @@ mod tests {
         assert!(digest.is_some_and(|d| d.message_count > 0));
         let after: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
         assert!(after <= prune_target(budget), "and lands on the same target: {after}");
+    }
+
+    /// Dogfooded in the pty rig: with two fat replies in the protected tail
+    /// the auto trigger falls back to the window budget (correctly, against
+    /// per-iteration refiring), and /compact inheriting that fallback
+    /// answered "nothing to prune" at 27k against a 20k setting, while the
+    /// very next automatic pass pruned the same transcript. The manual path
+    /// must aim at the configured trigger itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forced_compact_aims_at_the_setting_where_the_auto_path_falls_back() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir()
+            .join(format!("openmax-compact-manual-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.context_tokens = 400_000;
+            s.max_tokens = 2_048;
+            s.compaction_tokens = Some(20_000);
+        }
+        {
+            let mut data = build_session_data(&core, &id, &project);
+            for _ in 0..3 {
+                data.messages.push(ChatMessage::user("next part please"));
+                data.messages.push(ChatMessage::assistant(Some("a".repeat(33_000)), None));
+            }
+            // The fat tail puts the automatic path in its fallback band:
+            // enforce_budget must hold still on this exact transcript.
+            let schema_tokens = estimate_tokens(data.registry.schemas_wire_arc().len());
+            let budget = 400_000 - (2_048 + 1024);
+            assert_eq!(
+                compaction_trigger(budget, schema_tokens, Some(20_000), &data.messages),
+                budget,
+                "fixture must sit in the fallback band"
+            );
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+
+        compact_session(&core, &id, &project).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut receipt = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
+                        receipt = Some((tokens_before, tokens_after, compacted_messages));
+                        break;
+                    }
+                    AgentEvent::Error { message } => panic!("compaction errored: {message}"),
+                    _ => {}
+                }
+            }
+        }
+        let (before, after, dropped) = receipt.expect("a Compacted receipt must arrive");
+        assert!(dropped > 0, "the manual path must prune where the auto fallback holds");
+        assert!(after < before, "tokens reclaimed: {before} -> {after}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The forced path owes everything the budget path owes: the archive,
