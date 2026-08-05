@@ -2580,9 +2580,9 @@ impl App {
                     }
                 }
                 if compacted_messages == 0 {
-                    self.note(&format!(
-                        "already compact: ~{tokens_before} tokens is at or under the prune target"
-                    ));
+                    // No target claim here: a zero receipt can also mean the
+                    // prune stopped at the protected floor, not under target.
+                    self.note(&format!("nothing to prune (~{tokens_before} tokens)"));
                 } else {
                     self.note(&format!(
                         "compacted: ~{tokens_before} to ~{tokens_after} tokens, {} archived \
