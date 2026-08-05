@@ -1661,7 +1661,8 @@ async fn run_loop(
         if schemas_outgrow_budget(budget, schema_tokens) {
             report_schemas_over_budget(core, session_id, schema_tokens, budget).await;
         }
-        let trigger = compaction_trigger(budget, schema_tokens, settings.compaction_tokens);
+        let trigger =
+            compaction_trigger(budget, schema_tokens, settings.compaction_tokens, guard.messages());
         let before_len = guard.messages().len() as u64;
         let (budget_changed, compaction) = enforce_budget(guard.messages(), trigger, schema_tokens);
         // The prune rewrote absolute message indices; resume boundaries in
@@ -2505,16 +2506,42 @@ fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
 /// re-pay a summary request) every few iterations.
 const COMPACTION_TOKENS_FLOOR: usize = 20_000;
 
+/// What the digest note itself may cost after a prune, in tokens: the summary
+/// cap plus the structured fields. Counted into the irreducible floor below,
+/// so a trigger is only honored when its target has room for the note too.
+const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 400;
+
 /// The token total at which compaction fires. Defaults to the window-derived
 /// `budget`; the `compaction_tokens` setting can only pull it lower, never
 /// past the budget, because the budget is what guarantees the request still
-/// fits the endpoint. A setting the frozen schemas outgrow is unachievable
-/// (pruning cannot get under it), so it falls back to the budget rather than
-/// leaving compaction disarmed while the transcript grows toward the window.
-fn compaction_trigger(budget: usize, schema_tokens: usize, setting: Option<usize>) -> usize {
+/// fits the endpoint. Two unachievable shapes fall back to the budget rather
+/// than leaving the loop stuck: a setting the frozen schemas outgrow (pruning
+/// cannot get under it, and the futility guard would disarm compaction while
+/// the transcript grows toward the window), and a setting whose target the
+/// irreducible transcript outgrows (the pinned head, the newest messages the
+/// drop loop's length floor protects, and the note a prune leaves; a prune
+/// would end at the floor still over the target and re-fire on every
+/// iteration, paying an archive and a summary request each time).
+fn compaction_trigger(
+    budget: usize,
+    schema_tokens: usize,
+    setting: Option<usize>,
+    messages: &[ChatMessage],
+) -> usize {
     let Some(requested) = setting else { return budget };
     let trigger = requested.max(COMPACTION_TOKENS_FLOOR).min(budget);
     if schemas_outgrow_budget(trigger, schema_tokens) {
+        return budget;
+    }
+    let irreducible: usize = schema_tokens
+        + DIGEST_NOTE_ALLOWANCE_TOKENS
+        + messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < 2 || i + 6 >= messages.len())
+            .map(|(_, m)| m.estimated_tokens())
+            .sum::<usize>();
+    if prune_target(trigger) < irreducible {
         budget
     } else {
         trigger
@@ -4932,9 +4959,6 @@ mod tests {
     fn a_compaction_setting_pulls_the_trigger_below_the_window_budget() {
         let budget = 100_000;
         let schema_tokens = 500;
-        let trigger = compaction_trigger(budget, schema_tokens, Some(30_000));
-        assert_eq!(trigger, 30_000);
-
         let mut messages = vec![msg("system", 400), msg("user", 400)];
         while schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>()
             <= 30_000
@@ -4942,6 +4966,8 @@ mod tests {
             messages.push(msg("assistant", 2_000));
             messages.push(msg("user", 2_000));
         }
+        let trigger = compaction_trigger(budget, schema_tokens, Some(30_000), &messages);
+        assert_eq!(trigger, 30_000);
         let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens);
         assert!(changed, "over the setting must prune with the window budget still far away");
         let total: usize =
@@ -4961,8 +4987,8 @@ mod tests {
     /// endpoint, and unset means the budget exactly.
     #[test]
     fn the_compaction_setting_never_raises_the_trigger() {
-        assert_eq!(compaction_trigger(50_000, 500, Some(400_000)), 50_000);
-        assert_eq!(compaction_trigger(50_000, 500, None), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, Some(400_000), &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, None, &[]), 50_000);
     }
 
     /// A setting whose prune target the frozen schemas outgrow can never be
@@ -4974,7 +5000,33 @@ mod tests {
         let budget = 150_000;
         let schema_tokens = 18_000;
         assert!(schemas_outgrow_budget(20_000, schema_tokens));
-        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000)), budget);
+        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &[]), budget);
+    }
+
+    /// The other unachievable shape: a protected tail the setting's target
+    /// cannot contain. Pruning would stop at the drop loop's length floor
+    /// still over the target and fire again on every iteration, paying an
+    /// archive and a summary request each time, so the setting must fall
+    /// back to the window budget instead of arming that loop.
+    #[test]
+    fn a_setting_the_protected_tail_outgrows_falls_back_to_the_window_budget() {
+        let budget = 200_000;
+        let schema_tokens = 500;
+        // Six tool-heavy messages the drop loop may never remove, together
+        // well past the floored setting's 14k prune target.
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..3 {
+            messages.push(msg("assistant", 200));
+            messages.push(msg("tool", 30_000));
+        }
+        assert_eq!(
+            compaction_trigger(budget, schema_tokens, Some(20_000), &messages),
+            budget,
+            "an unreachable target must not arm per-iteration compaction"
+        );
+        // The same setting over a lean transcript stays in force.
+        let lean = vec![msg("system", 400), msg("user", 400)];
+        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &lean), 20_000);
     }
 
     /// Typos do not configure thrash: a tiny setting rides the floor, where
@@ -4982,7 +5034,7 @@ mod tests {
     #[test]
     fn a_tiny_compaction_setting_is_floored() {
         assert_eq!(
-            compaction_trigger(100_000, 500, Some(1_000)),
+            compaction_trigger(100_000, 500, Some(1_000), &[]),
             COMPACTION_TOKENS_FLOOR
         );
     }
