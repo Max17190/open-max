@@ -1,13 +1,20 @@
-# Open Max
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/openmax-wordmark-dark.svg">
+    <img src="docs/assets/openmax-wordmark.svg" alt="Open Max">
+  </picture>
+</p>
 
-**A self-extending Rust agent harness for coding in the terminal.**
+<p align="center"><strong>A self-extending Rust agent harness for coding in the terminal.</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="Rust"></a>
+</p>
 
 Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at the model server you choose: local, cloud, or a private proxy. No desktop shell, no heavyweight runtime, no telemetry.
 
 You own the endpoints, the tools, the skills, and the context.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 
 ## Features
 
