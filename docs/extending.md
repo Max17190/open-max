@@ -331,11 +331,15 @@ Three hard rules ride on this, with no rule language to widen them:
   immediately before every run, so a script rewritten between two calls of one
   turn does not run either.
 
-Approvals happen two ways: a human approving an in-session `write_file` or
-`edit_file` approves those exact bytes when they are part of a capability -
-the manifest, or a script an installed manifest runs - so writing the pair in
-either order costs no extra prompt, and `openmax --approve <path>` approves a
-file that arrived from outside (a clone, an installer, an auto-mode write).
+Approvals happen two ways: answering the `unapproved_source` prompt an
+external tool raises on its first call - the card names the manifest and its
+hash, and approving blesses the manifest and the code it runs - and `openmax
+--approve <path>` for everything else (a hook, a file that arrived from a
+clone or an installer, an auto-mode write). Approving an in-session
+`write_file` or `edit_file` of a capability file approves that write and
+nothing more: the approval card shows a clipped preview of the arguments, and
+a preview is not shown bytes, so a tool the agent writes still prompts on its
+first call and a hook stays inert until `--approve`.
 `--approve` on a manifest blesses the code it names in the same act and prints
 every path and hash it blessed, because a human cannot approve bytes they were
 not shown; it refuses when that code cannot be read. Like `--trust-project`,
