@@ -607,15 +607,40 @@ const DROPPED_MSG_TAIL_CHARS: usize = 300;
 const MAX_DIGEST_PATHS_FRESH: usize = 8;
 const MAX_DIGEST_PATHS: usize = 12;
 const MAX_DIGEST_TOOLS: usize = 16;
+/// Per-entry caps on what those fields accept, enforced at record and absorb
+/// time: anything longer is not a real path or tool name (the registry caps
+/// names at 64 ASCII chars), and one pathological call must not blow the
+/// note past `DIGEST_NOTE_ALLOWANCE_TOKENS`, which is derived from these
+/// caps. Denominated in BYTES, like every cap feeding the note: the token
+/// estimator is bytes/4, so a char-denominated cap would let multibyte
+/// fields cost up to four times what the allowance reserves.
+const MAX_DIGEST_PATH_BYTES: usize = 256;
+const MAX_DIGEST_TOOL_BYTES: usize = 64;
+/// Byte cap on one recorded user-goal snippet, same denomination as above.
+const MAX_DIGEST_SNIPPET_BYTES: usize = 120;
 
-/// What one prune may spend on summarizer input. The summary request's prompt
-/// side has `budget + 1024` tokens of room (`budget` already reserves
-/// max_tokens + 1024 out of the window), so 4 x budget chars ~= budget tokens
+/// What one prune may spend on summarizer input, in bytes. The summary
+/// request's prompt side has `budget + 1024` tokens of room (`budget` already
+/// reserves max_tokens + 1024 out of the window), so 4 x budget bytes ~= budget tokens
 /// leaves the reserve for the system line and envelope. Floored so small
 /// windows keep useful fidelity, capped so giant windows do not pay giant
 /// summary requests.
 fn dropped_text_cap(budget: usize) -> usize {
     budget.saturating_mul(4).clamp(DROPPED_TEXT_CAP_FLOOR, DROPPED_TEXT_CAP_CEIL)
+}
+
+/// Byte-capped take on a char boundary. Every note field and the summarizer
+/// input are budgeted in bytes (the estimator is bytes/4), and a plain byte
+/// slice could split a multibyte char; this is the one cut both use.
+fn take_note_bytes(s: &str, max_bytes: usize) -> String {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if i + c.len_utf8() > max_bytes {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    s[..end].to_string()
 }
 
 /// Head-plus-tail excerpt of one dropped message body: both ends survive, the
@@ -674,7 +699,7 @@ impl CompactionDigest {
         self.dropped.push(msg.clone());
         // Cap by chars so a single tool-call-heavy assistant message cannot
         // blow past the summary-request budget after the size check.
-        let remaining = self.text_cap.saturating_sub(self.dropped_text.chars().count());
+        let remaining = self.text_cap.saturating_sub(self.dropped_text.len());
         if remaining > 0 {
             let mut line = format!("{}: ", msg.role);
             if let Some(c) = msg.content.as_deref() {
@@ -690,7 +715,7 @@ impl CompactionDigest {
                 }
             }
             line.push('\n');
-            self.dropped_text.extend(line.chars().take(remaining));
+            self.dropped_text.push_str(&take_note_bytes(&line, remaining));
         }
         if msg.role == "user" {
             if let Some(c) = msg.content.as_deref() {
@@ -699,7 +724,7 @@ impl CompactionDigest {
                     && !trimmed.starts_with(DIGEST_PREFIX)
                     && self.user_snippets.len() < 4
                 {
-                    let snippet: String = trimmed.chars().take(120).collect();
+                    let snippet = take_note_bytes(trimmed, MAX_DIGEST_SNIPPET_BYTES);
                     if !self.user_snippets.iter().any(|s| s == &snippet) {
                         self.user_snippets.push(snippet);
                     }
@@ -712,12 +737,15 @@ impl CompactionDigest {
         }
         let Some(calls) = &msg.tool_calls else { return };
         for call in calls {
-            if !call.function.name.is_empty() {
+            if !call.function.name.is_empty()
+                && call.function.name.len() <= MAX_DIGEST_TOOL_BYTES
+            {
                 self.tools.insert(call.function.name.clone());
             }
             if let Ok(v) = serde_json::from_str::<Value>(&call.function.arguments) {
                 if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
-                    if self.paths.len() < MAX_DIGEST_PATHS_FRESH
+                    if path.len() <= MAX_DIGEST_PATH_BYTES
+                        && self.paths.len() < MAX_DIGEST_PATHS_FRESH
                         && !self.paths.iter().any(|p| p == path)
                     {
                         self.paths.push(path.to_string());
@@ -737,13 +765,19 @@ impl CompactionDigest {
             if self.tools.len() >= MAX_DIGEST_TOOLS {
                 break;
             }
-            self.tools.insert(tool.clone());
+            // Length-capped like fresh entries: records written before the
+            // caps existed must not smuggle oversized fields into new notes.
+            if tool.len() <= MAX_DIGEST_TOOL_BYTES {
+                self.tools.insert(tool.clone());
+            }
         }
         for path in &prior.paths {
             if self.paths.len() >= MAX_DIGEST_PATHS {
                 break;
             }
-            if !self.paths.iter().any(|p| p == path) {
+            if path.len() <= MAX_DIGEST_PATH_BYTES
+                && !self.paths.iter().any(|p| p == path)
+            {
                 self.paths.push(path.clone());
             }
         }
@@ -810,7 +844,7 @@ impl CompactionDigest {
 /// whenever this returns None (error, timeout, cancel, or empty reply). One
 /// request per compaction, which is rare by construction (hysteresis prune).
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
-const MAX_SUMMARY_CHARS: usize = 1_200;
+const MAX_SUMMARY_BYTES: usize = 1_200;
 
 /// `core` and `session_id` are taken only to bill this request: the
 /// summarizer is a real model call against the same endpoint, and a ledger
@@ -870,8 +904,8 @@ async fn summarize_compaction(
     if summary.is_empty() {
         return None;
     }
-    if summary.chars().count() > MAX_SUMMARY_CHARS {
-        return Some(summary.chars().take(MAX_SUMMARY_CHARS).collect::<String>() + "…");
+    if summary.len() > MAX_SUMMARY_BYTES {
+        return Some(take_note_bytes(&summary, MAX_SUMMARY_BYTES) + "…");
     }
     Some(summary)
 }
@@ -1661,8 +1695,10 @@ async fn run_loop(
         if schemas_outgrow_budget(budget, schema_tokens) {
             report_schemas_over_budget(core, session_id, schema_tokens, budget).await;
         }
+        let trigger =
+            compaction_trigger(budget, schema_tokens, settings.compaction_tokens, guard.messages());
         let before_len = guard.messages().len() as u64;
-        let (budget_changed, compaction) = enforce_budget(guard.messages(), budget, schema_tokens);
+        let (budget_changed, compaction) = enforce_budget(guard.messages(), trigger, schema_tokens);
         // The prune rewrote absolute message indices; resume boundaries in
         // the session meta must follow or replay dividers drift.
         let after_len = guard.messages().len() as u64;
@@ -2496,6 +2532,65 @@ fn schemas_exceed_budget(budget: usize, schema_tokens: usize) -> bool {
 /// gap. Either way the session is degraded and says so once.
 fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
     schema_tokens >= prune_target(budget)
+}
+
+/// Floor for the `compaction_tokens` setting. The prune target is 70% of the
+/// trigger, so the hysteresis gap is 30% of it; below this floor the gap is
+/// too small to buy append-only turns, and the session would re-prune (and
+/// re-pay a summary request) every few iterations.
+const COMPACTION_TOKENS_FLOOR: usize = 20_000;
+
+/// What the digest note itself may cost after a prune, in tokens. An upper
+/// bound, not a guess: the prefix and count, sixteen tool names of at most
+/// 64 bytes, twelve paths of at most 256, four user snippets of 120, the
+/// 1200-byte summary cap, the archive address, and the closing line come to
+/// ~5,000 bytes, ~1,260 tokens with the message envelope. Every cap is in
+/// bytes because the estimator is bytes/4. The gate test formats a digest
+/// at every cap and asserts it fits, so this constant and the format cannot
+/// drift apart. Counted into the irreducible floor below, so a trigger is
+/// only honored when its target has room for the note too.
+const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_300;
+
+/// The token total at which compaction fires. Defaults to the window-derived
+/// `budget`; the `compaction_tokens` setting can only pull it lower, never
+/// past the budget, because the budget is what guarantees the request still
+/// fits the endpoint. Two unachievable shapes fall back to the budget rather
+/// than leaving the loop stuck: a setting the frozen schemas outgrow (pruning
+/// cannot get under it, and the futility guard would disarm compaction while
+/// the transcript grows toward the window), and a setting whose target the
+/// irreducible transcript outgrows; a prune would end at the floor still
+/// over the target and re-fire on every iteration, paying an archive and a
+/// summary request each time.
+///
+/// Irreducible means exactly what a maximal prune leaves: the drop loop's
+/// six-message length floor ends at the pinned head, the digest note, and
+/// the newest three messages, so those (plus the note's own allowance) are
+/// what the target must contain. Counting more would fall back while a
+/// configured prune could in fact succeed, silently disabling the setting.
+fn compaction_trigger(
+    budget: usize,
+    schema_tokens: usize,
+    setting: Option<usize>,
+    messages: &[ChatMessage],
+) -> usize {
+    let Some(requested) = setting else { return budget };
+    let trigger = requested.max(COMPACTION_TOKENS_FLOOR).min(budget);
+    if schemas_outgrow_budget(trigger, schema_tokens) {
+        return budget;
+    }
+    let irreducible: usize = schema_tokens
+        + DIGEST_NOTE_ALLOWANCE_TOKENS
+        + messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < 2 || i + 3 >= messages.len())
+            .map(|(_, m)| m.estimated_tokens())
+            .sum::<usize>();
+    if prune_target(trigger) < irreducible {
+        budget
+    } else {
+        trigger
+    }
 }
 
 /// The context joined to a provider error when the request that failed was
@@ -4900,6 +4995,175 @@ mod tests {
         );
         let headroom = budget - total;
         assert!(headroom > 0, "a hysteresis gap must survive, got {headroom}");
+    }
+
+    /// The setting exists for windows compaction never reaches: a transcript
+    /// over the setting but far under the window budget must prune, through
+    /// the same machinery, down to the same 70% hysteresis of the setting.
+    #[test]
+    fn a_compaction_setting_pulls_the_trigger_below_the_window_budget() {
+        let budget = 100_000;
+        let schema_tokens = 500;
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        while schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>()
+            <= 30_000
+        {
+            messages.push(msg("assistant", 2_000));
+            messages.push(msg("user", 2_000));
+        }
+        let trigger = compaction_trigger(budget, schema_tokens, Some(30_000), &messages);
+        assert_eq!(trigger, 30_000);
+        let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens);
+        assert!(changed, "over the setting must prune with the window budget still far away");
+        let total: usize =
+            schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        assert!(
+            total <= prune_target(trigger),
+            "the prune aims at the setting's own hysteresis target: {total}"
+        );
+        assert!(
+            !enforce_budget(&mut messages, trigger, schema_tokens).0,
+            "and the gap buys append-only turns, same as at the window"
+        );
+    }
+
+    /// One direction only: a setting above the budget must not delay
+    /// compaction past the point where the request stops fitting the
+    /// endpoint, and unset means the budget exactly.
+    #[test]
+    fn the_compaction_setting_never_raises_the_trigger() {
+        assert_eq!(compaction_trigger(50_000, 500, Some(400_000), &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, None, &[]), 50_000);
+    }
+
+    /// A setting whose prune target the frozen schemas outgrow can never be
+    /// reached by pruning. It must fall back to the window budget, not feed
+    /// the futility guard: passing it through would disarm compaction
+    /// entirely while the transcript grows toward the real window.
+    #[test]
+    fn an_unachievable_compaction_setting_falls_back_to_the_window_budget() {
+        let budget = 150_000;
+        let schema_tokens = 18_000;
+        assert!(schemas_outgrow_budget(20_000, schema_tokens));
+        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &[]), budget);
+    }
+
+    /// The other unachievable shape: a protected tail the setting's target
+    /// cannot contain. Pruning would stop at the drop loop's length floor
+    /// still over the target and fire again on every iteration, paying an
+    /// archive and a summary request each time, so the setting must fall
+    /// back to the window budget instead of arming that loop.
+    #[test]
+    fn a_setting_the_protected_tail_outgrows_falls_back_to_the_window_budget() {
+        let budget = 200_000;
+        let schema_tokens = 500;
+        // Six tool-heavy messages the drop loop may never remove, together
+        // well past the floored setting's 14k prune target.
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..3 {
+            messages.push(msg("assistant", 200));
+            messages.push(msg("tool", 30_000));
+        }
+        assert_eq!(
+            compaction_trigger(budget, schema_tokens, Some(20_000), &messages),
+            budget,
+            "an unreachable target must not arm per-iteration compaction"
+        );
+        // The same setting over a lean transcript stays in force.
+        let lean = vec![msg("system", 400), msg("user", 400)];
+        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &lean), 20_000);
+
+        // And the floor counts only what a maximal prune actually leaves:
+        // the pinned head, the note, and the newest three. Six mid-sized
+        // messages whose newest three fit the target must not trip the
+        // fallback just because all six together would not.
+        let mut boundary = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..6 {
+            boundary.push(msg("assistant", 9_600));
+        }
+        assert_eq!(
+            compaction_trigger(budget, schema_tokens, Some(20_000), &boundary),
+            20_000,
+            "a reachable target must keep the setting in force"
+        );
+    }
+
+    /// The feasibility check reserves DIGEST_NOTE_ALLOWANCE_TOKENS for the
+    /// note a prune leaves, so the note must actually be bounded: garbage
+    /// path arguments and hallucinated tool names, fresh or carried in from
+    /// a pre-cap record, must never enter the digest fields.
+    #[test]
+    fn pathological_tool_calls_cannot_enter_the_digest_fields() {
+        let mut digest = CompactionDigest::new(dropped_text_cap(10_000));
+        digest.record_message(&assistant_with_tools(
+            &"t".repeat(MAX_DIGEST_TOOL_BYTES + 1),
+            &format!("{{\"path\":\"{}\"}}", "p".repeat(MAX_DIGEST_PATH_BYTES * 40)),
+        ));
+        // Multibyte entries under the old char caps but over the byte caps:
+        // the allowance is bytes/4, so these must be rejected too.
+        digest.record_message(&assistant_with_tools(
+            &"Ā".repeat(40),
+            &format!("{{\"path\":\"{}\"}}", "€".repeat(100)),
+        ));
+        digest.record_message(&ChatMessage::user("€".repeat(400)));
+        digest.record_message(&assistant_with_tools(
+            "read_file",
+            "{\"path\":\"src/lib.rs\"}",
+        ));
+        digest.absorb_prior(&sessions::CompactionRecord {
+            ts: 0,
+            message_count: 9,
+            tools: vec!["x".repeat(50_000), "€".repeat(100)],
+            paths: vec!["y".repeat(50_000), "Ā".repeat(200)],
+            user_snippets: Vec::new(),
+            digest: String::new(),
+        });
+        assert_eq!(digest.tools.iter().cloned().collect::<Vec<_>>(), vec!["read_file"]);
+        assert_eq!(digest.paths, vec!["src/lib.rs"]);
+        assert!(
+            digest.user_snippets.iter().all(|s| s.len() <= MAX_DIGEST_SNIPPET_BYTES),
+            "snippets are byte-capped like every other note field"
+        );
+    }
+
+    /// The other half of the same contract: a digest at every cap must format
+    /// to a note within the allowance, or the trigger check would arm a
+    /// target enforce_budget can never reach and compact on every iteration.
+    /// This is the lockstep gate between the constant and the format.
+    #[test]
+    fn the_digest_note_at_its_caps_stays_within_the_allowance() {
+        let mut digest = CompactionDigest::new(dropped_text_cap(10_000));
+        digest.message_count = 999;
+        for i in 0..MAX_DIGEST_TOOLS {
+            digest.tools.insert(format!("{}{i:02}", "t".repeat(MAX_DIGEST_TOOL_BYTES - 2)));
+        }
+        for i in 0..MAX_DIGEST_PATHS {
+            digest.paths.push(format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_BYTES - 2)));
+        }
+        for _ in 0..4 {
+            digest.user_snippets.push("s".repeat(120));
+        }
+        let archive = "a".repeat(200);
+        let summary = "m".repeat(MAX_SUMMARY_BYTES + 1);
+        for note in
+            [digest.format(Some(&archive)), digest.format_with_summary(&summary, Some(&archive))]
+        {
+            let cost = ChatMessage::user(note).estimated_tokens();
+            assert!(
+                cost <= DIGEST_NOTE_ALLOWANCE_TOKENS,
+                "a note at every cap costs {cost}, over the {DIGEST_NOTE_ALLOWANCE_TOKENS} allowance"
+            );
+        }
+    }
+
+    /// Typos do not configure thrash: a tiny setting rides the floor, where
+    /// the 30% hysteresis gap is still worth whole turns.
+    #[test]
+    fn a_tiny_compaction_setting_is_floored() {
+        assert_eq!(
+            compaction_trigger(100_000, 500, Some(1_000), &[]),
+            COMPACTION_TOKENS_FLOOR
+        );
     }
 
     /// The condition holds on every turn once it holds at all, so the advisory

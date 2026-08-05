@@ -79,6 +79,12 @@ pub struct Settings {
     /// Byte cap for bash/external tool output before tail-truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
+    /// Compact when the estimated request (transcript plus frozen tool
+    /// schemas) crosses this many tokens, instead of waiting for the
+    /// window-derived budget. One-directional: it can only fire compaction
+    /// earlier. Values above the budget, below the built-in floor, or
+    /// unreachable under the frozen schemas fall back to the budget.
+    pub compaction_tokens: Option<usize>,
     /// Cap on agent tool/model iterations per turn (main loop).
     #[serde(default = "default_max_agent_iterations")]
     pub max_agent_iterations: usize,
@@ -108,6 +114,7 @@ impl Default for Settings {
             max_tokens: 4096,
             temperature: 0.2,
             max_output_bytes: None,
+            compaction_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
         }
@@ -172,6 +179,15 @@ mod tests {
         assert_eq!(defaulted.max_parallel_tools, 4);
         let configured: Settings = serde_json::from_str(r#"{"max_parallel_tools":7}"#).unwrap();
         assert_eq!(configured.max_parallel_tools, 7);
+    }
+
+    #[test]
+    fn compaction_tokens_parses_and_defaults_to_none() {
+        let defaulted: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.compaction_tokens, None);
+        let configured: Settings =
+            serde_json::from_str(r#"{"compaction_tokens":150000}"#).unwrap();
+        assert_eq!(configured.compaction_tokens, Some(150_000));
     }
 
     #[test]
