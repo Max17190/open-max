@@ -263,6 +263,10 @@ pub struct App {
     pending_submit: Option<String>,
 
     running: bool,
+    /// The running work is a forced `/compact`, not a turn: it settles on
+    /// `Compacted` (or `Error`), never on `Done`, so those arms own the
+    /// state clearing a turn gets from its terminator.
+    compacting: bool,
     stream_text: String,
     thinking_chars: usize,
     thinking_tail: String,
@@ -507,6 +511,7 @@ impl App {
             queued: Vec::new(),
             flush_queue: false,
             running: false,
+            compacting: false,
             stream_text: String::new(),
             thinking_chars: 0,
             thinking_tail: String::new(),
@@ -670,6 +675,10 @@ impl App {
         self.session_id = None;
         self.transcript = Transcript::new();
         self.running = false;
+        // Session-scoped like `running`: the old session's receipt is
+        // filtered out once the id changes, so a flag left armed here would
+        // misroute the next session's first Error into the compaction branch.
+        self.compacting = false;
         self.stream_text.clear();
         self.thinking_chars = 0;
         self.thinking_tail.clear();
@@ -2085,6 +2094,27 @@ impl App {
                     }
                 }
             },
+            "compact" => match &self.session_id {
+                None => self.note("no session yet; nothing to compact"),
+                Some(id) => {
+                    let id = id.clone();
+                    // Spawned by the core: the summary upgrade is a real model
+                    // request, and the event loop must keep painting under it.
+                    // Marked running like a turn so prompts queue instead of
+                    // being refused and Esc cancels; the receipt (Compacted,
+                    // or Error) settles the state Done would for a turn.
+                    match agent::compact_session(&self.core, &id, &self.project) {
+                        Ok(()) => {
+                            self.running = true;
+                            self.compacting = true;
+                            self.set_presence(Presence::Working);
+                            self.dirty.mark_chrome();
+                            self.note("compacting…");
+                        }
+                        Err(e) => self.error(&e),
+                    }
+                }
+            },
             "new" => {
                 let old_id = self.session_id.clone();
                 self.reset_for_new_session();
@@ -2504,6 +2534,28 @@ impl App {
                     plural(skills, "skill"),
                 ));
             }
+            AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
+                if self.compacting {
+                    self.compacting = false;
+                    self.running = false;
+                    self.set_presence(Presence::Idle);
+                    self.dirty.mark_chrome();
+                    if !self.queued.is_empty() {
+                        self.flush_queue = true;
+                    }
+                }
+                if compacted_messages == 0 {
+                    self.note(&format!(
+                        "already compact: ~{tokens_before} tokens is at or under the prune target"
+                    ));
+                } else {
+                    self.note(&format!(
+                        "compacted: ~{tokens_before} to ~{tokens_after} tokens, {} archived \
+                         (prompt cache will re-prefill once)",
+                        plural(compacted_messages, "message"),
+                    ));
+                }
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Says what it costs and what to do, not how compaction reacts:
                 // that depends on whether any room is left at all.
@@ -2583,6 +2635,14 @@ impl App {
                 }
             }
             AgentEvent::Error { message } => {
+                if self.compacting {
+                    // A failed compaction has no Done to settle it; mirror
+                    // the failed-turn policy, queue back to the composer.
+                    self.compacting = false;
+                    self.running = false;
+                    self.set_presence(Presence::Idle);
+                    self.return_queue_to_composer();
+                }
                 self.pending_approval = None;
                 self.dirty.mark_chrome();
                 self.error(&message);
@@ -3841,6 +3901,23 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    /// A /new issued mid-compaction must not leave the compaction flag
+    /// armed: the old session's receipt is filtered out after the id
+    /// changes, and a stale flag would misroute the next session's first
+    /// Error into the compaction branch, clearing `running` while the core
+    /// still owns a turn (whose next prompt then skips the queue).
+    #[test]
+    fn a_session_reset_clears_the_compaction_flag_with_the_running_one() {
+        let (mut app, dir) = app_fixture();
+        app.session_id = Some("old".into());
+        app.running = true;
+        app.compacting = true;
+        app.reset_for_new_session();
+        assert!(!app.running);
+        assert!(!app.compacting, "compaction state is session-scoped, like running");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

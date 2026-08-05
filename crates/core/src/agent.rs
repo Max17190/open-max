@@ -915,6 +915,63 @@ fn is_digest_message(msg: &ChatMessage) -> bool {
         && msg.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX))
 }
 
+/// What settling a compaction digest needs from its caller. Borrowed whole,
+/// like `ReadonlyBatchCtx`, so the budget path and the forced `/compact`
+/// share one settlement instead of drifting copies.
+struct CompactionCtx<'a> {
+    core: &'a Arc<Core>,
+    session_id: &'a str,
+    project_root: &'a Path,
+    client: &'a ChatClient,
+    hooks: &'a Hooks,
+    cancelled: &'a Arc<CancelToken>,
+}
+
+/// Everything a prune owes once the transcript is rewritten: the lossless
+/// archive, the digest note upgrade, the compaction record, and the
+/// compaction hook.
+async fn apply_compaction_digest(
+    ctx: &CompactionCtx<'_>,
+    messages: &mut [ChatMessage],
+    mut digest: CompactionDigest,
+) {
+    let CompactionCtx { core, session_id, project_root, client, hooks, cancelled } = *ctx;
+    // The lossless record behind the note's address, written before
+    // the transcript rewrite below makes the edits permanent: both
+    // the pre-truncation originals and the dropped messages. `&` so
+    // both appends are attempted; a failed archive must not be
+    // advertised, so the address is withheld unless both landed.
+    let archived = sessions::append_archive(core, session_id, &digest.truncated)
+        & sessions::append_archive(core, session_id, &digest.dropped);
+    if digest.message_count == 0 {
+        return;
+    }
+    // Structured fields from the previous record carry forward by
+    // code: the prune may have dropped the old digest note, whose
+    // prose is lossy about the paths and tools it condensed.
+    if let Some(prior) = sessions::last_compaction(core, session_id) {
+        digest.absorb_prior(&prior);
+    }
+    let archive = archived.then(|| sessions::archive_display(core, session_id));
+    // Upgrade the heuristic note to a model-written summary when
+    // the endpoint cooperates; the note at index 2 was just
+    // inserted by the prune, so replacing it here keeps one
+    // digest message.
+    let note = match summarize_compaction(core, session_id, client, &digest, cancelled).await {
+        Some(summary) => digest.format_with_summary(&summary, archive.as_deref()),
+        None => digest.format(archive.as_deref()),
+    };
+    if messages.len() > 2 && is_digest_message(&messages[2]) {
+        messages[2] = ChatMessage::user(note.clone());
+    }
+    let record = digest.to_record(note);
+    sessions::append_compaction(core, session_id, &record);
+    if let Ok(value) = serde_json::to_value(&record) {
+        let failures = hooks.compaction(session_id, project_root, &value, cancelled).await;
+        report_hook_failures(core, session_id, failures);
+    }
+}
+
 /// Kick off one agent turn in a session. Errors if that session is already running.
 pub fn start_turn(
     core: Arc<Core>,
@@ -1082,6 +1139,193 @@ pub async fn reload_session(
     )
     .await;
     Ok((counts.0, counts.1, reload_receipt))
+}
+
+/// Force one compaction cycle now, outside any turn: prune to the same
+/// hysteresis target the budget path uses, settle everything a prune owes
+/// (archive, note, record, hook), and persist. The work runs off the
+/// caller's loop because the note upgrade is a real model request; the
+/// receipt arrives as a `Compacted` event, failures as `Error`. Claims the
+/// session exactly like a turn so the two can never interleave.
+/// The numbers one forced compaction reports. Built inside the guarded task,
+/// emitted by the wrapper only after the claim releases: the receipt is the
+/// frontend's cue to resume (queued prompts fire on it), so a receipt sent
+/// while the claim is still held would race the very start_turn it invites
+/// into a spurious "already working" refusal.
+struct CompactReceipt {
+    tokens_before: usize,
+    tokens_after: usize,
+    compacted_messages: usize,
+    context_tokens: usize,
+}
+
+pub fn compact_session(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+) -> Result<(), String> {
+    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
+        return Err(format!(
+            "project {} is not trusted; establish trust before compacting",
+            project_root.display()
+        ));
+    }
+    let cancelled = Arc::new(CancelToken::default());
+    {
+        // Same claim discipline as start_turn: session and cancel token under
+        // one hold, so a running compaction is always cancellable and a turn
+        // can never start into a half-claimed session.
+        let mut running = core.running.lock().unwrap();
+        if running.contains(session_id) {
+            return Err("the agent is already working in this session".into());
+        }
+        core.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), cancelled.clone());
+        running.insert(session_id.to_string());
+    }
+    let core = core.clone();
+    let session_id = session_id.to_string();
+    let project_root = project_root.to_path_buf();
+    tokio::spawn(async move {
+        let work = {
+            let core = core.clone();
+            let session_id = session_id.clone();
+            let project_root = project_root.clone();
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                run_compact(&core, &session_id, &project_root, &cancelled).await
+            })
+        };
+        // Guarded like a turn: a panic inside must still release the claim
+        // and say something, or the session looks busy forever.
+        let outcome = match work.await {
+            Ok(outcome) => outcome,
+            Err(join) => {
+                let detail = if join.is_cancelled() {
+                    "the compaction task was dropped".to_string()
+                } else {
+                    panic_detail(join.into_panic())
+                };
+                Err(format!("compaction ended unexpectedly: {detail}"))
+            }
+        };
+        {
+            // Released together, under the same outer lock the claim took
+            // them with, for the same reason spawn_guarded_turn does; and
+            // strictly before the receipt below, because the receipt is the
+            // frontend's cue to submit queued input against this session.
+            let mut running = core.running.lock().unwrap();
+            core.cancel_flags.lock().unwrap().remove(&session_id);
+            running.remove(&session_id);
+        }
+        match outcome {
+            Ok(receipt) => {
+                core.send_agent(&session_id, AgentEvent::Budget {
+                    used_tokens: receipt.tokens_after,
+                    context_tokens: receipt.context_tokens,
+                });
+                core.send_agent(&session_id, AgentEvent::Compacted {
+                    tokens_before: receipt.tokens_before,
+                    tokens_after: receipt.tokens_after,
+                    compacted_messages: receipt.compacted_messages,
+                });
+            }
+            Err(message) => core.send_agent(&session_id, AgentEvent::Error { message }),
+        }
+    });
+    Ok(())
+}
+
+/// The compaction cycle `/compact` forces: one iteration of the turn loop's
+/// budget block minus the completion request. Hydrates, takes the transcript
+/// under a guard, prunes to the trigger's target, settles the digest, and
+/// persists with a rewrite (the prune edited history). Returns the receipt
+/// rather than emitting it: the wrapper owns event order against the claim.
+async fn run_compact(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    cancelled: &Arc<CancelToken>,
+) -> Result<CompactReceipt, String> {
+    ensure_session_hydrated(core, session_id, project_root).await;
+    let settings = core.settings.lock().unwrap().clone();
+    let endpoint =
+        crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
+    let (messages, registry, take_seq) = {
+        let mut sessions_map = core.sessions.lock().await;
+        let data = sessions_map
+            .get_mut(session_id)
+            .ok_or_else(|| "session state is unavailable; try /new".to_string())?;
+        // A turn that slipped past the running check owns the transcript
+        // (mem::take leaves it empty); refuse rather than compact nothing.
+        if data.messages.is_empty() {
+            return Err("a turn is in flight; run /compact after it finishes".into());
+        }
+        let registry = data.registry.clone();
+        let (messages, seq) = take_messages(data);
+        (messages, registry, seq)
+    };
+    let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
+    let schema_tokens = estimate_tokens(registry.schemas_wire_arc().len());
+    let budget = endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024);
+    let trigger =
+        compaction_trigger(budget, schema_tokens, settings.compaction_tokens, guard.messages());
+    let tokens_before =
+        schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+    if schemas_exceed_budget(trigger, schema_tokens) {
+        guard.commit().await;
+        return Err(
+            "the frozen tool schemas alone fill the window, so pruning cannot help; \
+             uninstall tools (`openmax --spec usage` ranks what each costs) or raise \
+             context_tokens"
+                .into(),
+        );
+    }
+    if tokens_before <= achievable_target(trigger, schema_tokens) {
+        // Nothing above the target: say so through the same receipt rather
+        // than pruning history that already fits.
+        guard.commit().await;
+        return Ok(CompactReceipt {
+            tokens_before,
+            tokens_after: tokens_before,
+            compacted_messages: 0,
+            context_tokens: endpoint.context_tokens,
+        });
+    }
+    let before_len = guard.messages().len() as u64;
+    let (_, compaction) =
+        prune_transcript(guard.messages(), trigger, schema_tokens, tokens_before);
+    let after_len = guard.messages().len() as u64;
+    if after_len < before_len {
+        sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
+    }
+    let compacted_messages = compaction.as_ref().map(|d| d.message_count).unwrap_or(0);
+    if let Some(digest) = compaction {
+        let client = ChatClient::from_endpoint(&endpoint);
+        let hooks = Hooks::discover(project_root, &core.data_dir);
+        let ctx = CompactionCtx {
+            core,
+            session_id,
+            project_root,
+            client: &client,
+            hooks: &hooks,
+            cancelled,
+        };
+        apply_compaction_digest(&ctx, guard.messages(), digest).await;
+    }
+    let tokens_after =
+        schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+    save_messages(core, session_id, guard.messages(), true).await;
+    sessions::touch(core, session_id);
+    guard.commit().await;
+    Ok(CompactReceipt {
+        tokens_before,
+        tokens_after,
+        compacted_messages,
+        context_tokens: endpoint.context_tokens,
+    })
 }
 
 /// Install a rebuilt registry + system prompt into a live session and persist
@@ -1705,42 +1949,16 @@ async fn run_loop(
         if after_len < before_len {
             sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
         }
-        if let Some(mut digest) = compaction {
-            // The lossless record behind the note's address, written before
-            // the transcript rewrite below makes the edits permanent: both
-            // the pre-truncation originals and the dropped messages. `&` so
-            // both appends are attempted; a failed archive must not be
-            // advertised, so the address is withheld unless both landed.
-            let archived = sessions::append_archive(core, session_id, &digest.truncated)
-                & sessions::append_archive(core, session_id, &digest.dropped);
-            if digest.message_count > 0 {
-                // Structured fields from the previous record carry forward by
-                // code: the prune may have dropped the old digest note, whose
-                // prose is lossy about the paths and tools it condensed.
-                if let Some(prior) = sessions::last_compaction(core, session_id) {
-                    digest.absorb_prior(&prior);
-                }
-                let archive = archived.then(|| sessions::archive_display(core, session_id));
-                // Upgrade the heuristic note to a model-written summary when
-                // the endpoint cooperates; the note at index 2 was just
-                // inserted by enforce_budget, so replacing it here keeps one
-                // digest message.
-                let note = match summarize_compaction(core, session_id, &client, &digest, &cancelled).await {
-                    Some(summary) => digest.format_with_summary(&summary, archive.as_deref()),
-                    None => digest.format(archive.as_deref()),
-                };
-                let messages = guard.messages();
-                if messages.len() > 2 && is_digest_message(&messages[2]) {
-                    messages[2] = ChatMessage::user(note.clone());
-                }
-                let record = digest.to_record(note);
-                sessions::append_compaction(core, session_id, &record);
-                if let Ok(value) = serde_json::to_value(&record) {
-                    let failures =
-                        hooks.compaction(session_id, project_root, &value, &cancelled).await;
-                    report_hook_failures(core, session_id, failures);
-                }
-            }
+        if let Some(digest) = compaction {
+            let ctx = CompactionCtx {
+                core,
+                session_id,
+                project_root,
+                client: &client,
+                hooks: &hooks,
+                cancelled: &cancelled,
+            };
+            apply_compaction_digest(&ctx, guard.messages(), digest).await;
         }
         let used = schema_tokens
             + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
@@ -2625,7 +2843,7 @@ fn enforce_budget(
     budget: usize,
     schema_tokens: usize,
 ) -> (bool, Option<CompactionDigest>) {
-    let mut total: usize =
+    let total: usize =
         schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
     if total <= budget {
         return (false, None);
@@ -2637,6 +2855,20 @@ fn enforce_budget(
     if schemas_exceed_budget(budget, schema_tokens) {
         return (false, None);
     }
+    prune_transcript(messages, budget, schema_tokens, total)
+}
+
+/// The prune itself, shared by the budget path and the forced `/compact`,
+/// which fires inside the hysteresis gap where `enforce_budget` correctly
+/// holds still. Truncates old tool outputs toward the live context first,
+/// then drops whole exchanges into the digest until `achievable_target` is
+/// met.
+fn prune_transcript(
+    messages: &mut Vec<ChatMessage>,
+    budget: usize,
+    schema_tokens: usize,
+    mut total: usize,
+) -> (bool, Option<CompactionDigest>) {
     let target = achievable_target(budget, schema_tokens);
     let keep_tail = messages.len().saturating_sub(6);
     // What the transcript will still be about once this prune is done: the
@@ -5164,6 +5396,116 @@ mod tests {
             compaction_trigger(100_000, 500, Some(1_000), &[]),
             COMPACTION_TOKENS_FLOOR
         );
+    }
+
+    /// `/compact` exists to fire inside the hysteresis gap, where the budget
+    /// path correctly holds still: between the prune target and the budget,
+    /// enforce_budget must do nothing and the forced prune must still land
+    /// on the same target.
+    #[test]
+    fn a_forced_prune_fires_where_the_budget_path_holds() {
+        let budget = 10_000;
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        while messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_000 {
+            messages.push(msg("assistant", 800));
+            messages.push(msg("user", 800));
+        }
+        let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        assert!(
+            total > prune_target(budget) && total <= budget,
+            "the fixture must sit inside the gap: {total}"
+        );
+        assert!(!enforce_budget(&mut messages, budget, 0).0, "the budget path holds here");
+        let (changed, digest) = prune_transcript(&mut messages, budget, 0, total);
+        assert!(changed, "the forced prune fires where the budget path held");
+        assert!(digest.is_some_and(|d| d.message_count > 0));
+        let after: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        assert!(after <= prune_target(budget), "and lands on the same target: {after}");
+    }
+
+    /// The forced path owes everything the budget path owes: the archive,
+    /// the record, the digest note, the on-disk rewrite, the receipt event,
+    /// and the release of the session claim. Multi-threaded on purpose: the
+    /// receipt-only-after-release ordering is exactly what a parallel event
+    /// consumer observes, and a current-thread runtime cannot see the gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_session_prunes_records_persists_and_releases() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        {
+            // A refused connection, so the summary upgrade fails fast and the
+            // heuristic note is the one that lands.
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.context_tokens = 12_288;
+            s.max_tokens = 1_024;
+        }
+        // budget = 12_288 - (1_024 + 1_024) = 10_240, target 7_168. Build a
+        // transcript that only a forced prune will touch.
+        {
+            let mut data = build_session_data(&core, &id, &project);
+            while data.messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_500 {
+                data.messages.push(ChatMessage::user("q ".repeat(400)));
+                data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+            }
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+
+        compact_session(&core, &id, &project).unwrap();
+        assert!(core.is_running(&id), "a compaction claims the session like a turn");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut receipt = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
+                        // The receipt is the cue frontends submit queued
+                        // prompts on, so the claim must already be free.
+                        assert!(
+                            !core.is_running(&id),
+                            "the receipt must arrive only after the claim releases"
+                        );
+                        receipt = Some((tokens_before, tokens_after, compacted_messages));
+                        break;
+                    }
+                    AgentEvent::Error { message } => panic!("compaction errored: {message}"),
+                    _ => {}
+                }
+            }
+        }
+        let (before, after, dropped) = receipt.expect("a Compacted receipt must arrive");
+        assert!(dropped > 0, "the gap transcript must actually prune");
+        assert!(after < before, "the receipt must show the shrink: {before} -> {after}");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while core.is_running(&id) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!core.is_running(&id), "the claim must release");
+        assert!(sessions::last_compaction(&core, &id).is_some(), "the record sidecar lands");
+        let on_disk = sessions::load_messages(&core, &id).unwrap();
+        assert!(
+            on_disk.len() > 2
+                && on_disk[2]
+                    .content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(DIGEST_PREFIX)),
+            "the digest note is at index 2 on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The condition holds on every turn once it holds at all, so the advisory

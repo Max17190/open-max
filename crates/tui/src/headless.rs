@@ -242,6 +242,14 @@ async fn run_turn_events(
                     );
                 }
             }
+            AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
+                if !json {
+                    let _ = writeln!(
+                        stderr,
+                        "openmax: compacted ~{tokens_before} to ~{tokens_after} tokens ({compacted_messages} messages archived)"
+                    );
+                }
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Advisory: the turn still runs, so the exit code is untouched.
                 if !json {
