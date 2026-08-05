@@ -607,6 +607,12 @@ const DROPPED_MSG_TAIL_CHARS: usize = 300;
 const MAX_DIGEST_PATHS_FRESH: usize = 8;
 const MAX_DIGEST_PATHS: usize = 12;
 const MAX_DIGEST_TOOLS: usize = 16;
+/// Per-entry caps on what those fields accept, enforced at record and absorb
+/// time: anything longer is not a real path or tool name (the registry caps
+/// names at 64), and one pathological call must not blow the note past
+/// `DIGEST_NOTE_ALLOWANCE_TOKENS`, which is derived from these caps.
+const MAX_DIGEST_PATH_CHARS: usize = 256;
+const MAX_DIGEST_TOOL_CHARS: usize = 64;
 
 /// What one prune may spend on summarizer input. The summary request's prompt
 /// side has `budget + 1024` tokens of room (`budget` already reserves
@@ -712,12 +718,15 @@ impl CompactionDigest {
         }
         let Some(calls) = &msg.tool_calls else { return };
         for call in calls {
-            if !call.function.name.is_empty() {
+            if !call.function.name.is_empty()
+                && call.function.name.chars().count() <= MAX_DIGEST_TOOL_CHARS
+            {
                 self.tools.insert(call.function.name.clone());
             }
             if let Ok(v) = serde_json::from_str::<Value>(&call.function.arguments) {
                 if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
-                    if self.paths.len() < MAX_DIGEST_PATHS_FRESH
+                    if path.chars().count() <= MAX_DIGEST_PATH_CHARS
+                        && self.paths.len() < MAX_DIGEST_PATHS_FRESH
                         && !self.paths.iter().any(|p| p == path)
                     {
                         self.paths.push(path.to_string());
@@ -737,13 +746,19 @@ impl CompactionDigest {
             if self.tools.len() >= MAX_DIGEST_TOOLS {
                 break;
             }
-            self.tools.insert(tool.clone());
+            // Length-capped like fresh entries: records written before the
+            // caps existed must not smuggle oversized fields into new notes.
+            if tool.chars().count() <= MAX_DIGEST_TOOL_CHARS {
+                self.tools.insert(tool.clone());
+            }
         }
         for path in &prior.paths {
             if self.paths.len() >= MAX_DIGEST_PATHS {
                 break;
             }
-            if !self.paths.iter().any(|p| p == path) {
+            if path.chars().count() <= MAX_DIGEST_PATH_CHARS
+                && !self.paths.iter().any(|p| p == path)
+            {
                 self.paths.push(path.clone());
             }
         }
@@ -2506,10 +2521,15 @@ fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
 /// re-pay a summary request) every few iterations.
 const COMPACTION_TOKENS_FLOOR: usize = 20_000;
 
-/// What the digest note itself may cost after a prune, in tokens: the summary
-/// cap plus the structured fields. Counted into the irreducible floor below,
+/// What the digest note itself may cost after a prune, in tokens. An upper
+/// bound, not a guess: the prefix and count, sixteen tool names of at most
+/// 64 chars, twelve paths of at most 256, four user snippets of 120, the
+/// 1200-char summary cap, the archive address, and the closing line come to
+/// ~5,000 chars, ~1,260 tokens with the message envelope. The gate test
+/// formats a digest at every cap and asserts it fits, so this constant and
+/// the format cannot drift apart. Counted into the irreducible floor below,
 /// so a trigger is only honored when its target has room for the note too.
-const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 400;
+const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_300;
 
 /// The token total at which compaction fires. Defaults to the window-derived
 /// `budget`; the `compaction_tokens` setting can only pull it lower, never
@@ -5046,6 +5066,63 @@ mod tests {
             20_000,
             "a reachable target must keep the setting in force"
         );
+    }
+
+    /// The feasibility check reserves DIGEST_NOTE_ALLOWANCE_TOKENS for the
+    /// note a prune leaves, so the note must actually be bounded: garbage
+    /// path arguments and hallucinated tool names, fresh or carried in from
+    /// a pre-cap record, must never enter the digest fields.
+    #[test]
+    fn pathological_tool_calls_cannot_enter_the_digest_fields() {
+        let mut digest = CompactionDigest::new(dropped_text_cap(10_000));
+        digest.record_message(&assistant_with_tools(
+            &"t".repeat(MAX_DIGEST_TOOL_CHARS + 1),
+            &format!("{{\"path\":\"{}\"}}", "p".repeat(MAX_DIGEST_PATH_CHARS * 40)),
+        ));
+        digest.record_message(&assistant_with_tools(
+            "read_file",
+            "{\"path\":\"src/lib.rs\"}",
+        ));
+        digest.absorb_prior(&sessions::CompactionRecord {
+            ts: 0,
+            message_count: 9,
+            tools: vec!["x".repeat(50_000)],
+            paths: vec!["y".repeat(50_000)],
+            user_snippets: Vec::new(),
+            digest: String::new(),
+        });
+        assert_eq!(digest.tools.iter().cloned().collect::<Vec<_>>(), vec!["read_file"]);
+        assert_eq!(digest.paths, vec!["src/lib.rs"]);
+    }
+
+    /// The other half of the same contract: a digest at every cap must format
+    /// to a note within the allowance, or the trigger check would arm a
+    /// target enforce_budget can never reach and compact on every iteration.
+    /// This is the lockstep gate between the constant and the format.
+    #[test]
+    fn the_digest_note_at_its_caps_stays_within_the_allowance() {
+        let mut digest = CompactionDigest::new(dropped_text_cap(10_000));
+        digest.message_count = 999;
+        for i in 0..MAX_DIGEST_TOOLS {
+            digest.tools.insert(format!("{}{i:02}", "t".repeat(MAX_DIGEST_TOOL_CHARS - 2)));
+        }
+        for i in 0..MAX_DIGEST_PATHS {
+            digest.paths.push(format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_CHARS - 2)));
+        }
+        for _ in 0..4 {
+            digest.user_snippets.push("s".repeat(120));
+        }
+        let archive = "a".repeat(200);
+        let summary = "m".repeat(MAX_SUMMARY_CHARS + 1);
+        for note in
+            [digest.format(Some(&archive)), digest.format_with_summary(&summary, Some(&archive))]
+        {
+            let cost = ChatMessage::user(note).estimated_tokens();
+            assert!(
+                cost <= DIGEST_NOTE_ALLOWANCE_TOKENS,
+                "a note at every cap costs {cost}, over the {DIGEST_NOTE_ALLOWANCE_TOKENS} allowance"
+            );
+        }
     }
 
     /// Typos do not configure thrash: a tiny setting rides the floor, where
