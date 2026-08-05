@@ -1678,14 +1678,20 @@ impl App {
 
     /// Accept the selected completion into the composer. Returns a command to
     /// submit immediately for no-argument slash commands.
-    /// Whether the selected completion is already typed out in full, so
-    /// accepting it could only add its argument-positioning trailing space.
+    /// Whether the selected completion is a slash command already typed out
+    /// in full, so accepting it could only add its argument-positioning
+    /// trailing space and reopen the popup. Only slash completions loop that
+    /// way: accepting an `@` file mention inserts a separator that closes the
+    /// popup, and Enter there must keep composing, not submit mid-mention.
     /// The token under the cursor is compared to the item's insert text with
-    /// that trailing space ignored.
+    /// its trailing space ignored.
     fn completion_is_typed_exactly(&self) -> bool {
         let Some(popup) = &self.completion else {
             return false;
         };
+        if popup.kind != completion::Kind::Slash {
+            return false;
+        }
         let Some(item) = popup.selected_item() else {
             return false;
         };
@@ -4709,6 +4715,35 @@ mod tests {
             app.transcript.block_count() > 0,
             "the bare command should have produced output"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A fully typed `@` file mention is mid-prompt, not a finished command:
+    /// Enter must accept it and keep composing (the separator closes the
+    /// popup), never submit the draft out from under the user.
+    #[tokio::test]
+    async fn enter_on_a_fully_typed_file_mention_keeps_composing() {
+        let (mut app, dir) = app_fixture();
+        app.composer.load("look at @README.md");
+        app.completion = Some(crate::completion::Popup {
+            kind: crate::completion::Kind::File,
+            items: vec![crate::completion::Item {
+                insert: "@README.md ".into(),
+                label: "README.md".into(),
+                detail: String::new(),
+                submits: false,
+            }],
+            selected: 0,
+            token_start: 8,
+            token_len: 10,
+        });
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.composer.text(), "look at @README.md ");
+        assert_eq!(app.transcript.block_count(), 0, "the draft must not submit");
         fs::remove_dir_all(dir).unwrap();
     }
 
