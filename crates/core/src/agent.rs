@@ -2518,10 +2518,15 @@ const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 400;
 /// than leaving the loop stuck: a setting the frozen schemas outgrow (pruning
 /// cannot get under it, and the futility guard would disarm compaction while
 /// the transcript grows toward the window), and a setting whose target the
-/// irreducible transcript outgrows (the pinned head, the newest messages the
-/// drop loop's length floor protects, and the note a prune leaves; a prune
-/// would end at the floor still over the target and re-fire on every
-/// iteration, paying an archive and a summary request each time).
+/// irreducible transcript outgrows; a prune would end at the floor still
+/// over the target and re-fire on every iteration, paying an archive and a
+/// summary request each time.
+///
+/// Irreducible means exactly what a maximal prune leaves: the drop loop's
+/// six-message length floor ends at the pinned head, the digest note, and
+/// the newest three messages, so those (plus the note's own allowance) are
+/// what the target must contain. Counting more would fall back while a
+/// configured prune could in fact succeed, silently disabling the setting.
 fn compaction_trigger(
     budget: usize,
     schema_tokens: usize,
@@ -2538,7 +2543,7 @@ fn compaction_trigger(
         + messages
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i < 2 || i + 6 >= messages.len())
+            .filter(|(i, _)| *i < 2 || i + 3 >= messages.len())
             .map(|(_, m)| m.estimated_tokens())
             .sum::<usize>();
     if prune_target(trigger) < irreducible {
@@ -5027,6 +5032,20 @@ mod tests {
         // The same setting over a lean transcript stays in force.
         let lean = vec![msg("system", 400), msg("user", 400)];
         assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &lean), 20_000);
+
+        // And the floor counts only what a maximal prune actually leaves:
+        // the pinned head, the note, and the newest three. Six mid-sized
+        // messages whose newest three fit the target must not trip the
+        // fallback just because all six together would not.
+        let mut boundary = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..6 {
+            boundary.push(msg("assistant", 9_600));
+        }
+        assert_eq!(
+            compaction_trigger(budget, schema_tokens, Some(20_000), &boundary),
+            20_000,
+            "a reachable target must keep the setting in force"
+        );
     }
 
     /// Typos do not configure thrash: a tiny setting rides the floor, where
