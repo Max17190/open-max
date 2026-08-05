@@ -357,6 +357,7 @@ async fn main() -> std::io::Result<()> {
                 let mut states: std::collections::HashMap<&str, ObjectState> =
                     std::collections::HashMap::new();
                 let mut damaged = 0usize;
+                let mut restorable = 0usize;
                 for r in &history.records {
                     let short = r.sha256.as_deref().map(|s| &s[..12.min(s.len())]);
                     let where_ = match (r.path.as_os_str().is_empty(), r.sha256.as_deref()) {
@@ -372,6 +373,7 @@ async fn main() -> std::io::Result<()> {
                     // verify on read, not only on write.
                     let note = match (r.kind, r.sha256.as_deref()) {
                         (Kind::Change, Some(sha)) => {
+                            restorable += 1;
                             let state = *states.entry(sha).or_insert_with(|| {
                                 open_max_core::ledger::object_state(&data_dir, &project, sha)
                             });
@@ -436,21 +438,10 @@ async fn main() -> std::io::Result<()> {
                         );
                     }
                 }
-                if objects.is_dir() {
-                    println!(
-                        "\nobjects: {} (restore with cp <objects>/<sha> <path>)",
-                        objects.display()
-                    );
-                    if damaged > 0 {
-                        println!(
-                            "warning: {damaged} record(s) have no trustworthy object; those bytes cannot be restored from this ledger"
-                        );
-                    }
-                } else {
-                    println!(
-                        "\nobjects: {} is gone, so no version above can be restored from this ledger",
-                        objects.display()
-                    );
+                if let Some(summary) =
+                    ledger_objects_summary(objects.is_dir(), restorable, damaged, &objects)
+                {
+                    println!("{summary}");
                 }
                 std::process::exit(0);
             }
@@ -1124,6 +1115,38 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
 /// passed, or the resolved path the prompt printed - and nothing else does:
 /// the point is that a person read which policy is going away, so "y" is not
 /// enough.
+/// The trailing objects-store summary for `--ledger`. `restorable` counts the
+/// change records that name stored bytes; with none, a missing store is the
+/// normal state of an approvals-only ledger, not damage, so warning that
+/// "no version can be restored" would cry wolf over a ledger holding nothing
+/// restorable in the first place.
+fn ledger_objects_summary(
+    store_exists: bool,
+    restorable: usize,
+    damaged: usize,
+    objects: &std::path::Path,
+) -> Option<String> {
+    if store_exists {
+        let mut out = format!(
+            "\nobjects: {} (restore with cp <objects>/<sha> <path>)",
+            objects.display()
+        );
+        if damaged > 0 {
+            out.push_str(&format!(
+                "\nwarning: {damaged} record(s) have no trustworthy object; those bytes cannot be restored from this ledger"
+            ));
+        }
+        Some(out)
+    } else if restorable > 0 {
+        Some(format!(
+            "\nobjects: {} is gone, so no version above can be restored from this ledger",
+            objects.display()
+        ))
+    } else {
+        None
+    }
+}
+
 fn forget_confirmed(answer: &str, given: &str, resolved: &std::path::Path) -> bool {
     let answer = answer.trim();
     !answer.is_empty() && (answer == given.trim() || answer == resolved.display().to_string())
@@ -1302,6 +1325,26 @@ pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// An approvals-only ledger has no objects store because nothing ever
+    /// stored bytes; `--ledger` must not warn that "no version can be
+    /// restored" over records that were never restorable.
+    #[test]
+    fn approvals_only_ledger_reports_no_missing_objects() {
+        let objects = std::path::Path::new("/data/ledger/objects");
+        assert_eq!(ledger_objects_summary(false, 0, 0, objects), None);
+
+        // With stored bytes recorded, a missing store is real damage.
+        let gone = ledger_objects_summary(false, 2, 0, objects).unwrap();
+        assert!(gone.contains("is gone"), "{gone}");
+
+        // A present store keeps the restore hint, plus the damage count.
+        let ok = ledger_objects_summary(true, 2, 0, objects).unwrap();
+        assert!(ok.contains("restore with cp"), "{ok}");
+        assert!(!ok.contains("warning"), "{ok}");
+        let hurt = ledger_objects_summary(true, 2, 1, objects).unwrap();
+        assert!(hurt.contains("1 record(s) have no trustworthy object"), "{hurt}");
+    }
 
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);
