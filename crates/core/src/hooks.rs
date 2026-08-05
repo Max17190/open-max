@@ -449,10 +449,8 @@ impl Hooks {
     /// that policy silently.
     fn fail_closed_reason(&self) -> Option<String> {
         let mut parts = Vec::new();
-        if let Some(err) = &self.ledger_error {
-            parts.push(format!(
-                "the capability ledger cannot be read, so no hook approval can be verified; failing closed until a human repairs it (openmax --ledger-repair): {err}"
-            ));
+        if let Some(reason) = self.ledger_fail_closed_reason() {
+            parts.push(reason);
         }
         if !self.invalid.is_empty() {
             parts.push(format!(
@@ -473,6 +471,21 @@ impl Hooks {
             ));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// The one fail-closed state that also blocks prompt submission, kept in
+    /// one place so both gates give the same reason. Broken or revoked hook
+    /// files keep submission open on purpose: their repair carve-out writes
+    /// project files from inside a turn, so a turn must be able to start.
+    /// The ledger is repaired from the shell, outside any turn, and an
+    /// approved user_prompt_submit gate not running means the text reaches
+    /// the model endpoint and the transcript, which no later block undoes.
+    fn ledger_fail_closed_reason(&self) -> Option<String> {
+        self.ledger_error.as_ref().map(|err| {
+            format!(
+                "the capability ledger cannot be read, so no hook approval can be verified; failing closed until a human repairs it (openmax --ledger-repair): {err}"
+            )
+        })
     }
 
     /// True when this call rewrites one of the files that is failing closed
@@ -576,6 +589,9 @@ impl Hooks {
         cwd: &Path,
         cancel: &Arc<CancelToken>,
     ) -> PreToolResult {
+        if let Some(reason) = self.ledger_fail_closed_reason() {
+            return PreToolResult::Block { reason };
+        }
         for hook in &self.user_prompt {
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
@@ -1436,6 +1452,17 @@ mod tests {
             hooks.pre_tool_use("s", "write_file", &repair, &tmp, &cancel).await,
             PreToolResult::Block { .. }
         ));
+        // The prompt gate fails closed too: an approved user_prompt_submit
+        // hook (a secret or PII screen) not running means the text would
+        // reach the model endpoint and the transcript, which no later block
+        // can undo.
+        let submitted = hooks.user_prompt_submit("s", "the prompt", &tmp, &cancel).await;
+        match submitted {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("--ledger-repair"), "{reason}");
+            }
+            other => panic!("prompt submission must fail closed on an unreadable ledger, got {other:?}"),
+        }
         // Loud at turn start, and the notice must not prescribe --approve,
         // which fails under the same broken chain.
         let notices = hooks.notices();
