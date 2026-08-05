@@ -609,19 +609,38 @@ const MAX_DIGEST_PATHS: usize = 12;
 const MAX_DIGEST_TOOLS: usize = 16;
 /// Per-entry caps on what those fields accept, enforced at record and absorb
 /// time: anything longer is not a real path or tool name (the registry caps
-/// names at 64), and one pathological call must not blow the note past
-/// `DIGEST_NOTE_ALLOWANCE_TOKENS`, which is derived from these caps.
-const MAX_DIGEST_PATH_CHARS: usize = 256;
-const MAX_DIGEST_TOOL_CHARS: usize = 64;
+/// names at 64 ASCII chars), and one pathological call must not blow the
+/// note past `DIGEST_NOTE_ALLOWANCE_TOKENS`, which is derived from these
+/// caps. Denominated in BYTES, like every cap feeding the note: the token
+/// estimator is bytes/4, so a char-denominated cap would let multibyte
+/// fields cost up to four times what the allowance reserves.
+const MAX_DIGEST_PATH_BYTES: usize = 256;
+const MAX_DIGEST_TOOL_BYTES: usize = 64;
+/// Byte cap on one recorded user-goal snippet, same denomination as above.
+const MAX_DIGEST_SNIPPET_BYTES: usize = 120;
 
-/// What one prune may spend on summarizer input. The summary request's prompt
-/// side has `budget + 1024` tokens of room (`budget` already reserves
-/// max_tokens + 1024 out of the window), so 4 x budget chars ~= budget tokens
+/// What one prune may spend on summarizer input, in bytes. The summary
+/// request's prompt side has `budget + 1024` tokens of room (`budget` already
+/// reserves max_tokens + 1024 out of the window), so 4 x budget bytes ~= budget tokens
 /// leaves the reserve for the system line and envelope. Floored so small
 /// windows keep useful fidelity, capped so giant windows do not pay giant
 /// summary requests.
 fn dropped_text_cap(budget: usize) -> usize {
     budget.saturating_mul(4).clamp(DROPPED_TEXT_CAP_FLOOR, DROPPED_TEXT_CAP_CEIL)
+}
+
+/// Byte-capped take on a char boundary. Every note field and the summarizer
+/// input are budgeted in bytes (the estimator is bytes/4), and a plain byte
+/// slice could split a multibyte char; this is the one cut both use.
+fn take_note_bytes(s: &str, max_bytes: usize) -> String {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if i + c.len_utf8() > max_bytes {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    s[..end].to_string()
 }
 
 /// Head-plus-tail excerpt of one dropped message body: both ends survive, the
@@ -680,7 +699,7 @@ impl CompactionDigest {
         self.dropped.push(msg.clone());
         // Cap by chars so a single tool-call-heavy assistant message cannot
         // blow past the summary-request budget after the size check.
-        let remaining = self.text_cap.saturating_sub(self.dropped_text.chars().count());
+        let remaining = self.text_cap.saturating_sub(self.dropped_text.len());
         if remaining > 0 {
             let mut line = format!("{}: ", msg.role);
             if let Some(c) = msg.content.as_deref() {
@@ -696,7 +715,7 @@ impl CompactionDigest {
                 }
             }
             line.push('\n');
-            self.dropped_text.extend(line.chars().take(remaining));
+            self.dropped_text.push_str(&take_note_bytes(&line, remaining));
         }
         if msg.role == "user" {
             if let Some(c) = msg.content.as_deref() {
@@ -705,7 +724,7 @@ impl CompactionDigest {
                     && !trimmed.starts_with(DIGEST_PREFIX)
                     && self.user_snippets.len() < 4
                 {
-                    let snippet: String = trimmed.chars().take(120).collect();
+                    let snippet = take_note_bytes(trimmed, MAX_DIGEST_SNIPPET_BYTES);
                     if !self.user_snippets.iter().any(|s| s == &snippet) {
                         self.user_snippets.push(snippet);
                     }
@@ -719,13 +738,13 @@ impl CompactionDigest {
         let Some(calls) = &msg.tool_calls else { return };
         for call in calls {
             if !call.function.name.is_empty()
-                && call.function.name.chars().count() <= MAX_DIGEST_TOOL_CHARS
+                && call.function.name.len() <= MAX_DIGEST_TOOL_BYTES
             {
                 self.tools.insert(call.function.name.clone());
             }
             if let Ok(v) = serde_json::from_str::<Value>(&call.function.arguments) {
                 if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
-                    if path.chars().count() <= MAX_DIGEST_PATH_CHARS
+                    if path.len() <= MAX_DIGEST_PATH_BYTES
                         && self.paths.len() < MAX_DIGEST_PATHS_FRESH
                         && !self.paths.iter().any(|p| p == path)
                     {
@@ -748,7 +767,7 @@ impl CompactionDigest {
             }
             // Length-capped like fresh entries: records written before the
             // caps existed must not smuggle oversized fields into new notes.
-            if tool.chars().count() <= MAX_DIGEST_TOOL_CHARS {
+            if tool.len() <= MAX_DIGEST_TOOL_BYTES {
                 self.tools.insert(tool.clone());
             }
         }
@@ -756,7 +775,7 @@ impl CompactionDigest {
             if self.paths.len() >= MAX_DIGEST_PATHS {
                 break;
             }
-            if path.chars().count() <= MAX_DIGEST_PATH_CHARS
+            if path.len() <= MAX_DIGEST_PATH_BYTES
                 && !self.paths.iter().any(|p| p == path)
             {
                 self.paths.push(path.clone());
@@ -825,7 +844,7 @@ impl CompactionDigest {
 /// whenever this returns None (error, timeout, cancel, or empty reply). One
 /// request per compaction, which is rare by construction (hysteresis prune).
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
-const MAX_SUMMARY_CHARS: usize = 1_200;
+const MAX_SUMMARY_BYTES: usize = 1_200;
 
 /// `core` and `session_id` are taken only to bill this request: the
 /// summarizer is a real model call against the same endpoint, and a ledger
@@ -885,8 +904,8 @@ async fn summarize_compaction(
     if summary.is_empty() {
         return None;
     }
-    if summary.chars().count() > MAX_SUMMARY_CHARS {
-        return Some(summary.chars().take(MAX_SUMMARY_CHARS).collect::<String>() + "…");
+    if summary.len() > MAX_SUMMARY_BYTES {
+        return Some(take_note_bytes(&summary, MAX_SUMMARY_BYTES) + "…");
     }
     Some(summary)
 }
@@ -2523,12 +2542,13 @@ const COMPACTION_TOKENS_FLOOR: usize = 20_000;
 
 /// What the digest note itself may cost after a prune, in tokens. An upper
 /// bound, not a guess: the prefix and count, sixteen tool names of at most
-/// 64 chars, twelve paths of at most 256, four user snippets of 120, the
-/// 1200-char summary cap, the archive address, and the closing line come to
-/// ~5,000 chars, ~1,260 tokens with the message envelope. The gate test
-/// formats a digest at every cap and asserts it fits, so this constant and
-/// the format cannot drift apart. Counted into the irreducible floor below,
-/// so a trigger is only honored when its target has room for the note too.
+/// 64 bytes, twelve paths of at most 256, four user snippets of 120, the
+/// 1200-byte summary cap, the archive address, and the closing line come to
+/// ~5,000 bytes, ~1,260 tokens with the message envelope. Every cap is in
+/// bytes because the estimator is bytes/4. The gate test formats a digest
+/// at every cap and asserts it fits, so this constant and the format cannot
+/// drift apart. Counted into the irreducible floor below, so a trigger is
+/// only honored when its target has room for the note too.
 const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_300;
 
 /// The token total at which compaction fires. Defaults to the window-derived
@@ -5076,9 +5096,16 @@ mod tests {
     fn pathological_tool_calls_cannot_enter_the_digest_fields() {
         let mut digest = CompactionDigest::new(dropped_text_cap(10_000));
         digest.record_message(&assistant_with_tools(
-            &"t".repeat(MAX_DIGEST_TOOL_CHARS + 1),
-            &format!("{{\"path\":\"{}\"}}", "p".repeat(MAX_DIGEST_PATH_CHARS * 40)),
+            &"t".repeat(MAX_DIGEST_TOOL_BYTES + 1),
+            &format!("{{\"path\":\"{}\"}}", "p".repeat(MAX_DIGEST_PATH_BYTES * 40)),
         ));
+        // Multibyte entries under the old char caps but over the byte caps:
+        // the allowance is bytes/4, so these must be rejected too.
+        digest.record_message(&assistant_with_tools(
+            &"Ā".repeat(40),
+            &format!("{{\"path\":\"{}\"}}", "€".repeat(100)),
+        ));
+        digest.record_message(&ChatMessage::user("€".repeat(400)));
         digest.record_message(&assistant_with_tools(
             "read_file",
             "{\"path\":\"src/lib.rs\"}",
@@ -5086,13 +5113,17 @@ mod tests {
         digest.absorb_prior(&sessions::CompactionRecord {
             ts: 0,
             message_count: 9,
-            tools: vec!["x".repeat(50_000)],
-            paths: vec!["y".repeat(50_000)],
+            tools: vec!["x".repeat(50_000), "€".repeat(100)],
+            paths: vec!["y".repeat(50_000), "Ā".repeat(200)],
             user_snippets: Vec::new(),
             digest: String::new(),
         });
         assert_eq!(digest.tools.iter().cloned().collect::<Vec<_>>(), vec!["read_file"]);
         assert_eq!(digest.paths, vec!["src/lib.rs"]);
+        assert!(
+            digest.user_snippets.iter().all(|s| s.len() <= MAX_DIGEST_SNIPPET_BYTES),
+            "snippets are byte-capped like every other note field"
+        );
     }
 
     /// The other half of the same contract: a digest at every cap must format
@@ -5104,16 +5135,16 @@ mod tests {
         let mut digest = CompactionDigest::new(dropped_text_cap(10_000));
         digest.message_count = 999;
         for i in 0..MAX_DIGEST_TOOLS {
-            digest.tools.insert(format!("{}{i:02}", "t".repeat(MAX_DIGEST_TOOL_CHARS - 2)));
+            digest.tools.insert(format!("{}{i:02}", "t".repeat(MAX_DIGEST_TOOL_BYTES - 2)));
         }
         for i in 0..MAX_DIGEST_PATHS {
-            digest.paths.push(format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_CHARS - 2)));
+            digest.paths.push(format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_BYTES - 2)));
         }
         for _ in 0..4 {
             digest.user_snippets.push("s".repeat(120));
         }
         let archive = "a".repeat(200);
-        let summary = "m".repeat(MAX_SUMMARY_CHARS + 1);
+        let summary = "m".repeat(MAX_SUMMARY_BYTES + 1);
         for note in
             [digest.format(Some(&archive)), digest.format_with_summary(&summary, Some(&archive))]
         {
