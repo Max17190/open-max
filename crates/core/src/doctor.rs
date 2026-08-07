@@ -122,19 +122,22 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
     // Later directories overwrite earlier ones by name, so the last file to
     // claim a name is the live one.
-    mark_shadowed(&mut tools_found, false);
+    let tool_shadows = mark_shadowed(&mut tools_found, false);
     mark_beyond_cap(
         &mut tools_found,
         crate::registry::MAX_EXTERNAL_TOOLS,
+        &tool_shadows,
         |_| true,
         "tool cap",
     );
     // Rules and hook filters resolve against what actually loads, so the
-    // known-tool set is the live entries after shadowing and the cap - a
-    // rule naming a beyond-cap tool is as dead as one naming a typo.
+    // known-tool set is the entries the loader keeps: a rule naming a
+    // beyond-cap tool is as dead as one naming a typo, but a warned entry is
+    // still live - a tool whose command does not exist yet, or whose code
+    // awaits re-approval, loads all the same, so a rule naming it matches.
     external_names = tools_found
         .iter()
-        .filter(|(f, id)| id.is_some() && matches!(f.status, Status::Ok(_)))
+        .filter(|(f, id)| id.is_some() && !matches!(f.status, Status::Err(_)))
         .filter_map(|(_, id)| id.clone())
         .collect();
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
@@ -190,8 +193,8 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             skills_found.push((Finding { kind: "skill", path, status }, id));
         }
     }
-    mark_shadowed(&mut skills_found, false);
-    mark_beyond_cap(&mut skills_found, crate::skills::MAX_SKILLS, |_| true, "skill cap");
+    let skill_shadows = mark_shadowed(&mut skills_found, false);
+    mark_beyond_cap(&mut skills_found, crate::skills::MAX_SKILLS, &skill_shadows, |_| true, "skill cap");
     // The index byte cap drops whole lines from the frozen prompt: a skill
     // past it parses fine, but the model never sees its name, so nothing can
     // ever invoke it. Reproduce the exact accounting the prompt uses, and
@@ -320,12 +323,13 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
     // First stem wins, and a shadowed file is never loaded: the runtime does
     // not fail closed on one, so neither does this.
-    mark_shadowed(&mut hooks_found, true);
+    let hook_shadows = mark_shadowed(&mut hooks_found, true);
     for event in crate::hooks::HookEvent::ALL {
         let event = event.as_str();
         mark_beyond_cap(
             &mut hooks_found,
             crate::hooks::MAX_HOOKS_PER_EVENT,
+            &hook_shadows,
             |i| hook_events.get(i).copied().flatten() == Some(event),
             &format!("{event} hook cap"),
         );
@@ -984,7 +988,9 @@ fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> 
 /// claim a stem, while tools, skills, and templates let a later directory
 /// overwrite an earlier one. Both orders resolve to the project tier, since
 /// each surface lists its directories so the project file is the winner.
-fn mark_shadowed(entries: &mut [Entry], first_wins: bool) {
+/// Returns the shadowed indices: the loader deduplicates before it caps, so
+/// the cap ranking below needs to know which entries never held a slot.
+fn mark_shadowed(entries: &mut [Entry], first_wins: bool) -> std::collections::HashSet<usize> {
     let mut winner: HashMap<String, usize> = HashMap::new();
     for (i, (_, id)) in entries.iter().enumerate() {
         let Some(id) = id else { continue };
@@ -1002,31 +1008,36 @@ fn mark_shadowed(entries: &mut [Entry], first_wins: bool) {
             (w != i).then(|| (i, id.clone(), entries[w].0.path.clone()))
         })
         .collect();
+    let mut indices = std::collections::HashSet::new();
     for (i, id, winner_path) in shadowed {
+        indices.insert(i);
         let kind = entries[i].0.kind;
         entries[i].0.status = Status::Warn(format!(
             "shadowed by {}, where {kind} '{id}' resolves",
             winner_path.display()
         ));
     }
+    indices
 }
 
-/// Mark live (Ok, unshadowed) entries the loader's cap drops. The loader keeps
-/// the identity-sorted head, so ranking live identities reproduces exactly
-/// which files never load. `in_scope` restricts the ranking (hooks cap per
+/// Mark entries the loader's cap drops. The loader counts every parsed,
+/// deduplicated definition against its cap - a tool whose command is missing
+/// still occupies a slot - so the ranking is the parsed winners whatever
+/// their status, and it reproduces exactly which files never load. `shadowed`
+/// excludes the entries deduplication already dropped; `in_scope` restricts
+/// the ranking further (hooks cap per event, and only parsed files hold an
 /// event); `what` names the cap in the message.
 fn mark_beyond_cap(
     entries: &mut [Entry],
     cap: usize,
+    shadowed: &std::collections::HashSet<usize>,
     in_scope: impl Fn(usize) -> bool,
     what: &str,
 ) {
     let mut live: Vec<(String, usize)> = entries
         .iter()
         .enumerate()
-        .filter(|(i, (f, id))| {
-            id.is_some() && matches!(f.status, Status::Ok(_)) && in_scope(*i)
-        })
+        .filter(|(i, (_, id))| id.is_some() && !shadowed.contains(i) && in_scope(*i))
         .map(|(i, (_, id))| (id.clone().unwrap(), i))
         .collect();
     live.sort();
@@ -1821,6 +1832,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
+    /// The loader counts every parsed tool against the cap, whatever state
+    /// its command is in, so the cap ranking must too - in both directions.
+    /// A warned tool sorted past the cap never loads, so its name is dead for
+    /// rules; a warned tool inside the cap pushes the last healthy tool out,
+    /// which must not keep reading as healthy.
+    #[test]
+    fn the_cap_ranking_counts_warned_tools_like_the_loader() {
+        let cap = crate::registry::MAX_EXTERNAL_TOOLS;
+        let healthy = |root: &Path| {
+            for i in 0..cap {
+                write(
+                    root.join(".openmax/tools").join(format!("tool-{i:03}.toml")),
+                    &format!("name = \"tool-{i:03}\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n"),
+                );
+            }
+        };
+
+        // Sorts after every healthy tool: the loader's sorted head drops it.
+        let root = temp_project();
+        let data = temp_project();
+        healthy(&root);
+        write(
+            root.join(".openmax/tools/zzz-ghost.toml"),
+            "name = \"zzz-ghost\"\ndescription = \"d\"\ncommand = \"./missing.sh\"\n",
+        );
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"deny\"\ntool = \"zzz-ghost\"\n",
+        );
+        let findings = check_at(&root, &data);
+        match &find(&findings, "zzz-ghost.toml").status {
+            Status::Err(reason) => assert!(reason.contains("never loads"), "{reason}"),
+            other => panic!("a capped-out tool is dead, not merely command-less: {other:?}"),
+        }
+        assert!(
+            findings.iter().any(|f| f.status.summary().contains("no tool named 'zzz-ghost'")),
+            "a rule naming a capped-out tool never matches and must say so: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+
+        // Sorts before every healthy tool: it takes a slot, and the last
+        // healthy tool is the one the loader drops.
+        let root = temp_project();
+        let data = temp_project();
+        healthy(&root);
+        write(
+            root.join(".openmax/tools/aaa-ghost.toml"),
+            "name = \"aaa-ghost\"\ndescription = \"d\"\ncommand = \"./missing.sh\"\n",
+        );
+        let findings = check_at(&root, &data);
+        match &find(&findings, "aaa-ghost.toml").status {
+            Status::Warn(reason) => assert!(reason.contains("does not exist"), "{reason}"),
+            other => panic!("a loaded tool with a missing command warns: {other:?}"),
+        }
+        match &find(&findings, &format!("tool-{:03}.toml", cap - 1)).status {
+            Status::Err(reason) => assert!(reason.contains("never loads"), "{reason}"),
+            other => panic!("the tool the warned one displaced must not read healthy: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     #[test]
     fn missing_tool_command_warns_instead_of_looking_healthy() {
         let root = temp_project();
@@ -2003,6 +2077,37 @@ mod tests {
             1
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A tool that parses loads into the registry whether or not its command
+    /// exists yet (the missing script only matters at spawn time), so a rule
+    /// or hook filter naming it matches at runtime. Before this, --check said
+    /// "no tool named 'ghost' exists" about a tool `--spec usage` listed as
+    /// installed, inviting the user to delete a live deny rule.
+    #[test]
+    fn a_warned_tool_is_still_a_known_name_for_rules_and_filters() {
+        let root = temp_project();
+        write(
+            root.join(".openmax/tools/ghost.toml"),
+            "name = \"ghost\"\ndescription = \"d\"\ncommand = \"./scripts/ghost.sh\"\n",
+        );
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"deny\"\ntool = \"ghost\"\n",
+        );
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\ntool = \"ghost\"\n",
+        );
+
+        let findings = local(&root);
+        // The tool itself still warns about the command it cannot spawn.
+        assert!(matches!(find(&findings, "ghost.toml").status, Status::Warn(_)));
+        assert!(
+            !findings.iter().any(|f| f.status.summary().contains("no tool named 'ghost'")),
+            "a live tool's name must resolve for rules and hook filters: {findings:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
