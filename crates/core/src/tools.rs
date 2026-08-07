@@ -728,6 +728,12 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err("missing required argument: pattern");
     };
     let pattern = normalize_pattern(pattern);
+    // "", "/", "./" and friends all normalize to nothing. An empty glob can
+    // never match, and answering "no files matched" would read as a fact
+    // about the project rather than about the pattern.
+    if pattern.is_empty() {
+        return ToolOutcome::err("empty glob pattern; give a pattern like \"**/*.rs\"");
+    }
     let matcher = match globset::GlobBuilder::new(pattern).literal_separator(false).build() {
         Ok(g) => g.compile_matcher(),
         Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
@@ -800,10 +806,18 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(".git is excluded from search");
     }
     let file_matcher = match args["glob"].as_str() {
-        Some(g) => match globset::Glob::new(normalize_pattern(g)) {
-            Ok(m) => Some(m.compile_matcher()),
-            Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
-        },
+        Some(g) => {
+            let g = normalize_pattern(g);
+            // An empty filter matches nothing; "no matches" would blame the
+            // regex when the filter excluded every file up front.
+            if g.is_empty() {
+                return ToolOutcome::err("empty glob filter; give a pattern like \"*.rs\"");
+            }
+            match globset::Glob::new(g) {
+                Ok(m) => Some(m.compile_matcher()),
+                Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
+            }
+        }
         None => None,
     };
     // Full-corpus scans (rare or no matches) dominate this tool's latency, so
@@ -1078,6 +1092,16 @@ mod tests {
         assert_eq!(normalize_pattern(".//x"), "x");
         assert_eq!(normalize_pattern(".git/x"), ".git/x");
         assert_eq!(normalize_pattern("**/*.rs"), "**/*.rs");
+        // A pattern that is nothing but scope prefixes cannot match anything;
+        // saying "no files matched" would read as a fact about the project.
+        for empty in ["", "/", "./", "/./", ".//"] {
+            let out = glob_tool(&root, &json!({"pattern": empty}));
+            assert!(!out.ok, "{empty:?}: {}", out.output);
+            assert!(out.output.contains("empty glob pattern"), "{empty:?}: {}", out.output);
+            let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": empty}));
+            assert!(!out.ok, "{empty:?}: {}", out.output);
+            assert!(out.output.contains("empty glob filter"), "{empty:?}: {}", out.output);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
