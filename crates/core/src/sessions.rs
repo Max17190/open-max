@@ -50,6 +50,19 @@ pub struct SessionMeta {
     /// distinguishable instead of collapsing into one stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resume_points: Vec<u64>,
+    /// The legacy system-insert migration touches two stores: this index
+    /// (boundary shift) and the transcript (the inserted line). One atomic
+    /// write cannot span both files, so the shift records itself here, in
+    /// the same index write that performs it, and hydration completes the
+    /// interrupted half exactly once instead of guessing from transcript
+    /// shape. Only sessions saved before the prompt lived at index zero
+    /// ever carry this.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub system_insert_shifted: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 pub const UNTITLED: &str = "New session";
@@ -576,6 +589,7 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
         created_at: now(),
         updated_at: now(),
         resume_points: Vec::new(),
+        system_insert_shifted: false,
     };
     let m = meta.clone();
     with_index(core, move |metas| metas.push(m))?;
@@ -611,12 +625,20 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
     });
 }
 
-/// A system message was inserted at the front of the transcript (legacy
+/// A system message is being inserted at the front of the transcript (legacy
 /// sessions saved before the prompt lived at index zero); every absolute
-/// boundary moves down by one.
+/// boundary moves down by one, exactly once per session. The shift and its
+/// `system_insert_shifted` marker land in one atomic index write, so a crash
+/// between this and the transcript rewrite is recoverable: the next
+/// hydration sees the marker and skips the shift instead of drifting the
+/// boundaries a second time.
 pub fn shift_resume_points_for_system_insert(core: &Core, id: &str) {
     let _ = with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            if m.system_insert_shifted {
+                return;
+            }
+            m.system_insert_shifted = true;
             for p in &mut m.resume_points {
                 *p = p.saturating_add(1);
             }
@@ -888,6 +910,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 resume_points: Vec::new(),
+                system_insert_shifted: false,
             })
         })
         .unwrap();
@@ -1011,6 +1034,7 @@ mod tests {
                         created_at: 1,
                         updated_at: 1,
                         resume_points: Vec::new(),
+                        system_insert_shifted: false,
                     });
                 })
                 .unwrap();
