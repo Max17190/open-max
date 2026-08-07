@@ -645,9 +645,14 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
+/// Hidden files are searchable: the agent's own extension surface lives in
+/// dot-directories (`.openmax/tools`, `.agents`, `.github`), and a walker
+/// that skips them makes the agent blind to the capabilities it wrote.
+/// `.git` alone is excluded by name; gitignore rules still apply.
 fn project_walk(root: &Path) -> ignore::Walk {
     ignore::WalkBuilder::new(root)
-        .hidden(true)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
         .git_ignore(true)
         .git_global(true)
         .max_depth(Some(24))
@@ -741,7 +746,10 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
     let enough = AtomicBool::new(false);
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(12);
     ignore::WalkBuilder::new(&search_root)
-        .hidden(true)
+        // Same visibility contract as `project_walk`: hidden files are
+        // searchable, `.git` alone is excluded by name.
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
         .git_ignore(true)
         .git_global(true)
         .max_depth(Some(24))
@@ -999,6 +1007,32 @@ mod tests {
         assert!(out.output.contains("result limit reached"), "{}", out.output);
         let hits = out.output.lines().filter(|l| l.contains("big.txt")).count();
         assert_eq!(hits, MAX_GREP_RESULTS, "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The extension surface lives in dot-directories. A search that skips
+    /// them makes the agent blind to the capabilities it wrote, so hidden
+    /// files must be visible to glob and grep while `.git` never is.
+    #[test]
+    fn glob_and_grep_see_hidden_files_but_never_git() {
+        let root = temp_project();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        std::fs::write(root.join(".openmax/tools/fetch.toml"), "name = \"fetch_page\"\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "fetch_page in git internals\n").unwrap();
+
+        let out = glob_tool(&root, &json!({"pattern": "**/*.yml"}));
+        assert!(out.output.contains(".github/workflows/ci.yml"), "{}", out.output);
+        let out = glob_tool(&root, &json!({"pattern": "**/*.toml"}));
+        assert!(out.output.contains(".openmax/tools/fetch.toml"), "{}", out.output);
+        let out = glob_tool(&root, &json!({"pattern": "**/*"}));
+        assert!(!out.output.contains(".git/"), "{}", out.output);
+
+        let out = grep_tool(&root, &json!({"pattern": "fetch_page"}));
+        assert!(out.output.contains(".openmax/tools/fetch.toml:1:"), "{}", out.output);
+        assert!(!out.output.contains(".git/config"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
