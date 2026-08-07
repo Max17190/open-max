@@ -20,6 +20,13 @@
 //! against deletion. Every writer re-checks under `sessions_lock` that the
 //! session is still indexed, so a session deleted mid-turn cannot be
 //! resurrected by an append that was already in flight.
+//!
+//! The index itself is shared wider than one process: it is one file per data
+//! dir, and parallel openmax processes are normal usage. Its read-modify-write
+//! therefore also holds an exclusive flock (`index.lock`), and a damaged index
+//! is refused rather than defaulted to empty - either failure mode would end
+//! with sessions silently dropped from the index, which the still-indexed gate
+//! then converts into silently dropping their transcripts.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -311,19 +318,48 @@ pub fn load_manifest(core: &Core, id: &str) -> Option<crate::registry::RegistryM
 /// the agent loop, and exactly wrong for a tool whose answer is trusted
 /// when it says nothing was found.
 pub fn index_diagnostic(core: &Core) -> Option<String> {
+    match read_index(core) {
+        IndexRead::Damaged(reason) => Some(reason),
+        _ => None,
+    }
+}
+
+/// The three states an index read can land in. A missing file is a normal
+/// empty store. Unreadable and unparseable are not: they are evidence of
+/// history, and writers must refuse to replace that evidence with the empty
+/// default (see `with_index`).
+enum IndexRead {
+    Missing,
+    Loaded(Vec<SessionMeta>),
+    Damaged(String),
+}
+
+fn read_index(core: &Core) -> IndexRead {
     let path = index_path(core);
-    let text = std::fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<Vec<SessionMeta>>(&text) {
-        Ok(_) => None,
-        Err(e) => Some(format!("session index {} does not parse ({e})", path.display())),
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexRead::Missing,
+        Err(e) => {
+            return IndexRead::Damaged(format!(
+                "session index {} is unreadable ({e})",
+                path.display()
+            ))
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(metas) => IndexRead::Loaded(metas),
+        Err(e) => IndexRead::Damaged(format!(
+            "session index {} does not parse ({e})",
+            path.display()
+        )),
     }
 }
 
 fn load_index(core: &Core) -> Vec<SessionMeta> {
-    std::fs::read_to_string(index_path(core))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match read_index(core) {
+        IndexRead::Loaded(metas) => metas,
+        IndexRead::Missing | IndexRead::Damaged(_) => Vec::new(),
+    }
 }
 
 /// Whether the session still exists, i.e. whether writing a sidecar for it is
@@ -352,11 +388,47 @@ fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
     write_atomic(&index_path(core), json)
 }
 
-/// Read-modify-write the index under the state lock so concurrent agent
-/// turns can't clobber each other's metadata updates.
+/// Serialize index read-modify-writes across processes. `sessions_lock` only
+/// covers turns within one process; the index is one file per data dir, and
+/// two openmax processes are normal usage. Without this, their load -> save
+/// cycles interleave, the loser's `create` entry vanishes from the index, and
+/// the still-indexed gate then silently drops every write that session makes
+/// for the rest of its life - transcript included. Same flock discipline as
+/// the ledger and trust stores.
+///
+/// Callers must already hold `sessions_lock`: flock is per open file
+/// description, so that is what keeps one process from contending with
+/// itself (see the ledger's `with_lock` note). The lock releases when the
+/// returned handle drops.
+fn lock_index(core: &Core) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    let dir = sessions_dir(core);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("index.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    file.lock_exclusive()
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(file)
+}
+
+/// Read-modify-write the index under the state lock (concurrent turns in
+/// this process) and the index flock (concurrent processes). A damaged index
+/// is refused, not defaulted: saving the empty fallback over it would erase
+/// every session's metadata and turn the still-indexed gate off for all of
+/// them, converting one bad read into permanent, silent data loss.
 fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Result<R, String> {
     let _guard = core.sessions_lock.lock().unwrap();
-    let mut metas = load_index(core);
+    let _flock = lock_index(core)?;
+    let mut metas = match read_index(core) {
+        IndexRead::Loaded(metas) => metas,
+        IndexRead::Missing => Vec::new(),
+        IndexRead::Damaged(reason) => return Err(reason),
+    };
     let result = f(&mut metas);
     save_index(core, &metas)?;
     Ok(result)
@@ -584,7 +656,14 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     // first and the files second would let an append pass its check against
     // the stale index and recreate what this call is removing.
     let _guard = core.sessions_lock.lock().unwrap();
-    let mut metas = load_index(core);
+    let _flock = lock_index(core)?;
+    let mut metas = match read_index(core) {
+        IndexRead::Loaded(metas) => metas,
+        IndexRead::Missing => Vec::new(),
+        // Deleting one session must not cost every other session its
+        // metadata; repair the index first.
+        IndexRead::Damaged(reason) => return Err(reason),
+    };
     metas.retain(|m| m.id != id);
     save_index(core, &metas)?;
     let _ = std::fs::remove_file(messages_path(core, id));
@@ -666,6 +745,17 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
     // deleted session comes back, which is the one file that made the
     // deletion visible in the first place.
     if !still_indexed_locked(core, id) {
+        // "Deleted" stays a silent no-op. A damaged index is a different
+        // state: the write is being dropped for a reason the user can fix,
+        // so say so instead of losing the transcript quietly.
+        if let IndexRead::Damaged(reason) = read_index(core) {
+            core.send_agent(
+                id,
+                AgentEvent::Error {
+                    message: format!("warning: failed to persist session to disk: {reason}"),
+                },
+            );
+        }
         return;
     }
     // Never append onto a non-JSONL blob left on disk after a failed load.
@@ -892,6 +982,107 @@ mod tests {
             let path = sessions_dir(&core).join(format!("{id}.{suffix}"));
             assert!(!path.exists(), "{suffix} came back after delete");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Same doctrine as the append/delete test above: racing two writers and
+    /// hoping for the bad interleaving proves nothing, so this parks one
+    /// writer mid-read-modify-write and asserts the other blocks. Two `Core`s
+    /// on one data dir model two processes exactly - `sessions_lock` is per
+    /// `Core`, so only the index flock can serialize them.
+    #[test]
+    fn a_parallel_process_cannot_erase_a_sibling_session() {
+        let dir = std::env::temp_dir().join(format!("openmax-flock-{}", uuid::Uuid::new_v4()));
+        let (core_a, _rx_a) = Core::new(dir.clone()).unwrap();
+        let (core_b, _rx_b) = Core::new(dir.clone()).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = {
+            let core_a = core_a.clone();
+            std::thread::spawn(move || {
+                with_index(&core_a, |metas| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    metas.push(SessionMeta {
+                        id: "held-entry".into(),
+                        project: "/tmp/p".into(),
+                        title: "t".into(),
+                        created_at: 1,
+                        updated_at: 1,
+                        resume_points: Vec::new(),
+                    });
+                })
+                .unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sibling = {
+            let core_b = core_b.clone();
+            std::thread::spawn(move || {
+                let meta = create(&core_b, "/tmp/p".into()).unwrap();
+                done_tx.send(()).unwrap();
+                meta
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "a second process's create must block while another holds the index mid-write, \
+             or its entry is saved over and the still-indexed gate drops its transcript"
+        );
+        release_tx.send(()).unwrap();
+        parked.join().unwrap();
+        let sibling_meta = sibling.join().unwrap();
+
+        let ids: Vec<String> = load_index(&core_a).into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"held-entry".to_string()), "the parked writer's entry landed");
+        assert!(ids.contains(&sibling_meta.id), "and the sibling's entry survived it");
+        // The consequence that made this a data-loss bug and not a metadata
+        // nit: the sibling's writes still land.
+        append_usage(&core_b, &sibling_meta.id, &TokenUsage {
+            ts: 1,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cached_tokens: None,
+        });
+        assert_eq!(load_usage(&core_b, &sibling_meta.id).len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One truncated read must not cascade into an empty store: the writer
+    /// refuses a damaged index instead of "recovering" it to the default,
+    /// and the transcript drop it forces is loud instead of silent.
+    #[test]
+    fn a_damaged_index_is_refused_not_replaced_with_the_empty_default() {
+        let dir = std::env::temp_dir().join(format!("openmax-damaged-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+
+        let bad = "[{\"id\": \"trunc";
+        std::fs::write(index_path(&core), bad).unwrap();
+
+        touch(&core, &id);
+        assert_eq!(
+            std::fs::read_to_string(index_path(&core)).unwrap(),
+            bad,
+            "a metadata write must not save the empty default over a damaged index"
+        );
+        assert!(
+            delete(&core, &id).is_err(),
+            "deleting one session must not erase every other session's metadata"
+        );
+        assert_eq!(std::fs::read_to_string(index_path(&core)).unwrap(), bad);
+        assert!(index_diagnostic(&core).is_some(), "recall's diagnostic still has its evidence");
+
+        let mut persisted = 0usize;
+        save_messages(&core, &id, &[ChatMessage::user("kept?")], &mut persisted, false);
+        let warned = std::iter::from_fn(|| rx.try_recv().ok()).any(|envelope| {
+            matches!(&envelope.event, AgentEvent::Error { message }
+                if message.contains("does not parse"))
+        });
+        assert!(warned, "dropping a transcript over a damaged index must be loud");
         let _ = std::fs::remove_dir_all(dir);
     }
 
