@@ -632,8 +632,14 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
 /// between this and the transcript rewrite is recoverable: the next
 /// hydration sees the marker and skips the shift instead of drifting the
 /// boundaries a second time.
-pub fn shift_resume_points_for_system_insert(core: &Core, id: &str) {
-    let _ = with_index(core, |metas| {
+///
+/// Returns whether the index write landed. The caller must treat false as
+/// "the insert is not yet persistable": a transcript that gains its system
+/// line on disk while the marker is missing is indistinguishable from a
+/// modern session, so the boundaries would stay unshifted forever.
+#[must_use]
+pub fn shift_resume_points_for_system_insert(core: &Core, id: &str) -> bool {
+    with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             if m.system_insert_shifted {
                 return;
@@ -643,7 +649,8 @@ pub fn shift_resume_points_for_system_insert(core: &Core, id: &str) {
                 *p = p.saturating_add(1);
             }
         }
-    });
+    })
+    .is_ok()
 }
 
 /// Record that a new sitting resumed this session with `message_index`
@@ -835,7 +842,7 @@ mod tests {
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 7]);
 
         // A legacy system-prompt insert moves every boundary down one.
-        shift_resume_points_for_system_insert(&core, id);
+        assert!(shift_resume_points_for_system_insert(&core, id));
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![4, 8]);
         let _ = std::fs::remove_dir_all(dir);
     }
