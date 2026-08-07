@@ -708,10 +708,32 @@ fn touches_git(rel: &Path) -> bool {
     rel.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
 }
 
+/// Model-issued patterns routinely arrive scoped `./like/this` or
+/// `/like/this`. Matching runs against root-relative paths, so either prefix
+/// makes a pattern that can never match anything; both mean
+/// project-root-relative here, exactly as `resolve()` reads path arguments.
+fn normalize_pattern(pattern: &str) -> &str {
+    let mut p = pattern;
+    loop {
+        let trimmed = p.trim_start_matches('/').trim_start_matches("./");
+        if trimmed == p {
+            return trimmed;
+        }
+        p = trimmed;
+    }
+}
+
 fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
     let Some(pattern) = args["pattern"].as_str() else {
         return ToolOutcome::err("missing required argument: pattern");
     };
+    let pattern = normalize_pattern(pattern);
+    // "", "/", "./" and friends all normalize to nothing. An empty glob can
+    // never match, and answering "no files matched" would read as a fact
+    // about the project rather than about the pattern.
+    if pattern.is_empty() {
+        return ToolOutcome::err("empty glob pattern; give a pattern like \"**/*.rs\"");
+    }
     let matcher = match globset::GlobBuilder::new(pattern).literal_separator(false).build() {
         Ok(g) => g.compile_matcher(),
         Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
@@ -784,10 +806,18 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(".git is excluded from search");
     }
     let file_matcher = match args["glob"].as_str() {
-        Some(g) => match globset::Glob::new(g) {
-            Ok(m) => Some(m.compile_matcher()),
-            Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
-        },
+        Some(g) => {
+            let g = normalize_pattern(g);
+            // An empty filter matches nothing; "no matches" would blame the
+            // regex when the filter excluded every file up front.
+            if g.is_empty() {
+                return ToolOutcome::err("empty glob filter; give a pattern like \"*.rs\"");
+            }
+            match globset::Glob::new(g) {
+                Ok(m) => Some(m.compile_matcher()),
+                Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
+            }
+        }
         None => None,
     };
     // Full-corpus scans (rare or no matches) dominate this tool's latency, so
@@ -1066,6 +1096,40 @@ mod tests {
         assert!(out.output.contains("src/a.rs"), "{}", out.output);
         assert!(out.output.contains("src/deep/b.rs"), "{}", out.output);
         assert!(!out.output.contains("docs/c.md"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Models routinely scope patterns "./like/this" or "/like/this"; both
+    /// must mean project-root-relative rather than silently matching nothing.
+    #[test]
+    fn scoped_pattern_prefixes_are_normalized() {
+        let root = temp_project();
+        let out = glob_tool(&root, &json!({"pattern": "./src/**/*.rs"}));
+        assert!(out.ok && out.output.contains("src/a.rs"), "{}", out.output);
+        let out = glob_tool(&root, &json!({"pattern": "/src/*.rs"}));
+        assert!(out.ok && out.output.contains("src/a.rs"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "./src/*.rs"}));
+        assert!(out.ok && out.output.contains("src/a.rs:1:"), "{}", out.output);
+        // Normalization happens before the .git refusal, not instead of it.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "x\n").unwrap();
+        let out = glob_tool(&root, &json!({"pattern": "./.git/config"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        // The normalizer's own shape.
+        assert_eq!(normalize_pattern("././x"), "x");
+        assert_eq!(normalize_pattern(".//x"), "x");
+        assert_eq!(normalize_pattern(".git/x"), ".git/x");
+        assert_eq!(normalize_pattern("**/*.rs"), "**/*.rs");
+        // A pattern that is nothing but scope prefixes cannot match anything;
+        // saying "no files matched" would read as a fact about the project.
+        for empty in ["", "/", "./", "/./", ".//"] {
+            let out = glob_tool(&root, &json!({"pattern": empty}));
+            assert!(!out.ok, "{empty:?}: {}", out.output);
+            assert!(out.output.contains("empty glob pattern"), "{empty:?}: {}", out.output);
+            let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": empty}));
+            assert!(!out.ok, "{empty:?}: {}", out.output);
+            assert!(out.output.contains("empty glob filter"), "{empty:?}: {}", out.output);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
