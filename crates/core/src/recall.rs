@@ -103,6 +103,11 @@ pub struct RecallReport {
     /// Index entries whose files are gone: listed history that cannot be
     /// read is reported, not counted as scanned.
     pub sessions_unreadable: usize,
+    /// Sessions the scan ceiling cut inside: entered and partly indexed,
+    /// with a tail that was never read. Scanned would overclaim and skipped
+    /// would underclaim, so the cut is its own count. Never silent.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub sessions_partial: usize,
     /// Knobs whose requested value was not honoured. Silently substituting a
     /// number is the failure this whole surface is built against: an agent
     /// cannot tell a policy limit from the shape of its own data.
@@ -139,9 +144,15 @@ struct Chunk {
     /// distinct records do not.
     doc: String,
     text: String,
-    /// Structured paths (compaction records) for `path:` filtering beyond
-    /// plain text match.
+    /// Structured path evidence for `path:` filtering beyond plain text
+    /// match: compaction record paths, or a memory file's own stem.
     paths: Vec<String>,
+}
+
+/// serde gate for the counters that appear only when they have something
+/// to disclose.
+fn usize_is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The compiled query: everything is resolved before the scan loop.
@@ -640,6 +651,8 @@ struct Collected {
     chunks: Vec<Chunk>,
     scanned: usize,
     skipped: usize,
+    /// Sessions the ceiling cut inside, indexed only up to the cut.
+    partial: usize,
     unreadable: usize,
     bytes: usize,
 }
@@ -685,6 +698,13 @@ fn collect_chunks(
             // address and resolves it later cannot be asked to also remember
             // which working directory it was relative to.
             let source = path.display().to_string();
+            // The stem is the one piece of a memory file's address that names
+            // the fact rather than the store: every memory lives under
+            // .openmax/memory/ beneath the project root, so `path:` may
+            // select on the stem, never on the store directories or their
+            // ancestors.
+            let stem =
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
             for page in pages(&text) {
                 chunks.push(Chunk {
                     kind: "memory",
@@ -697,7 +717,7 @@ fn collect_chunks(
                     source: source.clone(),
                     line: None,
                     text: page.to_string(),
-                    paths: Vec::new(),
+                    paths: vec![stem.clone()],
                 });
             }
         }
@@ -712,6 +732,7 @@ fn collect_chunks(
 
     let mut scanned = 0usize;
     let mut skipped = 0usize;
+    let mut partial = 0usize;
     let mut unreadable = 0usize;
     for meta in &metas {
         if !session_filters.is_empty()
@@ -738,6 +759,9 @@ fn collect_chunks(
             continue;
         }
         scanned += 1;
+        // The ceiling can cut inside a session's stores; a session both
+        // entered and cut is disclosed as partial, never claimed whole.
+        let mut cut = false;
         let age = hours_since(now, meta.updated_at);
         // No title chunk. A title is the first 48 characters of the first
         // user message (agent.rs sets it there), and budget enforcement never
@@ -756,6 +780,7 @@ fn collect_chunks(
             bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget)
         {
             if bytes >= scan_ceiling {
+                cut = true;
                 break;
             }
             let text = bounded(format!("{} {}", record.digest, record.paths.join(" ")));
@@ -778,6 +803,7 @@ fn collect_chunks(
         let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
         for (line, msg) in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget) {
             if bytes >= scan_ceiling {
+                cut = true;
                 break;
             }
             if msg.role == "system" {
@@ -809,6 +835,7 @@ fn collect_chunks(
         let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
         for (line, msg) in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget) {
             if bytes >= scan_ceiling {
+                cut = true;
                 break;
             }
             let Some(content) = msg.content else { continue };
@@ -833,8 +860,11 @@ fn collect_chunks(
                 });
             }
         }
+        if cut {
+            partial += 1;
+        }
     }
-    Collected { chunks, scanned, skipped, unreadable, bytes }
+    Collected { chunks, scanned, skipped, partial, unreadable, bytes }
 }
 
 /// Whitespace-collapsed window around the rarest matched term (head of the
@@ -875,14 +905,16 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     }
     let now = sessions::unix_now();
     let collected = collect_chunks(core, project_root, now, MAX_SCAN_BYTES, &query.session_filters);
-    let Collected { chunks, scanned, skipped, unreadable, bytes } = collected;
+    let Collected { chunks, scanned, skipped, partial, unreadable, bytes } = collected;
 
     // `path:` selects sessions, not individual chunks: the transcript around
     // a file touch rarely repeats the literal path, so a session whose
     // structured compaction paths (or any chunk text) match contributes all
     // of its chunks - that is the hop. Session-less chunks (memories) pass on
-    // their own text or source. Multiple filters intersect at the session
-    // level, each possibly satisfied by a different chunk.
+    // their own text or stem: the absolute source would admit the store's
+    // directories and every ancestor of the project root as path evidence.
+    // Multiple filters intersect at the session level, each possibly
+    // satisfied by a different chunk.
     let path_pass: Vec<bool> = if query.path_filters.is_empty() {
         vec![true; chunks.len()]
     } else {
@@ -913,8 +945,8 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             .map(|chunk| match &chunk.session {
                 Some(id) => matched.contains(id),
                 None => query.path_filters.iter().all(|f| {
-                    chunk.text.to_lowercase().contains(f)
-                        || chunk.source.to_lowercase().contains(f)
+                    chunk.paths.iter().any(|p| p.to_lowercase().contains(f))
+                        || chunk.text.to_lowercase().contains(f)
                 }),
             })
             .collect()
@@ -1124,6 +1156,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
         sessions_scanned: scanned,
         sessions_skipped: skipped,
         sessions_unreadable: unreadable,
+        sessions_partial: partial,
         clamped: query.clamped.clone(),
         candidates,
         bytes_scanned: bytes,
@@ -1168,6 +1201,9 @@ pub fn render(report: &RecallReport) -> String {
     }
     if report.sessions_skipped > 0 {
         notes.push_str(&format!(", {} older skipped past the scan cap", report.sessions_skipped));
+    }
+    if report.sessions_partial > 0 {
+        notes.push_str(&format!(", {} partly scanned (scan cap)", report.sessions_partial));
     }
     if report.sessions_unreadable > 0 {
         notes.push_str(&format!(
@@ -1251,6 +1287,9 @@ pub fn render(report: &RecallReport) -> String {
         }
         if report.sessions_skipped > 0 {
             omitted.push(format!("{} past the scan cap", report.sessions_skipped));
+        }
+        if report.sessions_partial > 0 {
+            omitted.push(format!("{} partly scanned", report.sessions_partial));
         }
         if !omitted.is_empty() {
             out.push_str(&format!(" Not searched: {}.", omitted.join(", ")));
@@ -1452,6 +1491,54 @@ mod tests {
             c.bytes <= ceiling + MAX_CHUNK_BYTES,
             "overshoot must stay within one chunk of the ceiling, got {}",
             c.bytes
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session the ceiling cuts inside is a third disclosure class:
+    /// "scanned" would overclaim, "skipped" would underclaim, and a reader
+    /// trusting "nothing matched" over an unsearched tail is the lie this
+    /// surface exists to never tell. The cut is counted, rendered in the
+    /// header, owned by the empty-result disclosure, and dropped from the
+    /// JSON when there is nothing to disclose.
+    #[test]
+    fn a_partly_scanned_session_is_disclosed_not_claimed_whole() {
+        let (core, dir, project) = setup();
+        seed_session(&core, &project, "big", vec![
+            ChatMessage::user(format!("head {}", "x ".repeat(600))),
+            ChatMessage::user(format!("TAIL-NEEDLE {}", "y ".repeat(600))),
+        ]);
+        let c = collect_chunks(&core, &project, sessions::unix_now(), 1_000, &[]);
+        assert_eq!(c.scanned, 1, "the session was entered");
+        assert_eq!(c.skipped, 0, "and never skipped whole");
+        assert_eq!(c.partial, 1, "the ceiling cut inside it, and the cut must be counted");
+        assert!(
+            !c.chunks.iter().any(|ch| ch.text.contains("TAIL-NEEDLE")),
+            "the cut is real: the tail was never indexed"
+        );
+        // A session read to its end is whole, whatever the ceiling was.
+        let whole = collect_chunks(&core, &project, sessions::unix_now(), MAX_SCAN_BYTES, &[]);
+        assert_eq!(whole.partial, 0, "a fully read session is not partial");
+
+        let mut report = RecallReport {
+            sessions_scanned: 1,
+            sessions_partial: 1,
+            ..Default::default()
+        };
+        let text = render(&report);
+        assert!(text.contains("1 partly scanned (scan cap)"), "the header owns the cut: {text}");
+        assert!(
+            text.contains("Not searched: 1 partly scanned"),
+            "an empty result owns the cut: {text}"
+        );
+        assert!(
+            serde_json::to_string(&report).unwrap().contains("sessions_partial"),
+            "a consumer that trusts the JSON must see the cut"
+        );
+        report.sessions_partial = 0;
+        assert!(
+            !serde_json::to_string(&report).unwrap().contains("sessions_partial"),
+            "and nothing to disclose stays out of the report"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1948,6 +2035,38 @@ mod tests {
             let hits = recall(&core, &project, probe).unwrap().hits;
             assert!(hits.is_empty(), "{probe} matched the store's own address: {hits:?}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same rule for the memory store: a memory file's `path:` surface
+    /// is its stem, never its address. Every memory lives under
+    /// .openmax/memory/ beneath the project root, so matching the absolute
+    /// source would let path:openmax, path:memory, or any ancestor directory
+    /// of the project select every memory file as path evidence.
+    #[test]
+    fn memory_path_surface_is_its_stem_not_its_store_address() {
+        let (core, dir, project) = setup();
+        seed_session(&core, &project, "real", vec![ChatMessage::user("deploy port is 7443")]);
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        std::fs::write(
+            project.join(crate::memory::MEMORY_DIR).join("deploy-port.md"),
+            "# the deploy port is 7443\n",
+        )
+        .unwrap();
+        let ancestor = dir.file_name().unwrap().to_str().unwrap().to_lowercase();
+        let ancestor_probe = format!("port path:{ancestor}");
+        for probe in ["port path:openmax", "port path:memory", "port path:.md", &ancestor_probe] {
+            let hits = recall(&core, &project, probe).unwrap().hits;
+            assert!(hits.is_empty(), "{probe} matched the memory store's address: {hits:?}");
+        }
+        // The stem names the fact, and selecting on it keeps working even
+        // where the text writes the words apart.
+        let by_stem = recall(&core, &project, "port path:deploy-port").unwrap();
+        assert!(
+            by_stem.hits.iter().any(|h| h.kind == "memory"),
+            "path:<stem> must still select the memory file: {:?}",
+            by_stem.hits
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
