@@ -1749,12 +1749,20 @@ impl TokenBatcher {
 /// can only land at an await point, so it never interrupts a flush half way,
 /// and a tick racing the caller's final flush finds the buffers already
 /// drained and does nothing.
-fn spawn_stale_flusher(batcher: Arc<StdMutex<TokenBatcher>>) -> tokio::task::JoinHandle<()> {
+///
+/// The ticker holds the batcher weakly: a panicking turn unwinds past the
+/// caller's abort, and dropping a JoinHandle detaches rather than aborts, so
+/// a strong reference would leave a task ticking (and pinning `Core`) for the
+/// process lifetime. When the turn's own references drop, the upgrade fails
+/// and the task exits on its next tick.
+fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::JoinHandle<()> {
+    let batcher = Arc::downgrade(batcher);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            let Some(batcher) = batcher.upgrade() else { return };
             batcher.lock().unwrap().flush_if_stale();
         }
     })
@@ -1932,7 +1940,7 @@ async fn run_loop(
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
-        let flusher = spawn_stale_flusher(batcher.clone());
+        let flusher = spawn_stale_flusher(&batcher);
         let result = client
             .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
