@@ -29,7 +29,7 @@ use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{
-    filter_matching_indices, wrap_lines, Term, Transcript,
+    wrap_lines, Term, Transcript,
 };
 use crate::ui::{context, extensions, markdown, model_picker, ready};
 
@@ -250,6 +250,10 @@ pub struct App {
     scroll_search: Option<(String, usize, Vec<usize>)>,
     /// Last find query so n/N can step matches after the popup closes.
     scroll_search_last: Option<String>,
+    /// Find previews already built for the current query, by block index.
+    /// The popup draws every frame while streaming; previews must be built
+    /// per query change, not per frame. Cleared whenever matches rebuild.
+    find_previews: std::collections::HashMap<usize, String>,
     /// Project files for @-mentions; rescanned when a fresh `@` opens.
     file_index: Option<Arc<Vec<String>>>,
     file_index_pending: bool,
@@ -505,6 +509,7 @@ impl App {
             history_search: None,
             scroll_search: None,
             scroll_search_last: None,
+            find_previews: std::collections::HashMap::new(),
             file_index: None,
             file_index_pending: false,
             templates: Vec::new(),
@@ -1513,6 +1518,7 @@ impl App {
         let n = self.transcript.block_count();
         let matches: Vec<usize> = (0..n).collect();
         let selected = matches.len().saturating_sub(1);
+        self.find_previews.clear();
         self.scroll_search = Some((String::new(), selected, matches));
         self.completion = None;
         self.focus_scroll_match();
@@ -1601,13 +1607,13 @@ impl App {
     }
 
     fn refilter_scroll_search_inner(&mut self, prefer_latest: bool) {
-        let texts = self.transcript.all_block_search_texts();
+        self.find_previews.clear();
         {
             let Some((query, selected, matches)) = &mut self.scroll_search else {
                 return;
             };
             let prev_bi = matches.get(*selected).copied();
-            *matches = filter_matching_indices(&texts, query);
+            *matches = self.transcript.filter_matches(query);
             if matches.is_empty() {
                 *selected = 0;
             } else if prefer_latest {
@@ -1662,8 +1668,7 @@ impl App {
         if query.is_empty() {
             return;
         }
-        let texts = self.transcript.all_block_search_texts();
-        let matches = filter_matching_indices(&texts, &query);
+        let matches = self.transcript.filter_matches(&query);
         if matches.is_empty() {
             self.note("no matches");
             return;
@@ -2818,7 +2823,14 @@ impl App {
             None
         } else {
             self.scroll_search.as_ref().map(|(q, sel, matches)| {
-                scroll_search_lines(q, *sel, matches, &self.transcript, area.width)
+                scroll_search_lines(
+                    q,
+                    *sel,
+                    matches,
+                    &self.transcript,
+                    &mut self.find_previews,
+                    area.width,
+                )
             })
         };
         let popup_lines = if hist_lines.is_some() || find_lines.is_some() {
@@ -3563,6 +3575,7 @@ fn scroll_search_lines(
     selected: usize,
     matches: &[usize],
     transcript: &Transcript,
+    previews: &mut std::collections::HashMap<usize, String>,
     width: u16,
 ) -> Vec<Line<'static>> {
     let width = width as usize;
@@ -3611,13 +3624,19 @@ fn scroll_search_lines(
         } else {
             Style::default().fg(theme::DIM())
         };
-        let preview = transcript
-            .block_preview(bi, query)
-            .unwrap_or_else(|| format!("block {bi}"));
-        let one_line = preview.replace('\n', " ");
+        // Built once per (query, block): this renders on every frame while
+        // the popup is open, including every streaming frame, and a preview
+        // walks the block's text. The caller clears the cache when matches
+        // rebuild.
+        let preview = previews.entry(bi).or_insert_with(|| {
+            transcript
+                .block_preview(bi, query)
+                .unwrap_or_else(|| format!("block {bi}"))
+                .replace('\n', " ")
+        });
         lines.push(Line::from(vec![
             marker,
-            Span::styled(clip(&one_line, width.saturating_sub(4)), style),
+            Span::styled(clip(preview, width.saturating_sub(4)), style),
         ]));
     }
     lines

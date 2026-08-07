@@ -39,6 +39,12 @@ struct Block {
     folded: bool,
     /// Full tool output for expand / copy.
     full_output: Option<String>,
+    /// Lowercase plain text for find, built once at push: the find bar
+    /// filters on every keystroke and previews on every list rebuild, and
+    /// rebuilding + lowercasing every block's text made both O(session)
+    /// allocation per key. Fold-independent (it reads compact/full_output/
+    /// raw, never the folded view), so no invalidation path exists.
+    search_lower: String,
     cache_width: u16,
     cache_folded: bool,
     cache: Vec<Line<'static>>,
@@ -88,16 +94,32 @@ impl TextSelection {
     }
 }
 
+/// The one place a block's search text is lowered, so the test oracle can
+/// count builds: pushing a block builds exactly one, and no find keystroke
+/// may build any.
+fn lower_for_search(text: &str) -> String {
+    #[cfg(test)]
+    SEARCH_BUILDS.with(|counter| counter.set(counter.get() + 1));
+    text.to_lowercase()
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEARCH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Block {
     fn new(kind: BlockKind, raw: Vec<Line<'static>>) -> Self {
         let selectable = lines_to_plain(&raw);
         let selectable_chars = selectable.chars().count();
+        let search_lower = lower_for_search(&selectable);
         Self {
             kind,
             raw,
             compact: None,
             folded: false,
             full_output: None,
+            search_lower,
             cache_width: 0,
             cache_folded: false,
             cache: Vec::new(),
@@ -110,6 +132,14 @@ impl Block {
     fn tool(compact: Vec<Line<'static>>, full_output: String) -> Self {
         let selectable = lines_to_plain(&compact);
         let selectable_chars = selectable.chars().count();
+        // Search covers the compact header plus the whole output, matching
+        // what `search_text_line` reads back out; the folded view is not
+        // part of it.
+        let search_lower = if selectable.is_empty() {
+            lower_for_search(&full_output)
+        } else {
+            lower_for_search(&format!("{selectable}\n{full_output}"))
+        };
         let header = compact
             .first()
             .cloned()
@@ -136,6 +166,7 @@ impl Block {
             compact: Some(compact),
             folded: true,
             full_output: Some(full_output),
+            search_lower,
             cache_width: 0,
             cache_folded: true,
             cache: Vec::new(),
@@ -686,16 +717,21 @@ impl Transcript {
         Some(copy_text_without_chrome(&b.raw))
     }
 
-    /// Plain text for scrollback find (user/assistant/tool/system).
-    /// Tool blocks include the compact header and full output.
-    pub fn block_search_text(&self, i: usize) -> Option<String> {
-        let b = self.blocks.get(i)?;
-        Some(block_search_text(b))
-    }
-
-    /// Plain search text for every block, in order.
-    pub fn all_block_search_texts(&self) -> Vec<String> {
-        self.blocks.iter().map(block_search_text).collect()
+    /// Indices of blocks whose search text contains `query`,
+    /// case-insensitive; an empty query matches every block. Runs against
+    /// the per-block cache: one lowercase of the query, no per-block
+    /// allocation, so a find keystroke costs a scan, not a session rebuild.
+    pub fn filter_matches(&self, query: &str) -> Vec<usize> {
+        if query.is_empty() {
+            return (0..self.blocks.len()).collect();
+        }
+        let q = query.to_lowercase();
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.search_lower.contains(&q))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Select a block by index and scroll it into view. Test-support only:
@@ -734,22 +770,32 @@ impl Transcript {
         self.scroll_to_block(bi);
     }
 
-    /// One-line preview for find UI. Prefer a line containing `query` when set.
+    /// One-line preview for find UI. Prefer a line containing `query` when
+    /// set. The match is located in the cached lowercase text and only the
+    /// one line it names is read back in original case: `to_lowercase`
+    /// never maps a char to or from `\n`, so line indices agree between the
+    /// cache and the original.
     pub fn block_preview(&self, i: usize, query: &str) -> Option<String> {
-        let text = self.block_search_text(i)?;
+        let b = self.blocks.get(i)?;
         let q = query.trim();
         if !q.is_empty() {
             let q_low = q.to_lowercase();
-            if let Some(line) = text.lines().find(|l| l.to_lowercase().contains(&q_low)) {
-                return Some(line.trim().to_string());
+            if let Some(pos) = b.search_lower.find(&q_low) {
+                let line_idx =
+                    b.search_lower[..pos].bytes().filter(|&c| c == b'\n').count();
+                if let Some(line) = search_text_line(b, line_idx) {
+                    return Some(line.trim().to_string());
+                }
             }
         }
-        let line = text
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string();
+        let first_content = b
+            .search_lower
+            .split('\n')
+            .position(|l| !l.trim().is_empty());
+        let line = first_content
+            .and_then(|idx| search_text_line(b, idx))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default();
         Some(line)
     }
 
@@ -1096,7 +1142,14 @@ fn lines_to_plain(lines: &[Line<'static>]) -> String {
         .join("\n")
 }
 
-fn block_search_text(b: &Block) -> String {
+/// Line `line_idx` of a block's search text in original case, without
+/// rebuilding the whole text: the compact header is at most a couple of
+/// lines and the full output is read by reference. Composed exactly like
+/// the lowercase cache in `Block::new` / `Block::tool`, which is what
+/// keeps line indices between the two in agreement.
+fn search_text_line(b: &Block, line_idx: usize) -> Option<String> {
+    // `split('\n')`, not `.lines()`: indices come from counting `\n` bytes
+    // in the cache, and `.lines()` would drop a trailing empty slot.
     match &b.full_output {
         Some(out) => {
             let header = b
@@ -1105,29 +1158,22 @@ fn block_search_text(b: &Block) -> String {
                 .map(|c| lines_to_plain(c))
                 .unwrap_or_default();
             if header.is_empty() {
-                out.clone()
+                return out.split('\n').nth(line_idx).map(str::to_string);
+            }
+            // The composed text is `header\nout`, so the header occupies
+            // its `\n` count plus one line slots before `out` begins.
+            let header_slots = header.matches('\n').count() + 1;
+            if line_idx < header_slots {
+                header.split('\n').nth(line_idx).map(str::to_string)
             } else {
-                format!("{header}\n{out}")
+                out.split('\n').nth(line_idx - header_slots).map(str::to_string)
             }
         }
-        None => lines_to_plain(&b.raw),
+        None => lines_to_plain(&b.raw)
+            .split('\n')
+            .nth(line_idx)
+            .map(str::to_string),
     }
-}
-
-/// Case-insensitive substring filter over block plain texts.
-/// Returns indices into `texts` whose content matches `query`.
-/// An empty query matches every block (browse-all mode).
-pub fn filter_matching_indices(texts: &[String], query: &str) -> Vec<usize> {
-    if query.is_empty() {
-        return (0..texts.len()).collect();
-    }
-    let q = query.to_lowercase();
-    texts
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.to_lowercase().contains(&q))
-        .map(|(i, _)| i)
-        .collect()
 }
 
 /// Span-preserving word wrap. Greedy, breaking at the last space that fits;
@@ -1940,26 +1986,30 @@ mod tests {
     }
 
     #[test]
-    fn filter_matching_indices_empty_query_matches_all() {
-        let texts = vec!["a".into(), "b".into(), "c".into()];
-        assert_eq!(filter_matching_indices(&texts, ""), vec![0, 1, 2]);
+    fn filter_matches_empty_query_matches_all() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("a")]);
+        t.push_assistant(vec![Line::from("b")]);
+        t.push(vec![Line::from("c")]);
+        assert_eq!(t.filter_matches(""), vec![0, 1, 2]);
     }
 
     #[test]
-    fn filter_matching_indices_case_insensitive_substring() {
-        let texts = vec![
-            "Error: file not found".into(),
-            "ok done".into(),
-            "ERROR in path /tmp/foo".into(),
-            "nothing here".into(),
-        ];
-        assert_eq!(filter_matching_indices(&texts, "error"), vec![0, 2]);
-        assert_eq!(filter_matching_indices(&texts, "PATH"), vec![2]);
-        assert_eq!(filter_matching_indices(&texts, "zzz"), Vec::<usize>::new());
+    fn filter_matches_case_insensitive_substring() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push(vec![Line::from("Error: file not found")]);
+        t.push(vec![Line::from("ok done")]);
+        t.push(vec![Line::from("ERROR in path /tmp/foo")]);
+        t.push(vec![Line::from("nothing here")]);
+        assert_eq!(t.filter_matches("error"), vec![0, 2]);
+        assert_eq!(t.filter_matches("PATH"), vec![2]);
+        assert_eq!(t.filter_matches("zzz"), Vec::<usize>::new());
     }
 
     #[test]
-    fn block_search_text_includes_tool_full_output() {
+    fn find_covers_tool_full_output_beyond_the_folded_view() {
         let mut t = Transcript::new();
         t.set_width(80);
         t.push_user(vec![Line::from("you: check logs")]);
@@ -1968,14 +2018,145 @@ mod tests {
             vec![Line::from("✓ read_file app.rs")],
             "secret_token_xyz\nline2".into(),
         );
-        let texts = t.all_block_search_texts();
-        assert_eq!(texts.len(), 3);
-        assert!(texts[0].contains("check logs"));
-        assert!(texts[1].contains("looking"));
-        assert!(texts[2].contains("read_file"));
-        assert!(texts[2].contains("secret_token_xyz"));
-        let hits = filter_matching_indices(&texts, "secret_token");
-        assert_eq!(hits, vec![2]);
+        assert_eq!(t.filter_matches("check logs"), vec![0]);
+        assert_eq!(t.filter_matches("looking"), vec![1]);
+        assert_eq!(t.filter_matches("read_file"), vec![2]);
+        assert_eq!(t.filter_matches("secret_token"), vec![2]);
+    }
+
+    /// A find keystroke may not rebuild any block's search text: the cache
+    /// is built exactly once per pushed block, and filtering plus previews
+    /// run entirely against it.
+    #[test]
+    fn find_keystrokes_reuse_cached_search_text() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        let before = SEARCH_BUILDS.with(|c| c.get());
+        t.push_user(vec![Line::from("check the ledger")]);
+        t.push_assistant(vec![Line::from("looking at it")]);
+        t.push_tool(vec![Line::from("✓ bash")], "a very long output\nledger ok".into());
+        assert_eq!(
+            SEARCH_BUILDS.with(|c| c.get()) - before,
+            3,
+            "one build per pushed block"
+        );
+        let filtered = SEARCH_BUILDS.with(|c| c.get());
+        for query in ["l", "le", "led", "ledger", "LEDGER", "zzz"] {
+            std::hint::black_box(t.filter_matches(query));
+            std::hint::black_box(t.block_preview(2, query));
+        }
+        assert_eq!(
+            SEARCH_BUILDS.with(|c| c.get()),
+            filtered,
+            "a find keystroke rebuilt a block's search text"
+        );
+    }
+
+    /// Find keystroke cost at session scale. Not a correctness test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_find
+    #[test]
+    #[ignore]
+    fn measure_find_filter_cost() {
+        use std::time::Instant;
+        let mut t = Transcript::new();
+        t.set_width(120);
+        let output = "a log line about work being done in the harness\n".repeat(40);
+        for i in 0..500 {
+            t.push_user(vec![Line::from(format!("user turn {i}: check the ledger"))]);
+            t.push_assistant(vec![Line::from(format!("assistant reply {i} with prose"))]);
+            t.push_tool(vec![Line::from("✓ bash")], output.clone());
+        }
+
+        let n = 200;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(t.filter_matches("ledger"));
+        }
+        let cached_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+
+        // The old shape: rebuild and lowercase every block's text per call.
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let texts: Vec<String> = t
+                .blocks
+                .iter()
+                .map(|b| match &b.full_output {
+                    Some(out) => {
+                        let header = b
+                            .compact
+                            .as_ref()
+                            .map(|c| lines_to_plain(c))
+                            .unwrap_or_default();
+                        if header.is_empty() {
+                            out.clone()
+                        } else {
+                            format!("{header}\n{out}")
+                        }
+                    }
+                    None => lines_to_plain(&b.raw),
+                })
+                .collect();
+            let q = "ledger";
+            std::hint::black_box(
+                texts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, text)| text.to_lowercase().contains(q))
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let rebuilt_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+        println!(
+            "1500 blocks (~1 MB): cached {cached_ms:.3} ms per keystroke, rebuild {rebuilt_ms:.3} ms"
+        );
+    }
+
+    /// The cached preview path must return exactly what the uncached
+    /// implementation returned: rebuild the full text, lowercase per line,
+    /// prefer the first line containing the query, else the first non-empty
+    /// line. Includes unicode whose lowercase changes byte lengths.
+    #[test]
+    fn preview_matches_the_uncached_reference() {
+        fn reference(t: &TestBlockText, query: &str) -> String {
+            let text = &t.0;
+            let q = query.trim();
+            if !q.is_empty() {
+                let q_low = q.to_lowercase();
+                if let Some(line) = text.lines().find(|l| l.to_lowercase().contains(&q_low)) {
+                    return line.trim().to_string();
+                }
+            }
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+                .to_string()
+        }
+        struct TestBlockText(String);
+
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("İstanbul Σ ΟΔΟΣ mixed")]);
+        t.push_assistant(vec![Line::from("first"), Line::from(""), Line::from("  Second Line  ")]);
+        t.push_tool(
+            vec![Line::from("✓ read_file notes.md")],
+            "Header MATCH here\n\n漢字テスト row\ntail line".into(),
+        );
+        let texts = [
+            TestBlockText("İstanbul Σ ΟΔΟΣ mixed".into()),
+            TestBlockText("first\n\n  Second Line  ".into()),
+            TestBlockText("✓ read_file notes.md\nHeader MATCH here\n\n漢字テスト row\ntail line".into()),
+        ];
+        for (bi, text) in texts.iter().enumerate() {
+            for query in ["", "istanbul", "σ", "second", "match", "漢字", "tail", "zzz", "  match  "] {
+                assert_eq!(
+                    t.block_preview(bi, query).unwrap(),
+                    reference(text, query),
+                    "diverged on block {bi}, query {query:?}"
+                );
+            }
+        }
     }
 
     #[test]
