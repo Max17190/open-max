@@ -841,8 +841,15 @@ pub(crate) fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_hook_file(path: &Path) -> Result<HookSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    parse_hook_source(path, &text)
+}
+
+/// The same parse from bytes a caller already read (and hashed): what gets
+/// recorded about a manifest must be derivable from the exact bytes that were
+/// vouched for, not from a second read the file can change under.
+pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, String> {
     let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
-    let file: HookFile = toml::from_str(&text).map_err(|e| format!("invalid TOML: {e}"))?;
+    let file: HookFile = toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;
     let event = HookEvent::parse(&file.event).ok_or_else(|| {
         format!(
             "unknown event '{}': expected pre_tool_use, post_tool_use, user_prompt_submit, session_start, compaction, or turn_end",

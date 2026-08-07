@@ -582,7 +582,10 @@ pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
     parse_tool_source(path, &text)
 }
 
-fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
+/// The same parse from bytes a caller already read (and hashed), so what an
+/// approval records about a manifest cannot come from a different generation
+/// of the file than the hash it blesses.
+pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
     let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
     let file: ExternalToolFile =
         toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;

@@ -1207,7 +1207,38 @@ fn approve(
         let verified = read_verified(&dir)?;
         refuse_unpinned_authority(&verified)?;
         let known = approvals_from(&verified.records[..verified.pinned]);
-        let shape = path.and_then(|p| hook_record(p, project_root));
+        // The caller hashed the manifest, a human vouched for it, and only
+        // now is the record written - an open interval any process with
+        // `bash` can write across, the same interval adoption already
+        // refuses to trust. So the record's shape (the event that decides
+        // gate-or-observer, the code list the repair carve-out honors) is
+        // derived from bytes proven to hash to the vouched manifest, never
+        // from an unchecked read of the path: a manifest swapped inside the
+        // interval would otherwise land a gate's hash on file wearing an
+        // observer's shape. The code hashes in `shas[1..]` need no check -
+        // they only ever bless bytes the caller read, so a swapped script
+        // stays unapproved and fails closed on its own.
+        let shape = match path {
+            None => None,
+            Some(p) => {
+                let vouched = shas.first().map(String::as_str).unwrap_or_default();
+                let bytes = std::fs::read(p).map_err(|e| {
+                    format!(
+                        "cannot read {} while recording its approval ({e}); nothing was approved",
+                        p.display()
+                    )
+                })?;
+                if sha256_hex(&bytes) != vouched {
+                    return Err(format!(
+                        "{} changed after it was shown: the bytes on disk are not the bytes vouched for, so nothing was approved; review the file and approve it again",
+                        p.display()
+                    ));
+                }
+                std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|text| hook_record_source(p, text, project_root))
+            }
+        };
         let path = path.map(canonical_or);
         let new_hash = shas.iter().any(|sha| !known.contains(sha));
         let new_path = path.as_deref().is_some_and(|p| !known.was_live(p));
@@ -1421,11 +1452,12 @@ pub fn format_ts(secs: u64) -> String {
     format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
 }
 
-/// The approved shape of a hook file, read from the bytes being approved. A
+/// The approved shape of a hook file, derived from the exact bytes being
+/// approved - the caller has already proven them to be the vouched ones. A
 /// file that is not a hook manifest records nothing: tools and skills have no
 /// event to remember, and their code is bound by hash alone.
-fn hook_record(path: &Path, project_root: &Path) -> Option<ApprovedHook> {
-    let hook = crate::hooks::parse_hook_file(path).ok()?;
+fn hook_record_source(path: &Path, text: &str, project_root: &Path) -> Option<ApprovedHook> {
+    let hook = crate::hooks::parse_hook_source(path, text).ok()?;
     Some(ApprovedHook {
         path: canonical_or(path).display().to_string(),
         event: hook.event.as_str().to_string(),
@@ -1613,10 +1645,21 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
 /// whichever surface it belongs to. Both manifest surfaces name a `command`
 /// plus fixed `args`; skills name none.
 pub fn manifest_code(path: &Path, project_root: &Path) -> Vec<BoundCode> {
-    if let Ok(hook) = crate::hooks::parse_hook_file(path) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => manifest_code_source(path, &text, project_root),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The same answer from bytes a caller already read. `openmax --approve`
+/// hashes a manifest and lists the code that hash obliges it to bless; both
+/// must describe one read, or the interval between two reads is where a swap
+/// puts the hash of one file on record next to the code list of another.
+pub fn manifest_code_source(path: &Path, text: &str, project_root: &Path) -> Vec<BoundCode> {
+    if let Ok(hook) = crate::hooks::parse_hook_source(path, text) {
         return bound_code(&hook.command, &hook.args, project_root);
     }
-    if let Ok(spec) = crate::registry::parse_tool_file(path) {
+    if let Ok(spec) = crate::registry::parse_tool_source(path, text) {
         if let crate::registry::ToolKind::External(ext) = &spec.kind {
             return bound_code(&ext.command, &ext.args, project_root);
         }
@@ -2148,8 +2191,9 @@ mod tests {
         let data = temp("cap-data");
         let root = temp("cap-proj");
         let manifest = root.join("gate.toml");
-        std::fs::write(&manifest, "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
-        let shas = vec![sha256_hex(b"manifest"), sha256_hex(b"script")];
+        let body = "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n";
+        std::fs::write(&manifest, body).unwrap();
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
         approve_capability(&data, &root, &manifest, &shas).unwrap();
 
         let recorded = approvals(&data, &root).unwrap();
@@ -2174,8 +2218,9 @@ mod tests {
         let data = temp("act-data");
         let root = temp("act-proj");
         let manifest = root.join("gate.toml");
-        std::fs::write(&manifest, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
-        let shas = vec![sha256_hex(b"manifest"), sha256_hex(b"script")];
+        let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
+        std::fs::write(&manifest, body).unwrap();
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
         approve_capability(&data, &root, &manifest, &shas).unwrap();
 
         let records = history(&data, &root).unwrap();
@@ -2217,8 +2262,9 @@ mod tests {
         let root = temp("shape-proj");
         std::fs::write(root.join("gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
         let manifest = root.join("gate.toml");
-        std::fs::write(&manifest, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
-        approve_capability(&data, &root, &manifest, &[sha256_hex(b"m")]).unwrap();
+        let gate_body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
+        std::fs::write(&manifest, gate_body).unwrap();
+        approve_capability(&data, &root, &manifest, &[sha256_hex(gate_body.as_bytes())]).unwrap();
 
         let records = history(&data, &root).unwrap();
         assert_eq!(records[0].event.as_deref(), Some("pre_tool_use"), "the shape is in the line");
@@ -2231,19 +2277,20 @@ mod tests {
 
         // Demotion cannot rewrite the memory: the file now says observer, the
         // chain still says gate.
-        std::fs::write(&manifest, "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        let observer_body = "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n";
+        std::fs::write(&manifest, observer_body).unwrap();
         assert!(approvals(&data, &root).unwrap().approved_hook(&manifest).unwrap().is_gate());
 
         // A human who means it re-approves, and the new shape replaces the old
         // one rather than stacking behind it.
-        approve_capability(&data, &root, &manifest, &[sha256_hex(b"m2")]).unwrap();
+        approve_capability(&data, &root, &manifest, &[sha256_hex(observer_body.as_bytes())]).unwrap();
         let approved = approvals(&data, &root).unwrap();
         assert_eq!(approved.approved_hook(&manifest).unwrap().event(), "post_tool_use");
         assert!(!approved.approved_hook(&manifest).unwrap().is_gate());
 
         // Re-approving the same shape and hashes again records nothing.
         let before = history(&data, &root).unwrap().len();
-        approve_capability(&data, &root, &manifest, &[sha256_hex(b"m2")]).unwrap();
+        approve_capability(&data, &root, &manifest, &[sha256_hex(observer_body.as_bytes())]).unwrap();
         assert_eq!(history(&data, &root).unwrap().len(), before);
 
         // Retiring the path retires the shape with it: a path nobody expects
@@ -2314,6 +2361,54 @@ mod tests {
         let err = history(&data, &root).unwrap_err();
         assert!(err.contains("chain head"), "{err}");
         assert!(!is_approved(&data, &root, &payload), "an unpinned append is not an approval");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The approval act is an open interval: the caller hashes the manifest,
+    /// a human vouches for it, and only then is the record written - and any
+    /// process with `bash` can write the file in between. The shape the
+    /// record remembers (the event, the code list the repair carve-out
+    /// honors) must come from the vouched bytes, never from a fresh read of
+    /// the path: a manifest swapped inside the interval would otherwise put a
+    /// gate's hash on file with an observer's shape - the demotion bypass
+    /// through the approval itself.
+    #[test]
+    fn an_approval_refuses_a_manifest_that_changed_after_the_vouch() {
+        let data = temp("vouch-data");
+        let root = temp("vouch-proj");
+        let hooks_dir = root.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(root.join("gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        let manifest = hooks_dir.join("gate.toml");
+        let gate_body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
+        std::fs::write(&manifest, gate_body).unwrap();
+
+        // The hashes exactly as `openmax --approve` computes them: the
+        // manifest's bytes, plus the code those bytes name.
+        let mut shas = vec![sha256_hex(gate_body.as_bytes())];
+        shas.extend(manifest_code(&manifest, &root).into_iter().filter_map(|c| c.sha256));
+        assert_eq!(shas.len(), 2, "the gate script must be part of the act");
+
+        // Swapped inside the interval: same path, observer shape.
+        std::fs::write(&manifest, "event = \"post_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        let err = approve_capability(&data, &root, &manifest, &shas).unwrap_err();
+        assert!(err.contains("changed after it was shown"), "{err}");
+        assert!(history(&data, &root).unwrap().is_empty(), "a refused act records nothing");
+
+        // A deleted manifest is the same problem: no bytes on disk are the
+        // bytes vouched for, so there is nothing the record can describe.
+        std::fs::remove_file(&manifest).unwrap();
+        assert!(approve_capability(&data, &root, &manifest, &shas).is_err());
+        assert!(history(&data, &root).unwrap().is_empty());
+
+        // Restoring the vouched bytes lets the same act land, with the shape
+        // those bytes declare.
+        std::fs::write(&manifest, gate_body).unwrap();
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        let approved = approvals(&data, &root).unwrap();
+        let hook = approved.approved_hook(&manifest).expect("the shape is remembered");
+        assert!(hook.is_gate(), "the remembered shape is the vouched bytes' shape");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
