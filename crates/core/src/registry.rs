@@ -733,10 +733,7 @@ async fn spawn_external(
                 let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
                 let (ok, text) = match status.success() {
                     true => (true, text),
-                    false => {
-                        let code = status.code().unwrap_or(-1);
-                        (false, format!("exit code {code}\n{text}"))
-                    }
+                    false => (false, format!("{}\n{text}", tools::describe_exit(status))),
                 };
                 ToolOutcome::from_process(ok, text, &output, truncated)
             }
@@ -1166,7 +1163,7 @@ mutatng = true
         let fail = write_script(&project, "fail.sh", "#!/bin/sh\necho oops >&2\nexit 3\n");
         write_tool(&tools_dir, "slow.toml", &format!("name = \"slow\"\ndescription = \"s\"\ncommand = \"{}\"\ntimeout_secs = 3\n", slow.display()));
         write_tool(&tools_dir, "fail.toml", &format!("name = \"fail\"\ndescription = \"f\"\ncommand = \"{}\"\n", fail.display()));
-        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let registry = Registry::assemble(discover_external_in(std::slice::from_ref(&tools_dir)), Vec::new());
 
         let out = registry.execute("slow", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
@@ -1181,6 +1178,20 @@ mutatng = true
         assert!(!out.ok);
         assert!(out.output.starts_with("exit code 3"), "{}", out.output);
         assert!(out.output.contains("[stderr]") && out.output.contains("oops"), "{}", out.output);
+
+        #[cfg(unix)]
+        {
+            let sig = write_script(&project, "sig.sh", "#!/bin/sh\nkill -9 $$\n");
+            write_tool(&tools_dir, "sig.toml", &format!("name = \"sig\"\ndescription = \"g\"\ncommand = \"{}\"\n", sig.display()));
+            let registry = Registry::assemble(discover_external_in(std::slice::from_ref(&tools_dir)), Vec::new());
+            let out = registry.execute("sig", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
+            assert!(!out.ok);
+            assert!(
+                out.output.starts_with("killed by signal 9 (SIGKILL)"),
+                "a signal kill is named, not faked as an exit code: {}",
+                out.output
+            );
+        }
 
         let out = registry.execute("missing_binary", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok && out.output.contains("unknown tool"));

@@ -986,15 +986,43 @@ async fn bash_tool(
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 let (ok, text) = match status.success() {
                     true => (true, text),
-                    false => {
-                        let code = status.code().unwrap_or(-1);
-                        (false, format!("exit code {code}\n{text}"))
-                    }
+                    false => (false, format!("{}\n{text}", describe_exit(status))),
                 };
                 ToolOutcome::from_process(ok, text, &output, truncated)
             }
         },
     }
+}
+
+/// Describe a non-success exit honestly. A signal kill has no exit code, and
+/// the former "exit code -1" pointed diagnosis at a code nothing returned;
+/// naming the signal turns a segfault or an OOM kill into a readable fact.
+pub(crate) fn describe_exit(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            // Only numbers that are identical on Linux and macOS get a name;
+            // platform-divergent ones (e.g. SIGBUS: 7 vs 10) stay numeric
+            // rather than risk a wrong label.
+            let name = match signal {
+                1 => " (SIGHUP)",
+                2 => " (SIGINT)",
+                4 => " (SIGILL)",
+                6 => " (SIGABRT)",
+                8 => " (SIGFPE)",
+                9 => " (SIGKILL)",
+                11 => " (SIGSEGV)",
+                13 => " (SIGPIPE)",
+                14 => " (SIGALRM)",
+                15 => " (SIGTERM)",
+                24 => " (SIGXCPU)",
+                _ => "",
+            };
+            return format!("killed by signal {signal}{name}");
+        }
+    }
+    format!("exit code {}", status.code().unwrap_or(-1))
 }
 
 #[cfg(test)]
@@ -1277,6 +1305,31 @@ mod tests {
             "the bytes it managed to print still happened"
         );
         assert!(!out.process_truncated, "everything printed made it into the result");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A segfault or an OOM kill has no exit code; reporting "exit code -1"
+    /// pointed diagnosis at a code nothing returned. The signal is the fact.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_killed_command_names_the_signal() {
+        let root = temp_project();
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "echo about-to-die; kill -SEGV $$"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(
+            out.output.starts_with("killed by signal 11 (SIGSEGV)"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("about-to-die"), "output before the kill survives: {}", out.output);
+        assert!(!out.output.contains("exit code"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
