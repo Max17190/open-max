@@ -64,7 +64,8 @@ Fields:
 Runtime contract: the harness spawns `command args...` in the project root,
 writes the call's JSON arguments to stdin, and returns stdout as the result.
 Nonzero exit makes the result an error carrying `exit code N` plus output.
-Output is capped; overflow spills to `~/.openmax/cmd-logs`. The process is a
+Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
+7 days. The process is a
 native host process: it inherits the environment, credentials, and network
 access of Open Max.
 

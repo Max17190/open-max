@@ -22,6 +22,11 @@ use crate::state::CancelToken;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+/// How long a spilled command log stays on disk. Long enough that a resumed
+/// session can still tail a log its transcript points at; short enough that
+/// the directory stays bounded (unpruned, one machine reached 95 MB in a
+/// month).
+const SPILL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// A single native process invocation. The caller supplies exact argv and cwd;
 /// no shell interpretation is introduced by the supervisor.
@@ -500,6 +505,10 @@ async fn combine_logs(
         discard_spills(stdout, stderr).await;
         return Ok(None);
     }
+    // The one moment the directory grows is the right moment to shrink it:
+    // quiet commands never pay for a scan, and the files this invocation just
+    // wrote are fresh, so age-based pruning cannot touch them.
+    prune_spill_dir(dir).await;
     let path = dir.join(format!("cmd-{}.log", uuid::Uuid::new_v4()));
     let Ok(mut target) = tokio::fs::File::create(&path).await else {
         discard_spills(stdout, stderr).await;
@@ -529,6 +538,35 @@ async fn combine_logs(
     }
     discard_spills(stdout, stderr).await;
     Ok(Some(path))
+}
+
+/// Best-effort age-based cleanup of the spill directory. Only the two names
+/// this module writes are candidates (`cmd-*.log` and orphaned
+/// `.openmax-*.tmp` from a crashed spill); anything else is left alone, and
+/// every error is ignored because pruning must never fail the command.
+async fn prune_spill_dir(dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = (name.starts_with("cmd-") && name.ends_with(".log"))
+            || (name.starts_with(".openmax-") && name.ends_with(".tmp"));
+        if !ours {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).is_ok_and(|age| age > SPILL_LOG_RETENTION) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
 }
 
 async fn discard_spills(stdout: Option<PathBuf>, stderr: Option<PathBuf>) {
@@ -799,6 +837,50 @@ mod tests {
         assert!(output.log_truncated);
         assert!(String::from_utf8_lossy(&log).contains("4 bytes omitted"));
         assert!(log.starts_with(b"123456"));
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// One dogfooding machine reached 95 MB of spill logs in a month because
+    /// nothing ever deleted them. Writing a new log is the moment the
+    /// directory grows, so it is also the moment old logs age out; files the
+    /// harness did not write are never touched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writing_a_spill_log_prunes_the_aged_ones() {
+        fn age_by_eight_days(path: &Path) {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let old = unsafe { libc::time(std::ptr::null_mut()) } - 8 * 24 * 60 * 60;
+            let times =
+                [libc::timeval { tv_sec: old, tv_usec: 0 }, libc::timeval { tv_sec: old, tv_usec: 0 }];
+            assert_eq!(unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) }, 0);
+        }
+
+        let dir = std::env::temp_dir().join(format!("openmax-prune-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let aged_log = dir.join("cmd-ancient.log");
+        let aged_orphan = dir.join(".openmax-stdout-orphan.tmp");
+        let not_ours = dir.join("keepme.txt");
+        let fresh_log = dir.join("cmd-fresh.log");
+        for path in [&aged_log, &aged_orphan, &not_ours, &fresh_log] {
+            tokio::fs::write(path, b"x").await.unwrap();
+        }
+        age_by_eight_days(&aged_log);
+        age_by_eight_days(&aged_orphan);
+        age_by_eight_days(&not_ours);
+
+        let mut request = request("/bin/sh", &["-c", "printf 1234567890"]);
+        request.capture.spill_dir = Some(dir.clone());
+        request.capture.spill_bytes_per_stream = 6;
+        let output = run_process(request, Arc::new(CancelToken::default()))
+            .await
+            .unwrap();
+        assert!(output.log_path.is_some(), "the command itself must still spill");
+
+        assert!(!aged_log.exists(), "an aged log must be pruned");
+        assert!(!aged_orphan.exists(), "an aged orphaned spill must be pruned");
+        assert!(not_ours.exists(), "files the harness did not write are never touched");
+        assert!(fresh_log.exists(), "fresh logs are kept");
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
