@@ -153,10 +153,11 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 // A dotfile can never be a skill and no loader reads it, and
                 // Finder drops .DS_Store into every directory it opens, so
                 // warning about one would put permanent noise in every report.
+                // Judged through the lossy rendering, not to_str: a hidden
+                // name with invalid UTF-8 after the dot is still hidden.
                 let hidden = entry
                     .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with('.'));
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'));
                 if hidden {
                     continue;
                 }
@@ -2062,6 +2063,27 @@ mod tests {
             "{findings:?}"
         );
         assert!(find(&findings, "README.md").status.summary().contains("SKILL.md"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The exemption keys on the leading byte, not on the name being valid
+    /// UTF-8: `.` followed by invalid bytes is still a dotfile. Filesystems
+    /// that refuse such names skip the scenario by construction.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_dotfile_is_still_exempt() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp_project();
+        let dir = root.join(".agents/skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b".\xffhidden");
+        if std::fs::write(dir.join(name), "junk").is_ok() {
+            let findings = local(&root);
+            assert!(
+                !findings.iter().any(|f| f.path.to_string_lossy().contains("hidden")),
+                "{findings:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
