@@ -90,9 +90,10 @@ impl ToolOutcome {
     pub(crate) fn err(output: impl Into<String>) -> Self {
         Self { ok: false, output: output.into(), ..Self::default() }
     }
-    /// A result that carries none of the process output, because the call was
-    /// killed before it could be rendered. What the process managed to print
-    /// still happened, and the result dropped all of it.
+    /// A result that carries none of the process output: the user cancelled
+    /// the call, so what it printed is deliberately not spent back into the
+    /// context. The fields still record that the output happened, so a hook
+    /// can tell a quiet command from a silenced one.
     pub(crate) fn from_killed_process(output: impl Into<String>, process: &ProcessOutput) -> Self {
         let produced = process.stdout.total_bytes.saturating_add(process.stderr.total_bytes);
         Self {
@@ -909,10 +910,19 @@ async fn bash_tool(
             Termination::Cancelled => {
                 ToolOutcome::from_killed_process("command cancelled by user", &output)
             }
-            Termination::TimedOut => ToolOutcome::from_killed_process(
-                format!("command timed out after {timeout_secs}s"),
-                &output,
-            ),
+            // A hung command's last output is the diagnostic: which test was
+            // running, what it was waiting on. The tail is already captured
+            // when the timeout fires, so dropping it would turn a measurable
+            // failure into a guess.
+            Termination::TimedOut => {
+                let (text, truncated) = render_process_output(&output, caps.command_bytes);
+                ToolOutcome::from_process(
+                    false,
+                    format!("command timed out after {timeout_secs}s; output until the kill:\n{text}"),
+                    &output,
+                    truncated,
+                )
+            }
             Termination::Exited(status) => {
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 let (ok, text) = match status.success() {
@@ -1121,15 +1131,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A command killed for running too long still printed something, and a
-    /// hook that is told a process ran no bytes would draw the wrong
-    /// conclusion about the turn.
+    /// A hung command's last output is the diagnostic: which test was
+    /// running, what it was waiting on. The tail is captured before the kill,
+    /// so the result must carry it instead of reporting only that time ran
+    /// out.
     ///
     /// The timeout has to outlast shell startup by a wide margin: on a loaded
     /// CI runner a one-second budget can expire before `echo` ever runs, and
-    /// then the harness correctly reports the zero bytes that were printed.
+    /// then there is nothing captured for the result to carry.
     #[tokio::test]
-    async fn a_timed_out_command_still_reports_what_it_printed() {
+    async fn a_timed_out_command_reports_the_tail_it_captured() {
         let root = temp_project();
         let out = bash_tool(
             &root.join("data"),
@@ -1141,13 +1152,18 @@ mod tests {
         .await;
 
         assert!(!out.ok);
-        assert!(out.output.contains("timed out"), "{}", out.output);
+        assert!(out.output.contains("timed out after 5s"), "{}", out.output);
+        assert!(
+            out.output.contains("before-the-timeout"),
+            "the captured tail must survive the kill: {}",
+            out.output
+        );
         assert_eq!(
             out.process_bytes,
             Some("before-the-timeout\n".len() as u64),
             "the bytes it managed to print still happened"
         );
-        assert!(out.process_truncated, "and the result carries none of them");
+        assert!(!out.process_truncated, "everything printed made it into the result");
         let _ = std::fs::remove_dir_all(root);
     }
 

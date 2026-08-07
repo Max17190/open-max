@@ -712,10 +712,20 @@ async fn spawn_external(
                 format!("external tool '{name}' cancelled by user"),
                 &output,
             ),
-            Termination::TimedOut => ToolOutcome::from_killed_process(
-                format!("external tool '{name}' timed out after {}s", tool.timeout_secs),
-                &output,
-            ),
+            // Same contract as bash: the tail is already captured when the
+            // timeout fires, and it is the only clue to what the tool hung on.
+            Termination::TimedOut => {
+                let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
+                ToolOutcome::from_process(
+                    false,
+                    format!(
+                        "external tool '{name}' timed out after {}s; output until the kill:\n{text}",
+                        tool.timeout_secs
+                    ),
+                    &output,
+                    truncated,
+                )
+            }
             Termination::Exited(status) => {
                 let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
                 let (ok, text) = match status.success() {
@@ -1146,15 +1156,23 @@ mutatng = true
         let project = temp_dir("proj");
         let tools_dir = project.join(".openmax").join("tools");
         std::fs::create_dir_all(&tools_dir).unwrap();
-        let slow = write_script(&project, "slow.sh", "#!/bin/sh\nsleep 5\n");
+        // The timeout must outlast script startup by a wide margin, or a
+        // loaded runner kills the script before `echo` runs and there is
+        // legitimately no tail to report.
+        let slow = write_script(&project, "slow.sh", "#!/bin/sh\necho started-then-hung\nsleep 30\n");
         let fail = write_script(&project, "fail.sh", "#!/bin/sh\necho oops >&2\nexit 3\n");
-        write_tool(&tools_dir, "slow.toml", &format!("name = \"slow\"\ndescription = \"s\"\ncommand = \"{}\"\ntimeout_secs = 1\n", slow.display()));
+        write_tool(&tools_dir, "slow.toml", &format!("name = \"slow\"\ndescription = \"s\"\ncommand = \"{}\"\ntimeout_secs = 3\n", slow.display()));
         write_tool(&tools_dir, "fail.toml", &format!("name = \"fail\"\ndescription = \"f\"\ncommand = \"{}\"\n", fail.display()));
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
 
         let out = registry.execute("slow", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
-        assert!(out.output.contains("timed out after 1s"), "{}", out.output);
+        assert!(out.output.contains("timed out after 3s"), "{}", out.output);
+        assert!(
+            out.output.contains("started-then-hung"),
+            "the captured tail must survive the kill: {}",
+            out.output
+        );
 
         let out = registry.execute("fail", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
         assert!(!out.ok);
