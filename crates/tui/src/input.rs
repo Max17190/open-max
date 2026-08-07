@@ -91,6 +91,11 @@ pub struct Composer {
     /// The oracle for "moving the cursor must not re-wrap".
     #[cfg(test)]
     wraps: usize,
+    /// Single-char insertions. The oracle for "a paste splices whole
+    /// segments": per-char insertion re-scans the line prefix each time,
+    /// which is quadratic over a single-line paste.
+    #[cfg(test)]
+    char_inserts: usize,
     history: Vec<String>,
     hist_idx: Option<usize>,
     stash: String,
@@ -116,6 +121,8 @@ impl Composer {
             wrap_cache: None,
             #[cfg(test)]
             wraps: 0,
+            #[cfg(test)]
+            char_inserts: 0,
             history,
             hist_idx: None,
             stash: String::new(),
@@ -182,12 +189,26 @@ impl Composer {
     pub fn insert_str(&mut self, s: &str) {
         self.on_input();
         self.touch();
-        for c in s.chars() {
-            if c == '\n' {
+        // One splice per logical line, not one per char: inserting char by
+        // char re-scans the line prefix for every char, which is quadratic
+        // over a single-line paste (a 100 KB minified blob froze the UI for
+        // seconds). `\r` is dropped, matching the char path it replaces.
+        for (i, seg) in s.split('\n').enumerate() {
+            if i > 0 {
                 self.newline();
-            } else if c != '\r' {
-                self.insert_char(c);
             }
+            let seg = if seg.contains('\r') {
+                std::borrow::Cow::Owned(seg.replace('\r', ""))
+            } else {
+                std::borrow::Cow::Borrowed(seg)
+            };
+            if seg.is_empty() {
+                continue;
+            }
+            let line = &mut self.lines[self.row];
+            let byte = char_to_byte(line, self.col);
+            line.insert_str(byte, &seg);
+            self.col += seg.chars().count();
         }
     }
 
@@ -220,6 +241,10 @@ impl Composer {
     }
 
     fn insert_char(&mut self, c: char) {
+        #[cfg(test)]
+        {
+            self.char_inserts += 1;
+        }
         let line = &mut self.lines[self.row];
         let byte = char_to_byte(line, self.col);
         line.insert(byte, c);
@@ -875,8 +900,9 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
 }
 
 fn grapheme_boundaries(s: &str) -> Vec<usize> {
-    let mut boundaries = Vec::with_capacity(s.graphemes(true).count() + 1);
-    boundaries.push(0);
+    // Vec::new, not with_capacity(graphemes().count()): sizing the Vec by
+    // segmenting the whole string first costs a second full pass per call.
+    let mut boundaries = vec![0];
     let mut chars = 0usize;
     for grapheme in s.graphemes(true) {
         chars += grapheme.chars().count();
@@ -885,25 +911,48 @@ fn grapheme_boundaries(s: &str) -> Vec<usize> {
     boundaries
 }
 
+/// Char-index grapheme boundaries of `s`, lazily: 0, then one entry per
+/// grapheme. The cursor helpers below walk this only as far as the cursor,
+/// so a keystroke costs O(cursor), never a whole-line table allocation.
+fn boundary_iter(s: &str) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(s.graphemes(true).scan(0usize, |chars, grapheme| {
+        *chars += grapheme.chars().count();
+        Some(*chars)
+    }))
+}
+
 fn previous_grapheme_boundary(s: &str, col: usize) -> usize {
-    grapheme_boundaries(s)
-        .into_iter()
-        .rfind(|boundary| *boundary < col)
-        .unwrap_or(0)
+    let mut prev = 0;
+    for boundary in boundary_iter(s) {
+        if boundary >= col {
+            break;
+        }
+        prev = boundary;
+    }
+    prev
 }
 
 fn next_grapheme_boundary(s: &str, col: usize) -> usize {
-    grapheme_boundaries(s)
-        .into_iter()
-        .find(|boundary| *boundary > col)
-        .unwrap_or_else(|| s.chars().count())
+    // Falls through to the final boundary, which is the char count of `s`.
+    let mut last = 0;
+    for boundary in boundary_iter(s) {
+        if boundary > col {
+            return boundary;
+        }
+        last = boundary;
+    }
+    last
 }
 
 fn floor_grapheme_boundary(s: &str, col: usize) -> usize {
-    grapheme_boundaries(s)
-        .into_iter()
-        .rfind(|boundary| *boundary <= col)
-        .unwrap_or(0)
+    let mut prev = 0;
+    for boundary in boundary_iter(s) {
+        if boundary > col {
+            break;
+        }
+        prev = boundary;
+    }
+    prev
 }
 
 #[cfg(test)]
@@ -971,6 +1020,72 @@ mod tests {
         composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(composer.text(), "");
         assert_eq!(composer.col, 0);
+    }
+
+    /// A paste must splice whole segments, never insert char by char:
+    /// per-char insertion re-scans the line prefix for every char, which is
+    /// quadratic over a single-line paste and froze the UI for seconds on a
+    /// 100 KB minified blob.
+    #[test]
+    fn a_paste_splices_segments_instead_of_inserting_per_char() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob = "x".repeat(10_000);
+        composer.insert_str(&blob);
+        assert_eq!(
+            composer.char_inserts, 0,
+            "paste fell back to per-char insertion"
+        );
+        assert_eq!(composer.text(), blob);
+        // Typing still lands one insert per char.
+        composer.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(composer.char_inserts, 1);
+    }
+
+    #[test]
+    fn a_crlf_paste_drops_carriage_returns_and_splits_lines() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("first\r\nsecond\rhalf\r\n");
+        assert_eq!(composer.text(), "first\nsecondhalf\n");
+        assert_eq!((composer.row, composer.col), (2, 0));
+    }
+
+    #[test]
+    fn a_mid_line_paste_lands_at_the_cursor() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("head tail");
+        for _ in 0..4 {
+            composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        composer.insert_str("mid\nnext ");
+        assert_eq!(composer.text(), "head mid\nnext tail");
+        assert_eq!((composer.row, composer.col), (1, 5));
+    }
+
+    /// The lazy cursor helpers must agree with the materialized boundary
+    /// table at every column, including past-the-end columns.
+    #[test]
+    fn lazy_grapheme_boundaries_match_the_materialized_table() {
+        for s in ["", "abc", "e\u{301}👩‍💻x", "漢字 mix e\u{301}", "👩‍💻👩‍💻"] {
+            let table = grapheme_boundaries(s);
+            let chars = s.chars().count();
+            for col in 0..=chars + 1 {
+                assert_eq!(
+                    previous_grapheme_boundary(s, col),
+                    table.iter().copied().rfind(|b| *b < col).unwrap_or(0),
+                    "previous at {col} in {s:?}"
+                );
+                assert_eq!(
+                    next_grapheme_boundary(s, col),
+                    table.iter().copied().find(|b| *b > col).unwrap_or(chars),
+                    "next at {col} in {s:?}"
+                );
+                assert_eq!(
+                    floor_grapheme_boundary(s, col),
+                    table.iter().copied().rfind(|b| *b <= col).unwrap_or(0),
+                    "floor at {col} in {s:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1327,6 +1442,28 @@ mod tests {
         assert_eq!(composer.text(), "third");
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "");
+    }
+
+    /// Insertion cost of a paste, the case the segment splice in
+    /// `insert_str` exists for. Not a correctness test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_paste
+    #[test]
+    #[ignore]
+    fn measure_paste_cost() {
+        use std::time::Instant;
+
+        for (label, text) in [
+            ("single-line-10k", "x".repeat(10_000)),
+            ("single-line-100k", "x".repeat(100_000)),
+            ("multi-line-100k", "let value = compute(input);\n".repeat(3_600)),
+        ] {
+            let t0 = Instant::now();
+            let mut composer = Composer::new(&std::env::temp_dir());
+            composer.insert_str(&text);
+            let paste_ms = t0.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(composer.text());
+            println!("{label}: paste {paste_ms:.3} ms");
+        }
     }
 
     /// Wrap cost for a draft the size of a real paste. Not a correctness

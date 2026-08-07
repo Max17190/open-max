@@ -471,12 +471,17 @@ fn draw_frame(
     crossterm::queue!(terminal.backend_mut(), crossterm::terminal::BeginSynchronizedUpdate)?;
     terminal.draw(|f| app.draw(f))?;
     crossterm::queue!(terminal.backend_mut(), crossterm::terminal::EndSynchronizedUpdate)?;
+    let t_flush = Instant::now();
     terminal.backend_mut().flush()?;
-    if std::env::var_os("OPENMAX_PERF").is_some() {
+    // Read the env once: `var_os` takes the process env lock every call, and
+    // this runs on every frame.
+    static PERF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PERF.get_or_init(|| std::env::var_os("OPENMAX_PERF").is_some()) {
+        let flush_ms = t_flush.elapsed().as_secs_f64() * 1000.0;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let interval_ms = frame_interval.as_secs_f64() * 1000.0;
         eprintln!(
-            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
+            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} flush_ms={flush_ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
             app.perf_layout_ms, app.perf_selection_ms
         );
     }
@@ -3722,6 +3727,9 @@ fn paint_text_selection(
     line_map: &[Option<usize>],
     area: Rect,
 ) {
+    // One palette read for the whole overlay: the accessor takes the theme
+    // lock, and the inner loop touches every selected cell per frame.
+    let select_bg = theme::SELECT();
     for (row, line_idx) in line_map.iter().copied().enumerate() {
         let Some(line_idx) = line_idx else {
             continue;
@@ -3734,7 +3742,7 @@ fn paint_text_selection(
             if let Some(cell) =
                 buffer.cell_mut((area.x + column as u16, area.y + row as u16))
             {
-                cell.set_bg(theme::SELECT());
+                cell.set_bg(select_bg);
             }
         }
     }
