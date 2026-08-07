@@ -544,6 +544,11 @@ async fn combine_logs(
 /// this module writes are candidates (`cmd-*.log` and orphaned
 /// `.openmax-*.tmp` from a crashed spill); anything else is left alone, and
 /// every error is ignored because pruning must never fail the command.
+///
+/// A live spill can never age past the threshold: every caller that sets a
+/// spill dir clamps its timeout to at most 300 s, so an in-flight
+/// invocation's tmpfiles are always orders of magnitude fresher than the
+/// seven-day cutoff. An unbounded-timeout caller would break that invariant.
 async fn prune_spill_dir(dir: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
