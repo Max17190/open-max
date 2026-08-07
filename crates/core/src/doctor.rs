@@ -400,14 +400,27 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 
     let path = crate::providers::providers_path(data_dir);
     if let Some(result) = crate::providers::check_file(&path) {
-        findings.push(Finding {
-            kind: "providers",
-            path,
-            status: match result {
-                Ok(n) => Status::Ok(format!("{n} providers")),
-                Err(reason) => Status::Err(reason),
-            },
-        });
+        match result {
+            Ok((n, unknown_keys)) => {
+                // A typo'd key deserializes cleanly and configures nothing,
+                // which is exactly the silence this command exists to break.
+                for reason in unknown_keys {
+                    findings.push(Finding {
+                        kind: "providers",
+                        path: path.clone(),
+                        status: Status::Warn(reason),
+                    });
+                }
+                findings.push(Finding {
+                    kind: "providers",
+                    path,
+                    status: Status::Ok(format!("{n} providers")),
+                });
+            }
+            Err(reason) => {
+                findings.push(Finding { kind: "providers", path, status: Status::Err(reason) })
+            }
+        }
     }
 
     // An inherited approval store explains, in one line, why a capability that
@@ -1180,8 +1193,9 @@ fn dir_is_empty(dir: &Path) -> bool {
 }
 
 /// One edit apart, counting an adjacent swap as one edit: a dropped plural, a
-/// doubled letter, a single mistyped or transposed character.
-fn near(a: &str, b: &str) -> bool {
+/// doubled letter, a single mistyped or transposed character. Shared with the
+/// providers validator, which suggests near-miss keys the same way.
+pub(crate) fn near(a: &str, b: &str) -> bool {
     if a == b {
         return false;
     }
@@ -1992,6 +2006,35 @@ mod tests {
         let provider = findings.iter().find(|f| f.kind == "providers").unwrap();
         assert_eq!(provider.status.summary(), "1 providers");
 
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A typo'd providers.json key deserializes cleanly and configures
+    /// nothing; before this it read as "ok (1 providers)" while the models
+    /// list it was meant to be stayed silently empty.
+    #[test]
+    fn unknown_provider_keys_surface_as_warnings_not_health() {
+        let root = temp_project();
+        let data = temp_project();
+        std::fs::write(
+            data.join("providers.json"),
+            r#"{"providers":{"local":{"base_url":"http://127.0.0.1:11434/v1","modles":[]}}}"#,
+        )
+        .unwrap();
+
+        let findings = check_at(&root, &data);
+        let warn = findings
+            .iter()
+            .find(|f| f.kind == "providers" && matches!(f.status, Status::Warn(_)))
+            .expect("an ignored key must be reported");
+        assert!(warn.status.summary().contains("'modles'"), "{}", warn.status.summary());
+        assert!(warn.status.summary().contains("did you mean 'models'"), "{}", warn.status.summary());
+        // The file still loads, so the count line stays and nothing errors.
+        assert!(findings
+            .iter()
+            .any(|f| f.kind == "providers" && f.status.summary() == "1 providers"));
+        assert!(!has_errors(&findings));
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }

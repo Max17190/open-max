@@ -413,6 +413,10 @@ Select a provider with `"provider"` in settings.json, the `--provider` CLI
 option, or `/provider`; `/model` picks provider and model as one pair. This
 is endpoint configuration, not a plugin protocol.
 
+Unknown keys anywhere in the file configure nothing: the runtime ignores
+them, and `openmax --check` names each one (with the near-miss key it was
+probably meant to be).
+
 Example (`~/.openmax/providers.json`):
 
 ```json
@@ -719,7 +723,10 @@ mod tests {
         let path = dir.join("providers.json");
         std::fs::write(&path, example(PROVIDERS)).unwrap();
         match crate::providers::check_file(&path) {
-            Some(Ok(count)) => assert_eq!(count, 2, "example defines two providers"),
+            Some(Ok((count, unknown_keys))) => {
+                assert_eq!(count, 2, "example defines two providers");
+                assert!(unknown_keys.is_empty(), "the spec example draws warnings: {unknown_keys:?}");
+            }
             other => panic!("providers example must parse: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(dir);

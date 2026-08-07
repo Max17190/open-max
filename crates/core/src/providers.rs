@@ -182,8 +182,11 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
 
 /// Diagnose `providers.json` for `openmax --check`. Runtime loading remains
 /// deliberately quiet, while the validator reports syntax and values that
-/// would otherwise produce an empty catalog or fail at request time.
-pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
+/// would otherwise produce an empty catalog or fail at request time. `Ok`
+/// carries the provider count plus one warning per unknown key: serde's lax
+/// deserialization keeps runtime loading tolerant, so a typo'd key
+/// ("modles") configures nothing, and this is the one place that says so.
+pub(crate) fn check_file(path: &Path) -> Option<Result<(usize, Vec<String>), String>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -257,7 +260,69 @@ pub(crate) fn check_file(path: &Path) -> Option<Result<usize, String>> {
             }
         }
     }
-    Some(Ok(file.providers.len()))
+    Some(Ok((file.providers.len(), unknown_key_warnings(&text))))
+}
+
+/// One warning per key the typed parse silently drops, at every level the
+/// file has: top level, provider, model, and compat. Walked from the raw
+/// JSON because serde discards the unknown keys it skips.
+fn unknown_key_warnings(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return out;
+    };
+    let Some(top) = value.as_object() else { return out };
+    unknown_keys(top, &["providers"], "at the top level", &mut out);
+    let Some(providers) = top.get("providers").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (name, provider) in providers {
+        let Some(provider) = provider.as_object() else { continue };
+        unknown_keys(
+            provider,
+            &["base_url", "api_key", "api_key_env", "headers", "models", "compat"],
+            &format!("in provider '{name}'"),
+            &mut out,
+        );
+        if let Some(compat) = provider.get("compat").and_then(|v| v.as_object()) {
+            unknown_keys(
+                compat,
+                &["use_max_completion_tokens", "send_stream_options"],
+                &format!("in provider '{name}' compat"),
+                &mut out,
+            );
+        }
+        for model in provider.get("models").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(model) = model.as_object() else { continue };
+            let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            unknown_keys(
+                model,
+                &["id", "name", "context_tokens", "max_tokens"],
+                &format!("in provider '{name}' model '{id}'"),
+                &mut out,
+            );
+        }
+    }
+    out
+}
+
+fn unknown_keys(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    known: &[&str],
+    place: &str,
+    out: &mut Vec<String>,
+) {
+    for key in obj.keys() {
+        if known.contains(&key.as_str()) {
+            continue;
+        }
+        let hint = known
+            .iter()
+            .find(|k| crate::doctor::near(k, key))
+            .map(|k| format!(", did you mean '{k}'"))
+            .unwrap_or_default();
+        out.push(format!("unknown key '{key}' {place} configures nothing{hint}"));
+    }
 }
 
 /// Load named providers; empty map if missing or invalid.
@@ -518,7 +583,7 @@ mod tests {
             r#"{"providers":{"local":{"base_url":"http://127.0.0.1:11434/v1","models":[{"id":"coder"}]}}}"#,
         )
         .unwrap();
-        assert_eq!(check_file(&path).unwrap().unwrap(), 1);
+        assert_eq!(check_file(&path).unwrap().unwrap(), (1, Vec::new()));
 
         std::fs::write(&path, r#"{"providers":{"local":{"base_url":"not a url"}}}"#)
             .unwrap();
@@ -552,6 +617,60 @@ mod tests {
             .unwrap()
             .unwrap_err()
             .contains("invalid JSON"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Serde skips keys it does not know, so "modles" deserializes cleanly
+    /// and the models list it was meant to be stays empty, with nothing
+    /// anywhere saying why. The validator must name each ignored key, at
+    /// every level of the file, with the near-miss it was probably meant
+    /// to be - the same suggestion shape rules and hook filters get.
+    #[test]
+    fn check_file_names_unknown_keys_at_every_level() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+
+        std::fs::write(
+            &path,
+            r#"{"provider":{"local":{"base_url":"http://localhost/v1"}}}"#,
+        )
+        .unwrap();
+        let (count, warnings) = check_file(&path).unwrap().unwrap();
+        assert_eq!(count, 0, "the typo'd top-level key configures no providers");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("'provider'"), "{}", warnings[0]);
+        assert!(warnings[0].contains("did you mean 'providers'"), "{}", warnings[0]);
+
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"providers":{"orl":{"base_url":"http://localhost/v1","modles":[],"#,
+                r#""compat":{"use_max_completion_token":true},"#,
+                r#""models":[{"id":"m","contex_tokens":9000}]}}}"#,
+            ),
+        )
+        .unwrap();
+        let (count, warnings) = check_file(&path).unwrap().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("'modles' in provider 'orl'")
+                && w.contains("did you mean 'models'")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("'use_max_completion_token'")
+                && w.contains("compat")
+                && w.contains("did you mean 'use_max_completion_tokens'")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("'contex_tokens'")
+                && w.contains("model 'm'")
+                && w.contains("did you mean 'context_tokens'")),
+            "{warnings:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
