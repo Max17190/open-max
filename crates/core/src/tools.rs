@@ -429,9 +429,12 @@ fn read_file(root: &Path, args: &Value) -> ToolOutcome {
         out.push_str(&formatted);
     }
     if stopped_by_bytes {
+        // `byte_cap_line` is the first line that did NOT fit, so the
+        // continuation resumes exactly there. The former `+ 1` skipped one
+        // line per capped read, and pointed past EOF when the cap landed on
+        // the final line.
         out.push_str(&format!(
-            "… output limit reached at line {byte_cap_line} (file has {total} lines; continue with offset={})\n",
-            byte_cap_line + 1
+            "… output limit reached at line {byte_cap_line} (file has {total} lines; continue with offset={byte_cap_line})\n"
         ));
     } else if total > offset - 1 + limit {
         out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - (offset - 1 + limit), offset + limit));
@@ -1202,6 +1205,36 @@ mod tests {
         assert!(out.output.contains("output limit reached at line"), "{}", out.output);
         assert!(out.output.contains("continue with offset="), "{}", out.output);
         assert!(out.output.len() <= MAX_READ_BYTES + 200, "{}", out.output.len());
+
+        // The continuation must resume at the first omitted line: an
+        // off-by-one silently skips one line per capped read.
+        let hint: usize = out.output.split("continue with offset=").nth(1).unwrap()
+            .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+        let shown = out.output.lines().filter(|l| l.contains("xxxx")).count();
+        assert_eq!(hint, shown + 1, "hint must name the first omitted line: {}", out.output);
+        let next = read_file(&root, &json!({"path": "big.txt", "offset": hint}));
+        assert!(next.ok, "{}", next.output);
+        assert!(
+            next.output.trim_start().starts_with(&format!("{hint} ")),
+            "continuation starts at the omitted line: {}",
+            next.output
+        );
+
+        // When the cap lands on the final line, the hint must still name a
+        // readable line rather than pointing past EOF.
+        let mut exact = String::new();
+        for _ in 0..hint {
+            exact.push_str(&long_line);
+            exact.push('\n');
+        }
+        std::fs::write(root.join("exact.txt"), &exact).unwrap();
+        let out = read_file(&root, &json!({"path": "exact.txt"}));
+        let hint2: usize = out.output.split("continue with offset=").nth(1)
+            .expect("a file one line past the cap still gets a continuation")
+            .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+        assert_eq!(hint2, hint, "the final line is the first omitted one: {}", out.output);
+        let last = read_file(&root, &json!({"path": "exact.txt", "offset": hint2}));
+        assert!(last.ok, "the hint must be followable: {}", last.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
