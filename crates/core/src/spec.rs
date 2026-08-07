@@ -365,6 +365,17 @@ What the regex matches:
 - `glob`, `grep` → the pattern argument.
 - any other tool → the full serialized JSON arguments.
 
+`allow` is the only effect that removes a gate: it skips the approval prompt
+outright. The project file sits where you write, so an `allow` in it is inert
+until a human approves that exact content with
+`openmax --approve .openmax/permissions.toml`; until then those calls fall
+through to `approval_mode` and the human is asked. Editing the file revokes
+the approval, as with any other capability content. `deny` and `ask` only add
+friction and always apply. The global file is outside the project root, where
+your file tools cannot write, so its `allow` rules need no approval. Writing
+yourself an `allow` rule therefore grants nothing; ask the user to approve the
+file when they want the prompts gone.
+
 Rules never enter the prompt and are re-read every turn; an empty or missing
 file changes nothing. Fail closed: an unreadable or malformed file denies
 every tool. The one exemption: `write_file`/`edit_file` targeting the broken
@@ -700,6 +711,12 @@ mod tests {
                 .filter_map(|c| c.sha256),
         );
         crate::ledger::approve_capability(&data, &root, &hook, &shas).unwrap();
+        // The permissions example grants an `allow`, which is inert in a
+        // project file until a human approves it; the human stands in here
+        // too, so what --check sees is the installed example, not a half of it.
+        let perms = root.join(".openmax/permissions.toml");
+        let perms_sha = crate::ledger::sha256_hex(&std::fs::read(&perms).unwrap());
+        crate::ledger::approve_capability(&data, &root, &perms, &[perms_sha]).unwrap();
 
         let findings: Vec<_> = crate::doctor::check_at(&root, &data)
             .into_iter()
