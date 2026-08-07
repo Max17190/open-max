@@ -4,7 +4,7 @@
 //! The harness owns exactly three things here, all arithmetic: which memories
 //! surface (an index line each in the frozen prompt, ranked by activation),
 //! how activation is computed (recency and frequency of real use), and when a
-//! memory is forgotten (deleted once its activation stays below a floor). The
+//! memory is forgotten (deleted once it goes unused past a floor age). The
 //! content, the writing, and any deliberate recall beyond the index (grep,
 //! read_file) belong to the agent. No database, no daemon, no embedding: the
 //! directory is the memory, and forgetting is a feature - an index that only
@@ -14,10 +14,14 @@
 //! to human forgetting (Anderson & Schooler 1991): each past access at age
 //! `t` hours contributes `t^-0.5`, and activation is the log of the sum, so
 //! recency and frequency trade off in one number and one use of an old memory
-//! revives it. Events come from the file's mtime plus an append-only access
-//! log the turn loop feeds (reads and writes of memory paths by the file
-//! tools). Everything is computed lazily at scan time from timestamps; there
-//! is no background process to schedule or crash.
+//! revives it. Activation only ranks, though; the floors gate on the age of
+//! the most recent use, because the power-law sum lets `n` accesses outlast a
+//! single-access activation floor for `n^2` floor-ages, and a fact leaned on
+//! hourly for a week would otherwise spend decades in the index. Events come
+//! from the file's mtime plus an append-only access log the turn loop feeds
+//! (reads and writes of memory paths by the file tools). Everything is
+//! computed lazily at scan time from timestamps; there is no background
+//! process to schedule or crash.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -41,14 +45,14 @@ const MAX_DESCRIPTION_CHARS: usize = 160;
 /// Names are slugs so index lines, log lines, and paths stay unambiguous.
 const MAX_NAME_CHARS: usize = 64;
 
-/// A memory whose activation would equal one single access this many days
-/// old drops out of the index: still on disk, still greppable, no longer
-/// spending prompt bytes. ~3 weeks is where a single-shot human memory needs
-/// a cue too.
+/// A memory whose most recent use is older than this many days drops out of
+/// the index: still on disk, still greppable, no longer spending prompt
+/// bytes. ~3 weeks without a use is where a human memory needs a cue again,
+/// however well-worn it once was.
 const INDEX_FLOOR_DAYS: f64 = 21.0;
-/// Below the activation of one access this many days old, the file itself is
-/// deleted (a `gc` log line keeps its name, sha256, and description as the
-/// tombstone). Memory is not an archive; the session transcripts are.
+/// Unused past this many days, the file itself is deleted (a `gc` log line
+/// keeps its name, sha256, and description as the tombstone). Memory is not
+/// an archive; the session transcripts are.
 const GC_FLOOR_DAYS: f64 = 60.0;
 
 /// ACT-R base-level activation: `ln(sum(t_hours^-d))` with d = 0.5. Ages are
@@ -59,12 +63,6 @@ const DECAY_EXPONENT: f64 = 0.5;
 fn activation(ages_hours: &[f64]) -> f64 {
     let sum: f64 = ages_hours.iter().map(|t| t.max(1.0).powf(-DECAY_EXPONENT)).sum();
     sum.ln()
-}
-
-/// The activation a single access of the given age would have; the floors are
-/// defined through this so the constants above read in days, not in nepers.
-fn floor_activation(days: f64) -> f64 {
-    activation(&[days * 24.0])
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +84,9 @@ pub struct MemoryEntry {
     /// Project-relative path, as the index line shows it.
     pub path: String,
     pub activation: f64,
+    /// Age in hours of the most recent event; the index and GC floors gate
+    /// on this, not on activation, so frequency raises rank, never lifespan.
+    pub last_event_hours: u64,
     /// True when the entry made it into the injected index.
     pub in_index: bool,
 }
@@ -240,26 +241,34 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
         let Some(description) = description_of(&text) else { continue };
         // One physical act, one event: a write_file produces both an mtime
         // and a logged write at the same instant, and summing them would add
-        // a permanent ln(2) of activation (a 21-day fade becomes ~84 days).
-        // Ages bucket to whole hours (matching the one-hour clamp in
-        // `activation`), and buckets deduplicate.
+        // a permanent ln(2) of activation, outranking every honest
+        // single-event peer. Ages bucket to whole hours (matching the
+        // one-hour clamp in `activation`), and buckets deduplicate.
         let mut hour_buckets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
             let ts = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(now);
             hour_buckets.insert((now.saturating_sub(ts) / 3600).max(1));
         }
-        for record in log.iter().filter(|r| r.name == name && r.kind != "gc") {
+        // A gc tombstone is a horizon: a name reused after deletion starts
+        // fresh instead of inheriting the dead namesake's access history.
+        let horizon =
+            log.iter().filter(|r| r.name == name && r.kind == "gc").map(|r| r.ts).max();
+        for record in log.iter().filter(|r| {
+            r.name == name && r.kind != "gc" && horizon.is_none_or(|h| r.ts > h)
+        }) {
             hour_buckets.insert((now.saturating_sub(record.ts) / 3600).max(1));
         }
         if hour_buckets.is_empty() {
             hour_buckets.insert(1);
         }
+        let last_event_hours = hour_buckets.first().copied().unwrap_or(1);
         let ages: Vec<f64> = hour_buckets.into_iter().map(|h| h as f64).collect();
         entries.push(MemoryEntry {
             name: name.to_string(),
             description,
             path: format!("{MEMORY_DIR}/{name}.md"),
             activation: activation(&ages),
+            last_event_hours,
             in_index: false,
         });
     }
@@ -267,13 +276,16 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
         b.activation.partial_cmp(&a.activation).unwrap_or(std::cmp::Ordering::Equal).then(a.name.cmp(&b.name))
     });
 
-    // Greedy fill under the byte budget, faded entries never eligible.
-    let index_floor = floor_activation(INDEX_FLOOR_DAYS);
+    // Greedy fill under the byte budget. Entries unused past the floor age
+    // are never eligible, however high their activation ranks them.
+    let index_floor_hours = INDEX_FLOOR_DAYS * 24.0;
     let mut spent = 0usize;
     let mut omitted = 0usize;
     for entry in entries.iter_mut() {
         let line = index_line(entry);
-        if entry.activation >= index_floor && spent + line.len() <= MAX_MEMORY_BYTES {
+        if entry.last_event_hours as f64 <= index_floor_hours
+            && spent + line.len() <= MAX_MEMORY_BYTES
+        {
             entry.in_index = true;
             spent += line.len();
         } else {
@@ -322,16 +334,16 @@ pub fn index_section(project_root: &Path, now: u64) -> Option<(String, Vec<(Stri
     Some((out, breakdown))
 }
 
-/// Delete memories whose activation fell below the GC floor, logging a
-/// tombstone (name, sha256, description) per deletion so what was forgotten
-/// stays sayable even though the content is gone. Runs at session creation
-/// only: never mid-session, never on resume, so a prune cannot yank a file
-/// the live prompt still indexes.
+/// Delete memories unused past the GC floor age, logging a tombstone (name,
+/// sha256, description) per deletion so what was forgotten stays sayable
+/// even though the content is gone. Runs at session creation only: never
+/// mid-session, never on resume, so a prune cannot yank a file the live
+/// prompt still indexes.
 pub fn forget_faded(project_root: &Path, now: u64) -> Vec<String> {
-    let gc_floor = floor_activation(GC_FLOOR_DAYS);
+    let gc_floor_hours = GC_FLOOR_DAYS * 24.0;
     let scan = scan(project_root, now);
     let mut forgotten = Vec::new();
-    for entry in scan.entries.iter().filter(|e| e.activation < gc_floor) {
+    for entry in scan.entries.iter().filter(|e| e.last_event_hours as f64 > gc_floor_hours) {
         let path = project_root.join(&entry.path);
         let Ok(bytes) = std::fs::read(&path) else { continue };
         let record = AccessRecord {
@@ -438,8 +450,8 @@ mod tests {
 
     /// One physical act must be one event: a write_file leaves both an mtime
     /// and a logged write at the same instant, and counting both would add a
-    /// permanent ln(2) of activation, stretching the documented 21-day fade
-    /// to ~84 days. Found by the wire-level lifecycle eval, pinned here.
+    /// permanent ln(2) of activation, outranking every honest single-event
+    /// peer. Found by the wire-level lifecycle eval, pinned here.
     #[test]
     fn same_hour_signals_collapse_to_one_event() {
         let root = temp_project();
@@ -482,13 +494,17 @@ mod tests {
         assert!(live.in_index, "one recall must restore index presence");
 
         // 90 days out, the unread one crosses the GC floor and is deleted.
+        // The revival above is itself 60 days stale by then, so live-fact
+        // needs a use inside the GC window: staleness is measured from the
+        // last use, not bought off by history.
         let gc_now = now + 90 * DAY;
+        log_access(&root, "live-fact", gc_now - DAY, "read");
         let forgotten = forget_faded(&root, gc_now);
         assert_eq!(forgotten, vec!["stale-fact".to_string()]);
         assert!(!root.join(MEMORY_DIR).join("stale-fact.md").exists());
         assert!(
             root.join(MEMORY_DIR).join("live-fact.md").exists(),
-            "the revived memory survives GC"
+            "the recently used memory survives GC"
         );
         let tombstone = load_log(&root)
             .into_iter()
@@ -497,6 +513,57 @@ mod tests {
         assert_eq!(tombstone.name, "stale-fact");
         assert!(tombstone.sha256.is_some());
         assert_eq!(tombstone.description.as_deref(), Some("A fact from another era"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Frequency raises rank, never lifespan: a memory read hourly for most
+    /// of a week and then abandoned must fade on the same clock as one read
+    /// once. Against a single-access activation floor, 40 accesses would
+    /// outlast the floor for 40^2 floor-ages (~92 years in the index,
+    /// centuries on disk).
+    #[test]
+    fn a_frequent_memory_still_fades_once_it_goes_stale() {
+        let root = temp_project();
+        let now = unix_now();
+        write_memory(&root, "hot-then-dropped", "# A fact leaned on hourly, then abandoned");
+        for i in 0..40u64 {
+            log_access(&root, "hot-then-dropped", now - i * HOUR, "read");
+        }
+        let stale_now = now + 180 * DAY;
+        let stale = scan(&root, stale_now);
+        let entry = stale.entries.iter().find(|e| e.name == "hot-then-dropped").unwrap();
+        assert!(
+            !entry.in_index,
+            "40 accesses gone {INDEX_FLOOR_DAYS}+ days stale must leave the index \
+             (activation {})",
+            entry.activation
+        );
+        let forgotten = forget_faded(&root, stale_now);
+        assert_eq!(forgotten, vec!["hot-then-dropped".to_string()], "and GC agrees: stale is stale");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A name reused after GC starts from zero: the tombstone is a horizon,
+    /// and the dead namesake's access history stays on its side of it.
+    #[test]
+    fn a_reborn_name_does_not_inherit_the_dead_namesakes_history() {
+        let root = temp_project();
+        let now = unix_now();
+        // The dead namesake: twenty reads, then its gc tombstone.
+        for i in 0..20u64 {
+            log_access(&root, "fact", now - 40 * DAY - i * HOUR, "read");
+        }
+        log_access(&root, "fact", now - 30 * DAY, "gc");
+        // The reborn file and an untouched control, written the same instant.
+        write_memory(&root, "fact", "# A new fact under an old name");
+        write_memory(&root, "control", "# Fresh either way");
+        let scan = scan(&root, now);
+        let reborn = scan.entries.iter().find(|e| e.name == "fact").unwrap();
+        let control = scan.entries.iter().find(|e| e.name == "control").unwrap();
+        assert_eq!(
+            reborn.activation, control.activation,
+            "a reborn name must score like the fresh write it is"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
