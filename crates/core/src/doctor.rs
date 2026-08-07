@@ -130,11 +130,13 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         "tool cap",
     );
     // Rules and hook filters resolve against what actually loads, so the
-    // known-tool set is the live entries after shadowing and the cap - a
-    // rule naming a beyond-cap tool is as dead as one naming a typo.
+    // known-tool set is the entries the loader keeps: a rule naming a
+    // beyond-cap tool is as dead as one naming a typo, but a warned entry is
+    // still live - a tool whose command does not exist yet, or whose code
+    // awaits re-approval, loads all the same, so a rule naming it matches.
     external_names = tools_found
         .iter()
-        .filter(|(f, id)| id.is_some() && matches!(f.status, Status::Ok(_)))
+        .filter(|(f, id)| id.is_some() && !matches!(f.status, Status::Err(_)))
         .filter_map(|(_, id)| id.clone())
         .collect();
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
@@ -2003,6 +2005,37 @@ mod tests {
             1
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A tool that parses loads into the registry whether or not its command
+    /// exists yet (the missing script only matters at spawn time), so a rule
+    /// or hook filter naming it matches at runtime. Before this, --check said
+    /// "no tool named 'ghost' exists" about a tool `--spec usage` listed as
+    /// installed, inviting the user to delete a live deny rule.
+    #[test]
+    fn a_warned_tool_is_still_a_known_name_for_rules_and_filters() {
+        let root = temp_project();
+        write(
+            root.join(".openmax/tools/ghost.toml"),
+            "name = \"ghost\"\ndescription = \"d\"\ncommand = \"./scripts/ghost.sh\"\n",
+        );
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"deny\"\ntool = \"ghost\"\n",
+        );
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\ntool = \"ghost\"\n",
+        );
+
+        let findings = local(&root);
+        // The tool itself still warns about the command it cannot spawn.
+        assert!(matches!(find(&findings, "ghost.toml").status, Status::Warn(_)));
+        assert!(
+            !findings.iter().any(|f| f.status.summary().contains("no tool named 'ghost'")),
+            "a live tool's name must resolve for rules and hook filters: {findings:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
