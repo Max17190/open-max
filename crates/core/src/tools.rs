@@ -685,6 +685,11 @@ fn glob_walk_root(root: &Path, pattern: &str) -> PathBuf {
     }
 }
 
+/// True when `rel` (a root-relative path) names `.git` or anything inside it.
+fn touches_git(rel: &Path) -> bool {
+    rel.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+}
+
 fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
     let Some(pattern) = args["pattern"].as_str() else {
         return ToolOutcome::err("missing required argument: pattern");
@@ -694,6 +699,25 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
         Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
     };
     let walk_root = glob_walk_root(root, pattern);
+    // The walker's filter skips entries named .git during descent, but never
+    // the walk root itself, so a pattern scoped at or under .git would start
+    // inside the excluded tree. Canonicalizing catches a symlinked prefix
+    // that aliases .git without naming it (walk roots are followed even
+    // though the walk itself never follows links).
+    if walk_root.as_path() != root {
+        let scoped_into_git =
+            walk_root.strip_prefix(root).map(touches_git).unwrap_or(true);
+        let aliases_git = match (walk_root.canonicalize(), root.canonicalize()) {
+            (Ok(canon), Ok(root_canon)) => {
+                canon.strip_prefix(&root_canon).map(touches_git).unwrap_or(true)
+            }
+            // A nonexistent prefix walks nothing; let the normal path answer.
+            _ => false,
+        };
+        if scoped_into_git || aliases_git {
+            return ToolOutcome::err(".git is excluded from search");
+        }
+    }
     let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
     for entry in project_walk(&walk_root).flatten() {
         let path = entry.path();
@@ -731,6 +755,16 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
     };
+    // resolve() canonicalized, so a path (or a symlink) that lands inside
+    // .git names it here even when the argument never did. The walker's
+    // filter cannot help once .git is the walk root.
+    let inside_git = match root.canonicalize() {
+        Ok(root_canon) => search_root.strip_prefix(&root_canon).map(touches_git).unwrap_or(false),
+        Err(_) => false,
+    };
+    if inside_git {
+        return ToolOutcome::err(".git is excluded from search");
+    }
     let file_matcher = match args["glob"].as_str() {
         Some(g) => match globset::Glob::new(g) {
             Ok(m) => Some(m.compile_matcher()),
@@ -1033,6 +1067,34 @@ mod tests {
         let out = grep_tool(&root, &json!({"pattern": "fetch_page"}));
         assert!(out.output.contains(".openmax/tools/fetch.toml:1:"), "{}", out.output);
         assert!(!out.output.contains(".git/config"), "{}", out.output);
+
+        // Scoping a search at or under .git must not sidestep the walker's
+        // filter, which never sees the walk root itself.
+        let out = glob_tool(&root, &json!({"pattern": ".git/config"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        let out = glob_tool(&root, &json!({"pattern": ".git/**"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "fetch_page", "path": ".git"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "fetch_page", "path": ".git/hooks"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A symlink inside the project can alias .git without naming it; the
+    /// canonical path is the authority for the exclusion.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_symlink_to_git_is_still_excluded() {
+        let root = temp_project();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "fetch_page in git internals\n").unwrap();
+        std::os::unix::fs::symlink(root.join(".git"), root.join("gitlink")).unwrap();
+
+        let out = grep_tool(&root, &json!({"pattern": "fetch_page", "path": "gitlink"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        let out = glob_tool(&root, &json!({"pattern": "gitlink/*"}));
+        assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
