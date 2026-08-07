@@ -345,6 +345,19 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             &format!("{event} hook cap"),
         );
     }
+    // Both of the above are ordinary bookkeeping for a tool or a skill: the
+    // file does not load, and nothing else changes. For a gate a human
+    // approved it is the loop failing every tool call closed, so --check has
+    // to say that rather than leave a human reading "never loads" while their
+    // session refuses to run.
+    if let Ok(approvals) = crate::ledger::approvals(data_dir, project_root) {
+        mark_displaced_gates(&mut hooks_found, |path| {
+            approvals
+                .approved_hook(path)
+                .map(|a| a.is_gate())
+                .unwrap_or_else(|| approvals.was_live(path))
+        });
+    }
     findings.extend(hooks_found.into_iter().map(|(f, _)| f));
     findings.extend(hook_extras);
     // A deleted hook file leaves nothing on disk to report against, so the
@@ -1059,6 +1072,50 @@ fn mark_beyond_cap(
     }
 }
 
+/// Restate what displacement means for a gate a human approved. A shadowed or
+/// beyond-cap tool simply does not load; a gate in that position still holds
+/// the bytes a human blessed and is not gating, which the loop answers by
+/// failing every tool call closed. Two approved hooks on one stem are exempt:
+/// a project hook overriding a global one is precedence a human built, and the
+/// loop reads it the same way.
+fn mark_displaced_gates(entries: &mut [Entry], approved_gate: impl Fn(&Path) -> bool) {
+    let mut winner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, (_, id)) in entries.iter().enumerate() {
+        if let Some(id) = id {
+            winner.entry(id.as_str()).or_insert(i);
+        }
+    }
+    let displaced: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, (finding, id))| {
+            if !approved_gate(&finding.path) {
+                return false;
+            }
+            match &finding.status {
+                // The cap ranks approved entries only, so reaching here means
+                // a hook a human blessed lost the ranking.
+                Status::Err(message) => message.contains("never loads"),
+                Status::Warn(message) => {
+                    message.starts_with("shadowed by")
+                        && id
+                            .as_deref()
+                            .and_then(|id| winner.get(id))
+                            .is_some_and(|w| *w != *i && !matches!(entries[*w].0.status, Status::Ok(_)))
+                }
+                Status::Ok(_) => false,
+            }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for i in displaced {
+        let reason = entries[i].0.status.summary().to_string();
+        entries[i].0.status = Status::Err(format!(
+            "{reason}; it still holds the content a human approved, so every tool call fails closed until it can run again"
+        ));
+    }
+}
+
 /// Directories the project tier is actually read from, as (parent, child).
 const PROJECT_DIRS: &[(&str, &str)] = &[
     (".openmax", "tools"),
@@ -1350,6 +1407,89 @@ mod tests {
             other => panic!("a demoted gate must not read as an inert observer: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An approved gate can stop running without its file changing at all:
+    /// it lands past the per-event cap. The loop fails every tool call closed
+    /// on that, so `--check` has to describe that state rather than the milder
+    /// one it looks like from the directory listing ("never loads").
+    #[test]
+    fn an_approved_gate_past_the_cap_reads_as_fail_closed() {
+        let root = temp_project();
+        let data = root.join("data");
+        let body = "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n";
+        for i in 0..(crate::hooks::MAX_HOOKS_PER_EVENT + 1) {
+            let path = root.join(format!(".openmax/hooks/gate-{i:03}.toml"));
+            write(path.clone(), body);
+            let sha = crate::ledger::sha256_hex(&std::fs::read(&path).unwrap());
+            crate::ledger::approve_capability(&data, &root, &path, &[sha]).unwrap();
+        }
+
+        let findings = check_at(&root, &data);
+        let over = find(
+            &findings,
+            &format!("gate-{:03}.toml", crate::hooks::MAX_HOOKS_PER_EVENT),
+        );
+        match &over.status {
+            Status::Err(reason) => {
+                assert!(reason.contains("never loads"), "{reason}");
+                assert!(reason.contains("fails closed"), "{reason}");
+            }
+            other => panic!("a gate past the cap must read as fail-closed: {other:?}"),
+        }
+        // The hooks that do run are still reported as healthy.
+        assert!(matches!(find(&findings, "gate-000.toml").status, Status::Ok(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The other way a gate is displaced is occupation: a same-stem file in a
+    /// higher-precedence directory. Judged here on the entries themselves,
+    /// because the two tiers are the project and `$HOME` - and pointing the
+    /// process at a different HOME to build the case would leak into every
+    /// other test in this binary that reads it. Two approved hooks on one
+    /// stem stay the precedence a human built, exactly as the loop reads it.
+    #[test]
+    fn displacement_marks_a_gate_only_when_what_holds_its_stem_is_not_live() {
+        let entry = |path: &str, status: Status| {
+            (Finding { kind: "hook", path: PathBuf::from(path), status }, Some("gate".to_string()))
+        };
+        let shadowed = || {
+            Status::Warn("shadowed by /p/.openmax/hooks/gate.toml, where hook 'gate' resolves".into())
+        };
+
+        // The occupier does not load, so the human's gate is not gating.
+        let mut entries = vec![
+            entry("/p/.openmax/hooks/gate.toml", Status::Err("inert because its content is not approved".into())),
+            entry("/h/.openmax/hooks/gate.toml", shadowed()),
+        ];
+        mark_displaced_gates(&mut entries, |_| true);
+        match &entries[1].0.status {
+            Status::Err(reason) => {
+                assert!(reason.contains("shadowed by"), "{reason}");
+                assert!(reason.contains("fails closed"), "{reason}");
+            }
+            other => panic!("a shadowed approved gate must read as fail-closed: {other:?}"),
+        }
+
+        // The occupier is live: a project hook overriding a global one.
+        let mut entries = vec![
+            entry("/p/.openmax/hooks/gate.toml", Status::Ok("hook on pre_tool_use".into())),
+            entry("/h/.openmax/hooks/gate.toml", shadowed()),
+        ];
+        mark_displaced_gates(&mut entries, |_| true);
+        assert!(
+            matches!(entries[1].0.status, Status::Warn(_)),
+            "an approved override is precedence, not displacement: {:?}",
+            entries[1].0.status
+        );
+
+        // Nothing a human approved is at stake, so nothing is upgraded.
+        let mut entries = vec![
+            entry("/p/.openmax/hooks/gate.toml", Status::Err("inert".into())),
+            entry("/h/.openmax/hooks/gate.toml", shadowed()),
+        ];
+        mark_displaced_gates(&mut entries, |_| false);
+        assert!(matches!(entries[1].0.status, Status::Warn(_)));
     }
 
     /// A deleted hook file has nothing on disk to report against, so it is
