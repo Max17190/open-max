@@ -609,26 +609,35 @@ fn bounded(text: String) -> String {
 /// before the filters, not after: a blank line or one corrupt record would
 /// otherwise shift every number below it, and an address that is usually
 /// right is worse than no address at all.
+/// The second return says whether the budget cut the read before EOF: a
+/// dropped tail is unsearched history, and the caller owes it the same
+/// partial-scan disclosure as a mid-loop ceiling break. Detected by reading
+/// one byte past the budget, so a file that is exactly the budget is whole.
 fn bounded_jsonl<T: serde::de::DeserializeOwned>(
     path: &Path,
     io_budget: usize,
-) -> Vec<(usize, T)> {
+) -> (Vec<(usize, T)>, bool) {
     use std::io::Read as _;
     let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let mut buf = Vec::new();
-    if file.take(io_budget as u64).read_to_end(&mut buf).is_err() {
-        return Vec::new();
+    if file.take(io_budget as u64 + 1).read_to_end(&mut buf).is_err() {
+        return (Vec::new(), false);
+    }
+    let tail_cut = buf.len() > io_budget;
+    if tail_cut {
+        buf.truncate(io_budget);
     }
     // Lossy, because the budget may cut inside a multi-byte char: the mangled
     // final line fails to parse and is skipped like any other corrupt line.
-    String::from_utf8_lossy(&buf)
+    let values = String::from_utf8_lossy(&buf)
         .lines()
         .enumerate()
         .filter(|(_, l)| !l.trim().is_empty())
         .filter_map(|(i, l)| serde_json::from_str(l).ok().map(|value| (i + 1, value)))
-        .collect()
+        .collect();
+    (values, tail_cut)
 }
 
 /// Read at most `MAX_CHUNK_BYTES` of a text file, lossy at the cut.
@@ -776,9 +785,10 @@ fn collect_chunks(
         // scanned session of its path evidence.
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let compaction_path = std::path::PathBuf::from(sessions::compaction_display(core, &meta.id));
-        for (line, record) in
-            bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget)
-        {
+        let (records, tail_cut) =
+            bounded_jsonl::<sessions::CompactionRecord>(&compaction_path, io_budget);
+        cut |= tail_cut;
+        for (line, record) in records {
             if bytes >= scan_ceiling {
                 cut = true;
                 break;
@@ -801,7 +811,10 @@ fn collect_chunks(
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
-        for (line, msg) in bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget) {
+        let (records, tail_cut) =
+            bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget);
+        cut |= tail_cut;
+        for (line, msg) in records {
             if bytes >= scan_ceiling {
                 cut = true;
                 break;
@@ -833,7 +846,10 @@ fn collect_chunks(
         }
         let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
         let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
-        for (line, msg) in bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget) {
+        let (records, tail_cut) =
+            bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget);
+        cut |= tail_cut;
+        for (line, msg) in records {
             if bytes >= scan_ceiling {
                 cut = true;
                 break;
@@ -1539,6 +1555,34 @@ mod tests {
         assert!(
             !serde_json::to_string(&report).unwrap().contains("sessions_partial"),
             "and nothing to disclose stays out of the report"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The ceiling break is not the only bound that cuts inside a session:
+    /// `bounded_jsonl` stops at its byte budget, and a record it dropped
+    /// unparsed is unsearched history exactly like a skipped tail. A single
+    /// record longer than the whole budget never raises the byte counter at
+    /// all, so without the read reporting its own cut the session claims
+    /// whole while its one record went unsearched.
+    #[test]
+    fn a_tail_cut_by_the_bounded_read_marks_the_session_partial() {
+        let (core, dir, project) = setup();
+        // One record wider than ceiling + MAX_CHUNK_BYTES: the bounded read
+        // cuts inside it, it fails to parse, and no chunk is ever counted.
+        seed_session(&core, &project, "wide", vec![ChatMessage::user(format!(
+            "TAIL-NEEDLE {}",
+            "z".repeat(1_000 + MAX_CHUNK_BYTES + 1_000)
+        ))]);
+        let c = collect_chunks(&core, &project, sessions::unix_now(), 1_000, &[]);
+        assert!(
+            !c.chunks.iter().any(|ch| ch.text.contains("TAIL-NEEDLE")),
+            "the cut is real: the record was never indexed"
+        );
+        assert_eq!(c.scanned, 1, "the session was entered");
+        assert_eq!(
+            c.partial, 1,
+            "a record the bounded read dropped must mark the session partial"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
