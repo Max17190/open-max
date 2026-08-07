@@ -1693,7 +1693,9 @@ async fn refreeze_between_iterations(
     true
 }
 
-/// Buffers streamed deltas and flushes them as batched events.
+/// Buffers streamed deltas and flushes them as batched events. Flushes on
+/// push once the batch window has elapsed, and via [`spawn_stale_flusher`]
+/// when the stream goes quiet with a batch still buffered.
 struct TokenBatcher {
     core: Arc<Core>,
     session_id: String,
@@ -1717,6 +1719,20 @@ impl TokenBatcher {
         }
     }
 
+    /// Flush a batch the stream went quiet on. Pushes only flush when the
+    /// next delta arrives, so without this a tail buffered just before the
+    /// deltas stop - the model switching to tool-call arguments (which emit
+    /// no deltas), or a stalled endpoint - stays invisible until the whole
+    /// response ends: for a large write_file call, many seconds after the
+    /// text was received.
+    fn flush_if_stale(&mut self) {
+        if (!self.content.is_empty() || !self.thinking.is_empty())
+            && self.last_flush.elapsed() >= FLUSH_INTERVAL
+        {
+            self.flush();
+        }
+    }
+
     fn flush(&mut self) {
         if !self.content.is_empty() {
             self.core.send_agent(&self.session_id, AgentEvent::Token { text: std::mem::take(&mut self.content) });
@@ -1726,6 +1742,22 @@ impl TokenBatcher {
         }
         self.last_flush = Instant::now();
     }
+}
+
+/// Tick the batcher at the flush interval for the lifetime of one streaming
+/// request; the caller aborts the task as soon as the stream returns. Abort
+/// can only land at an await point, so it never interrupts a flush half way,
+/// and a tick racing the caller's final flush finds the buffers already
+/// drained and does nothing.
+fn spawn_stale_flusher(batcher: Arc<StdMutex<TokenBatcher>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            batcher.lock().unwrap().flush_if_stale();
+        }
+    })
 }
 
 async fn run_loop(
@@ -1900,11 +1932,13 @@ async fn run_loop(
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
+        let flusher = spawn_stale_flusher(batcher.clone());
         let result = client
             .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
+        flusher.abort();
         batcher.lock().unwrap().flush();
 
         let result = match result {
@@ -4689,6 +4723,137 @@ mod tests {
         assert!(message.contains("frozen tool schemas"), "{message}");
         assert!(message.contains("context_tokens 1200"), "{message}");
         assert_eq!(stop.as_deref(), Some("error"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The stale flush respects the batch window: a fresh batch stays
+    /// buffered, an aged one flushes without waiting for another push.
+    #[tokio::test]
+    async fn flush_if_stale_flushes_only_an_aged_batch() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-batcher-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let mut batcher = TokenBatcher::new(core.clone(), "s".into());
+        // Stage the batch by hand so the test controls the window exactly:
+        // push's own flush-on-arrival would race the timing it stages.
+        batcher.content.push_str("tail");
+        batcher.last_flush = Instant::now();
+        batcher.flush_if_stale();
+        assert!(rx.try_recv().is_err(), "a batch inside the window must stay buffered");
+
+        tokio::time::sleep(FLUSH_INTERVAL + Duration::from_millis(10)).await;
+        batcher.flush_if_stale();
+        match rx.try_recv().map(|env| env.event) {
+            Ok(AgentEvent::Token { text }) => assert_eq!(text, "tail"),
+            other => panic!("an aged batch must flush as one Token event, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The tail of a streamed reply must not wait for the stream to end: a
+    /// delta that lands inside the batch window is flushed only when the next
+    /// delta arrives, so when the deltas stop - the model switching to
+    /// streaming tool-call arguments, or a stalled endpoint - the buffered
+    /// text used to stay invisible until the whole response finished, many
+    /// seconds for a large write_file call. The stale-flush ticker must
+    /// surface it while the stream is still open.
+    #[tokio::test]
+    async fn a_buffered_stream_tail_flushes_while_the_stream_is_quiet() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-stale-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+
+        // Two content deltas in one write, so the second lands inside the
+        // first flush's batch window, then a long quiet gap before the
+        // terminator: the wire shape of a reply whose text is done while the
+        // response is not.
+        let tail_sent = Arc::new(AtomicBool::new(false));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = tail_sent.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => buf.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let headers = String::from_utf8_lossy(&buf).to_string();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let deltas = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"the tail \"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"of the answer\"},\"finish_reason\":null}]}\n\n",
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(deltas.as_bytes());
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(3));
+            sent.store(true, Ordering::SeqCst);
+            let _ = stream.write_all(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            );
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+        }
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        start_turn(core.clone(), "sess-stale".into(), project, "hi".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut streamed = String::new();
+        let mut complete_while_open = false;
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Token { text } => {
+                        streamed.push_str(&text);
+                        if streamed == "the tail of the answer"
+                            && !tail_sent.load(Ordering::SeqCst)
+                        {
+                            complete_while_open = true;
+                        }
+                    }
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(streamed, "the tail of the answer");
+        assert!(
+            complete_while_open,
+            "the buffered tail must flush while the stream is quiet, not at stream end"
+        );
+        assert_eq!(stop.as_deref(), Some("stop"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
