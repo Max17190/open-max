@@ -1924,6 +1924,9 @@ impl App {
             }
             Err(e) => {
                 let _ = self.transcript.pop_last_user();
+                // An open find popup indexes blocks; the rollback just
+                // changed them, so its matches and previews must rebuild.
+                self.refilter_scroll_search_live();
                 self.error(&e);
             }
         }
@@ -2642,8 +2645,11 @@ impl App {
                     }
                     "blocked" => {
                         // Core never accepted the text: drop the optimistic
-                        // user bubble and restore it to the composer.
+                        // user bubble and restore it to the composer. An
+                        // open find popup indexes blocks, so its matches
+                        // and previews must rebuild with the block gone.
                         let _ = self.transcript.pop_last_user();
+                        self.refilter_scroll_search_live();
                         if let Some(text) = self.pending_submit.take() {
                             if self.composer.is_empty() {
                                 self.composer.load(&text);
