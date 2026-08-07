@@ -1736,9 +1736,13 @@ impl App {
             self.completion = None;
             return;
         }
-        let (row, col, line) = self.composer.cursor_context();
-        let line = line.to_string();
-        match completion::trigger(&line, col, row == 0) {
+        // `trigger` returns owned data, so the composer borrow ends with the
+        // block: no per-keystroke copy of the row just to appease borrows.
+        let trigger = {
+            let (row, col, line) = self.composer.cursor_context();
+            completion::trigger(line, col, row == 0)
+        };
+        match trigger {
             None => self.completion = None,
             Some((kind, token_start, query)) => {
                 let token_len = query.chars().count() + 1;

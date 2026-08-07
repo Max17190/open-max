@@ -115,7 +115,7 @@ impl CommandSpec {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Slash,
     File,
@@ -162,13 +162,30 @@ impl Popup {
 /// The token under the cursor, if it can drive a completion. Slash commands
 /// complete only as the first token of the message; @-files complete anywhere.
 pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, String)> {
-    let chars: Vec<char> = line.chars().collect();
-    let col = col.min(chars.len());
+    // Runs on every keystroke: locate the cursor byte without materializing
+    // a Vec<char> of the row, walking only as far as the cursor.
+    let (cursor_byte, col) = {
+        let mut count = 0usize;
+        let mut byte = line.len();
+        for (b, _) in line.char_indices() {
+            if count == col {
+                byte = b;
+                break;
+            }
+            count += 1;
+        }
+        (byte, col.min(count))
+    };
     let mut start = col;
-    while start > 0 && !chars[start - 1].is_whitespace() {
+    let mut start_byte = 0usize;
+    for (b, c) in line[..cursor_byte].char_indices().rev() {
+        if c.is_whitespace() {
+            start_byte = b + c.len_utf8();
+            break;
+        }
         start -= 1;
     }
-    let token: String = chars[start..col].iter().collect();
+    let token = &line[start_byte..cursor_byte];
     if first_row && start == 0 {
         if let Some(query) = token.strip_prefix('/') {
             // Past the command name (a space would end the token) argument
@@ -240,14 +257,23 @@ pub fn file_items(files: &Arc<Vec<String>>, query: &str) -> Vec<Item> {
         .iter()
         .filter_map(|path| fuzzy_score(path, query).map(|s| (s, path)))
         .collect();
-    scored.sort_by(|a, b| {
+    // Only the top MAX_VISIBLE * 3 survive: select them in O(n), then order
+    // just that head, instead of fully sorting every match (an empty query
+    // matches the whole index). The comparator is total — paths are unique —
+    // so the result is identical to the full stable sort.
+    let keep = MAX_VISIBLE * 3;
+    let rank = |a: &(i32, &String), b: &(i32, &String)| {
         b.0.cmp(&a.0)
             .then_with(|| a.1.len().cmp(&b.1.len()))
             .then_with(|| a.1.cmp(b.1))
-    });
+    };
+    if scored.len() > keep {
+        scored.select_nth_unstable_by(keep - 1, rank);
+        scored.truncate(keep);
+    }
+    scored.sort_unstable_by(rank);
     scored
         .into_iter()
-        .take(MAX_VISIBLE * 3)
         .map(|(_, path)| Item {
             insert: format!("@{path} "),
             label: path.clone(),
@@ -264,43 +290,37 @@ pub fn fuzzy_score(path: &str, query: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
-    let hay: Vec<char> = path.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let name_start = path
-        .rfind('/')
-        .map(|i| path[..=i].chars().count())
-        .unwrap_or(0);
-
+    // One streaming pass, no allocation: this runs once per indexed file per
+    // keystroke, so a Vec<char> of every path made each popup keystroke a
+    // malloc storm. Bonus positions are tracked in byte offsets; char and
+    // byte coordinates agree on "filename or later" and "consecutive"
+    // because both sides advance through the same chars.
+    let name_start = path.rfind('/').map(|i| i + 1).unwrap_or(0);
     let mut score = 0i32;
-    let mut hi = 0usize;
-    let mut prev_hit: Option<usize> = None;
-    for &nc in &needle {
-        let mut found = None;
-        while hi < hay.len() {
-            if hay[hi] == nc {
-                found = Some(hi);
-                break;
+    let mut chars = path.char_indices();
+    let mut prev: Option<char> = None;
+    let mut last_hit: Option<usize> = None;
+    'query: for nc in query.chars().map(|c| c.to_ascii_lowercase()) {
+        for (at, c) in chars.by_ref() {
+            let lc = c.to_ascii_lowercase();
+            if lc == nc {
+                score += 1;
+                if at >= name_start {
+                    score += 8;
+                }
+                if last_hit.is_some_and(|end| end == at) {
+                    score += 6;
+                }
+                if matches!(prev, None | Some('/' | '_' | '-' | '.')) {
+                    score += 4;
+                }
+                last_hit = Some(at + c.len_utf8());
+                prev = Some(lc);
+                continue 'query;
             }
-            hi += 1;
+            prev = Some(lc);
         }
-        let at = found?;
-        score += 1;
-        if at >= name_start {
-            score += 8;
-        }
-        if prev_hit == Some(at.wrapping_sub(1)) {
-            score += 6;
-        }
-        if at == 0
-            || matches!(
-                hay.get(at.wrapping_sub(1)),
-                Some('/') | Some('_') | Some('-') | Some('.')
-            )
-        {
-            score += 4;
-        }
-        prev_hit = Some(at);
-        hi = at + 1;
+        return None;
     }
     Some(score)
 }
@@ -324,8 +344,15 @@ pub fn scan_files(root: &Path) -> Vec<String> {
             }
         }
     }
-    out.sort_by_key(|p| (p.matches('/').count(), p.clone()));
-    out
+    // sort_by_key evaluates its key per comparison, and this key cloned the
+    // whole path each time: ~570k allocations to sort a 20k-file index.
+    // Pair each path with its depth once and sort by moves instead.
+    let mut keyed: Vec<(usize, String)> = out
+        .into_iter()
+        .map(|p| (p.matches('/').count(), p))
+        .collect();
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Render the popup as full-width rows, selection marked and windowed.
@@ -532,6 +559,197 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.style.bg == Some(theme::SURFACE())));
+    }
+
+    /// The old char-table scorer, kept as the oracle: the streaming rewrite
+    /// must give the same score to every (path, query) pair.
+    fn fuzzy_score_reference(path: &str, query: &str) -> Option<i32> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let hay: Vec<char> = path.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let name_start = path
+            .rfind('/')
+            .map(|i| path[..=i].chars().count())
+            .unwrap_or(0);
+        let mut score = 0i32;
+        let mut hi = 0usize;
+        let mut prev_hit: Option<usize> = None;
+        for &nc in &needle {
+            let mut found = None;
+            while hi < hay.len() {
+                if hay[hi] == nc {
+                    found = Some(hi);
+                    break;
+                }
+                hi += 1;
+            }
+            let at = found?;
+            score += 1;
+            if at >= name_start {
+                score += 8;
+            }
+            if prev_hit == Some(at.wrapping_sub(1)) {
+                score += 6;
+            }
+            if at == 0
+                || matches!(
+                    hay.get(at.wrapping_sub(1)),
+                    Some('/') | Some('_') | Some('-') | Some('.')
+                )
+            {
+                score += 4;
+            }
+            prev_hit = Some(at);
+            hi = at + 1;
+        }
+        Some(score)
+    }
+
+    #[test]
+    fn streaming_fuzzy_score_matches_the_char_table_oracle() {
+        let paths = [
+            "src/app.rs",
+            "crates/tui/src/main.rs",
+            "assets/apple.png",
+            "a",
+            "no_slash_at_all.txt",
+            "deep/UPPER_case/Mixed-Name.File.md",
+            "docs/héllo wörld.md",
+            "漢字/ファイル.rs",
+            "dot.at.end.",
+            "//odd//empty//segments",
+        ];
+        let queries = [
+            "", "a", "app", "sar", "APP", "main", "rs", "é", "ファ", "zz", ".",
+            "/", "_", "deep.md", "xyz",
+        ];
+        for path in paths {
+            for query in queries {
+                assert_eq!(
+                    fuzzy_score(path, query),
+                    fuzzy_score_reference(path, query),
+                    "diverged on ({path:?}, {query:?})"
+                );
+            }
+        }
+    }
+
+    /// The old whole-row char-table trigger, kept as the oracle for the
+    /// bounded-scan rewrite, at every cursor position including past-the-end.
+    fn trigger_reference(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, String)> {
+        let chars: Vec<char> = line.chars().collect();
+        let col = col.min(chars.len());
+        let mut start = col;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let token: String = chars[start..col].iter().collect();
+        if first_row && start == 0 {
+            if let Some(query) = token.strip_prefix('/') {
+                if query
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Some((Kind::Slash, start, query.to_string()));
+                }
+            }
+        }
+        if let Some(query) = token.strip_prefix('@') {
+            return Some((Kind::File, start, query.to_string()));
+        }
+        None
+    }
+
+    #[test]
+    fn bounded_trigger_matches_the_char_table_oracle() {
+        let lines = [
+            "",
+            "/mo",
+            "/model foo",
+            "say /mo",
+            "look at @src/ma",
+            "email me a@b",
+            "@",
+            "héllo @wörld/ファイル.rs tail",
+            "  @indent",
+            "@a @b @c",
+        ];
+        for line in lines {
+            let max = line.chars().count() + 2;
+            for col in 0..=max {
+                for first_row in [true, false] {
+                    assert_eq!(
+                        trigger(line, col, first_row),
+                        trigger_reference(line, col, first_row),
+                        "diverged on ({line:?}, {col}, {first_row})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn top_k_file_items_match_the_full_sort() {
+        // Enough paths that selection actually truncates, with score and
+        // length ties to exercise every comparator level.
+        let files: Arc<Vec<String>> = Arc::new(
+            (0..400)
+                .map(|i| format!("dir{}/file{:03}.rs", i % 7, i))
+                .chain(["app.rs".to_string(), "src/app.rs".to_string()])
+                .collect(),
+        );
+        for query in ["", "app", "file0", "rs"] {
+            let got: Vec<String> = file_items(&files, query)
+                .into_iter()
+                .map(|i| i.label)
+                .collect();
+            let mut reference: Vec<(i32, &String)> = files
+                .iter()
+                .filter_map(|p| fuzzy_score(p, query).map(|s| (s, p)))
+                .collect();
+            reference.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.len().cmp(&b.1.len()))
+                    .then_with(|| a.1.cmp(b.1))
+            });
+            let want: Vec<String> = reference
+                .into_iter()
+                .take(MAX_VISIBLE * 3)
+                .map(|(_, p)| p.clone())
+                .collect();
+            assert_eq!(got, want, "diverged on {query:?}");
+        }
+    }
+
+    /// Popup filter cost at index scale. Not a correctness test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_file_filter
+    #[test]
+    #[ignore]
+    fn measure_file_filter_cost_per_keystroke() {
+        use std::time::Instant;
+        let files: Arc<Vec<String>> = Arc::new(
+            (0..20_000)
+                .map(|i| {
+                    format!(
+                        "crates/module{:02}/src/sub{:02}/feature_file_{:05}.rs",
+                        i % 40,
+                        i % 25,
+                        i
+                    )
+                })
+                .collect(),
+        );
+        for query in ["", "co", "core", "feature123"] {
+            let t0 = Instant::now();
+            let n = 20;
+            for _ in 0..n {
+                std::hint::black_box(file_items(&files, query));
+            }
+            let per_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+            println!("query {query:?}: {per_ms:.3} ms per keystroke");
+        }
     }
 
     #[test]
