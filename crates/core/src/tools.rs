@@ -402,12 +402,26 @@ fn read_file(root: &Path, args: &Value) -> ToolOutcome {
     let limit = args["limit"].as_u64().unwrap_or(MAX_READ_LINES as u64) as usize;
     let limit = limit.min(MAX_READ_LINES);
     let total = text.lines().count();
+    // An offset past the end must not read like an empty file: the model
+    // would conclude the content is gone rather than that its offset is
+    // stale.
+    if offset > total && total > 0 {
+        return ToolOutcome::err(format!(
+            "offset {offset} is past the end of {rel} ({total} lines); retry with a smaller offset"
+        ));
+    }
     let mut out = String::new();
     let mut stopped_by_bytes = false;
     let mut byte_cap_line = 0usize;
     for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
-        let line = if line.len() > MAX_LINE_CHARS { &line[..floor_char(line, MAX_LINE_CHARS)] } else { line };
-        let formatted = format!("{:>5} {}\n", i + 1, line);
+        // A clipped line must say so: silently dropping its tail sends the
+        // model into edit_file with an old_string that can never match.
+        let formatted = if line.len() > MAX_LINE_CHARS {
+            let end = floor_char(line, MAX_LINE_CHARS);
+            format!("{:>5} {}… [line clipped; {} more bytes]\n", i + 1, &line[..end], line.len() - end)
+        } else {
+            format!("{:>5} {}\n", i + 1, line)
+        };
         if out.len() + formatted.len() > MAX_READ_BYTES {
             stopped_by_bytes = true;
             byte_cap_line = i + 1;
@@ -416,9 +430,12 @@ fn read_file(root: &Path, args: &Value) -> ToolOutcome {
         out.push_str(&formatted);
     }
     if stopped_by_bytes {
+        // `byte_cap_line` is the first line that did NOT fit, so the
+        // continuation resumes exactly there. The former `+ 1` skipped one
+        // line per capped read, and pointed past EOF when the cap landed on
+        // the final line.
         out.push_str(&format!(
-            "… output limit reached at line {byte_cap_line} (file has {total} lines; continue with offset={})\n",
-            byte_cap_line + 1
+            "… output limit reached at line {byte_cap_line} (file has {total} lines; continue with offset={byte_cap_line})\n"
         ));
     } else if total > offset - 1 + limit {
         out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - (offset - 1 + limit), offset + limit));
@@ -1300,6 +1317,80 @@ mod tests {
         assert!(out.output.contains("output limit reached at line"), "{}", out.output);
         assert!(out.output.contains("continue with offset="), "{}", out.output);
         assert!(out.output.len() <= MAX_READ_BYTES + 200, "{}", out.output.len());
+
+        // The continuation must resume at the first omitted line: an
+        // off-by-one silently skips one line per capped read.
+        let hint: usize = out.output.split("continue with offset=").nth(1).unwrap()
+            .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+        let shown = out.output.lines().filter(|l| l.contains("xxxx")).count();
+        assert_eq!(hint, shown + 1, "hint must name the first omitted line: {}", out.output);
+        let next = read_file(&root, &json!({"path": "big.txt", "offset": hint}));
+        assert!(next.ok, "{}", next.output);
+        assert!(
+            next.output.trim_start().starts_with(&format!("{hint} ")),
+            "continuation starts at the omitted line: {}",
+            next.output
+        );
+
+        // When the cap lands on the final line, the hint must still name a
+        // readable line rather than pointing past EOF.
+        let mut exact = String::new();
+        for _ in 0..hint {
+            exact.push_str(&long_line);
+            exact.push('\n');
+        }
+        std::fs::write(root.join("exact.txt"), &exact).unwrap();
+        let out = read_file(&root, &json!({"path": "exact.txt"}));
+        let hint2: usize = out.output.split("continue with offset=").nth(1)
+            .expect("a file one line past the cap still gets a continuation")
+            .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+        assert_eq!(hint2, hint, "the final line is the first omitted one: {}", out.output);
+        let last = read_file(&root, &json!({"path": "exact.txt", "offset": hint2}));
+        assert!(last.ok, "the hint must be followable: {}", last.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A clipped line must say so. The silent version sends the model into
+    /// edit_file with an old_string that can never match: the read shows a
+    /// 500-byte prefix, the edit fails, and the closest-match hint points at
+    /// the very line the model just read.
+    #[test]
+    fn read_file_marks_clipped_long_lines() {
+        let root = std::env::temp_dir().join(format!("openmax-read-clip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let long = format!("prefix {}suffix-END", "x".repeat(600));
+        std::fs::write(root.join("long.txt"), format!("{long}\nshort\n")).unwrap();
+        let out = read_file(&root, &json!({"path": "long.txt"}));
+        assert!(out.ok, "{}", out.output);
+        let first = out.output.lines().next().unwrap();
+        assert!(first.contains("[line clipped;"), "{first}");
+        assert!(first.contains("more bytes]"), "{first}");
+        assert!(!first.contains("suffix-END"), "the tail is dropped, not hidden: {first}");
+        assert!(out.output.contains("    2 short"), "ordinary lines stay unmarked: {}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An offset past the end must not read like an empty file: the model
+    /// would conclude the content is gone rather than that its offset is
+    /// stale.
+    #[test]
+    fn read_file_offset_past_eof_is_an_error_not_an_empty_file() {
+        let root = std::env::temp_dir().join(format!("openmax-read-eof-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("small.txt"), "one\ntwo\nthree\n").unwrap();
+        let out = read_file(&root, &json!({"path": "small.txt", "offset": 50}));
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("past the end"), "{}", out.output);
+        assert!(out.output.contains("3 lines"), "{}", out.output);
+        // The last line is still reachable, and a truly empty file keeps its
+        // own message.
+        let out = read_file(&root, &json!({"path": "small.txt", "offset": 3}));
+        assert!(out.ok && out.output.contains("three"), "{}", out.output);
+        std::fs::write(root.join("empty.txt"), "").unwrap();
+        let out = read_file(&root, &json!({"path": "empty.txt", "offset": 5}));
+        assert!(out.ok && out.output.contains("(empty file)"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
