@@ -578,7 +578,12 @@ async fn main() -> std::io::Result<()> {
         // and it sits at an ordinary project path the agent writes freely. So
         // approving the manifest approves that code in the same act - and
         // prints it, because a human cannot bless bytes they were not shown.
-        let code = open_max_core::ledger::manifest_code(file, &project);
+        // The code list comes from the bytes just hashed, not a second read:
+        // two reads are an interval a concurrent write can split, putting one
+        // file's hash on record next to another file's code.
+        let code = std::str::from_utf8(&bytes)
+            .map(|text| open_max_core::ledger::manifest_code_source(file, text, &project))
+            .unwrap_or_default();
         let mut shas = vec![sha.clone()];
         for entry in &code {
             let Some(code_sha) = &entry.sha256 else {
