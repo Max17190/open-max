@@ -399,6 +399,17 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         });
                     }
                 }
+                // An inert allow reads as a healthy rule count from the file
+                // alone: the rule is well-formed, it just is not authority.
+                if let Some(reason) =
+                    crate::permissions::inert_allow_reason(&path, project_root, data_dir)
+                {
+                    findings.push(Finding {
+                        kind: "permissions",
+                        path: path.clone(),
+                        status: Status::Warn(reason),
+                    });
+                }
                 findings.push(Finding {
                     kind: "permissions",
                     path,
@@ -703,7 +714,7 @@ async fn run_examples_within(
     let caps = crate::tools::OutputCaps::from_settings(&settings);
     let gates = ExampleGates {
         hooks: crate::hooks::Hooks::discover(project_root, data_dir),
-        permissions: crate::permissions::Permissions::discover(project_root),
+        permissions: crate::permissions::Permissions::discover(project_root, data_dir),
         approval_mode: settings.approval_mode,
         agent_spawned: std::env::var_os("OPENMAX_SESSION").is_some(),
     };
@@ -2259,13 +2270,18 @@ mod tests {
             !has_errors(&findings),
             "the tool may simply not be written yet, so this cannot fail the run"
         );
-        // The built-in and the project's own tool are both known.
-        assert_eq!(
-            findings
-                .iter()
-                .filter(|f| f.kind == "permissions" && matches!(f.status, Status::Warn(_)))
-                .count(),
-            1
+        // The built-in and the project's own tool are both known. The file's
+        // `allow` rule is unapproved, so it warns too; that is the only other
+        // warning this file may produce.
+        let warnings: Vec<&str> = findings
+            .iter()
+            .filter(|f| f.kind == "permissions" && matches!(f.status, Status::Warn(_)))
+            .map(|f| f.status.summary())
+            .collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().filter(|w| w.contains("allow rule(s) are inert")).count() == 1,
+            "{warnings:?}"
         );
 
         let _ = std::fs::remove_dir_all(root);

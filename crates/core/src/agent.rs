@@ -1851,7 +1851,7 @@ async fn run_loop(
 
     // Discovered once per turn start; empty dirs/files are a cheap no-op.
     // Permissions never enter the prompt, so reloading next turn is fine.
-    let permissions = Permissions::discover(project_root);
+    let permissions = Permissions::discover(project_root, &core.data_dir);
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
