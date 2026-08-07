@@ -2153,6 +2153,23 @@ async fn run_loop(
                         continue;
                     }
                     PreToolResult::Cancelled => {
+                        // The ToolStart for this call already went out; close
+                        // it, as the batch path closes every started call on
+                        // cancel. A dangling start leaves the frontend showing
+                        // a tool that began and vanished, and a --stdio client
+                        // waiting on a tool_end that never comes; the reply
+                        // pushed here keeps the transcript pairing visible in
+                        // the same place instead of leaning on the post-loop
+                        // orphan stubs.
+                        core.send_agent(session_id, AgentEvent::ToolEnd {
+                            call_id: call.id.clone(),
+                            ok: false,
+                            output: "The user cancelled this turn.".into(),
+                        });
+                        guard.messages().push(ChatMessage::tool(
+                            call.id.clone(),
+                            "The user cancelled this turn.",
+                        ));
                         stop_reason = "cancelled".into();
                         break 'turns;
                     }
@@ -4601,6 +4618,116 @@ mod tests {
         let listed = sessions::list(&core, &project_key);
         let title = listed.iter().find(|m| m.id == id).expect("session in index").title.clone();
         assert_eq!(title, sessions::UNTITLED, "blocked prompt must not set the title");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Esc while a pre_tool_use hook runs must close the call it interrupted:
+    /// the ToolStart already went out, and the batch path closes every
+    /// started call on cancel. Without the paired ToolEnd the TUI shows a
+    /// tool that began and vanished (its meta entry never resolves into a
+    /// card) and a --stdio frontend waits on a tool_end that never comes.
+    #[tokio::test]
+    async fn a_cancel_during_a_pre_tool_hook_closes_the_started_call() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::PermissionsExt;
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-hookcancel-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("slow.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        std::fs::write(
+            hooks_dir.join("slow.toml"),
+            format!("event = \"pre_tool_use\"\ncommand = \"{}\"\n", script.display()),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &hooks_dir.join("slow.toml"));
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        // One-shot provider: a single read_file call, then a clean stop.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => buf.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let headers = String::from_utf8_lossy(&buf).to_string();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let _ = stream.write_all(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c-hook\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ).as_bytes());
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+        }
+
+        let id = "sess-hook-cancel";
+        start_turn(core.clone(), id.into(), project.clone(), "read it".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut started = None;
+        let mut ended = None;
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::ToolStart { call_id, .. } => {
+                        started = Some(call_id);
+                        // Esc lands while the hook script sleeps.
+                        core.cancel(id);
+                    }
+                    AgentEvent::ToolEnd { call_id, ok, .. } => {
+                        ended = Some((call_id, ok));
+                    }
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let started = started.expect("the call must have started");
+        assert_eq!(stop.as_deref(), Some("cancelled"));
+        let (ended_id, ok) = ended.expect("a started call must emit its ToolEnd before Done");
+        assert_eq!(ended_id, started, "the ToolEnd must close the started call");
+        assert!(!ok);
+        let messages = core.sessions.lock().await.get(id).unwrap().messages.clone();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some(started.as_str())),
+            "the interrupted call must keep a tool reply in the transcript"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
