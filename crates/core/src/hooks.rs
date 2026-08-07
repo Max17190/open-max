@@ -151,6 +151,16 @@ pub struct Hooks {
     /// once the file is gone, which is exactly the position an unparseable
     /// file leaves us in, so it gets the same fail-closed answer.
     missing: Vec<(PathBuf, String)>,
+    /// Gate hooks a human approved, still holding their approved bytes, that
+    /// this discovery cannot run: another file took their stem, or they sit
+    /// past the per-event cap. Neither is a change to the hook, so nothing
+    /// above sees them - and both end with a human's gate not gating, which
+    /// is the one outcome that must never be silent.
+    not_running: Vec<(PathBuf, String)>,
+    /// Every hook path this discovery actually read, one per stem. What is
+    /// missing from it is what the loader never reached, which is how a
+    /// shadowed file is told from a deleted one.
+    considered: Vec<PathBuf>,
     /// Why the approval store could not be read, when it could not. Every
     /// bucket above keys on what a human approved, so with the ledger
     /// unreadable there is no verdict to sort by: an approved gate cannot be
@@ -211,7 +221,12 @@ fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
         }
     }
     let invalid: Vec<(PathBuf, String)> = invalid_by_stem.into_values().collect();
-    let mut hooks = Hooks { invalid, ..Hooks::default() };
+    let considered = by_stem
+        .values()
+        .map(|s| s.source_path.clone())
+        .chain(invalid.iter().map(|(p, _)| p.clone()))
+        .collect();
+    let mut hooks = Hooks { invalid, considered, ..Hooks::default() };
     for spec in by_stem.into_values() {
         match spec.event {
             HookEvent::PreToolUse => hooks.pre.push(spec),
@@ -222,18 +237,8 @@ fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
             HookEvent::TurnEnd => hooks.turn_end.push(spec),
         }
     }
-    // BTreeMap iteration is stem-sorted, so each event list is deterministic
-    // and the cap keeps the sorted head. --check names what is beyond it.
-    for list in [
-        &mut hooks.pre,
-        &mut hooks.post,
-        &mut hooks.user_prompt,
-        &mut hooks.session_start,
-        &mut hooks.compaction,
-        &mut hooks.turn_end,
-    ] {
-        list.truncate(MAX_HOOKS_PER_EVENT);
-    }
+    // BTreeMap iteration is stem-sorted, so each event list is deterministic.
+    // The cap is applied later, over the approved set only: see `apply_cap`.
     hooks
 }
 
@@ -250,8 +255,14 @@ impl Hooks {
     /// disk. Discovery is one directory list per turn, so there is nothing
     /// worth that risk.
     pub fn discover(project_root: &Path, data_dir: &Path) -> Self {
-        let mut hooks = discover_in_dirs(&hook_dirs(project_root));
-        hooks.retain_approved(data_dir, project_root);
+        Self::discover_dirs(project_root, data_dir, &hook_dirs(project_root))
+    }
+
+    /// The same discovery against an explicit dir list - the list the
+    /// approval reconciliation judges shadowing against.
+    fn discover_dirs(project_root: &Path, data_dir: &Path, dirs: &[PathBuf]) -> Self {
+        let mut hooks = discover_in_dirs(dirs);
+        hooks.retain_approved(data_dir, project_root, dirs);
         hooks
     }
 
@@ -269,7 +280,7 @@ impl Hooks {
     /// Content at a path a human did approve is a *modification* of a live
     /// hook, and dropping a gate is how an edit turns a human gate off, so a
     /// revoked gate fails closed until it is restored or re-approved.
-    fn retain_approved(&mut self, data_dir: &Path, project_root: &Path) {
+    fn retain_approved(&mut self, data_dir: &Path, project_root: &Path, dirs: &[PathBuf]) {
         let approvals = match crate::ledger::approvals(data_dir, project_root) {
             Ok(approvals) => approvals,
             Err(reason) => {
@@ -402,25 +413,136 @@ impl Hooks {
         // entry, so nothing above ever sees it - and deleting a gate is
         // strictly easier than rewriting one. Absence gets the same answer as
         // a modification: the policy is not running, so nothing runs.
+        //
+        // A file that is still there but that discovery never read is the
+        // same outcome by a different route: another file holds its stem, or
+        // its directory could not be listed. Occupation is deletion's trick
+        // without the delete - the approved bytes sit untouched on disk while
+        // the gate stops running - so it is caught here too, where the
+        // question is what a human installed rather than what a directory
+        // now contains.
+        let considered: Vec<PathBuf> = std::mem::take(&mut self.considered);
         for path in approvals.live_paths() {
-            if path.exists() || !is_hook_manifest(path, project_root) {
+            if !manifest_in_dirs(path, dirs) {
                 continue;
             }
-            repair_paths.push(path.clone());
-            if let Some(approved) = approvals.approved_hook(path) {
-                repair_paths.extend(approved.code_paths());
+            let carve_out = |repair_paths: &mut Vec<PathBuf>| {
+                repair_paths.push(path.clone());
+                if let Some(approved) = approvals.approved_hook(path) {
+                    repair_paths.extend(approved.code_paths());
+                }
+            };
+            if !path.exists() {
+                carve_out(&mut repair_paths);
+                self.missing.push((
+                    path.clone(),
+                    format!("{}: an approved hook file was deleted", path.display()),
+                ));
+                continue;
             }
-            self.missing.push((
-                path.clone(),
-                format!(
-                    "{}: an approved hook file was deleted",
+            if considered.iter().any(|c| same_file(c, path)) {
+                continue;
+            }
+            let winner = stem_of(path)
+                .and_then(|stem| considered.iter().find(|c| stem_of(c) == Some(stem)));
+            // A winner a human also approved is precedence they built: a
+            // project hook overriding a global one is the documented way to
+            // do exactly that, so it is not displacement and says nothing.
+            if winner.is_some_and(|w| self.is_live(w)) {
+                continue;
+            }
+            let reason = match winner {
+                Some(winner) => format!(
+                    "{}: an approved hook is shadowed by {}, which holds its file stem and is not itself approved and running",
+                    path.display(),
+                    winner.display()
+                ),
+                None => format!(
+                    "{}: an approved hook file is on disk but discovery never read it; check that its directory is readable",
                     path.display()
                 ),
-            ));
+            };
+            carve_out(&mut repair_paths);
+            // The occupier is what has to change for the gate to come back,
+            // so the repair carve-out has to reach it. It grants nothing:
+            // writing there cannot approve anything, so the only content
+            // that ends the block is content a human already blessed.
+            if let Some(winner) = winner {
+                repair_paths.push(winner.clone());
+            }
+            let was_gate = approvals.approved_hook(path).map(|a| a.is_gate()).unwrap_or(true);
+            if was_gate {
+                self.not_running.push((path.clone(), reason));
+            } else {
+                notices.push(notice(path.clone(), "shadowed", reason));
+            }
         }
         self.revoked_gates = revoked_gates;
         self.repair_paths = repair_paths;
         self.notices = notices;
+        self.apply_cap();
+    }
+
+    /// Whether this exact path is one of the hooks that came through the
+    /// approval filter and will run this turn.
+    fn is_live(&self, path: &Path) -> bool {
+        self.events().into_iter().flatten().any(|s| same_file(&s.source_path, path))
+    }
+
+    fn events(&self) -> [&Vec<HookSpec>; 6] {
+        [
+            &self.pre,
+            &self.post,
+            &self.user_prompt,
+            &self.session_start,
+            &self.compaction,
+            &self.turn_end,
+        ]
+    }
+
+    /// Trim each event to the per-call cap, over the approved set only.
+    ///
+    /// Every `pre_tool_use` hook runs on every tool call, so the cap is a
+    /// latency bound and has to stay. What it must not be is a lever the
+    /// agent can pull: applied to the raw directory listing it ranked files
+    /// nobody approved alongside a human's gate, so 32 junk manifests with
+    /// earlier-sorting stems switched that gate off - the files doing the
+    /// evicting never running themselves. Ranking the approved set instead
+    /// keeps the same bound and leaves the ordering entirely in the hands of
+    /// the party that approves things.
+    ///
+    /// Over-cap gates are policy a human installed that is not running, so
+    /// they fail closed; over-cap observers are reported.
+    fn apply_cap(&mut self) {
+        let mut not_running = Vec::new();
+        let mut notices = Vec::new();
+        for list in [
+            &mut self.pre,
+            &mut self.post,
+            &mut self.user_prompt,
+            &mut self.session_start,
+            &mut self.compaction,
+            &mut self.turn_end,
+        ] {
+            if list.len() <= MAX_HOOKS_PER_EVENT {
+                continue;
+            }
+            for spec in list.split_off(MAX_HOOKS_PER_EVENT) {
+                let reason = format!(
+                    "{}: beyond the {MAX_HOOKS_PER_EVENT}-hook cap for {}, so it does not run; consolidate that event's hooks, or retire this one with `openmax --forget {}`",
+                    spec.source_path.display(),
+                    spec.event.as_str(),
+                    spec.source_path.display()
+                );
+                if spec.event.is_gate() {
+                    not_running.push((spec.source_path.clone(), reason));
+                } else {
+                    notices.push(notice(spec.source_path, spec.event.as_str(), reason));
+                }
+            }
+        }
+        self.not_running.extend(not_running);
+        self.notices.extend(notices);
     }
 
     /// Hooks that exist but did not load, for the frontend to show. Inert is
@@ -440,6 +562,7 @@ impl Hooks {
             && self.invalid.is_empty()
             && self.revoked_gates.is_empty()
             && self.missing.is_empty()
+            && self.not_running.is_empty()
             && self.ledger_error.is_none()
     }
 
@@ -469,6 +592,12 @@ impl Hooks {
             parts.push(format!(
                 "approved hook file(s) were deleted, failing closed until the file is restored or a human retires it (openmax --forget <path>): {}",
                 describe(&self.missing)
+            ));
+        }
+        if !self.not_running.is_empty() {
+            parts.push(format!(
+                "approved gate hook(s) still hold their approved content but cannot run, failing closed until they can (see openmax --check): {}",
+                describe(&self.not_running)
             ));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
@@ -703,14 +832,35 @@ fn resolve_for_repair(path: &Path) -> Option<PathBuf> {
 /// from, holding a `.toml`. Used to reconcile approved paths that are gone,
 /// where there is no file left to parse.
 pub(crate) fn is_hook_manifest(path: &Path, project_root: &Path) -> bool {
+    manifest_in_dirs(path, &hook_dirs(project_root))
+}
+
+/// The same question against the dirs a discovery actually read, so
+/// reconciliation and discovery can never disagree about which files are in
+/// scope.
+fn manifest_in_dirs(path: &Path, dirs: &[PathBuf]) -> bool {
     if path.extension().and_then(|e| e.to_str()) != Some("toml") {
         return false;
     }
     let Some(parent) = path.parent() else { return false };
-    hook_dirs(project_root).iter().any(|dir| {
-        parent == dir
-            || dir.canonicalize().map(|dir| parent == dir).unwrap_or(false)
+    dirs.iter().any(|dir| {
+        parent == dir || dir.canonicalize().map(|dir| parent == dir).unwrap_or(false)
     })
+}
+
+/// One identity per file, so two spellings of one path compare equal. Approved
+/// paths are stored canonical while a directory listing is not, and a file
+/// that is gone cannot be canonicalized at all.
+fn identity(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().or_else(|| resolve_for_repair(path))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || identity(a).is_some_and(|a| identity(b) == Some(a))
+}
+
+fn stem_of(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|s| s.to_str())
 }
 
 /// Hook files as "path: reason", for one fail-closed message.
@@ -1510,21 +1660,197 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
     }
 
+    /// The cap ranks approved hooks only. Approved observers beyond it are
+    /// reported and skipped - they gate nothing, so nothing blocks - and
+    /// other events are unaffected by one event's volume.
     #[test]
     fn hooks_beyond_the_per_event_cap_never_run() {
-        let dir = tempfile_dir();
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
         for i in 0..(MAX_HOOKS_PER_EVENT + 3) {
             write_hook_toml(
-                &dir,
+                &hooks_dir,
                 &format!("hook-{i:03}.toml"),
-                "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n",
+                "event = \"post_tool_use\"\ncommand = \"/bin/echo\"\n",
             );
         }
-        let hooks = discover_in_dirs(std::slice::from_ref(&dir));
+        let hooks = discover_for_test(&tmp);
         assert_eq!(hooks.post.len(), MAX_HOOKS_PER_EVENT);
-        // Other events are unaffected by post_tool_use volume.
         assert!(hooks.pre.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
+        // Observers beyond the cap are reported, and nothing fails closed.
+        let capped: Vec<_> =
+            hooks.notices().into_iter().filter(|n| n.detail.contains("cap")).collect();
+        assert_eq!(capped.len(), 3, "{capped:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The cap must rank what a human approved, not what sits in the
+    /// directory: unapproved files are the one thing an agent writes without
+    /// a human, and when the cap was applied before the approval filter, 32
+    /// junk manifests with earlier-sorting stems pushed an approved gate out
+    /// of discovery - a human's gate, switched off by files that themselves
+    /// never run.
+    #[tokio::test]
+    async fn unapproved_files_cannot_push_an_approved_gate_past_the_cap() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp, "gate.sh", "#!/bin/sh\necho 'blocked by the human gate'\nexit 1\n");
+        // The stem sorts after every junk file, so a pre-filter cap drops it.
+        let toml = hooks_dir.join("zz-gate.toml");
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        for i in 0..MAX_HOOKS_PER_EVENT {
+            write_hook_toml(
+                &hooks_dir,
+                &format!("hook-{i:03}.toml"),
+                "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+            );
+        }
+
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.pre_count(), 1, "only the approved gate is live");
+        let cancel = Arc::new(CancelToken::default());
+        let blocked = hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        match blocked {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("blocked by the human gate"), "{reason}");
+            }
+            other => panic!("the approved gate must still run: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// When humans genuinely approve more gates than the cap runs, the ones
+    /// beyond it are policy a human installed that is not running - so they
+    /// fail closed with a reason naming the cap and the way out, never
+    /// silently stop gating.
+    #[tokio::test]
+    async fn an_approved_gate_beyond_the_cap_fails_closed_instead_of_vanishing() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for i in 0..(MAX_HOOKS_PER_EVENT + 1) {
+            let toml = hooks_dir.join(format!("gate-{i:03}.toml"));
+            std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+            approve_hook_file(&tmp, &data, &toml);
+        }
+
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.pre_count(), MAX_HOOKS_PER_EVENT, "the sorted head runs");
+        let cancel = Arc::new(CancelToken::default());
+        let blocked = hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        match blocked {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("cap"), "{reason}");
+                assert!(
+                    reason.contains(&format!("gate-{:03}.toml", MAX_HOOKS_PER_EVENT)),
+                    "the dropped gate must be named: {reason}"
+                );
+                assert!(reason.contains("openmax --forget"), "the way out must be named: {reason}");
+            }
+            other => panic!("a gate beyond the cap must fail closed: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Shadowing is deletion's trick by occupation: a project file that takes
+    /// an approved global gate's stem keeps that gate out of discovery while
+    /// the gate's own file sits untouched on disk, which is exactly the case
+    /// the missing-file reconciliation cannot see. An unapproved occupier
+    /// runs nothing in the gate's place, so the gate fails closed - and the
+    /// way back in-session is writing approved content over the occupier,
+    /// which the repair carve-out must allow.
+    #[tokio::test]
+    async fn an_unapproved_file_cannot_shadow_an_approved_gate_into_silence() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let project_hooks = tmp.join("project-hooks");
+        let global_hooks = tmp.join("global-hooks");
+        std::fs::create_dir_all(&project_hooks).unwrap();
+        std::fs::create_dir_all(&global_hooks).unwrap();
+        write_script(&tmp, "gate.sh", "#!/bin/sh\nexit 1\n");
+        let approved_body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
+        let global_gate = global_hooks.join("gate.toml");
+        std::fs::write(&global_gate, approved_body).unwrap();
+        approve_hook_file(&tmp, &data, &global_gate);
+        let dirs = [project_hooks.clone(), global_hooks.clone()];
+        assert_eq!(Hooks::discover_dirs(&tmp, &data, &dirs).pre_count(), 1, "the gate is live");
+
+        // The agent writes a same-stem file it never got approved.
+        std::fs::write(project_hooks.join("gate.toml"), "event = \"post_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        let hooks = Hooks::discover_dirs(&tmp, &data, &dirs);
+        assert_eq!(hooks.pre_count(), 0, "the shadowed gate cannot run");
+        let cancel = Arc::new(CancelToken::default());
+        let blocked = hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        match blocked {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("shadowed"), "{reason}");
+                assert!(reason.contains("gate.toml"), "{reason}");
+            }
+            other => panic!("a shadowed approved gate must fail closed: {other:?}"),
+        }
+
+        // The occupier is repairable from inside the session: writing the
+        // approved bytes over it restores the policy under the winning stem.
+        let repair = serde_json::json!({"path": "project-hooks/gate.toml", "content": approved_body});
+        assert_eq!(
+            hooks.pre_tool_use("s", "write_file", &repair, &tmp, &cancel).await,
+            PreToolResult::Allow,
+            "writing approved content over the occupier must stay possible"
+        );
+        std::fs::write(project_hooks.join("gate.toml"), approved_body).unwrap();
+        let hooks = Hooks::discover_dirs(&tmp, &data, &dirs);
+        assert_eq!(hooks.pre_count(), 1, "approved bytes under the winning stem run again");
+        match hooks
+            .pre_tool_use("s", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => {
+                assert!(!reason.contains("failing closed"), "the gate blocks on its own terms: {reason}");
+            }
+            other => panic!("the restored gate must run and block: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Two approved hooks on one stem is precedence a human built - a project
+    /// override of a global hook - not displacement: the override runs, and
+    /// nothing blocks or nags about the file it supersedes.
+    #[tokio::test]
+    async fn an_approved_override_of_an_approved_hook_is_precedence_not_displacement() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let project_hooks = tmp.join("project-hooks");
+        let global_hooks = tmp.join("global-hooks");
+        std::fs::create_dir_all(&project_hooks).unwrap();
+        std::fs::create_dir_all(&global_hooks).unwrap();
+        let global_gate = global_hooks.join("gate.toml");
+        std::fs::write(&global_gate, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &global_gate);
+        let project_gate = project_hooks.join("gate.toml");
+        std::fs::write(&project_gate, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\ntool = \"bash\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &project_gate);
+
+        let dirs = [project_hooks.clone(), global_hooks.clone()];
+        let hooks = Hooks::discover_dirs(&tmp, &data, &dirs);
+        assert_eq!(hooks.pre_count(), 1);
+        assert!(hooks.notices().is_empty(), "{:?}", hooks.notices());
+        let cancel = Arc::new(CancelToken::default());
+        assert_eq!(
+            hooks.pre_tool_use("s", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel).await,
+            PreToolResult::Allow
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
@@ -1843,7 +2169,7 @@ tool = "bash"
         let hook = HookSpec {
             source_sha256: String::new(),
             event: HookEvent::PostToolUse,
-            command: "/bin/true".into(),
+            command: "/bin/echo".into(),
             args: Vec::new(),
             timeout_secs: 1,
             tool_filter: None,
@@ -1881,7 +2207,7 @@ tool = "bash"
         let hook = HookSpec {
             source_sha256: String::new(),
             event: HookEvent::PostToolUse,
-            command: "/bin/true".into(),
+            command: "/bin/echo".into(),
             args: Vec::new(),
             timeout_secs: 1,
             tool_filter: None,
