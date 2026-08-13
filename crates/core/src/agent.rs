@@ -1696,6 +1696,17 @@ async fn refreeze_between_iterations(
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
     let counts = (new_registry.tools.len(), new_registry.skills.len());
+    // Names the swap will add, computed against the outgoing generation while
+    // it is still here: these are the tools the model does not know it has.
+    let old_names: std::collections::HashSet<&str> =
+        registry.tools.iter().map(|s| s.name.as_str()).collect();
+    let added_tools: Vec<String> = new_registry
+        .tools
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|name| !old_names.contains(name))
+        .map(str::to_string)
+        .collect();
     let new_registry = Arc::new(new_registry);
     if messages.first().is_some_and(|m| m.role == "system") {
         messages[0] = ChatMessage::system(prompt);
@@ -1725,6 +1736,31 @@ async fn refreeze_between_iterations(
         Some((files, crate::ledger::Actor::Session)),
     )
     .await;
+    // The Refrozen event below reaches the UI, not the model, and the eval
+    // showed exactly that gap: an agent authored a valid tool, three
+    // refreezes fired, and it still ran the script by hand because nothing
+    // in its transcript said the tool was callable. Ride the receipt on this
+    // iteration's last tool result, where the model reads next. One line,
+    // only when extension bytes actually changed.
+    if let Some(last_tool) = messages.iter_mut().rev().find(|m| m.role == "tool") {
+        let what = if changes.is_empty() {
+            "extension files changed".to_string()
+        } else {
+            changes.join("; ")
+        };
+        let mut note = format!("\n[extension refreeze: {what}.");
+        if !added_tools.is_empty() {
+            note.push_str(&format!(
+                " New tools callable from your next step: {}.",
+                added_tools.join(", ")
+            ));
+        }
+        note.push(']');
+        match &mut last_tool.content {
+            Some(content) => content.push_str(&note),
+            None => last_tool.content = Some(note.trim_start().to_string()),
+        }
+    }
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
         skills: counts.1,
