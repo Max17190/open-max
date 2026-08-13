@@ -39,6 +39,41 @@ pub fn render(surface: &str) -> Option<&'static str> {
     }
 }
 
+/// The keys each TOML manifest surface cannot omit, in the order its contract
+/// above lists them. They live beside the contract so the message about an
+/// absent key and the document that demands it cannot drift apart.
+const REQUIRED_FIELDS: [(&str, &str); 2] =
+    [("tools", "name, description, command"), ("hooks", "event, command")];
+
+/// Render a manifest's `toml::de::Error` for one surface.
+///
+/// A toml error Displays as `TOML parse error at line L, column C` over a
+/// caret block. For a required key that is simply absent that header is
+/// false: the file parsed, serde then asked for a key nobody wrote, and the
+/// span it reports covers the whole document, so the carets land on line 1
+/// and invite an edit to an innocent line. Absent keys are named plainly
+/// instead, with the surface's required set and where to read the rest of the
+/// contract. Syntax and type errors keep the location, which is where they
+/// really are.
+///
+/// Both manifest structs are flat, so `missing field` can only mean a
+/// top-level key: there is no nested span this discards.
+pub(crate) fn manifest_toml_error(err: &toml::de::Error, surface: &str) -> String {
+    let Some(field) = err
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+    else {
+        return format!("invalid TOML: {err}");
+    };
+    match REQUIRED_FIELDS.iter().find(|(name, _)| *name == surface) {
+        Some((_, required)) => format!(
+            "missing required field '{field}': required fields are {required} (openmax --spec {surface})"
+        ),
+        None => format!("missing required field '{field}' (openmax --spec {surface})"),
+    }
+}
+
 const TOOLS: &str = r#"# External tools
 
 One TOML file per tool: `.openmax/tools/<name>.toml` (project) or
@@ -667,6 +702,23 @@ mod tests {
         }
         assert!(render("nope").is_none());
         assert!(render("").is_none());
+    }
+
+    /// The required set a missing-key message prints is the set the printed
+    /// contract marks required, in the same order, or one of the two is
+    /// lying to whoever is fixing the file.
+    #[test]
+    fn required_field_lists_match_the_printed_contracts() {
+        for (surface, required) in REQUIRED_FIELDS {
+            let text = render(surface).unwrap_or_else(|| panic!("no spec for {surface}"));
+            let marked = text
+                .lines()
+                .filter(|line| line.contains("(required)"))
+                .filter_map(|line| line.split('`').nth(1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_eq!(marked, required, "{surface}");
+        }
     }
 
     /// The printed contract cannot drift from the parsers: each example is

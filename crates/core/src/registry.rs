@@ -588,7 +588,7 @@ pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
 pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
     let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
     let file: ExternalToolFile =
-        toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;
+        toml::from_str(text).map_err(|e| crate::spec::manifest_toml_error(&e, "tools"))?;
     let name = file.name.trim().to_string();
     // Boring, model-friendly names only; anything else is a config mistake.
     let name_ok = !name.is_empty()
@@ -922,6 +922,37 @@ mod tests {
         let b = Registry::builtin_only();
         assert_eq!(a.tool_schemas_json().to_string(), b.tool_schemas_json().to_string());
         assert_eq!(a.tool_names(), b.tool_names());
+    }
+
+    /// A manifest that parses cleanly but omits a required key is still a
+    /// hard error, and it must say why in terms of the key. It used to be
+    /// announced as `invalid TOML: TOML parse error at line 1, column 1`
+    /// with carets under a line the author wrote correctly, which reads as
+    /// an instruction to go edit that line.
+    #[test]
+    fn a_missing_tool_field_is_named_not_blamed_on_a_line() {
+        let text = "name = \"deploy\"\ncommand = \"./deploy.sh\"\n";
+        let err = parse_tool_source(Path::new("deploy.toml"), text).unwrap_err();
+        assert!(err.contains("missing required field 'description'"), "{err}");
+        assert!(err.contains("name, description, command"), "{err}");
+        assert!(!err.contains("invalid TOML"), "{err}");
+        assert!(!err.contains("line 1, column 1"), "{err}");
+        assert!(!err.contains('^'), "{err}");
+
+        // A genuine syntax error keeps the location and the caret: there the
+        // file really is malformed, at that column.
+        let err = parse_tool_source(Path::new("deploy.toml"), "name = [not toml").unwrap_err();
+        assert!(err.contains("invalid TOML"), "{err}");
+        assert!(err.contains("line 1, column 9"), "{err}");
+        assert!(err.contains('^'), "{err}");
+
+        // So does a key of the wrong type: the value it points at is the
+        // value to fix.
+        let wrong_type = "name = 3\ndescription = \"d\"\ncommand = \"c\"\n";
+        let err = parse_tool_source(Path::new("deploy.toml"), wrong_type).unwrap_err();
+        assert!(err.contains("invalid TOML"), "{err}");
+        assert!(err.contains("invalid type"), "{err}");
+        assert!(err.contains('^'), "{err}");
     }
 
     #[test]
