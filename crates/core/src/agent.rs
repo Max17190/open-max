@@ -838,6 +838,26 @@ impl CompactionDigest {
         parts.join(" ")
     }
 
+    /// The note a truncation-only prune leaves. Phase 1 rewrites old tool
+    /// outputs in place and returns before the drop loop, so the transcript
+    /// holds no digest note and therefore no address at all: `…[older tool
+    /// output truncated]` reads as "these bytes are gone" when they are
+    /// archived verbatim. One note per prune, not one address per stub: the
+    /// address is per session, and repeating a ~90-byte path on every stub is
+    /// re-sent on every request for the life of the transcript.
+    fn format_truncation_only(&self, archive: Option<&str>) -> String {
+        let mut parts = vec![format!(
+            "{DIGEST_PREFIX} {} older tool outputs were shortened in place; each ends with \
+             \"…[older tool output truncated]\".",
+            self.truncated.len()
+        )];
+        if let Some(path) = archive {
+            parts.push(format!("Full text: {path} (bash: grep or tail it)."));
+        }
+        parts.push("Re-issue the call if you need the rest.".into());
+        parts.join(" ")
+    }
+
     /// The note used when the model wrote a real summary of the dropped
     /// context; exact paths stay listed because summaries paraphrase them.
     fn format_with_summary(&self, summary: &str, archive: Option<&str>) -> String {
@@ -972,6 +992,24 @@ async fn apply_compaction_digest(
     let archived = sessions::append_archive(core, session_id, &digest.truncated)
         & sessions::append_archive(core, session_id, &digest.dropped);
     if digest.message_count == 0 {
+        // Truncation-only: upgrade the note the prune just inserted with the
+        // address, now that the archive has honored it. Matched by content,
+        // not by position: index 2 may instead hold an earlier prune's real
+        // digest note, which carries a summary and Files touched this note
+        // does not. No summarizer request (dropped_text is empty so
+        // summarize_compaction returns None anyway), no compaction record (an
+        // empty one would make last_compaction return it and silently kill
+        // the structured carry-forward absorb_prior depends on), and no
+        // compaction hook, which today fires only for real compactions.
+        let inserted = digest.format_truncation_only(None);
+        if archived
+            && messages.len() > 2
+            && is_digest_message(&messages[2])
+            && messages[2].content.as_deref() == Some(inserted.as_str())
+        {
+            let archive = sessions::archive_display(core, session_id);
+            messages[2] = ChatMessage::user(digest.format_truncation_only(Some(&archive)));
+        }
         return;
     }
     // Structured fields from the previous record carry forward by
@@ -1338,6 +1376,8 @@ async fn run_compact(
     let after_len = guard.messages().len() as u64;
     if after_len < before_len {
         sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
+    } else if after_len > before_len {
+        sessions::shift_resume_points_for_note_insert(core, session_id);
     }
     let compacted_messages = compaction.as_ref().map(|d| d.message_count).unwrap_or(0);
     if let Some(digest) = compaction {
@@ -2004,6 +2044,8 @@ async fn run_loop(
         let after_len = guard.messages().len() as u64;
         if after_len < before_len {
             sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
+        } else if after_len > before_len {
+            sessions::shift_resume_points_for_note_insert(core, session_id);
         }
         if let Some(digest) = compaction {
             let ctx = CompactionCtx {
@@ -2885,6 +2927,14 @@ const COMPACTION_TOKENS_FLOOR: usize = 20_000;
 /// only honored when its target has room for the note too.
 const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_300;
 
+/// What the truncation-only note may cost, in tokens. Spent out of the
+/// DIGEST_NOTE_ALLOWANCE_TOKENS `compaction_trigger` already reserves
+/// unconditionally, so no allowance grows. Reserved inside the truncation
+/// loop's target check because the note is inserted after the target is met
+/// and its address is only appended later: without the reserve a prune could
+/// land exactly on target, gain the note, and re-fire next iteration.
+const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
+
 /// The token total at which compaction fires. Defaults to the window-derived
 /// `budget`; the `compaction_tokens` setting can only pull it lower, never
 /// past the budget, because the budget is what guarantees the request still
@@ -2994,6 +3044,17 @@ fn prune_transcript(
     let live_context = live_context(messages, keep_tail);
     let mut digest = CompactionDigest::new(dropped_text_cap(budget));
     let mut truncated = false;
+    // Room for the note a truncation-only prune leaves below, so meeting the
+    // target and then gaining the note cannot end above it. Zero when index 2
+    // already holds a real digest note: that note carries the archive address
+    // and fields (Files touched, the model summary) this one does not, so it
+    // is left alone and nothing new is inserted.
+    let note_reserve = if messages.len() > 2 && is_digest_message(&messages[2]) {
+        0
+    } else {
+        TRUNCATION_NOTE_ALLOWANCE_TOKENS
+    };
+    let mut reached = false;
     for msg in messages.iter_mut().take(keep_tail).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
@@ -3011,10 +3072,19 @@ fn prune_transcript(
                 }
             }
         }
-        if total <= target {
-            let digest = Some(digest).filter(CompactionDigest::has_archive_material);
-            return (true, digest);
+        if total + note_reserve <= target {
+            reached = true;
+            break;
         }
+    }
+    if reached {
+        // Addressless: `append_archive` has not run yet, and a note may never
+        // advertise an address the archive does not honor. The upgrade is
+        // `apply_compaction_digest`'s.
+        if note_reserve > 0 && !digest.truncated.is_empty() {
+            messages.insert(2, ChatMessage::user(digest.format_truncation_only(None)));
+        }
+        return (true, Some(digest).filter(CompactionDigest::has_archive_material));
     }
     // Drop whole exchanges starting after [system, first user]. Keep tool
     // replies consistent with the assistant message that requested them.
@@ -5454,9 +5524,239 @@ mod tests {
             digest.truncated[0].content.as_deref().unwrap().len() >= 4000,
             "the archive copy is the original, not the stub"
         );
-        assert_eq!(messages.len(), 10, "nothing should be dropped, only truncated");
-        let tool_len = messages[2].content.as_deref().unwrap().len();
+        assert_eq!(
+            messages.len(),
+            11,
+            "nothing dropped, only truncated, plus the note naming the archive"
+        );
+        let tool = messages.iter().find(|m| m.role == "tool").expect("the stub survives");
+        let tool_len = tool.content.as_deref().unwrap().len();
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");
+    }
+
+    /// The note is inserted after the target is met, so the target check has
+    /// to hold room for it. The fixture is tuned so the second truncation
+    /// lands on exactly 4200, the target: without the reserve the prune stops
+    /// there and the note carries it back over, which is the predicate
+    /// `/compact` reads to answer "already compact" and would re-prune, and
+    /// re-archive, on the next command.
+    #[test]
+    fn a_truncation_only_prune_leaves_room_for_its_own_note() {
+        let budget = 6_000;
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        for _ in 0..5 {
+            messages.push(msg("assistant", 100));
+            messages.push(msg("tool", 4000));
+        }
+        for _ in 0..2 {
+            messages.push(msg("user", 100));
+            messages.push(msg("assistant", 100));
+        }
+        // The tail message that tunes where the truncation steps land.
+        messages.push(msg("user", 100));
+        messages.push(msg("assistant", 2640));
+
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0);
+        assert!(changed);
+        assert!(
+            digest.is_some_and(|d| d.message_count == 0),
+            "the fixture must settle on truncation alone"
+        );
+        let total: usize = messages.iter().map(|m| m.estimated_tokens()).sum();
+        assert!(
+            total <= achievable_target(budget, 0),
+            "the note must fit inside the target the prune met: {total} of {}",
+            achievable_target(budget, 0)
+        );
+        assert!(
+            !enforce_budget(&mut messages, budget, 0).0,
+            "and the hysteresis gap survives, same as after a drop-prune"
+        );
+    }
+
+    /// A truncation-only prune returns before the drop loop, so nothing else
+    /// in the transcript would say the cut bytes survive: "…[older tool output
+    /// truncated]" reads as gone when the originals are archived verbatim. One
+    /// note carries the address for every stub, because the address is per
+    /// session and a per-stub copy is re-sent on every request forever.
+    #[test]
+    fn a_truncation_only_prune_still_says_where_the_bytes_went() {
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        messages.push(msg("tool", 4000));
+        messages.push(msg("assistant", 100));
+        for _ in 0..3 {
+            messages.push(msg("user", 100));
+            messages.push(msg("assistant", 100));
+        }
+        let (changed, digest) = enforce_budget(&mut messages, 700, 0);
+        assert!(changed);
+        let digest = digest.expect("truncation is destructive, so it must reach the archive");
+        assert_eq!(digest.message_count, 0, "nothing dropped: this is the truncation-only path");
+        assert!(!digest.truncated.is_empty());
+
+        let notes: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.starts_with(DIGEST_PREFIX))
+            .collect();
+        assert_eq!(notes.len(), 1, "one carrier per prune, not one address per stub");
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some(notes[0]),
+            "and it sits where every other digest note does"
+        );
+        assert!(notes[0].contains("older tool output truncated"), "{}", notes[0]);
+        assert!(
+            !notes[0].contains("archive.jsonl"),
+            "the address waits for append_archive to honor it: {}",
+            notes[0]
+        );
+    }
+
+    /// The two-phase upgrade: the prune writes the note addressless, and only
+    /// a landed archive earns it the path. Nothing else a real compaction owes
+    /// is paid here, because nothing was compacted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_truncation_only_note_gets_the_archive_address_once_the_archive_lands() {
+        use crate::state::{CancelToken, Core};
+
+        let dir = std::env::temp_dir()
+            .join(format!("openmax-trunc-note-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let settings = {
+            // A refused connection: this path must issue no request at all,
+            // and a reachable endpoint would hide that.
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.clone()
+        };
+
+        let original = "x".repeat(4000);
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        messages.push(ChatMessage::tool("c1", original.clone()));
+        messages.push(msg("assistant", 100));
+        for _ in 0..3 {
+            messages.push(msg("user", 100));
+            messages.push(msg("assistant", 100));
+        }
+        let (_, digest) = enforce_budget(&mut messages, 700, 0);
+        let digest = digest.expect("truncation must reach the archive");
+        assert_eq!(digest.message_count, 0, "the truncation-only path");
+
+        let endpoint = crate::providers::resolve(&settings, &core.data_dir).unwrap();
+        let client = ChatClient::from_endpoint(&endpoint);
+        let hooks = Hooks::discover(&project, &core.data_dir);
+        let cancelled = Arc::new(CancelToken::default());
+        let ctx = CompactionCtx {
+            core: &core,
+            session_id: &id,
+            project_root: &project,
+            client: &client,
+            hooks: &hooks,
+            cancelled: &cancelled,
+        };
+        apply_compaction_digest(&ctx, &mut messages, digest).await;
+
+        let note = messages[2].content.as_deref().unwrap();
+        assert!(note.contains(&sessions::archive_display(&core, &id)), "{note}");
+        assert!(note.contains("(bash: grep or tail it)"), "{note}");
+        assert!(!note.contains("Summary:"), "no summarizer runs on this path: {note}");
+        let archived = sessions::load_archive(&core, &id);
+        assert_eq!(archived.len(), 1, "the pre-truncation original, and only it");
+        assert_eq!(archived[0].content.as_deref(), Some(original.as_str()));
+        assert!(
+            sessions::last_compaction(&core, &id).is_none(),
+            "an empty record would make last_compaction return it and kill the \
+             structured carry-forward absorb_prior depends on"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A real digest note carries a summary and Files touched that a
+    /// truncation note does not, and its address is already in the transcript.
+    /// Neither the prune nor the archive upgrade may replace it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_truncation_note_never_overwrites_a_real_digest_note() {
+        use crate::state::{CancelToken, Core};
+
+        let budget = 3000;
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        for i in 0..12 {
+            messages.push(assistant_with_tools("read_file", &format!(r#"{{"path":"src/{i}.rs"}}"#)));
+            messages.push(msg("tool", 2500));
+        }
+        let (_, dropped) = enforce_budget(&mut messages, budget, 0);
+        assert!(dropped.is_some_and(|d| d.message_count > 0), "the first prune drops exchanges");
+        let real_note = messages[2].content.clone().expect("the real note lands at index 2");
+        assert!(real_note.contains("Files touched:"), "{real_note}");
+
+        // Fresh fat tool results, then a cheap tail, so the new outputs sit
+        // above keep_tail where truncation alone can settle the next prune.
+        for _ in 0..2 {
+            messages.push(msg("assistant", 40));
+            messages.push(msg("tool", 3000));
+        }
+        for _ in 0..3 {
+            messages.push(msg("user", 60));
+            messages.push(msg("assistant", 60));
+        }
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0);
+        assert!(changed);
+        let digest = digest.expect("the truncated originals must reach the archive");
+        assert_eq!(digest.message_count, 0, "the second prune truncates only");
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some(real_note.as_str()),
+            "the prune must leave the real note alone"
+        );
+
+        // And the archive upgrade must not take it either: it names an
+        // addressless note by content, not index 2 by position.
+        let dir = std::env::temp_dir()
+            .join(format!("openmax-trunc-keep-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let settings = {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.clone()
+        };
+        let endpoint = crate::providers::resolve(&settings, &core.data_dir).unwrap();
+        let client = ChatClient::from_endpoint(&endpoint);
+        let hooks = Hooks::discover(&project, &core.data_dir);
+        let cancelled = Arc::new(CancelToken::default());
+        let ctx = CompactionCtx {
+            core: &core,
+            session_id: &id,
+            project_root: &project,
+            client: &client,
+            hooks: &hooks,
+            cancelled: &cancelled,
+        };
+        apply_compaction_digest(&ctx, &mut messages, digest).await;
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some(real_note.as_str()),
+            "and the upgrade must leave it alone too"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX)))
+                .count(),
+            1,
+            "only one digest note may exist"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Truncation keeps the slice the conversation is about, not the slice
@@ -5479,7 +5779,11 @@ mod tests {
         }
         let (changed, _) = enforce_budget(&mut messages, 700, 0);
         assert!(changed);
-        let kept = messages[2].content.as_deref().unwrap();
+        let kept = messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .and_then(|m| m.content.as_deref())
+            .expect("the truncated tool message survives");
         assert!(
             kept.contains("checkout_timeout_msecs = 45000"),
             "the slice the conversation is about must survive, got: {kept}"
@@ -6021,15 +6325,30 @@ mod tests {
         }
         let archive = "a".repeat(200);
         let summary = "m".repeat(MAX_SUMMARY_BYTES + 1);
-        for note in
-            [digest.format(Some(&archive)), digest.format_with_summary(&summary, Some(&archive))]
-        {
+        // The truncation-only note has no unbounded field but the same
+        // address, so it rides the same gate. Only the stub count is
+        // rendered, so the bodies here are irrelevant.
+        digest.truncated = vec![msg("tool", 1); 999];
+        for note in [
+            digest.format(Some(&archive)),
+            digest.format_with_summary(&summary, Some(&archive)),
+            digest.format_truncation_only(Some(&archive)),
+        ] {
             let cost = ChatMessage::user(note).estimated_tokens();
             assert!(
                 cost <= DIGEST_NOTE_ALLOWANCE_TOKENS,
                 "a note at every cap costs {cost}, over the {DIGEST_NOTE_ALLOWANCE_TOKENS} allowance"
             );
         }
+        // And it is what the truncation loop reserves, not the whole
+        // allowance: the loop meets the target with this much held back.
+        let cost =
+            ChatMessage::user(digest.format_truncation_only(Some(&archive))).estimated_tokens();
+        assert!(
+            cost <= TRUNCATION_NOTE_ALLOWANCE_TOKENS,
+            "the truncation-only note costs {cost}, over the \
+             {TRUNCATION_NOTE_ALLOWANCE_TOKENS} the prune reserves"
+        );
     }
 
     /// Typos do not configure thrash: a tiny setting rides the floor, where
