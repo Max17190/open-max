@@ -625,6 +625,22 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
     });
 }
 
+/// A prune that only truncated inserts its note at index 2 without removing
+/// anything, so the transcript grows by exactly that message and every
+/// boundary at or after it moves up one. The mirror of
+/// `shift_resume_points_for_prune`, which only ever handles shrinkage.
+pub fn shift_resume_points_for_note_insert(core: &Core, id: &str) {
+    let _ = with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            for p in &mut m.resume_points {
+                if *p >= 2 {
+                    *p = p.saturating_add(1);
+                }
+            }
+        }
+    });
+}
+
 /// A system message is being inserted at the front of the transcript (legacy
 /// sessions saved before the prompt lived at index zero); every absolute
 /// boundary moves down by one, exactly once per session. The shift and its
@@ -844,6 +860,24 @@ mod tests {
         // A legacy system-prompt insert moves every boundary down one.
         assert!(shift_resume_points_for_system_insert(&core, id));
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![4, 8]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A prune that only truncated removes nothing and inserts its note at
+    /// index 2, so the transcript grows by one and every boundary from the
+    /// note onward must follow or replay dividers drift the other way.
+    #[test]
+    fn a_note_insert_moves_replay_boundaries_up_one() {
+        let dir =
+            std::env::temp_dir().join(format!("openmax-note-insert-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &create(&core, "/tmp/p".into()).unwrap().id;
+        record_resume_point(&core, id, 1);
+        record_resume_point(&core, id, 3);
+        record_resume_point(&core, id, 7);
+
+        shift_resume_points_for_note_insert(&core, id);
+        assert_eq!(meta(&core, id).unwrap().resume_points, vec![1, 4, 8]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
