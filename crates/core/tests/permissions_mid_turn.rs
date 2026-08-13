@@ -398,3 +398,73 @@ async fn a_deny_written_earlier_in_the_same_response_gates_the_next_call() {
     assert!(!ok, "the rm call must be refused, got: {output}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_written_by_a_failed_mutation_still_gates() {
+    // A bash command can persist the policy file and still exit nonzero; the
+    // reload must follow every executed mutating call, not only successful
+    // ones, or the persisted deny goes unobserved for the rest of the turn.
+    let dir = std::env::temp_dir().join(format!("omx-midturn-failed-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join("reports")).unwrap();
+    std::fs::write(project.join("reports/q0.md"), "# deliverable\n").unwrap();
+    let project = project.canonicalize().unwrap();
+
+    let write_then_fail = "mkdir -p .openmax && printf '[[rules]]\\neffect = \"deny\"\\ntool = \"bash\"\\narg_regex = \"rm\\\\\\\\s+.*reports\"\\n' > .openmax/permissions.toml && exit 7";
+    let base_url = scripted_endpoint(vec![
+        completion_with_tool_call("bash", serde_json::json!({ "command": write_then_fail })),
+        completion_with_tool_call("bash", serde_json::json!({ "command": "rm -rf reports" })),
+        completion_with_text("done"),
+    ])
+    .await;
+
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("settings.json"),
+        serde_json::json!({
+            "base_url": base_url,
+            "model": "scripted",
+            "approval_mode": "auto",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("trust.json"),
+        serde_json::json!({ "version": 1, "projects": [project.to_string_lossy()] }).to_string(),
+    )
+    .unwrap();
+
+    let (core, mut rx) = Core::new(data).unwrap();
+    start_turn(Arc::clone(&core), "failed-write-test".into(), PathBuf::from(&project), "go".into())
+        .unwrap();
+    let mut rm_outputs = Vec::new();
+    loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("turn finishes within 30s")
+            .expect("event channel stays open");
+        match envelope.event {
+            AgentEvent::ToolStart { call_id, args, .. } => {
+                if args.get("command").and_then(|c| c.as_str()) == Some("rm -rf reports") {
+                    rm_outputs.push(call_id);
+                }
+            }
+            AgentEvent::ToolEnd { ok, output, call_id } => {
+                if rm_outputs.contains(&call_id) {
+                    assert!(!ok, "the rm call must be refused, got: {output}");
+                }
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(!rm_outputs.is_empty(), "the scripted rm call ran through the gate");
+    assert!(
+        project.join("reports/q0.md").exists(),
+        "a policy persisted by a failed mutation must still gate the next call"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

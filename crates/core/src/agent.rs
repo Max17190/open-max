@@ -2424,14 +2424,18 @@ async fn run_loop(
                 guard.messages().push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
                 if executed {
                     repeat_tracker.record_executed(name, &args_key);
-                    if outcome.ok && registry.is_mutating(name) {
-                        extensions_touched = true;
+                    if registry.is_mutating(name) {
+                        if outcome.ok {
+                            extensions_touched = true;
+                        }
                         // Reload here, not at iteration end: one assistant
                         // response can carry the policy write and the call
                         // the policy denies, and the later call must already
                         // see the rule. Concurrent batches hold read-only
                         // calls only, so this serial point covers every
-                        // mutation. TurnPermissions keeps each observed
+                        // mutation - including a failed one, because a bash
+                        // command can persist the policy file and still exit
+                        // nonzero. TurnPermissions keeps each observed
                         // snapshot as a floor, so a reload can narrow policy
                         // but never widen it; `deny`/`ask` need no approval,
                         // and unapproved `allow` rules are dropped at load.
