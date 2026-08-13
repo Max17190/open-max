@@ -695,7 +695,7 @@ async fn spawn_external(
         program: tool.command.clone().into(),
         args: tool.args.iter().cloned().map(Into::into).collect(),
         cwd: root.to_path_buf(),
-        stdin: StdinMode::Bytes(args.to_string().into_bytes()),
+        stdin: StdinMode::json_line(args),
         timeout: std::time::Duration::from_secs(tool.timeout_secs),
         capture: CaptureSpec {
             head_bytes: 0,
@@ -1151,6 +1151,34 @@ mutatng = true
             .await;
         assert!(out.ok, "{}", out.output);
         assert!(out.output.contains("got: {\"message\":\"hi\"}"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// The args payload is one newline-terminated line: a tool reading it
+    /// with `read -r` under `&&` (or `set -e`) must see a complete line, or
+    /// correct line-oriented shell fails at EOF with the payload fully
+    /// delivered.
+    #[tokio::test]
+    async fn strict_line_readers_get_a_terminated_payload() {
+        let project = temp_dir("strictline");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let script =
+            write_script(&project, "strict.sh", "#!/bin/sh\nread -r line && echo \"ok: $line\"\n");
+        write_tool(
+            &tools_dir,
+            "strict.toml",
+            &format!(
+                "name = \"strict\"\ndescription = \"strict line reader\"\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        );
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let out = registry
+            .execute("strict", &serde_json::json!({"k": "v"}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel())
+            .await;
+        assert!(out.ok, "read -r must succeed on a terminated line: {}", out.output);
+        assert!(out.output.contains("ok: {\"k\":\"v\"}"), "{}", out.output);
         let _ = std::fs::remove_dir_all(project);
     }
 

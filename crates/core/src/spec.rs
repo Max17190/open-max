@@ -97,7 +97,8 @@ Fields:
   the human content approval below.
 
 Runtime contract: the harness spawns `command args...` in the project root,
-writes the call's JSON arguments to stdin, and returns stdout as the result.
+writes the call's JSON arguments to stdin as one newline-terminated line, and
+returns stdout as the result.
 Nonzero exit makes the result an error carrying `exit code N` plus output.
 Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
 7 days. The process is a
@@ -286,7 +287,7 @@ exit status is ignored. `session_start` fires on a session's first turn;
 `compaction` fires after context was pruned; `turn_end` fires with the stop
 reason, even on cancel. Hooks never inject text into the model context.
 
-Each run receives one JSON payload on stdin:
+Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
   where `tool_ok` is null, because the call has not run yet.
 - post_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok",

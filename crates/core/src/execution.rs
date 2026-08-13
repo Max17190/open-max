@@ -44,6 +44,19 @@ pub(crate) enum StdinMode {
     Bytes(Vec<u8>),
 }
 
+impl StdinMode {
+    /// A JSON payload delivered as one newline-terminated line. JSON parsers
+    /// ignore the trailing newline; line-oriented consumers require it - a
+    /// script reading with `read -r` under `set -e` hits EOF on an
+    /// unterminated stream, exits nonzero, and (as a gate hook) blocks every
+    /// call it guards even though the payload was fully delivered.
+    pub(crate) fn json_line(value: &serde_json::Value) -> Self {
+        let mut bytes = value.to_string().into_bytes();
+        bytes.push(b'\n');
+        Self::Bytes(bytes)
+    }
+}
+
 /// Bounded in-memory capture plus an optional, bounded raw-output log.
 #[derive(Clone)]
 pub(crate) struct CaptureSpec {
