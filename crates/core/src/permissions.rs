@@ -18,6 +18,65 @@ pub enum PermissionDecision {
     Ask,
 }
 
+/// Rank for composing two decisions: the higher one governs. `Allow` sits
+/// below `Default` because it removes a gate the default path would apply.
+fn restrictiveness(decision: &PermissionDecision) -> u8 {
+    match decision {
+        PermissionDecision::Deny { .. } => 3,
+        PermissionDecision::Ask => 2,
+        PermissionDecision::Default => 1,
+        PermissionDecision::Allow => 0,
+    }
+}
+
+/// The rules in force while a turn runs: the freshest discovery, floored by
+/// every discovery the turn has already seen.
+///
+/// A mutating call's edit must narrow policy immediately - "install the
+/// guard, then prove it" is the natural task shape, and the proof must not
+/// run unguarded. The same reload must not work in reverse, and not only
+/// for the turn-start rules: a deny that appeared mid-turn (a human editing
+/// the file while the agent runs) must not vanish because a later mutation
+/// rewrote the file without it. So every snapshot the turn observed keeps
+/// voting, each call takes the most restrictive answer, and relaxations
+/// arrive with the next turn's fresh discovery. Snapshots are one small
+/// parsed file each, bounded by the turn's iteration cap.
+pub struct TurnPermissions {
+    /// Turn-start discovery first, then one entry per reload, newest last.
+    observed: Vec<Permissions>,
+}
+
+impl TurnPermissions {
+    pub fn new(turn_start: Permissions) -> Self {
+        Self { observed: vec![turn_start] }
+    }
+
+    /// Record a fresh discovery for the rest of the turn.
+    pub fn reload(&mut self, current: Permissions) {
+        self.observed.push(current);
+    }
+
+    /// The decision in force: the most restrictive answer any observed
+    /// snapshot gives, the newest such snapshot supplying the wording. Every
+    /// snapshot keeps its own fail-closed and repair-carve-out behavior, so
+    /// a file broken at any point does not lose its one repair path here.
+    pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
+        let mut snapshots = self.observed.iter();
+        let first = snapshots.next().expect("a turn always has its start discovery");
+        let mut decision = first.evaluate(tool, args);
+        let mut rank = restrictiveness(&decision);
+        for snapshot in snapshots {
+            let candidate = snapshot.evaluate(tool, args);
+            let candidate_rank = restrictiveness(&candidate);
+            if candidate_rank >= rank {
+                rank = candidate_rank;
+                decision = candidate;
+            }
+        }
+        decision
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Effect {
     Allow,

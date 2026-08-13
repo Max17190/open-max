@@ -432,8 +432,10 @@ tool = "bash"
 arg_regex = "^cargo (test|check|build)"
 ```
 
-Activation: next turn. Verify with `openmax --check` (it reports the exact
-fail-closed reason for a malformed file).
+Activation: rules are re-read at every turn start, and mid-turn after any
+successful mutating call, so a rule you write is in force before your next
+step. Verify with `openmax --check` (it reports the exact fail-closed reason
+for a malformed file).
 "#;
 
 const PROVIDERS: &str = r#"# Providers
