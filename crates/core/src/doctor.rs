@@ -167,6 +167,10 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 
     let mut skills_found: Vec<Entry> = Vec::new();
     let mut skill_meta: Vec<(String, String, PathBuf)> = Vec::new();
+    // Deferred like the tool clamps, for the same reason: what the index line
+    // fails to say only matters for a skill that has an index line at all.
+    // Indices into `skills_found`.
+    let mut skill_notes: Vec<(usize, String)> = Vec::new();
     for dir in crate::skills::skill_dirs(data_dir, project_root) {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
@@ -216,10 +220,25 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 continue;
             }
             let mut id = None;
-            let status = match crate::skills::parse_skill_md(&path) {
+            // One read per file, like the tool loop: the description the spec
+            // clamps and the description the author wrote have to come from
+            // one generation of the bytes, or the report compares two files.
+            let source = std::fs::read_to_string(&path);
+            let parsed = match &source {
+                Ok(text) => crate::skills::parse_skill_source(&path, text),
+                Err(e) => Err(format!("unreadable: {e}")),
+            };
+            let status = match parsed {
                 Ok(s) => {
                     id = Some(s.name.clone());
                     skill_meta.push((s.name.clone(), s.description.clone(), path.clone()));
+                    if let Some(reason) = source
+                        .as_deref()
+                        .ok()
+                        .and_then(|text| skill_description_gap(text, &s.name))
+                    {
+                        skill_notes.push((skills_found.len(), reason));
+                    }
                     Status::Ok(format!("skill '{}'", s.name))
                 }
                 Err(reason) => Status::Err(reason),
@@ -245,6 +264,14 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     crate::prompt::MAX_SKILLS_BYTES
                 ));
             }
+        }
+    }
+    // Last word to the checks above: they decide whether the model ever sees
+    // an index line for this skill, and these notes only describe one it does.
+    for (i, reason) in skill_notes {
+        let (finding, _) = &mut skills_found[i];
+        if matches!(finding.status, Status::Ok(_)) {
+            finding.status = Status::Warn(reason);
         }
     }
     findings.extend(skills_found.into_iter().map(|(f, _)| f));
@@ -587,9 +614,9 @@ fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding>
 
 /// Memory files are data, not capabilities, so nothing here is an Err: a file
 /// the index ignores is a Warn naming the reason and the fix, and a live one
-/// is an Ok saying whether the index currently shows it. The check answers
-/// the question the agent actually has after writing a memory: will a future
-/// session see this?
+/// is an Ok saying whether the index currently shows it (a Warn when it shows
+/// it clipped). The check answers the question the agent actually has after
+/// writing a memory: will a future session see this, as written?
 fn memory_findings(project_root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
     let dir = project_root.join(crate::memory::MEMORY_DIR);
@@ -610,11 +637,18 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
             } else {
                 "faded from the index (unused; a read_file revives it)".to_string()
             };
-            findings.push(Finding {
-                kind: "memory",
-                path,
-                status: Status::Ok(format!("memory '{stem}' — {visibility}")),
-            });
+            // Indexed under a first line the index had to cut is still a
+            // degraded index line: the future session it was written for reads
+            // the clip, not the sentence, so the cut is worth a warning.
+            let status = if memory.description_clipped() {
+                Status::Warn(format!(
+                    "memory '{stem}' is {visibility}, but its first line runs past the {}-char index cap: the line a future session reads is clipped there, so keep it a one-line summary and put the rest in the body",
+                    crate::memory::MAX_DESCRIPTION_CHARS
+                ))
+            } else {
+                Status::Ok(format!("memory '{stem}' — {visibility}"))
+            };
+            findings.push(Finding { kind: "memory", path, status });
             continue;
         }
         let reason = if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -1197,6 +1231,29 @@ fn clamped_timeout_reason(text: &str, what: &str, min: u64, max: u64) -> Option<
     })
 }
 
+/// What a skill's line in the frozen index will not say. The description is
+/// the only text of a skill that ever reaches the model, so a skill without
+/// one is indexed under a bare name that cannot say when to use it, and one
+/// written past the cap is cut there, usually losing the "when" at the end.
+/// Both load, and neither is visible in the file, which is why `--check` has
+/// to say it. Takes the bytes the caller already parsed, for the same reason
+/// the timeout clamp does.
+fn skill_description_gap(text: &str, name: &str) -> Option<String> {
+    let written = crate::skills::raw_description(text).unwrap_or_default();
+    if written.trim().is_empty() {
+        return Some(format!(
+            "'{name}' has no `description:`, so its line in the frozen skills index is a bare name: the index line cannot say when to use it, and the model has nothing else to go on"
+        ));
+    }
+    let cap = crate::skills::MAX_SKILL_DESC_CHARS;
+    let chars = written.chars().count();
+    (chars > cap).then(|| {
+        format!(
+            "'{name}' has a {chars}-char `description:`, past the {cap}-char cap: the frozen skills index shows the first {cap} chars and cuts the rest, so whatever the tail says (often the \"when\") never reaches the model"
+        )
+    })
+}
+
 /// Mark files a loader never reaches because another file claims the same
 /// identity. `first_wins` mirrors the loader: hooks keep the first file to
 /// claim a stem, while tools, skills, and templates let a later directory
@@ -1756,6 +1813,115 @@ mod tests {
             Status::Err(reason) => assert!(reason.contains("skill cap"), "{reason}"),
             other => panic!("a count-capped skill must be an error: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The description is the whole of a skill's presence in the prompt, so a
+    /// skill missing one, or writing one longer than the index shows, is not
+    /// the healthy file `ok` claims: both were silent before this, and the
+    /// degradation is invisible in the file itself. The skill still loads, so
+    /// both are warnings.
+    #[test]
+    fn skill_descriptions_that_the_index_cannot_carry_are_named() {
+        let root = temp_project();
+        // A scoped data dir, so a global skill on the developer's machine
+        // cannot spend the index budget these four are measured against.
+        let data = temp_project();
+        write(
+            root.join(".agents/skills/silent/SKILL.md"),
+            "---\nname: silent\n---\nbody\n",
+        );
+        write(
+            root.join(".agents/skills/blank/SKILL.md"),
+            "---\nname: blank\ndescription:   \n---\nbody\n",
+        );
+        let long = "w".repeat(crate::skills::MAX_SKILL_DESC_CHARS + 40);
+        write(
+            root.join(".agents/skills/wordy/SKILL.md"),
+            &format!("---\nname: wordy\ndescription: {long}\n---\nbody\n"),
+        );
+        write(
+            root.join(".agents/skills/good/SKILL.md"),
+            "---\nname: good\ndescription: cuts a release, when the changelog is ready\n---\nbody\n",
+        );
+
+        let findings = check_at(&root, &data);
+        for (dir, name) in [("silent", "silent"), ("blank", "blank")] {
+            match &find(&findings, &format!("{dir}/SKILL.md")).status {
+                Status::Warn(reason) => {
+                    assert!(reason.contains(&format!("'{name}' has no `description:`")), "{reason}");
+                    assert!(reason.contains("when to use it"), "{reason}");
+                }
+                other => panic!("a skill with no description must warn: {other:?}"),
+            }
+        }
+        match &find(&findings, "wordy/SKILL.md").status {
+            Status::Warn(reason) => {
+                assert!(
+                    reason.contains(&format!("{}-char cap", crate::skills::MAX_SKILL_DESC_CHARS)),
+                    "the cap must be named: {reason}"
+                );
+                assert!(reason.contains("cuts the rest"), "{reason}");
+            }
+            other => panic!("an over-cap description must warn: {other:?}"),
+        }
+        match &find(&findings, "good/SKILL.md").status {
+            Status::Ok(_) => {}
+            other => panic!("a describable skill stays healthy: {other:?}"),
+        }
+        assert!(!has_errors(&findings), "none of this stops the skill loading");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A template whose frontmatter never closes expands its own fence and
+    /// keys into the user's message. SKILL.md refuses that by name; the
+    /// template parser now does too, and the report has to agree with the
+    /// parser or one of them is lying about what `/name` will send.
+    #[test]
+    fn a_template_with_unclosed_frontmatter_is_an_error() {
+        let root = temp_project();
+        write(
+            root.join(".agents/prompts/half-open.md"),
+            "---\ndescription: fix a bug\nFind the bug in $1 and fix it.\n",
+        );
+        match &find(&local(&root), "half-open.md").status {
+            Status::Err(reason) => assert!(reason.contains("frontmatter never closes"), "{reason}"),
+            other => panic!("an unclosed frontmatter block must be an error: {other:?}"),
+        }
+        assert!(
+            crate::templates::expand_invocation(&root.join("data"), &root, "half-open now")
+                .is_none(),
+            "the report says err, so the runtime must refuse it too"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A memory whose first line is longer than the index cap is indexed under
+    /// a clipped line: the future session it was written for reads the clip.
+    /// Reporting a plain `ok` left the author believing the whole sentence
+    /// carried over.
+    #[test]
+    fn a_memory_first_line_past_the_index_cap_says_it_is_clipped() {
+        let root = temp_project();
+        let long = "e".repeat(crate::memory::MAX_DESCRIPTION_CHARS + 30);
+        write(root.join(".openmax/memory/verbose.md"), &format!("# {long}\nbody\n"));
+        write(root.join(".openmax/memory/terse.md"), "# The deploy port is 7443\nbody\n");
+
+        let findings = local(&root);
+        match &find(&findings, "verbose.md").status {
+            Status::Warn(reason) => {
+                assert!(reason.contains("in the session index"), "still indexed: {reason}");
+                assert!(
+                    reason.contains(&format!("{}-char index cap", crate::memory::MAX_DESCRIPTION_CHARS)),
+                    "the cap must be named: {reason}"
+                );
+                assert!(reason.contains("clipped"), "{reason}");
+            }
+            other => panic!("a clipped memory description must warn: {other:?}"),
+        }
+        assert!(matches!(find(&findings, "terse.md").status, Status::Ok(_)));
+        assert!(!has_errors(&findings), "memory findings never fail a check");
         let _ = std::fs::remove_dir_all(root);
     }
 
