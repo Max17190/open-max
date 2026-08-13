@@ -230,6 +230,16 @@ async fn run_turn_events(
                 }
                 if stop_reason == "error" {
                     exit_code = 1;
+                } else if matches!(
+                    stop_reason.as_str(),
+                    "max_iterations" | "budget_exhausted" | "unverified"
+                ) {
+                    // The turn ran out of room rather than finishing, so a
+                    // script that reads exit 0 as "the work is done" would be
+                    // wrong. Its own code: 1 is an operational failure and
+                    // nothing failed, 3 is a human boundary and no human was
+                    // asked. Resubmitting continues the work.
+                    exit_code = 4;
                 }
                 return exit_code;
             }
@@ -297,6 +307,57 @@ fn truncate_line(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn that stopped short is not a turn that finished, and a script
+    /// driving `openmax -p` has no other way to tell: the text on stdout looks
+    /// like an answer either way. So the incomplete reasons get their own code
+    /// rather than sharing 0 with success or 1 with an operational failure.
+    #[tokio::test]
+    async fn an_incomplete_turn_exits_four_in_print_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-headless-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (core, mut rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+
+        // Every stop reason a Done event can carry, and what a caller gets.
+        // `truncated` and `blocked` reach 0 here on purpose: both emit an
+        // Error event first, which is what sets their 1 in a real run.
+        let cases = [
+            ("stop", 0),
+            ("tool_calls", 0),
+            ("cancelled", 0),
+            ("error", 1),
+            ("max_iterations", 4),
+            ("budget_exhausted", 4),
+            ("unverified", 4),
+        ];
+        for (stop_reason, expected) in cases {
+            core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
+            let mut saw_tokens = false;
+            let code =
+                run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr)
+                    .await;
+            assert_eq!(code, expected, "stop reason {stop_reason}");
+        }
+
+        // An Error before the Done is what a truncated or blocked turn sends.
+        for stop_reason in ["truncated", "blocked"] {
+            core.send_agent("s", AgentEvent::Error { message: "boom".into() });
+            core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
+            let mut saw_tokens = false;
+            let code =
+                run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr)
+                    .await;
+            assert_eq!(code, 1, "stop reason {stop_reason}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn truncate_line_flattens_and_caps_on_char_boundaries() {

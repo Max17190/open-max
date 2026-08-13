@@ -85,6 +85,16 @@ pub struct Settings {
     /// earlier. Values above the budget, below the built-in floor, or
     /// unreachable under the frozen schemas fall back to the budget.
     pub compaction_tokens: Option<usize>,
+    /// Ceiling on the tokens one turn may spend across the agent requests it
+    /// makes, counted as a provider bills them: prompt plus completion, with
+    /// cached prompt tokens at full value, because what this bounds is the
+    /// work a turn may ask for and not what it happened to cost. Checked
+    /// before each request, so it can only end a turn early, never extend one.
+    /// A compaction summary is not charged here: it is housekeeping that makes
+    /// the next request smaller, and refusing a turn for it would spend the
+    /// ceiling on the thing that was saving it. None means no ceiling (the
+    /// behavior every existing settings.json has today).
+    pub max_agent_tokens: Option<usize>,
     /// Cap on agent tool/model iterations per turn (main loop).
     #[serde(default = "default_max_agent_iterations")]
     pub max_agent_iterations: usize,
@@ -115,6 +125,7 @@ impl Default for Settings {
             temperature: 0.2,
             max_output_bytes: None,
             compaction_tokens: None,
+            max_agent_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
         }
@@ -188,6 +199,22 @@ mod tests {
         let configured: Settings =
             serde_json::from_str(r#"{"compaction_tokens":150000}"#).unwrap();
         assert_eq!(configured.compaction_tokens, Some(150_000));
+    }
+
+    /// Absent from every settings.json that exists today, so the default has
+    /// to be "no ceiling"; and the round trip has to survive `deny_unknown_fields`,
+    /// which is what a serialized-but-unparsed key would fail.
+    #[test]
+    fn max_agent_tokens_defaults_to_none_and_round_trips() {
+        let defaulted: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.max_agent_tokens, None);
+        assert_eq!(Settings::default().max_agent_tokens, None);
+        let configured: Settings =
+            serde_json::from_str(r#"{"max_agent_tokens":120000}"#).unwrap();
+        assert_eq!(configured.max_agent_tokens, Some(120_000));
+        let json = serde_json::to_string(&configured).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_agent_tokens, Some(120_000));
     }
 
     #[test]

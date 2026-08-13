@@ -2649,6 +2649,18 @@ impl App {
                             "stopped: reached the tool-call limit for one turn (send a follow-up to continue)",
                         );
                     }
+                    "budget_exhausted" => {
+                        self.pending_submit = None;
+                        self.note(
+                            "stopped: reached the token budget for one turn (send a follow-up to continue)",
+                        );
+                    }
+                    "unverified" => {
+                        self.pending_submit = None;
+                        self.note(
+                            "stopped: a blocking turn_end hook kept refusing this answer, so the turn ended unverified (see openmax --check)",
+                        );
+                    }
                     "error" => {
                         self.pending_submit = None;
                     }
