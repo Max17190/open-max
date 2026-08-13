@@ -1070,7 +1070,7 @@ async fn run_hook(
         program: hook.command.clone().into(),
         args: hook.args.iter().cloned().map(Into::into).collect(),
         cwd: cwd.to_path_buf(),
-        stdin: StdinMode::Bytes(payload.to_string().into_bytes()),
+        stdin: StdinMode::json_line(&payload),
         timeout: Duration::from_secs(hook.timeout_secs),
         capture: CaptureSpec {
             // Hook block reasons keep their beginning and are character-capped
@@ -1669,6 +1669,33 @@ mod tests {
 
     fn write_hook_toml(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    /// The stdin payload is one newline-terminated line. A gate script that
+    /// reads it with `read -r` under `set -e` is correct line-oriented shell,
+    /// and an unterminated stream made exactly that script exit nonzero at
+    /// EOF - so a gate that meant to allow blocked every call it guarded.
+    #[tokio::test]
+    async fn a_gate_reading_its_payload_line_strictly_still_allows() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp, "strict.sh", "#!/bin/sh\nset -e\nread -r line\nexit 0\n");
+        let toml = hooks_dir.join("strict.toml");
+        std::fs::write(&toml, "event = \"pre_tool_use\"\ncommand = \"./strict.sh\"\n").unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.pre_count(), 1, "the approved pair is live");
+        let cancel = Arc::new(CancelToken::default());
+        let args = serde_json::json!({"command": "ls"});
+        let result = hooks.pre_tool_use("s", "bash", &args, &tmp, &cancel).await;
+        assert!(
+            matches!(result, PreToolResult::Allow),
+            "a strict line reader must see a complete line: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// The cap ranks approved hooks only. Approved observers beyond it are
