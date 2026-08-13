@@ -76,10 +76,20 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     #[allow(unused_assignments)]
     let mut external_names: Vec<String> = Vec::new();
     let mut tool_meta: Vec<(String, PathBuf)> = Vec::new();
-    let mut tool_extras: Vec<Finding> = Vec::new();
+    // Deferred to after shadowing and the cap: a file the loader never reaches
+    // has no runtime behavior to describe. Indices into `tools_found`.
+    let mut tool_clamps: Vec<(usize, String)> = Vec::new();
     for dir in crate::registry::external_tool_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "toml") {
-            let parsed = crate::registry::parse_tool_file(&path);
+            // One read per file. Every claim in this file's findings has to
+            // come from one generation of its bytes: a second read for the
+            // clamp diagnostic is an interval a rewrite can split, and the
+            // report would then describe two files that never existed at once.
+            let source = std::fs::read_to_string(&path);
+            let parsed = match &source {
+                Ok(text) => crate::registry::parse_tool_source(&path, text),
+                Err(e) => Err(format!("unreadable: {e}")),
+            };
             let mut id = None;
             let status = match parsed {
                 Ok(spec) if tools::TOOL_NAMES.contains(&spec.name.as_str()) => {
@@ -89,17 +99,15 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     id = Some(spec.name.clone());
                     external_names.push(spec.name.clone());
                     tool_meta.push((spec.name.clone(), path.clone()));
-                    if let Some(reason) = clamped_timeout_reason(
-                        &path,
-                        "tool",
-                        crate::registry::MIN_TIMEOUT_SECS,
-                        crate::registry::MAX_TIMEOUT_SECS,
-                    ) {
-                        tool_extras.push(Finding {
-                            kind: "tool",
-                            path: path.clone(),
-                            status: Status::Warn(reason),
-                        });
+                    if let Some(reason) = source.as_deref().ok().and_then(|text| {
+                        clamped_timeout_reason(
+                            text,
+                            "tool",
+                            crate::registry::MIN_TIMEOUT_SECS,
+                            crate::registry::MAX_TIMEOUT_SECS,
+                        )
+                    }) {
+                        tool_clamps.push((tools_found.len(), reason));
                     }
                     let external = match &spec.kind {
                         crate::registry::ToolKind::External(ext) => Some(ext.clone()),
@@ -109,7 +117,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         .as_ref()
                         .and_then(|ext| missing_command_reason(&ext.command, project_root));
                     match (missing, external) {
-                        (Some(reason), _) => Status::Warn(reason),
+                        (Some((_, reason)), _) => Status::Warn(reason),
                         (None, Some(ext)) => match stale_code_reason(
                             data_dir,
                             project_root,
@@ -136,7 +144,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // Later directories overwrite earlier ones by name, so the last file to
     // claim a name is the live one.
     let tool_shadows = mark_shadowed(&mut tools_found, false);
-    mark_beyond_cap(
+    let tool_capped = mark_beyond_cap(
         &mut tools_found,
         crate::registry::MAX_EXTERNAL_TOOLS,
         &tool_shadows,
@@ -153,6 +161,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         .filter(|(f, id)| id.is_some() && !matches!(f.status, Status::Err(_)))
         .filter_map(|(_, id)| id.clone())
         .collect();
+    let tool_extras = clamp_findings("tool", &tools_found, tool_clamps, &tool_shadows, &tool_capped);
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
     findings.extend(tool_extras);
 
@@ -262,12 +271,20 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // Aligned with hooks_found: the parsed event of each Ok entry.
     let mut hook_events: Vec<Option<&'static str>> = Vec::new();
     let mut hook_extras: Vec<Finding> = Vec::new();
+    // Indices into `hooks_found`, emitted only for the entries that load.
+    let mut hook_clamps: Vec<(usize, String)> = Vec::new();
     for dir in crate::hooks::hook_dirs(project_root) {
         for path in files_with_extension(&dir, "toml") {
             // Hooks resolve by file stem, and the first stem to appear claims
             // it whether or not the file parses.
             let id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
-            let status = match crate::hooks::parse_hook_file(&path) {
+            // One read, for the same reason as the tool loop above.
+            let source = std::fs::read_to_string(&path);
+            let parsed = match &source {
+                Ok(text) => crate::hooks::parse_hook_source(&path, text),
+                Err(e) => Err(format!("unreadable: {e}")),
+            };
+            let status = match parsed {
                 Ok(h) => {
                     if let Some(filter) = h.tool_filter.as_deref() {
                         if let Some(reason) = unknown_tool_reason(
@@ -284,22 +301,20 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             });
                         }
                     }
-                    if let Some(mut reason) = clamped_timeout_reason(
-                        &path,
-                        "hook",
-                        crate::hooks::MIN_TIMEOUT_SECS,
-                        crate::hooks::MAX_TIMEOUT_SECS,
-                    ) {
+                    if let Some(mut reason) = source.as_deref().ok().and_then(|text| {
+                        clamped_timeout_reason(
+                            text,
+                            "hook",
+                            crate::hooks::MIN_TIMEOUT_SECS,
+                            crate::hooks::MAX_TIMEOUT_SECS,
+                        )
+                    }) {
                         // A gate that times out blocks, so the clamp decides
                         // when this file starts refusing calls.
                         if h.event.is_gate() {
                             reason.push_str("; a gate that times out blocks");
                         }
-                        hook_extras.push(Finding {
-                            kind: "hook",
-                            path: path.clone(),
-                            status: Status::Warn(reason),
-                        });
+                        hook_clamps.push((hooks_found.len(), reason));
                     }
                     hook_events.push(Some(h.event.as_str()));
                     // Hooks run with host authority and no per-call gate, so
@@ -346,17 +361,19 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                     "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
                                     path.display()
                                 ))
-                            } else if let Some(missing) =
+                            } else if let Some((problem, missing)) =
                                 missing_command_reason(&h.command, project_root)
                             {
-                                // `openmax --approve` refuses a manifest whose
-                                // code cannot be read, so prescribing it here
-                                // sends a human to a command that answers with
-                                // this instead. Nothing can approve a hook
-                                // that has no code yet.
+                                // Approval is not the next step when the
+                                // command does not resolve: `openmax
+                                // --approve` answers a manifest whose code it
+                                // cannot read with that diagnosis instead. Each
+                                // resolution failure gets the repair that fits
+                                // it, since "create it" is wrong advice for a
+                                // file that exists.
                                 Status::Err(format!(
-                                    "inert because {missing}: create it, then approve the hook and the code it runs together with `openmax --approve {}`",
-                                    path.display()
+                                    "inert because {missing}: {}",
+                                    problem.hook_repair(h.command.trim(), &path)
                                 ))
                             } else {
                                 // Only `openmax --approve`, from outside a
@@ -370,7 +387,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             }
                         }
                         None => match missing_command_reason(&h.command, project_root) {
-                            Some(reason) => Status::Warn(reason),
+                            Some((_, reason)) => Status::Warn(reason),
                             None => Status::Ok(format!("hook on {}", h.event.as_str())),
                         },
                     }
@@ -386,15 +403,16 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // First stem wins, and a shadowed file is never loaded: the runtime does
     // not fail closed on one, so neither does this.
     let hook_shadows = mark_shadowed(&mut hooks_found, true);
+    let mut hook_capped = std::collections::HashSet::new();
     for event in crate::hooks::HookEvent::ALL {
         let event = event.as_str();
-        mark_beyond_cap(
+        hook_capped.extend(mark_beyond_cap(
             &mut hooks_found,
             crate::hooks::MAX_HOOKS_PER_EVENT,
             &hook_shadows,
             |i| hook_events.get(i).copied().flatten() == Some(event),
             &format!("{event} hook cap"),
-        );
+        ));
     }
     // Both of the above are ordinary bookkeeping for a tool or a skill: the
     // file does not load, and nothing else changes. For a gate a human
@@ -409,6 +427,13 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 .unwrap_or_else(|| approvals.was_live(path))
         });
     }
+    hook_extras.extend(clamp_findings(
+        "hook",
+        &hooks_found,
+        hook_clamps,
+        &hook_shadows,
+        &hook_capped,
+    ));
     findings.extend(hooks_found.into_iter().map(|(f, _)| f));
     findings.extend(hook_extras);
     // A deleted hook file leaves nothing on disk to report against, so the
@@ -1045,12 +1070,46 @@ fn stale_code_reason(
     Some(format!("the code it runs, {problem}"))
 }
 
+/// The three ways a `command` fails to resolve. They are three different
+/// repairs, and for a hook they are also three different answers to "can this
+/// be approved at all": `openmax --approve` blesses bytes, so a command that
+/// resolves to no file binds nothing it can read, while an unexecutable script
+/// approves fine and still cannot spawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommandProblem {
+    Absent,
+    NotExecutable,
+    NotOnPath,
+}
+
+impl CommandProblem {
+    /// What repairs it, phrased for a hook that is inert until approved: each
+    /// case names its own fix, and whether approval is even reachable yet.
+    fn hook_repair(self, command: &str, manifest: &Path) -> String {
+        let manifest = manifest.display();
+        match self {
+            Self::Absent => format!(
+                "create it, then approve the hook and the code it runs together with `openmax --approve {manifest}`"
+            ),
+            Self::NotExecutable => format!(
+                "make it executable (chmod +x '{command}'), then approve the hook and the code it runs together with `openmax --approve {manifest}`"
+            ),
+            Self::NotOnPath => format!(
+                "install it or point `command` at a script inside the project; a name that resolves to nothing binds no code, so `openmax --approve {manifest}` refuses it as it stands"
+            ),
+        }
+    }
+}
+
 /// Why `command` will not spawn from this checkout, if it will not. A path
 /// (contains '/') resolves against the project root, exactly as the runtime
 /// spawns it; a bare name resolves on PATH. This warns rather than errors:
 /// check-time and run-time environments legitimately differ (CI without the
 /// tool installed, a script the agent writes next).
-fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> {
+fn missing_command_reason(
+    command: &str,
+    project_root: &Path,
+) -> Option<(CommandProblem, String)> {
     let command = command.trim();
     if command.is_empty() {
         return None; // the parser already errors on this
@@ -1062,7 +1121,10 @@ fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> 
             project_root.join(command)
         };
         if !path.is_file() {
-            return Some(format!("command '{command}' does not exist from the project root"));
+            return Some((
+                CommandProblem::Absent,
+                format!("command '{command}' does not exist from the project root"),
+            ));
         }
         #[cfg(unix)]
         {
@@ -1071,7 +1133,10 @@ fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> 
                 .map(|m| m.permissions().mode() & 0o111 != 0)
                 .unwrap_or(false);
             if !executable {
-                return Some(format!("command '{command}' exists but is not executable"));
+                return Some((
+                    CommandProblem::NotExecutable,
+                    format!("command '{command}' exists but is not executable"),
+                ));
             }
         }
         return None;
@@ -1079,18 +1144,45 @@ fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> 
     let found = std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| dir.join(command).is_file())
     });
-    (!found).then(|| format!("command '{command}' is not on PATH"))
+    (!found).then(|| {
+        (
+            CommandProblem::NotOnPath,
+            format!("command '{command}' is not on PATH"),
+        )
+    })
+}
+
+/// The clamp warnings for the entries that survived shadowing and the cap. A
+/// file the loader never reaches describes no runtime behavior: it is reported
+/// as shadowed or capped, and a second line about a timeout it will never
+/// serve would read as if it ran.
+fn clamp_findings(
+    kind: &'static str,
+    entries: &[Entry],
+    clamps: Vec<(usize, String)>,
+    shadowed: &std::collections::HashSet<usize>,
+    capped: &std::collections::HashSet<usize>,
+) -> Vec<Finding> {
+    clamps
+        .into_iter()
+        .filter(|(i, _)| !shadowed.contains(i) && !capped.contains(i))
+        .map(|(i, reason)| Finding {
+            kind,
+            path: entries[i].0.path.clone(),
+            status: Status::Warn(reason),
+        })
+        .collect()
 }
 
 /// Why the `timeout_secs` this file asks for is not the one it gets, if it is
 /// not. Both loaders clamp out-of-range values and say nothing, which for a
 /// gate is a policy change rather than a detail: a gate that times out blocks,
-/// so an author who wrote 600 is enforcing a 60-second budget. The raw value
-/// is re-read here because the parsed spec only carries the clamped one, and
-/// what a human has to be told is the number they wrote.
-fn clamped_timeout_reason(path: &Path, what: &str, min: u64, max: u64) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let written = toml::from_str::<toml::Value>(&text)
+/// so an author who wrote 600 is enforcing a 60-second budget. Takes the bytes
+/// the caller already parsed, never a path: the parsed spec carries only the
+/// clamped number, and reading the file again to recover the written one would
+/// let a rewrite between the two reads produce a report of two generations.
+fn clamped_timeout_reason(text: &str, what: &str, min: u64, max: u64) -> Option<String> {
+    let written = toml::from_str::<toml::Value>(text)
         .ok()?
         .as_table()?
         .get("timeout_secs")?
@@ -1148,14 +1240,15 @@ fn mark_shadowed(entries: &mut [Entry], first_wins: bool) -> std::collections::H
 /// their status, and it reproduces exactly which files never load. `shadowed`
 /// excludes the entries deduplication already dropped; `in_scope` restricts
 /// the ranking further (hooks cap per event, and only parsed files hold an
-/// event); `what` names the cap in the message.
+/// event); `what` names the cap in the message. Returns the indices it marked,
+/// because nothing else --check says about a file that never loads is true.
 fn mark_beyond_cap(
     entries: &mut [Entry],
     cap: usize,
     shadowed: &std::collections::HashSet<usize>,
     in_scope: impl Fn(usize) -> bool,
     what: &str,
-) {
+) -> std::collections::HashSet<usize> {
     let mut live: Vec<(String, usize)> = entries
         .iter()
         .enumerate()
@@ -1163,11 +1256,14 @@ fn mark_beyond_cap(
         .map(|(i, (_, id))| (id.clone().unwrap(), i))
         .collect();
     live.sort();
+    let mut marked = std::collections::HashSet::new();
     for (id, i) in live.into_iter().skip(cap) {
+        marked.insert(i);
         entries[i].0.status = Status::Err(format!(
             "'{id}' is beyond the {cap}-file {what} and never loads: consolidate or delete files"
         ));
     }
+    marked
 }
 
 /// Restate what displacement means for a gate a human approved. A shadowed or
@@ -2207,26 +2303,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A hook whose command does not exist cannot be approved at all:
+    /// A hook whose command does not resolve cannot be approved at all:
     /// `openmax --approve` refuses a manifest whose code it cannot read. So
-    /// the report has to name the missing file, or it prescribes the one
-    /// command that answers with a different diagnosis.
+    /// the report has to name the file, or it prescribes the one command that
+    /// answers with a different diagnosis. The three ways a command fails to
+    /// resolve are three different repairs, and only one of them is "create
+    /// it": telling a human to create a file that already exists is the same
+    /// wrong instruction in a new place.
     #[test]
-    fn a_hook_whose_command_is_missing_says_so_instead_of_prescribing_approval() {
+    fn a_hook_whose_command_does_not_resolve_names_the_repair_that_fits() {
         let root = temp_project();
         let data = root.join("data");
         write(
             root.join(".openmax/hooks/gate.toml"),
             "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n",
         );
-        // The premise: there are no bytes to bless, which is exactly what
-        // `--approve` refuses on.
-        assert!(
-            crate::ledger::bound_code("./gate.sh", &[], &root)
-                .iter()
-                .any(|c| c.sha256.is_none()),
-            "a command that does not exist must bind no approvable code"
+        write(
+            root.join(".openmax/hooks/unexec.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"./unexec.sh\"\n",
         );
+        write(
+            root.join(".openmax/hooks/ghost.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"openmax-nonexistent-binary\"\n",
+        );
+        // Readable, so `--approve` would take it; not executable, so it still
+        // cannot spawn.
+        write(root.join("unexec.sh"), "#!/bin/sh\ntrue\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("unexec.sh"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        // The premise for the other two: no bytes to bless, which is exactly
+        // what `--approve` refuses on.
+        for command in ["./gate.sh", "openmax-nonexistent-binary"] {
+            assert!(
+                crate::ledger::bound_code(command, &[], &root)
+                    .iter()
+                    .any(|c| c.sha256.is_none()),
+                "a command that resolves to nothing must bind no approvable code: {command}"
+            );
+        }
 
         let findings = local_at(&root, &data);
         match &find(&findings, "gate.toml").status {
@@ -2240,6 +2361,31 @@ mod tests {
                 );
             }
             other => panic!("a hook with no code must name the missing file: {other:?}"),
+        }
+        // Executability is a unix mode bit; nothing else reads one.
+        #[cfg(unix)]
+        match &find(&findings, "unexec.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("exists but is not executable"), "{reason}");
+                assert!(reason.contains("chmod +x './unexec.sh'"), "{reason}");
+                assert!(
+                    !reason.contains("create it"),
+                    "the file exists; creating it is not the repair: {reason}"
+                );
+            }
+            other => panic!("an unexecutable script must name its own repair: {other:?}"),
+        }
+        match &find(&findings, "ghost.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("is not on PATH"), "{reason}");
+                assert!(reason.contains("install it"), "{reason}");
+                assert!(reason.contains("refuses it as it stands"), "{reason}");
+                assert!(
+                    !reason.contains("create it"),
+                    "a PATH name is not created in the project: {reason}"
+                );
+            }
+            other => panic!("a command missing from PATH must name its own repair: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2290,6 +2436,109 @@ mod tests {
         }
         // A value the loader honours is not worth a line.
         assert!(clamped("watch.toml").is_none(), "{findings:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A clamp warning is a claim about runtime behavior, so it belongs only
+    /// to the definitions the loader actually keeps. A shadowed file and a
+    /// file past the cap are reported as shadowed and capped; a second line
+    /// about the timeout they will never serve would read as if they ran.
+    #[test]
+    fn a_clamp_warning_is_never_reported_for_a_file_that_never_loads() {
+        let root = temp_project();
+        let data = root.join("data");
+        // Same tool name in both tiers: the project file wins, so the global
+        // one is shadowed and its timeout is nothing the loader ever sees.
+        write(
+            data.join("tools/dup.toml"),
+            "name = \"dup\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\ntimeout_secs = 600\n",
+        );
+        write(
+            root.join(".openmax/tools/dup.toml"),
+            "name = \"dup\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\ntimeout_secs = 10\n",
+        );
+        // One hook past the per-event cap, and the rest inside it.
+        for i in 0..(crate::hooks::MAX_HOOKS_PER_EVENT + 1) {
+            write(
+                root.join(format!(".openmax/hooks/gate-{i:03}.toml")),
+                "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n",
+            );
+        }
+
+        let findings = local_at(&root, &data);
+        let clamp_line = |needle: &str| {
+            findings.iter().find(|f| {
+                f.path.to_string_lossy().contains(needle)
+                    && f.status.summary().contains("timeout_secs")
+            })
+        };
+        let shadowed = find(&findings, "data/tools/dup.toml");
+        assert!(
+            matches!(&shadowed.status, Status::Warn(r) if r.contains("shadowed by")),
+            "{:?}",
+            shadowed.status
+        );
+        assert!(
+            clamp_line("data/tools/dup.toml").is_none(),
+            "a shadowed tool serves no timeout: {:?}",
+            clamp_line("data/tools/dup.toml").map(|f| f.status.summary())
+        );
+        let capped = format!("gate-{:03}.toml", crate::hooks::MAX_HOOKS_PER_EVENT);
+        assert!(
+            matches!(&find(&findings, &capped).status, Status::Err(r) if r.contains("never loads")),
+            "{:?}",
+            find(&findings, &capped).status
+        );
+        assert!(
+            clamp_line(&capped).is_none(),
+            "a hook past the cap serves no timeout: {:?}",
+            clamp_line(&capped).map(|f| f.status.summary())
+        );
+        // The files that do load still say what they were going to say.
+        assert!(
+            clamp_line(".openmax/hooks/gate-000.toml").is_some(),
+            "a hook inside the cap still reports its clamp"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The clamp diagnostic describes the bytes it was handed, which are the
+    /// bytes the finding's own parse used. Recovering the written value from a
+    /// second read of the path would leave an interval a rewrite can land in,
+    /// and one finding would then describe two generations of a file.
+    #[test]
+    fn a_clamp_diagnostic_describes_the_bytes_it_was_given() {
+        let root = temp_project();
+        let path = root.join(".openmax/hooks/gate.toml");
+        // What is on disk now: the generation a rewrite left behind.
+        write(
+            path.clone(),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\ntimeout_secs = 5\n",
+        );
+        // What the caller parsed a moment earlier.
+        let parsed = "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n";
+
+        let reason = clamped_timeout_reason(
+            parsed,
+            "hook",
+            crate::hooks::MIN_TIMEOUT_SECS,
+            crate::hooks::MAX_TIMEOUT_SECS,
+        )
+        .expect("the parsed bytes ask for 600");
+        assert!(reason.contains("timeout_secs = 600"), "{reason}");
+        assert!(reason.contains("clamped to 60 seconds"), "{reason}");
+        // And the generation on disk, judged on its own bytes, says nothing.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            clamped_timeout_reason(
+                &on_disk,
+                "hook",
+                crate::hooks::MIN_TIMEOUT_SECS,
+                crate::hooks::MAX_TIMEOUT_SECS,
+            )
+            .is_none(),
+            "an in-range timeout is not a finding"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
