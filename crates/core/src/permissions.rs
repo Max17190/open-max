@@ -18,6 +18,60 @@ pub enum PermissionDecision {
     Ask,
 }
 
+/// Rank for composing two decisions: the higher one governs. `Allow` sits
+/// below `Default` because it removes a gate the default path would apply.
+fn restrictiveness(decision: &PermissionDecision) -> u8 {
+    match decision {
+        PermissionDecision::Deny { .. } => 3,
+        PermissionDecision::Ask => 2,
+        PermissionDecision::Default => 1,
+        PermissionDecision::Allow => 0,
+    }
+}
+
+/// The rules in force while a turn runs: the freshest discovery, floored by
+/// what was live when the turn began.
+///
+/// A mutating call's edit must narrow policy immediately - "install the
+/// guard, then prove it" is the natural task shape, and the proof must not
+/// run unguarded. The same reload must not work in reverse: a mutating call
+/// that rewrites the file to drop a deny would otherwise lift a restriction
+/// the turn started under, so each call takes the more restrictive of the
+/// two answers. Relaxations arrive with the next turn's fresh discovery.
+pub struct TurnPermissions {
+    turn_start: Permissions,
+    reloaded: Option<Permissions>,
+}
+
+impl TurnPermissions {
+    pub fn new(turn_start: Permissions) -> Self {
+        Self { turn_start, reloaded: None }
+    }
+
+    /// Swap in a fresh discovery for the rest of the turn.
+    pub fn reload(&mut self, current: Permissions) {
+        self.reloaded = Some(current);
+    }
+
+    /// The decision in force: the reloaded answer, unless the turn-start
+    /// answer is more restrictive. Both sides keep their own fail-closed and
+    /// repair-carve-out behavior, so a file broken at turn start does not
+    /// lose its one repair path here.
+    pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
+        let start = self.turn_start.evaluate(tool, args);
+        let Some(current) = &self.reloaded else {
+            return start;
+        };
+        let now = current.evaluate(tool, args);
+        if restrictiveness(&now) >= restrictiveness(&start) {
+            now
+        } else {
+            start
+        }
+    }
+
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Effect {
     Allow,
