@@ -31,6 +31,11 @@ struct Rule {
     tool: String,
     /// Compiled optional arg filter. Invalid patterns are dropped at load.
     arg_regex: Option<Regex>,
+    /// Where this rule was written: the 1-based `[[rules]]` position as the
+    /// file spells it, and the file it came from. Carried from load so a deny
+    /// can point at one rule instead of at the policy as a whole.
+    index: usize,
+    source: PathBuf,
 }
 
 /// Permission rules for the current project. Loaded once per agent turn.
@@ -73,7 +78,10 @@ struct RuleFile {
 enum FileLoad {
     Missing,
     Ok(Vec<Rule>),
-    /// File exists but is unusable; caller must fail closed.
+    /// File exists but is unusable; caller must fail closed. The reason names
+    /// the rule, never the file: `--check` prints the path in its own column,
+    /// and the one reader who sees the reason bare - the model, through the
+    /// deny - gets the file prepended by the caller that knows it.
     Invalid(String),
 }
 
@@ -105,7 +113,13 @@ impl Permissions {
                     return Self {
                         rules: Vec::new(),
                         fail_closed: true,
-                        fail_closed_reason: Some(reason),
+                        // The model reads this reason with no path column
+                        // around it, and the repair carve-out is a rewrite of
+                        // exactly this file, so the file is named here.
+                        fail_closed_reason: Some(format!(
+                            "permissions file {}: {reason}",
+                            display_source(path, project_root, home_dir().as_deref())
+                        )),
                         invalid_path: Some(path.clone()),
                         project_root: project_root.to_path_buf(),
                         inert_allows: Vec::new(),
@@ -198,7 +212,16 @@ impl Permissions {
             return match rule.effect {
                 Effect::Allow => PermissionDecision::Allow,
                 Effect::Deny => PermissionDecision::Deny {
-                    reason: format!("permission rule denied tool {tool}"),
+                    // Which rule, not just which tool: the two files merge into
+                    // one list, so with several rules installed an overbroad
+                    // regex is otherwise undebuggable from the message alone.
+                    // The pattern itself stays out - it can be long, and the
+                    // file plus the index is enough to go read it.
+                    reason: format!(
+                        "permission rule denied tool {tool} (rule {} in {})",
+                        rule.index,
+                        display_source(&rule.source, &self.project_root, home_dir().as_deref())
+                    ),
                 },
                 Effect::Ask => PermissionDecision::Ask,
             };
@@ -325,10 +348,7 @@ fn load_file(path: &Path) -> FileLoad {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            return FileLoad::Invalid(format!(
-                "permissions file {} unreadable ({e}); failing closed",
-                path.display()
-            ));
+            return FileLoad::Invalid(format!("unreadable ({e}); failing closed"));
         }
     };
     // Empty file is an intentional no-op, not a parse failure.
@@ -338,14 +358,15 @@ fn load_file(path: &Path) -> FileLoad {
     let file: PermissionsFile = match toml::from_str(&text) {
         Ok(f) => f,
         Err(e) => {
-            return FileLoad::Invalid(format!(
-                "permissions file {} is malformed ({e}); failing closed",
-                path.display()
-            ));
+            return FileLoad::Invalid(format!("is malformed ({e}); failing closed"));
         }
     };
     let mut rules = Vec::with_capacity(file.rules.len());
-    for raw in file.rules {
+    // Rules are numbered as they are written, not as they survive: the human
+    // fixing this counts `[[rules]]` blocks down the file, so a skipped one
+    // must not shift every number after it.
+    for (i, raw) in file.rules.into_iter().enumerate() {
+        let index = i + 1;
         let tool = raw.tool.trim().to_string();
         if tool.is_empty() {
             continue;
@@ -354,10 +375,12 @@ fn load_file(path: &Path) -> FileLoad {
             "allow" => Effect::Allow,
             "deny" => Effect::Deny,
             "ask" => Effect::Ask,
+            // Naming the rule and the legal spellings is the whole message:
+            // without the index two identical typos read identically, and
+            // without the list a case error looks like a mystery.
             other => {
                 return FileLoad::Invalid(format!(
-                    "permissions file {} has unknown effect {other:?}; failing closed",
-                    path.display()
+                    "rule {index} has unknown effect {other:?}: expected \"allow\", \"deny\", or \"ask\"; failing closed"
                 ));
             }
         };
@@ -365,10 +388,11 @@ fn load_file(path: &Path) -> FileLoad {
             None => None,
             Some(pat) => match Regex::new(pat) {
                 Ok(re) => Some(re),
+                // The regex engine's own caret block pinpoints the character;
+                // this only has to say which rule it is under.
                 Err(e) => {
                     return FileLoad::Invalid(format!(
-                        "permissions file {} has invalid arg_regex ({e}); failing closed",
-                        path.display()
+                        "rule {index} has invalid arg_regex ({e}); failing closed"
                     ));
                 }
             },
@@ -377,9 +401,30 @@ fn load_file(path: &Path) -> FileLoad {
             effect,
             tool,
             arg_regex,
+            index,
+            source: path.to_path_buf(),
         });
     }
     FileLoad::Ok(rules)
+}
+
+/// How a rule's file is named back to whoever reads the message: relative to
+/// the project for the project file, `~`-spelled for the global one, absolute
+/// when it is neither. The two files merge into one evaluated list, so the
+/// tier is part of the answer to "which rule denied this", and both spellings
+/// are ones a shell will take when the fix has to happen there.
+fn display_source(path: &Path, project_root: &Path, home: Option<&Path>) -> String {
+    if let Ok(rel) = path.strip_prefix(project_root) {
+        return rel.display().to_string();
+    }
+    if let Some(rel) = home.and_then(|home| path.strip_prefix(home).ok()) {
+        return format!("~/{}", rel.display());
+    }
+    path.display().to_string()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// Primary argument string used for optional `arg_regex` matching.
@@ -807,6 +852,156 @@ tool = "write_file"
             perms.evaluate("read_file", &json!({"path": "a.rs"})),
             PermissionDecision::Default
         );
+    }
+
+    /// A bad `effect` has to say which rule is bad and what the legal
+    /// spellings are. Without the index, rule 1 and rule 17 produce the same
+    /// sentence; without the list, `"Allow"` reads as a mystery rather than as
+    /// a capital letter. The hooks surface already answers both questions for
+    /// its own enum, and this is the same question.
+    #[test]
+    fn unknown_effect_names_the_rule_and_the_legal_values() {
+        let tmp = tempfile_dir();
+        let path = tmp.join(".openmax").join("permissions.toml");
+        write_perms(
+            &path,
+            r#"
+[[rules]]
+effect = "deny"
+tool = "bash"
+
+[[rules]]
+effect = "Allow"
+tool = "bash"
+"#,
+        );
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
+        match perms.evaluate("bash", &json!({"command": "ls"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(reason.contains("rule 2 has unknown effect \"Allow\""), "{reason}");
+                assert!(
+                    reason.contains("expected \"allow\", \"deny\", or \"ask\""),
+                    "{reason}"
+                );
+                // The model reads this with no path column around it.
+                assert!(reason.contains(".openmax/permissions.toml"), "{reason}");
+                assert!(reason.contains("failing closed"), "{reason}");
+            }
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
+        // `--check` prints the path itself, so the reason does not repeat it.
+        match check_file(&path) {
+            Some(Err(reason)) => {
+                assert!(
+                    reason.starts_with("rule 2 has unknown effect \"Allow\":"),
+                    "{reason}"
+                );
+                assert!(!reason.contains(&*path.display().to_string()), "{reason}");
+            }
+            other => panic!("expected an Err diagnosis, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Same question of a broken pattern: the regex engine points at the
+    /// character, and the message has to point at the rule holding it.
+    #[test]
+    fn invalid_arg_regex_names_the_rule() {
+        let tmp = tempfile_dir();
+        let path = tmp.join(".openmax").join("permissions.toml");
+        write_perms(
+            &path,
+            r#"
+[[rules]]
+effect = "ask"
+tool = "write_file"
+
+[[rules]]
+effect = "allow"
+tool = "bash"
+arg_regex = "^ls"
+
+[[rules]]
+effect = "deny"
+tool = "bash"
+arg_regex = "(unclosed"
+"#,
+        );
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
+        match perms.evaluate("bash", &json!({"command": "ls -la"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(reason.contains("rule 3 has invalid arg_regex"), "{reason}");
+                // The engine's own caret block survives.
+                assert!(reason.contains("unclosed group"), "{reason}");
+                assert!(reason.contains("failing closed"), "{reason}");
+            }
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A deny the model relays has to name the rule that fired. The project
+    /// and global files merge into one list, so the tier is half the answer:
+    /// "rule 2" alone points at two different lines of two different files.
+    #[test]
+    fn a_deny_names_the_rule_that_fired() {
+        let tmp = tempfile_dir();
+        let root = tmp.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = root.join(".openmax").join("permissions.toml");
+        let global = tmp.join("home").join(".openmax").join("permissions.toml");
+        write_perms(
+            &project,
+            r#"
+[[rules]]
+effect = "deny"
+tool = "write_file"
+arg_regex = "^src/"
+
+[[rules]]
+effect = "deny"
+tool = "bash"
+arg_regex = "rm\\s+-rf"
+"#,
+        );
+        write_perms(&global, "[[rules]]\neffect = \"deny\"\ntool = \"glob\"\n");
+        let perms = Permissions::from_files(&root, &[project, global.clone()], &tmp.join("data"));
+
+        match perms.evaluate("bash", &json!({"command": "rm -rf /tmp/foo"})) {
+            PermissionDecision::Deny { reason } => {
+                assert_eq!(
+                    reason,
+                    "permission rule denied tool bash (rule 2 in .openmax/permissions.toml)"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        // The global file numbers from its own first rule, and is named as its
+        // own file - not as the project one that happens to be listed first.
+        match perms.evaluate("glob", &json!({"pattern": "**/*.rs"})) {
+            PermissionDecision::Deny { reason } => {
+                assert_eq!(
+                    reason,
+                    format!(
+                        "permission rule denied tool glob (rule 1 in {})",
+                        global.display()
+                    )
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        // In a real session that global path sits under $HOME, and is spelled
+        // the way a human would type it to go fix it.
+        let home = Path::new("/home/dev");
+        assert_eq!(
+            display_source(
+                &home.join(".openmax/permissions.toml"),
+                &home.join("work/repo"),
+                Some(home)
+            ),
+            "~/.openmax/permissions.toml"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
