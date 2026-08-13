@@ -999,7 +999,8 @@ pub(crate) fn parse_hook_file(path: &Path) -> Result<HookSpec, String> {
 /// vouched for, not from a second read the file can change under.
 pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, String> {
     let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
-    let file: HookFile = toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;
+    let file: HookFile =
+        toml::from_str(text).map_err(|e| crate::spec::manifest_toml_error(&e, "hooks"))?;
     let event = HookEvent::parse(&file.event).ok_or_else(|| {
         format!(
             "unknown event '{}': expected pre_tool_use, post_tool_use, user_prompt_submit, session_start, compaction, or turn_end",
@@ -1981,6 +1982,32 @@ command = "true"
             .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
             .await;
         assert!(matches!(result, PreToolResult::Block { .. }));
+    }
+
+    /// Same contract as a tool manifest: an absent key is named, not
+    /// reported as a parse failure at a line that parsed fine. The file is
+    /// still refused, so a hook missing `command` never loads.
+    #[test]
+    fn a_missing_hook_field_is_named_not_blamed_on_a_line() {
+        let err =
+            parse_hook_source(Path::new("audit.toml"), "event = \"post_tool_use\"\n").unwrap_err();
+        assert!(err.contains("missing required field 'command'"), "{err}");
+        assert!(err.contains("event, command"), "{err}");
+        assert!(!err.contains("invalid TOML"), "{err}");
+        assert!(!err.contains("line 1, column 1"), "{err}");
+        assert!(!err.contains('^'), "{err}");
+
+        let err = parse_hook_source(Path::new("audit.toml"), "command = \"true\"\n").unwrap_err();
+        assert!(err.contains("missing required field 'event'"), "{err}");
+        assert!(!err.contains("invalid TOML"), "{err}");
+        assert!(!err.contains("line 1, column 1"), "{err}");
+        assert!(!err.contains('^'), "{err}");
+
+        // A real syntax error still carries where it is.
+        let err = parse_hook_source(Path::new("audit.toml"), "event = [not toml").unwrap_err();
+        assert!(err.contains("invalid TOML"), "{err}");
+        assert!(err.contains("line 1, column 10"), "{err}");
+        assert!(err.contains('^'), "{err}");
     }
 
     #[tokio::test]
