@@ -88,8 +88,13 @@ pub struct Settings {
     /// Ceiling on the tokens one turn may spend across the agent requests it
     /// makes, counted as a provider bills them: prompt plus completion, with
     /// cached prompt tokens at full value, because what this bounds is the
-    /// work a turn may ask for and not what it happened to cost. Checked
-    /// before each request, so it can only end a turn early, never extend one.
+    /// work a turn may ask for and not what it happened to cost. Enforced at
+    /// admission: a request goes out only when what the turn has spent plus
+    /// the request's own estimated size still fits, so the ceiling refuses
+    /// the request it cannot afford instead of the one after it. The reply
+    /// side is not reserved, so the last admitted request may run past the
+    /// cap by at most `max_tokens`; a cap the first request cannot fit ends
+    /// the turn before it spends anything.
     /// A compaction summary is not charged here: it is housekeeping that makes
     /// the next request smaller, and refusing a turn for it would spend the
     /// ceiling on the thing that was saving it. None means no ceiling (the

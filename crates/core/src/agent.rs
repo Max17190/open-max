@@ -2006,16 +2006,6 @@ async fn run_loop(
     let max_iterations = settings.max_agent_iterations.max(1);
 
     'turns: for _ in 0..max_iterations {
-        // A spend ceiling, checked before the request that would spend past
-        // it, so it can only end a turn early and never extends one. Never a
-        // mid-stream kill: a request already in flight is already paid for,
-        // and killing it would throw away tokens the user has bought.
-        if let Some(cap) = settings.max_agent_tokens {
-            if spent_tokens >= cap {
-                stop_reason = "budget_exhausted".into();
-                break 'turns;
-            }
-        }
         // The tool schemas are re-sent whole on every request, so they are as
         // real as the transcript. Read per iteration: a mid-turn refreeze
         // swaps the wire bytes, and the overhead must follow the current
@@ -2057,6 +2047,21 @@ async fn run_loop(
         }
         let used = schema_tokens
             + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        // The ceiling refuses the request it cannot afford, not just the one
+        // after it: what the turn has spent plus the request-side size of the
+        // one about to go out, the same number the budget event below reports.
+        // Checked after compaction so a prune gets its chance to shrink the
+        // request under the cap first, and never mid-stream: a request in
+        // flight is already paid for. The reply side is not reserved, so the
+        // last admitted request may run past the cap by at most `max_tokens`;
+        // a cap the first request cannot fit ends the turn before it spends
+        // anything.
+        if let Some(cap) = settings.max_agent_tokens {
+            if spent_tokens.saturating_add(used) > cap {
+                stop_reason = "budget_exhausted".into();
+                break 'turns;
+            }
+        }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
@@ -5144,8 +5149,10 @@ mod tests {
         std::fs::write(project.join("a.txt"), "hello\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
-        // Every reply costs the same 1500 the provider reports, so the third
-        // request is the one the ceiling refuses.
+        // Every reply costs the same 1500 the provider reports and the cap
+        // sits between one and two of those charges, so the second request is
+        // the one admission refuses: the 500 left cannot fit a request the
+        // loop estimates at well over that.
         let sse = format!(
             "{TOOL_SSE}data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1000,\"completion_tokens\":500}}}}\n\n"
         );
@@ -5164,8 +5171,8 @@ mod tests {
         assert_eq!(stop, "budget_exhausted");
         assert_eq!(
             *requests.lock().unwrap(),
-            2,
-            "the ceiling stops the turn before a request, never mid-stream"
+            1,
+            "the request that cannot fit is refused, not dispatched"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -5192,8 +5199,9 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
-            // Below the frozen schemas alone, so one request exhausts it.
-            s.max_agent_tokens = Some(200);
+            // Above one request's estimate and below two, so the fallback
+            // charge is what refuses the second request.
+            s.max_agent_tokens = Some(2000);
             s.max_agent_iterations = 4;
         }
 
@@ -5202,6 +5210,38 @@ mod tests {
         let (stop, _) = drive_turn(&mut rx).await;
         assert_eq!(stop, "budget_exhausted", "a silent provider is charged, not exempt");
         assert_eq!(*requests.lock().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cap no request can fit buys nothing, not one request: the turn ends
+    /// loudly before spending, and exit 4 says why. Compaction ran first, so
+    /// this is the cap being infeasible, not the transcript being bloated.
+    #[tokio::test]
+    async fn a_cap_the_first_request_cannot_fit_spends_nothing() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // Below the frozen schemas alone, so no request can ever fit.
+            s.max_agent_tokens = Some(200);
+            s.max_agent_iterations = 4;
+        }
+
+        let id = "sess-budget-infeasible";
+        start_turn(core.clone(), id.into(), project, "hi".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "budget_exhausted");
+        assert_eq!(*requests.lock().unwrap(), 0, "an unaffordable request is never dispatched");
 
         let _ = std::fs::remove_dir_all(dir);
     }
