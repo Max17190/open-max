@@ -19,7 +19,10 @@ use crate::state::CancelToken;
 use std::sync::Arc;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
-const MAX_TIMEOUT_SECS: u64 = 60;
+/// The range a `timeout_secs` is clamped into. Named so --check can quote the
+/// bounds it warns against instead of restating them.
+pub(crate) const MIN_TIMEOUT_SECS: u64 = 1;
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 60;
 /// Per-event hook cap. Every pre_tool_use hook runs on every tool call, so an
 /// unbounded set turns discovery mistakes into unbounded per-call latency.
 /// Stems sort deterministically; the head runs, --check names the rest.
@@ -1020,7 +1023,7 @@ pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, Str
         event,
         command,
         args: file.args,
-        timeout_secs: file.timeout_secs.clamp(1, MAX_TIMEOUT_SECS),
+        timeout_secs: file.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
         tool_filter,
         source_path: path.to_path_buf(),
         // Filled by the approval filter, which is where the approved set is
