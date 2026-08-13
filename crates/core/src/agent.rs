@@ -2426,6 +2426,16 @@ async fn run_loop(
                     repeat_tracker.record_executed(name, &args_key);
                     if outcome.ok && registry.is_mutating(name) {
                         extensions_touched = true;
+                        // Reload here, not at iteration end: one assistant
+                        // response can carry the policy write and the call
+                        // the policy denies, and the later call must already
+                        // see the rule. Concurrent batches hold read-only
+                        // calls only, so this serial point covers every
+                        // mutation. TurnPermissions keeps each observed
+                        // snapshot as a floor, so a reload can narrow policy
+                        // but never widen it; `deny`/`ask` need no approval,
+                        // and unapproved `allow` rules are dropped at load.
+                        permissions.reload(Permissions::discover(project_root, &core.data_dir));
                     }
                 }
             }
@@ -2437,13 +2447,8 @@ async fn run_loop(
         // callable in iteration N+1 without ending the turn. One deliberate
         // prompt-cache re-prefill, and only when extension bytes actually
         // changed; hooks keep their per-turn discovery, because an
-        // agent-written hook is inert until a human approves it anyway.
-        // Permissions reload below on the same trigger: `deny`/`ask` only add
-        // friction and unapproved `allow` rules are dropped at load, so
-        // applying an edit mid-turn can narrow but never widen.
-        if extensions_touched {
-            permissions.reload(Permissions::discover(project_root, &core.data_dir));
-        }
+        // agent-written hook is inert until a human approves it anyway
+        // (permissions reload per mutating call, above).
         let refrozen = extensions_touched
             && refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
                 .await;
