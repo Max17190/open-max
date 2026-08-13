@@ -116,8 +116,17 @@ pub struct Record {
     /// widen its own exemption.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code: Vec<String>,
+    /// Whether those approved bytes asked the hook to gate on an event that
+    /// gates only on request. Skipped when false so every line written before
+    /// the field existed still serializes to the bytes the chain hashed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blocking: bool,
     /// sha256 of the previous record's serialized line ("" for the first).
     pub prev: String,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One entry of a sync's outcome, for the refreeze receipt.
@@ -640,6 +649,7 @@ fn sync_locked(
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: prev.clone(),
         };
         let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
@@ -662,6 +672,7 @@ fn sync_locked(
                 also: Vec::new(),
                 event: None,
                 code: Vec::new(),
+                blocking: false,
                 prev: prev.clone(),
             };
             let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
@@ -728,18 +739,35 @@ pub struct ApprovedHook {
     /// The project-local files the approved bytes named as code.
     #[serde(default)]
     code: Vec<String>,
+    /// Whether the approved bytes asked for a blocking hook. `default` is
+    /// what makes every record written before this field existed read back
+    /// as the observer a human actually approved.
+    #[serde(default)]
+    blocking: bool,
 }
 
 impl ApprovedHook {
     /// Whether what was approved gates calls. A gate that stops running is
     /// fail-open, which is why this question is asked of the approved content
     /// rather than of whatever now sits at the path.
+    ///
+    /// Both halves are load-bearing across the upgrade. A record with no
+    /// `blocking` field is a hook a human approved as an observer, so it must
+    /// not be promoted into a gate by a later build; a `pre_tool_use` record
+    /// from the same era carries no flag either, and must not be demoted out
+    /// of one.
     pub fn is_gate(&self) -> bool {
-        matches!(self.event.as_str(), "pre_tool_use" | "user_prompt_submit")
+        self.blocking || matches!(self.event.as_str(), "pre_tool_use" | "user_prompt_submit")
     }
 
     pub fn event(&self) -> &str {
         &self.event
+    }
+
+    /// Whether the approved bytes asked to gate an event that gates only on
+    /// request, for diagnostics that name the shape a human installed.
+    pub fn blocking(&self) -> bool {
+        self.blocking
     }
 
     /// The code paths the approved content named, for the repair carve-out.
@@ -822,6 +850,7 @@ fn approvals_from(records: &[Record]) -> Approvals {
                         path: key,
                         event: event.clone(),
                         code: r.code.clone(),
+                        blocking: r.blocking,
                     });
                 }
             }
@@ -1033,6 +1062,7 @@ fn seal_marker(dir: &Path, records: &[Record], ts: u64) -> Option<Record> {
         also: Vec::new(),
         event: None,
         code: Vec::new(),
+        blocking: false,
         prev: String::new(),
     })
 }
@@ -1116,6 +1146,7 @@ pub fn adopt_legacy_approvals(
             also: hashes.iter().skip(1).cloned().collect(),
             event: shape.map(|h| h.event.clone()),
             code: shape.map(|h| h.code.clone()).unwrap_or_default(),
+            blocking: shape.is_some_and(|h| h.blocking),
             prev: String::new(),
         };
         let mut records = Vec::new();
@@ -1144,6 +1175,7 @@ pub fn adopt_legacy_approvals(
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         });
         let (lines, head) = chain(records, &verified.head)?;
@@ -1258,6 +1290,7 @@ fn approve(
             kind: Kind::Approval,
             also: shas.iter().skip(1).cloned().collect(),
             event: shape.as_ref().map(|h| h.event.clone()),
+            blocking: shape.as_ref().is_some_and(|h| h.blocking),
             code: shape.map(|h| h.code).unwrap_or_default(),
             prev: String::new(),
         };
@@ -1266,10 +1299,13 @@ fn approve(
     })
 }
 
-/// The comparable part of a remembered hook shape: what it gates on and what
-/// it runs. The path is the key, so it is not part of the answer.
-fn shape_of(hook: Option<&ApprovedHook>) -> Option<(&str, &[String])> {
-    hook.map(|h| (h.event.as_str(), h.code.as_slice()))
+/// The comparable part of a remembered hook shape: what it gates on, whether
+/// it gates at all, and what it runs. The path is the key, so it is not part
+/// of the answer. `blocking` belongs here because retracting it is exactly how
+/// a human demotes a gate, and a shape that forgot it would leave the old
+/// gate's memory standing forever.
+fn shape_of(hook: Option<&ApprovedHook>) -> Option<(&str, bool, &[String])> {
+    hook.map(|h| (h.event.as_str(), h.blocking, h.code.as_slice()))
 }
 
 /// What `openmax --ledger-repair` did.
@@ -1465,6 +1501,10 @@ fn hook_record_source(path: &Path, text: &str, project_root: &Path) -> Option<Ap
             .into_iter()
             .map(|c| c.path.display().to_string())
             .collect(),
+        // What these bytes asked for, not what they amount to: an event that
+        // always gates is remembered by its event, and this flag is the half
+        // of `is_gate` that only `turn_end` can ever set.
+        blocking: hook.blocking,
     })
 }
 
@@ -1501,6 +1541,7 @@ pub fn forget_capability(
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         };
         let (lines, head) = chain(vec![record], &verified.head)?;
@@ -2352,6 +2393,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: head.trim().to_string(),
         };
         let line = serde_json::to_string(&record).unwrap();
@@ -2409,6 +2451,124 @@ mod tests {
         let approved = approvals(&data, &root).unwrap();
         let hook = approved.approved_hook(&manifest).expect("the shape is remembered");
         assert!(hook.is_gate(), "the remembered shape is the vouched bytes' shape");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every record written before `blocking` existed describes a `turn_end`
+    /// hook a human approved as an observer, because that is all a `turn_end`
+    /// hook could be. Reading one back as a gate would hand an installed base
+    /// of observers the power to end turns, on nobody's say-so but the
+    /// upgrade's.
+    #[test]
+    fn an_approved_turn_end_observer_never_becomes_a_gate_by_upgrade() {
+        let legacy: ApprovedHook = serde_json::from_str(
+            r#"{"path":"/p/.openmax/hooks/watch.toml","event":"turn_end","code":["/p/watch.sh"]}"#,
+        )
+        .expect("a record from before the field still parses");
+        assert!(!legacy.is_gate(), "an upgrade must not promote what a human approved");
+        assert!(!legacy.blocking());
+        assert_eq!(legacy.event(), "turn_end");
+        assert_eq!(legacy.code_paths().count(), 1, "the rest of the shape survives");
+    }
+
+    /// The other half of the same default. A `pre_tool_use` record from the
+    /// same era carries no flag either, and reading the flag *instead of* the
+    /// event would demote every gate a human installed before this build.
+    #[test]
+    fn a_pre_tool_use_record_written_before_the_blocking_field_still_gates() {
+        for event in ["pre_tool_use", "user_prompt_submit"] {
+            let legacy: ApprovedHook = serde_json::from_str(&format!(
+                r#"{{"path":"/p/.openmax/hooks/gate.toml","event":"{event}"}}"#
+            ))
+            .expect("a record from before the field still parses");
+            assert!(legacy.is_gate(), "{event} gates on its event, flag or no flag");
+            assert!(!legacy.blocking(), "{event} never asked for the flag");
+        }
+    }
+
+    /// The approval act is an open interval (see the vouched-bytes test
+    /// above), and `blocking` is the part of a hook's shape that decides
+    /// whether it can end a turn. So it is derived from the bytes proven to
+    /// hash to what a human vouched for, and a manifest swapped inside the
+    /// interval records nothing at all.
+    #[test]
+    fn approving_a_blocking_turn_end_records_the_blocking_shape_from_the_vouched_bytes() {
+        let data = temp("blocking-vouch-data");
+        let root = temp("blocking-vouch-proj");
+        let hooks_dir = root.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(root.join("verify.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        let manifest = hooks_dir.join("verify.toml");
+        let gate_body = "event = \"turn_end\"\nblocking = true\ncommand = \"./verify.sh\"\n";
+        std::fs::write(&manifest, gate_body).unwrap();
+        let mut shas = vec![sha256_hex(gate_body.as_bytes())];
+        shas.extend(manifest_code(&manifest, &root).into_iter().filter_map(|c| c.sha256));
+
+        // Swapped inside the interval: the same hashes, one word short.
+        std::fs::write(&manifest, "event = \"turn_end\"\ncommand = \"./verify.sh\"\n").unwrap();
+        let err = approve_capability(&data, &root, &manifest, &shas).unwrap_err();
+        assert!(err.contains("changed after it was shown"), "{err}");
+        assert!(history(&data, &root).unwrap().is_empty(), "a refused act records nothing");
+
+        // The vouched bytes back on disk, and the shape they declare is what
+        // the chain carries.
+        std::fs::write(&manifest, gate_body).unwrap();
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        let records = history(&data, &root).unwrap();
+        assert!(records[0].blocking, "the flag rides the record");
+        assert_eq!(records[0].event.as_deref(), Some("turn_end"));
+        let hook = approvals(&data, &root)
+            .unwrap()
+            .approved_hook(&manifest)
+            .expect("the shape reads back")
+            .clone();
+        assert!(hook.blocking() && hook.is_gate());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `blocking` is the whole difference between a hook that can end a turn
+    /// and one that watches, so two shapes that differ only in it are two
+    /// different shapes. Leaving it out of the comparison would make
+    /// re-approving a gate's exact former bytes a no-op - nothing new to
+    /// record - and the observer shape recorded in between would stand as the
+    /// approved one forever, with the file on disk saying otherwise.
+    #[test]
+    fn changing_only_the_blocking_flag_is_a_new_shape() {
+        let data = temp("blocking-shape-data");
+        let root = temp("blocking-shape-proj");
+        let hooks_dir = root.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(root.join("verify.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        let manifest = hooks_dir.join("verify.toml");
+        let gate_body = "event = \"turn_end\"\nblocking = true\ncommand = \"./verify.sh\"\n";
+        let watch_body = "event = \"turn_end\"\ncommand = \"./verify.sh\"\n";
+        let approve = |body: &str| {
+            std::fs::write(&manifest, body).unwrap();
+            let mut shas = vec![sha256_hex(body.as_bytes())];
+            shas.extend(manifest_code(&manifest, &root).into_iter().filter_map(|c| c.sha256));
+            approve_capability(&data, &root, &manifest, &shas).unwrap();
+        };
+        let is_gate = || {
+            approvals(&data, &root).unwrap().approved_hook(&manifest).unwrap().is_gate()
+        };
+
+        approve(gate_body);
+        assert!(is_gate(), "the approved bytes asked to gate");
+
+        // A human demotes it on purpose.
+        approve(watch_body);
+        assert!(!is_gate(), "and un-asked it on purpose");
+
+        // Then changes their mind. The hashes are already blessed and the
+        // event and code never moved, so `blocking` is the only thing that
+        // makes this act new - and if it is not new, nothing is recorded and
+        // the gate never comes back.
+        let before = history(&data, &root).unwrap().len();
+        approve(gate_body);
+        assert_eq!(history(&data, &root).unwrap().len(), before + 1, "the shape moved");
+        assert!(is_gate(), "re-approving the gate's own bytes restores the gate");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2489,6 +2649,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: sha256_hex(last.as_bytes()),
         };
         let line = serde_json::to_string(&record).unwrap();
@@ -2618,6 +2779,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         };
         let line = serde_json::to_string(&old).unwrap();
@@ -2723,6 +2885,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         };
         let line = serde_json::to_string(&old).unwrap();
@@ -2868,6 +3031,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         });
 
@@ -2918,6 +3082,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         });
         assert!(read(&data, &root).unwrap().interrupted_write);
@@ -2952,6 +3117,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         };
         let line = serde_json::to_string(&record).unwrap();
@@ -2987,6 +3153,7 @@ mod tests {
             also: Vec::new(),
             event: None,
             code: Vec::new(),
+            blocking: false,
             prev: String::new(),
         };
         let line = serde_json::to_string(&record).unwrap();

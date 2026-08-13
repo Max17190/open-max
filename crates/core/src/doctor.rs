@@ -337,8 +337,10 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         )
                     }) {
                         // A gate that times out blocks, so the clamp decides
-                        // when this file starts refusing calls.
-                        if h.event.is_gate() {
+                        // when this file starts refusing calls. Asked of the
+                        // hook, not of its event: a blocking turn_end refuses
+                        // on the same terms.
+                        if h.gates() {
                             reason.push_str("; a gate that times out blocks");
                         }
                         hook_clamps.push((hooks_found.len(), reason));
@@ -371,11 +373,11 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             // harmless observer.
                             let was_gate = approved.map(|a| a.is_gate()).unwrap_or(true);
                             if let Some(approved) = approved {
-                                if approved.is_gate() && !h.event.is_gate() {
+                                if approved.is_gate() && !h.gates() {
                                     reason = format!(
                                         "an approved {} gate was rewritten as a {} hook, which would stop it gating",
-                                        approved.event(),
-                                        h.event.as_str()
+                                        crate::hooks::shape_name(approved.event(), approved.blocking()),
+                                        crate::hooks::shape_name(h.event.as_str(), h.blocking)
                                     );
                                 }
                             }
@@ -415,7 +417,13 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         }
                         None => match missing_command_reason(&h.command, project_root) {
                             Some((_, reason)) => Status::Warn(reason),
-                            None => Status::Ok(format!("hook on {}", h.event.as_str())),
+                            // The shape, not just the event: `turn_end` alone
+                            // says nothing about whether this file can end a
+                            // turn, and that is the whole of what it does.
+                            None => Status::Ok(format!(
+                                "hook on {}",
+                                crate::hooks::shape_name(h.event.as_str(), h.blocking)
+                            )),
                         },
                     }
                 }
@@ -2602,6 +2610,74 @@ mod tests {
         }
         // A value the loader honours is not worth a line.
         assert!(clamped("watch.toml").is_none(), "{findings:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `--check` classifies hooks so a human can see which files can refuse
+    /// something. A `turn_end` hook with `blocking = true` can, so every place
+    /// the report tells a gate from an observer has to ask the hook and not
+    /// its event: the shape it names, the clamp that decides when it starts
+    /// refusing, and the fail-closed line it earns once a human has approved
+    /// it and the content moves.
+    #[test]
+    fn check_names_a_blocking_turn_end_hook_as_a_gate() {
+        let root = temp_project();
+        let data = root.join("data");
+        let gate = root.join(".openmax/hooks/verify.toml");
+        let gate_body =
+            "event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n";
+        write(gate.clone(), gate_body);
+        write(
+            root.join(".openmax/hooks/watch.toml"),
+            "event = \"turn_end\"\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n",
+        );
+        crate::ledger::approve_capability(
+            &data,
+            &root,
+            &gate,
+            &[crate::ledger::sha256_hex(gate_body.as_bytes())],
+        )
+        .unwrap();
+
+        let findings = local_at(&root, &data);
+        let clamped = |needle: &str| {
+            findings
+                .iter()
+                .find(|f| {
+                    f.path.to_string_lossy().contains(needle)
+                        && f.status.summary().contains("timeout_secs")
+                })
+                .map(|f| f.status.summary())
+                .unwrap_or_else(|| panic!("no clamp finding for {needle}"))
+        };
+        assert!(
+            clamped("verify.toml").contains("a gate that times out blocks"),
+            "{}",
+            clamped("verify.toml")
+        );
+        assert!(
+            !clamped("watch.toml").contains("a gate that times out blocks"),
+            "an observer's clamp is not a policy change: {}",
+            clamped("watch.toml")
+        );
+        // The shape it is, not the event it rides on.
+        assert!(
+            matches!(&find(&findings, "verify.toml").status, Status::Ok(s) if s == "hook on blocking turn_end"),
+            "{:?}",
+            find(&findings, "verify.toml").status
+        );
+
+        // Approved, then rewritten without the word: a gate a human installed
+        // that no longer gates, which is the loop refusing every tool call.
+        write(gate.clone(), "event = \"turn_end\"\ncommand = \"/bin/echo\"\n");
+        match &find(&local_at(&root, &data), "verify.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("blocking turn_end"), "{reason}");
+                assert!(reason.contains("stop it gating"), "{reason}");
+                assert!(reason.contains("every tool call fails closed"), "{reason}");
+            }
+            other => panic!("a demoted turn_end gate must read as a live gate: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

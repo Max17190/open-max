@@ -1,8 +1,10 @@
 //! Process lifecycle hooks: optional external commands that gate or observe
 //! agent lifecycle events. `pre_tool_use` and `user_prompt_submit` can block
 //! (nonzero exit); `post_tool_use`, `session_start` (a session's first turn),
-//! `compaction` (context was pruned), and `turn_end` (stop reason; fires even
-//! on cancel) observe only. Empty discovery costs almost nothing (one
+//! and `compaction` (context was pruned) observe only. `turn_end` (stop
+//! reason; fires even on cancel) observes unless its approved bytes set
+//! `blocking`, in which case a nonzero exit sends the turn back to the model
+//! instead of ending it. Empty discovery costs almost nothing (one
 //! directory list). Hooks never change tool schemas and never inject text
 //! into the model.
 
@@ -27,6 +29,11 @@ pub(crate) const MAX_TIMEOUT_SECS: u64 = 60;
 /// unbounded set turns discovery mistakes into unbounded per-call latency.
 /// Stems sort deterministically; the head runs, --check names the rest.
 pub const MAX_HOOKS_PER_EVENT: usize = 32;
+/// Consecutive turn_end blocks one turn will honor before the harness
+/// overrides the hook and ends the turn `unverified`. A constant, not a
+/// setting: it is a safety floor, and a policy that needs it configurable is a
+/// policy that has already wedged.
+pub const MAX_TURN_END_CONTINUATIONS: usize = 8;
 const MAX_REASON_CHARS: usize = 500;
 /// How much tool output a `post_tool_use` hook is handed. Enough for an eval
 /// or telemetry hook to work with, small enough that copying it to every
@@ -97,6 +104,10 @@ pub struct HookSpec {
     /// When set, the hook only runs for this tool name.
     pub tool_filter: Option<String>,
     pub source_path: PathBuf,
+    /// Whether these bytes asked to gate an event that gates only on request.
+    /// Rejected outright on every event but `turn_end`, so nothing else can
+    /// carry it.
+    pub(crate) blocking: bool,
     /// The project-local files this hook hands to the host (its `command`,
     /// plus any `args` naming a file inside the project), each with the
     /// sha256 a human approved. Filled by the approval filter; re-checked
@@ -358,12 +369,12 @@ impl Hooks {
                 // gate: the conservative answer to a question we cannot ask.
                 let was_gate = approved.map(|a| a.is_gate()).unwrap_or(true);
                 if let Some(approved) = approved {
-                    if approved.is_gate() && !spec.event.is_gate() {
+                    if approved.is_gate() && !spec.gates() {
                         reason = format!(
                             "{}: an approved {} gate was rewritten as a {} hook, which would stop it gating",
                             spec.source_path.display(),
-                            approved.event(),
-                            spec.event.as_str()
+                            shape_name(approved.event(), approved.blocking()),
+                            shape_name(spec.event.as_str(), spec.blocking)
                         );
                     }
                 }
@@ -537,7 +548,7 @@ impl Hooks {
                     spec.event.as_str(),
                     spec.source_path.display()
                 );
-                if spec.event.is_gate() {
+                if spec.gates() {
                     not_running.push((spec.source_path.clone(), reason));
                 } else {
                     notices.push(notice(spec.source_path, spec.event.as_str(), reason));
@@ -791,32 +802,81 @@ impl Hooks {
         failures
     }
 
-    /// Run `turn_end` hooks with the turn's stop reason. Observe only, and
-    /// deliberately run with a fresh cancel token: a cancelled turn is still
-    /// a finished turn worth observing. Failures are returned.
+    /// Run `turn_end` hooks with the turn's stop reason. Deliberately run with
+    /// a fresh cancel token: a cancelled turn is still a finished turn worth
+    /// observing.
+    ///
+    /// Observe only unless a hook's approved bytes asked to block, and unless
+    /// the caller says this end attempt is one a refusal can change. The
+    /// asymmetry is the point: the hook always gets to speak, and only the
+    /// caller knows whether the turn has anything left to spend on doing what
+    /// it says.
     pub async fn turn_end(
         &self,
         session_id: &str,
         cwd: &Path,
         stop_reason: &str,
-    ) -> Vec<HookFailure> {
+        attempt: TurnEndAttempt,
+    ) -> TurnEndOutcome {
         let cancel = Arc::new(CancelToken::default());
-        let mut failures = Vec::new();
+        let mut outcome = TurnEndOutcome::default();
         for hook in &self.turn_end {
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
                 "session_id": session_id,
                 "cwd": cwd.display().to_string(),
                 "stop_reason": stop_reason,
+                "blockable": attempt.blockable && hook.gates(),
+                "continuation": attempt.continuation,
+                "continuations_left":
+                    MAX_TURN_END_CONTINUATIONS.saturating_sub(attempt.continuation),
             });
             match run_hook(hook, payload, cwd, &cancel).await {
                 HookRun::Allow => {}
-                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Block(reason) => {
+                    if !hook.gates() {
+                        outcome.failures.push(failure(hook, reason));
+                        continue;
+                    }
+                    if attempt.blockable {
+                        // The refusal is the turn's answer, so it stops here.
+                        // The hooks behind it run again on the next end
+                        // attempt, against the world this one produced.
+                        outcome.refusal = Some(reason);
+                        return outcome;
+                    }
+                    // Nothing left to honor it with, so it is reported like
+                    // any other failed run - and the caller still learns that
+                    // a gate said no, which is what ends the turn unverified.
+                    outcome.failures.push(failure(hook, reason.clone()));
+                    outcome.refusal.get_or_insert(reason);
+                }
                 HookRun::Cancelled => break,
             }
         }
-        failures
+        outcome
     }
+}
+
+/// Which end attempt a `turn_end` run is reporting on. Both numbers reach the
+/// hook, because a policy that keeps refusing has to be able to see itself
+/// approaching the harness override rather than discover it afterwards.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnEndAttempt {
+    /// Refusals this turn has already honored; 0 on the first end attempt.
+    pub continuation: usize,
+    /// Whether a nonzero exit will be honored this time.
+    pub blockable: bool,
+}
+
+/// What one `turn_end` run produced: the observe-only failures to report, and
+/// a gating hook's refusal when one refused. The refusal is reported whether
+/// or not it is honored, so a caller that cannot act on it can still say why
+/// the turn ended the way it did.
+#[derive(Debug, Default)]
+pub struct TurnEndOutcome {
+    pub failures: Vec<HookFailure>,
+    pub refusal: Option<String>,
 }
 
 /// Resolve a path for the repair comparison without requiring the file to
@@ -955,6 +1015,24 @@ impl HookSpec {
             Some(name) => name == tool,
         }
     }
+
+    /// Whether THIS hook gates. The event answers "is this event always a
+    /// gate" (two events, forever); a turn_end hook gates only when the
+    /// approved bytes said the word.
+    pub(crate) fn gates(&self) -> bool {
+        self.event.is_gate() || (self.event == HookEvent::TurnEnd && self.blocking)
+    }
+}
+
+/// How a hook shape reads in a diagnostic. `turn_end` gates only when its
+/// bytes ask to, so the word is part of the name there and a demotion message
+/// that dropped it would name two different shapes identically.
+pub(crate) fn shape_name(event: &str, blocking: bool) -> String {
+    if blocking {
+        format!("blocking {event}")
+    } else {
+        event.to_string()
+    }
 }
 
 enum HookRun {
@@ -977,6 +1055,11 @@ struct HookFile {
     /// Optional tool name filter.
     #[serde(default)]
     tool: Option<String>,
+    /// Opt-in for the one event that can gate either way. Explicit because a
+    /// hook that can end a turn is authority, and authority is never inferred
+    /// from an exit code a hook already had.
+    #[serde(default)]
+    blocking: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -1014,6 +1097,12 @@ pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, Str
     if command.is_empty() {
         return Err("command is empty".into());
     }
+    if file.blocking && event != HookEvent::TurnEnd {
+        return Err(format!(
+            "blocking is only meaningful on turn_end: '{}' either always gates (pre_tool_use, user_prompt_submit) or never does",
+            file.event.trim()
+        ));
+    }
     let tool_filter = file
         .tool
         .map(|t| t.trim().to_string())
@@ -1026,6 +1115,7 @@ pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, Str
         timeout_secs: file.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
         tool_filter,
         source_path: path.to_path_buf(),
+        blocking: file.blocking,
         // Filled by the approval filter, which is where the approved set is
         // known; a spec that never passed it runs nothing.
         bound_code: Vec::new(),
@@ -1397,6 +1487,139 @@ mod tests {
             hooks.pre_tool_use("s", "bash", &serde_json::json!({}), &tmp, &cancel).await,
             PreToolResult::Allow
         );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The same trick against the one event that gates by asking. A human
+    /// approved a `turn_end` hook with `blocking = true`, so it can refuse a
+    /// turn's completion; the agent deletes that one word. Nothing about the
+    /// event changed, so a check that only knows which events always gate sees
+    /// an observer becoming an observer and lets it go - and a gate a human
+    /// installed stops running. What decides is the approved shape, so it
+    /// fails closed like any other demoted gate.
+    #[tokio::test]
+    async fn an_approved_blocking_turn_end_rewritten_as_non_blocking_fails_closed() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp, "verify.sh", "#!/bin/sh\nexit 1\n");
+        let toml = hooks_dir.join("verify.toml");
+        let approved_body =
+            "event = \"turn_end\"\nblocking = true\ncommand = \"./verify.sh\"\n";
+        std::fs::write(&toml, approved_body).unwrap();
+        approve_hook_file(&tmp, &data, &toml);
+        assert_eq!(Hooks::discover(&tmp, &data).turn_end.len(), 1, "the approved gate is live");
+
+        // One word deleted: same event, same script, no gate.
+        std::fs::write(&toml, "event = \"turn_end\"\ncommand = \"./verify.sh\"\n").unwrap();
+        let hooks = Hooks::discover(&tmp, &data);
+        assert!(hooks.turn_end.is_empty(), "the rewritten content is not approved");
+        let cancel = Arc::new(CancelToken::default());
+        match hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("blocking turn_end"), "{reason}");
+                assert!(reason.contains("stop it gating"), "{reason}");
+                assert!(reason.contains("verify.toml"), "{reason}");
+            }
+            other => panic!("a demoted turn_end gate must fail closed: {other:?}"),
+        }
+
+        // A rewrite that keeps the word is still revoked (the bytes changed),
+        // but it is not a demotion, and saying so would misname what happened.
+        write_script(&tmp, "other.sh", "#!/bin/sh\nexit 1\n");
+        std::fs::write(
+            &toml,
+            "event = \"turn_end\"\nblocking = true\ncommand = \"./other.sh\"\n",
+        )
+        .unwrap();
+        match Hooks::discover(&tmp, &data)
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("content changed since it was approved"), "{reason}");
+                assert!(!reason.contains("stop it gating"), "still a gate: {reason}");
+            }
+            other => panic!("an edited gate must still fail closed: {other:?}"),
+        }
+
+        // Restoring the approved bytes restores the gate; nothing else does.
+        std::fs::write(&toml, approved_body).unwrap();
+        assert_eq!(Hooks::discover(&tmp, &data).turn_end.len(), 1);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// `blocking` is an answer to a question only `turn_end` asks. On an event
+    /// that always gates it would read as the thing that made it a gate, and
+    /// on an observer it would read as a gate that never fires; both are
+    /// authority a reader would believe. So it is a parse error, which is what
+    /// makes the flag mean exactly one thing wherever it appears.
+    #[test]
+    fn the_blocking_key_is_rejected_on_every_event_but_turn_end() {
+        let path = Path::new("/hooks/x.toml");
+        for event in ["pre_tool_use", "post_tool_use", "user_prompt_submit", "session_start", "compaction"] {
+            let text = format!("event = \"{event}\"\nblocking = true\ncommand = \"/bin/echo\"\n");
+            let err = parse_hook_source(path, &text).unwrap_err();
+            assert!(err.contains("only meaningful on turn_end"), "{event}: {err}");
+            assert!(err.contains(event), "the error must name the event: {err}");
+            // `blocking = false` says nothing that is not already true, so it
+            // is not worth refusing a file over.
+            let allowed = format!("event = \"{event}\"\nblocking = false\ncommand = \"/bin/echo\"\n");
+            let spec = parse_hook_source(path, &allowed).expect("false is not a claim");
+            assert!(!spec.blocking);
+        }
+        let spec = parse_hook_source(
+            path,
+            "event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\n",
+        )
+        .expect("turn_end is where the flag lives");
+        assert!(spec.blocking && spec.gates());
+        // And the default is the observer every turn_end hook already was.
+        let plain =
+            parse_hook_source(path, "event = \"turn_end\"\ncommand = \"/bin/echo\"\n").unwrap();
+        assert!(!plain.blocking && !plain.gates());
+    }
+
+    /// The cap is a latency bound, and for a gate it is also policy that is
+    /// not running. A blocking turn_end pushed past it is exactly that, so it
+    /// fails closed with the rest of them rather than becoming a notice
+    /// nobody has to act on.
+    #[tokio::test]
+    async fn a_blocking_turn_end_hook_counts_as_a_gate_for_the_per_event_cap() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for i in 0..(MAX_HOOKS_PER_EVENT + 1) {
+            let toml = hooks_dir.join(format!("end-{i:03}.toml"));
+            std::fs::write(
+                &toml,
+                "event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\n",
+            )
+            .unwrap();
+            approve_hook_file(&tmp, &data, &toml);
+        }
+
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(hooks.turn_end.len(), MAX_HOOKS_PER_EVENT, "the sorted head runs");
+        let cancel = Arc::new(CancelToken::default());
+        match hooks
+            .pre_tool_use("s", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await
+        {
+            PreToolResult::Block { reason } => {
+                assert!(reason.contains("cap"), "{reason}");
+                assert!(
+                    reason.contains(&format!("end-{:03}.toml", MAX_HOOKS_PER_EVENT)),
+                    "the dropped gate must be named: {reason}"
+                );
+            }
+            other => panic!("a blocking turn_end past the cap must fail closed: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2238,6 +2461,7 @@ tool = "bash"
             timeout_secs: 1,
             tool_filter: None,
             source_path: PathBuf::from("/hooks/audit.toml"),
+            blocking: false,
             bound_code: Vec::new(),
         };
         let payload = tool_payload(
@@ -2276,6 +2500,7 @@ tool = "bash"
             timeout_secs: 1,
             tool_filter: None,
             source_path: PathBuf::from("/hooks/audit.toml"),
+            blocking: false,
             bound_code: Vec::new(),
         };
         let payload = tool_payload(
@@ -2392,11 +2617,15 @@ tool = "bash"
         );
         let hooks = discover_for_test(&tmp);
         // turn_end uses its own fresh token, so a cancelled turn still fires.
-        hooks.turn_end("sess", &tmp, "cancelled").await;
+        hooks.turn_end("sess", &tmp, "cancelled", TurnEndAttempt::default()).await;
         let end: Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join("end.json")).unwrap()).unwrap();
         assert_eq!(end["event"], "turn_end");
         assert_eq!(end["stop_reason"], "cancelled");
+        // A cancelled turn is over, so nothing it reports can be refused.
+        assert_eq!(end["blockable"], false);
+        assert_eq!(end["continuation"], 0);
+        assert_eq!(end["continuations_left"], MAX_TURN_END_CONTINUATIONS);
     }
 
     #[tokio::test]

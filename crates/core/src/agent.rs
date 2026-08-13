@@ -22,7 +22,11 @@
 //!    spinner that never stops. A `user_prompt_submit` gate that denies or is
 //!    cancelled returns before the turn starts, so no title is written, no
 //!    `session_start` fires, and no `turn_end` fires either: there was no turn
-//!    to end.
+//!    to end. Exactly one of those exits can be refused: the model falling
+//!    silent, where an approved blocking `turn_end` hook sends its reason back
+//!    as a user message and the turn continues. The other exits are a budget
+//!    that ran out or a human who stopped the turn, and neither is a hook's to
+//!    overrule.
 //!
 //! Read-only calls batch and run concurrently; anything mutating serializes.
 //! Refreezing mid-turn is allowed between iterations but never inside one, so
@@ -1992,7 +1996,15 @@ async fn run_loop(
             report_hook_failures(
                 core,
                 session_id,
-                hooks.turn_end(session_id, project_root, "error").await,
+                hooks
+                    .turn_end(
+                        session_id,
+                        project_root,
+                        "error",
+                        crate::hooks::TurnEndAttempt::default(),
+                    )
+                    .await
+                    .failures,
             );
             core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
             return;
@@ -2017,6 +2029,14 @@ async fn run_loop(
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
+    // What every request of this turn has cost so far, and how many turn_end
+    // refusals the turn has already honored. Both are turn-scoped: a
+    // continuation is more of the same turn, so it spends the same budgets.
+    let mut spent_tokens: usize = 0;
+    let mut continuation: usize = 0;
+    // Set when the model-stopped break already ran the turn_end hooks, so the
+    // late call site does not run them a second time for one end.
+    let mut turn_end_fired = false;
     let mut repeat_tracker = RepeatCallTracker::new();
     // What this turn used, merged into the project usage file at turn end so
     // the agent (via openmax --spec usage) can prune its own toolbox.
@@ -2069,6 +2089,21 @@ async fn run_loop(
         }
         let used = schema_tokens
             + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        // The ceiling refuses the request it cannot afford, not just the one
+        // after it: what the turn has spent plus the request-side size of the
+        // one about to go out, the same number the budget event below reports.
+        // Checked after compaction so a prune gets its chance to shrink the
+        // request under the cap first, and never mid-stream: a request in
+        // flight is already paid for. The reply side is not reserved, so the
+        // last admitted request may run past the cap by at most `max_tokens`;
+        // a cap the first request cannot fit ends the turn before it spends
+        // anything.
+        if let Some(cap) = settings.max_agent_tokens {
+            if spent_tokens.saturating_add(used) > cap {
+                stop_reason = "budget_exhausted".into();
+                break 'turns;
+            }
+        }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
 
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
@@ -2116,6 +2151,23 @@ async fn run_loop(
                 cached_tokens: u.cached_tokens,
             });
         }
+
+        // Charge the turn for the request that just returned. A provider that
+        // reports nothing is charged the numbers this iteration already
+        // computed - the request-side estimate that fed the budget event, plus
+        // the reply it produced - so silence about usage cannot buy a turn an
+        // unbounded number of requests.
+        spent_tokens = spent_tokens.saturating_add(match result.usage {
+            Some(u) => u.prompt_tokens.saturating_add(u.completion_tokens) as usize,
+            None => used.saturating_add(estimate_tokens(
+                result.content.len()
+                    + result
+                        .tool_calls
+                        .iter()
+                        .map(|c| c.function.arguments.len())
+                        .sum::<usize>(),
+            )),
+        });
 
         // Prefer structured calls from the server; when there are none (or all
         // are broken), recover calls from raw markup in the content (see fallback.rs).
@@ -2169,7 +2221,46 @@ async fn run_loop(
             break 'turns;
         }
         if tool_calls.is_empty() {
+            // The one exit a hook may refuse. The model says it is done, so an
+            // approved blocking turn_end gets to check the world before that
+            // becomes the turn's answer; the hook verifies what is on disk,
+            // never the model's claim about it, which is why nothing about the
+            // reply is handed to it. Every other exit is a budget the turn has
+            // run out of or a human who stopped it, and neither is a hook's to
+            // overrule - which is also why the cancel check above comes first.
+            let blockable = continuation < crate::hooks::MAX_TURN_END_CONTINUATIONS;
+            let outcome = hooks
+                .turn_end(
+                    session_id,
+                    project_root,
+                    &result.finish_reason,
+                    crate::hooks::TurnEndAttempt { continuation, blockable },
+                )
+                .await;
+            report_hook_failures(core, session_id, outcome.failures);
+            if let Some(reason) = outcome.refusal {
+                if blockable {
+                    // The refusal reaches the model as the user speaking: it
+                    // is work to do, not a tool result, and there is no call
+                    // id to answer. On disk before the next request goes out,
+                    // the discipline a prune already follows (#172). The stop
+                    // reason is deliberately left alone: a refused end is not
+                    // an end, so a loop that runs out here says so.
+                    guard.messages().push(ChatMessage::user(reason));
+                    save_messages(core, session_id, guard.messages(), false).await;
+                    continuation += 1;
+                    continue 'turns;
+                }
+                // Past the cap the harness ends the turn itself and says so: a
+                // policy that cannot be satisfied in this many rounds has
+                // wedged, and the answer it kept refusing was never verified.
+                stop_reason = "unverified".into();
+                break 'turns;
+            }
             stop_reason = result.finish_reason;
+            // The consult IS this end's turn_end run, so the late site stays
+            // quiet: one end attempt, one fire.
+            turn_end_fired = true;
             break 'turns;
         }
 
@@ -2535,11 +2626,25 @@ async fn run_loop(
         let _ = crate::ledger::record_usage(&core.data_dir, project_root, &delta.ledger);
         crate::memory::record_accesses(project_root, &delta.memory);
     }
-    report_hook_failures(
-        core,
-        session_id,
-        hooks.turn_end(session_id, project_root, &stop_reason).await,
-    );
+    // Every exit that did not already consult fires here, exactly once, with
+    // the reason the turn is actually ending on. A refusal at this point has
+    // nothing left to spend on doing what it asks, so it is reported and the
+    // turn ends anyway.
+    if !turn_end_fired {
+        report_hook_failures(
+            core,
+            session_id,
+            hooks
+                .turn_end(
+                    session_id,
+                    project_root,
+                    &stop_reason,
+                    crate::hooks::TurnEndAttempt { continuation, blockable: false },
+                )
+                .await
+                .failures,
+        );
+    }
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
 }
 
@@ -4992,6 +5097,551 @@ mod tests {
                 .unwrap();
         assert_eq!(end["event"], "turn_end");
         assert_eq!(end["stop_reason"], "error");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A provider that answers every request with the same scripted stream and
+    /// counts what it was asked for. What ends these turns is the loop's own
+    /// accounting, which is the thing under test.
+    async fn counting_endpoint(sse: &str) -> (String, Arc<StdMutex<usize>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen = requests.clone();
+        let body = sse.to_string();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0u8; content_length];
+                if content_length > 0 && sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                *seen.lock().unwrap() += 1;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    /// One finished reply with no tool calls: the model saying it is done.
+    const STOP_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// One read-only tool call, so the loop keeps going until a budget stops it.
+    const TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    fn write_exec(path: &Path, body: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Drive one turn's events to its Done, collecting the hook failures the
+    /// frontend was told about along the way.
+    async fn drive_turn(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
+    ) -> (String, Vec<String>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut failures = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::HookFailed { detail, .. } => failures.push(detail),
+                    AgentEvent::Done { stop_reason } => return (stop_reason, failures),
+                    _ => {}
+                }
+            }
+        }
+        panic!("the turn never emitted Done");
+    }
+
+    /// The turn's transcript as it stands in memory after the turn.
+    async fn transcript(core: &Arc<Core>, id: &str) -> Vec<ChatMessage> {
+        core.sessions.lock().await.get(id).unwrap().messages.clone()
+    }
+
+    fn user_messages(messages: &[ChatMessage], needle: &str) -> usize {
+        messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| c.contains(needle)))
+            .count()
+    }
+
+    /// A turn is bounded by what it may spend as well as by how many steps it
+    /// may take. The ceiling is checked before each request, so it ends the
+    /// turn between steps rather than killing a stream that is already paid
+    /// for, and the reason says which bound was hit.
+    #[tokio::test]
+    async fn a_turn_that_exhausts_its_token_budget_stops_with_budget_exhausted() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        // Every reply costs the same 1500 the provider reports and the cap
+        // sits between one and two of those charges, so the second request is
+        // the one admission refuses: the 500 left cannot fit a request the
+        // loop estimates at well over that.
+        let sse = format!(
+            "{TOOL_SSE}data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1000,\"completion_tokens\":500}}}}\n\n"
+        );
+        let (base_url, requests) = counting_endpoint(&sse).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.max_agent_tokens = Some(2000);
+            s.max_agent_iterations = 10;
+        }
+
+        let id = "sess-budget";
+        start_turn(core.clone(), id.into(), project, "keep reading".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "budget_exhausted");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            1,
+            "the request that cannot fit is refused, not dispatched"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The ceiling cannot depend on the provider volunteering numbers: a
+    /// backend that reports no usage would otherwise buy an unbounded turn by
+    /// saying nothing. The loop already computes both sides of the request for
+    /// its own budget event, and those stand in.
+    #[tokio::test]
+    async fn a_provider_that_reports_no_usage_still_charges_the_token_budget() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        // No usage chunk at all: what a local backend without accounting sends.
+        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // Above one request's estimate and below two, so the fallback
+            // charge is what refuses the second request.
+            s.max_agent_tokens = Some(2000);
+            s.max_agent_iterations = 4;
+        }
+
+        let id = "sess-budget-silent";
+        start_turn(core.clone(), id.into(), project, "keep reading".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "budget_exhausted", "a silent provider is charged, not exempt");
+        assert_eq!(*requests.lock().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cap no request can fit buys nothing, not one request: the turn ends
+    /// loudly before spending, and exit 4 says why. Compaction ran first, so
+    /// this is the cap being infeasible, not the transcript being bloated.
+    #[tokio::test]
+    async fn a_cap_the_first_request_cannot_fit_spends_nothing() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // Below the frozen schemas alone, so no request can ever fit.
+            s.max_agent_tokens = Some(200);
+            s.max_agent_iterations = 4;
+        }
+
+        let id = "sess-budget-infeasible";
+        start_turn(core.clone(), id.into(), project, "hi".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "budget_exhausted");
+        assert_eq!(*requests.lock().unwrap(), 0, "an unaffordable request is never dispatched");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The completion contract: the model says it is done, an approved
+    /// blocking turn_end hook checks the world and disagrees, and its reason
+    /// goes back as a user message so the model can act on it. The turn
+    /// continues instead of ending on an answer nothing verified.
+    #[tokio::test]
+    async fn a_blocking_turn_end_hook_sends_its_reason_back_and_the_turn_continues() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("verify.sh");
+        // Refuses the first end attempt and passes the second, the shape a
+        // real check has once the agent has fixed what it named.
+        write_exec(
+            &script,
+            &format!(
+                "#!/bin/sh\nif [ -f {0}/passed ]; then exit 0; fi\n: > {0}/passed\necho 'the build does not compile yet'\nexit 1\n",
+                project.display()
+            ),
+        );
+        let toml = hooks_dir.join("verify.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+        }
+
+        let id = "sess-verify";
+        start_turn(core.clone(), id.into(), project.clone(), "ship it".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop", "the second end attempt was allowed");
+        assert_eq!(*requests.lock().unwrap(), 2, "the refusal bought one more request");
+        let messages = transcript(&core, id).await;
+        assert_eq!(
+            user_messages(&messages, "the build does not compile yet"),
+            1,
+            "the reason must reach the model as work to do: {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A hook that never accepts is a wedged turn, and a wedged turn spends
+    /// real money. The harness overrides it after a fixed number of honored
+    /// refusals and ends the turn `unverified`, which says exactly what
+    /// happened: the answer stands, and nothing checked it.
+    #[tokio::test]
+    async fn a_turn_end_gate_cannot_wedge_the_turn_past_the_continuation_cap() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("never.sh");
+        write_exec(&script, "#!/bin/sh\necho 'still not verified'\nexit 1\n");
+        let toml = hooks_dir.join("never.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // Higher than the continuation cap, so the cap is what stops this.
+            s.max_agent_iterations = 20;
+        }
+
+        let id = "sess-wedge";
+        start_turn(core.clone(), id.into(), project.clone(), "ship it".into()).unwrap();
+        let (stop, failures) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            crate::hooks::MAX_TURN_END_CONTINUATIONS + 1,
+            "one first attempt plus the honored refusals, and no more"
+        );
+        let messages = transcript(&core, id).await;
+        assert_eq!(
+            user_messages(&messages, "still not verified"),
+            crate::hooks::MAX_TURN_END_CONTINUATIONS,
+            "every honored refusal reaches the model exactly once"
+        );
+        assert!(
+            failures.iter().any(|d| d.contains("still not verified")),
+            "the override must say what it overrode: {failures:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A continuation is more of the same turn, so it re-enters the same
+    /// bounded loop and spends the same iteration budget. A hook that refuses
+    /// forever cannot buy a turn more steps than its settings allow.
+    #[tokio::test]
+    async fn blocked_continuations_spend_the_iteration_budget() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("never.sh");
+        write_exec(&script, "#!/bin/sh\necho 'still not verified'\nexit 1\n");
+        let toml = hooks_dir.join("never.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // Below the continuation cap, so the iteration budget binds first.
+            s.max_agent_iterations = 3;
+        }
+
+        let id = "sess-iterations";
+        start_turn(core.clone(), id.into(), project, "ship it".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "max_iterations", "a refused end is not an end");
+        assert_eq!(*requests.lock().unwrap(), 3, "three iterations, three requests");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Esc is a human ending the turn, and no policy outranks that. The hook
+    /// still fires, because a cancelled turn is a finished turn worth
+    /// observing, but its refusal buys nothing.
+    #[tokio::test]
+    async fn a_cancelled_turn_ignores_a_blocking_turn_end_verdict() {
+        use crate::state::Core;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("never.sh");
+        write_exec(&script, "#!/bin/sh\necho 'still not verified'\nexit 1\n");
+        let toml = hooks_dir.join("never.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        // A reply that arrives in two halves, so Esc lands while the stream is
+        // still open and the cancel is set well before the loop resolves it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0u8; content_length];
+                if content_length > 0 && sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                *seen.lock().unwrap() += 1;
+                let _ = sock
+                    .write_all(concat!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"thinking\"},\"finish_reason\":null}]}\n\n",
+                    ).as_bytes())
+                    .await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = sock
+                    .write_all(concat!(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    ).as_bytes())
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+        }
+
+        let id = "sess-cancel-verdict";
+        start_turn(core.clone(), id.into(), project, "ship it".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Token { .. } => core.cancel(id),
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("cancelled"));
+        assert_eq!(*requests.lock().unwrap(), 1, "a verdict must not restart a cancelled turn");
+        let messages = transcript(&core, id).await;
+        assert_eq!(
+            user_messages(&messages, "still not verified"),
+            0,
+            "nothing a hook says outranks Esc: {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One end attempt, one turn_end run. The consult that allows the end IS
+    /// that end's hook run, so an allowing hook must not see the turn end
+    /// twice - a hook that counts, bills, or posts would double every one.
+    #[tokio::test]
+    async fn a_turn_end_hook_fires_once_when_it_allows() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("count.sh");
+        let log = project.join("ends.jsonl");
+        write_exec(
+            &script,
+            &format!("#!/bin/sh\ncat >> {0}\necho >> {0}\n", log.display()),
+        );
+        let toml = hooks_dir.join("count.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+        }
+
+        let id = "sess-once";
+        start_turn(core.clone(), id.into(), project, "ship it".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(*requests.lock().unwrap(), 1);
+        let lines: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "one end, one fire: {lines:?}");
+        assert_eq!(lines[0]["stop_reason"], "stop");
+        assert_eq!(lines[0]["blockable"], true, "this is the attempt that could be refused");
+        assert_eq!(lines[0]["continuation"], 0);
+        assert_eq!(
+            lines[0]["continuations_left"],
+            crate::hooks::MAX_TURN_END_CONTINUATIONS
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

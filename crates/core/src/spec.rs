@@ -276,6 +276,8 @@ Fields:
 - `args` (optional): fixed argv strings.
 - `timeout_secs` (optional): default 10, clamped to 1..60.
 - `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
+- `blocking` (optional): `turn_end` only, default false. Rejected on every
+  other event, which either always gates or never does.
 
 Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
 call or the prompt. The block reason is the hook's stdout (or stderr if stdout
@@ -283,10 +285,25 @@ is empty), capped at 500 chars. A blocked tool call returns to the model as a
 failed tool result carrying the reason; a blocked prompt never reaches the
 model. A gate that times out or fails to start blocks.
 
-Observe events (`post_tool_use`, `session_start`, `compaction`, `turn_end`):
-exit status is ignored. `session_start` fires on a session's first turn;
-`compaction` fires after context was pruned; `turn_end` fires with the stop
-reason, even on cancel. Hooks never inject text into the model context.
+Observe events (`post_tool_use`, `session_start`, `compaction`, and `turn_end`
+without `blocking`): exit status is ignored. `session_start` fires on a
+session's first turn; `compaction` fires after context was pruned; `turn_end`
+fires with the stop reason, even on cancel. Hooks never inject text into the
+model context.
+
+Conditional gate (`turn_end` with `blocking = true`): a nonzero exit refuses
+the turn's completion. The reason is sent back as a user message and the turn
+continues from there, spending the same iteration and token budgets any other
+continuation would. Only one exit can be refused: the model falling silent
+with no tool calls, whatever `stop_reason` it carried. `max_iterations`,
+`budget_exhausted`, `cancelled`, `error`, and `truncated` still fire the hook,
+but there is nothing left to honor a refusal with, so it is reported and the
+turn ends. The payload says which case this is (`blockable`), how many
+refusals have already been honored (`continuation`), and how many are left
+(`continuations_left`). After 8 honored refusals the harness overrides the
+hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
+that, and on `max_iterations` and `budget_exhausted`. A blocking hook that
+times out or fails to start refuses, like any other gate.
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
@@ -308,7 +325,12 @@ Each run receives one JSON payload on stdin, as one newline-terminated line:
 - session_start: {"event", "session_id", "cwd"}
 - compaction: {"event", "session_id", "cwd", "record"} where `record` is the
   persisted compaction digest.
-- turn_end: {"event", "session_id", "cwd", "stop_reason"}
+- turn_end: {"event", "session_id", "cwd", "stop_reason", "blockable",
+  "continuation", "continuations_left"} where `blockable` says whether a
+  nonzero exit will be honored this time, `continuation` counts the refusals
+  already honored in this turn (0 on the first end attempt), and
+  `continuations_left` is what remains before the harness overrides the hook.
+  A hook without `blocking` always sees `blockable` false.
 
 Approval: a hook is inert until a human approves its exact content - the
 `.toml` *and* the project-local file its `command` (or a path in `args`) names,
@@ -329,14 +351,17 @@ Fail closed, four ways, all reported by `openmax --check`:
   fixed or removed (a broken file might have been a gate), unless a valid
   project file shadows its stem - or unless no human ever approved that path,
   in which case it never ran and stays inert instead.
-- A gate hook (`pre_tool_use`, `user_prompt_submit`) whose path was approved
-  and whose content no longer is blocks every tool until the approved content
-  is restored or a human re-approves it. Editing a live gate cannot turn it
-  off, and that includes a comment-only edit or a rewritten script. Whether a
-  modified hook counts as a gate is decided by the `event` a human approved,
-  never by the `event` the current file declares: rewriting an approved
-  `pre_tool_use` gate into an observe hook would otherwise stop it gating, so
-  it reads as a demoted gate and still fails closed. The repair carve-out is
+- A gate hook (`pre_tool_use`, `user_prompt_submit`, or a `turn_end` a human
+  approved with `blocking = true`) whose path was approved and whose content no
+  longer is blocks every tool until the approved content is restored or a human
+  re-approves it. Editing a live gate cannot turn it off, and that includes a
+  comment-only edit or a rewritten script. Whether a modified hook counts as a
+  gate is decided by the shape a human approved, never by what the current file
+  declares: rewriting an approved `pre_tool_use` gate into an observe hook, or
+  dropping `blocking` from an approved `turn_end` gate, would otherwise stop it
+  gating, so it reads as a demoted gate and still fails closed. A record
+  written before `blocking` existed is read as the observer a human approved,
+  so no upgrade promotes an old `turn_end` hook into a gate. The repair carve-out is
   scoped the same way, to the manifest plus the code the *approved* content
   named, so a rewritten hook cannot hand itself an exemption for a new path.
 - A hook file a human approved that is *deleted* blocks every tool the same
@@ -913,7 +938,13 @@ mod tests {
             ("user_prompt_submit", vec!["event", "session_id", "cwd", "text"]),
             ("session_start", vec!["event", "session_id", "cwd"]),
             ("compaction", vec!["event", "session_id", "cwd", "record"]),
-            ("turn_end", vec!["event", "session_id", "cwd", "stop_reason"]),
+            (
+                "turn_end",
+                vec![
+                    "event", "session_id", "cwd", "stop_reason", "blockable", "continuation",
+                    "continuations_left",
+                ],
+            ),
         ];
         for (marker, fields) in cases {
             let payload = payload_of(marker);
