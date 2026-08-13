@@ -41,7 +41,7 @@ const ACCESS_LOG: &str = ".access.jsonl";
 /// on demand via read_file.
 pub const MAX_MEMORY_BYTES: usize = 1_500;
 /// One line per memory: past this the first line is a summary, not an essay.
-const MAX_DESCRIPTION_CHARS: usize = 160;
+pub(crate) const MAX_DESCRIPTION_CHARS: usize = 160;
 /// Names are slugs so index lines, log lines, and paths stay unambiguous.
 const MAX_NAME_CHARS: usize = 64;
 
@@ -89,6 +89,16 @@ pub struct MemoryEntry {
     pub last_event_hours: u64,
     /// True when the entry made it into the injected index.
     pub in_index: bool,
+}
+
+impl MemoryEntry {
+    /// True when the first line was longer than the index cap, so the line a
+    /// future session reads is a cut of what the author wrote. Read off the
+    /// description the scan already built (past the cap it is exactly the cap
+    /// plus the ellipsis), never a second read of the file.
+    pub fn description_clipped(&self) -> bool {
+        self.description.chars().count() > MAX_DESCRIPTION_CHARS
+    }
 }
 
 #[derive(Clone, Debug, Default)]

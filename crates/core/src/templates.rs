@@ -132,6 +132,13 @@ pub(crate) fn parse_template(path: &Path) -> Result<TemplateSpec, String> {
         ));
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    // A block that opens with `---` and never closes is refused by name, the
+    // way SKILL.md refuses it: the fence and every key under it would
+    // otherwise be expanded into the user's message as body text, which is
+    // exactly what the author meant them not to be.
+    if text.starts_with("---") && frontmatter_end(&text).is_none() {
+        return Err("frontmatter never closes with `---`".into());
+    }
     if body_of(&text).trim().is_empty() {
         return Err("template body is empty".into());
     }
@@ -143,17 +150,23 @@ pub(crate) fn parse_template(path: &Path) -> Result<TemplateSpec, String> {
     Ok(TemplateSpec { name, description, path: path.to_path_buf() })
 }
 
+/// Offset of the closing `---` within the text that follows the opening one,
+/// or None when there is no frontmatter block to speak of.
+fn frontmatter_end(text: &str) -> Option<usize> {
+    text.strip_prefix("---")?.find("\n---")
+}
+
 /// The template body: everything after an optional `---` frontmatter block.
 fn body_of(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("---") else { return text };
-    let Some(end) = rest.find("\n---") else { return text };
+    let Some(end) = frontmatter_end(text) else { return text };
     let after = &rest[end + 4..];
     after.strip_prefix('\n').unwrap_or(after)
 }
 
 fn frontmatter_description(text: &str) -> Option<String> {
     let rest = text.strip_prefix("---")?;
-    let end = rest.find("\n---")?;
+    let end = frontmatter_end(text)?;
     for line in rest[..end].lines() {
         if let Some(v) = line.trim().strip_prefix("description:") {
             return Some(v.trim().trim_matches('"').replace(['\n', '\r'], " "));
@@ -337,6 +350,28 @@ mod tests {
         assert_eq!(discovered.len(), MAX_TEMPLATES);
         assert!(!discovered.iter().any(|t| t.name == "zzz-omx-tail"), "sorted past the cap");
         assert_eq!(expand_invocation(&data, &root, "zzz-omx-tail hello").unwrap(), "Tail says hello.\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An opening `---` with no closing one is the same authoring mistake
+    /// SKILL.md names, and it is worse here: the fence and the `description:`
+    /// line would be sent to the model as part of the user's message. Refuse
+    /// the file instead, so discovery drops it and `--check` can say why.
+    #[test]
+    fn unclosed_frontmatter_is_rejected() {
+        let root = temp_dir("unclosed");
+        write_template(&root, "half-open", "---\ndescription: d\nDo the thing.\n");
+        write_template(&root, "closed", "---\ndescription: d\n---\nDo the thing.\n");
+        match parse_template(&root.join("half-open.md")) {
+            Err(reason) => assert_eq!(reason, "frontmatter never closes with `---`"),
+            Ok(spec) => panic!("frontmatter that never closes must not parse: {spec:?}"),
+        }
+        let discovered = discover_in(std::slice::from_ref(&root));
+        assert_eq!(discovered.len(), 1, "only the closed one is a template");
+        assert_eq!(discovered[0].name, "closed");
+        // A body that merely contains `---` later is not frontmatter at all.
+        write_template(&root, "ruled", "Section one.\n\n---\n\nSection two.\n");
+        assert_eq!(parse_template(&root.join("ruled.md")).unwrap().name, "ruled");
         let _ = std::fs::remove_dir_all(root);
     }
 

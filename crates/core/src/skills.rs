@@ -79,23 +79,35 @@ pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, S
         .find("\n---")
         .ok_or("frontmatter never closes with `---`")?;
     let mut name = None;
-    let mut description = None;
     for line in body[..end].lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("name:") {
+        if let Some(v) = line.trim().strip_prefix("name:") {
             name = Some(v.trim().trim_matches('"').to_string());
-        } else if let Some(v) = line.strip_prefix("description:") {
-            description = Some(v.trim().trim_matches('"').to_string());
         }
     }
     let name = name
         .filter(|n| !n.is_empty())
         .ok_or("frontmatter has no non-empty `name:`")?;
-    let mut description = description.unwrap_or_default().replace(['\n', '\r'], " ");
+    let mut description = raw_description(text).unwrap_or_default();
     if description.chars().count() > MAX_SKILL_DESC_CHARS {
         description = description.chars().take(MAX_SKILL_DESC_CHARS).collect::<String>() + "…";
     }
     Ok(SkillSpec { name, description, path: path.to_path_buf() })
+}
+
+/// The `description:` exactly as the frontmatter wrote it, before the index
+/// cap clamps it. `openmax --check` reads it from the same bytes the parse
+/// used, so a report can say the written line is longer than the indexed one
+/// without a second read of the file.
+pub(crate) fn raw_description(text: &str) -> Option<String> {
+    let body = text.strip_prefix("---")?;
+    let end = body.find("\n---")?;
+    let mut description = None;
+    for line in body[..end].lines() {
+        if let Some(v) = line.trim().strip_prefix("description:") {
+            description = Some(v.trim().trim_matches('"').replace(['\n', '\r'], " "));
+        }
+    }
+    description
 }
 
 #[cfg(test)]

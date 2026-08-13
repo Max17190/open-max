@@ -230,7 +230,8 @@ the user's slash command `/<name>` and must be 1-64 chars of [a-zA-Z0-9_-].
 
 Structure: an optional `---` frontmatter block with a one-line `description:`
 (shown in the completion popup, capped at 200 chars), then the body. An empty
-body is invalid.
+body is invalid, and so is a block that opens with `---` and never closes with
+`---` (the fence and its keys would otherwise expand as message text).
 
 Substitution when the user runs `/<name> args...`:
 - `$ARGUMENTS` expands to the raw argument string.
