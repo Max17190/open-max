@@ -241,3 +241,79 @@ async fn a_deny_live_at_turn_start_survives_its_own_removal_for_the_turn() {
     assert!(!ok, "the rm call must still be refused, got: {output}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deny_added_mid_turn_survives_its_removal_for_the_turn() {
+    // The ratchet covers every snapshot the turn observed, not only the
+    // turn-start one: a deny that appeared mid-turn (a human editing the
+    // file while the agent runs) must not vanish because a later mutation
+    // rewrote the file without it.
+    let dir = std::env::temp_dir().join(format!("omx-midturn-ratchet-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join("reports")).unwrap();
+    std::fs::write(project.join("reports/q0.md"), "# deliverable\n").unwrap();
+    let project = project.canonicalize().unwrap();
+
+    // The turn starts with no policy at all; the script installs a deny,
+    // removes it again, then runs the command the mid-turn deny named.
+    let rule = "[[rules]]\neffect = \"deny\"\ntool = \"bash\"\narg_regex = \"rm\\\\s+.*reports\"\n";
+    let base_url = scripted_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/permissions.toml", "content": rule }),
+        ),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/permissions.toml", "content": "" }),
+        ),
+        completion_with_tool_call("bash", serde_json::json!({ "command": "rm -rf reports" })),
+        completion_with_text("done"),
+    ])
+    .await;
+
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("settings.json"),
+        serde_json::json!({
+            "base_url": base_url,
+            "model": "scripted",
+            "approval_mode": "auto",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("trust.json"),
+        serde_json::json!({ "version": 1, "projects": [project.to_string_lossy()] }).to_string(),
+    )
+    .unwrap();
+
+    let (core, mut rx) = Core::new(data).unwrap();
+    start_turn(Arc::clone(&core), "ratchet-test".into(), PathBuf::from(&project), "go".into())
+        .unwrap();
+    let mut bash_outputs = Vec::new();
+    loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("turn finishes within 30s")
+            .expect("event channel stays open");
+        match envelope.event {
+            AgentEvent::ToolEnd { ok, output, call_id } => {
+                if call_id == "call-bash" {
+                    bash_outputs.push((ok, output));
+                }
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        project.join("reports/q0.md").exists(),
+        "a deny observed mid-turn must survive its removal until the turn ends"
+    );
+    let (ok, output) = bash_outputs.first().expect("the scripted rm call ran through the gate");
+    assert!(!ok, "the rm call must still be refused, got: {output}");
+    let _ = std::fs::remove_dir_all(dir);
+}
