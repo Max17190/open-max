@@ -34,6 +34,10 @@ pub const MAX_EXTERNAL_PARAMS_BYTES: usize = 4_096;
 /// External-tool cap, mirroring `skills::MAX_SKILLS`: the sorted head loads,
 /// the rest is counted, reported by the prompt trailer, and named by --check.
 pub const MAX_EXTERNAL_TOOLS: usize = 64;
+/// The range a `timeout_secs` is clamped into. Named so --check can quote the
+/// bounds it warns against instead of restating them.
+pub(crate) const MIN_TIMEOUT_SECS: u64 = 1;
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Clone, Debug)]
 pub enum ToolKind {
@@ -639,7 +643,7 @@ pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, Str
             example,
             command: file.command.trim().to_string(),
             args: file.args,
-            timeout_secs: file.timeout_secs.clamp(1, 300),
+            timeout_secs: file.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
             source_path: path.to_path_buf(),
         }),
     })

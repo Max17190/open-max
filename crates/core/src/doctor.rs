@@ -76,6 +76,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     #[allow(unused_assignments)]
     let mut external_names: Vec<String> = Vec::new();
     let mut tool_meta: Vec<(String, PathBuf)> = Vec::new();
+    let mut tool_extras: Vec<Finding> = Vec::new();
     for dir in crate::registry::external_tool_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "toml") {
             let parsed = crate::registry::parse_tool_file(&path);
@@ -88,6 +89,18 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     id = Some(spec.name.clone());
                     external_names.push(spec.name.clone());
                     tool_meta.push((spec.name.clone(), path.clone()));
+                    if let Some(reason) = clamped_timeout_reason(
+                        &path,
+                        "tool",
+                        crate::registry::MIN_TIMEOUT_SECS,
+                        crate::registry::MAX_TIMEOUT_SECS,
+                    ) {
+                        tool_extras.push(Finding {
+                            kind: "tool",
+                            path: path.clone(),
+                            status: Status::Warn(reason),
+                        });
+                    }
                     let external = match &spec.kind {
                         crate::registry::ToolKind::External(ext) => Some(ext.clone()),
                         crate::registry::ToolKind::Builtin => None,
@@ -141,6 +154,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         .filter_map(|(_, id)| id.clone())
         .collect();
     findings.extend(tools_found.into_iter().map(|(f, _)| f));
+    findings.extend(tool_extras);
 
     let mut skills_found: Vec<Entry> = Vec::new();
     let mut skill_meta: Vec<(String, String, PathBuf)> = Vec::new();
@@ -270,6 +284,23 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             });
                         }
                     }
+                    if let Some(mut reason) = clamped_timeout_reason(
+                        &path,
+                        "hook",
+                        crate::hooks::MIN_TIMEOUT_SECS,
+                        crate::hooks::MAX_TIMEOUT_SECS,
+                    ) {
+                        // A gate that times out blocks, so the clamp decides
+                        // when this file starts refusing calls.
+                        if h.event.is_gate() {
+                            reason.push_str("; a gate that times out blocks");
+                        }
+                        hook_extras.push(Finding {
+                            kind: "hook",
+                            path: path.clone(),
+                            status: Status::Warn(reason),
+                        });
+                    }
                     hook_events.push(Some(h.event.as_str()));
                     // Hooks run with host authority and no per-call gate, so
                     // content no human approved - the file or the code it runs
@@ -306,14 +337,34 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                     );
                                 }
                             }
+                            // A live gate is judged on its own state first:
+                            // the session is refusing every tool call, and
+                            // `reason` already names the file that is missing
+                            // when that is what revoked it.
                             if was_live && was_gate {
                                 Status::Err(format!(
                                     "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
                                     path.display()
                                 ))
-                            } else {
+                            } else if let Some(missing) =
+                                missing_command_reason(&h.command, project_root)
+                            {
+                                // `openmax --approve` refuses a manifest whose
+                                // code cannot be read, so prescribing it here
+                                // sends a human to a command that answers with
+                                // this instead. Nothing can approve a hook
+                                // that has no code yet.
                                 Status::Err(format!(
-                                    "inert because {reason}: a human must approve this exact content with `openmax --approve {}` (an in-session write approval also counts)",
+                                    "inert because {missing}: create it, then approve the hook and the code it runs together with `openmax --approve {}`",
+                                    path.display()
+                                ))
+                            } else {
+                                // Only `openmax --approve`, from outside a
+                                // session, activates a hook: the in-session
+                                // write card shows a clipped preview, and a
+                                // preview is not shown bytes.
+                                Status::Err(format!(
+                                    "inert because {reason}: a human must approve this exact content with `openmax --approve {}`, run outside a session (an in-session write approval approves the write and nothing more)",
                                     path.display()
                                 ))
                             }
@@ -1029,6 +1080,29 @@ fn missing_command_reason(command: &str, project_root: &Path) -> Option<String> 
         std::env::split_paths(&paths).any(|dir| dir.join(command).is_file())
     });
     (!found).then(|| format!("command '{command}' is not on PATH"))
+}
+
+/// Why the `timeout_secs` this file asks for is not the one it gets, if it is
+/// not. Both loaders clamp out-of-range values and say nothing, which for a
+/// gate is a policy change rather than a detail: a gate that times out blocks,
+/// so an author who wrote 600 is enforcing a 60-second budget. The raw value
+/// is re-read here because the parsed spec only carries the clamped one, and
+/// what a human has to be told is the number they wrote.
+fn clamped_timeout_reason(path: &Path, what: &str, min: u64, max: u64) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let written = toml::from_str::<toml::Value>(&text)
+        .ok()?
+        .as_table()?
+        .get("timeout_secs")?
+        .as_integer()?;
+    // A value outside i64, or below zero, never parses into the spec at all,
+    // so anything reaching here is a number the loader accepted and clamped.
+    let effective = written.clamp(min as i64, max as i64);
+    (written != effective).then(|| {
+        format!(
+            "timeout_secs = {written} is outside the documented {min}..{max} range, so this {what} is clamped to {effective} seconds, not {written}"
+        )
+    })
 }
 
 /// Mark files a loader never reaches because another file claims the same
@@ -2096,6 +2170,127 @@ mod tests {
         assert!(matches!(real.status, Status::Ok(_)), "{:?}", real.status);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Findings for files under this project, for the tests that pass an
+    /// explicit data dir: `$HOME/.openmax/hooks` is a real directory on a
+    /// developer's machine and its files are not part of any assertion here.
+    fn local_at(root: &Path, data: &Path) -> Vec<Finding> {
+        check_at(root, data).into_iter().filter(|f| f.path.starts_with(root)).collect()
+    }
+
+    /// Only `openmax --approve`, run outside a session, activates a hook:
+    /// `retain_approved` drops everything else, and the in-session write card
+    /// shows a preview rather than the bytes. Offering that write approval as
+    /// an alternative would send a human to an act that leaves the hook inert.
+    #[test]
+    fn an_unapproved_hook_names_the_only_approval_that_activates_it() {
+        let root = temp_project();
+        let data = root.join("data");
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+        );
+
+        let findings = local_at(&root, &data);
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("openmax --approve"), "{reason}");
+                assert!(reason.contains("run outside a session"), "{reason}");
+                assert!(
+                    reason.contains("approves the write and nothing more"),
+                    "an in-session write approval never activates a hook: {reason}"
+                );
+            }
+            other => panic!("an unapproved hook must read as inert: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A hook whose command does not exist cannot be approved at all:
+    /// `openmax --approve` refuses a manifest whose code it cannot read. So
+    /// the report has to name the missing file, or it prescribes the one
+    /// command that answers with a different diagnosis.
+    #[test]
+    fn a_hook_whose_command_is_missing_says_so_instead_of_prescribing_approval() {
+        let root = temp_project();
+        let data = root.join("data");
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n",
+        );
+        // The premise: there are no bytes to bless, which is exactly what
+        // `--approve` refuses on.
+        assert!(
+            crate::ledger::bound_code("./gate.sh", &[], &root)
+                .iter()
+                .any(|c| c.sha256.is_none()),
+            "a command that does not exist must bind no approvable code"
+        );
+
+        let findings = local_at(&root, &data);
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(reason.contains("./gate.sh"), "{reason}");
+                assert!(reason.contains("does not exist from the project root"), "{reason}");
+                assert!(reason.contains("create it"), "{reason}");
+                assert!(
+                    !reason.contains("its content is not approved"),
+                    "approval is not the missing step here: {reason}"
+                );
+            }
+            other => panic!("a hook with no code must name the missing file: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Both loaders clamp `timeout_secs` silently, and for a gate the clamp is
+    /// policy: it decides when the hook starts blocking calls. A report that
+    /// says "ok" leaves the author believing the budget they wrote.
+    #[test]
+    fn a_timeout_outside_the_documented_range_is_reported_not_silently_clamped() {
+        let root = temp_project();
+        let data = root.join("data");
+        write(
+            root.join(".openmax/tools/slow.toml"),
+            "name = \"slow\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\ntimeout_secs = 600\n",
+        );
+        write(
+            root.join(".openmax/hooks/gate.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n",
+        );
+        write(
+            root.join(".openmax/hooks/watch.toml"),
+            "event = \"turn_end\"\ncommand = \"/bin/echo\"\ntimeout_secs = 5\n",
+        );
+
+        let findings = local_at(&root, &data);
+        let clamped = |needle: &str| {
+            findings.iter().find(|f| {
+                f.path.to_string_lossy().contains(needle)
+                    && f.status.summary().contains("timeout_secs")
+            })
+        };
+        match clamped("slow.toml").map(|f| &f.status) {
+            Some(Status::Warn(reason)) => {
+                assert!(reason.contains("timeout_secs = 600"), "{reason}");
+                assert!(reason.contains("1..300"), "{reason}");
+                assert!(reason.contains("clamped to 300 seconds"), "{reason}");
+            }
+            other => panic!("a tool's clamped timeout must be reported: {other:?}"),
+        }
+        match clamped("gate.toml").map(|f| &f.status) {
+            Some(Status::Warn(reason)) => {
+                assert!(reason.contains("timeout_secs = 600"), "{reason}");
+                assert!(reason.contains("1..60"), "{reason}");
+                assert!(reason.contains("clamped to 60 seconds"), "{reason}");
+                assert!(reason.contains("a gate that times out blocks"), "{reason}");
+            }
+            other => panic!("a gate's clamped timeout must be reported: {other:?}"),
+        }
+        // A value the loader honours is not worth a line.
+        assert!(clamped("watch.toml").is_none(), "{findings:?}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
