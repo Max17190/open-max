@@ -1925,9 +1925,12 @@ async fn run_loop(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
-    // Discovered once per turn start; empty dirs/files are a cheap no-op.
-    // Permissions never enter the prompt, so reloading next turn is fine.
-    let permissions = Permissions::discover(project_root, &core.data_dir);
+    // Discovered at turn start and re-discovered after any iteration whose
+    // mutating call succeeded: a deny the agent just wrote must be in force
+    // before its next step, or "install the guard, then prove it" runs the
+    // proof unguarded. Permissions never enter the prompt, so a reload costs
+    // one small file parse and no cache.
+    let mut permissions = Permissions::discover(project_root, &core.data_dir);
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
@@ -2430,7 +2433,14 @@ async fn run_loop(
         // next model request, so a tool the agent writes in iteration N is
         // callable in iteration N+1 without ending the turn. One deliberate
         // prompt-cache re-prefill, and only when extension bytes actually
-        // changed; hooks and permissions keep their per-turn discovery.
+        // changed; hooks keep their per-turn discovery, because an
+        // agent-written hook is inert until a human approves it anyway.
+        // Permissions reload below on the same trigger: `deny`/`ask` only add
+        // friction and unapproved `allow` rules are dropped at load, so
+        // applying an edit mid-turn can narrow but never widen.
+        if extensions_touched {
+            permissions = Permissions::discover(project_root, &core.data_dir);
+        }
         let refrozen = extensions_touched
             && refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
                 .await;
