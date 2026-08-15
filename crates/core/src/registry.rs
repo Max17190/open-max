@@ -38,6 +38,10 @@ pub const MAX_EXTERNAL_TOOLS: usize = 64;
 /// bounds it warns against instead of restating them.
 pub(crate) const MIN_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 300;
+/// Cap on env var names one tool manifest may forward. Sixteen is far past
+/// any observed need; the cap exists so a manifest cannot smuggle an
+/// unreviewably long grant list past the human reading the approval.
+pub(crate) const MAX_ENV_NAMES: usize = 16;
 
 #[derive(Clone, Debug)]
 pub enum ToolKind {
@@ -57,6 +61,10 @@ pub struct ExternalTool {
     pub example: Option<ToolExample>,
     pub command: String,
     pub args: Vec<String>,
+    /// Env var names forwarded from the parent environment; everything else
+    /// is scrubbed. Empty = the baseline only. The manifest is the approval
+    /// unit, so this list is part of what the human blesses.
+    pub env: Vec<String>,
     pub timeout_secs: u64,
     /// Where the definition came from, for actionable error messages.
     pub source_path: PathBuf,
@@ -488,7 +496,14 @@ pub struct RegistryManifest {
 /// as absent (fail closed on unknown future formats): the session falls back
 /// to built-ins and the next turn re-freezes cleanly from disk, instead of
 /// deserializing a newer format into the wrong shape.
-pub const MANIFEST_VERSION: u32 = 2;
+///
+/// v3: external tools carry an `env` allowlist. A v2 manifest has no such
+/// field, and defaulting it to empty would resume a credential-dependent
+/// tool with a scrubbed environment while the fingerprint still matched
+/// disk (no refreeze to repair it). Bumping the version makes v2 read as
+/// absent, so the session re-freezes from disk once and picks up the real
+/// grant - the same forward-only migration this constant already promises.
+pub const MANIFEST_VERSION: u32 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
@@ -502,6 +517,12 @@ pub struct ExternalToolManifest {
     pub mutating: bool,
     pub command: String,
     pub args: Vec<String>,
+    /// Env var names forwarded to the tool. Present in every v3 manifest;
+    /// the serde default only guards a hand-edited file, because v2
+    /// manifests (which lack it) never reach this deserializer - the
+    /// version gate reads them as absent so the session refreezes from disk.
+    #[serde(default)]
+    pub env: Vec<String>,
     pub timeout_secs: u64,
     pub source_path: PathBuf,
 }
@@ -521,6 +542,7 @@ impl Registry {
                     mutating: spec.mutating,
                     command: t.command.clone(),
                     args: t.args.clone(),
+                    env: t.env.clone(),
                     timeout_secs: t.timeout_secs,
                     source_path: t.source_path.clone(),
                 }),
@@ -550,6 +572,7 @@ impl Registry {
                     example: None,
                     command: t.command,
                     args: t.args,
+                    env: t.env,
                     timeout_secs: t.timeout_secs,
                     source_path: t.source_path,
                 }),
@@ -638,6 +661,11 @@ struct ExternalToolFile {
     timeout_secs: u64,
     #[serde(default)]
     mutating: bool,
+    /// Environment variable NAMES this tool receives from the parent
+    /// environment, on top of the scrubbed baseline. Part of the manifest,
+    /// so the credential grant is inside the bytes a human approves.
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -765,6 +793,22 @@ pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, Str
         Some(_) => return Err("params must be a JSON-schema object".into()),
         None => serde_json::json!({ "type": "object", "properties": {} }),
     };
+    if file.env.len() > MAX_ENV_NAMES {
+        return Err(format!(
+            "env lists {} variables; at most {MAX_ENV_NAMES} may be declared",
+            file.env.len()
+        ));
+    }
+    for var in &file.env {
+        let ok = !var.is_empty()
+            && var.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ok {
+            return Err(format!(
+                "invalid env var name '{var}': [A-Za-z_][A-Za-z0-9_]* required"
+            ));
+        }
+    }
     Ok(ToolSpec {
         name,
         description,
@@ -775,6 +819,7 @@ pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, Str
             example,
             command: file.command.trim().to_string(),
             args: file.args,
+            env: file.env,
             timeout_secs: file.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
             source_path: path.to_path_buf(),
         }),
@@ -838,6 +883,7 @@ async fn spawn_external(
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
         sandbox,
+        env_allowlist: Some(tool.env.clone()),
     };
 
     match execution::run_process(request, cancel).await {
@@ -1150,6 +1196,64 @@ mod tests {
             "a broken override under a different filename must still withhold the fallback"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The env allowlist is enforced at spawn: declared names arrive,
+    /// undeclared parent env - API keys included - does not. Both variables
+    /// are set on the test process, so the only difference is the manifest.
+    #[tokio::test]
+    async fn an_external_tool_receives_only_its_declared_env() {
+        let dir = std::env::temp_dir().join(format!("openmax-envtool-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/envcheck.toml"),
+            "name = \"envcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '%s|%s' \\\"$OPENMAX_TEST_KEEP\\\" \\\"$OPENMAX_TEST_DROP\\\"\"]\nenv = [\"OPENMAX_TEST_KEEP\"]\n",
+        )
+        .unwrap();
+        std::env::set_var("OPENMAX_TEST_KEEP", "kept");
+        std::env::set_var("OPENMAX_TEST_DROP", "leaked");
+        let registry = Registry::build(&dir.join("data"), &project);
+        let out = registry
+            .execute(
+                "envcheck",
+                &serde_json::json!({}),
+                &dir.join("data"),
+                &project,
+                tools::OutputCaps::default(),
+                Arc::new(CancelToken::default()),
+            )
+            .await;
+        std::env::remove_var("OPENMAX_TEST_KEEP");
+        std::env::remove_var("OPENMAX_TEST_DROP");
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.trim(), "kept|", "declared env arrives; the rest is scrubbed");
+    }
+
+    #[test]
+    fn env_names_are_validated_and_capped() {
+        let path = Path::new("/p/.openmax/tools/t.toml");
+        let bad = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nenv = [\"BAD-NAME\"]\n";
+        let err = parse_tool_source(path, bad).unwrap_err();
+        assert!(err.contains("invalid env var name"), "{err}");
+        let many: Vec<String> = (0..17).map(|i| format!("\"VAR_{i}\"")).collect();
+        let over = format!(
+            "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nenv = [{}]\n",
+            many.join(", ")
+        );
+        let err = parse_tool_source(path, &over).unwrap_err();
+        assert!(err.contains("at most 16"), "{err}");
+        // The list round-trips through the frozen manifest so a resumed
+        // session keeps the same grant.
+        let good = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nenv = [\"GITHUB_TOKEN\"]\n";
+        let spec = parse_tool_source(path, good).unwrap();
+        let registry = Registry::assemble(vec![spec], Vec::new());
+        let manifest = registry.to_manifest();
+        let restored = Registry::from_manifest(manifest);
+        match &restored.get("t").unwrap().kind {
+            ToolKind::External(t) => assert_eq!(t.env, vec!["GITHUB_TOKEN"]),
+            ToolKind::Builtin => panic!("external expected"),
+        }
     }
 
     #[test]

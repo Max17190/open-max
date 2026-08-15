@@ -125,3 +125,34 @@ openmax --trust-project --stdio
 Trust is persisted for the exact canonical path in `~/.openmax/trust.json`. It
 authorizes the harness to run in that project; it does not sandbox project
 code.
+
+## Hardened profile
+
+The honest answer to "lock the agent down" is configuration the harness
+already has, not a sandbox. In auto mode, `bash` runs unprompted with the
+full authority of your account; that is the deliberate default for fluid
+work in a trusted project. To harden a project:
+
+- `"approval_mode": "ask"` in settings.json puts every mutating call in
+  front of you, or
+- keep auto mode but add an ask rule for bash in your **global**
+  `~/.openmax/permissions.toml` (outside the project root, so the agent
+  cannot edit it):
+
+```toml
+[[rules]]
+effect = "ask"
+tool = "bash"
+```
+
+External tools are narrower than bash by construction: every tool's first
+run needs your approval of its exact bytes, its environment is scrubbed to
+a baseline plus the `env` names its approved manifest declares, and
+unapproved tool code can only ever execute as a sandboxed probe (no
+network, writes confined) via `openmax --check --run-examples`.
+
+Residual risk to know about: an *approved* tool or a bash command can fetch
+content at runtime (`curl | sh`) that no approval ever covered. Approval
+binds bytes on disk at approval time, deliberately - pinning runtime
+fetches is unbounded. Review what you approve, and prefer tools whose code
+lives in project files where the approval reaches it.

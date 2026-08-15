@@ -4360,6 +4360,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A pre-env (v2) manifest must not resume a credential-dependent tool
+    /// with an empty grant while the fingerprint still matches disk. The
+    /// version gate reads v2 as absent, so hydration rebuilds from disk and
+    /// the manifest's real env list is live on the resumed session.
+    #[test]
+    fn a_legacy_manifest_without_env_is_rebuilt_with_the_real_grant() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/needs.toml"),
+            "name = \"needs\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nenv = [\"GITHUB_TOKEN\"]\n",
+        )
+        .unwrap();
+        // Forge the persisted v2 record: same fingerprint as disk (so no
+        // fingerprint-driven refreeze would repair it), env stripped.
+        let fresh = crate::registry::Registry::build(&core.data_dir, &project);
+        let mut legacy = fresh.to_manifest();
+        legacy.version = 2;
+        for t in &mut legacy.external_tools {
+            t.env.clear();
+        }
+        sessions::save_manifest(&core, id, &legacy);
+
+        let data = build_session_data(&core, id, &project);
+        match &data.registry.get("needs").expect("tool present").kind {
+            crate::registry::ToolKind::External(t) => assert_eq!(
+                t.env,
+                vec!["GITHUB_TOKEN"],
+                "a resumed session must carry the tool's real env grant"
+            ),
+            crate::registry::ToolKind::Builtin => panic!("external expected"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn build_session_data_honors_manifest_without_messages() {
         use crate::state::Core;

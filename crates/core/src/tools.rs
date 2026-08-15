@@ -992,6 +992,7 @@ async fn bash_tool(
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
         sandbox: None,
+        env_allowlist: None,
     };
     match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),

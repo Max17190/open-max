@@ -97,6 +97,12 @@ Fields:
   approval_mode gate (snapshots, read-only sessions, prompts). Trusted
   metadata for scheduling and UX, not a sandbox: it never widens or narrows
   the human content approval below.
+- `env` (optional, default none): the environment variable NAMES this tool
+  receives from the harness's environment, e.g. `env = ["GITHUB_TOKEN"]`
+  (at most 16). Everything not listed is scrubbed: the tool always gets a
+  baseline (PATH, HOME, LANG, TERM), and nothing else - API keys included -
+  unless named here. The list is manifest bytes, so the credential grant is
+  part of what the human approves.
 
 Runtime contract: the harness spawns `command args...` in the project root,
 writes the call's JSON arguments to stdin as one newline-terminated line, and
@@ -104,8 +110,8 @@ returns stdout as the result.
 Nonzero exit makes the result an error carrying `exit code N` plus output.
 Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
 7 days. The process is a
-native host process: it inherits the environment, credentials, and network
-access of Open Max.
+native host process with the network and filesystem authority of Open Max;
+its environment is the scrubbed baseline plus the manifest's `env` list.
 
 Human approval: because of that authority, the first call of any tool file -
 mutating or not - stops for a human, who approves the exact bytes. Later calls
