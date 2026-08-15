@@ -900,7 +900,7 @@ impl ExampleGates {
             // perform, which round 4's dogfooding showed corners a model
             // toward stripping the session marker instead.
             return Err(format!(
-                "unapproved source; a human can run `openmax --approve {}`, or approve the tool's first call in a session: that card covers these exact bytes",
+                "unapproved source; a human can run `openmax --approve {}`, or make the tool's first call in a session and approve the card it raises: it covers these exact bytes",
                 ext.source_path.display()
             ));
         }
