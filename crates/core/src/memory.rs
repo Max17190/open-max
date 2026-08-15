@@ -325,6 +325,48 @@ pub fn index_line(entry: &MemoryEntry) -> String {
 
 /// The injected index section, or None when nothing qualifies so the
 /// zero-memory prompt stays byte-identical to a memoryless build.
+/// (name, index-line hash) for exactly the memories that WILL be in the
+/// frozen prompt's index: valid-named, not faded, within the byte budget.
+/// The refreeze receipt's "indexed" claim is built from this, so it can
+/// never name a file the prompt then omits (bad stem, expired, over-budget).
+/// The hash covers the rendered index line, so editing a description that
+/// changes the line is a delta while an unrelated body edit is not.
+pub fn indexed_identities(project_root: &Path, now: u64) -> Vec<(String, u64)> {
+    use std::hash::{Hash, Hasher};
+    scan(project_root, now)
+        .entries
+        .iter()
+        .filter(|e| e.in_index)
+        .map(|e| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            index_line(e).hash(&mut h);
+            (e.name.clone(), h.finish())
+        })
+        .collect()
+}
+
+/// The valid-named memory `.md` files (path, content) that a write must
+/// refreeze on: only these can ever reach the index, so a write to a
+/// bad-name file triggers nothing, and the fingerprint stays deterministic
+/// from disk (no dependency on `now`, the access log, or the budget).
+pub fn indexable_files(project_root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let dir = memory_dir(project_root);
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<(PathBuf, Vec<u8>)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(valid_name)
+        })
+        .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 pub fn index_section(project_root: &Path, now: u64) -> Option<(String, Vec<(String, usize)>)> {
     let scan = scan(project_root, now);
     let shown: Vec<&MemoryEntry> = scan.entries.iter().filter(|e| e.in_index).collect();

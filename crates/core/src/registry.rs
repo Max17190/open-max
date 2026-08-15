@@ -259,33 +259,21 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
-    // Memory: hashed into the fingerprint (a write refreezes; the prompt's
-    // memory index rebuilds), recorded by name for the receipt, never
-    // ledgered. Only `.md` files: the access log changes on every read.
-    let mut memory_files: Vec<(String, u64)> = Vec::new();
+    // Memory: the fingerprint hashes only VALID-named memory bytes (a write
+    // to one refreezes; the prompt's index rebuilds), deterministic from
+    // disk. The receipt's memory delta is the INDEXED selection - valid,
+    // unfaded, within budget - so it can never claim a file the prompt then
+    // omits (Greptile P1). Never ledgered (data, not capability).
     {
         let dir = project_root.join(crate::memory::MEMORY_DIR);
         dir.hash(&mut h);
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut files: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "md"))
-                .collect();
-            files.sort();
-            for path in files {
-                path.hash(&mut h);
-                let bytes = std::fs::read(&path).ok();
-                bytes.hash(&mut h);
-                let Some(bytes) = bytes else { continue };
-                let mut fh = DefaultHasher::new();
-                bytes.hash(&mut fh);
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    memory_files.push((stem.to_string(), fh.finish()));
-                }
-            }
+        for (path, bytes) in crate::memory::indexable_files(project_root) {
+            path.hash(&mut h);
+            bytes.hash(&mut h);
         }
     }
+    let memory_files: Vec<(String, u64)> =
+        crate::memory::indexed_identities(project_root, crate::memory::unix_now());
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
