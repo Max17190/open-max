@@ -1653,10 +1653,13 @@ const INLINE_FLAGS: [&str; 4] = ["-c", "-e", "--eval", "--exec"];
 const SCRIPT_EXTENSIONS: [&str; 8] = ["py", "sh", "bash", "js", "mjs", "ts", "rb", "pl"];
 
 /// The script file an interpreter-style command will run, when its argv names
-/// one: the first positional argument, judged only when it is shaped like a
-/// script file. An inline-program flag before it (`-c`, `-e`) means the
-/// program is text on the command line, not a file, so there is nothing to
-/// resolve.
+/// one: the leading positional argument, judged only when it is shaped like a
+/// script file, and only when no option stands before it. Any earlier option
+/// may consume or redefine the operand (`node -p result.js` evaluates the
+/// text `result.js`; `sh -s x.sh` reads the program from stdin and keeps
+/// `x.sh` as `$1`), and option tables differ per interpreter, so a flag
+/// anywhere before the candidate means None: a warning about a file that
+/// never was one costs more than a miss.
 pub(crate) fn interpreter_script<'a>(command: &str, args: &'a [String]) -> Option<&'a str> {
     let stem = Path::new(command.trim()).file_name()?.to_string_lossy().to_string();
     if !INTERPRETERS.iter().any(|i| stem == *i) {
@@ -1664,11 +1667,11 @@ pub(crate) fn interpreter_script<'a>(command: &str, args: &'a [String]) -> Optio
     }
     for arg in args {
         let arg = arg.trim();
-        if INLINE_FLAGS.contains(&arg) {
-            return None;
-        }
-        if arg.is_empty() || arg.starts_with('-') {
+        if arg.is_empty() {
             continue;
+        }
+        if arg.starts_with('-') {
+            return None;
         }
         return Path::new(arg)
             .extension()

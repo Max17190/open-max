@@ -2167,10 +2167,30 @@ mod tests {
             root.join(".openmax/tools/mod.toml"),
             "name = \"modrun\"\ndescription = \"runs a module\"\ncommand = \"python3\"\nargs = [\"-m\", \"pytest\"]\n",
         );
+        // An option can consume or redefine the operand behind it: `node -p`
+        // evaluates the next token as expression text, and `sh -s` reads the
+        // program from stdin and keeps the token as $1. Neither names a file
+        // the command opens, so neither may draw a missing-script warning.
+        write(
+            root.join(".openmax/tools/nodep.toml"),
+            "name = \"nodep\"\ndescription = \"prints an expression\"\ncommand = \"node\"\nargs = [\"-p\", \"result.js\"]\n",
+        );
+        write(
+            root.join(".openmax/tools/shs.toml"),
+            "name = \"shs\"\ndescription = \"stdin program\"\ncommand = \"sh\"\nargs = [\"-s\", \"script.sh\"]\n",
+        );
         let findings = local(&root);
         assert!(
             !some_warn_contains(&findings, "mod.toml", "does not exist"),
             "a module argument must not draw a script warning: {findings:?}"
+        );
+        assert!(
+            !some_warn_contains(&findings, "nodep.toml", "does not exist"),
+            "an option operand is not a script: {findings:?}"
+        );
+        assert!(
+            !some_warn_contains(&findings, "shs.toml", "does not exist"),
+            "sh -s keeps the token as $1, not a program file: {findings:?}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
