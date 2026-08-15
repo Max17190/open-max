@@ -486,10 +486,19 @@ tool = "bash"
 arg_regex = "^cargo (test|check|build)"
 ```
 
-Activation: rules are re-read at every turn start, and mid-turn after any
-successful mutating call, so a rule you write is in force before your next
-step. Verify with `openmax --check` (it reports the exact fail-closed reason
-for a malformed file).
+Activation is one-directional within a turn: rules are re-read at turn start
+and after every mutating call, and every snapshot the turn has observed keeps
+voting, most-restrictive answer wins. So a NEW restriction (a `deny`/`ask`
+you write) is in force before your next step - "install the guard, then prove
+it" proves it guarded. But a RELAXATION only lands at the next turn's fresh
+discovery: removing a deny, or FIXING a file you broke earlier this turn, does
+not take effect until the turn ends. Concretely: if a mutating call leaves
+permissions.toml malformed, the file fails closed and DENIES EVERY tool call
+(including bash, so `openmax --check` cannot run) for the rest of that turn;
+your repair to the file is allowed (write_file/edit_file/read_file on exactly
+that path stay open) but applies only from the next turn. The harness says so
+on the writing call. Between turns, verify with `openmax --check` (it reports
+the exact fail-closed reason for a malformed file).
 "#;
 
 const PROVIDERS: &str = r#"# Providers

@@ -61,16 +61,37 @@ impl TurnPermissions {
     /// snapshot keeps its own fail-closed and repair-carve-out behavior, so
     /// a file broken at any point does not lose its one repair path here.
     pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
-        let mut snapshots = self.observed.iter();
-        let first = snapshots.next().expect("a turn always has its start discovery");
+        let mut snapshots = self.observed.iter().enumerate();
+        let (_, first) = snapshots.next().expect("a turn always has its start discovery");
         let mut decision = first.evaluate(tool, args);
         let mut rank = restrictiveness(&decision);
-        for snapshot in snapshots {
+        let mut winner_idx = 0usize;
+        for (idx, snapshot) in snapshots {
             let candidate = snapshot.evaluate(tool, args);
             let candidate_rank = restrictiveness(&candidate);
             if candidate_rank >= rank {
                 rank = candidate_rank;
                 decision = candidate;
+                winner_idx = idx;
+            }
+        }
+        // A deny rendered from a snapshot that is no longer the newest is
+        // stale wording: the file was malformed earlier this turn and floors
+        // the rest of it, but the reason quotes a generation that no longer
+        // exists on disk (dogfood: the deny cited a broken regex fixed 50s
+        // earlier). If the newest snapshot no longer denies, say so.
+        let newest = self.observed.len() - 1;
+        if winner_idx < newest {
+            if let PermissionDecision::Deny { reason } = &mut decision {
+                let newest_ok = !matches!(
+                    self.observed[newest].evaluate(tool, args),
+                    PermissionDecision::Deny { .. }
+                );
+                if newest_ok {
+                    reason.push_str(
+                        " (this denies from a permissions snapshot observed earlier this turn;                          the file on disk is valid now and applies from the next turn - within a                          turn policy only narrows)",
+                    );
+                }
             }
         }
         decision
@@ -204,6 +225,17 @@ impl Permissions {
         &self.inert_allows
     }
 
+    /// The fail-closed reason when this policy file is malformed, else None.
+    /// Surfaced on the writing call so a mutation that bricks the policy for
+    /// the rest of the turn is loud, not a silent wall of denies.
+    pub fn fail_closed_reason(&self) -> Option<&str> {
+        if self.fail_closed {
+            self.fail_closed_reason.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// True when this call is a rewrite of the very file that is failing
     /// closed. The broken file expresses no enforceable policy, and the agent
     /// is told to write this file, so leaving one path open keeps a typo from
@@ -219,7 +251,11 @@ impl Permissions {
     /// way it was written: from the shell, guided by the path in the deny
     /// reason and by `openmax --check`.
     fn repairs_invalid_policy(&self, tool: &str, args: &Value) -> bool {
-        if !matches!(tool, "write_file" | "edit_file") {
+        // read_file is included: repairing a file you cannot read is not a
+        // repair path - the agent had to blind-rewrite a malformed
+        // permissions.toml it was denied read access to (dogfood). read_file
+        // is read-only, so it widens nothing the write path did not already.
+        if !matches!(tool, "write_file" | "edit_file" | "read_file") {
             return false;
         }
         let Some(invalid) = &self.invalid_path else {
@@ -537,17 +573,51 @@ mod tests {
             PermissionDecision::Default,
             "path resolution must not depend on spelling"
         );
+        // read_file on the broken file is exempt too: repairing a file you
+        // cannot read is not a repair path (dogfood - the agent had to
+        // blind-rewrite it). read-only, so it widens nothing the write did.
+        assert_eq!(
+            perms.evaluate("read_file", &json!({"path": ".openmax/permissions.toml"})),
+            PermissionDecision::Default,
+            "reading the broken file to repair it must be possible"
+        );
 
         // Nothing else is exempt.
         for (tool, args) in [
             ("bash", json!({"command": "cat .openmax/permissions.toml"})),
-            ("read_file", json!({"path": ".openmax/permissions.toml"})),
+            ("read_file", json!({"path": "src/main.rs"})),
             ("write_file", json!({"path": "src/main.rs"})),
         ] {
             assert!(
                 matches!(perms.evaluate(tool, &args), PermissionDecision::Deny { .. }),
                 "{tool} must still fail closed"
             );
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A deny that wins from a stale (earlier-this-turn) snapshot while the
+    /// newest snapshot no longer denies gets a staleness marker: the wording
+    /// otherwise quotes a file generation that no longer exists on disk
+    /// (dogfood - the deny cited a broken regex fixed 50s earlier).
+    #[test]
+    fn a_stale_snapshot_deny_says_the_file_is_valid_now() {
+        let tmp = tempfile_dir();
+        let perms_path = tmp.join(".openmax").join("permissions.toml");
+        let data = tmp.join("data");
+        // Turn start: malformed -> fails closed.
+        write_perms(&perms_path, "[[rule]]\neffect = \"deny\"\n");
+        let mut turn = TurnPermissions::new(Permissions::discover(&tmp, &data));
+        // The agent repairs it mid-turn (a valid, permissive file).
+        write_perms(&perms_path, "");
+        turn.reload(Permissions::discover(&tmp, &data));
+        // A src write is still denied (the stale fail-closed snapshot floors
+        // it), but the reason now says the file is valid and applies next turn.
+        match turn.evaluate("write_file", &json!({"path": "src/main.rs"})) {
+            PermissionDecision::Deny { reason } => {
+                assert!(reason.contains("valid now and applies from the next turn"), "{reason}");
+            }
+            other => panic!("stale fail-closed snapshot must still floor the turn: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(tmp);
     }

@@ -3128,7 +3128,42 @@ async fn run_loop(
                         // and unapproved `allow` rules are dropped at load.
                         let current = Permissions::discover(project_root, &core.data_dir);
                         let inert: Vec<String> = current.notices().to_vec();
+                        // A mutation that leaves permissions.toml malformed
+                        // bricks EVERY tool call for the rest of this turn
+                        // (the snapshot floors it), and only the notices path
+                        // spoke - a wall of denies with no cause, and the
+                        // prescribed `openmax --check` needs bash, which is
+                        // now denied. Say it on the writing call, once, with
+                        // the parse reason and the turn-scoped rule.
+                        let fail_closed_now = current.fail_closed_reason().map(str::to_string);
                         permissions.reload(current);
+                        if let Some(reason) = fail_closed_now {
+                            let novel = novel_policy_notices(
+                                core,
+                                session_id,
+                                vec![format!("permissions fail-closed: {reason}")],
+                            )
+                            .await;
+                            if !novel.is_empty() {
+                                if let Some(last) =
+                                    guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                                {
+                                    let note = format!(
+                                        "\n[permissions.toml is now malformed ({reason}). Every tool \
+                                         call is DENIED for the rest of THIS turn - policy snapshots \
+                                         only narrow within a turn, never widen - and your repair \
+                                         (write_file/edit_file/read_file on exactly this file is still \
+                                         allowed) takes effect at the START OF THE NEXT TURN, not \
+                                         this one. openmax --check cannot run until then (bash is \
+                                         denied too).]"
+                                    );
+                                    match &mut last.content {
+                                        Some(content) => content.push_str(&note),
+                                        None => last.content = Some(note.trim_start().to_string()),
+                                    }
+                                }
+                            }
+                        }
                         // The agent may have just written itself an allow
                         // rule that can never fire (#180). Say so NOW, on
                         // this call's result, with the command that lifts

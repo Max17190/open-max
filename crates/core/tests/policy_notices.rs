@@ -483,3 +483,99 @@ async fn an_out_of_session_approval_is_named_at_the_next_turn() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A mutating call that leaves permissions.toml malformed bricks every tool
+/// call for the rest of the turn (dogfood: 29 silent denies, --check itself
+/// denied). The writing call now carries a receipt naming the parse reason
+/// and the turn-scoped consequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalidating_write_to_permissions_is_named_on_the_writing_call() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/permissions.toml", "content": "[[rule]]\neffect = \"deny\"\n" }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "brick-perms", &project, "write it").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("permissions.toml is now malformed"), "{content}");
+    assert!(content.contains("DENIED for the rest of THIS turn"), "{content}");
+    assert!(content.contains("START OF THE NEXT TURN"), "{content}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Editing the SCRIPT an approved gate runs revokes the approval and fails
+/// closed, but the script is not a .toml - the hook fingerprint missed it,
+/// so the edit got no receipt and the agent learned only when its next call
+/// was blocked (dogfood). The bound code is now in the fingerprint, so the
+/// hook-write receipt fires on the code edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_an_approved_gates_script_is_named_on_the_writing_call() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let gate = project.join("gate.sh");
+    std::fs::write(&gate, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let hook = project.join(".openmax/hooks/gate.toml");
+    std::fs::write(&hook, "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+    // The human approved the hook manifest and its script.
+    std::fs::create_dir_all(&data).unwrap();
+    let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&hook).unwrap())];
+    shas.extend(
+        open_max_core::ledger::manifest_code(&hook, &project)
+            .into_iter()
+            .filter_map(|c| c.sha256),
+    );
+    open_max_core::ledger::approve_capability(&data, &project, &hook, &shas).unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": "gate.sh", "content": "#!/bin/sh\n# tampered\nexit 0\n" }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "gate-script-edit", &project, "edit the gate script").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("[hook files changed"), "{content}");
+    assert!(content.contains("failing closed"), "an edit to an approved gate's code is named as revoking: {content}");
+    let _ = std::fs::remove_dir_all(dir);
+}
