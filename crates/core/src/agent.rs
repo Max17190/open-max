@@ -2238,7 +2238,7 @@ async fn run_loop(
                 )
                 .await;
             report_hook_failures(core, session_id, outcome.failures);
-            if let Some(reason) = outcome.refusal {
+            if let Some(refusal) = outcome.refusal {
                 if blockable {
                     // The refusal reaches the model as the user speaking: it
                     // is work to do, not a tool result, and there is no call
@@ -2246,8 +2246,22 @@ async fn run_loop(
                     // the discipline a prune already follows (#172). The stop
                     // reason is deliberately left alone: a refused end is not
                     // an end, so a loop that runs out here says so.
-                    guard.messages().push(ChatMessage::user(reason));
+                    guard.messages().push(ChatMessage::user(refusal.reason.clone()));
                     save_messages(core, session_id, guard.messages(), false).await;
+                    // Disk first, then the wire: the frontend hears about the
+                    // continuation only once the transcript a resume would
+                    // replay already records it, so the live view never
+                    // reports a refusal the disk denies.
+                    core.send_agent(
+                        session_id,
+                        AgentEvent::TurnRefused {
+                            hook: refusal.hook,
+                            reason: refusal.reason,
+                            continuation,
+                            continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
+                                .saturating_sub(continuation),
+                        },
+                    );
                     continuation += 1;
                     continue 'turns;
                 }
@@ -5373,6 +5387,143 @@ mod tests {
             user_messages(&messages, "the build does not compile yet"),
             1,
             "the reason must reach the model as work to do: {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every event until Done, so a test can see what a frontend sees.
+    async fn drive_turn_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
+    ) -> (String, Vec<AgentEvent>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                if let AgentEvent::Done { stop_reason } = env.event {
+                    return (stop_reason, events);
+                }
+                events.push(env.event);
+            }
+        }
+        panic!("the turn never emitted Done");
+    }
+
+    /// A honored refusal grows the transcript with a user message the client
+    /// never sent. Without an event saying so, a frontend watches the model
+    /// finish and then start again with no visible cause, while a replay of
+    /// the same session from disk shows the injected message: the live view
+    /// and the disk disagree about what happened.
+    #[tokio::test]
+    async fn a_honored_refusal_is_visible_on_the_wire() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("verify.sh");
+        write_exec(
+            &script,
+            &format!(
+                "#!/bin/sh\nif [ -f {0}/passed ]; then exit 0; fi\n: > {0}/passed\necho 'the build does not compile yet'\nexit 1\n",
+                project.display()
+            ),
+        );
+        let toml = hooks_dir.join("verify.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+        }
+
+        start_turn(core.clone(), "sess-wire".into(), project.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "stop");
+        let refusals: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
+                    Some((hook.as_str(), reason.as_str(), *continuation, *continuations_left))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            vec![(
+                "verify",
+                "the build does not compile yet",
+                0,
+                crate::hooks::MAX_TURN_END_CONTINUATIONS
+            )],
+            "one honored refusal, named by hook stem, carrying the payload's numbers"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The overridden ninth refusal is not a continuation: it is reported as
+    /// a failure and ends the turn `unverified`, so `turn_refused` counts
+    /// exactly the user messages the transcript gained and no more.
+    #[tokio::test]
+    async fn the_overridden_refusal_is_not_a_continuation() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("never.sh");
+        write_exec(&script, "#!/bin/sh\necho 'still not verified'\nexit 1\n");
+        let toml = hooks_dir.join("never.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.max_agent_iterations = 20;
+        }
+
+        start_turn(core.clone(), "sess-wire-cap".into(), project.clone(), "ship it".into())
+            .unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "unverified");
+        let refused = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnRefused { .. }))
+            .count();
+        assert_eq!(
+            refused,
+            crate::hooks::MAX_TURN_END_CONTINUATIONS,
+            "one event per honored refusal; the override is a failure, not a continuation"
         );
 
         let _ = std::fs::remove_dir_all(dir);

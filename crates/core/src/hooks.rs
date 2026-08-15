@@ -842,14 +842,16 @@ impl Hooks {
                         // The refusal is the turn's answer, so it stops here.
                         // The hooks behind it run again on the next end
                         // attempt, against the world this one produced.
-                        outcome.refusal = Some(reason);
+                        outcome.refusal = Some(Refusal { hook: hook_stem(hook), reason });
                         return outcome;
                     }
                     // Nothing left to honor it with, so it is reported like
                     // any other failed run - and the caller still learns that
                     // a gate said no, which is what ends the turn unverified.
                     outcome.failures.push(failure(hook, reason.clone()));
-                    outcome.refusal.get_or_insert(reason);
+                    outcome
+                        .refusal
+                        .get_or_insert(Refusal { hook: hook_stem(hook), reason });
                 }
                 HookRun::Cancelled => break,
             }
@@ -876,7 +878,19 @@ pub struct TurnEndAttempt {
 #[derive(Debug, Default)]
 pub struct TurnEndOutcome {
     pub failures: Vec<HookFailure>,
-    pub refusal: Option<String>,
+    pub refusal: Option<Refusal>,
+}
+
+/// A gating hook's refusal: which hook said no, by file stem - the name every
+/// other hook report uses - and what it said.
+#[derive(Clone, Debug)]
+pub struct Refusal {
+    pub hook: String,
+    pub reason: String,
+}
+
+fn hook_stem(hook: &HookSpec) -> String {
+    hook.source_path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string()
 }
 
 /// Resolve a path for the repair comparison without requiring the file to

@@ -274,6 +274,16 @@ async fn run_turn_events(
                     let _ = writeln!(stderr, "openmax: hook '{hook}' failed on {event}: {detail}");
                 }
             }
+            AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
+                if !json {
+                    let _ = writeln!(
+                        stderr,
+                        "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {reason}",
+                        continuation + 1,
+                        continuation + continuations_left,
+                    );
+                }
+            }
             AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }
             | AgentEvent::Usage { .. }
