@@ -400,32 +400,65 @@ impl Registry {
         match self.get(name).map(|s| s.kind.clone()) {
             Some(ToolKind::Builtin) => tools::execute(name, args, data_dir, root, caps, cancel).await,
             Some(ToolKind::External(tool)) => {
-                spawn_external(name, &tool, args, data_dir, root, caps, cancel).await
+                spawn_external(name, &tool, args, data_dir, root, caps, cancel, None).await
             }
-            None => {
-                // A name matching a file that failed to load gets the parse
-                // reason, not a bare "unknown": the model most likely wrote
-                // (or was promised) that very file.
-                if let Some((path, reason)) = self.broken.iter().find(|(path, _)| {
-                    path.file_stem().is_some_and(|stem| stem == name)
-                        || path.file_name().is_some_and(|f| f == "SKILL.md")
-                            && path.parent().and_then(|d| d.file_name()).is_some_and(|d| d == name)
-                }) {
-                    let shown = path.strip_prefix(root).unwrap_or(path);
-                    return ToolOutcome::err(format!(
-                        "unknown tool: {name}; {} exists but did NOT load: {reason}. \
-                         Fix the file and verify with bash: openmax --check. The \
-                         available tools are {}",
-                        shown.display(),
-                        self.tool_names().join(", ")
-                    ));
-                }
-                ToolOutcome::err(format!(
-                    "unknown tool: {name}; the available tools are {}",
-                    self.tool_names().join(", ")
-                ))
-            }
+            None => self.unknown_tool_error(name, root),
         }
+    }
+
+    /// Probe one EXTERNAL tool inside an OS sandbox (no network, writes
+    /// confined to `scratch`, scrubbed env): the pre-approval iteration path
+    /// for `--run-examples` on tools no human has blessed yet. Only external
+    /// tools are probeable; built-ins have no unapproved state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_example_sandboxed(
+        &self,
+        name: &str,
+        args: &Value,
+        data_dir: &Path,
+        root: &Path,
+        caps: tools::OutputCaps,
+        cancel: Arc<CancelToken>,
+        scratch: &Path,
+    ) -> ToolOutcome {
+        match self.get(name).map(|s| s.kind.clone()) {
+            Some(ToolKind::External(tool)) => {
+                let sandbox = execution::SandboxPolicy {
+                    ro_root: root.to_path_buf(),
+                    rw_scratch: scratch.to_path_buf(),
+                };
+                spawn_external(name, &tool, args, data_dir, root, caps, cancel, Some(sandbox))
+                    .await
+            }
+            Some(ToolKind::Builtin) => {
+                ToolOutcome::err(format!("'{name}' is a built-in; probes are for external tools"))
+            }
+            None => self.unknown_tool_error(name, root),
+        }
+    }
+
+    /// A name matching a file that failed to load gets the parse reason, not
+    /// a bare "unknown": the model most likely wrote (or was promised) that
+    /// very file.
+    fn unknown_tool_error(&self, name: &str, root: &Path) -> ToolOutcome {
+        if let Some((path, reason)) = self.broken.iter().find(|(path, _)| {
+            path.file_stem().is_some_and(|stem| stem == name)
+                || path.file_name().is_some_and(|f| f == "SKILL.md")
+                    && path.parent().and_then(|d| d.file_name()).is_some_and(|d| d == name)
+        }) {
+            let shown = path.strip_prefix(root).unwrap_or(path);
+            return ToolOutcome::err(format!(
+                "unknown tool: {name}; {} exists but did NOT load: {reason}. \
+                 Fix the file and verify with bash: openmax --check. The \
+                 available tools are {}",
+                shown.display(),
+                self.tool_names().join(", ")
+            ));
+        }
+        ToolOutcome::err(format!(
+            "unknown tool: {name}; the available tools are {}",
+            self.tool_names().join(", ")
+        ))
     }
 }
 
@@ -781,6 +814,7 @@ fn validate_params_schema(params: &Value) -> Result<(), String> {
 /// call's JSON arguments on stdin, and treat stdout as the result. Same
 /// output caps and spill-to-file behavior as bash. One process per call,
 /// nothing stays resident.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_external(
     name: &str,
     tool: &ExternalTool,
@@ -789,6 +823,7 @@ async fn spawn_external(
     root: &Path,
     caps: tools::OutputCaps,
     cancel: Arc<CancelToken>,
+    sandbox: Option<execution::SandboxPolicy>,
 ) -> ToolOutcome {
     let request = ProcessRequest {
         program: tool.command.clone().into(),
@@ -802,7 +837,7 @@ async fn spawn_external(
             spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
-        sandbox: None,
+        sandbox,
     };
 
     match execution::run_process(request, cancel).await {
@@ -814,8 +849,8 @@ async fn spawn_external(
         Err(ProcessError::Wait(e)) => {
             ToolOutcome::err(format!("external tool '{name}' failed: {e}"))
         }
-        // Session-path external tools run unsandboxed (sandbox: None above);
-        // the sandboxed probe path in doctor.rs maps this to its refusal.
+        // Only sandboxed probe runs can see this; session-path calls pass
+        // sandbox: None. The caller (doctor.rs) words the refusal.
         Err(e @ ProcessError::SandboxUnavailable(_)) => ToolOutcome::err(e.to_string()),
         Ok(output) => match &output.termination {
             Termination::Cancelled => ToolOutcome::from_killed_process(

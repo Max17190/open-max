@@ -1057,11 +1057,20 @@ async fn run_tool_examples(
     // timeouts, so batching the report would look like a hang.
     let result = open_max_core::doctor::run_examples(project, |verdict| {
         ran += 1;
+        let badge = match verdict.sandboxed {
+            // Loud by design: the probe ran UNAPPROVED content with zero
+            // host authority; nothing was blessed by it running.
+            true => format!(
+                "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: openmax --approve {}]",
+                verdict.path.display()
+            ),
+            false => String::new(),
+        };
         match &verdict.result {
-            Ok(()) => println!("ok   example     {}", verdict.tool),
+            Ok(()) => println!("ok   example     {}{badge}", verdict.tool),
             Err(reason) => {
                 failures += 1;
-                println!("err  example     {}  {reason}", verdict.tool);
+                println!("err  example     {}  {reason}{badge}", verdict.tool);
             }
         }
         let _ = std::io::stdout().flush();
@@ -1098,6 +1107,14 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
         Ok(verdicts) => {
             for verdict in verdicts {
                 let (status, message) = match &verdict.result {
+                    Ok(()) if verdict.sandboxed => (
+                        "ok",
+                        format!(
+                            "example for '{}' ran in a sandbox (unapproved content: no network, writes confined; approve with openmax --approve {})",
+                            verdict.tool,
+                            verdict.path.display()
+                        ),
+                    ),
                     Ok(()) => ("ok", format!("example for '{}' ran", verdict.tool)),
                     Err(reason) => {
                         failures += 1;
@@ -1109,6 +1126,7 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
                     "path": verdict.path.display().to_string(),
                     "status": status,
                     "message": message,
+                    "sandboxed": verdict.sandboxed,
                 }));
             }
         }

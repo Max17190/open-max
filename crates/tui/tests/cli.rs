@@ -142,15 +142,36 @@ fn run_examples_is_gated_and_reported_through_json() {
     // Trust it (the endpoint is dead, so the turn fails after trust is stored).
     cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
 
-    // Trusted but unapproved: still nothing runs, and the message says how.
+    // Trusted but unapproved: each example probes in a sandbox with zero
+    // host authority instead of refusing flat. The harmless prover passes
+    // (marked sandboxed, with the approve pointer), the broken failer fails
+    // with its own diagnostic, and nothing is blessed by any of it. On a
+    // host with no sandbox backend, the fall-back refusal keeps the old
+    // unapproved-source wording; both are exit 1 here (failer always fails).
     let out = cmd(&project, &home)
         .args(["--check", "--json", "--run-examples"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    let reported = messages(&json(&out));
-    assert_eq!(reported.matches("unapproved source").count(), 2, "{reported}");
-    assert!(reported.contains("--approve"), "{reported}");
+    let value = json(&out);
+    let reported = messages(&value);
+    if reported.contains("cannot sandbox a probe") {
+        assert_eq!(reported.matches("cannot sandbox a probe").count(), 2, "{reported}");
+        assert!(reported.contains("--approve"), "{reported}");
+    } else {
+        assert!(reported.contains("ran in a sandbox"), "{reported}");
+        assert!(reported.contains("openmax --approve"), "{reported}");
+        assert!(reported.contains("boom"), "{reported}");
+        assert!(
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["surface"] == "example")
+                .all(|row| row["sandboxed"] == true),
+            "unapproved probes must be labeled: {value}"
+        );
+    }
 
     for tool in ["prover.toml", "failer.toml"] {
         let out = cmd(&project, &home)
@@ -160,8 +181,8 @@ fn run_examples_is_gated_and_reported_through_json() {
         assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
-    // Approved: the passing example passes, the failing one fails the run and
-    // brings its diagnostic with it.
+    // Approved: host runs now, unlabeled - the passing example passes, the
+    // failing one fails the run and brings its diagnostic with it.
     let out = cmd(&project, &home)
         .args(["--check", "--json", "--run-examples"])
         .output()
@@ -172,6 +193,15 @@ fn run_examples_is_gated_and_reported_through_json() {
     assert!(reported.contains("ok"), "{reported}");
     assert!(reported.contains("boom"), "{reported}");
     assert!(reported.contains("exit code 3"), "{reported}");
+    assert!(
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["surface"] == "example")
+            .all(|row| row["sandboxed"] == false),
+        "approved content keeps unlabeled host runs: {value}"
+    );
 
     // Without --check the flag would be silently swallowed; that reads as
     // success for work that never ran.
