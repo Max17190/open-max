@@ -144,7 +144,24 @@ pub struct Core {
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Serializes read-modify-write cycles on the session index file.
     pub sessions_lock: Mutex<()>,
+    /// Content hash of settings.json as this process last knew it: the bytes
+    /// read at launch, refreshed by [`Core::save_settings`]. Settings are
+    /// launch-frozen, so any other change to the file is drift this process
+    /// will never adopt - the drift receipt tells the model so, including
+    /// the brick warning when the new bytes would not even parse. Lock
+    /// discipline: never held across the `settings` lock (see
+    /// `approval_mode`'s note; this mutex is leaf-only).
+    settings_disk_fingerprint: Mutex<Option<u64>>,
     events: mpsc::UnboundedSender<AgentEventEnvelope>,
+}
+
+/// Content identity of settings.json on disk; None when missing/unreadable.
+fn settings_file_hash(data_dir: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(crate::config::settings_path(data_dir)).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
 }
 
 impl Core {
@@ -190,6 +207,7 @@ impl Core {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = std::fs::create_dir_all(&data_dir);
         let settings = crate::config::load(&data_dir)?;
+        let core_data_dir = data_dir.clone();
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
@@ -199,6 +217,7 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
+            settings_disk_fingerprint: Mutex::new(settings_file_hash(&core_data_dir)),
             events: tx,
         });
         Ok((core, rx))
@@ -227,6 +246,7 @@ impl Core {
             Ok(settings) => (settings, None),
             Err(reason) => (crate::config::Settings::default(), Some(reason)),
         };
+        let core_data_dir = data_dir.clone();
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
@@ -236,9 +256,48 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
+            settings_disk_fingerprint: Mutex::new(settings_file_hash(&core_data_dir)),
             events: tx,
         });
         (core, rx, unreadable)
+    }
+
+    /// Persist settings through the process's own hand: the on-disk
+    /// fingerprint is refreshed with the write, so a TUI-authored save never
+    /// reads as external drift.
+    pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
+        crate::config::save(&self.data_dir, settings)?;
+        self.refresh_settings_fingerprint();
+        Ok(())
+    }
+
+    /// Adopt the current on-disk settings bytes as this process's own. For
+    /// save paths that write through `config::save` directly (an existing
+    /// helper with its own tests): call this after a successful write so the
+    /// drift receipt never accuses the TUI's own hand.
+    pub fn refresh_settings_fingerprint(&self) {
+        *self
+            .settings_disk_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = settings_file_hash(&self.data_dir);
+    }
+
+    /// Whether settings.json on disk moved since this process last read or
+    /// wrote it. On drift, records the new content (so each distinct change
+    /// is reported once) and returns whether the new bytes would parse -
+    /// the caller words the receipt. None while the disk matches.
+    pub fn settings_disk_changed(&self) -> Option<Result<(), String>> {
+        let current = settings_file_hash(&self.data_dir);
+        let mut seen = self
+            .settings_disk_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *seen == current {
+            return None;
+        }
+        *seen = current;
+        drop(seen);
+        Some(crate::config::load(&self.data_dir).map(|_| ()))
     }
 
     pub fn send_agent(&self, session_id: &str, event: AgentEvent) {

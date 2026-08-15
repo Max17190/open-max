@@ -210,7 +210,7 @@ async fn drive<W: Write>(
                                 let saved = {
                                     let mut next = core.settings.lock().unwrap().clone();
                                     next.approval_mode = parsed;
-                                    open_max_core::config::save(&core.data_dir, &next)
+                                    core.save_settings(&next)
                                 };
                                 match saved {
                                     Ok(()) => {

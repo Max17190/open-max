@@ -1427,6 +1427,7 @@ impl App {
             model.clone(),
         ) {
             Ok(next) => {
+                self.core.refresh_settings_fingerprint();
                 *self.core.settings.lock().unwrap() = next;
                 let source = provider
                     .map(|name| format!(" from {name}"))
@@ -2091,7 +2092,7 @@ impl App {
                             if !p.models.is_empty() && !p.models.iter().any(|m| m.id == s.model) {
                                 s.model = p.models[0].id.clone();
                             }
-                            let _ = config::save(&self.core.data_dir, &s);
+                            let _ = self.core.save_settings(&s);
                         }
                         let ep = {
                             let s = self.core.settings.lock().unwrap();
@@ -2113,7 +2114,7 @@ impl App {
                     {
                         let mut s = self.core.settings.lock().unwrap();
                         s.approval_mode = mode;
-                        let _ = config::save(&self.core.data_dir, &s);
+                        let _ = self.core.save_settings(&s);
                     }
                     // An explicit persisted choice outranks a run override,
                     // which would otherwise keep masking it.

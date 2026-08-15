@@ -261,6 +261,41 @@ fn report_hook_failures(
     }
 }
 
+/// A settings.json drift note, when the file moved outside this process's
+/// own writes. Settings are launch-frozen by design (base_url/api_key are
+/// credential routing, approval_mode hot-adoption would be self-approval),
+/// so an agent edit is inert for this process - and, unstated, that silence
+/// cost real detours. Valid new bytes: state the launch-read rule and what
+/// this session still runs. Invalid bytes: the brick warning (next launch
+/// exits 2), delivered while the author can still repair the file.
+fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
+    let changed = core.settings_disk_changed()?;
+    Some(match changed {
+        Ok(()) => {
+            let (model, endpoint) = {
+                let s = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let endpoint = s
+                    .provider
+                    .clone()
+                    .filter(|p| !p.trim().is_empty())
+                    .unwrap_or_else(|| s.base_url.clone());
+                (s.model.clone(), endpoint)
+            };
+            format!(
+                "[settings.json changed on disk. Settings are read at launch: this session \
+                 still runs {model} via {endpoint}, and the new values apply from the next \
+                 openmax launch. Switching this session's model is /model, which the user \
+                 runs; the TUI rewrites settings.json on /model and settings changes, \
+                 overwriting manual edits.]"
+            )
+        }
+        Err(e) => format!(
+            "[settings.json is now INVALID: {e}. The next launch of openmax will refuse to \
+             start (exit 2) until the file parses; fix it now.]"
+        ),
+    })
+}
+
 /// Filter to policy notices this session has not yet narrated to the model,
 /// and mark them reported. Identity is the full notice text - it embeds the
 /// file path, which is the identity that matters - so a static problem notes
@@ -2130,6 +2165,14 @@ async fn run_loop(
     // edit would surface turns later as an unrelated-looking resolve error.
     let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
 
+    if let Some(note) = settings_drift_note(core) {
+        // Same channel as the refreeze receipt: before the prompt, once per
+        // distinct on-disk content.
+        let msgs = guard.messages();
+        let at = msgs.len().saturating_sub(1);
+        msgs.insert(at, ChatMessage::user(note));
+    }
+
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
     // fails closed rather than silently hitting flat base_url.
@@ -2813,6 +2856,21 @@ async fn run_loop(
                             if let Some(last) =
                                 guard.messages().iter_mut().rev().find(|m| m.role == "tool")
                             {
+                                match &mut last.content {
+                                    Some(content) => content.push_str(&note),
+                                    None => last.content = Some(note.trim_start().to_string()),
+                                }
+                            }
+                        }
+                        // A settings.json edit (bash: outside the project
+                        // root) is inert for this session and bricks the
+                        // next launch when malformed - answered on the
+                        // writing call, while it is still repairable.
+                        if let Some(note) = settings_drift_note(core) {
+                            if let Some(last) =
+                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                            {
+                                let note = format!("\n{note}");
                                 match &mut last.content {
                                     Some(content) => content.push_str(&note),
                                     None => last.content = Some(note.trim_start().to_string()),

@@ -137,7 +137,7 @@ impl Default for Settings {
     }
 }
 
-fn settings_path(data_dir: &Path) -> PathBuf {
+pub(crate) fn settings_path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.json")
 }
 
