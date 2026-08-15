@@ -469,9 +469,21 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 // Only `openmax --approve`, from outside a
                                 // session, activates a hook: the in-session
                                 // write card shows a clipped preview, and a
-                                // preview is not shown bytes.
+                                // preview is not shown bytes. For a
+                                // non-blocking turn_end the shape rides
+                                // along: this is the line a round-4 author
+                                // read before handing an observer to a human
+                                // as a completion gate, three out of three
+                                // weak-tier runs.
+                                let shape_note = if h.event == crate::hooks::HookEvent::TurnEnd
+                                    && !h.blocking
+                                {
+                                    ". as written it observes only: exit status is ignored at turn end, and `blocking = true` is what gates completion"
+                                } else {
+                                    ""
+                                };
                                 Status::Err(format!(
-                                    "inert because {reason}: a human must approve this exact content with `openmax --approve {}`, run outside a session (an in-session write approval approves the write and nothing more)",
+                                    "inert because {reason}: a human must approve this exact content with `openmax --approve {}`, run outside a session (an in-session write approval approves the write and nothing more){shape_note}",
                                     shell_quote(&path)
                                 ))
                             }
@@ -482,11 +494,25 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             Some((_, reason)) => Status::Warn(reason),
                             // The shape, not just the event: `turn_end` alone
                             // says nothing about whether this file can end a
-                            // turn, and that is the whole of what it does.
-                            None => Status::Ok(format!(
-                                "hook on {}",
-                                crate::hooks::shape_name(h.event.as_str(), h.blocking)
-                            )),
+                            // turn, and that is the whole of what it does. For
+                            // the one event with two shapes the ok line says
+                            // which one loaded: all three weak-tier authors in
+                            // round 4 wrote an observer while stating the
+                            // harness would block on nonzero exit, and this
+                            // line is where they looked.
+                            None => {
+                                if h.event == crate::hooks::HookEvent::TurnEnd && !h.blocking {
+                                    Status::Ok(
+                                        "hook on turn_end (observer: exit status is ignored; `blocking = true` gates completion)"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    Status::Ok(format!(
+                                        "hook on {}",
+                                        crate::hooks::shape_name(h.event.as_str(), h.blocking)
+                                    ))
+                                }
+                            }
                         },
                     }
                 }
@@ -692,7 +718,7 @@ fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding>
                 kind,
                 path,
                 status: Status::Warn(format!(
-                    "its inline program reads {named} at runtime, and approval does not cover that file: only this manifest's text is bound. move the program into {named} and name it in `args` so its bytes are approved too"
+                    "its inline program reads {named} at runtime, and approval does not cover that file: only this manifest's text is bound. put the program in a project file and name it in `args` so its bytes are approved too"
                 )),
             });
         }
@@ -867,8 +893,14 @@ impl ExampleGates {
         // approved first. Content-bound, exactly like the in-session gate: any
         // edit to the tool file revokes the approval.
         if !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+            // Two repairs, because two readers: a human runs --approve, and an
+            // agent - for whom that command refuses by design - calls the tool
+            // once so the human answers the approval card. Prescribing only
+            // the out-of-session command hands the agent a repair it cannot
+            // perform, which round 4's dogfooding showed corners a model
+            // toward stripping the session marker instead.
             return Err(format!(
-                "unapproved source; run openmax --approve {}",
+                "unapproved source; a human can run `openmax --approve {}`, or approve the tool's first call in a session: that card covers these exact bytes",
                 ext.source_path.display()
             ));
         }
@@ -2380,6 +2412,13 @@ mod tests {
         let refusal = verdict(&results, "pwn").result.as_ref().unwrap_err();
         assert!(refusal.contains("unapproved source"), "{refusal}");
         assert!(refusal.contains("--approve"), "{refusal}");
+        // Both repairs, because both readers: --approve refuses for the agent
+        // that most often reads this, so the refusal must also name the
+        // in-session path (call the tool, the human answers the card).
+        assert!(
+            refusal.contains("first call in a session"),
+            "the refusal must name the repair an agent can perform: {refusal}"
+        );
         assert!(!touched.exists(), "the refused example must not have run");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
@@ -2804,6 +2843,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The inline-program warning's repair must name a destination that makes
+    /// sense: round 4 caught it prescribing "move the program into
+    /// data/sales.csv" - the data file the program reads - because the repair
+    /// clause reused the read target as the destination.
+    #[test]
+    fn the_inline_program_repair_names_a_project_file_not_the_read_target() {
+        let root = temp_project();
+        write(root.join("data/sales.csv"), "a,b\n1,2\n");
+        write(
+            root.join(".openmax/tools/inline.toml"),
+            "name = \"inline\"\ndescription = \"d\"\ncommand = \"python3\"\nargs = [\"-c\", \"print(open('data/sales.csv').read())\"]\n",
+        );
+        let findings = local(&root);
+        let warn = statuses_of(&findings, "inline.toml")
+            .into_iter()
+            .find_map(|s| match s {
+                Status::Warn(reason) if reason.contains("inline program") => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the inline read must warn");
+        assert!(
+            warn.contains("put the program in a project file"),
+            "the repair must name a sensible destination: {warn}"
+        );
+        assert!(
+            !warn.contains("move the program into"),
+            "the repair must not name the read target as the destination: {warn}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A hook file that was approved and live and then stops parsing is the
     /// runtime failing every tool call closed (`invalid` in hooks.rs).
     /// Reporting the parse error alone reads as ordinary bookkeeping while
@@ -3063,6 +3133,32 @@ mod tests {
             matches!(&find(&findings, "verify.toml").status, Status::Ok(s) if s == "hook on blocking turn_end"),
             "{:?}",
             find(&findings, "verify.toml").status
+        );
+        // The observer shape says the one thing separating it from the gate
+        // its author may have meant: all three weak-tier round-4 authors
+        // wrote exactly this file while stating nonzero exit would block. It
+        // must ride the message on both sides of approval, because the
+        // authoring model only ever reads the unapproved one.
+        assert!(
+            matches!(&find(&findings, "watch.toml").status,
+                Status::Err(s) if s.contains("exit status is ignored") && s.contains("blocking = true")),
+            "{:?}",
+            find(&findings, "watch.toml").status
+        );
+        let watch = root.join(".openmax/hooks/watch.toml");
+        let watch_body = std::fs::read(&watch).unwrap();
+        crate::ledger::approve_capability(
+            &data,
+            &root,
+            &watch,
+            &[crate::ledger::sha256_hex(&watch_body)],
+        )
+        .unwrap();
+        assert!(
+            matches!(&find(&local_at(&root, &data), "watch.toml").status,
+                Status::Ok(s) if s.contains("exit status is ignored") && s.contains("blocking = true")),
+            "{:?}",
+            find(&local_at(&root, &data), "watch.toml").status
         );
 
         // Approved, then rewritten without the word: a gate a human installed
