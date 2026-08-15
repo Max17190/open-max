@@ -120,6 +120,21 @@ struct ProvidersCache {
     /// None when the file was missing or unreadable at last load.
     content_hash: Option<u64>,
     map: BTreeMap<String, ProviderConfig>,
+    /// The parse error when the file existed but was not valid JSON. Kept so
+    /// resolve() and receipts can say "the file is broken" instead of the
+    /// misleading "unknown provider" an empty map produces.
+    parse_error: Option<String>,
+}
+
+/// What the last providers.json read actually found, for receipts and
+/// diagnostics: how many providers loaded, whether the file failed to
+/// parse (and why), and the content identity of the bytes read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvidersStatus {
+    pub count: usize,
+    pub names: Vec<String>,
+    pub parse_error: Option<String>,
+    pub content_hash: Option<u64>,
 }
 
 static PROVIDERS_CACHE: OnceLock<Mutex<ProvidersCache>> = OnceLock::new();
@@ -131,6 +146,7 @@ pub fn invalidate_providers_cache() {
             cache.data_dir.clear();
             cache.content_hash = None;
             cache.map.clear();
+            cache.parse_error = None;
         }
     }
 }
@@ -142,14 +158,20 @@ fn content_hash(text: &str) -> u64 {
     h.finish()
 }
 
-fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
-    let Ok(file) = serde_json::from_str::<ProvidersFile>(text) else {
-        return BTreeMap::new();
+fn parse_providers_file(text: &str) -> Result<BTreeMap<String, ProviderConfig>, String> {
+    let file = match serde_json::from_str::<ProvidersFile>(text) {
+        Ok(file) => file,
+        // The runtime stays lax about unknown keys (--check names those),
+        // but a file that is not JSON at all must keep its reason: an empty
+        // map here surfaces later as "unknown provider", which sends the
+        // repair in the wrong direction.
+        Err(e) => return Err(e.to_string()),
     };
     // A provider with an empty base_url is kept, not dropped: it still shows
     // up in listings and fails loudly at resolve time (MissingEndpoint)
     // instead of silently vanishing from the picker.
-    file.providers
+    let map = file
+        .providers
         .into_iter()
         .map(|(name, raw)| {
             let base_url = raw.base_url.trim().to_string();
@@ -177,7 +199,8 @@ fn parse_providers_file(text: &str) -> BTreeMap<String, ProviderConfig> {
                 },
             )
         })
-        .collect()
+        .collect();
+    Ok(map)
 }
 
 /// Diagnose `providers.json` for `openmax --check`. Runtime loading remains
@@ -332,25 +355,71 @@ fn unknown_keys(
 /// served stale. The read happens under the cache mutex so a slow reader
 /// holding older bytes can never publish over a newer snapshot.
 pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
+    load_snapshot(data_dir).0
+}
+
+/// One consistent read: the catalog AND its parse status from the same
+/// cache generation, under one lock hold. resolve() uses this so the error
+/// it reports describes the very bytes it looked the name up in - two
+/// separate reads could straddle a file replacement and name the wrong
+/// version.
+fn load_snapshot(data_dir: &Path) -> (BTreeMap<String, ProviderConfig>, Option<String>) {
     let path = providers_path(data_dir);
     let lock = PROVIDERS_CACHE.get_or_init(|| {
         Mutex::new(ProvidersCache {
             data_dir: PathBuf::new(),
             content_hash: None,
             map: BTreeMap::new(),
+            parse_error: None,
         })
     });
     let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let text = std::fs::read_to_string(&path).ok();
+    refresh_cache(&mut cache, data_dir, &path);
+    (cache.map.clone(), cache.parse_error.clone())
+}
+
+/// Re-read disk into the cache when the content moved. Runs under the cache
+/// mutex; both `load_providers` and `providers_status` go through here so
+/// the catalog and its status can never disagree.
+fn refresh_cache(cache: &mut ProvidersCache, data_dir: &Path, path: &Path) {
+    let text = std::fs::read_to_string(path).ok();
     let hash = text.as_deref().map(content_hash);
     if cache.data_dir == data_dir && cache.content_hash == hash {
-        return cache.map.clone();
+        return;
     }
-    let map = text.map(|t| parse_providers_file(&t)).unwrap_or_default();
+    let (map, parse_error) = match text {
+        None => (BTreeMap::new(), None),
+        Some(t) => match parse_providers_file(&t) {
+            Ok(map) => (map, None),
+            Err(e) => (BTreeMap::new(), Some(e)),
+        },
+    };
     cache.data_dir = data_dir.to_path_buf();
     cache.content_hash = hash;
-    cache.map = map.clone();
-    map
+    cache.map = map;
+    cache.parse_error = parse_error;
+}
+
+/// The current read's outcome, through the same cache (and mutex) as
+/// [`load_providers`].
+pub fn providers_status(data_dir: &Path) -> ProvidersStatus {
+    let path = providers_path(data_dir);
+    let lock = PROVIDERS_CACHE.get_or_init(|| {
+        Mutex::new(ProvidersCache {
+            data_dir: PathBuf::new(),
+            content_hash: None,
+            map: BTreeMap::new(),
+            parse_error: None,
+        })
+    });
+    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+    refresh_cache(&mut cache, data_dir, &path);
+    ProvidersStatus {
+        count: cache.map.len(),
+        names: cache.map.keys().cloned().collect(),
+        parse_error: cache.parse_error.clone(),
+        content_hash: cache.content_hash,
+    }
 }
 
 /// List provider names sorted for display.
@@ -364,8 +433,13 @@ pub enum ResolveError {
     MissingEndpoint,
     /// No model id configured for the resolved endpoint.
     MissingModel,
-    /// Settings named a provider that is not in providers.json (or the file is bad).
+    /// Settings named a provider that is not in providers.json.
     UnknownProvider(String),
+    /// providers.json exists but is not valid JSON: every provider is
+    /// unavailable until it parses. Distinct from UnknownProvider because
+    /// "add it to providers.json" sends the repair in the wrong direction
+    /// when the file itself is the problem.
+    InvalidProvidersFile(String),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -383,6 +457,10 @@ impl std::fmt::Display for ResolveError {
                 f,
                 "unknown provider '{name}': add it to ~/.openmax/providers.json or clear settings.provider"
             ),
+            ResolveError::InvalidProvidersFile(err) => write!(
+                f,
+                "~/.openmax/providers.json is invalid JSON: {err} — every provider is unavailable until it parses; fix the file (openmax --check names problems) or clear settings.provider"
+            ),
         }
     }
 }
@@ -392,7 +470,7 @@ impl std::fmt::Display for ResolveError {
 /// When `settings.provider` is set, that name must exist. Silent fallback to
 /// flat `base_url` would send traffic to the wrong endpoint.
 pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
-    let providers = load_providers(data_dir);
+    let (providers, parse_error) = load_snapshot(data_dir);
     let provider_name = settings
         .provider
         .as_ref()
@@ -401,6 +479,12 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
 
     if let Some(ref name) = provider_name {
         let Some(p) = providers.get(name) else {
+            // An empty catalog because the file failed to parse is the
+            // file's fault, not the name's: say so - from the same snapshot
+            // the lookup used.
+            if let Some(err) = parse_error {
+                return Err(ResolveError::InvalidProvidersFile(err));
+            }
             return Err(ResolveError::UnknownProvider(name.clone()));
         };
         let base_url = p.base_url.trim();
@@ -802,6 +886,38 @@ mod tests {
         };
         let err = resolve(&s, &dir).unwrap_err();
         assert!(matches!(err, ResolveError::UnknownProvider(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A providers.json that is not valid JSON parsed to an EMPTY catalog
+    /// silently, so a named provider surfaced as "unknown provider" - a
+    /// repair pointed at the wrong problem. The parse error must survive to
+    /// both the status surface and the resolve error.
+    #[test]
+    fn a_malformed_providers_file_fails_loudly_not_as_unknown_provider() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(&dir, r#"{"providers": {"xai": {"base_url": }"#);
+        let status = providers_status(&dir);
+        assert_eq!(status.count, 0);
+        let err = status.parse_error.expect("the parse error is kept, not swallowed");
+        assert!(!err.is_empty());
+
+        let s = Settings {
+            provider: Some("xai".into()),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let resolved = resolve(&s, &dir).unwrap_err();
+        assert!(
+            matches!(resolved, ResolveError::InvalidProvidersFile(_)),
+            "a broken file is the file's fault, not the name's: {resolved:?}"
+        );
+        assert!(resolved.to_string().contains("invalid JSON"), "{resolved}");
+
+        // A genuinely unknown name in a VALID file keeps the old error.
+        write_providers(&dir, r#"{"providers":{}}"#);
+        let resolved = resolve(&s, &dir).unwrap_err();
+        assert!(matches!(resolved, ResolveError::UnknownProvider(_)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
