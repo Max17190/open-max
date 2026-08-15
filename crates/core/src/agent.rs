@@ -1477,18 +1477,70 @@ async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_roo
         .or_insert(built);
 }
 
+/// One receipt body for both refreeze sites: what changed, what did NOT
+/// load (with the parse reason, so a broken write is never mistaken for a
+/// live capability), and which tool names became callable.
+fn refreeze_receipt_text(
+    changes: &[String],
+    added_tools: &[String],
+    broken: &[(std::path::PathBuf, String)],
+    project_root: &Path,
+) -> String {
+    let what = if changes.is_empty() {
+        "extension files changed".to_string()
+    } else {
+        changes.join("; ")
+    };
+    let mut note = format!("[extension refreeze: {what}.");
+    if !broken.is_empty() {
+        let listed: Vec<String> = broken
+            .iter()
+            .map(|(path, reason)| {
+                let shown = path.strip_prefix(project_root).unwrap_or(path);
+                format!("{} ({reason})", shown.display())
+            })
+            .collect();
+        note.push_str(&format!(
+            " NOT loaded: {} — not callable until fixed; verify with bash: openmax --check.",
+            listed.join("; ")
+        ));
+    }
+    if !added_tools.is_empty() {
+        note.push_str(&format!(
+            " New tools callable from your next step: {}.",
+            added_tools.join(", ")
+        ));
+    }
+    note.push(']');
+    note
+}
+
+/// Names the incoming generation adds, computed against the outgoing
+/// registry while it is still current: the tools the model does not know
+/// it has.
+fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
+    let old_names: std::collections::HashSet<&str> =
+        old.tools.iter().map(|s| s.name.as_str()).collect();
+    new.tools
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|name| !old_names.contains(name))
+        .map(str::to_string)
+        .collect()
+}
+
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
-) {
+) -> Option<String> {
     let mut snapshot = {
         let root = project_root.to_path_buf();
         let dd = core.data_dir.clone();
         match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&dd, &root)).await
         {
             Ok(snapshot) => snapshot,
-            Err(_) => return,
+            Err(_) => return None,
         }
     };
     let files = std::mem::take(&mut snapshot.files);
@@ -1538,27 +1590,29 @@ async fn refreeze_if_extensions_changed(
                 }
             }
         }
-        return;
+        return None;
     }
     let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
-        return;
+        return None;
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
     let counts = (registry.tools.len(), registry.skills.len());
-    let applied = {
+    let broken = registry.broken.clone();
+    let applied_added = {
         let mut sessions_map = core.sessions.lock().await;
         match sessions_map.get_mut(session_id) {
             // Re-check under the lock: this turn owns `running`, so nothing
             // else mutates the session, but stay defensive about empty
             // (taken) state.
             Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
+                let added = added_tool_names(&data.registry, &registry);
                 apply_freeze(core, session_id, data, registry, prompt, breakdown);
-                true
+                Some(added)
             }
-            _ => false,
+            _ => None,
         }
     };
-    if applied {
+    if let Some(added_tools) = applied_added {
         // Turn start: the change happened while no turn was running, so it
         // is external to this session (a human, git, an installer). Claims a
         // broken ledger left queued land first, under their own actors.
@@ -1569,12 +1623,19 @@ async fn refreeze_if_extensions_changed(
             Some((files, crate::ledger::Actor::External)),
         )
         .await;
+        let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, project_root);
         core.send_agent(session_id, AgentEvent::Refrozen {
             tools: counts.0,
             skills: counts.1,
             changes,
         });
+        // The Refrozen event reaches the UI; the returned receipt is for the
+        // MODEL. The caller appends it to the turn's transcript, closing the
+        // same gap #184 closed mid-turn: an extension installed by a human
+        // between turns was announced on screen and invisible to the model.
+        return Some(receipt);
     }
+    None
 }
 
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
@@ -1740,17 +1801,8 @@ async fn refreeze_between_iterations(
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
     let counts = (new_registry.tools.len(), new_registry.skills.len());
-    // Names the swap will add, computed against the outgoing generation while
-    // it is still here: these are the tools the model does not know it has.
-    let old_names: std::collections::HashSet<&str> =
-        registry.tools.iter().map(|s| s.name.as_str()).collect();
-    let added_tools: Vec<String> = new_registry
-        .tools
-        .iter()
-        .map(|s| s.name.as_str())
-        .filter(|name| !old_names.contains(name))
-        .map(str::to_string)
-        .collect();
+    let added_tools = added_tool_names(registry, &new_registry);
+    let broken = new_registry.broken.clone();
     let new_registry = Arc::new(new_registry);
     if messages.first().is_some_and(|m| m.role == "system") {
         messages[0] = ChatMessage::system(prompt);
@@ -1787,19 +1839,10 @@ async fn refreeze_between_iterations(
     // iteration's last tool result, where the model reads next. One line,
     // only when extension bytes actually changed.
     if let Some(last_tool) = messages.iter_mut().rev().find(|m| m.role == "tool") {
-        let what = if changes.is_empty() {
-            "extension files changed".to_string()
-        } else {
-            changes.join("; ")
-        };
-        let mut note = format!("\n[extension refreeze: {what}.");
-        if !added_tools.is_empty() {
-            note.push_str(&format!(
-                " New tools callable from your next step: {}.",
-                added_tools.join(", ")
-            ));
-        }
-        note.push(']');
+        let note = format!(
+            "\n{}",
+            refreeze_receipt_text(&changes, &added_tools, &broken, project_root)
+        );
         match &mut last_tool.content {
             Some(content) => content.push_str(&note),
             None => last_tool.content = Some(note.trim_start().to_string()),
@@ -1934,7 +1977,7 @@ async fn run_loop(
 
     // Self-modification: pick up extension files written since the last
     // freeze before this turn's schemas and prompt are locked in.
-    refreeze_if_extensions_changed(core, session_id, project_root).await;
+    let turn_start_receipt = refreeze_if_extensions_changed(core, session_id, project_root).await;
 
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
@@ -1968,6 +2011,17 @@ async fn run_loop(
         }
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
+
+    if let Some(receipt) = turn_start_receipt {
+        // The model-facing half of the turn-start refreeze (the Refrozen
+        // event is UI chrome). Inserted BEFORE the user prompt so the
+        // endpoint-failure path's prompt-pop still removes the prompt, while
+        // the receipt - which records a refreeze that stays applied - stays.
+        // Pure suffix growth relative to the previous turn: prefix-stable.
+        let msgs = guard.messages();
+        let at = msgs.len().saturating_sub(1);
+        msgs.insert(at, ChatMessage::user(receipt));
+    }
 
     // Discovered at turn start and re-discovered after any iteration whose
     // mutating call succeeded: a deny the agent just wrote must be in force
@@ -4242,6 +4296,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A broken tool file still refreezes (its bytes are in the fingerprint)
+    /// and the receipt says the file did NOT load, with the parse reason -
+    /// otherwise "file changed" reads as "tool is live" and the model calls
+    /// a tool that does not exist.
+    #[tokio::test]
+    async fn midturn_refreeze_names_a_broken_file_instead_of_implying_it_loaded() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let mut data = build_session_data(&core, id, &project);
+            data.messages.push(ChatMessage::user("write a deploy tool"));
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        // The iteration that wrote the file left its tool result last, where
+        // the receipt rides.
+        messages.push(ChatMessage {
+            role: "tool".into(),
+            content: Some("wrote .openmax/tools/deploy.toml".into()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".into()),
+        });
+
+        // Missing required field `command`: parses as TOML, fails the spec.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\n",
+        )
+        .unwrap();
+        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(registry.get("deploy").is_none(), "a broken file must not load");
+        let tool_msg = messages.iter().rev().find(|m| m.role == "tool").unwrap();
+        let content = tool_msg.content.as_deref().unwrap();
+        assert!(content.contains("NOT loaded"), "receipt must flag the failure: {content}");
+        assert!(content.contains("deploy.toml"), "receipt must name the file: {content}");
+        assert!(
+            content.contains("command"),
+            "receipt must carry the parse reason (missing field): {content}"
+        );
+
+        // The model calls the tool it believes it wrote: the error names the
+        // parse failure, not a bare unknown-tool.
+        let out = registry
+            .execute(
+                "deploy",
+                &serde_json::json!({}),
+                &core.data_dir,
+                &project,
+                tools::OutputCaps::default(),
+                Arc::new(crate::state::CancelToken::default()),
+            )
+            .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("did NOT load"), "{}", out.output);
+        assert!(out.output.contains("command"), "{}", out.output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The agent-native loop: a tool written mid-session is frozen in at the
     /// next turn start with no human action, and an unchanged disk is a no-op
     /// (prompt cache stays warm).
@@ -4260,22 +4384,28 @@ mod tests {
             core.sessions.lock().await.insert(id.to_string(), data);
         }
 
-        // Unchanged disk: no-op, no event, same registry Arc.
+        // Unchanged disk: no-op, no event, same registry Arc, no receipt.
         let before = core.sessions.lock().await.get(id).unwrap().registry.clone();
-        refreeze_if_extensions_changed(&core, id, &project).await;
+        assert!(refreeze_if_extensions_changed(&core, id, &project).await.is_none());
         {
             let map = core.sessions.lock().await;
             assert!(Arc::ptr_eq(&map.get(id).unwrap().registry, &before), "no-op must not rebuild");
         }
 
-        // The agent writes a tool; the next turn start must freeze it in.
+        // The agent writes a tool; the next turn start must freeze it in and
+        // hand back a model-facing receipt naming the tool (the Refrozen
+        // event alone is frontend chrome - the #184 gap at turn start).
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
             "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
-        refreeze_if_extensions_changed(&core, id, &project).await;
+        let receipt = refreeze_if_extensions_changed(&core, id, &project)
+            .await
+            .expect("an applied turn-start refreeze returns its receipt");
+        assert!(receipt.contains("[extension refreeze:"), "{receipt}");
+        assert!(receipt.contains("deploy"), "the receipt names the added tool: {receipt}");
         {
             let map = core.sessions.lock().await;
             let data = map.get(id).unwrap();
