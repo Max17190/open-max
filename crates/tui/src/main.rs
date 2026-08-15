@@ -49,8 +49,10 @@ options:
                          in effect
       --approve <path>   approve the exact current content of a capability file
                          and of the project-local code it runs
-      --forget <path>    stop expecting an approved capability file to exist
-                         (after deliberately deleting one)
+      --forget <path>    stop expecting an approved HOOK file to exist (after
+                         deliberately deleting one; a missing approved hook
+                         fails closed). Tools never fail closed: a deleted
+                         approved tool needs nothing forgotten
       --run-examples     with --check, execute each tool's [example] once.
                          Unsandboxed: needs a trusted project and a tool file
                          approved with --approve, and honors permissions and
@@ -433,10 +435,36 @@ async fn main() -> std::io::Result<()> {
                         .map(|s| format!("  session {s}"))
                         .unwrap_or_default();
                     // One approval act can bless a manifest and the code it
-                    // runs; the audit has to show that it covered both.
+                    // runs; the audit has to show that it covered both - and
+                    // whether their bytes are actually stored. Approvals
+                    // recorded before objects were stored at approval time
+                    // (or by hash alone) have nothing to restore, and the
+                    // footer's recipe must not imply otherwise.
                     let bound = match r.also.len() {
                         0 => String::new(),
-                        n => format!("  (+{n} bound file{})", if n == 1 { "" } else { "s" }),
+                        n => {
+                            let stored = r
+                                .also
+                                .iter()
+                                .filter(|sha| {
+                                    matches!(
+                                        *states.entry(sha.as_str()).or_insert_with(|| {
+                                            open_max_core::ledger::object_state(&data_dir, &project, sha)
+                                        }),
+                                        ObjectState::Intact
+                                    )
+                                })
+                                .count();
+                            let plural = if n == 1 { "" } else { "s" };
+                            if stored == n {
+                                format!("  (+{n} bound file{plural})")
+                            } else {
+                                format!(
+                                    "  (+{n} bound file{plural}, {} not stored: approved before bytes were kept)",
+                                    n - stored
+                                )
+                            }
+                        }
                     };
                     let what = match (r.kind, short) {
                         (Kind::Change, Some(sha)) => format!("change   {sha} {where_}"),

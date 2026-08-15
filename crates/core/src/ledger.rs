@@ -1283,6 +1283,25 @@ fn approve(
                         p.display()
                     ));
                 }
+                // The ledger promises `cp objects/<sha> <path>` restores what
+                // an approval blessed; until now approvals stored no object
+                // at all, so an approved manifest deleted before any freeze
+                // saw it - and EVERY bound script, which no freeze ever
+                // reads - was unrestorable while --ledger said otherwise
+                // (dogfood: an 86-second hunt for an object that could not
+                // exist). Store the vouched manifest bytes, and each bound
+                // file whose on-disk bytes hash to a sha the human vouched.
+                store_object(&dir, vouched, &bytes)?;
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    for code in manifest_code_source(p, text, project_root) {
+                        let (Some(sha), Ok(code_bytes)) = (code.sha256.as_deref(), std::fs::read(&code.path)) else {
+                            continue;
+                        };
+                        if shas.iter().any(|s| s == sha) && sha256_hex(&code_bytes) == sha {
+                            store_object(&dir, sha, &code_bytes)?;
+                        }
+                    }
+                }
                 std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|text| hook_record_source(p, text, project_root))
@@ -1475,6 +1494,22 @@ pub enum ObjectState {
     Intact,
     Missing,
     Corrupt,
+}
+
+/// Write `bytes` as `objects/<sha>` unless a valid object is already there.
+/// Never trusts a pre-existing object blindly: one that does not hash to its
+/// name is replaced with the authentic bytes.
+fn store_object(dir: &Path, sha: &str, bytes: &[u8]) -> Result<(), String> {
+    let object = dir.join("objects").join(sha);
+    let valid = std::fs::read(&object)
+        .map(|existing| sha256_hex(&existing) == sha)
+        .unwrap_or(false);
+    if valid {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir.join("objects"))
+        .map_err(|e| format!("cannot create {}: {e}", dir.join("objects").display()))?;
+    crate::sessions::write_atomic(&object, bytes)
 }
 
 pub fn object_state(data_dir: &Path, project_root: &Path, sha: &str) -> ObjectState {
@@ -2058,6 +2093,38 @@ mod tests {
         let sha = records[0].sha256.clone().unwrap();
         let object = project_dir(&data, &root).join("objects").join(&sha);
         assert_eq!(std::fs::read_to_string(object).unwrap(), "name = \"a\"");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An approval stores what it blessed: the manifest AND every bound
+    /// file, so `cp objects/<sha> <path>` restores exactly what a human
+    /// approved. Before, approvals stored nothing (only freezes did, and a
+    /// freeze never reads a bound script), while --ledger promised restore.
+    #[test]
+    fn an_approval_stores_the_manifest_and_bound_code_as_objects() {
+        let data = temp("appr-obj-data");
+        let root = temp("appr-obj-proj");
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let script = root.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let manifest = root.join(".openmax/tools/t.toml");
+        std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
+        let manifest_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
+        let script_sha = sha256_hex(&std::fs::read(&script).unwrap());
+        approve_capability(&data, &root, &manifest, &[manifest_sha.clone(), script_sha.clone()]).unwrap();
+        let objects = project_dir(&data, &root).join("objects");
+        assert_eq!(
+            std::fs::read(objects.join(&manifest_sha)).unwrap(),
+            std::fs::read(&manifest).unwrap(),
+            "the approved manifest bytes are restorable"
+        );
+        assert_eq!(
+            std::fs::read(objects.join(&script_sha)).unwrap(),
+            std::fs::read(&script).unwrap(),
+            "the approved bound script bytes are restorable"
+        );
+        assert!(matches!(object_state(&data, &root, &script_sha), ObjectState::Intact));
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }

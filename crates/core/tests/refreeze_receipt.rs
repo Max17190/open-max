@@ -644,3 +644,42 @@ async fn a_rejected_memory_name_is_never_claimed_indexed() {
     assert!(!system.contains("Invalid-Stem"), "the prompt omits it: {system}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+async fn removing_an_approved_tool_says_the_approval_outlives_it() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest_path = project.join(".openmax/tools/echoer.toml");
+    std::fs::write(&manifest_path, "name = \"echoer\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n").unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&manifest_path).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &manifest_path, &[sha]).unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "bash",
+            serde_json::json!({ "command": "rm .openmax/tools/echoer.toml" }),
+        ),
+        completion_with_text("gone"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "remove-approved", &project, "remove it").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("Removed approved tools: echoer"), "{content}");
+    assert!(content.contains("the approval outlives the file"), "{content}");
+    assert!(content.contains("nothing needs forgetting"), "{content}");
+    let _ = std::fs::remove_dir_all(dir);
+}

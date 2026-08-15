@@ -1658,6 +1658,14 @@ fn refreeze_receipt_text(
             listed.join(", ")
         ));
     }
+    if !added.removed_approved.is_empty() {
+        note.push_str(&format!(
+            " Removed approved tools: {} — the approval outlives the file (identical bytes at \
+             that path would run without a card); tools never fail closed, so nothing needs \
+             forgetting (openmax --forget is for hooks).",
+            added.removed_approved.join(", ")
+        ));
+    }
     if let Some((added_m, updated_m, removed_m)) = &added.memory {
         let mut parts = Vec::new();
         if !added_m.is_empty() {
@@ -1698,6 +1706,11 @@ struct AddedTools {
     /// generations know their memory files. A memory write is now what
     /// refreezes; the receipt says the fact is indexed from the next step.
     memory: Option<(Vec<String>, Vec<String>, Vec<String>)>,
+    /// External tools present before and gone now whose bytes a human had
+    /// approved. The approval outlives the file (content-addressed), tools
+    /// never fail closed, and --forget is for hooks: say all three, or the
+    /// agent hands the human a chore that does nothing (dogfood).
+    removed_approved: Vec<String>,
 }
 
 fn classify_added_tools(
@@ -1734,11 +1747,23 @@ fn classify_added_tools(
         }
         _ => None,
     };
+    let mut removed_approved: Vec<String> = Vec::new();
+    for old_spec in &old_registry.tools {
+        let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
+        if new_registry.get(&old_spec.name).is_some() {
+            continue;
+        }
+        if crate::ledger::is_approved(data_dir, project_root, &old_ext.source_sha256) {
+            removed_approved.push(old_spec.name.clone());
+        }
+    }
+    removed_approved.sort();
     let mut out = AddedTools {
         approved: Vec::new(),
         unapproved: Vec::new(),
         modified_unapproved: Vec::new(),
         memory,
+        removed_approved,
     };
     for name in added_tool_names(old_registry, new_registry) {
         match unapproved_capability(new_registry, data_dir, project_root, &name) {
