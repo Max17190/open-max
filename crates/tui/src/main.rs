@@ -609,6 +609,16 @@ async fn main() -> std::io::Result<()> {
                 if !code.is_empty() {
                     println!("editing either revokes this approval; re-run --approve after any change");
                 }
+                // Absolute for the dir comparison: the hook-dir check
+                // matches parents against absolute discovery dirs, and the
+                // CLI accepts a project-relative path.
+                let shape_path =
+                    if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
+                if let Some(line) =
+                    open_max_core::hooks::approved_shape_line(&shape_path, &project, &bytes)
+                {
+                    println!("{line}");
+                }
                 std::process::exit(0);
             }
             Err(e) => {

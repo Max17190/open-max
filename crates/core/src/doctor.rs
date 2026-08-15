@@ -901,7 +901,7 @@ impl ExampleGates {
             // toward stripping the session marker instead.
             return Err(format!(
                 "unapproved source; a human can run `openmax --approve {}`, or make the tool's first call in a session and approve the card it raises: it covers these exact bytes",
-                ext.source_path.display()
+                shell_quote(&ext.source_path)
             ));
         }
         // A turn in `ask` mode puts every mutating call in front of a person.

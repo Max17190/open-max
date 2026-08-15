@@ -908,6 +908,27 @@ fn resolve_for_repair(path: &Path) -> Option<PathBuf> {
 /// Whether this path is a hook manifest: one of the two directories hooks load
 /// from, holding a `.toml`. Used to reconcile approved paths that are gone,
 /// where there is no file left to parse.
+/// The one-line shape of a hook manifest for surfaces outside this crate
+/// (the `--approve` receipt): what the human just activated, in the loop's
+/// own words, from the same bytes the approval hashed. None for anything that
+/// is not a hook manifest or does not parse; the approval output already
+/// carries the parse story elsewhere. Round 4's dogfooding is the reason the
+/// turn_end observer spells out what it will not do: all six weak-tier
+/// authoring runs handed a human an observer described as a completion gate,
+/// and the human's approval is the last place the mismatch can be caught.
+pub fn approved_shape_line(path: &Path, project_root: &Path, bytes: &[u8]) -> Option<String> {
+    if !is_hook_manifest(path, project_root) {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let hook = parse_hook_source(path, text).ok()?;
+    Some(if hook.event == HookEvent::TurnEnd && !hook.blocking {
+        "this records a hook on turn_end that observes only: exit status is ignored, and `blocking = true` is what gates completion".to_string()
+    } else {
+        format!("this records a hook on {}", shape_name(hook.event.as_str(), hook.blocking))
+    })
+}
+
 pub(crate) fn is_hook_manifest(path: &Path, project_root: &Path) -> bool {
     manifest_in_dirs(path, &hook_dirs(project_root))
 }

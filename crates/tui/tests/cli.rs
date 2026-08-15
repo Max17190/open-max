@@ -215,6 +215,29 @@ fn approve_names_every_file_it_blesses() {
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("approved .openmax/hooks/gate.toml"), "{stdout}");
     assert!(stdout.contains("gate.sh"), "the code it runs must be named: {stdout}");
+    assert!(
+        stdout.contains("this records a hook on pre_tool_use"),
+        "the receipt must say what shape was activated: {stdout}"
+    );
+
+    // The shape a human most needs to see is the one an agent most often
+    // mis-describes: a turn_end file without `blocking` handed over as a
+    // completion gate. The receipt says what it will not do.
+    std::fs::write(
+        hooks.join("watch.toml"),
+        "event = \"turn_end\"\ncommand = \"./gate.sh\"\n",
+    )
+    .unwrap();
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/watch.toml"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("observes only") && stdout.contains("`blocking = true`"),
+        "approving a turn_end observer must say exit status is ignored: {stdout}"
+    );
 
     // The pair is live, and rewriting the script alone revokes it.
     let out = cmd(&project, &home).arg("--check").output().unwrap();
