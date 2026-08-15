@@ -355,6 +355,15 @@ fn unknown_keys(
 /// served stale. The read happens under the cache mutex so a slow reader
 /// holding older bytes can never publish over a newer snapshot.
 pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
+    load_snapshot(data_dir).0
+}
+
+/// One consistent read: the catalog AND its parse status from the same
+/// cache generation, under one lock hold. resolve() uses this so the error
+/// it reports describes the very bytes it looked the name up in - two
+/// separate reads could straddle a file replacement and name the wrong
+/// version.
+fn load_snapshot(data_dir: &Path) -> (BTreeMap<String, ProviderConfig>, Option<String>) {
     let path = providers_path(data_dir);
     let lock = PROVIDERS_CACHE.get_or_init(|| {
         Mutex::new(ProvidersCache {
@@ -366,7 +375,7 @@ pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
     });
     let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
     refresh_cache(&mut cache, data_dir, &path);
-    cache.map.clone()
+    (cache.map.clone(), cache.parse_error.clone())
 }
 
 /// Re-read disk into the cache when the content moved. Runs under the cache
@@ -461,7 +470,7 @@ impl std::fmt::Display for ResolveError {
 /// When `settings.provider` is set, that name must exist. Silent fallback to
 /// flat `base_url` would send traffic to the wrong endpoint.
 pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
-    let providers = load_providers(data_dir);
+    let (providers, parse_error) = load_snapshot(data_dir);
     let provider_name = settings
         .provider
         .as_ref()
@@ -471,8 +480,9 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     if let Some(ref name) = provider_name {
         let Some(p) = providers.get(name) else {
             // An empty catalog because the file failed to parse is the
-            // file's fault, not the name's: say so.
-            if let Some(err) = providers_status(data_dir).parse_error {
+            // file's fault, not the name's: say so - from the same snapshot
+            // the lookup used.
+            if let Some(err) = parse_error {
                 return Err(ResolveError::InvalidProvidersFile(err));
             }
             return Err(ResolveError::UnknownProvider(name.clone()));
