@@ -524,6 +524,28 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 .map(|a| a.is_gate())
                 .unwrap_or_else(|| approvals.was_live(path))
         });
+        // An unparseable file that held its stem and was approved once is the
+        // loop failing every tool call closed (`invalid` in hooks.rs, which
+        // blocks whatever the approved shape was, because broken bytes name
+        // no event): its parse error alone reads as bookkeeping while the
+        // session refuses to run. After shadow marking, because a broken file
+        // an earlier valid stem shadows never runs and must not claim to be
+        // blocking anything.
+        for (i, (finding, _)) in hooks_found.iter_mut().enumerate() {
+            if hook_shadows.contains(&i)
+                || hook_capped.contains(&i)
+                || hook_events.get(i).copied().flatten().is_some()
+                || !approvals.was_live(&finding.path)
+            {
+                continue;
+            }
+            if let Status::Err(reason) = &finding.status {
+                finding.status = Status::Err(format!(
+                    "{reason}; this file was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
+                    finding.path.display()
+                ));
+            }
+        }
     }
     hook_extras.extend(clamp_findings(
         "hook",
@@ -2737,6 +2759,49 @@ mod tests {
     /// developer's machine and its files are not part of any assertion here.
     fn local_at(root: &Path, data: &Path) -> Vec<Finding> {
         check_at(root, data).into_iter().filter(|f| f.path.starts_with(root)).collect()
+    }
+
+    /// A hook file that was approved and live and then stops parsing is the
+    /// runtime failing every tool call closed (`invalid` in hooks.rs).
+    /// Reporting the parse error alone reads as ordinary bookkeeping while
+    /// the session refuses to run every call; the same broken bytes at a path
+    /// no human approved really are ordinary, and must not borrow the claim.
+    #[test]
+    fn a_broken_once_live_hook_file_names_its_consequence() {
+        let root = temp_project();
+        let data = root.join("data");
+        let hook = root.join(".openmax/hooks/gate.toml");
+        write(hook.clone(), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n");
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap());
+        crate::ledger::approve_capability(&data, &root, &hook, &[sha]).unwrap();
+        // Broken in place: the bytes no longer parse, the approval stands.
+        write(hook.clone(), "event = \"pre_tool_use\ncommand = broken");
+        let findings = local_at(&root, &data);
+        match &find(&findings, "gate.toml").status {
+            Status::Err(reason) => {
+                assert!(
+                    reason.contains("every tool call fails closed"),
+                    "the report must say what the session is doing: {reason}"
+                );
+                assert!(reason.contains("--approve"), "{reason}");
+            }
+            other => panic!("a broken live hook must err with its consequence: {other:?}"),
+        }
+
+        // The same broken bytes never approved never loaded, so they block
+        // nothing and the finding must not claim they do.
+        write(
+            root.join(".openmax/hooks/scratch.toml"),
+            "event = \"pre_tool_use\ncommand = broken",
+        );
+        let findings = local_at(&root, &data);
+        match &find(&findings, "scratch.toml").status {
+            Status::Err(reason) => {
+                assert!(!reason.contains("fails closed"), "an inert file must stay ordinary: {reason}")
+            }
+            other => panic!("broken bytes are still an error: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Only `openmax --approve`, run outside a session, activates a hook:
