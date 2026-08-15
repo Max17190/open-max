@@ -3183,7 +3183,21 @@ async fn request_approval(
     let (tx, rx) = oneshot::channel::<bool>();
     core.approvals.lock().unwrap().insert(approval_id.clone(), tx);
     let summary = crate::registry::summarize_call(name, args);
-    let detail = approval_detail(args);
+    let mut detail = approval_detail(args);
+    if let Some(source) = source {
+        // Advisory evidence, prepended so card clipping cannot hide it: a
+        // sandboxed probe of exactly these bytes passed. The receipt grants
+        // nothing - approving still grants real host authority - and any
+        // edit to the manifest or its code orphans it.
+        if crate::doctor::probe_passed(&core.data_dir, &source.shas) {
+            detail = match detail.is_empty() {
+                true => "probe: example passed in sandbox (no network, writes confined)".into(),
+                false => format!(
+                    "probe: example passed in sandbox (no network, writes confined) | {detail}"
+                ),
+            };
+        }
+    }
     core.send_agent(session_id, AgentEvent::ApprovalRequest {
         approval_id: approval_id.clone(),
         name: name.to_string(),
@@ -4500,6 +4514,82 @@ mod tests {
             "the receipt must name what changed: {receipt:?}"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The unapproved-source card carries the probe evidence when a
+    /// sandboxed example of exactly these bytes passed - prepended to the
+    /// detail so clipping cannot hide it - and stays evidence-free for a
+    /// vector no probe has proven.
+    #[tokio::test]
+    async fn the_approval_card_carries_probe_evidence_for_exact_bytes() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let sha = "a".repeat(64);
+        std::fs::create_dir_all(core.data_dir.join("probes")).unwrap();
+        std::fs::write(
+            core.data_dir.join("probes").join(format!("{sha}.json")),
+            serde_json::json!({
+                "tool": "docsearch",
+                "shas": [sha],
+                "verdict": "example passed in sandbox (no network, writes confined)",
+                "unix_time": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let drive = |shas: Vec<String>, core: Arc<Core>| async move {
+            let source = UnapprovedCapability {
+                path: ".openmax/tools/docsearch.toml".into(),
+                sha256: shas[0].clone(),
+                source_path: "/tmp/docsearch.toml".into(),
+                shas,
+            };
+            request_approval(
+                &core,
+                "probe-card",
+                "docsearch",
+                &serde_json::json!({"query": "x"}),
+                "unapproved_source",
+                Some(&source),
+                &Arc::new(crate::state::CancelToken::default()),
+            )
+            .await
+        };
+
+        // Matching vector: the card carries the evidence.
+        let task = tokio::spawn(drive(vec![sha.clone()], core.clone()));
+        let detail = loop {
+            let env = rx.recv().await.expect("event");
+            if let AgentEvent::ApprovalRequest { approval_id, detail, .. } = env.event {
+                core.respond_approval(&approval_id, false);
+                break detail;
+            }
+        };
+        let _ = task.await;
+        assert!(
+            detail.starts_with("probe: example passed in sandbox"),
+            "matching bytes carry the evidence first: {detail}"
+        );
+
+        // A different vector (edited bytes): no evidence.
+        let other = "b".repeat(64);
+        let task = tokio::spawn(drive(vec![other], core.clone()));
+        let detail = loop {
+            let env = rx.recv().await.expect("event");
+            if let AgentEvent::ApprovalRequest { approval_id, detail, .. } = env.event {
+                core.respond_approval(&approval_id, false);
+                break detail;
+            }
+        };
+        let _ = task.await;
+        assert!(
+            !detail.contains("probe:"),
+            "unproven bytes must show no evidence: {detail}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
