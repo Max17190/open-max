@@ -146,7 +146,10 @@ tool = "bash"
 ```
 
 External tools are narrower than bash by construction: every tool's first
-run needs your approval of its exact bytes, its environment is scrubbed to
+run needs your approval of its exact bytes (`openmax --approve` and
+`--trust-project` refuse agent-spawned processes AND callers with no
+terminal, so an agent cannot launder a grant through `env -u` in bash;
+automation a human runs may set `OPENMAX_HUMAN_ATTEST=1`), its environment is scrubbed to
 a baseline plus the `env` names its approved manifest declares, and
 unapproved tool code can only ever execute as a sandboxed probe (no
 network, writes confined) via `openmax --check --run-examples`.

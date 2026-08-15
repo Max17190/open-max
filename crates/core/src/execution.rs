@@ -526,6 +526,12 @@ pub(crate) async fn run_process(
     // trust grant through a child process it starts. Applied after any
     // env_clear so the marker survives the scrub.
     command.env("OPENMAX_SESSION", "1");
+    // The human attestation must never reach an agent-spawned child: a
+    // session launched under an attested shell (CI, an eval rig) would
+    // otherwise hand every bash call a ready-made bypass - unset the marker,
+    // inherit the attestation, grant authority. Stripped unconditionally;
+    // no child of the harness is the human.
+    command.env_remove("OPENMAX_HUMAN_ATTEST");
     match request.stdin {
         StdinMode::Null => {
             command.stdin(std::process::Stdio::null());
@@ -932,6 +938,27 @@ mod tests {
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
+    }
+
+    /// The human attestation never reaches an agent-spawned child, even when
+    /// the harness itself was launched under one: otherwise a bash call
+    /// could unset the session marker and inherit a ready-made bypass.
+    #[tokio::test]
+    async fn spawned_processes_never_inherit_the_human_attestation() {
+        std::env::set_var("OPENMAX_HUMAN_ATTEST", "1");
+        let request = ProcessRequest {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf '[%s]' \"$OPENMAX_HUMAN_ATTEST\"".into()],
+            cwd: std::env::temp_dir(),
+            stdin: StdinMode::Null,
+            timeout: Duration::from_secs(5),
+            capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
+            sandbox: None,
+            env_allowlist: None,
+        };
+        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        std::env::remove_var("OPENMAX_HUMAN_ATTEST");
+        assert_eq!(String::from_utf8_lossy(&output.stdout.head), "[]");
     }
 
     fn sandboxed_request(scratch: &Path, script: &str) -> ProcessRequest {

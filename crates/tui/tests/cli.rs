@@ -55,7 +55,56 @@ fn cmd(project: &Path, home: &Path) -> Command {
     // A developer dogfooding openmax runs cargo test from inside a session;
     // the harness marks such children and trust would refuse (#83).
     c.env_remove("OPENMAX_SESSION");
+    // Tests are human-run automation with no terminal: attest it, so
+    // --approve / --trust-project (which now require a tty otherwise) run.
+    c.env("OPENMAX_HUMAN_ATTEST", "1");
     c
+}
+
+/// The authority-granting commands refuse a caller with no terminal and no
+/// attestation, even with the session marker absent: `env -u
+/// OPENMAX_SESSION openmax --approve` from an agent's bash (piped stdio, no
+/// tty) is exactly this shape, and round-4 dogfooding watched an agent
+/// reach for it on its first attempt.
+#[test]
+fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
+    let (project, home) = fresh_dirs("noterminal");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(project.join("gate.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n",
+    )
+    .unwrap();
+    let bare = |args: &[&str]| {
+        let mut c = cmd(&project, &home);
+        c.env_remove("OPENMAX_HUMAN_ATTEST");
+        c.stdin(std::process::Stdio::null());
+        c.args(args).output().unwrap()
+    };
+    let out = bare(&["--approve", ".openmax/hooks/gate.toml"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no terminal"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = bare(&["--trust-project", "-p", "hi"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    // The attestation (what cmd() sets) is what lets test automation through.
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
@@ -1090,6 +1139,8 @@ fn recall_reads_history_when_settings_are_unreadable() {
         .args(["--trust-project", "-p", "hello"])
         .current_dir(&project)
         .env("HOME", &home)
+        // Trust is a human act; this test stands in for the human.
+        .env("OPENMAX_HUMAN_ATTEST", "1")
         .output()
         .unwrap();
     assert!(!refused.status.success(), "a turn must still fail closed on unreadable settings");
@@ -1192,5 +1243,42 @@ fn a_new_session_reuses_the_previous_session_prefix() {
         a["messages"][0], b["messages"][0],
         "the system prompt must be identical across sessions, or every new session \
          pays a full prefill"
+    );
+}
+
+/// Greptile's repro: a session launched under an attested shell must not
+/// hand its bash children a bypass. The child unsets the marker; the
+/// attestation must already be gone; --approve refuses for lack of a
+/// terminal.
+#[test]
+fn an_attested_parent_does_not_let_a_bash_child_approve() {
+    let (project, home) = fresh_dirs("attest-inherit");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(project.join("gate.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(hooks.join("gate.toml"), "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+    // The scripted turn: one bash call that does exactly what the dogfood
+    // agent did, from a parent that IS attested (cmd() sets it).
+    let bypass = format!(
+        "env -u OPENMAX_SESSION {} --approve .openmax/hooks/gate.toml < /dev/null; echo \"exit=$?\"",
+        openmax_bin()
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": bypass })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "go"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("exit=3"), "the child's --approve must refuse: {stderr}");
+    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&ledger.stdout).contains("approved"),
+        "no approval may land from an agent's bash child"
     );
 }

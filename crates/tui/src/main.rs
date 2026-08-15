@@ -202,6 +202,42 @@ fn flush_prompt_tokens(
     Ok(())
 }
 
+/// Whether a human is standing behind an authority-GRANTING command
+/// (`--approve`, `--trust-project`). Two walls, both required to pass:
+///
+/// 1. Not agent-spawned: the `OPENMAX_SESSION` marker every child carries.
+///    Round-4 dogfooding showed this alone is one `env -u` away - an agent
+///    hitting the in-session refusal reached for `env -u OPENMAX_SESSION
+///    openmax --approve` on its FIRST attempt, and the ledger recorded the
+///    result as a human act.
+/// 2. An interactive terminal on stdin - the same wall `--forget` and
+///    `--ledger-repair` already stand behind. A `bash` tool call has piped
+///    stdio and no tty; the marker can be unset, a terminal cannot be
+///    conjured without allocating a pty (the documented ~20-line ceiling,
+///    now the SAME ceiling for granting authority as for removing it).
+///
+/// Human automation (CI, eval rigs, `cargo test`) has no terminal and is
+/// still a human act: `OPENMAX_HUMAN_ATTEST=1` states that explicitly. It
+/// is honored only when the session marker is ABSENT, and it is a variable
+/// a human sets on purpose - never one a session exports to its children -
+/// so an agent must both unset the marker AND forge the attestation, which
+/// is a deliberate act with a name, not a stumbled-into one-liner.
+fn require_human(what: &str, repair: &str) {
+    if std::env::var_os("OPENMAX_SESSION").is_some() {
+        eprintln!(
+            "openmax: {what} is a human action: this process was started from an agent session; ask the user to run `{repair}`"
+        );
+        std::process::exit(3);
+    }
+    let attested = std::env::var_os("OPENMAX_HUMAN_ATTEST").is_some_and(|v| v == "1");
+    if !attested && !std::io::stdin().is_terminal() {
+        eprintln!(
+            "openmax: {what} is a human action and this process has no terminal; run `{repair}` from an interactive shell (automation a human runs may set OPENMAX_HUMAN_ATTEST=1)"
+        );
+        std::process::exit(3);
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = match parse_args() {
@@ -556,14 +592,9 @@ async fn main() -> std::io::Result<()> {
     }
 
     if let Some(path) = &cli.approve {
-        // Approval is a human action, exactly like trust: agent-spawned
-        // processes are refused.
-        if std::env::var_os("OPENMAX_SESSION").is_some() {
-            eprintln!(
-                "openmax: approvals are human actions: this process was started from an agent session; ask the user to run `openmax --approve {path}`"
-            );
-            std::process::exit(3);
-        }
+        // Approval is a human action, exactly like trust; see require_human
+        // for the two walls and why the marker alone was not one.
+        require_human("approval", &format!("openmax --approve {path}"));
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let file = std::path::Path::new(path);
         let bytes = match std::fs::read(file) {
@@ -1306,6 +1337,12 @@ fn ensure_project_trust(
                 project.display()
             ));
         }
+        // Same second wall as --approve: a human at a terminal, or an
+        // explicit attestation for automation a human runs.
+        require_human(
+            "a trust grant",
+            &format!("openmax --trust-project (in {})", project.display()),
+        );
         let trusted = open_max_core::trust::trust_project(data_dir, project)?;
         eprintln!("openmax: trusted project {}", trusted.display());
         return Ok(());
