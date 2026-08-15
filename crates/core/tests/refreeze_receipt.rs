@@ -359,8 +359,8 @@ async fn the_receipt_distinguishes_callable_from_registered_pending_approval() {
     assert!(content.contains("registered"), "{content}");
     assert!(content.contains("human approval"), "{content}");
     assert!(
-        content.contains("openmax --approve .openmax/tools/wordfreq.toml"),
-        "the receipt names the exact approve command: {content}"
+        content.contains("openmax --approve '.openmax/tools/wordfreq.toml'"),
+        "the receipt names the exact approve command, shell-quoted: {content}"
     );
     assert!(content.contains("--run-examples"), "and the probe path: {content}");
     drop(bodies);

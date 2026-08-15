@@ -340,3 +340,95 @@ async fn a_hook_written_mid_turn_is_named_inert_on_the_writing_call() {
     assert!(content.contains("openmax --approve"), "{content}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A receipt's approve command is a copyable shell line: a manifest filename
+/// with a metacharacter must arrive quoted, or the paste runs the
+/// metacharacter instead of naming the file (review finding).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receipt_shell_quotes_a_metacharacter_manifest_path() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest = "name = \"odd\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/a b$(x).toml", "content": manifest }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "quote", &project, "go").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content.contains("openmax --approve '.openmax/tools/a b$(x).toml'"),
+        "the path must be single-quoted in the copyable command: {content}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An APPROVED gate whose bytes change mid-turn is not inert - it fails
+/// closed and blocks every call from the next turn. The write receipt must
+/// say that, not "approved hooks apply from the next turn" (review finding).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_gate_write_receipt_says_calls_are_blocked() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let hook_path = project.join(".openmax/hooks/gate.toml");
+    std::fs::write(&hook_path, "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
+    // The human approves the gate.
+    std::fs::create_dir_all(&data).unwrap();
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&hook_path).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &hook_path, &[sha]).unwrap();
+
+    // The agent then edits the approved gate.
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({
+                "path": ".openmax/hooks/gate.toml",
+                "content": "event = \"pre_tool_use\"\ncommand = \"/bin/false\"\n"
+            }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "revoke", &project, "edit the gate").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("failing closed"), "{content}");
+    assert!(content.contains("BLOCKED"), "{content}");
+    assert!(
+        !content.contains("approved hooks apply from the next turn"),
+        "a revoked gate must not be described as merely pending: {content}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

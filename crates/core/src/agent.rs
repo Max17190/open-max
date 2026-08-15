@@ -1621,10 +1621,18 @@ fn refreeze_receipt_text(
         // too, and the very next step was an approval card - the model
         // called the receipt out as overselling. Registered is not callable
         // until a human blesses the bytes; say which, and how.
+        // Quoted like doctor's repair lines: the path is a copyable shell
+        // command, and a valid manifest filename may carry spaces or
+        // metacharacters.
         let listed: Vec<String> = added
             .unapproved
             .iter()
-            .map(|(name, path)| format!("{name} (openmax --approve {path})"))
+            .map(|(name, path)| {
+                format!(
+                    "{name} (openmax --approve {})",
+                    crate::doctor::shell_quote(std::path::Path::new(path))
+                )
+            })
             .collect();
         note.push_str(&format!(
             " New tools registered; the FIRST call of each stops for human approval of its \
@@ -2930,7 +2938,19 @@ async fn run_loop(
                                 .into_iter()
                                 .map(|f| format!("'{}' on {}: {}", f.hook, f.event, f.detail))
                                 .collect();
-                            let note = if inert.is_empty() {
+                            // An APPROVED gate whose bytes just changed is not
+                            // inert - it fails closed and blocks every tool
+                            // call from the next turn until restored or
+                            // re-approved. Say that, not "applies next turn".
+                            let note = if let Some(blocked) = discovered.fail_closed_reason() {
+                                format!(
+                                    "\n[hook files changed. A live gate is now failing closed: \
+                                     {blocked}. From the next turn every tool call is BLOCKED \
+                                     until the file is restored to its approved bytes or a human \
+                                     re-approves it (openmax --approve <path>, at a terminal \
+                                     outside any session).]"
+                                )
+                            } else if inert.is_empty() {
                                 "\n[hook files changed. Hooks are discovered at turn start; \
                                  approved hooks apply from the next turn.]"
                                     .to_string()

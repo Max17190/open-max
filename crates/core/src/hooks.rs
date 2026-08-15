@@ -585,7 +585,7 @@ impl Hooks {
     /// approved. Tool execution blocks on either, because both mean a gate the
     /// user wrote down is not running, and running on without it would drop
     /// that policy silently.
-    fn fail_closed_reason(&self) -> Option<String> {
+    pub(crate) fn fail_closed_reason(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(reason) = self.ledger_fail_closed_reason() {
             parts.push(reason);
