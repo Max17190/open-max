@@ -203,6 +203,12 @@ async fn drive_turn(
             break;
         }
     }
+    // Done is emitted before the session's `running` flag clears; a second
+    // start_turn racing that window is refused as "already working". Wait
+    // for idle, as the headless front end does.
+    while core.is_running(session) {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 /// A broken tool write refreezes too (its bytes moved the fingerprint), and
