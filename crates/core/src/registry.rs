@@ -91,6 +91,10 @@ pub struct Registry {
     /// Content hash of the extension files this registry was built from;
     /// compared against disk at turn start to detect extension changes.
     pub ext_fingerprint: u64,
+    /// Extension files read this freeze that failed to load, with the parse
+    /// reason. Receipts and the unknown-tool error name these so a broken
+    /// write is never mistaken for a live capability.
+    pub broken: Vec<(PathBuf, String)>,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
@@ -115,6 +119,10 @@ pub(crate) struct ExtensionSnapshot {
     /// The ledger records exactly this generation, so what it attests is what
     /// the freeze actually used - never a second read that could differ.
     pub(crate) files: Vec<(PathBuf, String, Vec<u8>)>,
+    /// Files read but not loaded, with the reason. The bytes are already in
+    /// the fingerprint (a broken write still triggers a refreeze); keeping
+    /// the reason lets that refreeze's receipt say the tool is NOT live.
+    pub(crate) broken: Vec<(PathBuf, String)>,
 }
 
 impl ExtensionSnapshot {
@@ -132,6 +140,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+    let mut broken: Vec<(PathBuf, String)> = Vec::new();
     let mut external_by_name: HashMap<String, ToolSpec> = HashMap::new();
     for dir in external_tool_dirs(data_dir, project_root) {
         dir.hash(&mut h);
@@ -151,11 +160,15 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let Some(bytes) = bytes else { continue };
             files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
             let Ok(text) = std::str::from_utf8(&bytes) else {
+                broken.push((path, "not valid UTF-8".into()));
                 continue;
             };
-            if let Ok(spec) = parse_tool_source(&path, text) {
+            match parse_tool_source(&path, text) {
                 // Global is scanned first, so a project definition wins.
-                external_by_name.insert(spec.name.clone(), spec);
+                Ok(spec) => {
+                    external_by_name.insert(spec.name.clone(), spec);
+                }
+                Err(reason) => broken.push((path, reason)),
             }
         }
     }
@@ -178,11 +191,15 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let Some(bytes) = bytes else { continue };
             files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
             let Ok(text) = std::str::from_utf8(&bytes) else {
+                broken.push((path, "not valid UTF-8".into()));
                 continue;
             };
-            if let Ok(spec) = skills::parse_skill_source(&path, text) {
+            match skills::parse_skill_source(&path, text) {
                 // Global is scanned first, so a project definition wins.
-                skills_by_name.insert(spec.name.clone(), spec);
+                Ok(spec) => {
+                    skills_by_name.insert(spec.name.clone(), spec);
+                }
+                Err(reason) => broken.push((path, reason)),
             }
         }
     }
@@ -208,6 +225,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         tools_omitted,
         skills_omitted,
         files: files_read,
+        broken,
     }
 }
 
@@ -229,6 +247,7 @@ impl Registry {
         registry.ext_fingerprint = snapshot.fingerprint;
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
+        registry.broken = snapshot.broken;
         registry
     }
 
@@ -274,6 +293,7 @@ impl Registry {
             skills_omitted: 0,
             tools_omitted: 0,
             ext_fingerprint: 0,
+            broken: Vec::new(),
             schemas,
             schemas_wire,
             by_name,
@@ -334,10 +354,29 @@ impl Registry {
             Some(ToolKind::External(tool)) => {
                 spawn_external(name, &tool, args, data_dir, root, caps, cancel).await
             }
-            None => ToolOutcome::err(format!(
-                "unknown tool: {name}; the available tools are {}",
-                self.tool_names().join(", ")
-            )),
+            None => {
+                // A name matching a file that failed to load gets the parse
+                // reason, not a bare "unknown": the model most likely wrote
+                // (or was promised) that very file.
+                if let Some((path, reason)) = self.broken.iter().find(|(path, _)| {
+                    path.file_stem().is_some_and(|stem| stem == name)
+                        || path.file_name().is_some_and(|f| f == "SKILL.md")
+                            && path.parent().and_then(|d| d.file_name()).is_some_and(|d| d == name)
+                }) {
+                    let shown = path.strip_prefix(root).unwrap_or(path);
+                    return ToolOutcome::err(format!(
+                        "unknown tool: {name}; {} exists but did NOT load: {reason}. \
+                         Fix the file and verify with bash: openmax --check. The \
+                         available tools are {}",
+                        shown.display(),
+                        self.tool_names().join(", ")
+                    ));
+                }
+                ToolOutcome::err(format!(
+                    "unknown tool: {name}; the available tools are {}",
+                    self.tool_names().join(", ")
+                ))
+            }
         }
     }
 }
