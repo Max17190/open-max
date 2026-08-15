@@ -1642,12 +1642,44 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
 /// specific: a token inside the inline program that names a file which exists
 /// in the project and is not already bound. `sh -c 'echo hi'` names none and
 /// stays quiet, which is what keeps the warning worth reading.
+const INTERPRETERS: [&str; 12] = [
+    "sh", "bash", "zsh", "dash", "ksh", "python", "python3", "node", "ruby", "perl", "deno", "bun",
+];
+const INLINE_FLAGS: [&str; 4] = ["-c", "-e", "--eval", "--exec"];
+
+/// Extensions that mark an argv token as a program file rather than a module
+/// name or data argument. Deliberately narrow: `--check` warns from this, and
+/// a warning about a file that never was one costs more than a miss.
+const SCRIPT_EXTENSIONS: [&str; 8] = ["py", "sh", "bash", "js", "mjs", "ts", "rb", "pl"];
+
+/// The script file an interpreter-style command will run, when its argv names
+/// one: the first positional argument, judged only when it is shaped like a
+/// script file. An inline-program flag before it (`-c`, `-e`) means the
+/// program is text on the command line, not a file, so there is nothing to
+/// resolve.
+pub(crate) fn interpreter_script<'a>(command: &str, args: &'a [String]) -> Option<&'a str> {
+    let stem = Path::new(command.trim()).file_name()?.to_string_lossy().to_string();
+    if !INTERPRETERS.iter().any(|i| stem == *i) {
+        return None;
+    }
+    for arg in args {
+        let arg = arg.trim();
+        if INLINE_FLAGS.contains(&arg) {
+            return None;
+        }
+        if arg.is_empty() || arg.starts_with('-') {
+            continue;
+        }
+        return Path::new(arg)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e))
+            .then_some(arg);
+    }
+    None
+}
+
 pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) -> Option<PathBuf> {
-    const INTERPRETERS: [&str; 12] = [
-        "sh", "bash", "zsh", "dash", "ksh", "python", "python3", "node", "ruby", "perl", "deno",
-        "bun",
-    ];
-    const INLINE_FLAGS: [&str; 4] = ["-c", "-e", "--eval", "--exec"];
     let stem = Path::new(command.trim()).file_name()?.to_string_lossy().to_string();
     if !INTERPRETERS.iter().any(|i| stem == *i) {
         return None;

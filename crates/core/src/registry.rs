@@ -589,6 +589,18 @@ pub(crate) fn parse_tool_file(path: &Path) -> Result<ToolSpec, String> {
 /// The same parse from bytes a caller already read (and hashed), so what an
 /// approval records about a manifest cannot come from a different generation
 /// of the file than the hash it blesses.
+/// The `description` exactly as the manifest wrote it, before the schema cap
+/// clamps it, normalized the way the parse normalizes it. `openmax --check`
+/// reads it from the same bytes the parse used, so a report can say the
+/// written line is longer than the schema one without a second read of the
+/// file (mirrors `skills::raw_description`). None when the file does not
+/// parse; the parse error already reports that.
+pub(crate) fn raw_description(text: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(text).ok()?;
+    let desc = value.get("description")?.as_str()?;
+    Some(desc.trim().replace(['\n', '\r'], " "))
+}
+
 pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, String> {
     let source_sha256 = crate::ledger::sha256_hex(text.as_bytes());
     let file: ExternalToolFile =
