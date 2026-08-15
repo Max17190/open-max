@@ -109,13 +109,21 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     }) {
                         tool_clamps.push((tools_found.len(), reason));
                     }
+                    if let Some(reason) = source
+                        .as_deref()
+                        .ok()
+                        .and_then(|text| tool_description_gap(text, &spec.name))
+                    {
+                        tool_clamps.push((tools_found.len(), reason));
+                    }
                     let external = match &spec.kind {
                         crate::registry::ToolKind::External(ext) => Some(ext.clone()),
                         crate::registry::ToolKind::Builtin => None,
                     };
-                    let missing = external
-                        .as_ref()
-                        .and_then(|ext| missing_command_reason(&ext.command, project_root));
+                    let missing = external.as_ref().and_then(|ext| {
+                        missing_command_reason(&ext.command, project_root)
+                            .or_else(|| missing_script_reason(&ext.command, &ext.args, project_root))
+                    });
                     match (missing, external) {
                         (Some((_, reason)), _) => Status::Warn(reason),
                         (None, Some(ext)) => match stale_code_reason(
@@ -239,6 +247,32 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     {
                         skill_notes.push((skills_found.len(), reason));
                     }
+                    // The dir listing, not the resolved path: on a
+                    // case-folding filesystem `SKILL.md` resolves to a file
+                    // spelled otherwise and the skill loads here, so the
+                    // miscase branch below - the only warning about it - can
+                    // never fire on exactly the machines where the skill
+                    // still works. It vanishes on the first case-sensitive
+                    // checkout instead.
+                    if let Some(found) = miscased_skill_file(&entry) {
+                        let found =
+                            found.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let exact = std::fs::read_dir(&entry)
+                            .ok()
+                            .is_some_and(|rd| rd.flatten().any(|e| e.file_name() == "SKILL.md"));
+                        let reason = if exact {
+                            format!(
+                                "'{}' also holds {found}, which is never read and collides with SKILL.md on a case-folding filesystem; keep exactly one",
+                                s.name
+                            )
+                        } else {
+                            format!(
+                                "'{}' loads from {found} because this filesystem folds case; a case-sensitive checkout drops the skill silently, so rename it SKILL.md",
+                                s.name
+                            )
+                        };
+                        skill_notes.push((skills_found.len(), reason));
+                    }
                     Status::Ok(format!("skill '{}'", s.name))
                 }
                 Err(reason) => Status::Err(reason),
@@ -277,12 +311,29 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     findings.extend(skills_found.into_iter().map(|(f, _)| f));
 
     let mut templates_found: Vec<Entry> = Vec::new();
+    // Deferred like the skill notes, for the same reason: what the popup line
+    // fails to say only matters for a template whose file the loader keeps.
+    let mut template_notes: Vec<(usize, String)> = Vec::new();
     for dir in crate::templates::template_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "md") {
             let mut id = None;
-            let status = match crate::templates::parse_template(&path) {
+            // One read per file, like the tool and skill loops: the clamp
+            // diagnostic and the parse must describe one generation of bytes.
+            let source = std::fs::read_to_string(&path);
+            let parsed = match &source {
+                Ok(text) => crate::templates::parse_template_source(&path, text),
+                Err(e) => Err(format!("unreadable: {e}")),
+            };
+            let status = match parsed {
                 Ok(t) => {
                     id = Some(t.name.clone());
+                    if let Some(reason) = source
+                        .as_deref()
+                        .ok()
+                        .and_then(|text| template_description_gap(text, &t.name))
+                    {
+                        template_notes.push((templates_found.len(), reason));
+                    }
                     Status::Ok(format!("template /{}", t.name))
                 }
                 Err(reason) => Status::Err(reason),
@@ -291,6 +342,14 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
     mark_shadowed(&mut templates_found, false);
+    // Last word to the shadowing above: a note only describes a file whose
+    // line the popup will actually show.
+    for (i, reason) in template_notes {
+        let (finding, _) = &mut templates_found[i];
+        if matches!(finding.status, Status::Ok(_)) {
+            finding.status = Status::Warn(reason);
+        }
+    }
     findings.extend(templates_found.into_iter().map(|(f, _)| f));
 
     let known_tools = known_tool_names(&external_names);
@@ -391,7 +450,9 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                     path.display()
                                 ))
                             } else if let Some((problem, missing)) =
-                                missing_command_reason(&h.command, project_root)
+                                missing_command_reason(&h.command, project_root).or_else(|| {
+                                    missing_script_reason(&h.command, &h.args, project_root)
+                                })
                             {
                                 // Approval is not the next step when the
                                 // command does not resolve: `openmax
@@ -415,7 +476,9 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 ))
                             }
                         }
-                        None => match missing_command_reason(&h.command, project_root) {
+                        None => match missing_command_reason(&h.command, project_root)
+                            .or_else(|| missing_script_reason(&h.command, &h.args, project_root))
+                        {
                             Some((_, reason)) => Status::Warn(reason),
                             // The shape, not just the event: `turn_end` alone
                             // says nothing about whether this file can end a
@@ -1194,6 +1257,34 @@ fn missing_command_reason(
     })
 }
 
+/// Why the script an interpreter-style command names will not run, if it
+/// will not. Judged the way `bound_code` binds it: the first positional
+/// argument, and only when it is shaped like a script file, so a module name
+/// (`python3 -m pytest`) or a data argument never draws a warning about a
+/// file it never was. The repair is `Absent`'s: the file has to exist before
+/// anything else about it can be true.
+fn missing_script_reason(
+    command: &str,
+    args: &[String],
+    project_root: &Path,
+) -> Option<(CommandProblem, String)> {
+    let script = crate::ledger::interpreter_script(command, args)?;
+    let path = if Path::new(script).is_absolute() {
+        PathBuf::from(script)
+    } else {
+        project_root.join(script)
+    };
+    (!path.is_file()).then(|| {
+        (
+            CommandProblem::Absent,
+            format!(
+                "command '{}' runs '{script}', which does not exist from the project root",
+                command.trim()
+            ),
+        )
+    })
+}
+
 /// The clamp warnings for the entries that survived shadowing and the cap. A
 /// file the loader never reaches describes no runtime behavior: it is reported
 /// as shadowed or capped, and a second line about a timeout it will never
@@ -1246,6 +1337,40 @@ fn clamped_timeout_reason(text: &str, what: &str, min: u64, max: u64) -> Option<
 /// Both load, and neither is visible in the file, which is why `--check` has
 /// to say it. Takes the bytes the caller already parsed, for the same reason
 /// the timeout clamp does.
+/// Why the description this tool wrote is not the one the schema shows, when
+/// it is not. Same contract as `skill_description_gap`: the schema line is
+/// the model's only knowledge of an external tool, and both the clamp and an
+/// empty string decide silently what that line can say.
+fn tool_description_gap(text: &str, name: &str) -> Option<String> {
+    let written = crate::registry::raw_description(text)?;
+    if written.trim().is_empty() {
+        return Some(format!(
+            "'{name}' has an empty `description`: the schema line is the model's only knowledge of this tool, and it says nothing"
+        ));
+    }
+    let cap = crate::registry::MAX_EXTERNAL_DESC_CHARS;
+    let chars = written.chars().count();
+    (chars > cap).then(|| {
+        format!(
+            "'{name}' has a {chars}-char `description`, past the {cap}-char cap: the schema shows the first {cap} chars and cuts the rest, so whatever the tail says never reaches the model"
+        )
+    })
+}
+
+/// The same gap for a template's popup line. An absent description is legal
+/// here - the human invoking /name already knows what they installed - so
+/// only the silent clamp is worth a line.
+fn template_description_gap(text: &str, name: &str) -> Option<String> {
+    let written = crate::templates::raw_description(text)?;
+    let cap = crate::templates::MAX_TEMPLATE_DESC_CHARS;
+    let chars = written.chars().count();
+    (chars > cap).then(|| {
+        format!(
+            "'/{name}' has a {chars}-char `description:`, past the {cap}-char cap: the completion popup shows the first {cap} chars and cuts the rest"
+        )
+    })
+}
+
 fn skill_description_gap(text: &str, name: &str) -> Option<String> {
     let written = crate::skills::raw_description(text).unwrap_or_default();
     if written.trim().is_empty() {
@@ -1466,9 +1591,12 @@ fn wrong_extension_files(dir: &Path, parent: &str, child: &str) -> Vec<Finding> 
         .into_iter()
         .filter(|p| p.is_file())
         .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e != want && CONFIG_EXTENSIONS.contains(&e))
+            p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                // A recognizable config format in the wrong dialect, or a
+                // near-miss of the right one (.tml, .tomll): both are files
+                // an author meant to be read, silently never read.
+                e != want && (CONFIG_EXTENSIONS.contains(&e) || near(e, want))
+            })
         })
         .map(|path| Finding {
             kind: "path",
@@ -1901,6 +2029,168 @@ mod tests {
             crate::templates::expand_invocation(&root.join("data"), &root, "half-open now")
                 .is_none(),
             "the report says err, so the runtime must refuse it too"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every finding for one path: clamp-style warnings ride as extra lines
+    /// beside the entry's own status, so asserting on the first match alone
+    /// would read past them.
+    fn statuses_of<'a>(findings: &'a [Finding], needle: &str) -> Vec<&'a Status> {
+        findings
+            .iter()
+            .filter(|f| f.path.to_string_lossy().contains(needle))
+            .map(|f| &f.status)
+            .collect()
+    }
+
+    fn some_warn_contains(findings: &[Finding], needle: &str, text: &str) -> bool {
+        statuses_of(findings, needle)
+            .iter()
+            .any(|s| matches!(s, Status::Warn(reason) if reason.contains(text)))
+    }
+
+    /// The schema clamps an overlong tool description with no report, so the
+    /// author believes the model reads the whole line; same silent-surface
+    /// class as the skill description gap, one surface over.
+    #[test]
+    fn an_overlong_tool_description_warns_what_the_schema_cuts() {
+        let root = temp_project();
+        let long = "word ".repeat(60);
+        write(
+            root.join(".openmax/tools/big.toml"),
+            &format!("name = \"big\"\ndescription = \"{long}\"\ncommand = \"/bin/sh\"\n"),
+        );
+        let findings = local(&root);
+        assert!(
+            some_warn_contains(&findings, "big.toml", "past the 200-char cap"),
+            "an overlong tool description must warn: {findings:?}"
+        );
+
+        write(
+            root.join(".openmax/tools/mute.toml"),
+            "name = \"mute\"\ndescription = \"\"\ncommand = \"/bin/sh\"\n",
+        );
+        let findings = local(&root);
+        assert!(
+            some_warn_contains(&findings, "mute.toml", "empty `description`"),
+            "an empty tool description must warn: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The popup clamps a template description the same way; a template with
+    /// a clipped line read as plain ok.
+    #[test]
+    fn an_overlong_template_description_warns_what_the_popup_cuts() {
+        let root = temp_project();
+        let long = "word ".repeat(60);
+        write(
+            root.join(".agents/prompts/verbose.md"),
+            &format!("---\ndescription: {long}\n---\nDo the thing to $1.\n"),
+        );
+        let findings = local(&root);
+        assert!(
+            some_warn_contains(&findings, "verbose.md", "past the 200-char cap"),
+            "an overlong template description must warn: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `.tml` is one edit from the one extension the dir is read as, which is
+    /// precisely the typo an author makes; it was silently never read while
+    /// `.yaml` in the same dir warned.
+    #[test]
+    fn a_near_miss_extension_in_a_manifest_dir_is_named() {
+        let root = temp_project();
+        write(root.join(".openmax/tools/notes.tml"), "name = \"notes\"\n");
+        let findings = local(&root);
+        assert!(
+            some_warn_contains(&findings, "notes.tml", "read as .toml only"),
+            "a near-miss extension must be named: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A SKILL.md spelled skill.md must draw a warning on every filesystem.
+    /// Case-sensitive systems never load it (the existing miscase branch);
+    /// case-folding systems load it fine and previously said nothing, which
+    /// is backwards: the machine where it works is the machine that needs the
+    /// warning, because the first case-sensitive checkout drops the skill
+    /// silently.
+    #[test]
+    fn a_miscased_skill_file_is_named_on_every_filesystem() {
+        let root = temp_project();
+        write(
+            root.join(".agents/skills/howto/skill.md"),
+            "---\nname: howto\ndescription: how to do the thing\n---\nbody\n",
+        );
+        let findings = local(&root);
+        assert!(
+            some_warn_contains(&findings, "howto", "skill.md"),
+            "the miscased file must be named whether or not it loaded here: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An interpreter command whose argv names a script that does not exist
+    /// fails at every call (tool) or every fire (hook), and --check said
+    /// nothing: `missing_command_reason` judged only `command`, and `python3`
+    /// resolves fine.
+    #[test]
+    fn a_missing_interpreter_script_is_named_for_tools_and_hooks() {
+        let root = temp_project();
+        write(
+            root.join(".openmax/tools/runner.toml"),
+            "name = \"runner\"\ndescription = \"runs the generator\"\ncommand = \"python3\"\nargs = [\"gen.py\"]\n",
+        );
+        write(
+            root.join(".openmax/hooks/audit.toml"),
+            "event = \"post_tool_use\"\ncommand = \"python3\"\nargs = [\"audit.py\"]\n",
+        );
+        let findings = local(&root);
+        assert!(
+            some_warn_contains(&findings, "runner.toml", "runs 'gen.py', which does not exist"),
+            "the tool's missing script must be named: {findings:?}"
+        );
+        let hook_says = statuses_of(&findings, "audit.toml").iter().any(|s| match s {
+            Status::Err(reason) | Status::Warn(reason) => {
+                reason.contains("runs 'audit.py', which does not exist")
+                    && reason.contains("create it")
+            }
+            _ => false,
+        });
+        assert!(hook_says, "the hook's missing script must be named with its repair: {findings:?}");
+
+        // A module name is not a script file: `-m pytest` must stay silent.
+        write(
+            root.join(".openmax/tools/mod.toml"),
+            "name = \"modrun\"\ndescription = \"runs a module\"\ncommand = \"python3\"\nargs = [\"-m\", \"pytest\"]\n",
+        );
+        // An option can consume or redefine the operand behind it: `node -p`
+        // evaluates the next token as expression text, and `sh -s` reads the
+        // program from stdin and keeps the token as $1. Neither names a file
+        // the command opens, so neither may draw a missing-script warning.
+        write(
+            root.join(".openmax/tools/nodep.toml"),
+            "name = \"nodep\"\ndescription = \"prints an expression\"\ncommand = \"node\"\nargs = [\"-p\", \"result.js\"]\n",
+        );
+        write(
+            root.join(".openmax/tools/shs.toml"),
+            "name = \"shs\"\ndescription = \"stdin program\"\ncommand = \"sh\"\nargs = [\"-s\", \"script.sh\"]\n",
+        );
+        let findings = local(&root);
+        assert!(
+            !some_warn_contains(&findings, "mod.toml", "does not exist"),
+            "a module argument must not draw a script warning: {findings:?}"
+        );
+        assert!(
+            !some_warn_contains(&findings, "nodep.toml", "does not exist"),
+            "an option operand is not a script: {findings:?}"
+        );
+        assert!(
+            !some_warn_contains(&findings, "shs.toml", "does not exist"),
+            "sh -s keeps the token as $1, not a program file: {findings:?}"
         );
         let _ = std::fs::remove_dir_all(root);
     }

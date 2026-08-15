@@ -121,6 +121,14 @@ fn valid_name(name: &str) -> bool {
 
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_template(path: &Path) -> Result<TemplateSpec, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    parse_template_source(path, &text)
+}
+
+/// The same parse from bytes the caller already read, so a diagnostic
+/// computed beside it (the raw description a cap will clamp) describes the
+/// same generation of the file as the parse itself.
+pub(crate) fn parse_template_source(path: &Path, text: &str) -> Result<TemplateSpec, String> {
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -131,18 +139,17 @@ pub(crate) fn parse_template(path: &Path) -> Result<TemplateSpec, String> {
             "invalid template name '{name}': 1-64 chars of [a-zA-Z0-9_-] required (the stem becomes /{name})"
         ));
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
     // A block that opens with `---` and never closes is refused by name, the
     // way SKILL.md refuses it: the fence and every key under it would
     // otherwise be expanded into the user's message as body text, which is
     // exactly what the author meant them not to be.
-    if text.starts_with("---") && frontmatter_end(&text).is_none() {
+    if text.starts_with("---") && frontmatter_end(text).is_none() {
         return Err("frontmatter never closes with `---`".into());
     }
-    if body_of(&text).trim().is_empty() {
+    if body_of(text).trim().is_empty() {
         return Err("template body is empty".into());
     }
-    let mut description = frontmatter_description(&text).unwrap_or_default();
+    let mut description = frontmatter_description(text).unwrap_or_default();
     if description.chars().count() > MAX_TEMPLATE_DESC_CHARS {
         description =
             description.chars().take(MAX_TEMPLATE_DESC_CHARS).collect::<String>() + "…";
@@ -162,6 +169,14 @@ fn body_of(text: &str) -> &str {
     let Some(end) = frontmatter_end(text) else { return text };
     let after = &rest[end + 4..];
     after.strip_prefix('\n').unwrap_or(after)
+}
+
+/// The `description:` exactly as the frontmatter wrote it, before the popup
+/// cap clamps it. `openmax --check` reads it from the same bytes the parse
+/// used, so a report can say the written line is longer than the shown one
+/// without a second read of the file (mirrors `skills::raw_description`).
+pub(crate) fn raw_description(text: &str) -> Option<String> {
+    frontmatter_description(text)
 }
 
 fn frontmatter_description(text: &str) -> Option<String> {
