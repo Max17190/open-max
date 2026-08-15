@@ -669,6 +669,36 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
 
+    // settings.json is launch-read and fail-closed: a file that will refuse
+    // the next launch (exit 2) must be named by the one command whose job is
+    // to say what is wrong before a launch finds out. The drift receipt tells
+    // the agent to fix it; this is how the agent (or a human) confirms it did.
+    let settings_path = crate::config::settings_path(data_dir);
+    if settings_path.exists() {
+        match crate::config::load(data_dir) {
+            Ok(settings) => findings.push(Finding {
+                kind: "settings",
+                path: settings_path,
+                status: Status::Ok(format!(
+                    "model {} via {}; read at launch, not hot (openmax --spec settings)",
+                    if settings.model.is_empty() { "<unset>" } else { settings.model.as_str() },
+                    settings
+                        .provider
+                        .as_deref()
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or(if settings.base_url.is_empty() { "<no endpoint>" } else { "base_url" })
+                )),
+            }),
+            Err(reason) => findings.push(Finding {
+                kind: "settings",
+                path: settings_path,
+                status: Status::Err(format!(
+                    "{reason}; the next launch will refuse to start (exit 2) until this parses"
+                )),
+            }),
+        }
+    }
+
     // An inherited approval store explains, in one line, why a capability that
     // worked yesterday now asks or fails closed. Without it the hook findings
     // above read as "its content changed" for content nobody touched.
@@ -3319,6 +3349,33 @@ mod tests {
                 && f.status.summary().contains("nearly the same thing")),
             "look-alike skills must be flagged"
         );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// settings.json is launch-read and fail-closed, so --check must name a
+    /// file that will refuse the next launch - it is how the drift receipt's
+    /// "fix it now" gets confirmed. Dogfooding found the gap: a bricking file
+    /// got a silent exit 0 from --check while -p exited 2 on it.
+    #[test]
+    fn check_names_a_settings_file_that_would_brick_the_next_launch() {
+        let root = temp_project();
+        let data = temp_project();
+        std::fs::write(data.join("settings.json"), "{ invalid json broken").unwrap();
+        let findings = check_at(&root, &data);
+        let s = findings.iter().find(|f| f.kind == "settings").expect("settings is checked");
+        assert!(matches!(s.status, Status::Err(_)), "{:?}", s.status);
+        assert!(s.status.summary().contains("exit 2"), "{}", s.status.summary());
+
+        std::fs::write(
+            data.join("settings.json"),
+            r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto"}"#,
+        )
+        .unwrap();
+        let findings = check_at(&root, &data);
+        let s = findings.iter().find(|f| f.kind == "settings").unwrap();
+        assert!(matches!(s.status, Status::Ok(_)), "{:?}", s.status);
+        assert!(s.status.summary().contains("read at launch"), "{}", s.status.summary());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
