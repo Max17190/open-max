@@ -2254,6 +2254,11 @@ async fn run_loop(
                 // Past the cap the harness ends the turn itself and says so: a
                 // policy that cannot be satisfied in this many rounds has
                 // wedged, and the answer it kept refusing was never verified.
+                // The consult above was this end's turn_end run - its payload
+                // already said blockable false and continuations_left 0 - so
+                // the late site stays quiet here too: overriding the verdict
+                // is not a second end.
+                turn_end_fired = true;
                 stop_reason = "unverified".into();
                 break 'turns;
             }
@@ -5427,6 +5432,64 @@ mod tests {
         assert!(
             failures.iter().any(|d| d.contains("still not verified")),
             "the override must say what it overrode: {failures:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The consult that ends a turn `unverified` IS that end's turn_end run,
+    /// so the late site must not run the hook again for the same end. Counted
+    /// at the script itself: request and transcript counts come out identical
+    /// whether or not the override double-fires, so only the hook's own run
+    /// log can see the extra execution (a notification hook would fire twice
+    /// per capped turn).
+    #[tokio::test]
+    async fn the_override_consult_is_the_turn_end_fire() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let log = project.join("runs.log");
+        let script = project.join("never.sh");
+        write_exec(
+            &script,
+            &format!(
+                "#!/bin/sh\necho run >> \"{}\"\necho 'still not verified'\nexit 1\n",
+                log.display()
+            ),
+        );
+        let toml = hooks_dir.join("never.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.max_agent_iterations = 20;
+        }
+
+        start_turn(core.clone(), "sess-onefire".into(), project.clone(), "ship it".into())
+            .unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "unverified");
+        let runs = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            crate::hooks::MAX_TURN_END_CONTINUATIONS + 1,
+            "one first attempt plus one consult per end attempt, and no late-site re-fire"
         );
 
         let _ = std::fs::remove_dir_all(dir);
