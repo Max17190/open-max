@@ -447,7 +447,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             if was_live && was_gate {
                                 Status::Err(format!(
                                     "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
-                                    path.display()
+                                    shell_quote(&path)
                                 ))
                             } else if let Some((problem, missing)) =
                                 missing_command_reason(&h.command, project_root).or_else(|| {
@@ -472,7 +472,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 // preview is not shown bytes.
                                 Status::Err(format!(
                                     "inert because {reason}: a human must approve this exact content with `openmax --approve {}`, run outside a session (an in-session write approval approves the write and nothing more)",
-                                    path.display()
+                                    shell_quote(&path)
                                 ))
                             }
                         }
@@ -542,7 +542,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             if let Status::Err(reason) = &finding.status {
                 finding.status = Status::Err(format!(
                     "{reason}; this file was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
-                    finding.path.display()
+                    shell_quote(&finding.path)
                 ));
             }
         }
@@ -570,7 +570,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 path: path.clone(),
                 status: Status::Err(format!(
                     "an approved hook file was deleted; every tool call fails closed until it is restored or retired with `openmax --forget {}`",
-                    path.display()
+                    shell_quote(path)
                 )),
             });
         }
@@ -672,6 +672,17 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 /// text opens while it runs. Only flagged when the inline program actually
 /// names a file that exists here - a warning that fired on every `sh -c` would
 /// teach authors to skip warnings.
+/// Wrap a path for a copyable shell command. Several `--check` diagnostics
+/// print `openmax --approve <path>` for a human to paste, and the path comes
+/// from a file the agent named: a hook called `gate$(cmd).toml` is a legal
+/// file the agent can create, approve once, then break, and an unquoted path
+/// in the pasted repair command would run `$(cmd)` instead of naming the
+/// file. POSIX single-quoting neutralizes every metacharacter, including an
+/// embedded single quote (closed, escaped, reopened).
+fn shell_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut warn = |kind: &'static str, path: PathBuf, command: &str, args: &[String]| {
@@ -1213,13 +1224,14 @@ impl CommandProblem {
     /// What repairs it, phrased for a hook that is inert until approved: each
     /// case names its own fix, and whether approval is even reachable yet.
     fn hook_repair(self, command: &str, manifest: &Path) -> String {
-        let manifest = manifest.display();
+        let manifest = shell_quote(manifest);
+        let command_q = shell_quote(Path::new(command));
         match self {
             Self::Absent => format!(
                 "create it, then approve the hook and the code it runs together with `openmax --approve {manifest}`"
             ),
             Self::NotExecutable => format!(
-                "make it executable (chmod +x '{command}'), then approve the hook and the code it runs together with `openmax --approve {manifest}`"
+                "make it executable (chmod +x {command_q}), then approve the hook and the code it runs together with `openmax --approve {manifest}`"
             ),
             Self::NotOnPath => format!(
                 "install it or point `command` at a script inside the project; a name that resolves to nothing binds no code, so `openmax --approve {manifest}` refuses it as it stands"
@@ -2759,6 +2771,37 @@ mod tests {
     /// developer's machine and its files are not part of any assertion here.
     fn local_at(root: &Path, data: &Path) -> Vec<Finding> {
         check_at(root, data).into_iter().filter(|f| f.path.starts_with(root)).collect()
+    }
+
+    /// The repair command a diagnostic prints is copyable, and the path in it
+    /// comes from a file the agent named. A hook called `gate$(cmd).toml` is a
+    /// legal file: approved once, then broken, its fail-closed message prints
+    /// `openmax --approve <path>`, and an unquoted path would run `$(cmd)`
+    /// when pasted. Every copyable command in --check quotes the path.
+    #[test]
+    fn copyable_repair_commands_shell_quote_the_path() {
+        let root = temp_project();
+        let data = root.join("data");
+        let evil = ".openmax/hooks/gate$(touch pwned).toml";
+        let hook = root.join(evil);
+        write(hook.clone(), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n");
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap());
+        crate::ledger::approve_capability(&data, &root, &hook, &[sha]).unwrap();
+        write(hook.clone(), "event = \"pre_tool_use\ncommand = broken");
+        let reason = match &find(&local_at(&root, &data), "gate$(touch pwned)").status {
+            Status::Err(reason) => reason.clone(),
+            other => panic!("a broken live hook must err: {other:?}"),
+        };
+        // The metacharacters are inside single quotes, so a paste is inert.
+        assert!(
+            reason.contains("'") && reason.contains("$(touch pwned)"),
+            "the path must appear, single-quoted: {reason}"
+        );
+        assert!(
+            !reason.contains("approve /") && !reason.contains(".toml`"),
+            "the raw unquoted path must not sit in a copyable command: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A hook file that was approved and live and then stops parsing is the
