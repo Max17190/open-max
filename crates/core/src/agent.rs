@@ -2124,6 +2124,12 @@ async fn run_loop(
         );
     }
 
+    // The provider catalog's content identity at turn start: an agent bash
+    // edit to ~/.openmax/providers.json is otherwise silent (the file is
+    // outside the project root, so no refreeze covers it), and a malformed
+    // edit would surface turns later as an unrelated-looking resolve error.
+    let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
+
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
     // fails closed rather than silently hitting flat base_url.
@@ -2776,6 +2782,37 @@ async fn run_loop(
                                     "{PERMISSION_NOTE_PREFIX}{}]",
                                     novel.join(NOTICE_JOINER)
                                 );
+                                match &mut last.content {
+                                    Some(content) => content.push_str(&note),
+                                    None => last.content = Some(note.trim_start().to_string()),
+                                }
+                            }
+                        }
+                        // A providers.json edit (bash: the file is outside
+                        // the project root) gets a receipt too: what loaded,
+                        // when it applies - or that the catalog is EMPTY,
+                        // while the author can still fix it.
+                        let status = crate::providers::providers_status(&core.data_dir);
+                        if status.content_hash != providers_seen {
+                            providers_seen = status.content_hash;
+                            let note = match &status.parse_error {
+                                Some(err) => format!(
+                                    "\n[providers.json changed but is invalid JSON: {err}. The \
+                                     provider catalog is EMPTY until this parses; any turn using \
+                                     settings.provider will fail at its start.]"
+                                ),
+                                None => format!(
+                                    "\n[providers.json changed: {} provider(s) ({}). Endpoint \
+                                     resolution happens at turn start, so a provider or model \
+                                     switch applies from the next turn; switching this session's \
+                                     model is /model, which the user runs.]",
+                                    status.count,
+                                    status.names.join(", ")
+                                ),
+                            };
+                            if let Some(last) =
+                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                            {
                                 match &mut last.content {
                                     Some(content) => content.push_str(&note),
                                     None => last.content = Some(note.trim_start().to_string()),
