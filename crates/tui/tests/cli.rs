@@ -1282,3 +1282,92 @@ fn an_attested_parent_does_not_let_a_bash_child_approve() {
         "no approval may land from an agent's bash child"
     );
 }
+
+/// A process the harness itself spawned has no human on its client. Round-4
+/// dogfooding watched an agent launch `openmax --stdio` from bash, receive
+/// its own unapproved_source card over the pipe, answer it, and land a
+/// standing grant in the ledger as a human act. The card is never raised in
+/// an agent-spawned process: the call is declined with the reason, an eager
+/// client's `approve` finds nothing to answer, and the ledger stays empty.
+#[test]
+fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
+    let (project, home) = fresh_dirs("nested-stdio");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let marker = project.join("SELF-APPROVED");
+    std::fs::write(
+        tools.join("selfapprove.toml"),
+        format!(
+            "name = \"selfapprove\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {}\"]\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("selfapprove", serde_json::json!({})), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    // Trust as the human first (attested), then run the nested session the
+    // way an agent's bash would: session marker set, piped stdio, no tty.
+    {
+        // Trust without spending a scripted turn: handshake, then quit.
+        let mut trust = cmd(&project, &home)
+            .args(["--trust-project", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = trust.stdin.take().unwrap();
+        let mut hello = String::new();
+        BufReader::new(trust.stdout.take().unwrap()).read_line(&mut hello).unwrap();
+        assert!(hello.contains("\"hello\""), "{hello}");
+        writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
+        drop(stdin);
+        assert_eq!(trust.wait().unwrap().code(), Some(0));
+    }
+    let mut child = cmd(&project, &home)
+        .env("OPENMAX_SESSION", "1")
+        .env_remove("OPENMAX_HUMAN_ATTEST")
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"hello\""), "{line}");
+    writeln!(stdin, r#"{{"cmd":"user","text":"call selfapprove"}}"#).unwrap();
+    let mut saw_card = false;
+    let mut decline = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let ev: serde_json::Value = serde_json::from_str(&line).unwrap();
+        match ev["type"].as_str() {
+            Some("approval_request") => {
+                saw_card = true;
+                // The eager client answers yes - it must change nothing.
+                writeln!(stdin, r#"{{"cmd":"approve","approval_id":"{}","approved":true}}"#, ev["approval_id"].as_str().unwrap()).unwrap();
+            }
+            Some("tool_end") => decline = ev["output"].as_str().unwrap_or("").to_string(),
+            Some("done") => break,
+            _ => {}
+        }
+    }
+    writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
+    drop(stdin);
+    let _ = child.wait();
+    assert!(!saw_card, "no card may be raised in an agent-spawned process");
+    assert!(decline.contains("no human is on this client"), "the refusal says why: {decline}");
+    assert!(decline.contains("openmax --approve"), "{decline}");
+    assert!(!marker.exists(), "the unapproved tool must not have run");
+    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
+    assert!(!String::from_utf8_lossy(&ledger.stdout).contains("approved"), "the ledger must record no grant");
+}

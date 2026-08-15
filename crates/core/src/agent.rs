@@ -2784,7 +2784,12 @@ async fn run_loop(
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
-                            output: declined_message(source),
+                            output: match source {
+                                Some(source) if agent_spawned() => {
+                                    nested_session_declined_message(source)
+                                }
+                                _ => declined_message(source),
+                            },
                             diff: None, ..Default::default()
                         }, false),
                         ApprovalOutcome::TimedOut => (tools::ToolOutcome {
@@ -3275,6 +3280,30 @@ fn declined_message(source: Option<&UnapprovedCapability>) -> String {
     }
 }
 
+/// The content-approval card in a process the harness itself spawned. There
+/// is no human on this client: whatever answers the card is the parent
+/// agent's own tool call (round-4 dogfooding watched an agent launch
+/// `openmax --stdio` from bash, receive its own card, and answer it - the
+/// grant landed in the ledger as a human act). So the card is never raised
+/// here; the refusal says why and names the two real repairs.
+fn nested_session_declined_message(source: &UnapprovedCapability) -> String {
+    format!(
+        "This tool's content has not been approved by a human, and this session was started \
+         by an agent (no human is on this client), so no approval card can be raised here: \
+         the harness declined the call. Tell the user to run: openmax --approve {} at a \
+         terminal, or make the tool's first call from a session a human is watching.",
+        source.path
+    )
+}
+
+/// True when the harness itself spawned this process: every child it starts
+/// carries the marker (execution.rs), and the marker is what `--approve`,
+/// `--trust-project`, `--forget` refuse on. The same wall applies to the
+/// in-session card: an agent-spawned process has no human to show it to.
+fn agent_spawned() -> bool {
+    std::env::var_os("OPENMAX_SESSION").is_some()
+}
+
 /// Short form of a capability hash for display, matching `openmax --approve`.
 fn short_sha(sha: &str) -> String {
     sha.chars().take(12).collect()
@@ -3289,6 +3318,16 @@ async fn request_approval(
     source: Option<&UnapprovedCapability>,
     cancelled: &Arc<CancelToken>,
 ) -> ApprovalOutcome {
+    // A standing grant of host authority (unapproved_source) needs a human,
+    // and an agent-spawned process has none on the other end of any card it
+    // could raise: whatever answers is the parent agent. Decline without
+    // raising - the same wall the CLI's authority-granting commands stand
+    // behind, applied to the one in-session path that grants. Gate cards
+    // (`approval_mode`) still forward: they cover one call, not standing
+    // authority, and the parent could run the same call under its own mode.
+    if reason == "unapproved_source" && agent_spawned() {
+        return ApprovalOutcome::Declined;
+    }
     let approval_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
     core.approvals.lock().unwrap().insert(approval_id.clone(), tx);
@@ -4674,6 +4713,10 @@ mod tests {
     #[tokio::test]
     async fn the_approval_card_carries_probe_evidence_for_exact_bytes() {
         use crate::state::Core;
+        // A developer dogfooding openmax runs cargo test from inside a
+        // session (#83); the marker would make this process agent-spawned,
+        // and the card is never raised there. No test relies on it being set.
+        std::env::remove_var("OPENMAX_SESSION");
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
