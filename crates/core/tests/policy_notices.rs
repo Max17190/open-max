@@ -131,6 +131,11 @@ async fn drive_turn(
             break;
         }
     }
+    // Done precedes the running flag clearing; wait for idle before the
+    // caller starts another turn (a fast runner races that window).
+    while core.is_running(session) {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 const ALLOW_RULE: &str = "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\narg_regex = \"^git status\"\n";
