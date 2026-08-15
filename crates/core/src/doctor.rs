@@ -869,6 +869,48 @@ enum Admission {
     Sandboxed,
 }
 
+/// A passing sandboxed probe leaves a receipt keyed on the manifest sha,
+/// recording the FULL sha vector the probe ran (manifest + bound code).
+/// Advisory evidence for the approval card, deliberately not a ledger
+/// record: it grants nothing, and any edit to either half changes the
+/// vector and orphans the receipt.
+fn record_probe_receipt(data_dir: &Path, tool: &str, shas: &[String]) {
+    let Some(manifest_sha) = shas.first() else { return };
+    let dir = data_dir.join("probes");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let unix_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let receipt = serde_json::json!({
+        "tool": tool,
+        "shas": shas,
+        "verdict": "example passed in sandbox (no network, writes confined)",
+        "unix_time": unix_time,
+    });
+    // Atomic publish: a concurrent card lookup sees either the previous
+    // complete receipt or this one, never a truncated document it would
+    // read as "no evidence".
+    let _ = crate::sessions::write_atomic(&dir.join(format!("{manifest_sha}.json")), receipt.to_string());
+}
+
+/// Whether a passing probe receipt exists for exactly this sha vector. Used
+/// by the in-session approval card as evidence; a mismatch on any element
+/// (edited manifest or script) reads as no receipt.
+pub(crate) fn probe_passed(data_dir: &Path, shas: &[String]) -> bool {
+    let Some(manifest_sha) = shas.first() else { return false };
+    let path = data_dir.join("probes").join(format!("{manifest_sha}.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let recorded: Vec<&str> = receipt["shas"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    recorded == shas.iter().map(String::as_str).collect::<Vec<_>>()
+}
+
 impl ExampleGates {
     /// The documented call order (hooks pre → permissions → approval_mode →
     /// execute), evaluated with the same predicates the agent loop calls.
@@ -1050,6 +1092,15 @@ async fn run_examples_within(
             }
             Ok(Admission::Sandboxed) => {
                 sandboxed = true;
+                // The vector the probe is ABOUT to run: captured before the
+                // spawn, so a script rewritten while the probe runs cannot
+                // earn a passing receipt for bytes that were never probed.
+                let mut probed_shas = vec![ext.source_sha256.clone()];
+                probed_shas.extend(
+                    crate::ledger::bound_code(&ext.command, &ext.args, project_root)
+                        .into_iter()
+                        .filter_map(|c| c.sha256),
+                );
                 let scratch = data_dir
                     .join("probes-scratch")
                     .join(uuid::Uuid::new_v4().to_string());
@@ -1077,7 +1128,14 @@ async fn run_examples_within(
                                 shell_quote(&ext.source_path)
                             ))
                         } else {
-                            example_verdict(&outcome, example)
+                            let verdict = example_verdict(&outcome, example);
+                            if verdict.is_ok() {
+                                // Evidence for the approval card: the exact
+                                // pre-spawn vector, so any edit - before OR
+                                // during the run - orphans the receipt.
+                                record_probe_receipt(data_dir, &spec.name, &probed_shas);
+                            }
+                            verdict
                         }
                     }
                 }
@@ -2505,6 +2563,104 @@ mod tests {
             Ok(()) => panic!("a write outside the scratch must fail the probe"),
         }
         assert!(!touched.exists(), "the probe must not touch the project");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A passing probe leaves an exact-vector receipt; editing the manifest
+    /// orphans it. The receipt is evidence, never authority: the ledger
+    /// still records no approval.
+    #[tokio::test]
+    async fn a_passing_probe_leaves_a_receipt_bound_to_the_exact_bytes() {
+        let root = temp_project();
+        let manifest = tool_file(
+            &root,
+            "probe.toml",
+            "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat\"]\n\n[example]\nexpect_regex = \"hello\"\n[example.args]\nmsg = \"hello\"\n",
+        );
+        let data = approved_data_dir(&root, &[]);
+
+        let results = examples(&root, &data).await.unwrap();
+        let v = verdict(&results, "probe");
+        if let Err(reason) = &v.result {
+            assert!(reason.contains("cannot sandbox a probe"), "{reason}");
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(data);
+            return;
+        }
+        let bytes = std::fs::read(&manifest).unwrap();
+        let shas = vec![crate::ledger::sha256_hex(&bytes)];
+        assert!(probe_passed(&data, &shas), "the passing probe must leave a receipt");
+        assert!(
+            !crate::ledger::is_approved(&data, &root, &shas[0]),
+            "a receipt is evidence, not an approval"
+        );
+
+        // Any edit to the manifest changes the vector and orphans the receipt.
+        std::fs::write(
+            &manifest,
+            "name = \"probe\"\ndescription = \"edited\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat\"]\n",
+        )
+        .unwrap();
+        let edited = std::fs::read(&manifest).unwrap();
+        let edited_shas = vec![crate::ledger::sha256_hex(&edited)];
+        assert!(!probe_passed(&data, &edited_shas), "edited bytes have no receipt");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A script rewritten WHILE its probe runs must not earn a passing
+    /// receipt for the rewritten bytes: the receipt names the vector that
+    /// was actually probed (captured before the spawn), and the rewritten
+    /// vector has no receipt.
+    #[tokio::test]
+    async fn a_receipt_names_the_bytes_that_were_probed_not_the_bytes_after() {
+        let root = temp_project();
+        let script = root.join("slow.sh");
+        write(
+            script.clone(),
+            "#!/bin/sh\nsleep 1\nprintf hello\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let manifest = tool_file(
+            &root,
+            "slow.toml",
+            "name = \"slow\"\ndescription = \"d\"\ncommand = \"./slow.sh\"\n\n[example]\nexpect_regex = \"hello\"\n",
+        );
+        let data = approved_data_dir(&root, &[]);
+        let original_script_sha = crate::ledger::sha256_hex(&std::fs::read(&script).unwrap());
+        let manifest_sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+
+        // Rewrite the script mid-run: the probe sleeps 1s, we swap at ~200ms.
+        let rewriter = {
+            let script = script.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                // Same length and same output as the original, so the
+                // shell (which reads scripts incrementally) still exits 0
+                // and prints hello - only the BYTES differ. That is the
+                // precise shape where a post-run hash would lie.
+                std::fs::write(&script, "#!/bin/sh\nsleep 1\nprintf hello\n#x").unwrap();
+            })
+        };
+        let results = examples(&root, &data).await.unwrap();
+        let _ = rewriter.await;
+        let v = verdict(&results, "slow");
+        if let Err(reason) = &v.result {
+            assert!(reason.contains("cannot sandbox a probe"), "{reason}");
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(data);
+            return;
+        }
+        let probed = vec![manifest_sha.clone(), original_script_sha];
+        assert!(probe_passed(&data, &probed), "the receipt names the bytes that actually ran");
+        let rewritten_sha = crate::ledger::sha256_hex(&std::fs::read(&script).unwrap());
+        let rewritten = vec![manifest_sha, rewritten_sha];
+        assert!(!probe_passed(&data, &rewritten), "the rewritten bytes earned no receipt");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
