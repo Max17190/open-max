@@ -2790,20 +2790,31 @@ async fn run_loop(
                             // approves this exact content - the manifest and
                             // the code it runs: later runs of the same bytes
                             // need no prompt, any edit to either revokes.
-                            if let Some(source) = source {
-                                if let Err(e) = crate::ledger::approve_capability(
+                            // Whether the grant is now recorded: only then does
+                            // the receipt below promise cardless future calls.
+                            // If recording failed (e.g. the manifest changed
+                            // while the card was open), the NEXT call asks
+                            // again, so a "runs without a card" receipt would
+                            // lie (Greptile).
+                            let recorded = match source {
+                                None => false,
+                                Some(source) => match crate::ledger::approve_capability(
                                     &core.data_dir,
                                     project_root,
                                     &source.source_path,
                                     &source.shas,
                                 ) {
-                                    core.send_agent(session_id, AgentEvent::Error {
-                                        message: format!(
-                                            "approval was granted but could not be recorded (the tool will ask again): {e}"
-                                        ),
-                                    });
-                                }
-                            }
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        core.send_agent(session_id, AgentEvent::Error {
+                                            message: format!(
+                                                "approval was granted but could not be recorded (the tool will ask again): {e}"
+                                            ),
+                                        });
+                                        false
+                                    }
+                                },
+                            };
                             let mut outcome = registry
                                 .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
                                 .await;
@@ -2812,15 +2823,26 @@ async fn run_loop(
                             // one that never stopped - and a model that saw
                             // its edited tool re-prompt (correctly) and then
                             // run concluded that revocation does not work,
-                            // and taught the human so. Say what just happened.
+                            // and taught the human so. Say what just happened -
+                            // but only claim cardless future calls when the
+                            // grant actually landed.
                             if let Some(source) = source {
-                                outcome.output.push_str(&format!(
-                                    "\n[approved by the user: {} ({}) — later calls of these exact \
-                                     bytes run without a card; any edit to the manifest or its code \
-                                     asks again]",
-                                    source.path,
-                                    short_sha(&source.sha256)
-                                ));
+                                let note = if recorded {
+                                    format!(
+                                        "[approved by the user: {} ({}) — later calls of these exact \
+                                         bytes run without a card; any edit to the manifest or its \
+                                         code asks again]",
+                                        source.path,
+                                        short_sha(&source.sha256)
+                                    )
+                                } else {
+                                    format!(
+                                        "[the user approved this call, but the approval could not be \
+                                         recorded, so the NEXT call of {} stops for a card again]",
+                                        source.path
+                                    )
+                                };
+                                outcome.output.push_str(&format!("\n{note}"));
                             }
                             (outcome, false)
                         }
@@ -3337,8 +3359,12 @@ fn unapproved_capability(
     // `openmax --approve <manifest>` blesses the pair.
     let mut shas = vec![ext.source_sha256.clone()];
     shas.extend(code.into_iter().filter_map(|c| c.sha256));
-    let command_line = std::iter::once(ext.command.clone())
-        .chain(ext.args.iter().cloned())
+    // Each argv token shell-quoted, so `a b`, an empty arg, or a value with
+    // quotes/metacharacters keeps its boundary on the card - a space-joined
+    // line reads as a different or ambiguous invocation (Greptile security).
+    let command_line = std::iter::once(&ext.command)
+        .chain(ext.args.iter())
+        .map(|a| crate::doctor::shell_quote(std::path::Path::new(a)))
         .collect::<Vec<_>>()
         .join(" ");
     Some(UnapprovedCapability {

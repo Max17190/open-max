@@ -512,3 +512,52 @@ async fn a_script_only_edit_announces_the_revocation_on_the_writing_call() {
     assert!(!content.contains("[extension refreeze:"), "no fingerprint moved: {content}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// If the approval cannot be recorded (the manifest changed while the card
+/// was open), the receipt must NOT claim later calls run without a card -
+/// the next call asks again (Greptile). It says the recording failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrecordable_approval_does_not_claim_cardless_future_calls() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest = project.join(".openmax/tools/t.toml");
+    std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n").unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        // The model calls t; the human approves; but between card and record
+        // the manifest bytes change (a concurrent edit), so approve_capability
+        // refuses (bytes on disk are not the vouched bytes).
+        completion_with_tool_call("t", serde_json::json!({})),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    let manifest2 = manifest.clone();
+    open_max_core::agent::start_turn(std::sync::Arc::clone(&core), "unrecordable".into(), project.clone(), "go".into()).unwrap();
+    loop {
+        let env = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+        match env.event {
+            AgentEvent::ApprovalRequest { approval_id, .. } => {
+                // Change the manifest bytes before answering: the record will
+                // refuse because disk != vouched.
+                std::fs::write(&manifest2, "name = \"t\"\ndescription = \"CHANGED\"\ncommand = \"/bin/echo\"\n").unwrap();
+                core.respond_approval(&approval_id, true);
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let tool = second["messages"].as_array().unwrap().iter()
+        .find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap();
+    assert!(
+        !tool.contains("run without a card"),
+        "an unrecorded approval must not promise cardless calls: {tool}"
+    );
+    assert!(tool.contains("could not be recorded"), "{tool}");
+    let _ = std::fs::remove_dir_all(dir);
+}
