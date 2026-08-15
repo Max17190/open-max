@@ -246,3 +246,69 @@ async fn a_tui_authored_save_is_not_drift() {
     );
     let _ = std::fs::remove_dir_all(&env.dir);
 }
+
+/// Missing and unreadable are distinct drift states: a launch with no
+/// settings.json followed by an edit that leaves a DIRECTORY at the path
+/// (unreadable as a file, and it bricks the next launch) must be reported,
+/// not treated as "still missing".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_settings_file_replaced_by_a_directory_is_drift() {
+    let mut env = build_env(vec![completion_with_text("placeholder")]).await;
+    let settings_path = env.data.join("settings.json");
+    // Recreate the endpoint script now the path is known: mkdir at the
+    // settings path is exactly the shape a careless bash write can leave.
+    let mkdir = format!("rm -f {p} && mkdir {p}", p = settings_path.display());
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call("bash", serde_json::json!({ "command": mkdir })),
+        completion_with_text("done"),
+    ])
+    .await;
+    // Simulate "launched with no settings.json": the process's own view is
+    // Missing. Point the live settings at the endpoint in memory only and
+    // remove the file the fixture wrote.
+    let mut s = env.core.settings.lock().unwrap().clone();
+    s.base_url = base_url;
+    *env.core.settings.lock().unwrap() = s;
+    std::fs::remove_file(&settings_path).unwrap();
+    // Adopt the missing state as the launch view.
+    let _ = env.core.settings_disk_changed();
+    env.bodies = bodies;
+
+    drive_turn(&mut env, "dir-drift", "go").await;
+    let bodies = env.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let result = tool_result(&bodies[1]);
+    assert!(
+        result.contains("INVALID"),
+        "a directory at the settings path is drift that bricks the next launch: {result}"
+    );
+    let _ = std::fs::remove_dir_all(&env.dir);
+}
+
+/// The fingerprint after a harness save is of the bytes the harness WROTE,
+/// never a re-read of the path. Modeled deterministically: the external
+/// replacement lands BEFORE the harness adopts its own save (the interval-
+/// race outcome). A re-read-based adoption would swallow the foreign bytes
+/// as this process's own; fingerprinting the intended bytes keeps them
+/// visible as drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_racing_external_replacement_is_not_adopted_by_save() {
+    let env = build_env(vec![completion_with_text("only")]).await;
+    let settings_path = env.data.join("settings.json");
+    let mut s = env.core.settings.lock().unwrap().clone();
+    s.model = "scripted-2".into();
+    // The harness's write (through the direct helper, as /model does)...
+    open_max_core::config::save(&env.data, &s).unwrap();
+    // ...an external replacement lands in the interval...
+    let mut external = s.clone();
+    external.model = "external-edit".into();
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&external).unwrap()).unwrap();
+    // ...and only now does the harness adopt what IT saved.
+    env.core.adopt_saved_settings(&s);
+    *env.core.settings.lock().unwrap() = s;
+    assert!(
+        env.core.settings_disk_changed().is_some(),
+        "the foreign bytes must read as drift, not be adopted as this process's own"
+    );
+    let _ = std::fs::remove_dir_all(&env.dir);
+}

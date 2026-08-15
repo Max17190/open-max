@@ -158,12 +158,19 @@ pub fn load(data_dir: &Path) -> Result<Settings, String> {
 }
 
 pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
+    save_bytes(data_dir, settings).map(|_| ())
+}
+
+/// `save`, also returning the exact bytes written so a caller can fingerprint
+/// what IT wrote rather than re-reading a path something else may have
+/// replaced in the meantime.
+pub(crate) fn save_bytes(data_dir: &Path, settings: &Settings) -> Result<Vec<u8>, String> {
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     let destination = settings_path(data_dir);
-    crate::sessions::write_atomic(&destination, json)?;
+    crate::sessions::write_atomic(&destination, json.clone())?;
     // Endpoint resolution is cached; force a re-read after settings change.
     crate::providers::invalidate_providers_cache();
-    Ok(())
+    Ok(json.into_bytes())
 }
 
 #[cfg(test)]

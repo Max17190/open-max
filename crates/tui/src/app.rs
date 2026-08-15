@@ -1427,7 +1427,7 @@ impl App {
             model.clone(),
         ) {
             Ok(next) => {
-                self.core.refresh_settings_fingerprint();
+                self.core.adopt_saved_settings(&next);
                 *self.core.settings.lock().unwrap() = next;
                 let source = provider
                     .map(|name| format!(" from {name}"))

@@ -151,17 +151,35 @@ pub struct Core {
     /// the brick warning when the new bytes would not even parse. Lock
     /// discipline: never held across the `settings` lock (see
     /// `approval_mode`'s note; this mutex is leaf-only).
-    settings_disk_fingerprint: Mutex<Option<u64>>,
+    settings_disk_fingerprint: Mutex<SettingsFingerprint>,
     events: mpsc::UnboundedSender<AgentEventEnvelope>,
 }
 
-/// Content identity of settings.json on disk; None when missing/unreadable.
-fn settings_file_hash(data_dir: &std::path::Path) -> Option<u64> {
+/// Content identity of settings.json on disk. Missing and unreadable are
+/// distinct states: a launch with no file followed by a bash action that
+/// leaves a directory (or anything unreadable) at the path is drift that
+/// bricks the next launch, and must not compare equal to "still missing".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsFingerprint {
+    Missing,
+    Unreadable,
+    Bytes(u64),
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let bytes = std::fs::read(crate::config::settings_path(data_dir)).ok()?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
-    Some(h.finish())
+    h.finish()
+}
+
+fn settings_file_fingerprint(data_dir: &std::path::Path) -> SettingsFingerprint {
+    let path = crate::config::settings_path(data_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => SettingsFingerprint::Bytes(hash_bytes(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SettingsFingerprint::Missing,
+        Err(_) => SettingsFingerprint::Unreadable,
+    }
 }
 
 impl Core {
@@ -217,7 +235,7 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
-            settings_disk_fingerprint: Mutex::new(settings_file_hash(&core_data_dir)),
+            settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             events: tx,
         });
         Ok((core, rx))
@@ -256,7 +274,7 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
-            settings_disk_fingerprint: Mutex::new(settings_file_hash(&core_data_dir)),
+            settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             events: tx,
         });
         (core, rx, unreadable)
@@ -266,20 +284,32 @@ impl Core {
     /// fingerprint is refreshed with the write, so a TUI-authored save never
     /// reads as external drift.
     pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
-        crate::config::save(&self.data_dir, settings)?;
-        self.refresh_settings_fingerprint();
+        // Hold the fingerprint lock across the write so a concurrent drift
+        // check cannot observe the new bytes before this process claims
+        // them, and fingerprint the exact bytes WRITTEN - not a re-read of
+        // the path, which an external replacement could have swapped in the
+        // interval and thereby been adopted as this process's own.
+        let mut seen = self
+            .settings_disk_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let written = crate::config::save_bytes(&self.data_dir, settings)?;
+        *seen = SettingsFingerprint::Bytes(hash_bytes(&written));
         Ok(())
     }
 
-    /// Adopt the current on-disk settings bytes as this process's own. For
-    /// save paths that write through `config::save` directly (an existing
-    /// helper with its own tests): call this after a successful write so the
-    /// drift receipt never accuses the TUI's own hand.
-    pub fn refresh_settings_fingerprint(&self) {
-        *self
-            .settings_disk_fingerprint
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = settings_file_hash(&self.data_dir);
+    /// Adopt these exact settings as this process's own after a save that
+    /// went through `config::save` directly (an existing helper with its own
+    /// tests). Fingerprints the serialization of what was saved, never a
+    /// re-read of the path.
+    pub fn adopt_saved_settings(&self, settings: &Settings) {
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            *self
+                .settings_disk_fingerprint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                SettingsFingerprint::Bytes(hash_bytes(json.as_bytes()));
+        }
     }
 
     /// Whether settings.json on disk moved since this process last read or
@@ -287,7 +317,7 @@ impl Core {
     /// is reported once) and returns whether the new bytes would parse -
     /// the caller words the receipt. None while the disk matches.
     pub fn settings_disk_changed(&self) -> Option<Result<(), String>> {
-        let current = settings_file_hash(&self.data_dir);
+        let current = settings_file_fingerprint(&self.data_dir);
         let mut seen = self
             .settings_disk_fingerprint
             .lock()
