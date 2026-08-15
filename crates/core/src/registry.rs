@@ -107,6 +107,9 @@ pub struct Registry {
     /// registry rebuilt from a manifest that predates the field, so the
     /// first refreeze after an upgrade does not narrate every memory as new.
     pub memory_files: Option<Vec<(String, u64)>>,
+    /// The rendered memory index section captured in the SAME scan as
+    /// `memory_files`, so the frozen prompt and the receipt cannot disagree.
+    pub memory_section: Option<(String, Vec<(String, usize)>)>,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
@@ -141,6 +144,8 @@ pub(crate) struct ExtensionSnapshot {
     /// whenever some unrelated extension file happens to change. Not ledger
     /// files (data, not capability), so not in `files`.
     pub(crate) memory_files: Vec<(String, u64)>,
+    /// The index section from the same scan as `memory_files`.
+    pub(crate) memory_section: Option<(String, Vec<(String, usize)>)>,
 }
 
 impl ExtensionSnapshot {
@@ -272,8 +277,8 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             bytes.hash(&mut h);
         }
     }
-    let memory_files: Vec<(String, u64)> =
-        crate::memory::indexed_identities(project_root, crate::memory::unix_now());
+    let (memory_section, memory_files) =
+        crate::memory::index_and_identities(project_root, crate::memory::unix_now());
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
@@ -298,6 +303,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         files: files_read,
         broken,
         memory_files,
+        memory_section,
     }
 }
 
@@ -331,6 +337,7 @@ impl Registry {
         registry.skills_omitted = snapshot.skills_omitted;
         registry.broken = snapshot.broken;
         registry.memory_files = Some(snapshot.memory_files);
+        registry.memory_section = snapshot.memory_section;
         registry
     }
 
@@ -378,6 +385,7 @@ impl Registry {
             ext_fingerprint: 0,
             broken: Vec::new(),
             memory_files: None,
+            memory_section: None,
             schemas,
             schemas_wire,
             by_name,

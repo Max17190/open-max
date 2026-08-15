@@ -123,9 +123,15 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // The memory index rides the frozen prefix like the skills index: a line
     // per surfaced fact, bodies loaded on demand, nothing when the project
     // has no live memories so the zero-cost invariant holds.
-    if let Some((index, rows)) =
-        crate::memory::index_section(project_root, crate::memory::unix_now())
-    {
+    // Prefer the section captured in the registry's own freeze scan, so the
+    // frozen prompt and the refreeze receipt describe the same memory
+    // selection (Greptile: two separate scans could diverge). A registry that
+    // did not scan memory (builtin-only, from a manifest) scans fresh.
+    let memory = registry
+        .memory_section
+        .clone()
+        .or_else(|| crate::memory::index_section(project_root, crate::memory::unix_now()));
+    if let Some((index, rows)) = memory {
         let before = prompt.len();
         prompt.push_str(
             "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n",

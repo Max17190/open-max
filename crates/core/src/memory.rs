@@ -332,17 +332,47 @@ pub fn index_line(entry: &MemoryEntry) -> String {
 /// The hash covers the rendered index line, so editing a description that
 /// changes the line is a delta while an unrelated body edit is not.
 pub fn indexed_identities(project_root: &Path, now: u64) -> Vec<(String, u64)> {
+    index_and_identities(project_root, now).1
+}
+
+/// One scan producing BOTH the rendered index section (for the frozen prompt)
+/// AND the receipt identities (for the refreeze receipt), so the two can
+/// never disagree - a memory changed between two separate scans could make
+/// the receipt claim a fact live that the next prompt then omits (Greptile).
+/// (rendered index section, per-name byte breakdown) or None when empty.
+pub type IndexSection = Option<(String, Vec<(String, usize)>)>;
+
+pub fn index_and_identities(
+    project_root: &Path,
+    now: u64,
+) -> (IndexSection, Vec<(String, u64)>) {
     use std::hash::{Hash, Hasher};
-    scan(project_root, now)
-        .entries
+    let scan = scan(project_root, now);
+    let shown: Vec<&MemoryEntry> = scan.entries.iter().filter(|e| e.in_index).collect();
+    let identities: Vec<(String, u64)> = shown
         .iter()
-        .filter(|e| e.in_index)
         .map(|e| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             index_line(e).hash(&mut h);
             (e.name.clone(), h.finish())
         })
-        .collect()
+        .collect();
+    let section = if shown.is_empty() {
+        None
+    } else {
+        let mut out = String::new();
+        let mut breakdown = Vec::new();
+        for entry in &shown {
+            let line = index_line(entry);
+            breakdown.push((entry.name.clone(), line.len()));
+            out.push_str(&line);
+        }
+        if scan.omitted > 0 {
+            out.push_str(&trailer_line(scan.omitted));
+        }
+        Some((out, breakdown))
+    };
+    (section, identities)
 }
 
 /// The valid-named memory `.md` files (path, content) that a write must

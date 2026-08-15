@@ -562,6 +562,7 @@ async fn an_unrecordable_approval_does_not_claim_cardless_future_calls() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_memory_write_refreezes_and_is_indexed_for_the_next_step() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
