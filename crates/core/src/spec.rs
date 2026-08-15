@@ -116,7 +116,9 @@ its environment is the scrubbed baseline plus the manifest's `env` list.
 Human approval: because of that authority, the first call of any tool file -
 mutating or not - stops for a human, who approves the exact bytes. Later calls
 of identical bytes run unprompted; any edit revokes and asks again. Approve
-outside a session with `openmax --approve .openmax/tools/<name>.toml`, or by
+at an interactive terminal outside any session with `openmax --approve
+.openmax/tools/<name>.toml` (a human act: it refuses agent-spawned processes
+and callers with no terminal, so it cannot be laundered through bash), or by
 approving the write that created it. `openmax --spec usage` lists the approval
 state of every installed tool.
 
