@@ -79,6 +79,11 @@ pub struct SessionData {
     /// skipped, which is what keeps unchanged turn starts from growing this
     /// by one per turn.
     pub pending_syncs: Vec<(ExtensionGeneration, crate::ledger::Actor)>,
+    /// Content hashes of policy notices (inert allow rules, hooks that did
+    /// not load) already narrated to the MODEL this session. The condition
+    /// holds every turn once it holds at all, so the transcript gets one
+    /// note per distinct notice - the UI keeps its per-turn events.
+    pub reported_policy_notices: HashSet<u64>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous
