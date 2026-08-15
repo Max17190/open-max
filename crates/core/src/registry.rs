@@ -140,9 +140,12 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
-    // (path, reason, dir precedence index): the index resolves same-name
-    // collisions between a broken file and a loaded definition truthfully.
-    let mut broken_at: Vec<(PathBuf, String, usize)> = Vec::new();
+    // (path, reason, dir precedence index, declared name if recoverable):
+    // tools are keyed by DECLARED name, not file stem, so a collision between
+    // a broken file and a loaded definition must be judged on the name the
+    // broken file declares (bar.toml can declare name = "foo"); the stem is
+    // only the fallback when the file is too broken to yield a name.
+    let mut broken_at: Vec<(PathBuf, String, usize, Option<String>)> = Vec::new();
     let mut external_by_name: HashMap<String, (usize, ToolSpec)> = HashMap::new();
     for (dir_index, dir) in external_tool_dirs(data_dir, project_root).into_iter().enumerate() {
         dir.hash(&mut h);
@@ -162,7 +165,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let Some(bytes) = bytes else { continue };
             files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                broken_at.push((path, "not valid UTF-8".into(), dir_index));
+                broken_at.push((path, "not valid UTF-8".into(), dir_index, None));
                 continue;
             };
             match parse_tool_source(&path, text) {
@@ -170,7 +173,10 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
                 Ok(spec) => {
                     external_by_name.insert(spec.name.clone(), (dir_index, spec));
                 }
-                Err(reason) => broken_at.push((path, reason, dir_index)),
+                Err(reason) => {
+                    let declared = declared_tool_name(text);
+                    broken_at.push((path, reason, dir_index, declared));
+                }
             }
         }
     }
@@ -182,19 +188,20 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // under a valid project override: the override is legitimately active,
     // and the reason says so instead of claiming the name is not callable.
     let mut broken: Vec<(PathBuf, String)> = Vec::new();
-    for (path, mut reason, broken_dir) in broken_at {
-        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string());
-        if let Some(stem) = stem {
-            if let Some((loaded_dir, _)) = external_by_name.get(&stem) {
+    for (path, mut reason, broken_dir, declared) in broken_at {
+        let name = declared
+            .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+        if let Some(name) = name {
+            if let Some((loaded_dir, _)) = external_by_name.get(&name) {
                 if broken_dir > *loaded_dir {
                     reason.push_str(&format!(
-                        "; the lower-precedence definition of '{stem}' is withheld until \
+                        "; the lower-precedence definition of '{name}' is withheld until \
                          this override is fixed or removed"
                     ));
-                    external_by_name.remove(&stem);
+                    external_by_name.remove(&name);
                 } else {
                     reason.push_str(&format!(
-                        "; a higher-precedence definition of '{stem}' is active and callable"
+                        "; a higher-precedence definition of '{name}' is active and callable"
                     ));
                 }
             }
@@ -258,6 +265,16 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         files: files_read,
         broken,
     }
+}
+
+/// The `name` a tool manifest declares, when the document is TOML enough to
+/// yield one - a manifest that fails the spec (missing `command`, bad
+/// schema) still names its tool, and that name is what a collision with a
+/// loaded definition must be judged on. Malformed TOML yields None.
+fn declared_tool_name(text: &str) -> Option<String> {
+    let doc: toml::Value = toml::from_str(text).ok()?;
+    let name = doc.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Compatibility helper for diagnostics and tests that only need the content
@@ -1081,6 +1098,18 @@ mod tests {
             .find(|(p, _)| p.starts_with(&data))
             .expect("the broken global is recorded");
         assert!(reason.contains("higher-precedence"), "{reason}");
+
+        // Tools are keyed by DECLARED name, not stem: a broken project file
+        // named bar.toml that declares name = "wordcount" still collides
+        // with the valid global wordcount, and the fallback is withheld.
+        std::fs::remove_file(project.join(".openmax/tools/wordcount.toml")).unwrap();
+        std::fs::write(data.join("tools/wordcount.toml"), valid).unwrap();
+        std::fs::write(project.join(".openmax/tools/bar.toml"), broken).unwrap();
+        let registry = Registry::build(&data, &project);
+        assert!(
+            registry.get("wordcount").is_none(),
+            "a broken override under a different filename must still withhold the fallback"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
