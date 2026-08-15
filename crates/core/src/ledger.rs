@@ -458,6 +458,51 @@ pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, Stri
     read_verified(&project_dir(data_dir, project_root)).map(|v| v.records)
 }
 
+/// One human act against a capability's approval state, for surfacing an
+/// approval a session did not witness (#199): the path, whether it granted
+/// or retired, the actor, and the session that recorded it (None for a CLI
+/// act outside any session). Identity is content-stable across reads.
+#[derive(Clone, Debug)]
+pub struct ApprovalEvent {
+    pub path: PathBuf,
+    pub granted: bool,
+    pub session_id: Option<String>,
+    /// A stable id for this record (path + sha + ts + kind), so a session
+    /// can remember which events it has already narrated.
+    pub id: u64,
+}
+
+/// Every approval/retirement in the chain, oldest first. Cheap: one verified
+/// read, no object hashing.
+pub fn approval_events(data_dir: &Path, project_root: &Path) -> Vec<ApprovalEvent> {
+    let Ok(verified) = read_verified(&project_dir(data_dir, project_root)) else {
+        return Vec::new();
+    };
+    verified
+        .records
+        .iter()
+        .filter_map(|r| {
+            let granted = match r.kind {
+                Kind::Approval => true,
+                Kind::PathRetired => false,
+                _ => return None,
+            };
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            r.path.hash(&mut h);
+            r.sha256.hash(&mut h);
+            r.ts.hash(&mut h);
+            r.kind.as_str().hash(&mut h);
+            Some(ApprovalEvent {
+                path: r.path.clone(),
+                granted,
+                session_id: r.session_id.clone(),
+                id: h.finish(),
+            })
+        })
+        .collect()
+}
+
 /// History plus the interrupted-write flag, for callers that report state.
 pub fn read(data_dir: &Path, project_root: &Path) -> Result<History, String> {
     read_verified(&project_dir(data_dir, project_root)).map(|v| History {
