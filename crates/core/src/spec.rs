@@ -454,6 +454,19 @@ What the regex matches:
 - `glob`, `grep` → the pattern argument.
 - any other tool → the full serialized JSON arguments.
 
+A rule (and a `pre_tool_use` hook) sees TEXT, not effects. A `deny` on
+`bash` matches the command STRING, so it stops the spellings your regex
+anticipates and nothing else: `rm src/x` is caught, but `python3 -c
+'os.remove(...)'`, `truncate -s 0 src/x`, `find src -delete`, and `> src/x`
+are all different strings that reach the same file. A `tool = "bash"` rule
+also does not gate `write_file`/`edit_file` at all - those are separate tools.
+So a permission rule is friction against known patterns, NOT a filesystem
+guarantee: if a user asks for a hard guarantee that some path cannot be
+written, say plainly that these gates cannot deliver one, and offer what they
+can - `approval_mode = "ask"` so every mutating call is seen, an `ask` rule so
+the patterns you name prompt rather than run, or moving the files out of the
+agent's reach. Do not hand over a confident guard that does not guard.
+
 `allow` is the only effect that removes a gate: it skips the approval prompt
 outright. The project file sits where you write, so an `allow` in it is inert
 until a human approves that exact content with
