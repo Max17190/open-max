@@ -156,6 +156,16 @@ pub enum AgentEvent {
     /// allowed to be silent: a policy the user wrote down and is not getting
     /// has to say so.
     HookFailed { hook: String, event: String, detail: String },
+    /// A blocking `turn_end` hook refused the model's completion and the
+    /// harness honored it: `reason` is already in the transcript as a user
+    /// message (on disk before this event goes out) and the turn continues.
+    /// Without this a frontend watches the model finish and then start again
+    /// with no visible cause, while a later replay of the same session shows
+    /// the injected message - the live view and the disk would disagree.
+    /// `continuation` and `continuations_left` are the numbers the hook's
+    /// payload carried for this attempt: refusals honored before this one,
+    /// and how many the harness had left to honor.
+    TurnRefused { hook: String, reason: String, continuation: usize, continuations_left: usize },
     /// Exactly one per turn, and the only guaranteed terminator. Carries the
     /// provider's `finish_reason` on a normal end, or one of the harness's own:
     /// `truncated` (the stream ended with no completion signal, so the reply is
@@ -185,7 +195,7 @@ mod tests {
 
     /// Golden wire format for every `AgentEvent`, wrapped in its envelope
     /// exactly as `--stdio` and `--print --json` emit it. These strings are
-    /// the `openmax-stdio/3` contract: session_id first, then the `type`
+    /// the `openmax-stdio/4` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     #[test]
@@ -297,6 +307,15 @@ mod tests {
                 detail: "exit code 1".into(),
             }),
             r#"{"session_id":"s1","type":"hook_failed","hook":"audit","event":"post_tool_use","detail":"exit code 1"}"#
+        );
+        assert_eq!(
+            env(AgentEvent::TurnRefused {
+                hook: "verify".into(),
+                reason: "tests failing".into(),
+                continuation: 0,
+                continuations_left: 8,
+            }),
+            r#"{"session_id":"s1","type":"turn_refused","hook":"verify","reason":"tests failing","continuation":0,"continuations_left":8}"#
         );
         assert_eq!(
             env(AgentEvent::Done { stop_reason: "stop".into() }),

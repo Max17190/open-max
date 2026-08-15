@@ -2622,6 +2622,22 @@ impl App {
                 // Observe hooks are fail-open; the note keeps them honest.
                 self.note(&format!("hook '{hook}' failed on {event}: {detail}"));
             }
+            AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
+                // The refusal is already a user message on disk, so a resumed
+                // session replays it as one; pushing the same block live keeps
+                // the view being watched and the view being replayed the same
+                // transcript. The note carries what the block cannot: whose
+                // verdict this was and how close the harness is to overriding.
+                self.note(&format!(
+                    "turn_end gate '{hook}' refused completion (refusal {} of {}); its reason continues the turn:",
+                    continuation + 1,
+                    continuation + continuations_left,
+                ));
+                self.insert_user_block(&reason);
+                // An open find popup indexes blocks; the injected one must
+                // enter its matches now, exactly as a finished message does.
+                self.refilter_scroll_search_live();
+            }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
                 self.set_presence(Presence::Idle);

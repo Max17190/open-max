@@ -302,7 +302,10 @@ turn ends. The payload says which case this is (`blockable`), how many
 refusals have already been honored (`continuation`), and how many are left
 (`continuations_left`). After 8 honored refusals the harness overrides the
 hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
-that, and on `max_iterations` and `budget_exhausted`. A blocking hook that
+that, and on `max_iterations` and `budget_exhausted`. A refusal whose injected
+user message cannot be persisted is reported and ends the turn `unverified`
+the same way: a continuation only the running process remembers would diverge
+from every replay of the session. A blocking hook that
 times out or fails to start refuses, like any other gate.
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
@@ -619,14 +622,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/3)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/4)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/3","protocol_version":3,"session_id":"...","version":"...","project":"/abs/path"}.
+{"type":"hello","proto":"openmax-stdio/4","protocol_version":4,"session_id":"...","version":"...","project":"/abs/path"}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -656,7 +659,14 @@ tokens_after, compacted_messages: the receipt of a forced compaction;
 compacted_messages of 0 means the transcript was already at or under the
 prune target and nothing changed),
 `hook_failed` (hook, event, detail: a hook did not run - an observe-only hook
-failed, or a hook file on disk is not loaded - and the turn proceeded), `done`
+failed, or a hook file on disk is not loaded - and the turn proceeded),
+`turn_refused` (hook, reason, continuation, continuations_left: a blocking
+`turn_end` hook refused the model's completion and the harness honored it;
+`reason` is already in the transcript as a user message - on disk before this
+event goes out - and the turn continues, so render it, or the live view shows
+the model finishing and then starting again with no visible cause while a
+replay of the same session from disk shows the injected message; the two
+counters are the numbers the hook's payload carried for this attempt), `done`
 (stop_reason), `error` (message).
 
 `approval_request.reason` is `gate` (approval_mode or a permission rule) or
@@ -684,6 +694,11 @@ A command line over 8 MiB, or one that is not valid UTF-8, is refused with a
 While a client is live, approvals are forwarded and openmax waits for an
 `approve`; after quit or EOF, pending and later approvals are declined so
 shutdown drains promptly.
+
+What changed in openmax-stdio/4: `turn_refused` is new. A client written for
+/3 has never seen a turn continue after `message_done` without its own `user`
+command; under a blocking `turn_end` hook that is now a normal turn shape, and
+this event is the only line that says why.
 
 What changed in openmax-stdio/3: `budget.used_tokens` now counts the frozen
 tool schemas sent on every request, not the transcript alone. Same field,
@@ -891,6 +906,12 @@ mod tests {
                 hook: String::new(),
                 event: String::new(),
                 detail: String::new(),
+            },
+            AgentEvent::TurnRefused {
+                hook: String::new(),
+                reason: String::new(),
+                continuation: 0,
+                continuations_left: 0,
             },
             AgentEvent::Done { stop_reason: String::new() },
             AgentEvent::Error { message: String::new() },

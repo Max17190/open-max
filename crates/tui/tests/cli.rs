@@ -449,8 +449,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/3");
-    assert_eq!(hello["protocol_version"], 3);
+    assert_eq!(hello["proto"], "openmax-stdio/4");
+    assert_eq!(hello["protocol_version"], 4);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
