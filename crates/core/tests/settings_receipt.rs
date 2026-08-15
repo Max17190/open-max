@@ -142,6 +142,11 @@ async fn drive_turn(env: &mut Env, session: &str, text: &str) {
             break;
         }
     }
+    // Done precedes the running flag clearing; wait for idle before the
+    // caller starts another turn (a fast runner races that window).
+    while env.core.is_running(session) {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 fn tool_result(body: &str) -> String {
