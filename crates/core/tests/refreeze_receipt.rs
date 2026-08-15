@@ -366,3 +366,149 @@ async fn the_receipt_distinguishes_callable_from_registered_pending_approval() {
     drop(bodies);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Approval outcomes reach the model. (1) An approved first call carries a
+/// receipt naming the grant and its revocation rule - the approve path was
+/// silent, so an approved call looked identical to one that never stopped,
+/// and a model that saw its edited tool re-prompt then run concluded that
+/// revocation does not work. (2) Editing an approved manifest is narrated at
+/// the refreeze as revoking the approval. (3) Editing only the SCRIPT (no
+/// fingerprint moves, no refreeze) is narrated on the writing call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_grants_and_revocations_are_narrated_to_the_model() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let script = project.join("echo.sh");
+    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let manifest_v1 = "name = \"echoer\"\ndescription = \"d\"\ncommand = \"./echo.sh\"\nmutating = false\n";
+    let manifest_v2 = "name = \"echoer\"\ndescription = \"d2\"\ncommand = \"./echo.sh\"\nmutating = false\n";
+    std::fs::write(project.join(".openmax/tools/echoer.toml"), manifest_v1).unwrap();
+
+    let (base_url, bodies) = recording_endpoint(vec![
+        // Turn 1: call the unapproved tool (card -> approved), then edit its
+        // manifest (refreeze: revocation), then edit only its script.
+        completion_with_tool_call("echoer", serde_json::json!({ "x": 1 })),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/echoer.toml", "content": manifest_v2 }),
+        ),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": "echo.sh", "content": "#!/bin/sh\n# edited\ncat\n" }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    // The human answers the card when it fires.
+    start_turn(Arc::clone(&core), "grant-narrated".into(), project.clone(), "go".into()).unwrap();
+    let mut approved_once = false;
+    loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("turn finishes within 30s")
+            .expect("event channel stays open");
+        match envelope.event {
+            AgentEvent::ApprovalRequest { approval_id, .. } => {
+                approved_once = true;
+                core.respond_approval(&approval_id, true);
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(approved_once, "the first call must have raised the card");
+    let bodies_now = bodies.lock().unwrap().clone();
+    assert!(bodies_now.len() >= 3);
+    let tool_msgs = |body: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    // Request 2 carries the approved call's result.
+    let first = &tool_msgs(&bodies_now[1])[0];
+    assert!(first.contains("[approved by the user: .openmax/tools/echoer.toml"), "{first}");
+    assert!(first.contains("any edit to the manifest or its code asks again"), "{first}");
+    // Request 3 carries the manifest edit's result + refreeze receipt.
+    let second = &tool_msgs(&bodies_now[2])[1];
+    assert!(second.contains("[extension refreeze:"), "{second}");
+    assert!(
+        second.contains("Modified tools whose current bytes no human has approved"),
+        "a manifest edit of an approved tool is narrated as revoking: {second}"
+    );
+    assert!(second.contains("echoer (openmax --approve"), "{second}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The script-only edit path: no fingerprint moves, no refreeze, and yet the
+/// writing call's result must say the approval was revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_only_edit_announces_the_revocation_on_the_writing_call() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let script = project.join("echo.sh");
+    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let manifest_path = project.join(".openmax/tools/echoer.toml");
+    std::fs::write(&manifest_path, "name = \"echoer\"\ndescription = \"d\"\ncommand = \"./echo.sh\"\nmutating = false\n").unwrap();
+    // The human approved manifest + script beforehand.
+    std::fs::create_dir_all(&data).unwrap();
+    let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&manifest_path).unwrap())];
+    shas.extend(
+        open_max_core::ledger::manifest_code(&manifest_path, &project)
+            .into_iter()
+            .filter_map(|c| c.sha256),
+    );
+    open_max_core::ledger::approve_capability(&data, &project, &manifest_path, &shas).unwrap();
+
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": "echo.sh", "content": "#!/bin/sh\n# edited\ncat\n" }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "script-edit", &project, "edit the script").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content.contains("[approval revoked:"),
+        "a script edit must be narrated as revoking the tool's approval: {content}"
+    );
+    assert!(content.contains("echoer (openmax --approve"), "{content}");
+    assert!(!content.contains("[extension refreeze:"), "no fingerprint moved: {content}");
+    let _ = std::fs::remove_dir_all(dir);
+}
