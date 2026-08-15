@@ -1,0 +1,3 @@
+event = "pre_tool_use"
+command = "./scripts/plan-mode-gate.py"
+timeout_secs = 5
