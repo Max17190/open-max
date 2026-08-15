@@ -315,3 +315,54 @@ async fn a_turn_start_refreeze_note_reaches_the_model() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The receipt must not oversell: an unapproved tool is registered, and its
+/// first call stops for a human. Round-4 dogfooding watched the receipt say
+/// "callable" and the very next step raise an approval card - the model
+/// itself named the receipt as dishonest. Approved bytes keep "callable".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_receipt_distinguishes_callable_from_registered_pending_approval() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+
+    let manifest = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\nmutating = false\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wordfreq.toml", "content": manifest }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    drive_turn(&core, &mut rx, "unapproved-receipt", &project, "go").await;
+
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !content.contains("callable from your next step: wordfreq"),
+        "an unapproved tool must not be called callable: {content}"
+    );
+    assert!(content.contains("registered"), "{content}");
+    assert!(content.contains("human approval"), "{content}");
+    assert!(
+        content.contains("openmax --approve .openmax/tools/wordfreq.toml"),
+        "the receipt names the exact approve command: {content}"
+    );
+    assert!(content.contains("--run-examples"), "and the probe path: {content}");
+    drop(bodies);
+    let _ = std::fs::remove_dir_all(dir);
+}

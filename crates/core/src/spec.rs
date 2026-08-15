@@ -78,6 +78,10 @@ pub(crate) fn manifest_toml_error(err: &toml::de::Error, surface: &str) -> Strin
 
 const TOOLS: &str = r#"# External tools
 
+(Every `openmax ...` command below means the binary running THIS session:
+`$OPENMAX_BIN` is set on every process the harness spawns. A bare `openmax`
+on PATH may be a different, older build that prints the same version.)
+
 One TOML file per tool: `.openmax/tools/<name>.toml` (project) or
 `~/.openmax/tools/<name>.toml` (global). Project wins on name collision.
 A tool named like a built-in (list_dir, read_file, write_file, edit_file,
@@ -909,6 +913,18 @@ mod tests {
         let perms = root.join(".openmax/permissions.toml");
         let perms_sha = crate::ledger::sha256_hex(&std::fs::read(&perms).unwrap());
         crate::ledger::approve_capability(&data, &root, &perms, &[perms_sha]).unwrap();
+        // The tool example too: an unapproved tool loads but --check says
+        // its first call stops for approval (a Warn, not Ok), so the human
+        // stands in here as well; what this test asserts is that the spec's
+        // examples PARSE and LOAD, not the ledger's state.
+        let tool = root.join(".openmax/tools/todo_scan.toml");
+        let mut tool_shas = vec![crate::ledger::sha256_hex(&std::fs::read(&tool).unwrap())];
+        tool_shas.extend(
+            crate::ledger::manifest_code(&tool, &root)
+                .into_iter()
+                .filter_map(|c| c.sha256),
+        );
+        crate::ledger::approve_capability(&data, &root, &tool, &tool_shas).unwrap();
 
         let findings: Vec<_> = crate::doctor::check_at(&root, &data)
             .into_iter()

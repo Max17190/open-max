@@ -298,3 +298,45 @@ async fn a_resumed_session_does_not_repeat_a_persisted_notice() {
     assert_eq!(notes, 1, "the resumed process must not add a second copy of the notice");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A hook file written mid-turn gets a receipt on the writing call saying it
+/// is NOT running (inert until a human approves it out of session). Hooks
+/// are outside the extension fingerprint, so before this the write got no
+/// receipt at all and the agent believed its gate was live for a whole turn
+/// (round-4 dogfood).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_written_mid_turn_is_named_inert_on_the_writing_call() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let hook = "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/hooks/gate.toml", "content": hook }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "hook-write", &project, "install a gate").await;
+
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("[hook files changed"), "{content}");
+    assert!(content.contains("Not running"), "the hook is named inert now, not next turn: {content}");
+    assert!(content.contains("openmax --approve"), "{content}");
+    let _ = std::fs::remove_dir_all(dir);
+}

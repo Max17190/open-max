@@ -139,6 +139,27 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             Some(changed) => Status::Warn(format!(
                                 "{changed}, so the next call asks for approval again"
                             )),
+                            // Loaded but never approved: the same state a
+                            // hook reports as inert. A tool is not inert -
+                            // its first call prompts - but "ok" read as
+                            // "callable now" to round-4's models, opposite
+                            // the hook line for the same gate. Say so.
+                            None if !crate::ledger::is_approved(
+                                data_dir,
+                                project_root,
+                                &ext.source_sha256,
+                            ) =>
+                            {
+                                Status::Warn(format!(
+                                    "tool '{}' loads; no human has approved its content, so its \
+                                     first call stops for approval (openmax --approve {}, or \
+                                     approve the card it raises in a session; prove it first with \
+                                     openmax --check --run-examples, which probes unapproved \
+                                     tools in a sandbox)",
+                                    spec.name,
+                                    shell_quote(&ext.source_path)
+                                ))
+                            }
                             None => Status::Ok(format!("tool '{}'", spec.name)),
                         },
                         (None, None) => Status::Ok(format!("tool '{}'", spec.name)),
@@ -2442,7 +2463,12 @@ mod tests {
 
         let findings = local(&root);
         assert!(has_errors(&findings));
-        assert!(matches!(find(&findings, "good.toml").status, Status::Ok(_)));
+        // Parses and loads; approval state (Ok vs the unapproved Warn) is
+        // the ledger's business, asserted elsewhere.
+        assert!(matches!(
+            find(&findings, "good.toml").status,
+            Status::Ok(_) | Status::Warn(_)
+        ));
         assert!(find(&findings, "good.toml").status.summary().contains("deploy"));
         assert!(find(&findings, "broken.toml").status.summary().contains("invalid TOML"));
         assert!(find(&findings, "shadow.toml").status.summary().contains("shadows a built-in"));
@@ -3075,6 +3101,17 @@ mod tests {
         let ghost = findings.iter().find(|f| f.path.ends_with("ghost.toml")).unwrap();
         assert!(matches!(ghost.status, Status::Warn(_)), "{:?}", ghost.status);
         assert!(ghost.status.summary().contains("does not exist"), "{}", ghost.status.summary());
+        // A loadable but never-approved tool is not "ok": its first call
+        // stops for approval, and --check says so (the same disclosure a
+        // hook gets, previously missing for tools - dogfood finding).
+        let real = findings.iter().find(|f| f.path.ends_with("real.toml")).unwrap();
+        assert!(matches!(real.status, Status::Warn(_)), "{:?}", real.status);
+        assert!(real.status.summary().contains("no human has approved"), "{}", real.status.summary());
+        assert!(real.status.summary().contains("--approve"), "{}", real.status.summary());
+        // Approve the exact bytes and it reads healthy.
+        let bytes = std::fs::read(tools_dir.join("real.toml")).unwrap();
+        crate::ledger::approve_hash(&data, &root, &crate::ledger::sha256_hex(&bytes)).unwrap();
+        let findings = check_at(&root, &data);
         let real = findings.iter().find(|f| f.path.ends_with("real.toml")).unwrap();
         assert!(matches!(real.status, Status::Ok(_)), "{:?}", real.status);
         let _ = std::fs::remove_dir_all(root);
