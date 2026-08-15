@@ -645,6 +645,7 @@ async fn a_rejected_memory_name_is_never_claimed_indexed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_an_approved_tool_says_the_approval_outlives_it() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
@@ -681,5 +682,49 @@ async fn removing_an_approved_tool_says_the_approval_outlives_it() {
     assert!(content.contains("Removed approved tools: echoer"), "{content}");
     assert!(content.contains("the approval outlives the file"), "{content}");
     assert!(content.contains("nothing needs forgetting"), "{content}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Deleting a tool whose SCRIPT was edited (manifest unchanged, but the
+/// bound code no longer matches what was approved) must NOT be classified
+/// as a removed-approved tool: the runtime gate would ask again, so the
+/// receipt cannot claim 'would run without a card' (Greptile).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_tool_with_edited_bound_code_is_not_called_approved() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let script = project.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+    let manifest = project.join(".openmax/tools/t.toml");
+    std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    // Approve manifest + the ORIGINAL script.
+    let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
+    shas.extend(open_max_core::ledger::manifest_code(&manifest, &project).into_iter().filter_map(|c| c.sha256));
+    open_max_core::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
+    // Edit the script AND delete the manifest in one turn.
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call("write_file", serde_json::json!({ "path": "run.sh", "content": "#!/bin/sh\n# edited\ncat\n" })),
+        completion_with_tool_call("bash", serde_json::json!({ "command": "rm .openmax/tools/t.toml" })),
+        completion_with_text("gone"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "edit-then-remove", &project, "go").await;
+    let bodies = bodies.lock().unwrap();
+    // The removal receipt (request 3) must not name t as removed-approved.
+    let third: serde_json::Value = serde_json::from_str(&bodies[2]).unwrap();
+    for m in third["messages"].as_array().unwrap() {
+        if let Some(c) = m["content"].as_str() {
+            assert!(
+                !c.contains("Removed approved tools: t"),
+                "a tool with edited bound code is not approved: {c}"
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(dir);
 }

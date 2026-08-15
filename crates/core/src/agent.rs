@@ -1748,13 +1748,21 @@ fn classify_added_tools(
         _ => None,
     };
     let mut removed_approved: Vec<String> = Vec::new();
-    for old_spec in &old_registry.tools {
-        let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
-        if new_registry.get(&old_spec.name).is_some() {
-            continue;
-        }
-        if crate::ledger::is_approved(data_dir, project_root, &old_ext.source_sha256) {
-            removed_approved.push(old_spec.name.clone());
+    if !old_registry.tools.is_empty() {
+        let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
+        for old_spec in &old_registry.tools {
+            let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
+            if new_registry.get(&old_spec.name).is_some() {
+                continue;
+            }
+            // The FULL approval the runtime gate checks: manifest sha AND the
+            // bound code. A tool whose script was edited (manifest unchanged)
+            // is not actually approved - the next call asks - so its deletion
+            // must not claim 'would run without a card' (Greptile).
+            let code = crate::ledger::bound_code(&old_ext.command, &old_ext.args, project_root);
+            if approvals.contains(&old_ext.source_sha256) && approvals.covers_code(&code) {
+                removed_approved.push(old_spec.name.clone());
+            }
         }
     }
     removed_approved.sort();
