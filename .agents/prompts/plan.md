@@ -1,7 +1,7 @@
 ---
 description: Enter read-only plan mode (only PLAN.md writable)
 ---
-<!-- openmax:plan-mode:arm -->
+<!-- openmax-plan-mode-arm-9f3c1a7e42b8d605 -->
 
 # Plan mode is now ARMED (harness-enforced)
 

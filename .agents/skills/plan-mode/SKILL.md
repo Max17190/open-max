@@ -10,9 +10,22 @@ description: Read-only planning via /plan and /execute; harness blocks all write
 - `/execute [note]` — disarms plan mode and implements `PLAN.md`.
 
 ## How enforcement works
-1. `user_prompt_submit` hook (`scripts/plan-mode-prompt.py`) sees the arm/disarm
-   HTML comment markers injected by the `/plan` and `/execute` prompt templates
-   and writes or removes `.openmax/state/plan-armed`.
+1. `user_prompt_submit` hook (`scripts/plan-mode-prompt.py`) toggles
+   `.openmax/state/plan-armed` when the FIRST non-empty line of the submitted
+   text is the arm or disarm marker - an opaque high-entropy HTML comment the
+   `/plan` and `/execute` templates put on line one, before any user
+   `$ARGUMENTS`. First-line-only means a `/plan` whose args quote the disarm
+   marker still arms; the opaque token means an ordinary or pasted message
+   does not toggle it by accident.
+
+   Threat model: the `user_prompt_submit` payload carries only the expanded
+   prompt text, not the trusted slash-command, so the arm/disarm signal is
+   necessarily in-band. Plan mode is the USER's own guard - the same user who
+   armed it can `/execute` - so a user deliberately reproducing the marker is
+   not a privilege escalation, and file content the agent reads never reaches
+   this hook (it fires on the user's prompt only). This is an example
+   capability, not a core security boundary; treat plan mode as a workflow
+   guard, not a sandbox.
 2. `pre_tool_use` hook (`scripts/plan-mode-gate.py`) runs on every tool call.
    While the state file exists it allows only:
    - `read_file`, `list_dir`, `glob`, `grep`

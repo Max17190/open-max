@@ -6,8 +6,8 @@ import json
 import sys
 from pathlib import Path
 
-ARM = "<!-- openmax:plan-mode:arm -->"
-DISARM = "<!-- openmax:plan-mode:disarm -->"
+ARM = "<!-- openmax-plan-mode-arm-9f3c1a7e42b8d605 -->"
+DISARM = "<!-- openmax-plan-mode-disarm-1b7e4c92a0f5d38a -->"
 STATE = Path(".openmax/state/plan-armed")
 
 

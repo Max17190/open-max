@@ -1,7 +1,7 @@
 ---
 description: Leave plan mode and implement PLAN.md
 ---
-<!-- openmax:plan-mode:disarm -->
+<!-- openmax-plan-mode-disarm-1b7e4c92a0f5d38a -->
 
 # Plan mode is now DISARMED — execute the plan
 
