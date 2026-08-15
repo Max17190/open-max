@@ -276,8 +276,10 @@ Fields:
 - `args` (optional): fixed argv strings.
 - `timeout_secs` (optional): default 10, clamped to 1..60.
 - `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
-- `blocking` (optional): `turn_end` only, default false. Rejected on every
-  other event, which either always gates or never does.
+- `blocking` (optional): `turn_end` only, default false. True makes the hook
+  a completion gate: a nonzero exit refuses the turn's end and the reason is
+  sent back as a user message. False observes only; exit status is ignored.
+  Rejected on every other event, which either always gates or never does.
 
 Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
 call or the prompt. The block reason is the hook's stdout (or stderr if stdout
