@@ -140,9 +140,11 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
-    let mut broken: Vec<(PathBuf, String)> = Vec::new();
-    let mut external_by_name: HashMap<String, ToolSpec> = HashMap::new();
-    for dir in external_tool_dirs(data_dir, project_root) {
+    // (path, reason, dir precedence index): the index resolves same-name
+    // collisions between a broken file and a loaded definition truthfully.
+    let mut broken_at: Vec<(PathBuf, String, usize)> = Vec::new();
+    let mut external_by_name: HashMap<String, (usize, ToolSpec)> = HashMap::new();
+    for (dir_index, dir) in external_tool_dirs(data_dir, project_root).into_iter().enumerate() {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -160,18 +162,47 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let Some(bytes) = bytes else { continue };
             files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                broken.push((path, "not valid UTF-8".into()));
+                broken_at.push((path, "not valid UTF-8".into(), dir_index));
                 continue;
             };
             match parse_tool_source(&path, text) {
                 // Global is scanned first, so a project definition wins.
                 Ok(spec) => {
-                    external_by_name.insert(spec.name.clone(), spec);
+                    external_by_name.insert(spec.name.clone(), (dir_index, spec));
                 }
-                Err(reason) => broken.push((path, reason)),
+                Err(reason) => broken_at.push((path, reason, dir_index)),
             }
         }
     }
+    // A broken file colliding by stem with a loaded definition must not lie
+    // in either direction. A broken PROJECT file over a valid global: the
+    // user's override is what they meant to run, so the global fallback is
+    // withheld (running different code than intended, silently, is the
+    // failure this whole surface exists to prevent). A broken GLOBAL file
+    // under a valid project override: the override is legitimately active,
+    // and the reason says so instead of claiming the name is not callable.
+    let mut broken: Vec<(PathBuf, String)> = Vec::new();
+    for (path, mut reason, broken_dir) in broken_at {
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string());
+        if let Some(stem) = stem {
+            if let Some((loaded_dir, _)) = external_by_name.get(&stem) {
+                if broken_dir > *loaded_dir {
+                    reason.push_str(&format!(
+                        "; the lower-precedence definition of '{stem}' is withheld until \
+                         this override is fixed or removed"
+                    ));
+                    external_by_name.remove(&stem);
+                } else {
+                    reason.push_str(&format!(
+                        "; a higher-precedence definition of '{stem}' is active and callable"
+                    ));
+                }
+            }
+        }
+        broken.push((path, reason));
+    }
+    let external_by_name: HashMap<String, ToolSpec> =
+        external_by_name.into_iter().map(|(k, (_, v))| (k, v)).collect();
     let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
     for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
@@ -1008,6 +1039,49 @@ mod tests {
         assert!(err.contains("invalid TOML"), "{err}");
         assert!(err.contains("invalid type"), "{err}");
         assert!(err.contains('^'), "{err}");
+    }
+
+    /// A same-name collision between a broken file and a loaded definition
+    /// must not lie in either direction: a broken PROJECT override withholds
+    /// the global fallback (running different code than the user configured,
+    /// silently, is the failure this surface exists to prevent), while a
+    /// broken GLOBAL under a valid project override leaves the override
+    /// callable and says so.
+    #[test]
+    fn a_broken_project_override_withholds_the_global_fallback() {
+        let dir = std::env::temp_dir().join(format!("openmax-collide-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(data.join("tools")).unwrap();
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        let valid = "name = \"wordcount\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n";
+        let broken = "name = \"wordcount\"\ndescription = \"d\"\n";
+
+        // Broken project override + valid global: withheld, and the reason
+        // says so instead of claiming the name is not callable elsewhere.
+        std::fs::write(data.join("tools/wordcount.toml"), valid).unwrap();
+        std::fs::write(project.join(".openmax/tools/wordcount.toml"), broken).unwrap();
+        let registry = Registry::build(&data, &project);
+        assert!(registry.get("wordcount").is_none(), "the global fallback must be withheld");
+        let (_, reason) = registry
+            .broken
+            .iter()
+            .find(|(p, _)| p.starts_with(&project))
+            .expect("the broken override is recorded");
+        assert!(reason.contains("withheld"), "{reason}");
+
+        // Reverse: broken global + valid project override stays callable.
+        std::fs::write(data.join("tools/wordcount.toml"), broken).unwrap();
+        std::fs::write(project.join(".openmax/tools/wordcount.toml"), valid).unwrap();
+        let registry = Registry::build(&data, &project);
+        assert!(registry.get("wordcount").is_some(), "the valid override must stay callable");
+        let (_, reason) = registry
+            .broken
+            .iter()
+            .find(|(p, _)| p.starts_with(&data))
+            .expect("the broken global is recorded");
+        assert!(reason.contains("higher-precedence"), "{reason}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
