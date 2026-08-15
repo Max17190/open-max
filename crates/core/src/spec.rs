@@ -463,7 +463,9 @@ also does not gate `write_file`/`edit_file` at all - those are separate tools.
 So a permission rule is friction against known patterns, NOT a filesystem
 guarantee: if a user asks for a hard guarantee that some path cannot be
 written, say plainly that these gates cannot deliver one, and offer what they
-can - `approval_mode = "ask"` so every mutating call is seen, an `ask` rule so
+can - `approval_mode = "ask"` so every mutating call not covered by an
+approved `allow` rule is shown (an approved `allow` still runs it unprompted,
+so drop such rules for the paths you want to see), an `ask` rule so
 the patterns you name prompt rather than run, or moving the files out of the
 agent's reach. Do not hand over a confident guard that does not guard.
 
