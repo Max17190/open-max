@@ -496,7 +496,14 @@ pub struct RegistryManifest {
 /// as absent (fail closed on unknown future formats): the session falls back
 /// to built-ins and the next turn re-freezes cleanly from disk, instead of
 /// deserializing a newer format into the wrong shape.
-pub const MANIFEST_VERSION: u32 = 2;
+///
+/// v3: external tools carry an `env` allowlist. A v2 manifest has no such
+/// field, and defaulting it to empty would resume a credential-dependent
+/// tool with a scrubbed environment while the fingerprint still matched
+/// disk (no refreeze to repair it). Bumping the version makes v2 read as
+/// absent, so the session re-freezes from disk once and picks up the real
+/// grant - the same forward-only migration this constant already promises.
+pub const MANIFEST_VERSION: u32 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
@@ -510,8 +517,10 @@ pub struct ExternalToolManifest {
     pub mutating: bool,
     pub command: String,
     pub args: Vec<String>,
-    /// Additive: manifests written before this field default to empty
-    /// (baseline-only env), matching the parse-time default.
+    /// Env var names forwarded to the tool. Present in every v3 manifest;
+    /// the serde default only guards a hand-edited file, because v2
+    /// manifests (which lack it) never reach this deserializer - the
+    /// version gate reads them as absent so the session refreezes from disk.
     #[serde(default)]
     pub env: Vec<String>,
     pub timeout_secs: u64,
