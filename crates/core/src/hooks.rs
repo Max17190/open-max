@@ -1206,6 +1206,7 @@ async fn run_hook(
             spill_bytes_per_stream: 0,
         },
         sandbox: None,
+        env_allowlist: None,
     };
 
     match execution::run_process(request, cancel.clone()).await {

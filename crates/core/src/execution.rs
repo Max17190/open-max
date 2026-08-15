@@ -45,6 +45,14 @@ pub(crate) struct ProcessRequest {
     /// no sandbox policy). `Some` exists for probe runs of code no human
     /// has approved yet: see [`SandboxPolicy`].
     pub sandbox: Option<SandboxPolicy>,
+    /// Env var NAMES forwarded from the parent environment. `None` = the
+    /// full host environment (bash, hooks: the user's shell). `Some(names)`
+    /// = scrub, then a baseline (PATH, HOME, LANG, TERM from the parent)
+    /// plus exactly the named variables - external tools, whose manifest
+    /// declares the list, making the credential grant part of the bytes a
+    /// human approves. Ignored under `sandbox`: a probe stays fully
+    /// scrubbed whatever its manifest asks for.
+    pub env_allowlist: Option<Vec<String>>,
 }
 
 /// Containment for a probe run: no network, filesystem reads allowed, writes
@@ -490,11 +498,27 @@ pub(crate) async fn run_process(
         // A probe holds no ambient secrets: scrubbed environment, HOME at
         // the scratch. PATH keeps the system directories so interpreters
         // resolve; project-local scripts are reachable via cwd as usual.
+        // Deliberately ignores env_allowlist: unapproved code gets nothing.
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         command.env("HOME", &policy.rw_scratch);
         command.env("TERM", "dumb");
         command.env("LANG", "C.UTF-8");
+    } else if let Some(names) = &request.env_allowlist {
+        // The manifest-declared grant: baseline from the parent so
+        // interpreters and tools behave, plus exactly the named variables.
+        // Everything else - API keys included - stays with the harness.
+        command.env_clear();
+        for baseline in ["PATH", "HOME", "LANG", "TERM"] {
+            if let Some(value) = std::env::var_os(baseline) {
+                command.env(baseline, value);
+            }
+        }
+        for name in names {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
     }
     // Mark every native child as agent-spawned. Trust grants are human
     // actions: the CLI refuses --trust-project (and the interactive trust
@@ -885,6 +909,7 @@ mod tests {
                 spill_bytes_per_stream: 1024,
             },
             sandbox: None,
+            env_allowlist: None,
         }
     }
 
@@ -903,6 +928,7 @@ mod tests {
                 spill_bytes_per_stream: 0,
             },
             sandbox: None,
+            env_allowlist: None,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
@@ -925,6 +951,7 @@ mod tests {
                 ro_root: scratch.to_path_buf(),
                 rw_scratch: scratch.to_path_buf(),
             }),
+            env_allowlist: None,
         }
     }
 
