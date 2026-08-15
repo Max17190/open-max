@@ -636,11 +636,27 @@ Commands, one JSON object per line:
 - {"cmd":"user","text":"..."} starts a turn.
 - {"cmd":"approve","approval_id":"...","approved":true|false} answers a
   pending approval.
+- {"cmd":"approval_mode","mode":"auto"|"ask"|"readonly"} sets the gate for
+  mutating tools, persisted to settings like the TUI's /approvals. Answered
+  by {"type":"approval_mode","mode":"..."} once the new mode is saved, or a
+  `protocol_error` naming the legal values; on a save failure the mode is
+  unchanged and the error says so.
+- {"cmd":"reload"} re-freezes tools, skills, and the prompt from current
+  config, like /reload; answered by a `refrozen` event, and refused with a
+  `protocol_error` while a turn is in flight.
 - {"cmd":"cancel"} cancels the running turn.
 - {"cmd":"quit"} drains the in-flight turn, then exits. EOF behaves like quit.
 Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
 session continues; extra fields on a known command are ignored; blank lines
 are skipped.
+
+`openmax --stdio --continue` reattaches to the directory's latest session.
+After `hello` it emits one
+{"type":"transcript","session_id":"...","messages":[{"role":"user"|"assistant","content":"..."},...],"truncated":bool}
+line so the client can render what came before: user and assistant text only,
+bounded per message and in total (`truncated` says whether anything was cut),
+with the session file remaining the full record. No synthetic live events are
+replayed, so a `token` stream always means a running turn.
 
 Events: every line carries `session_id`, a `type` discriminator, then fields.
 Parse by field name, never by key order. Types: `token` (text), `thinking`

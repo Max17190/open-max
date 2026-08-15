@@ -957,6 +957,47 @@ mod tests {
         );
     }
 
+    /// Every stdin command the reader accepts and every bespoke stdout line
+    /// the session emits must appear in the printed contract: a frontend is
+    /// written against `openmax --spec stdio` and judged by `validate_line`,
+    /// so a name the spec omits is either a capability its author cannot
+    /// discover or a line their client rejects on arrival. The match is
+    /// exhaustive, so adding a Command variant without teaching the spec
+    /// stops compiling here.
+    #[test]
+    fn the_spec_names_every_command_and_bespoke_line() {
+        let text = open_max_core::spec::render("stdio").unwrap();
+        let wire = [
+            r#"{"cmd":"user","text":"hi"}"#,
+            r#"{"cmd":"approve","approval_id":"a","approved":true}"#,
+            r#"{"cmd":"approval_mode","mode":"auto"}"#,
+            r#"{"cmd":"reload"}"#,
+            r#"{"cmd":"cancel"}"#,
+            r#"{"cmd":"quit"}"#,
+        ];
+        for line in wire {
+            let cmd: Command = serde_json::from_str(line).expect(line);
+            let name = match cmd {
+                Command::User { .. } => "user",
+                Command::Approve { .. } => "approve",
+                Command::ApprovalMode { .. } => "approval_mode",
+                Command::Reload => "reload",
+                Command::Cancel => "cancel",
+                Command::Quit => "quit",
+            };
+            assert!(
+                text.contains(&format!("\"cmd\":\"{name}\"")),
+                "--spec stdio never names command '{name}'"
+            );
+        }
+        for ty in ["hello", "protocol_error", "approval_mode", "transcript"] {
+            assert!(
+                text.contains(&format!("\"type\":\"{ty}\"")),
+                "--spec stdio never names bespoke line '{ty}'"
+            );
+        }
+    }
+
     #[test]
     fn a_refused_user_command_is_terminated_by_done() {
         let env = AgentEventEnvelope {
