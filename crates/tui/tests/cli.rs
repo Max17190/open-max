@@ -1245,3 +1245,40 @@ fn a_new_session_reuses_the_previous_session_prefix() {
          pays a full prefill"
     );
 }
+
+/// Greptile's repro: a session launched under an attested shell must not
+/// hand its bash children a bypass. The child unsets the marker; the
+/// attestation must already be gone; --approve refuses for lack of a
+/// terminal.
+#[test]
+fn an_attested_parent_does_not_let_a_bash_child_approve() {
+    let (project, home) = fresh_dirs("attest-inherit");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(project.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(project.join("gate.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(hooks.join("gate.toml"), "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
+    // The scripted turn: one bash call that does exactly what the dogfood
+    // agent did, from a parent that IS attested (cmd() sets it).
+    let bypass = format!(
+        "env -u OPENMAX_SESSION {} --approve .openmax/hooks/gate.toml < /dev/null; echo \"exit=$?\"",
+        openmax_bin()
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": bypass })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "go"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("exit=3"), "the child's --approve must refuse: {stderr}");
+    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&ledger.stdout).contains("approved"),
+        "no approval may land from an agent's bash child"
+    );
+}
