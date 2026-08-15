@@ -517,8 +517,11 @@ Example (`~/.openmax/providers.json`):
 }
 ```
 
-Activation: resolved at the next turn (settings edits apply without a
-restart). Verify with `openmax --check`.
+Activation: providers.json is re-read every turn (content-keyed cache), so
+a catalog edit applies at the next turn without a restart. settings.json is
+NOT hot - it is read once at launch; see `openmax --spec settings` for the
+boundary and the supported model-switch recipe. Verify with `openmax
+--check`, which validates providers.json and settings.json.
 "#;
 
 const SETTINGS: &str = r#"# Settings (`~/.openmax/settings.json`)

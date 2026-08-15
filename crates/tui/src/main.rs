@@ -811,7 +811,7 @@ async fn main() -> std::io::Result<()> {
         // to explain), and both faces have to agree on the exit code.
         if findings.is_empty() && !cli.run_examples {
             println!(
-                "no extension files found (tools, skills, templates, hooks, permissions, providers)"
+                "no extension files found (tools, skills, templates, hooks, permissions, providers, settings)"
             );
             std::process::exit(0);
         }
