@@ -32,7 +32,7 @@
 //! Refreezing mid-turn is allowed between iterations but never inside one, so
 //! the schemas a model was shown are the schemas its reply is checked against.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -267,6 +267,49 @@ fn report_hook_failures(
 /// once per session while a new or reworded one gets through. The UI channel
 /// (HookFailed events, per turn) is unchanged; this dedupe is only for the
 /// transcript, where repetition is token spend.
+fn policy_notice_hash(notice: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    notice.hash(&mut h);
+    h.finish()
+}
+
+const POLICY_NOTE_PREFIX: &str = "[policy notice: ";
+const PERMISSION_NOTE_PREFIX: &str = "\n[permission notice: ";
+const NOTICE_JOINER: &str = " | ";
+
+/// Rebuild the reported-notice set from a persisted transcript, so a resumed
+/// session (new process, hydrated messages) does not re-narrate every
+/// still-applicable static notice: the transcript already carries them, and
+/// once per SESSION means once across the session's whole life, not once
+/// per process. Notes are split on the joiner they were assembled with, so
+/// the hashes match what novel_policy_notices would compute.
+fn rehydrate_policy_notices(messages: &[ChatMessage]) -> HashSet<u64> {
+    let mut seen = HashSet::new();
+    for message in messages {
+        let Some(content) = message.content.as_deref() else { continue };
+        let bodies: Vec<&str> = match message.role.as_str() {
+            "user" => content
+                .strip_prefix(POLICY_NOTE_PREFIX)
+                .and_then(|s| s.strip_suffix(']'))
+                .into_iter()
+                .collect(),
+            "tool" => content
+                .split(PERMISSION_NOTE_PREFIX)
+                .skip(1)
+                .filter_map(|tail| tail.split(']').next())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for body in bodies {
+            for notice in body.split(NOTICE_JOINER) {
+                seen.insert(policy_notice_hash(notice));
+            }
+        }
+    }
+    seen
+}
+
 async fn novel_policy_notices(
     core: &Arc<Core>,
     session_id: &str,
@@ -281,12 +324,7 @@ async fn novel_policy_notices(
     };
     notices
         .into_iter()
-        .filter(|n| {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            n.hash(&mut h);
-            data.reported_policy_notices.insert(h.finish())
-        })
+        .filter(|n| data.reported_policy_notices.insert(policy_notice_hash(n)))
         .collect()
 }
 
@@ -369,6 +407,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
                 count,
             )
         };
+        let reported_policy_notices = rehydrate_policy_notices(&messages);
         SessionData {
             messages,
             registry,
@@ -380,7 +419,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             system_insert_unrecorded,
             ledger_synced: false,
             pending_syncs: Vec::new(),
-            reported_policy_notices: Default::default(),
+            reported_policy_notices,
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -2079,7 +2118,10 @@ async fn run_loop(
     if !novel.is_empty() {
         let msgs = guard.messages();
         let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(format!("[policy notice: {}]", novel.join(" | "))));
+        msgs.insert(
+            at,
+            ChatMessage::user(format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER))),
+        );
     }
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
@@ -2730,8 +2772,10 @@ async fn run_loop(
                             if let Some(last) =
                                 guard.messages().iter_mut().rev().find(|m| m.role == "tool")
                             {
-                                let note =
-                                    format!("\n[permission notice: {}]", novel.join(" | "));
+                                let note = format!(
+                                    "{PERMISSION_NOTE_PREFIX}{}]",
+                                    novel.join(NOTICE_JOINER)
+                                );
                                 match &mut last.content {
                                     Some(content) => content.push_str(&note),
                                     None => last.content = Some(note.trim_start().to_string()),

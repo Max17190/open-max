@@ -239,3 +239,57 @@ async fn a_turn_start_policy_notice_lands_once_per_session() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Once per SESSION means across the session's whole life: a resumed
+/// session (new process, hydrated transcript) must not re-narrate a still-
+/// applicable static notice the transcript already carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_session_does_not_repeat_a_persisted_notice() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax")).unwrap();
+    std::fs::write(project.join(".openmax/permissions.toml"), ALLOW_RULE).unwrap();
+    let project = project.canonicalize().unwrap();
+
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_text("first process"),
+        completion_with_text("second process"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+
+    // Process one: an INDEXED session (saves are silent no-ops for an
+    // unindexed id, which would make this test pass vacuously), the notice
+    // lands, the transcript persists.
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    let session = open_max_core::sessions::create(&core, project.to_string_lossy().into())
+        .unwrap()
+        .id;
+    drive_turn(&core, &mut rx, &session, &project, "turn one").await;
+    assert!(
+        open_max_core::sessions::load_messages(&core, &session).is_some(),
+        "the transcript must be on disk for this to be a real resume"
+    );
+    drop(rx);
+    drop(core);
+
+    // Process two: same session id, hydrated from disk.
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, &session, &project, "turn two").await;
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let notes = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            m["role"] == "user"
+                && m["content"].as_str().is_some_and(|c| c.starts_with("[policy notice:"))
+        })
+        .count();
+    assert_eq!(notes, 1, "the resumed process must not add a second copy of the notice");
+    let _ = std::fs::remove_dir_all(dir);
+}
