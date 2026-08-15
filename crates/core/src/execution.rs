@@ -1,7 +1,10 @@
 //! Native child-process supervision shared by agent-dispatched commands.
 //!
-//! This module deliberately preserves the host environment. It owns lifecycle
-//! and bounded capture, not sandbox policy.
+//! By default this module deliberately preserves the host environment: it
+//! owns lifecycle and bounded capture, and the session's tools, hooks, and
+//! bash all run with `sandbox: None`. The one exception is an explicit
+//! [`SandboxPolicy`] on a request - probe runs of unapproved tool code -
+//! which is argv surgery plus an env scrub, still the same lifecycle.
 
 use std::{
     ffi::OsString,
@@ -37,6 +40,37 @@ pub(crate) struct ProcessRequest {
     pub stdin: StdinMode,
     pub timeout: Duration,
     pub capture: CaptureSpec,
+    /// OS-level containment for this one spawn. `None` is the default and
+    /// preserves the module's stated posture exactly (host environment,
+    /// no sandbox policy). `Some` exists for probe runs of code no human
+    /// has approved yet: see [`SandboxPolicy`].
+    pub sandbox: Option<SandboxPolicy>,
+}
+
+/// Containment for a probe run: no network, filesystem reads allowed, writes
+/// confined to `rw_scratch`, environment scrubbed to a minimal set with
+/// `HOME` pointed at the scratch dir. This is not a general sandbox and
+/// deliberately not applied to bash, hooks, or approved tools - it exists so
+/// an agent can iterate on a tool it just wrote (and a human can see "the
+/// example passed in a sandbox") before anyone grants the tool real host
+/// authority. Reads are not cut because the agent already holds unconfined
+/// bash: the marginal authority a probe must not have is the network (the
+/// probe exfiltrating on its own) and mutation outside its scratch.
+///
+/// Backends: macOS `sandbox-exec` (deny network* + deny file-write* outside
+/// scratch, on an allow-default base - the shape Bazel and Nix ride), Linux
+/// bubblewrap (`--unshare-all`, read-only root bind, scratch bound
+/// read-write). No backend, or a backend that cannot be probed alive, is
+/// [`ProcessError::SandboxUnavailable`]: callers fail closed to their
+/// pre-sandbox refusal, never silently unsandboxed.
+#[derive(Clone, Debug)]
+pub(crate) struct SandboxPolicy {
+    /// The project root the probe may read (documentation of intent; reads
+    /// are broadly allowed - see above - but the cwd and inputs live here).
+    #[allow(dead_code)]
+    pub ro_root: PathBuf,
+    /// The one directory the probe may write; also its HOME.
+    pub rw_scratch: PathBuf,
 }
 
 pub(crate) enum StdinMode {
@@ -123,6 +157,10 @@ pub(crate) struct ProcessOutput {
 pub(crate) enum ProcessError {
     Spawn(io::Error),
     Wait(io::Error),
+    /// A sandboxed run was requested and no working backend exists on this
+    /// host. Distinct so callers can fall back to their pre-sandbox refusal:
+    /// the one wrong answer is running the probe unsandboxed anyway.
+    SandboxUnavailable(String),
 }
 
 impl std::fmt::Display for ProcessError {
@@ -130,6 +168,9 @@ impl std::fmt::Display for ProcessError {
         match self {
             Self::Spawn(error) => write!(f, "failed to spawn process: {error}"),
             Self::Wait(error) => write!(f, "failed while supervising process: {error}"),
+            Self::SandboxUnavailable(reason) => {
+                write!(f, "no sandbox backend available on this host: {reason}")
+            }
         }
     }
 }
@@ -339,23 +380,128 @@ where
     }
 }
 
+/// Rewrite `(program, args)` to run under this host's sandbox backend, or
+/// say why no containment is possible. Pure argv surgery: the supervisor's
+/// lifecycle, capture, and process-group handling see one program like any
+/// other (the wrapper is the group leader, so cancel and timeout kill the
+/// whole tree unchanged).
+fn apply_sandbox(
+    program: &OsString,
+    args: &[OsString],
+    policy: &SandboxPolicy,
+) -> Result<(OsString, Vec<OsString>), ProcessError> {
+    #[cfg(target_os = "macos")]
+    {
+        let exec = Path::new("/usr/bin/sandbox-exec");
+        if !exec.exists() {
+            return Err(ProcessError::SandboxUnavailable(
+                "/usr/bin/sandbox-exec is missing".into(),
+            ));
+        }
+        // Allow-default with explicit cuts: network entirely, writes outside
+        // the scratch (plus the null device). The kernel evaluates canonical
+        // paths, and /var and /tmp are symlinks into /private on macOS, so
+        // the subpath rule must name the canonical spelling or a scratch
+        // under the temp dir denies its own writes. Seatbelt profile strings
+        // quote paths; a quote inside a path cannot be expressed safely, so
+        // refuse.
+        let canonical = policy
+            .rw_scratch
+            .canonicalize()
+            .unwrap_or_else(|_| policy.rw_scratch.clone());
+        let scratch = canonical.to_string_lossy();
+        if scratch.contains('"') {
+            return Err(ProcessError::SandboxUnavailable(
+                "scratch path contains a quote, unrepresentable in a sandbox profile".into(),
+            ));
+        }
+        let profile = format!(
+            "(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n\
+             (allow file-write* (subpath \"{scratch}\"))\n\
+             (allow file-write-data (literal \"/dev/null\"))\n\
+             (allow file-write-data (literal \"/dev/dtracehelper\"))\n"
+        );
+        let mut wrapped: Vec<OsString> = vec!["-p".into(), profile.into(), program.clone()];
+        wrapped.extend(args.iter().cloned());
+        Ok((exec.as_os_str().to_os_string(), wrapped))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(bwrap) = ["/usr/bin/bwrap", "/usr/local/bin/bwrap", "/bin/bwrap"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            return Err(ProcessError::SandboxUnavailable(
+                "bubblewrap (bwrap) is not installed".into(),
+            ));
+        };
+        // Read-only root, scratch bound writable, all namespaces unshared
+        // (which cuts the network). If user namespaces are disabled the run
+        // fails at spawn with bwrap's own diagnostic - a loud refusal, not a
+        // silent unsandboxed run.
+        let mut wrapped: Vec<OsString> = vec![
+            "--die-with-parent".into(),
+            "--unshare-all".into(),
+            "--ro-bind".into(),
+            "/".into(),
+            "/".into(),
+            "--dev".into(),
+            "/dev".into(),
+            "--proc".into(),
+            "/proc".into(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--bind".into(),
+            policy.rw_scratch.as_os_str().to_os_string(),
+            policy.rw_scratch.as_os_str().to_os_string(),
+            "--".into(),
+            program.clone(),
+        ];
+        wrapped.extend(args.iter().cloned());
+        Ok((bwrap.as_os_str().to_os_string(), wrapped))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (program, args, policy);
+        Err(ProcessError::SandboxUnavailable(
+            "no sandbox backend for this platform".into(),
+        ))
+    }
+}
+
 /// Execute one native process with concurrent bounded output capture.
 pub(crate) async fn run_process(
     request: ProcessRequest,
     cancel: Arc<CancelToken>,
 ) -> Result<ProcessOutput, ProcessError> {
-    let mut command = Command::new(&request.program);
+    let (program, args) = match &request.sandbox {
+        None => (request.program.clone(), request.args.clone()),
+        Some(policy) => apply_sandbox(&request.program, &request.args, policy)?,
+    };
+    let mut command = Command::new(&program);
     command
-        .args(&request.args)
+        .args(&args)
         .current_dir(&request.cwd)
-        // Mark every native child as agent-spawned. Trust grants are human
-        // actions: the CLI refuses --trust-project (and the interactive trust
-        // prompt) when this marker is present, so an agent cannot launder a
-        // trust grant through a child process it starts.
-        .env("OPENMAX_SESSION", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if let Some(policy) = &request.sandbox {
+        // A probe holds no ambient secrets: scrubbed environment, HOME at
+        // the scratch. PATH keeps the system directories so interpreters
+        // resolve; project-local scripts are reachable via cwd as usual.
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        command.env("HOME", &policy.rw_scratch);
+        command.env("TERM", "dumb");
+        command.env("LANG", "C.UTF-8");
+    }
+    // Mark every native child as agent-spawned. Trust grants are human
+    // actions: the CLI refuses --trust-project (and the interactive trust
+    // prompt) when this marker is present, so an agent cannot launder a
+    // trust grant through a child process it starts. Applied after any
+    // env_clear so the marker survives the scrub.
+    command.env("OPENMAX_SESSION", "1");
     match request.stdin {
         StdinMode::Null => {
             command.stdin(std::process::Stdio::null());
@@ -738,6 +884,7 @@ mod tests {
                 spill_dir: None,
                 spill_bytes_per_stream: 1024,
             },
+            sandbox: None,
         }
     }
 
@@ -755,9 +902,121 @@ mod tests {
                 spill_dir: None,
                 spill_bytes_per_stream: 0,
             },
+            sandbox: None,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
+    }
+
+    fn sandboxed_request(scratch: &Path, script: &str) -> ProcessRequest {
+        ProcessRequest {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: scratch.to_path_buf(),
+            stdin: StdinMode::Null,
+            timeout: Duration::from_secs(10),
+            capture: CaptureSpec {
+                head_bytes: 4096,
+                tail_bytes: 4096,
+                spill_dir: None,
+                spill_bytes_per_stream: 0,
+            },
+            sandbox: Some(SandboxPolicy {
+                ro_root: scratch.to_path_buf(),
+                rw_scratch: scratch.to_path_buf(),
+            }),
+        }
+    }
+
+    /// Run a sandboxed request, or - on a host with no backend - assert the
+    /// fail-closed error and skip the behavioral half. Never silently green.
+    async fn run_sandboxed(request: ProcessRequest) -> Option<ProcessOutput> {
+        match run_process(request, Arc::new(CancelToken::default())).await {
+            Ok(output) => Some(output),
+            Err(ProcessError::SandboxUnavailable(reason)) => {
+                eprintln!("sandbox backend unavailable here ({reason}); fail-closed path verified");
+                None
+            }
+            Err(other) => panic!("sandboxed spawn failed unexpectedly: {other}"),
+        }
+    }
+
+    /// The probe's write authority ends at its scratch: an escape attempt
+    /// fails and leaves nothing behind, while a scratch write succeeds.
+    #[tokio::test]
+    async fn a_sandboxed_probe_writes_only_inside_its_scratch() {
+        let base = std::env::temp_dir().join(format!("omx-sbx-{}", uuid::Uuid::new_v4()));
+        let scratch = base.join("scratch");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let script = format!(
+            "echo probed > inside.txt; echo escaped > {}/escape.txt",
+            outside.display()
+        );
+        let Some(output) = run_sandboxed(sandboxed_request(&scratch, &script)).await else {
+            return;
+        };
+        assert!(scratch.join("inside.txt").exists(), "scratch write must succeed");
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "a write outside the scratch must be denied"
+        );
+        match output.termination {
+            Termination::Exited(status) => assert!(!status.success(), "the escape must fail loudly"),
+            _ => panic!("probe should run to completion"),
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The probe has no network: a loopback connect to a live listener fails
+    /// under the sandbox. The listener is provably alive (bound in-process),
+    /// so a pass can only mean the sandbox cut the network.
+    #[tokio::test]
+    async fn a_sandboxed_probe_has_no_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = std::env::temp_dir().join(format!("omx-sbx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = format!(
+            "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {port}), 2); print(\"CONNECTED\")'"
+        );
+        let Some(output) = run_sandboxed(sandboxed_request(&base, &script)).await else {
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout.head).to_string();
+        assert!(
+            !stdout.contains("CONNECTED"),
+            "a sandboxed probe reached the network: {stdout}"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The probe's environment is scrubbed - a secret in the parent env never
+    /// reaches it - while the agent-spawned marker survives the scrub and
+    /// HOME points into the scratch.
+    #[tokio::test]
+    async fn a_sandboxed_probe_env_is_scrubbed() {
+        // Set on the test process; an unsandboxed child would inherit it.
+        std::env::set_var("OPENMAX_TEST_SECRET_ZZZ", "leak");
+        let base = std::env::temp_dir().join(format!("omx-sbx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = "printf '%s|%s|%s' \"$OPENMAX_TEST_SECRET_ZZZ\" \"$OPENMAX_SESSION\" \"$HOME\"";
+        let Some(output) = run_sandboxed(sandboxed_request(&base, script)).await else {
+            std::env::remove_var("OPENMAX_TEST_SECRET_ZZZ");
+            return;
+        };
+        std::env::remove_var("OPENMAX_TEST_SECRET_ZZZ");
+        let stdout = String::from_utf8_lossy(&output.stdout.head).to_string();
+        let parts: Vec<&str> = stdout.split('|').collect();
+        assert_eq!(parts[0], "", "parent env must not leak into a probe: {stdout}");
+        assert_eq!(parts[1], "1", "the session marker survives the scrub: {stdout}");
+        assert!(
+            parts[2].contains(base.file_name().unwrap().to_str().unwrap()),
+            "HOME points into the scratch: {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]

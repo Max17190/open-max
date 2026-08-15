@@ -802,6 +802,7 @@ async fn spawn_external(
             spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
+        sandbox: None,
     };
 
     match execution::run_process(request, cancel).await {
@@ -813,6 +814,9 @@ async fn spawn_external(
         Err(ProcessError::Wait(e)) => {
             ToolOutcome::err(format!("external tool '{name}' failed: {e}"))
         }
+        // Session-path external tools run unsandboxed (sandbox: None above);
+        // the sandboxed probe path in doctor.rs maps this to its refusal.
+        Err(e @ ProcessError::SandboxUnavailable(_)) => ToolOutcome::err(e.to_string()),
         Ok(output) => match &output.termination {
             Termination::Cancelled => ToolOutcome::from_killed_process(
                 format!("external tool '{name}' cancelled by user"),

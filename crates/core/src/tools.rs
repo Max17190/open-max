@@ -991,10 +991,14 @@ async fn bash_tool(
             spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
+        sandbox: None,
     };
     match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
         Err(ProcessError::Wait(e)) => ToolOutcome::err(format!("command failed: {e}")),
+        // bash never runs sandboxed (request.sandbox is None above); keep
+        // the honest message should that ever change.
+        Err(e @ ProcessError::SandboxUnavailable(_)) => ToolOutcome::err(e.to_string()),
         Ok(output) => match &output.termination {
             Termination::Cancelled => {
                 ToolOutcome::from_killed_process("command cancelled by user", &output)

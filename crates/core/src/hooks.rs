@@ -1205,6 +1205,7 @@ async fn run_hook(
             spill_dir: None,
             spill_bytes_per_stream: 0,
         },
+        sandbox: None,
     };
 
     match execution::run_process(request, cancel.clone()).await {
@@ -1217,6 +1218,9 @@ async fn run_hook(
                 hook.source_path.display()
             ))
         }
+        // Hooks never run sandboxed (sandbox: None above); a gate still
+        // fails closed if that ever changes.
+        Err(e @ ProcessError::SandboxUnavailable(_)) => HookRun::Block(e.to_string()),
         Err(ProcessError::Wait(e)) => {
             HookRun::Block(format!("hook '{}' failed: {e}", hook.source_path.display()))
         }
