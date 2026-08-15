@@ -183,23 +183,31 @@ capped rendering a tool call returns (the tail, once output exceeds the cap),
 so a token printed early by a noisy command can scroll out of the window.
 Plain `--check` never executes anything.
 
-An example is the tool's real command with the harness's full host authority,
-run in the project root with no sandbox and no snapshot: it can delete files
-and write outside the project. So it passes the same gates a turn applies, and
-runs only when all of them admit it:
+How an example runs depends on whether a human has approved the tool's exact
+bytes (manifest plus the project-local code it names):
 
-- the project is trusted (`openmax --trust-project`);
-- a human approved the tool file's exact bytes (`openmax --approve <path>`);
-  editing the file revokes that approval;
-- `pre_tool_use` hooks allow the call, and permission rules admit it: `deny`
-  refuses, and so does `ask`, because nothing here can prompt - write
-  `effect = "allow"` for a tool whose example should run unattended;
-- `approval_mode` is not `readonly` for a `mutating` tool. A `mutating`
-  example under `approval_mode = "ask"` needs a human to start the run, so it
-  is refused when the agent loop spawned the process.
+- UNAPPROVED (the common case while you are still writing it): the example
+  runs as a SANDBOXED PROBE - no network, writes confined to a scratch dir
+  (which is also its HOME and TMPDIR), scrubbed environment - with zero host
+  authority granted, so it needs no approval, no `ask`-mode person, and you
+  may run it mid-turn as often as you like. The verdict is labeled
+  `[sandboxed probe: ...]`, and a passing probe leaves evidence that the
+  approval card later shows the human ("probe: example passed in sandbox").
+  A passing probe approves NOTHING: in-session calls still stop for the card
+  until a human approves the bytes. On a host with no sandbox backend the
+  probe is refused (never run unsandboxed) and the refusal says so.
+- APPROVED: the example is the tool's real command with the harness's host
+  authority, run in the project root with no sandbox and no snapshot, behind
+  the same gates a turn applies: `pre_tool_use` hooks allow it; permission
+  rules admit it (`deny` refuses, and so does `ask`, because nothing here can
+  prompt - write `effect = "allow"` for a tool whose example should run
+  unattended); and `approval_mode` is not `readonly` for a `mutating` tool
+  (a `mutating` example under `approval_mode = "ask"` needs a human to start
+  the run, so it is refused when the agent loop spawned the process).
 
-Each refusal names what to fix. An example must not itself run
-`openmax --check --run-examples`: that is refused rather than recursed into.
+Both need the project trusted (`openmax --trust-project`). Each refusal names
+what to fix. An example must not itself run `openmax --check --run-examples`:
+that is refused rather than recursed into.
 "#;
 
 const SKILLS: &str = r#"# Skills
