@@ -103,6 +103,10 @@ pub struct Registry {
     /// reason. Receipts and the unknown-tool error name these so a broken
     /// write is never mistaken for a live capability.
     pub broken: Vec<(PathBuf, String)>,
+    /// Memory files (stem, content hash) this freeze indexed; None for a
+    /// registry rebuilt from a manifest that predates the field, so the
+    /// first refreeze after an upgrade does not narrate every memory as new.
+    pub memory_files: Option<Vec<(String, u64)>>,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
@@ -131,6 +135,12 @@ pub(crate) struct ExtensionSnapshot {
     /// the fingerprint (a broken write still triggers a refreeze); keeping
     /// the reason lets that refreeze's receipt say the tool is NOT live.
     pub(crate) broken: Vec<(PathBuf, String)>,
+    /// Project memory files (stem, content hash). Memory rides the frozen
+    /// prompt's index, so a memory write moves the fingerprint and refreezes:
+    /// the fact is live from the next step, deterministically, instead of
+    /// whenever some unrelated extension file happens to change. Not ledger
+    /// files (data, not capability), so not in `files`.
+    pub(crate) memory_files: Vec<(String, u64)>,
 }
 
 impl ExtensionSnapshot {
@@ -249,6 +259,33 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
+    // Memory: hashed into the fingerprint (a write refreezes; the prompt's
+    // memory index rebuilds), recorded by name for the receipt, never
+    // ledgered. Only `.md` files: the access log changes on every read.
+    let mut memory_files: Vec<(String, u64)> = Vec::new();
+    {
+        let dir = project_root.join(crate::memory::MEMORY_DIR);
+        dir.hash(&mut h);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut files: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "md"))
+                .collect();
+            files.sort();
+            for path in files {
+                path.hash(&mut h);
+                let bytes = std::fs::read(&path).ok();
+                bytes.hash(&mut h);
+                let Some(bytes) = bytes else { continue };
+                let mut fh = DefaultHasher::new();
+                bytes.hash(&mut fh);
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    memory_files.push((stem.to_string(), fh.finish()));
+                }
+            }
+        }
+    }
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
@@ -272,6 +309,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         skills_omitted,
         files: files_read,
         broken,
+        memory_files,
     }
 }
 
@@ -304,6 +342,7 @@ impl Registry {
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
         registry.broken = snapshot.broken;
+        registry.memory_files = Some(snapshot.memory_files);
         registry
     }
 
@@ -350,6 +389,7 @@ impl Registry {
             tools_omitted: 0,
             ext_fingerprint: 0,
             broken: Vec::new(),
+            memory_files: None,
             schemas,
             schemas_wire,
             by_name,
@@ -490,6 +530,11 @@ pub struct RegistryManifest {
     /// and triggers one re-freeze on the next turn (forward only).
     #[serde(default)]
     pub ext_fingerprint: u64,
+    /// Memory files (stem, content hash) the freeze indexed, so a resumed
+    /// session's first memory receipt is a real delta. Additive: absent in
+    /// older manifests, which then narrate no memory delta once.
+    #[serde(default)]
+    pub memory_files: Option<Vec<(String, u64)>>,
 }
 
 /// Current manifest format. A manifest carrying any other version is treated
@@ -549,6 +594,7 @@ impl Registry {
             })
             .collect();
         RegistryManifest {
+            memory_files: self.memory_files.clone(),
             version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
@@ -580,6 +626,7 @@ impl Registry {
             .collect();
         let mut registry = Self::assemble(external, manifest.skills);
         registry.ext_fingerprint = manifest.ext_fingerprint;
+        registry.memory_files = manifest.memory_files;
         registry
     }
 

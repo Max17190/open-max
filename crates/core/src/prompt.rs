@@ -128,7 +128,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     {
         let before = prompt.len();
         prompt.push_str(
-            "\n\nMemory (facts saved in earlier sessions; read_file one before relying on it):\n",
+            "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n",
         );
         prompt.push_str(&index);
         breakdown.components.push(("memory index".into(), prompt.len() - before));
@@ -179,7 +179,7 @@ Working files (there is no built-in plan mode or todo list):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
 - TODO.md: the running task list; check items off as you finish.\n\
 - AGENTS.md: standing project instructions; keep it short (loads at session create and on /reload).\n\
-- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line becomes an index line in future sessions. Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
+- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line is indexed at the next freeze (a write triggers one). Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -681,7 +681,7 @@ mod tests {
         .unwrap();
         let (with, breakdown) = system_prompt_with_breakdown(&dir, &registry);
         assert!(
-            with.contains("Memory (facts saved in earlier sessions"),
+            with.contains("Memory (facts saved by earlier turns or sessions"),
             "memory section must appear:\n{with}"
         );
         assert!(with.contains(

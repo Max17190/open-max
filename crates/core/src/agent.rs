@@ -1658,6 +1658,24 @@ fn refreeze_receipt_text(
             listed.join(", ")
         ));
     }
+    if let Some((added_m, updated_m, removed_m)) = &added.memory {
+        let mut parts = Vec::new();
+        if !added_m.is_empty() {
+            parts.push(format!("indexed: {}", added_m.join(", ")));
+        }
+        if !updated_m.is_empty() {
+            parts.push(format!("updated: {}", updated_m.join(", ")));
+        }
+        if !removed_m.is_empty() {
+            parts.push(format!("dropped: {}", removed_m.join(", ")));
+        }
+        if !parts.is_empty() {
+            note.push_str(&format!(
+                " Memory index {} — live in your prompt from your next step.",
+                parts.join("; ")
+            ));
+        }
+    }
     note.push(']');
     note
 }
@@ -1676,6 +1694,10 @@ struct AddedTools {
     /// the receipt said only "modified", and a model that then saw the card
     /// concluded revocation was broken.
     modified_unapproved: Vec<(String, String)>,
+    /// Memory index delta (added, updated, removed stems), when both
+    /// generations know their memory files. A memory write is now what
+    /// refreezes; the receipt says the fact is indexed from the next step.
+    memory: Option<(Vec<String>, Vec<String>, Vec<String>)>,
 }
 
 fn classify_added_tools(
@@ -1684,10 +1706,39 @@ fn classify_added_tools(
     data_dir: &Path,
     project_root: &Path,
 ) -> AddedTools {
+    let memory = match (&old_registry.memory_files, &new_registry.memory_files) {
+        (Some(old), Some(new)) => {
+            let old_map: std::collections::HashMap<&str, u64> =
+                old.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+            let new_map: std::collections::HashMap<&str, u64> =
+                new.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+            let mut added: Vec<String> = Vec::new();
+            let mut updated: Vec<String> = Vec::new();
+            let mut removed: Vec<String> = Vec::new();
+            for (n, h) in &new_map {
+                match old_map.get(n) {
+                    None => added.push(n.to_string()),
+                    Some(oh) if oh != h => updated.push(n.to_string()),
+                    Some(_) => {}
+                }
+            }
+            for n in old_map.keys() {
+                if !new_map.contains_key(n) {
+                    removed.push(n.to_string());
+                }
+            }
+            added.sort();
+            updated.sort();
+            removed.sort();
+            Some((added, updated, removed))
+        }
+        _ => None,
+    };
     let mut out = AddedTools {
         approved: Vec::new(),
         unapproved: Vec::new(),
         modified_unapproved: Vec::new(),
+        memory,
     };
     for name in added_tool_names(old_registry, new_registry) {
         match unapproved_capability(new_registry, data_dir, project_root, &name) {
