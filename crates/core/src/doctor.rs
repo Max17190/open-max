@@ -890,7 +890,10 @@ fn record_probe_receipt(data_dir: &Path, tool: &str, shas: &[String]) {
         "verdict": "example passed in sandbox (no network, writes confined)",
         "unix_time": unix_time,
     });
-    let _ = std::fs::write(dir.join(format!("{manifest_sha}.json")), receipt.to_string());
+    // Atomic publish: a concurrent card lookup sees either the previous
+    // complete receipt or this one, never a truncated document it would
+    // read as "no evidence".
+    let _ = crate::sessions::write_atomic(&dir.join(format!("{manifest_sha}.json")), receipt.to_string());
 }
 
 /// Whether a passing probe receipt exists for exactly this sha vector. Used
@@ -1089,6 +1092,15 @@ async fn run_examples_within(
             }
             Ok(Admission::Sandboxed) => {
                 sandboxed = true;
+                // The vector the probe is ABOUT to run: captured before the
+                // spawn, so a script rewritten while the probe runs cannot
+                // earn a passing receipt for bytes that were never probed.
+                let mut probed_shas = vec![ext.source_sha256.clone()];
+                probed_shas.extend(
+                    crate::ledger::bound_code(&ext.command, &ext.args, project_root)
+                        .into_iter()
+                        .filter_map(|c| c.sha256),
+                );
                 let scratch = data_dir
                     .join("probes-scratch")
                     .join(uuid::Uuid::new_v4().to_string());
@@ -1119,15 +1131,9 @@ async fn run_examples_within(
                             let verdict = example_verdict(&outcome, example);
                             if verdict.is_ok() {
                                 // Evidence for the approval card: the exact
-                                // vector that ran, so any later edit to the
-                                // manifest or its code orphans the receipt.
-                                let mut shas = vec![ext.source_sha256.clone()];
-                                shas.extend(
-                                    crate::ledger::bound_code(&ext.command, &ext.args, project_root)
-                                        .into_iter()
-                                        .filter_map(|c| c.sha256),
-                                );
-                                record_probe_receipt(data_dir, &spec.name, &shas);
+                                // pre-spawn vector, so any edit - before OR
+                                // during the run - orphans the receipt.
+                                record_probe_receipt(data_dir, &spec.name, &probed_shas);
                             }
                             verdict
                         }
@@ -2599,6 +2605,62 @@ mod tests {
         let edited = std::fs::read(&manifest).unwrap();
         let edited_shas = vec![crate::ledger::sha256_hex(&edited)];
         assert!(!probe_passed(&data, &edited_shas), "edited bytes have no receipt");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A script rewritten WHILE its probe runs must not earn a passing
+    /// receipt for the rewritten bytes: the receipt names the vector that
+    /// was actually probed (captured before the spawn), and the rewritten
+    /// vector has no receipt.
+    #[tokio::test]
+    async fn a_receipt_names_the_bytes_that_were_probed_not_the_bytes_after() {
+        let root = temp_project();
+        let script = root.join("slow.sh");
+        write(
+            script.clone(),
+            "#!/bin/sh\nsleep 1\nprintf hello\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let manifest = tool_file(
+            &root,
+            "slow.toml",
+            "name = \"slow\"\ndescription = \"d\"\ncommand = \"./slow.sh\"\n\n[example]\nexpect_regex = \"hello\"\n",
+        );
+        let data = approved_data_dir(&root, &[]);
+        let original_script_sha = crate::ledger::sha256_hex(&std::fs::read(&script).unwrap());
+        let manifest_sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+
+        // Rewrite the script mid-run: the probe sleeps 1s, we swap at ~200ms.
+        let rewriter = {
+            let script = script.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                // Same length and same output as the original, so the
+                // shell (which reads scripts incrementally) still exits 0
+                // and prints hello - only the BYTES differ. That is the
+                // precise shape where a post-run hash would lie.
+                std::fs::write(&script, "#!/bin/sh\nsleep 1\nprintf hello\n#x").unwrap();
+            })
+        };
+        let results = examples(&root, &data).await.unwrap();
+        let _ = rewriter.await;
+        let v = verdict(&results, "slow");
+        if let Err(reason) = &v.result {
+            assert!(reason.contains("cannot sandbox a probe"), "{reason}");
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(data);
+            return;
+        }
+        let probed = vec![manifest_sha.clone(), original_script_sha];
+        assert!(probe_passed(&data, &probed), "the receipt names the bytes that actually ran");
+        let rewritten_sha = crate::ledger::sha256_hex(&std::fs::read(&script).unwrap());
+        let rewritten = vec![manifest_sha, rewritten_sha];
+        assert!(!probe_passed(&data, &rewritten), "the rewritten bytes earned no receipt");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
