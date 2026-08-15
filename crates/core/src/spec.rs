@@ -302,7 +302,10 @@ turn ends. The payload says which case this is (`blockable`), how many
 refusals have already been honored (`continuation`), and how many are left
 (`continuations_left`). After 8 honored refusals the harness overrides the
 hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
-that, and on `max_iterations` and `budget_exhausted`. A blocking hook that
+that, and on `max_iterations` and `budget_exhausted`. A refusal whose injected
+user message cannot be persisted is reported and ends the turn `unverified`
+the same way: a continuation only the running process remembers would diverge
+from every replay of the session. A blocking hook that
 times out or fails to start refuses, like any other gate.
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:

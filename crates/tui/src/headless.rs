@@ -20,6 +20,14 @@ pub struct HeadlessArgs {
     pub json: bool,
 }
 
+/// Hook-authored text on a terminal-bound line: a reason or detail is often
+/// built from tool or test output, and a control byte in it (a carriage
+/// return, an ANSI escape) could split or restyle the diagnostic. One space
+/// per control byte keeps the line one line.
+fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 /// Run one or more agent turns and exit when the last finishes. Approvals in
 /// `ask` mode are declined so unattended runs never hang; set `approval_mode`
 /// to `auto` for unattended mutations. Multiple prompts reuse one session_id.
@@ -271,16 +279,21 @@ async fn run_turn_events(
             }
             AgentEvent::HookFailed { hook, event, detail } => {
                 if !json {
-                    let _ = writeln!(stderr, "openmax: hook '{hook}' failed on {event}: {detail}");
+                    let _ = writeln!(
+                        stderr,
+                        "openmax: hook '{hook}' failed on {event}: {}",
+                        printable(detail)
+                    );
                 }
             }
             AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
                 if !json {
                     let _ = writeln!(
                         stderr,
-                        "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {reason}",
+                        "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {}",
                         continuation + 1,
                         continuation + continuations_left,
+                        printable(reason),
                     );
                 }
             }

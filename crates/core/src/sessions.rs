@@ -781,7 +781,15 @@ pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
 ///
 /// Serializes disk access with `sessions_lock` so concurrent turns in the same
 /// process cannot interleave appends or rewrites of the same file.
-pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) {
+/// True when the transcript on disk cannot now diverge from `messages`:
+/// either the bytes landed, or there is deliberately no recorded transcript
+/// to diverge from (a deleted session's save is a silent no-op, and deletion
+/// removed what a resume would replay). False when a recorded transcript
+/// exists and could not be brought up to date: a damaged index, or a write
+/// that failed after the rewrite fallback. Callers that only fire-and-report
+/// may ignore it; a caller about to act on the recorded state (a refusal
+/// continuation) must not.
+pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) -> bool {
     let path = messages_path(core, id);
     let _guard = core.sessions_lock.lock().unwrap();
     // Same rule as the sidecars, and for the same reason: cancellation is
@@ -800,8 +808,9 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
                     message: format!("warning: failed to persist session to disk: {reason}"),
                 },
             );
+            return false;
         }
-        return;
+        return true;
     }
     // Never append onto a non-JSONL blob left on disk after a failed load.
     let needs_rewrite =
@@ -824,7 +833,10 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
     };
 
     match result {
-        Ok(()) => *persisted = messages.len(),
+        Ok(()) => {
+            *persisted = messages.len();
+            true
+        }
         Err(e) => {
             core.send_agent(
                 id,
@@ -832,6 +844,7 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
                     message: format!("warning: failed to persist session to disk: {e}"),
                 },
             );
+            false
         }
     }
 }

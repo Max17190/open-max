@@ -2247,23 +2247,47 @@ async fn run_loop(
                     // reason is deliberately left alone: a refused end is not
                     // an end, so a loop that runs out here says so.
                     guard.messages().push(ChatMessage::user(refusal.reason.clone()));
-                    save_messages(core, session_id, guard.messages(), false).await;
-                    // Disk first, then the wire: the frontend hears about the
-                    // continuation only once the transcript a resume would
-                    // replay already records it, so the live view never
-                    // reports a refusal the disk denies.
+                    if save_messages(core, session_id, guard.messages(), false).await {
+                        // Disk first, then the wire: the frontend hears about
+                        // the continuation only once the transcript a resume
+                        // would replay already records it, so the live view
+                        // never reports a refusal the disk denies.
+                        core.send_agent(
+                            session_id,
+                            AgentEvent::TurnRefused {
+                                hook: refusal.hook,
+                                reason: refusal.reason,
+                                continuation,
+                                continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
+                                    .saturating_sub(continuation),
+                            },
+                        );
+                        continuation += 1;
+                        continue 'turns;
+                    }
+                    // The refusal cannot be made durable, so it is not
+                    // honored: a continuation only this process remembers is
+                    // the divergence #172 exists to prevent (a resume would
+                    // replay a conversation the continuation never happened
+                    // in). The save path already said why; this says what it
+                    // cost, and the turn ends `unverified` because a gate
+                    // said no and nothing could honor it - the same state
+                    // the continuation cap ends in.
+                    guard.messages().pop();
                     core.send_agent(
                         session_id,
-                        AgentEvent::TurnRefused {
+                        AgentEvent::HookFailed {
                             hook: refusal.hook,
-                            reason: refusal.reason,
-                            continuation,
-                            continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
-                                .saturating_sub(continuation),
+                            event: "turn_end".into(),
+                            detail: format!(
+                                "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({})",
+                                refusal.reason
+                            ),
                         },
                     );
-                    continuation += 1;
-                    continue 'turns;
+                    turn_end_fired = true;
+                    stop_reason = "unverified".into();
+                    break 'turns;
                 }
                 // Past the cap the harness ends the turn itself and says so: a
                 // policy that cannot be satisfied in this many rounds has
@@ -2680,7 +2704,9 @@ async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, 
 
 /// Persist transcript to disk without cloning it back into SessionData.
 /// The turn owns `messages` until `MessageGuard` commits on drop/finish.
-async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) {
+/// True when the transcript is durable on disk after this call (see
+/// `sessions::save_messages`); the fenced-migration drop is false.
+async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) -> bool {
     let mut sessions_map = core.sessions.lock().await;
     if let Some(data) = sessions_map.get_mut(session_id) {
         // A deferred system-insert migration fences every save: the inserted
@@ -2689,9 +2715,9 @@ async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessa
         // drop the save loudly rather than persist the two stores against
         // each other.
         if data.system_insert_unrecorded {
-            if sessions::shift_resume_points_for_system_insert(core, session_id) {
+            return if sessions::shift_resume_points_for_system_insert(core, session_id) {
                 data.system_insert_unrecorded = false;
-                sessions::save_messages(core, session_id, messages, &mut data.persisted_count, true);
+                sessions::save_messages(core, session_id, messages, &mut data.persisted_count, true)
             } else {
                 core.send_agent(
                     session_id,
@@ -2701,10 +2727,12 @@ async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessa
                             .into(),
                     },
                 );
-            }
-            return;
+                false
+            };
         }
-        sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite);
+        sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite)
+    } else {
+        false
     }
 }
 
@@ -5473,6 +5501,65 @@ mod tests {
                 crate::hooks::MAX_TURN_END_CONTINUATIONS
             )],
             "one honored refusal, named by hook stem, carrying the payload's numbers"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A refusal that cannot be made durable is not honored: a continuation
+    /// only this process remembers would diverge from every replay (#172's
+    /// invariant), so the turn ends `unverified` with a failure naming the
+    /// withheld continuation, and no `turn_refused` claims one happened. A
+    /// damaged session index is the injectable divergence state: a recorded
+    /// transcript exists and cannot be brought up to date.
+    #[tokio::test]
+    async fn an_unpersistable_refusal_is_not_honored() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("never.sh");
+        write_exec(&script, "#!/bin/sh\necho 'still not verified'\nexit 1\n");
+        let toml = hooks_dir.join("never.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        // A recorded transcript exists (the session is indexed), and then the
+        // index is damaged: every save now reports and returns non-durable.
+        let id = crate::sessions::create(&core, project.display().to_string()).unwrap().id;
+        let index = core.data_dir.join("sessions").join("index.json");
+        std::fs::write(&index, "{ not json").unwrap();
+
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.max_agent_iterations = 20;
+        }
+
+        start_turn(core.clone(), id.clone(), project.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "unverified", "a refused, unrecordable answer is not verified");
+        assert_eq!(*requests.lock().unwrap(), 1, "no continuation was dispatched");
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::TurnRefused { .. })),
+            "the wire must not claim a continuation the disk denies"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored"))),
+            "the withheld continuation must be named: {events:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

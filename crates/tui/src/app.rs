@@ -2634,6 +2634,9 @@ impl App {
                     continuation + continuations_left,
                 ));
                 self.insert_user_block(&reason);
+                // An open find popup indexes blocks; the injected one must
+                // enter its matches now, exactly as a finished message does.
+                self.refilter_scroll_search_live();
             }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
