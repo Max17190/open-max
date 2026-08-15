@@ -833,6 +833,11 @@ pub struct ExampleVerdict {
     pub tool: String,
     pub path: PathBuf,
     pub result: Result<(), String>,
+    /// True when this run was a sandboxed probe of UNAPPROVED content: it
+    /// executed with no network, writes confined to a scratch dir, and a
+    /// scrubbed environment - and granted nothing. In-session calls still
+    /// prompt until a human runs `openmax --approve`.
+    pub sandboxed: bool,
 }
 
 /// Newline-separated stack of project roots whose examples are already
@@ -856,6 +861,14 @@ struct ExampleGates {
     agent_spawned: bool,
 }
 
+/// How an example may run: with host authority (approved content behind the
+/// full gate set), or as a sandboxed probe (unapproved content, no network,
+/// writes confined, scrubbed env - zero host authority granted).
+enum Admission {
+    Host,
+    Sandboxed,
+}
+
 impl ExampleGates {
     /// The documented call order (hooks pre → permissions → approval_mode →
     /// execute), evaluated with the same predicates the agent loop calls.
@@ -871,7 +884,7 @@ impl ExampleGates {
         project_root: &Path,
         data_dir: &Path,
         cancel: &std::sync::Arc<crate::state::CancelToken>,
-    ) -> Result<(), String> {
+    ) -> Result<Admission, String> {
         use crate::config::ApprovalMode;
         use crate::hooks::PreToolResult;
         use crate::permissions::PermissionDecision;
@@ -905,6 +918,19 @@ impl ExampleGates {
             // itself; trust and the content approval are the human decisions.
             PermissionDecision::Allow | PermissionDecision::Default => {}
         }
+        // Unapproved content probes in a sandbox instead of refusing. The
+        // flat refusal protected nothing an agent could not already do with
+        // bash - it only prevented the verified, receipt-producing path -
+        // while forcing write -> approve -> fail -> edit -> re-approve loops
+        // on the human. A probe grants zero host authority (no network,
+        // writes confined to scratch, scrubbed env), so it is exempt from
+        // the mode/person gates below, which exist to guard host authority;
+        // the mode gates still guard every approved (host) run, unchanged.
+        // The in-session content gate (unapproved_capability) is untouched:
+        // a passing probe approves nothing.
+        if !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+            return Ok(Admission::Sandboxed);
+        }
         // One exhaustive read of approval_mode, in the turn's precedence:
         // readonly is a hard block, ask needs a person, auto needs neither.
         let needs_person = if spec.mutating {
@@ -918,22 +944,6 @@ impl ExampleGates {
         } else {
             false
         };
-        // Running an example runs the file's command with host authority and
-        // no human on the other end of a prompt, so the exact bytes must be
-        // approved first. Content-bound, exactly like the in-session gate: any
-        // edit to the tool file revokes the approval.
-        if !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
-            // Two repairs, because two readers: a human runs --approve, and an
-            // agent - for whom that command refuses by design - calls the tool
-            // once so the human answers the approval card. Prescribing only
-            // the out-of-session command hands the agent a repair it cannot
-            // perform, which round 4's dogfooding showed corners a model
-            // toward stripping the session marker instead.
-            return Err(format!(
-                "unapproved source; a human can run `openmax --approve {}`, or make the tool's first call in a session and approve the card it raises: it covers these exact bytes",
-                shell_quote(&ext.source_path)
-            ));
-        }
         // A turn in `ask` mode puts every mutating call in front of a person.
         // The human who typed this command is that person; an agent-spawned
         // process has nobody, so it refuses rather than running unattended.
@@ -943,7 +953,7 @@ impl ExampleGates {
                     .into(),
             );
         }
-        Ok(())
+        Ok(Admission::Host)
     }
 }
 
@@ -1027,15 +1037,50 @@ async fn run_examples_within(
     for spec in &registry.tools {
         let ToolKind::External(ext) = &spec.kind else { continue };
         let Some(example) = &ext.example else { continue };
-        let result = match gates
+        let admission = gates
             .admit(spec, ext, &example.args, project_root, data_dir, &cancel)
-            .await
-        {
-            Ok(()) => {
+            .await;
+        let mut sandboxed = false;
+        let result = match admission {
+            Ok(Admission::Host) => {
                 let outcome = registry
                     .execute(&spec.name, &example.args, data_dir, project_root, caps, cancel.clone())
                     .await;
                 example_verdict(&outcome, example)
+            }
+            Ok(Admission::Sandboxed) => {
+                sandboxed = true;
+                let scratch = data_dir
+                    .join("probes-scratch")
+                    .join(uuid::Uuid::new_v4().to_string());
+                match std::fs::create_dir_all(&scratch) {
+                    Err(e) => Err(format!("could not create the probe scratch dir: {e}")),
+                    Ok(()) => {
+                        let outcome = registry
+                            .execute_example_sandboxed(
+                                &spec.name,
+                                &example.args,
+                                data_dir,
+                                project_root,
+                                caps,
+                                cancel.clone(),
+                                &scratch,
+                            )
+                            .await;
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        // No backend: fall back to the pre-sandbox refusal,
+                        // with the reason - never a silent unsandboxed run.
+                        if !outcome.ok && outcome.output.contains("no sandbox backend available") {
+                            Err(format!(
+                                "unapproved source and this host cannot sandbox a probe ({}); a human can run `openmax --approve {}`, or make the tool's first call in a session and approve the card it raises",
+                                outcome.output.trim(),
+                                shell_quote(&ext.source_path)
+                            ))
+                        } else {
+                            example_verdict(&outcome, example)
+                        }
+                    }
+                }
             }
             Err(reason) => Err(reason),
         };
@@ -1043,6 +1088,7 @@ async fn run_examples_within(
             tool: spec.name.clone(),
             path: ext.source_path.clone(),
             result,
+            sandboxed,
         };
         report(&verdict);
         results.push(verdict);
@@ -2419,7 +2465,7 @@ mod tests {
     /// gate that makes same-turn self-extension safe applies here too: an
     /// unapproved tool file must not spawn, and must say how to approve it.
     #[tokio::test]
-    async fn an_unapproved_tool_file_never_runs_its_example() {
+    async fn an_unapproved_tool_probes_sandboxed_and_cannot_touch_the_host() {
         let root = temp_project();
         let touched = root.join("side-effect");
         let approved = tool_file(
@@ -2438,18 +2484,62 @@ mod tests {
         let data = approved_data_dir(&root, &[&approved]);
 
         let results = examples(&root, &data).await.unwrap();
-        assert!(verdict(&results, "approved").result.is_ok());
-        let refusal = verdict(&results, "pwn").result.as_ref().unwrap_err();
-        assert!(refusal.contains("unapproved source"), "{refusal}");
-        assert!(refusal.contains("--approve"), "{refusal}");
-        // Both repairs, because both readers: --approve refuses for the agent
-        // that most often reads this, so the refusal must also name the
-        // in-session path (call the tool, the human answers the card).
-        assert!(
-            refusal.contains("first call in a session"),
-            "the refusal must name the repair an agent can perform: {refusal}"
+        let ok = verdict(&results, "approved");
+        assert!(ok.result.is_ok());
+        assert!(!ok.sandboxed, "approved content keeps its host run");
+        // Unapproved content now probes in a sandbox instead of refusing
+        // flat: the guarantee the refusal used to provide - no host side
+        // effects - is enforced by the sandbox itself. The write-outside-
+        // scratch is denied, so the probe fails loudly and the project stays
+        // untouched. On a host with no backend, the fall-back refusal keeps
+        // the old wording.
+        let pwn = verdict(&results, "pwn");
+        match &pwn.result {
+            Err(reason) if reason.contains("cannot sandbox a probe") => {
+                assert!(reason.contains("--approve"), "{reason}");
+            }
+            Err(reason) => {
+                assert!(pwn.sandboxed, "unapproved content runs only as a probe");
+                assert!(reason.contains("example run failed"), "{reason}");
+            }
+            Ok(()) => panic!("a write outside the scratch must fail the probe"),
+        }
+        assert!(!touched.exists(), "the probe must not touch the project");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// The fluidity half of the probe contract: an agent can prove a
+    /// freshly written, harmless tool end-to-end before any human approves
+    /// it - the probe runs, its verdict is marked sandboxed, and nothing is
+    /// blessed by the pass (the ledger still has no approval).
+    #[tokio::test]
+    async fn an_unapproved_read_only_tool_probe_passes_in_the_sandbox() {
+        let root = temp_project();
+        let unapproved = tool_file(
+            &root,
+            "probe.toml",
+            "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat\"]\n\n[example]\nexpect_regex = \"hello\"\n[example.args]\nmsg = \"hello\"\n",
         );
-        assert!(!touched.exists(), "the refused example must not have run");
+        let data = approved_data_dir(&root, &[]);
+
+        let results = examples(&root, &data).await.unwrap();
+        let v = verdict(&results, "probe");
+        match &v.result {
+            Err(reason) if reason.contains("cannot sandbox a probe") => {
+                // No backend on this host: fail-closed verified instead.
+                assert!(reason.contains("--approve"), "{reason}");
+            }
+            Err(reason) => panic!("a harmless probe must pass in the sandbox: {reason}"),
+            Ok(()) => {
+                assert!(v.sandboxed);
+                let bytes = std::fs::read(&unapproved).unwrap();
+                assert!(
+                    !crate::ledger::is_approved(&data, &root, &crate::ledger::sha256_hex(&bytes)),
+                    "a passing probe must approve nothing"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
