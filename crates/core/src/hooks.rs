@@ -585,7 +585,7 @@ impl Hooks {
     /// approved. Tool execution blocks on either, because both mean a gate the
     /// user wrote down is not running, and running on without it would drop
     /// that policy silently.
-    fn fail_closed_reason(&self) -> Option<String> {
+    pub(crate) fn fail_closed_reason(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(reason) = self.ledger_fail_closed_reason() {
             parts.push(reason);
@@ -1107,6 +1107,32 @@ pub(crate) fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
         dirs.push(PathBuf::from(home).join(".openmax").join("hooks"));
     }
     dirs
+}
+
+/// Content identity of every hook manifest on disk (paths + bytes), for the
+/// mid-turn "you just wrote a hook" receipt: hooks are outside the
+/// extension fingerprint (they are discovered per turn, since an
+/// agent-written hook is inert until a human approves it), so a write to
+/// one otherwise gets no receipt at all until the next turn's policy notice
+/// - a whole turn in which the agent may believe its gate is live.
+pub(crate) fn hooks_fingerprint(project_root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for dir in hook_dirs(project_root) {
+        dir.hash(&mut h);
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        files.sort();
+        for path in files {
+            path.hash(&mut h);
+            std::fs::read(&path).ok().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.

@@ -1587,7 +1587,7 @@ async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_roo
 /// live capability), and which tool names became callable.
 fn refreeze_receipt_text(
     changes: &[String],
-    added_tools: &[String],
+    added: &AddedTools,
     broken: &[(std::path::PathBuf, String)],
     project_root: &Path,
 ) -> String {
@@ -1610,14 +1610,65 @@ fn refreeze_receipt_text(
             listed.join("; ")
         ));
     }
-    if !added_tools.is_empty() {
+    if !added.approved.is_empty() {
         note.push_str(&format!(
             " New tools callable from your next step: {}.",
-            added_tools.join(", ")
+            added.approved.join(", ")
+        ));
+    }
+    if !added.unapproved.is_empty() {
+        // Round-4 dogfooding: this line used to say "callable" for these
+        // too, and the very next step was an approval card - the model
+        // called the receipt out as overselling. Registered is not callable
+        // until a human blesses the bytes; say which, and how.
+        // Quoted like doctor's repair lines: the path is a copyable shell
+        // command, and a valid manifest filename may carry spaces or
+        // metacharacters.
+        let listed: Vec<String> = added
+            .unapproved
+            .iter()
+            .map(|(name, path)| {
+                format!(
+                    "{name} (openmax --approve {})",
+                    crate::doctor::shell_quote(std::path::Path::new(path))
+                )
+            })
+            .collect();
+        note.push_str(&format!(
+            " New tools registered; the FIRST call of each stops for human approval of its \
+             exact bytes: {}. Prove one first with bash: openmax --check --run-examples \
+             (unapproved tools probe in a sandbox).",
+            listed.join(", ")
         ));
     }
     note.push(']');
     note
+}
+
+/// Names the incoming generation adds, split by whether a human has already
+/// approved the exact bytes: approved names are callable now; unapproved
+/// names are registered and their first call prompts. Computed against the
+/// incoming registry (which carries the tools) and the ledger.
+struct AddedTools {
+    approved: Vec<String>,
+    /// (name, project-relative manifest path for the --approve command)
+    unapproved: Vec<(String, String)>,
+}
+
+fn classify_added_tools(
+    names: Vec<String>,
+    new_registry: &Registry,
+    data_dir: &Path,
+    project_root: &Path,
+) -> AddedTools {
+    let mut out = AddedTools { approved: Vec::new(), unapproved: Vec::new() };
+    for name in names {
+        match unapproved_capability(new_registry, data_dir, project_root, &name) {
+            Some(source) => out.unapproved.push((name, source.path)),
+            None => out.approved.push(name),
+        }
+    }
+    out
 }
 
 /// Names the incoming generation adds, computed against the outgoing
@@ -1710,7 +1761,12 @@ async fn refreeze_if_extensions_changed(
             // else mutates the session, but stay defensive about empty
             // (taken) state.
             Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
-                let added = added_tool_names(&data.registry, &registry);
+                let added = classify_added_tools(
+                    added_tool_names(&data.registry, &registry),
+                    &registry,
+                    &core.data_dir,
+                    project_root,
+                );
                 apply_freeze(core, session_id, data, registry, prompt, breakdown);
                 Some(added)
             }
@@ -1906,7 +1962,12 @@ async fn refreeze_between_iterations(
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
     let counts = (new_registry.tools.len(), new_registry.skills.len());
-    let added_tools = added_tool_names(registry, &new_registry);
+    let added_tools = classify_added_tools(
+        added_tool_names(registry, &new_registry),
+        &new_registry,
+        &core.data_dir,
+        project_root,
+    );
     let broken = new_registry.broken.clone();
     let new_registry = Arc::new(new_registry);
     if messages.first().is_some_and(|m| m.role == "system") {
@@ -2164,6 +2225,7 @@ async fn run_loop(
     // outside the project root, so no refreeze covers it), and a malformed
     // edit would surface turns later as an unrelated-looking resolve error.
     let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
+    let mut hooks_seen = crate::hooks::hooks_fingerprint(project_root);
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
@@ -2852,6 +2914,54 @@ async fn run_loop(
                                     status.count,
                                     status.names.join(", ")
                                 ),
+                            };
+                            if let Some(last) =
+                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                            {
+                                match &mut last.content {
+                                    Some(content) => content.push_str(&note),
+                                    None => last.content = Some(note.trim_start().to_string()),
+                                }
+                            }
+                        }
+                        // A hook file written this call: hooks are outside
+                        // the extension fingerprint, so this write got no
+                        // refreeze receipt and the inertness notice would
+                        // otherwise land a whole turn later (dogfood: the
+                        // agent believed its gate was live for a turn).
+                        let hooks_now = crate::hooks::hooks_fingerprint(project_root);
+                        if hooks_now != hooks_seen {
+                            hooks_seen = hooks_now;
+                            let discovered = Hooks::discover(project_root, &core.data_dir);
+                            let inert: Vec<String> = discovered
+                                .notices()
+                                .into_iter()
+                                .map(|f| format!("'{}' on {}: {}", f.hook, f.event, f.detail))
+                                .collect();
+                            // An APPROVED gate whose bytes just changed is not
+                            // inert - it fails closed and blocks every tool
+                            // call from the next turn until restored or
+                            // re-approved. Say that, not "applies next turn".
+                            let note = if let Some(blocked) = discovered.fail_closed_reason() {
+                                format!(
+                                    "\n[hook files changed. A live gate is now failing closed: \
+                                     {blocked}. From the next turn every tool call is BLOCKED \
+                                     until the file is restored to its approved bytes or a human \
+                                     re-approves it (openmax --approve <path>, at a terminal \
+                                     outside any session).]"
+                                )
+                            } else if inert.is_empty() {
+                                "\n[hook files changed. Hooks are discovered at turn start; \
+                                 approved hooks apply from the next turn.]"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "\n[hook files changed. Not running: {}. Hooks activate only \
+                                     after a human runs openmax --approve <path> at a terminal \
+                                     outside any session; until then the guarantee is NOT in \
+                                     force - say so if asked, do not claim it.]",
+                                    inert.join(" | ")
+                                )
                             };
                             if let Some(last) =
                                 guard.messages().iter_mut().rev().find(|m| m.role == "tool")

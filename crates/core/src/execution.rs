@@ -532,6 +532,18 @@ pub(crate) async fn run_process(
     // inherit the attestation, grant authority. Stripped unconditionally;
     // no child of the harness is the human.
     command.env_remove("OPENMAX_HUMAN_ATTEST");
+    // Name the binary that is running this session. Every spec tells the
+    // agent to shell out to `openmax --check` / `--spec`, and round-4
+    // dogfooding hit a PATH `openmax` twelve days older than the harness
+    // hosting the session, teaching claims that build had since retracted -
+    // both printed the same version string. `$OPENMAX_BIN` is the same
+    // build by construction. Not applied under a sandbox: a probe gets no
+    // handle to the harness.
+    if request.sandbox.is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            command.env("OPENMAX_BIN", exe);
+        }
+    }
     match request.stdin {
         StdinMode::Null => {
             command.stdin(std::process::Stdio::null());
@@ -959,6 +971,28 @@ mod tests {
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         std::env::remove_var("OPENMAX_HUMAN_ATTEST");
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "[]");
+    }
+
+    /// Every unsandboxed child learns which binary is running the session:
+    /// `$OPENMAX_BIN` names this executable, so `openmax --check` in a tool
+    /// or bash can be pinned to the same build. A sandboxed probe gets no
+    /// such handle.
+    #[tokio::test]
+    async fn spawned_processes_learn_the_hosting_binary() {
+        let request = ProcessRequest {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf %s \"$OPENMAX_BIN\"".into()],
+            cwd: std::env::temp_dir(),
+            stdin: StdinMode::Null,
+            timeout: Duration::from_secs(5),
+            capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
+            sandbox: None,
+            env_allowlist: None,
+        };
+        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        let got = String::from_utf8_lossy(&output.stdout.head).to_string();
+        let expected = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        assert_eq!(got, expected, "OPENMAX_BIN must name the running executable");
     }
 
     fn sandboxed_request(scratch: &Path, script: &str) -> ProcessRequest {
