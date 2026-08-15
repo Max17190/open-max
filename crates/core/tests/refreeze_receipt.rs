@@ -793,3 +793,43 @@ async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The receipt the model reads also reaches the WIRE as a harness_note, so a
+/// custom frontend can render what the model sees (dogfood: two
+/// frontend-shaped judges found the tool_end output bare, the NOT-loaded
+/// receipt invisible off-transcript).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_harness_note_reaches_the_wire_for_a_broken_tool_write() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let broken = "name = \"wf\"\ndescription = \"d\"\n"; // missing command
+    let (base_url, _bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wf.toml", "content": broken }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    open_max_core::agent::start_turn(std::sync::Arc::clone(&core), "wire-note".into(), project.clone(), "go".into()).unwrap();
+    let mut note = None;
+    loop {
+        let env = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await.expect("30s").expect("open");
+        match env.event {
+            AgentEvent::HarnessNote { text, .. } => {
+                if text.contains("NOT loaded") { note = Some(text); }
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    let note = note.expect("the NOT-loaded receipt reaches the wire as a harness_note");
+    assert!(note.contains("wf.toml"), "{note}");
+    let _ = std::fs::remove_dir_all(dir);
+}

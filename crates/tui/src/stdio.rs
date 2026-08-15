@@ -4,7 +4,7 @@
 //! speak line-delimited JSON (an editor plugin, an orchestrator, another
 //! openmax) can drive a complete interactive session, approvals included.
 //!
-//! Protocol (`openmax-stdio/4`), one JSON object per line. The normative
+//! Protocol (`openmax-stdio/5`), one JSON object per line. The normative
 //! reference (every field of every line) lives in README under "stdio
 //! protocol"; `crates/core/src/types.rs` golden tests pin the event wire.
 //!
@@ -17,7 +17,7 @@
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
 //! stdout lines:
-//!   {"type":"hello","proto":"openmax-stdio/4","protocol_version":4,"session_id":"...","version":"...","project":"..."}
+//!   {"type":"hello","proto":"openmax-stdio/5","protocol_version":5,"session_id":"...","version":"...","project":"..."}
 //!   AgentEvent envelopes exactly as `--print --json` emits them
 //!   {"type":"protocol_error","message":"..."}        bad input; session unharmed
 //!
@@ -45,11 +45,11 @@ use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-pub const PROTO: &str = "openmax-stdio/4";
+pub const PROTO: &str = "openmax-stdio/5";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).
@@ -439,7 +439,7 @@ fn transcript_value(
     })
 }
 
-/// Validate one JSONL line against the `openmax-stdio/4` contract using the
+/// Validate one JSONL line against the `openmax-stdio/5` contract using the
 /// authoritative types (`Command` for stdin, `AgentEvent` for stdout events),
 /// so there is no second schema to drift. Returns a short label on success
 /// (`cmd user`, `event token`, `hello`) or a human reason on failure.

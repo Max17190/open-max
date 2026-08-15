@@ -2613,6 +2613,16 @@ impl App {
                     plural(skills, "skill"),
                 ));
             }
+            AgentEvent::HarnessNote { text, .. } => {
+                // Render it: not every note has a TUI-visible equivalent (the
+                // hook-write note produced no screen change, and Refrozen
+                // shows only its generic toolbox summary, not the NOT-loaded
+                // reason), so ignoring it dropped harness corrections a
+                // stdio client would see (Greptile). The bracket prefix is
+                // stripped for a cleaner line; the text is already the model's.
+                let shown = text.trim().trim_start_matches('[').trim_end_matches(']');
+                self.note(shown);
+            }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {
                     self.compacting = false;
