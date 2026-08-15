@@ -3316,6 +3316,11 @@ struct UnapprovedCapability {
     /// `command args...` as the manifest declares it: what an approval
     /// actually grants authority to, rendered on the card.
     command_line: String,
+    /// The env var NAMES the manifest forwards to the child (the #206 `env`
+    /// allowlist). An approval grants the tool these secrets, so the card
+    /// must disclose them - approving credential access you cannot see is
+    /// exactly what the content gate exists to prevent (Greptile security).
+    env: Vec<String>,
     /// The manifest as the approval store keys it, for recording the grant.
     source_path: PathBuf,
     /// Every hash one approval of this capability must record: the manifest's,
@@ -3371,6 +3376,7 @@ fn unapproved_capability(
         path: path.display().to_string(),
         sha256: ext.source_sha256.clone(),
         command_line,
+        env: ext.env.clone(),
         source_path: ext.source_path.clone(),
         shas,
     })
@@ -3473,6 +3479,11 @@ async fn request_approval(
                 true => format!("runs: {}", source.command_line),
                 false => format!("runs: {} | {detail}", source.command_line),
             };
+        }
+        if !source.env.is_empty() {
+            // Prepended, like the probe evidence, so card clipping cannot
+            // hide the credential grant.
+            detail = format!("receives env: {} | {detail}", source.env.join(", "));
         }
         // Advisory evidence, prepended so card clipping cannot hide it: a
         // sandboxed probe of exactly these bytes passed. The receipt grants
@@ -4053,6 +4064,7 @@ mod tests {
             path: ".openmax/tools/danger.toml".into(),
             sha256: "a".repeat(64),
             command_line: "./danger.sh".into(),
+            env: Vec::new(),
             source_path: PathBuf::from("/proj/.openmax/tools/danger.toml"),
             shas: vec!["a".repeat(64)],
         };
@@ -4883,6 +4895,7 @@ mod tests {
                 path: ".openmax/tools/docsearch.toml".into(),
                 sha256: shas[0].clone(),
                 command_line: "./scripts/docsearch.sh".into(),
+                env: vec!["GITHUB_TOKEN".into()],
                 source_path: "/tmp/docsearch.toml".into(),
                 shas,
             };
@@ -4915,6 +4928,10 @@ mod tests {
         assert!(
             detail.contains("runs: ./scripts/docsearch.sh"),
             "the card names what will execute: {detail}"
+        );
+        assert!(
+            detail.contains("receives env: GITHUB_TOKEN"),
+            "the card discloses the credential grant: {detail}"
         );
 
         // A different vector (edited bytes): no evidence - and the card SAYS
