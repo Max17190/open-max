@@ -261,6 +261,35 @@ fn report_hook_failures(
     }
 }
 
+/// Filter to policy notices this session has not yet narrated to the model,
+/// and mark them reported. Identity is the full notice text - it embeds the
+/// file path, which is the identity that matters - so a static problem notes
+/// once per session while a new or reworded one gets through. The UI channel
+/// (HookFailed events, per turn) is unchanged; this dedupe is only for the
+/// transcript, where repetition is token spend.
+async fn novel_policy_notices(
+    core: &Arc<Core>,
+    session_id: &str,
+    notices: Vec<String>,
+) -> Vec<String> {
+    if notices.is_empty() {
+        return Vec::new();
+    }
+    let mut map = core.sessions.lock().await;
+    let Some(data) = map.get_mut(session_id) else {
+        return Vec::new();
+    };
+    notices
+        .into_iter()
+        .filter(|n| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            n.hash(&mut h);
+            data.reported_policy_notices.insert(h.finish())
+        })
+        .collect()
+}
+
 /// Tell the frontend, once per session, that the installed tool schemas cost
 /// more than the window can spend. It holds on every turn once it holds at
 /// all, so repeating it per turn would be noise; the turn still runs, because
@@ -351,6 +380,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             system_insert_unrecorded,
             ledger_synced: false,
             pending_syncs: Vec::new(),
+            reported_policy_notices: Default::default(),
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -383,6 +413,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             system_insert_unrecorded: false,
             ledger_synced: false,
             pending_syncs: Vec::new(),
+            reported_policy_notices: Default::default(),
         }
     }
 }
@@ -2031,7 +2062,25 @@ async fn run_loop(
     // restriction waits for the next turn's fresh discovery. Permissions
     // never enter the prompt, so a reload costs one small file parse and no
     // cache.
-    let mut permissions = TurnPermissions::new(Permissions::discover(project_root, &core.data_dir));
+    let turn_start_policy = Permissions::discover(project_root, &core.data_dir);
+    let mut startup_notices: Vec<String> = turn_start_policy.notices().to_vec();
+    let mut permissions = TurnPermissions::new(turn_start_policy);
+    // Hooks that exist but did not load, and allow rules that are inert
+    // until a human approves them: both were UI-only, so an agent that wrote
+    // itself an allow rule kept being prompted with no stated cause. One
+    // harness note per distinct notice per session, ahead of the prompt.
+    startup_notices.extend(
+        hooks
+            .notices()
+            .into_iter()
+            .map(|f| format!("hook '{}' on {} did not load: {}", f.hook, f.event, f.detail)),
+    );
+    let novel = novel_policy_notices(core, session_id, startup_notices).await;
+    if !novel.is_empty() {
+        let msgs = guard.messages();
+        let at = msgs.len().saturating_sub(1);
+        msgs.insert(at, ChatMessage::user(format!("[policy notice: {}]", novel.join(" | "))));
+    }
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
@@ -2669,7 +2718,26 @@ async fn run_loop(
                         // snapshot as a floor, so a reload can narrow policy
                         // but never widen it; `deny`/`ask` need no approval,
                         // and unapproved `allow` rules are dropped at load.
-                        permissions.reload(Permissions::discover(project_root, &core.data_dir));
+                        let current = Permissions::discover(project_root, &core.data_dir);
+                        let inert: Vec<String> = current.notices().to_vec();
+                        permissions.reload(current);
+                        // The agent may have just written itself an allow
+                        // rule that can never fire (#180). Say so NOW, on
+                        // this call's result, with the command that lifts
+                        // it - not silently at the next surprise prompt.
+                        let novel = novel_policy_notices(core, session_id, inert).await;
+                        if !novel.is_empty() {
+                            if let Some(last) =
+                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                            {
+                                let note =
+                                    format!("\n[permission notice: {}]", novel.join(" | "));
+                                match &mut last.content {
+                                    Some(content) => content.push_str(&note),
+                                    None => last.content = Some(note.trim_start().to_string()),
+                                }
+                            }
+                        }
                     }
                 }
             }
