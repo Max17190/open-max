@@ -781,5 +781,15 @@ async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval
         !content.contains("Removed approved tools: t"),
         "deleted code cannot be called cardless-runnable: {content}"
     );
+    // Restorability is qualified, not promised: a legacy or hash-only approval
+    // keeps the sha without storing objects, so the claim is "may" (Greptile).
+    assert!(
+        content.contains("may run without a card"),
+        "the receipt must not overstate object restorability: {content}"
+    );
+    assert!(
+        !content.contains("objects remain in the ledger (restorable)"),
+        "the unconditional restorable claim was removed: {content}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

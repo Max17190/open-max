@@ -1668,10 +1668,12 @@ fn refreeze_receipt_text(
     }
     if !added.removed_approval_survives.is_empty() {
         note.push_str(&format!(
-            " Removed tools with a surviving approval: {} — the manifest was approved and its \
-             objects remain in the ledger (restorable), but the code on disk was edited or \
-             deleted, so restoring the manifest alone would ask again until the exact approved \
-             bytes are back; nothing needs forgetting (openmax --forget is for hooks).",
+            " Removed tools with a surviving approval: {} — the manifest's approval is still \
+             recorded in the ledger, so if the exact approved bytes are restored they may run \
+             without a card (a legacy or hash-only approval predates object storage, so its \
+             bytes may not be restorable from the ledger - check with openmax --ledger). The \
+             code on disk was edited or deleted, so restoring the manifest alone would ask \
+             again; nothing needs forgetting (openmax --forget is for hooks).",
             added.removed_approval_survives.join(", ")
         ));
     }
@@ -1723,10 +1725,12 @@ struct AddedTools {
     removed_approved: Vec<String>,
     /// Removed external tools whose MANIFEST sha was approved but whose bound
     /// code no longer matches on disk (edited, or deleted alongside the
-    /// manifest). The approval and its content-addressed objects still live in
-    /// the ledger, so omitting it as if nothing survived is wrong (Greptile);
-    /// yet restoring the manifest alone would ask again, so this must NOT claim
-    /// the bytes run without a card. Reported as a distinct clause.
+    /// manifest). The approval RECORD survives in the ledger, so omitting it as
+    /// if nothing survived is wrong (Greptile); yet the current disk bytes are
+    /// not approved, so this must NOT claim they run without a card. Whether
+    /// the original bytes can actually be restored depends on whether the
+    /// approval stored objects (a legacy or hash-only approval did not), so the
+    /// clause says "may" and points at openmax --ledger. A distinct clause.
     removed_approval_survives: Vec<String>,
 }
 
