@@ -2848,8 +2848,10 @@ impl App {
         // temporarily own it instead of stacking more chrome.
         // The composer soft-wraps inside its border, so how many rows it wants
         // depends on the width it will get: the area less the two border cells.
-        let desired_input_h = if self.pending_approval.is_some() {
-            5
+        let desired_input_h = if let Some((_, _, _, _, env)) = self.pending_approval.as_ref() {
+            // Grow the card so a wrapped credential grant fits above the
+            // choice line; clamped to the screen height by the layout.
+            (approval_card_height(env, area.width.saturating_sub(2)) + 2).max(5)
         } else {
             self.composer
                 .height(area.width.saturating_sub(2))
@@ -3042,12 +3044,26 @@ impl App {
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
         let lines = approval_card_lines(name, summary, detail, env, inner.width);
+        // The choice line is always last; with a wrapped env grant the card
+        // is taller than three lines, so the mouse targets follow the choice
+        // line down instead of sitting at a fixed row. If the card was clamped
+        // shorter than its content (a tiny terminal), the choice line is
+        // clipped off - then there are no click targets, which is the safe
+        // outcome: you cannot Allow what the card could not fully show.
+        let row_count = lines.len() as u16;
         Paragraph::new(lines)
             .style(Style::default().bg(theme::SURFACE()))
             .render(inner, frame.buffer_mut());
 
-        if inner.height >= 3 {
-            self.approval_hits = approval_hit_regions(inner);
+        if row_count >= 3 && row_count <= inner.height {
+            self.approval_hits = approval_choice_hit_regions(Rect {
+                x: inner.x,
+                y: inner.y + row_count - 1,
+                width: inner.width,
+                height: 1,
+            });
+        } else {
+            self.approval_hits = [None; 3];
         }
     }
 
@@ -3901,6 +3917,60 @@ fn compact_approval_lines(
     lines
 }
 
+/// The declared env allowlist, wrapped so EVERY granted name is visible - a
+/// single clipped line dropped later names behind an ellipsis while Allow
+/// stayed selectable, and every one of those names is forwarded to the host
+/// process (Greptile). The first line carries the `receives env:` label;
+/// continuation lines carry the rest of the comma list. A lone name wider
+/// than the card is hard-clipped (unavoidable), but a multi-name list never
+/// loses a name to width. The card grows to fit these (see `desired_input_h`).
+fn approval_env_wrap(env: &[String], width: usize) -> Vec<String> {
+    if env.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::from("receives env: ");
+    for (i, name) in env.iter().enumerate() {
+        if i == 0 {
+            cur.push_str(name);
+            continue;
+        }
+        // Would ", <name>" overflow? Then close this line with a trailing
+        // comma and start a continuation line with the name.
+        if cur.chars().count() + 2 + name.chars().count() > width {
+            cur.push(',');
+            lines.push(cur);
+            cur = name.clone();
+        } else {
+            cur.push_str(", ");
+            cur.push_str(name);
+        }
+    }
+    lines.push(cur);
+    lines.into_iter().map(|l| clip(&l, width)).collect()
+}
+
+/// The wrapped env grant as warn-styled lines (empty when nothing is granted).
+fn approval_env_lines(env: &[String], width: usize) -> Vec<Line<'static>> {
+    approval_env_wrap(env, width)
+        .into_iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l,
+                Style::default()
+                    .fg(theme::WARN())
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect()
+}
+
+/// How many inner rows the full card needs at this width: one summary line,
+/// one line per wrapped env-grant line, one detail line, and the choice line.
+fn approval_card_height(env: &[String], inner_width: u16) -> u16 {
+    3 + approval_env_wrap(env, inner_width as usize).len() as u16
+}
+
 fn approval_card_lines(
     name: &str,
     summary: &str,
@@ -3910,35 +3980,29 @@ fn approval_card_lines(
 ) -> Vec<Line<'static>> {
     let width = width as usize;
     let body = if detail.is_empty() { summary } else { detail };
-    vec![
-        Line::from(vec![
-            Span::styled(
-                tool_card::human_name(name),
-                Style::default()
-                    .fg(theme::WARN())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                clip(summary, width.saturating_sub(name.len() + 2)),
-                Style::default(),
-            ),
-        ]),
-        approval_body_line(body, env, width),
-        approval_choice_line(),
-    ]
-}
-
-fn approval_hit_regions(inner: Rect) -> [Option<Rect>; 3] {
-    if inner.height < 3 {
-        return [None; 3];
-    }
-    approval_choice_hit_regions(Rect {
-        x: inner.x,
-        y: inner.y + 2,
-        width: inner.width,
-        height: 1,
-    })
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            tool_card::human_name(name),
+            Style::default()
+                .fg(theme::WARN())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            clip(summary, width.saturating_sub(name.len() + 2)),
+            Style::default(),
+        ),
+    ])];
+    // The credential grant wraps across as many lines as it needs, so no
+    // granted name is ever hidden by width; the ordinary detail follows on
+    // its own single line, and the choice line is always last.
+    lines.extend(approval_env_lines(env, width));
+    lines.push(Line::from(Span::styled(
+        clip(body, width),
+        Style::default().fg(theme::DIM()),
+    )));
+    lines.push(approval_choice_line());
+    lines
 }
 
 fn approval_choice_hit_regions(row: Rect) -> [Option<Rect>; 3] {
@@ -3983,7 +4047,7 @@ fn is_shift_tab(key: &KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_card_lines, approval_hit_regions, command_parts, compact_approval_lines,
+        approval_card_lines, approval_choice_hit_regions, command_parts, compact_approval_lines,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         is_shift_tab, paint_text_selection, parse_change_counts, plural, presence_title,
         rect_contains, save_model_selection,
@@ -4309,12 +4373,12 @@ mod tests {
 
     #[test]
     fn approval_hit_regions_match_each_visible_choice_and_clip_narrowly() {
-        let wide = approval_hit_regions(Rect::new(2, 3, 60, 3));
+        let wide = approval_choice_hit_regions(Rect::new(2, 5, 60, 1));
         for hit in wide.into_iter().flatten() {
             assert!(rect_contains(hit, hit.x, hit.y));
             assert!(!rect_contains(hit, hit.right(), hit.y));
         }
-        let narrow = approval_hit_regions(Rect::new(0, 0, 12, 3));
+        let narrow = approval_choice_hit_regions(Rect::new(0, 0, 12, 1));
         assert!(narrow[0].is_some());
         assert!(narrow[1].is_none());
         assert!(narrow[2].is_none());
@@ -5724,11 +5788,19 @@ mod tests {
             text.contains("receives env"),
             "the credential grant must survive a 40-col card: {text}"
         );
+        // EVERY granted secret must be visible, not just the first: a single
+        // clipped line dropped the later names behind an ellipsis while Allow
+        // stayed selectable (Greptile). The grant wraps instead.
         assert!(
             text.contains("DEPLOY_TOKEN"),
             "the first granted secret must be visible: {text}"
         );
-        // ...and Allow is still offered, so a human never approves blind.
+        assert!(
+            text.contains("AWS_SECRET_ACCESS_KEY"),
+            "the second granted secret must not be clipped away: {text}"
+        );
+        // ...and Allow is still offered below the full grant, so a human
+        // never approves blind.
         assert!(text.contains("[y] Allow once"));
         assert!(app.approval_hits.iter().all(Option::is_some));
         fs::remove_dir_all(dir).unwrap();
