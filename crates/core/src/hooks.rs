@@ -1129,7 +1129,22 @@ pub(crate) fn hooks_fingerprint(project_root: &Path) -> u64 {
         files.sort();
         for path in files {
             path.hash(&mut h);
-            std::fs::read(&path).ok().hash(&mut h);
+            let bytes = std::fs::read(&path).ok();
+            bytes.hash(&mut h);
+            // A hook's receipt must fire when the CODE it runs changes, not
+            // only its manifest: editing an approved gate's script revokes
+            // the approval and fails closed, but the script is not a .toml,
+            // so a fingerprint over manifests alone missed it (dogfood: an
+            // approved live gate silently revoked, no receipt). Fold each
+            // hook's bound project-local files in.
+            if let Some(text) = bytes.as_ref().and_then(|b| std::str::from_utf8(b).ok()) {
+                for code in crate::ledger::manifest_code_source(&path, text, project_root) {
+                    code.path.hash(&mut h);
+                    if let Some(sha) = code.sha256.as_ref() {
+                        sha.hash(&mut h);
+                    }
+                }
+            }
         }
     }
     h.finish()

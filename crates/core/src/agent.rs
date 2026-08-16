@@ -3128,7 +3128,96 @@ async fn run_loop(
                         // and unapproved `allow` rules are dropped at load.
                         let current = Permissions::discover(project_root, &core.data_dir);
                         let inert: Vec<String> = current.notices().to_vec();
+                        // A mutation that leaves permissions.toml malformed
+                        // bricks EVERY tool call for the rest of this turn
+                        // (the snapshot floors it), and only the notices path
+                        // spoke - a wall of denies with no cause, and the
+                        // prescribed `openmax --check` needs bash, which is
+                        // now denied. Say it on the writing call, once, with
+                        // the parse reason and the turn-scoped rule.
+                        let fail_closed_now = current.fail_closed_reason().map(str::to_string);
                         permissions.reload(current);
+                        if let Some(reason) = fail_closed_now {
+                            let novel = novel_policy_notices(
+                                core,
+                                session_id,
+                                vec![format!("permissions fail-closed: {reason}")],
+                            )
+                            .await;
+                            if !novel.is_empty() {
+                                if let Some(last) =
+                                    guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                                {
+                                    // The repair carve-out returns Default for
+                                    // write/edit on this file, but an earlier
+                                    // snapshot this turn may have explicitly
+                                    // DENIED one of them, and the most
+                                    // restrictive answer wins - so the receipt
+                                    // must not promise a repair tool a rule
+                                    // already blocks (Greptile). Report only the
+                                    // repair tools the effective turn policy
+                                    // still allows.
+                                    // Probe BOTH path spellings a repair call
+                                    // could use: an `arg_regex` matches the raw
+                                    // path argument, so a deny anchored to the
+                                    // relative `.openmax/permissions.toml`
+                                    // would miss an absolute-only probe and the
+                                    // receipt would advertise a tool the
+                                    // relative call is denied (Greptile). A tool
+                                    // is "allowed" only if NEITHER spelling is
+                                    // denied.
+                                    let abs = project_root
+                                        .join(".openmax/permissions.toml")
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    let repair_denied = |tool: &str| {
+                                        [
+                                            abs.as_str(),
+                                            ".openmax/permissions.toml",
+                                            "./.openmax/permissions.toml",
+                                        ]
+                                        .iter()
+                                        .any(|p| {
+                                            matches!(
+                                                permissions.evaluate(
+                                                    tool,
+                                                    &serde_json::json!({ "path": p }),
+                                                ),
+                                                crate::permissions::PermissionDecision::Deny { .. }
+                                            )
+                                        })
+                                    };
+                                    let allowed: Vec<&str> = ["write_file", "edit_file"]
+                                        .into_iter()
+                                        .filter(|t| !repair_denied(t))
+                                        .collect();
+                                    let repair_clause = if allowed.is_empty() {
+                                        "a rule earlier this turn denies write_file and edit_file on \
+                                         this file too, so even the repair waits for the START OF THE \
+                                         NEXT TURN; read_file is not allowed"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "{} on exactly this file is still allowed and takes \
+                                             effect at the START OF THE NEXT TURN, not this one; \
+                                             read_file is NOT, so rewrite it from what you intended",
+                                            allowed.join("/")
+                                        )
+                                    };
+                                    let note = format!(
+                                        "\n[permissions.toml is now malformed ({reason}). Every tool \
+                                         call is DENIED for the rest of THIS turn - policy snapshots \
+                                         only narrow within a turn, never widen - and your repair \
+                                         ({repair_clause}). \
+                                         openmax --check cannot run until then (bash is denied too).]"
+                                    );
+                                    match &mut last.content {
+                                        Some(content) => content.push_str(&note),
+                                        None => last.content = Some(note.trim_start().to_string()),
+                                    }
+                                }
+                            }
+                        }
                         // The agent may have just written itself an allow
                         // rule that can never fire (#180). Say so NOW, on
                         // this call's result, with the command that lifts
