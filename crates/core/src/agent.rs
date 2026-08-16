@@ -2804,7 +2804,25 @@ async fn run_loop(
                                     &source.source_path,
                                     &source.shas,
                                 ) {
-                                    Ok(()) => true,
+                                    // approve() records the manifest hash and
+                                    // every bound file it could READ. When the
+                                    // manifest points at code that is missing
+                                    // or unreadable, that entry hashes to
+                                    // nothing, so `covers_code` stays false and
+                                    // the NEXT call still stops for a card - a
+                                    // "runs without a card" receipt would lie
+                                    // (Greptile). "Recorded" therefore means
+                                    // the grant now covers the exact bytes the
+                                    // gate re-reads, not merely that a record
+                                    // was written: re-run that gate and believe
+                                    // its answer.
+                                    Ok(()) => unapproved_capability(
+                                        &registry,
+                                        &core.data_dir,
+                                        project_root,
+                                        name,
+                                    )
+                                    .is_none(),
                                     Err(e) => {
                                         core.send_agent(session_id, AgentEvent::Error {
                                             message: format!(
@@ -3480,11 +3498,13 @@ async fn request_approval(
                 false => format!("runs: {} | {detail}", source.command_line),
             };
         }
-        if !source.env.is_empty() {
-            // Prepended, like the probe evidence, so card clipping cannot
-            // hide the credential grant.
-            detail = format!("receives env: {} | {detail}", source.env.join(", "));
-        }
+        // The credential grant (source.env) does NOT go here. Prepending it
+        // to a one-line detail did not make it un-hideable: the probe
+        // evidence prepended after it, and the TUI prepends provenance before
+        // clipping the line to the terminal width, so a narrow card dropped
+        // "receives env: …" while Allow stayed selectable (Greptile
+        // security). It rides the event as its own field and the frontend
+        // gives it a dedicated line the card never clips.
         // Advisory evidence, prepended so card clipping cannot hide it: a
         // sandboxed probe of exactly these bytes passed. The receipt grants
         // nothing - approving still grants real host authority - and any
@@ -3509,6 +3529,7 @@ async fn request_approval(
         reason: reason.to_string(),
         source_path: source.map(|s| s.path.clone()).unwrap_or_default(),
         source_sha: source.map(|s| short_sha(&s.sha256)).unwrap_or_default(),
+        env: source.map(|s| s.env.clone()).unwrap_or_default(),
     });
 
     let outcome = tokio::select! {
@@ -4913,11 +4934,11 @@ mod tests {
 
         // Matching vector: the card carries the evidence.
         let task = tokio::spawn(drive(vec![sha.clone()], core.clone()));
-        let detail = loop {
-            let env = rx.recv().await.expect("event");
-            if let AgentEvent::ApprovalRequest { approval_id, detail, .. } = env.event {
+        let (detail, env_names) = loop {
+            let ev = rx.recv().await.expect("event");
+            if let AgentEvent::ApprovalRequest { approval_id, detail, env, .. } = ev.event {
                 core.respond_approval(&approval_id, false);
-                break detail;
+                break (detail, env);
             }
         };
         let _ = task.await;
@@ -4929,9 +4950,16 @@ mod tests {
             detail.contains("runs: ./scripts/docsearch.sh"),
             "the card names what will execute: {detail}"
         );
+        // The credential grant rides its own field, never the clippable
+        // detail: a narrow card gives it a dedicated line it cannot drop.
+        assert_eq!(
+            env_names,
+            vec!["GITHUB_TOKEN".to_string()],
+            "the credential grant is structured, not folded into detail"
+        );
         assert!(
-            detail.contains("receives env: GITHUB_TOKEN"),
-            "the card discloses the credential grant: {detail}"
+            !detail.contains("receives env"),
+            "env must not be buried in the clippable detail line: {detail}"
         );
 
         // A different vector (edited bytes): no evidence - and the card SAYS
@@ -6081,6 +6109,88 @@ mod tests {
             *requests.lock().unwrap(),
             1,
             "the request that cannot fit is refused, not dispatched"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One tool call to `brokentool`, so the loop stops for its content card.
+    const BROKEN_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"brokentool\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A human at the card approves an external tool whose manifest names code
+    /// that is missing (the agent wrote the .toml but not the script, or it
+    /// was deleted). approve() can only bless the manifest hash; the missing
+    /// script has no bytes to hash, so `covers_code` stays false and the NEXT
+    /// call still stops for a card. The receipt must say exactly that, not
+    /// promise cardless future calls (Greptile): a "runs without a card"
+    /// receipt teaches the model that revocation is broken, the same lesson
+    /// the whole receipt exists to prevent.
+    #[tokio::test]
+    async fn an_approval_that_cannot_cover_missing_code_says_it_asks_again() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-recv-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        // The manifest names ./missing.sh, which is never written.
+        std::fs::write(
+            project.join(".openmax/tools/brokentool.toml"),
+            "name = \"brokentool\"\ndescription = \"d\"\ncommand = \"./missing.sh\"\nmutating = false\n",
+        )
+        .unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(BROKEN_TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // One iteration: call the tool, then the loop stops. The receipt
+            // is what the test reads, not the stop reason.
+            s.max_agent_iterations = 1;
+        }
+
+        let id = "sess-recv";
+        start_turn(core.clone(), id.into(), project.clone(), "use it".into()).unwrap();
+
+        // Drive to Done, approving the one content card the tool raises.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        core.respond_approval(&approval_id, true);
+                    }
+                    AgentEvent::Done { .. } => break,
+                    _ => {}
+                },
+                Ok(None) => panic!("event stream closed before Done"),
+                Err(_) => {}
+            }
+        }
+
+        let messages = transcript(&core, id).await;
+        let tool_msg = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "tool")
+            .and_then(|m| m.content.clone())
+            .expect("the brokentool call left a tool message");
+        assert!(
+            tool_msg.contains("stops for a card again"),
+            "an approval that cannot cover missing code must not promise cardless calls: {tool_msg}"
+        );
+        assert!(
+            !tool_msg.contains("run without a card"),
+            "the receipt claimed a cardless future call it cannot honor: {tool_msg}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

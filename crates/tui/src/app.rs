@@ -280,7 +280,7 @@ pub struct App {
     stream_chars: usize,
     running_tool: Option<(String, String)>,
     /// Pending mutating-tool gate: id, tool name, summary, detail preview.
-    pending_approval: Option<(String, String, String, String)>,
+    pending_approval: Option<(String, String, String, String, Vec<String>)>,
     pending_diffs: HashMap<String, DiffText>,
     tool_meta: HashMap<String, ToolMeta>,
     last_tool_output: Option<String>,
@@ -1000,7 +1000,7 @@ impl App {
         }
 
         // Approval prompt swallows keys until answered.
-        if let Some((id, name, _, _)) = self.pending_approval.clone() {
+        if let Some((id, name, _, _, _)) = self.pending_approval.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.core.respond_approval(&id, true);
@@ -1352,7 +1352,7 @@ impl App {
     /// Approval hit regions use the fixed order allow once, allow for run,
     /// deny. Keyboard handling remains the authoritative path.
     fn respond_approval_choice(&mut self, choice: usize) {
-        let Some((id, _, _, _)) = self.pending_approval.clone() else {
+        let Some((id, _, _, _, _)) = self.pending_approval.clone() else {
             return;
         };
         match choice {
@@ -2521,6 +2521,7 @@ impl App {
                 reason,
                 source_path,
                 source_sha,
+                env,
             } => {
                 // Interactive approvals show provenance at the moment it
                 // matters: capability content no human has approved - the
@@ -2540,7 +2541,7 @@ impl App {
                 } else {
                     detail
                 };
-                self.pending_approval = Some((approval_id, name, summary, detail));
+                self.pending_approval = Some((approval_id, name, summary, detail, env));
                 self.set_presence(Presence::NeedsApproval);
                 self.completion = None;
                 self.dirty.mark_chrome();
@@ -2552,7 +2553,7 @@ impl App {
                 if self
                     .pending_approval
                     .as_ref()
-                    .is_some_and(|(id, _, _, _)| id == &approval_id)
+                    .is_some_and(|(id, _, _, _, _)| id == &approval_id)
                 {
                     self.pending_approval = None;
                     // The turn resumes; the needs-you state is over.
@@ -3003,11 +3004,11 @@ impl App {
     }
 
     fn draw_approval(&mut self, frame: &mut Frame, area: Rect) {
-        let Some((_, name, summary, detail)) = self.pending_approval.as_ref() else {
+        let Some((_, name, summary, detail, env)) = self.pending_approval.as_ref() else {
             return;
         };
         if area.height < 5 {
-            let lines = compact_approval_lines(name, summary, detail, area.width, area.height);
+            let lines = compact_approval_lines(name, summary, detail, env, area.width, area.height);
             let height = (lines.len() as u16).min(area.height);
             let draw_area = Rect {
                 y: area.bottom().saturating_sub(height),
@@ -3040,7 +3041,7 @@ impl App {
             .style(Style::default().bg(theme::SURFACE()));
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
-        let lines = approval_card_lines(name, summary, detail, inner.width);
+        let lines = approval_card_lines(name, summary, detail, env, inner.width);
         Paragraph::new(lines)
             .style(Style::default().bg(theme::SURFACE()))
             .render(inner, frame.buffer_mut());
@@ -3822,10 +3823,49 @@ fn approval_choice_line() -> Line<'static> {
     ])
 }
 
+/// The card's middle line, with the declared env allowlist given the FIRST
+/// claim on the width. Folding "receives env: …" into the tail of a clipped
+/// detail string let a narrow card drop the credential grant while Allow
+/// stayed selectable (Greptile security). Here the grant leads, warn-styled,
+/// and is clipped only against the whole width, so a long env list truncates
+/// but the disclosure itself is never hidden; the ordinary detail fills
+/// whatever width is left. The card layout stays exactly three lines, so the
+/// fixed mouse hit-regions do not shift.
+fn approval_body_line(detail: &str, env: &[String], width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    if !env.is_empty() {
+        let text = clip(&format!("receives env: {}", env.join(", ")), width);
+        used = text.chars().count();
+        spans.push(Span::styled(
+            text,
+            Style::default()
+                .fg(theme::WARN())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !detail.is_empty() && used < width {
+        let sep = if used > 0 { "  " } else { "" };
+        let remaining = width - used - sep.len().min(width - used);
+        let d = clip(detail, remaining);
+        if !d.is_empty() {
+            if !sep.is_empty() {
+                spans.push(Span::raw(sep));
+            }
+            spans.push(Span::styled(d, Style::default().fg(theme::DIM())));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(""));
+    }
+    Line::from(spans)
+}
+
 fn compact_approval_lines(
     name: &str,
     summary: &str,
     detail: &str,
+    env: &[String],
     width: u16,
     height: u16,
 ) -> Vec<Line<'static>> {
@@ -3837,21 +3877,25 @@ fn compact_approval_lines(
         return vec![approval_choice_line()];
     }
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{}  ", tool_card::human_name(name)),
-            Style::default()
-                .fg(theme::WARN())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(clip(summary, width.saturating_sub(name.len() + 2))),
-    ])];
-    if height >= 3 {
-        let body = if detail.is_empty() { summary } else { detail };
-        lines.push(Line::from(Span::styled(
-            clip(body, width),
-            Style::default().fg(theme::DIM()),
-        )));
+    let body = if detail.is_empty() { summary } else { detail };
+    let mut lines = Vec::new();
+    if !env.is_empty() && height == 2 {
+        // Two rows leave one for the choice line: the credential grant
+        // outranks the call summary, so Allow is never the only thing shown.
+        lines.push(approval_body_line(body, env, width));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}  ", tool_card::human_name(name)),
+                Style::default()
+                    .fg(theme::WARN())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(clip(summary, width.saturating_sub(name.len() + 2))),
+        ]));
+        if height >= 3 {
+            lines.push(approval_body_line(body, env, width));
+        }
     }
     lines.push(approval_choice_line());
     lines
@@ -3861,6 +3905,7 @@ fn approval_card_lines(
     name: &str,
     summary: &str,
     detail: &str,
+    env: &[String],
     width: u16,
 ) -> Vec<Line<'static>> {
     let width = width as usize;
@@ -3879,10 +3924,7 @@ fn approval_card_lines(
                 Style::default(),
             ),
         ]),
-        Line::from(Span::styled(
-            clip(body, width),
-            Style::default().fg(theme::DIM()),
-        )),
+        approval_body_line(body, env, width),
         approval_choice_line(),
     ]
 }
@@ -4250,6 +4292,7 @@ mod tests {
             "bash",
             "run tests",
             "cargo test with a deliberately long trailing argument",
+            &[],
             24,
         );
         assert_eq!(lines.len(), 3);
@@ -4499,6 +4542,7 @@ mod tests {
                 "write_file".into(),
                 "summary".into(),
                 "detail".into(),
+                vec![],
             ));
             app.on_key(key).await.unwrap();
             assert_eq!(
@@ -4587,7 +4631,7 @@ mod tests {
             config::save(&dir, &settings).unwrap();
         }
         app.pending_approval =
-            Some(("id".into(), "bash".into(), "sum".into(), "detail".into()));
+            Some(("id".into(), "bash".into(), "sum".into(), "detail".into(), vec![]));
 
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await
@@ -4940,6 +4984,7 @@ mod tests {
             detail: "cargo test".into(),
             source_path: String::new(),
             source_sha: String::new(),
+            env: vec![],
         });
 
         app.on_key(KeyEvent::new(
@@ -5124,6 +5169,7 @@ mod tests {
             reason: "gate".into(),
             source_path: String::new(),
             source_sha: String::new(),
+            env: vec![],
         });
         assert_eq!(app.presence, Presence::NeedsApproval);
 
@@ -5625,6 +5671,7 @@ mod tests {
             detail: "cargo fetch".into(),
             source_path: String::new(),
             source_sha: String::new(),
+            env: vec![],
         });
         let pending = render_app(&mut app, 88, 16);
         let pending_text = buffer_text(&pending);
@@ -5645,13 +5692,46 @@ mod tests {
 
     #[test]
     fn compact_approval_keeps_keyboard_choices_visible() {
-        let lines = compact_approval_lines("bash", "run tests", "cargo test", 64, 4);
+        let lines = compact_approval_lines("bash", "run tests", "cargo test", &[], 64, 4);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Shell"));
         assert!(text.contains("cargo test"));
         assert!(text.contains("[y] Allow once"));
         assert!(text.contains("[a] Allow for run"));
         assert!(text.contains("[n] Deny"));
+    }
+
+    #[test]
+    fn narrow_approval_card_still_shows_the_env_grant() {
+        // A 40-column card with a long detail: folding "receives env: …"
+        // into the tail of one clipped detail line let the credential grant
+        // fall off while Allow stayed selectable (Greptile security). The
+        // grant now leads its own line, so a narrow terminal cannot hide it.
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-env".into(),
+            name: "deploy".into(),
+            summary: "deploy".into(),
+            detail: "probe: example passed in sandbox (no network, writes confined) | runs: ./scripts/deploy.sh --prod".into(),
+            reason: "unapproved_source".into(),
+            source_path: ".openmax/tools/deploy.toml".into(),
+            source_sha: "abcdef012345".into(),
+            env: vec!["DEPLOY_TOKEN".into(), "AWS_SECRET_ACCESS_KEY".into()],
+        });
+        let buffer = render_app(&mut app, 40, 16);
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains("receives env"),
+            "the credential grant must survive a 40-col card: {text}"
+        );
+        assert!(
+            text.contains("DEPLOY_TOKEN"),
+            "the first granted secret must be visible: {text}"
+        );
+        // ...and Allow is still offered, so a human never approves blind.
+        assert!(text.contains("[y] Allow once"));
+        assert!(app.approval_hits.iter().all(Option::is_some));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5665,6 +5745,7 @@ mod tests {
             detail: "cargo test".into(),
             source_path: String::new(),
             source_sha: String::new(),
+            env: vec![],
         });
         let buffer = render_app(&mut app, 64, 4);
         let rendered = rows(&buffer);
