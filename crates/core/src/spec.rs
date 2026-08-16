@@ -479,9 +479,14 @@ the harness took the tool at its word. So the honest recipe for "watch every
 write to X" pairs `ask` mode with an audit of every approved external tool
 that could reach X: read what each one actually runs, and if a self-declared
 read-only tool can mutate, that is the hole to close. The durable gate is a
-`deny` (or `ask`) rule on the tool's NAME: rules run before the content gate,
-so they stop even an approved tool, and they keep stopping it whatever its
-bytes become. There is no operation today that revokes an external tool's
+`deny` (or `ask`) rule on the tool's NAME, placed BEFORE any matching `allow`:
+rules run before the content gate, so they stop even an approved tool, and
+they keep stopping it whatever its bytes become. But evaluation is FIRST-MATCH,
+so an earlier `allow` for the same tool shadows the gate and the tool runs
+unprompted - and project rules are read before global ones, so a global gate
+cannot override a project `allow`. Put the deny/ask above every matching
+`allow` (removing or reordering any that a human approved earlier), or the gate
+is inert. There is no operation today that revokes an external tool's
 content approval in place - `--forget` retires a path or hook but leaves the
 approved manifest and code hashes standing - and neither editing nor deleting
 the file revokes that approval: both stop the tool as it is now, but the
@@ -1107,6 +1112,17 @@ mod tests {
         assert!(
             flat.contains("Only the name rule survives such a restore"),
             "the spec must name the mitigation that survives a byte-identical restore"
+        );
+        // Evaluation is first-match, so the gate is inert behind an earlier
+        // allow: the spec must state the ordering requirement, or a reader adds
+        // a deny below an approved allow and it never fires (Greptile).
+        assert!(
+            flat.contains("evaluation is FIRST-MATCH") && flat.contains("earlier `allow`"),
+            "the spec must say a name gate is shadowed by an earlier allow"
+        );
+        assert!(
+            flat.contains("Put the deny/ask above every matching `allow`"),
+            "the spec must tell the reader to place the gate before any matching allow"
         );
     }
 
