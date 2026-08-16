@@ -109,7 +109,17 @@ pub struct Registry {
     pub memory_files: Option<Vec<(String, u64)>>,
     /// The rendered memory index section captured in the SAME scan as
     /// `memory_files`, so the frozen prompt and the receipt cannot disagree.
+    /// `None` here is ambiguous on its own - an empty scan and a registry that
+    /// never scanned both leave it None - so `memory_scanned` disambiguates.
     pub memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// True only when THIS registry actually ran a memory scan (a fresh
+    /// freeze). A manifest-restored registry sets `memory_files` for the
+    /// resume delta but never captured a section, so it is false and the
+    /// prompt scans fresh - otherwise a resumed session would render no
+    /// memory index at all while `memory_files.is_some()` (Greptile). A
+    /// scanned-but-empty freeze is true, so its empty selection is honored
+    /// (no rescan), which is the invariant `memory_section` exists for.
+    pub memory_scanned: bool,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
@@ -338,6 +348,7 @@ impl Registry {
         registry.broken = snapshot.broken;
         registry.memory_files = Some(snapshot.memory_files);
         registry.memory_section = snapshot.memory_section;
+        registry.memory_scanned = true;
         registry
     }
 
@@ -386,6 +397,7 @@ impl Registry {
             broken: Vec::new(),
             memory_files: None,
             memory_section: None,
+            memory_scanned: false,
             schemas,
             schemas_wire,
             by_name,

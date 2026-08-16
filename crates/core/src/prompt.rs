@@ -125,15 +125,16 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // has no live memories so the zero-cost invariant holds.
     // Prefer the section captured in the registry's own freeze scan, so the
     // frozen prompt and the refreeze receipt describe the same memory
-    // selection (Greptile: two separate scans could diverge). Whether a scan
-    // HAPPENED is `memory_files.is_some()`, NOT whether it found anything: a
-    // freeze that scanned and found no memories captures `memory_section =
-    // None`, and falling back to a fresh scan there would re-introduce the
-    // divergence for the empty case - a memory written between the freeze and
-    // this render would enter the prompt while the receipt still reports no
-    // change (Greptile). Only a registry that never scanned (builtin-only,
-    // from a manifest) scans fresh here.
-    let memory = if registry.memory_files.is_some() {
+    // selection (Greptile: two separate scans could diverge). The signal is
+    // `memory_scanned` - whether THIS registry ran a scan - not whether the
+    // scan found anything: a freeze that scanned and found no memories
+    // captures `memory_section = None`, and rescanning there would re-inject a
+    // memory written after the freeze while the receipt reports no change. A
+    // registry that never scanned (builtin-only, or restored from a manifest,
+    // which keeps memory_files for the resume delta but captured no section)
+    // scans fresh, or a resumed session would render no memory index at all
+    // (Greptile).
+    let memory = if registry.memory_scanned {
         registry.memory_section.clone()
     } else {
         crate::memory::index_section(project_root, crate::memory::unix_now())
@@ -716,7 +717,7 @@ mod tests {
     fn a_scanned_empty_registry_does_not_rescan_memory() {
         let dir = temp_project();
         let registry = Registry::build(&dir.join("data"), &dir);
-        assert!(registry.memory_files.is_some(), "the build scanned memory");
+        assert!(registry.memory_scanned, "the build scanned memory");
         std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
         std::fs::write(
             dir.join(".openmax/memory/late.md"),
@@ -732,6 +733,34 @@ mod tests {
         // picks up the same on-disk memory.
         let fresh = system_prompt(&dir, &Registry::builtin_only());
         assert!(fresh.contains("Memory ("), "builtin-only scans fresh:\n{fresh}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A manifest-restored registry keeps `memory_files` (for the resume
+    /// delta) but never captured a `memory_section`, so `memory_scanned` is
+    /// false and the prompt must scan fresh - otherwise a resumed session with
+    /// live memories renders no memory index at all (Greptile). Regenerating
+    /// the prompt from such a registry must still show the memories on disk.
+    #[test]
+    fn a_manifest_restored_registry_rebuilds_the_memory_index() {
+        let dir = temp_project();
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/deploy-port.md"),
+            "# The deploy port is 7443\nSet in infra/nginx.conf.",
+        )
+        .unwrap();
+        // Freeze with the memory present, round-trip through the manifest.
+        let frozen = Registry::build(&dir.join("data"), &dir);
+        assert!(frozen.memory_scanned && frozen.memory_section.is_some());
+        let restored = Registry::from_manifest(frozen.to_manifest());
+        assert!(!restored.memory_scanned, "a manifest restore never scanned");
+        assert!(restored.memory_files.is_some(), "but it keeps files for the delta");
+        let prompt = system_prompt(&dir, &restored);
+        assert!(
+            prompt.contains("The deploy port is 7443"),
+            "the resumed prompt must rebuild the memory index:\n{prompt}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
