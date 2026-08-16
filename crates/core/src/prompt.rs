@@ -125,12 +125,19 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // has no live memories so the zero-cost invariant holds.
     // Prefer the section captured in the registry's own freeze scan, so the
     // frozen prompt and the refreeze receipt describe the same memory
-    // selection (Greptile: two separate scans could diverge). A registry that
-    // did not scan memory (builtin-only, from a manifest) scans fresh.
-    let memory = registry
-        .memory_section
-        .clone()
-        .or_else(|| crate::memory::index_section(project_root, crate::memory::unix_now()));
+    // selection (Greptile: two separate scans could diverge). Whether a scan
+    // HAPPENED is `memory_files.is_some()`, NOT whether it found anything: a
+    // freeze that scanned and found no memories captures `memory_section =
+    // None`, and falling back to a fresh scan there would re-introduce the
+    // divergence for the empty case - a memory written between the freeze and
+    // this render would enter the prompt while the receipt still reports no
+    // change (Greptile). Only a registry that never scanned (builtin-only,
+    // from a manifest) scans fresh here.
+    let memory = if registry.memory_files.is_some() {
+        registry.memory_section.clone()
+    } else {
+        crate::memory::index_section(project_root, crate::memory::unix_now())
+    };
     if let Some((index, rows)) = memory {
         let before = prompt.len();
         prompt.push_str(
@@ -695,6 +702,36 @@ mod tests {
         ));
         assert_eq!(breakdown.memory.len(), 1);
         assert!(breakdown.components.iter().any(|(name, _)| name == "memory index"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A freeze that scanned memory and found none captures memory_files =
+    /// Some(empty) and memory_section = None. A memory written AFTER that
+    /// freeze must NOT enter the prompt - the frozen receipt reported no
+    /// memory change, so injecting one would put the prompt and the receipt
+    /// back in disagreement for the empty case (Greptile). Only a registry
+    /// that never scanned (builtin-only, from a manifest) falls back to a
+    /// fresh scan.
+    #[test]
+    fn a_scanned_empty_registry_does_not_rescan_memory() {
+        let dir = temp_project();
+        let registry = Registry::build(&dir.join("data"), &dir);
+        assert!(registry.memory_files.is_some(), "the build scanned memory");
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/late.md"),
+            "# A fact written after the freeze\nbody.",
+        )
+        .unwrap();
+        let prompt = system_prompt(&dir, &registry);
+        assert!(
+            !prompt.contains("Memory ("),
+            "the captured empty snapshot is used, not a fresh scan:\n{prompt}"
+        );
+        // The sanctioned fallback still works: a registry that never scanned
+        // picks up the same on-disk memory.
+        let fresh = system_prompt(&dir, &Registry::builtin_only());
+        assert!(fresh.contains("Memory ("), "builtin-only scans fresh:\n{fresh}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
