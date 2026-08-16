@@ -454,6 +454,52 @@ What the regex matches:
 - `glob`, `grep` → the pattern argument.
 - any other tool → the full serialized JSON arguments.
 
+A rule (and a `pre_tool_use` hook) sees TEXT, not effects. A `deny` on
+`bash` matches the command STRING, so it stops the spellings your regex
+anticipates and nothing else: `rm src/x` is caught, but `python3 -c
+'os.remove(...)'`, `truncate -s 0 src/x`, `find src -delete`, and `> src/x`
+are all different strings that reach the same file. A `tool = "bash"` rule
+also does not gate `write_file`/`edit_file` at all - those are separate tools.
+So a permission rule is friction against known patterns, NOT a filesystem
+guarantee: if a user asks for a hard guarantee that some path cannot be
+written, say plainly that these gates cannot deliver one, and offer what they
+can - `approval_mode = "ask"` so every call CLASSIFIED as mutating and not
+covered by an approved `allow` rule is shown (an approved `allow` still runs it
+unprompted, so drop the rules that cover the path you want to see - and that is
+not only path-scoped `write_file`/`edit_file` allows: a `bash` allow matches
+COMMAND TEXT, so an approved `allow` on a `bash` command that can mutate the
+path, e.g. `truncate -s 0 src/x`, force-allows it with no prompt, and a
+`write_file`/`edit_file` rule does not constrain bash at all - so remove or
+narrow every effective allow, bash included, whose command could reach the
+path), an `ask` rule so the patterns you name prompt rather than run, or moving
+the files out of the agent's reach. Do not hand over a confident guard that
+does not guard.
+
+"Classified as mutating" is not "can mutate". For a builtin the class is
+fixed; for an external tool it is the manifest's own `mutating` flag, which is
+trusted metadata the agent writes, not an effects check the harness runs. An
+approved
+external tool that declares `mutating = false` is a native host process that
+can still write or delete any path, and `ask` mode will NOT stop it, because
+the harness took the tool at its word. So the honest recipe for "watch every
+write to X" pairs `ask` mode with an audit of every approved external tool
+that could reach X: read what each one actually runs, and if a self-declared
+read-only tool can mutate, that is the hole to close. The durable gate is a
+`deny` (or `ask`) rule on the tool's NAME, placed BEFORE any matching `allow`:
+rules run before the content gate, so they stop even an approved tool, and
+they keep stopping it whatever its bytes become. But evaluation is FIRST-MATCH,
+so an earlier `allow` for the same tool shadows the gate and the tool runs
+unprompted - and project rules are read before global ones, so a global gate
+cannot override a project `allow`. Put the deny/ask above every matching
+`allow` (removing or reordering any that a human approved earlier), or the gate
+is inert. There is no operation today that revokes an external tool's
+content approval in place - `--forget` retires a path or hook but leaves the
+approved manifest and code hashes standing - and neither editing nor deleting
+the file revokes that approval: both stop the tool as it is now, but the
+original approved bytes still match the standing approval, so restoring them
+byte-for-byte would run without a card again. Only the name rule survives such
+a restore. `ask` mode alone will not surface this for you.
+
 `allow` is the only effect that removes a gate: it skips the approval prompt
 outright. The project file sits where you write, so an `allow` in it is inert
 until a human approves that exact content with
@@ -774,7 +820,7 @@ here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
-detail, reason, source_path, source_sha), `approval_settled` (approval_id,
+detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
 each recorded capability-file change and its actor), `schemas_over_budget`
 (schema_tokens, budget_tokens: the installed tools take most of what the
@@ -800,7 +846,13 @@ manifest, or the project-local code it runs - no human has approved.
 `unapproved_source` is the human boundary itself and must never be
 auto-approved; it carries `source_path` (project-relative where possible) and
 `source_sha` (first 12 hex chars), so a client that cannot prompt can print
-`openmax --approve <source_path>`. Both are empty on `gate`.
+`openmax --approve <source_path>`. Both are empty on `gate`. `env` is the list
+of environment variable NAMES the approved tool will receive (its manifest's
+`env` allowlist): a credential grant. It is omitted from the wire when empty,
+so a `gate` and a tool that forwards nothing carry no `env` key. When present,
+render it on its OWN line the card never clips - approving secrets a narrow
+terminal hid behind other detail is the failure the field exists to prevent;
+do not fold it into `detail`.
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
@@ -1019,6 +1071,74 @@ mod tests {
             );
         }
         assert!(render("stdio").unwrap().contains("openmax --check --stdio"));
+    }
+
+    /// `ask` mode prompts only on calls the harness CLASSIFIES as mutating,
+    /// and for an external tool that class is the manifest's self-declared
+    /// `mutating` flag - trusted metadata, not an effects check. A tool that
+    /// declares `mutating = false` runs unprompted even though it is host code
+    /// that can write anything, so the permissions spec must not promise `ask`
+    /// mode shows "every mutating call" without that caveat and the audit it
+    /// implies (Greptile): a reader who trusts the unqualified promise builds
+    /// a guard with a hole in it.
+    #[test]
+    fn permissions_spec_qualifies_ask_mode_with_the_classification_caveat() {
+        let text = render("permissions").unwrap();
+        assert!(
+            text.contains("CLASSIFIED as mutating"),
+            "ask-mode guidance must say it prompts on CLASSIFIED-mutating calls"
+        );
+        assert!(
+            text.contains("trusted metadata") && text.contains("not an effects check"),
+            "the spec must say the classification is trusted metadata, not an effects check"
+        );
+        assert!(
+            text.contains("audit") && text.contains("mutating = false"),
+            "the spec must advise auditing approved external tools that declare mutating = false"
+        );
+        // The mitigation must be real: there is no in-place approval revoke,
+        // so the spec must say so and name what actually closes the hole -
+        // advising "revoke the approval" would send the reader to --forget,
+        // which leaves the tool's hashes standing (Greptile). Collapse the
+        // doc's line wrapping so the check does not depend on where a phrase
+        // breaks across lines.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("no operation today that revokes an external tool's content approval"),
+            "the spec must state that an external-tool approval cannot be revoked in place"
+        );
+        // The durable mitigation is a name rule; the spec must say editing or
+        // deleting the file does NOT revoke the standing approval (a
+        // byte-identical restore runs cardless), or a reader would trust a
+        // control that a restore defeats (Greptile).
+        assert!(
+            flat.contains("neither editing nor deleting the file revokes that approval"),
+            "the spec must say edit/delete do not revoke the standing approval"
+        );
+        assert!(
+            flat.contains("Only the name rule survives such a restore"),
+            "the spec must name the mitigation that survives a byte-identical restore"
+        );
+        // Protecting a path from ask-mode bypass also means dropping bash
+        // allows: a bash allow matches command text, so an approved bash allow
+        // whose command mutates the path force-allows it, and path-scoped
+        // write/edit rules do not constrain bash (Greptile).
+        assert!(
+            flat.contains("a `bash` allow matches COMMAND TEXT")
+                && flat.contains("does not constrain bash"),
+            "the spec must warn that a bash allow can bypass ask mode for the path"
+        );
+        // Evaluation is first-match, so the gate is inert behind an earlier
+        // allow: the spec must state the ordering requirement, or a reader adds
+        // a deny below an approved allow and it never fires (Greptile).
+        assert!(
+            flat.contains("evaluation is FIRST-MATCH") && flat.contains("earlier `allow`"),
+            "the spec must say a name gate is shadowed by an earlier allow"
+        );
+        assert!(
+            flat.contains("Put the deny/ask above every matching `allow`"),
+            "the spec must tell the reader to place the gate before any matching allow"
+        );
     }
 
     /// A frontend author reads `--spec stdio` and is then judged by
