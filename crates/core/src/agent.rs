@@ -268,6 +268,23 @@ fn report_hook_failures(
 /// cost real detours. Valid new bytes: state the launch-read rule and what
 /// this session still runs. Invalid bytes: the brick warning (next launch
 /// exits 2), delivered while the author can still repair the file.
+/// Insert a turn-start harness note just before the pending user prompt AND
+/// emit it on the wire as a `HarnessNote`. The transcript half is what the
+/// MODEL reads; the wire half is what a custom or interactive frontend reads,
+/// so a protocol-v5 client can display the state change that affects the next
+/// turn instead of it being model-only (Greptile). The empty `call_id` marks
+/// a note owned by no tool call, exactly as the policy-notice path does.
+fn insert_startup_note(
+    core: &Arc<Core>,
+    session_id: &str,
+    msgs: &mut Vec<ChatMessage>,
+    text: String,
+) {
+    let at = msgs.len().saturating_sub(1);
+    msgs.insert(at, ChatMessage::user(text.clone()));
+    core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
+}
+
 fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
     let changed = core.settings_disk_changed()?;
     Some(match changed {
@@ -2358,9 +2375,9 @@ async fn run_loop(
         // endpoint-failure path's prompt-pop still removes the prompt, while
         // the receipt - which records a refreeze that stays applied - stays.
         // Pure suffix growth relative to the previous turn: prefix-stable.
-        let msgs = guard.messages();
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(receipt));
+        // Also to the wire: the Refrozen event is a summary; the detailed
+        // receipt (which files, why one did not load) is what a frontend shows.
+        insert_startup_note(core, session_id, guard.messages(), receipt);
     }
 
     // Approvals recorded outside this running session (#199): a human at
@@ -2398,9 +2415,7 @@ async fn run_loop(
                  is live with bash: openmax --check.]",
                 fresh.join("; ")
             );
-            let msgs = guard.messages();
-            let at = msgs.len().saturating_sub(1);
-            msgs.insert(at, ChatMessage::user(note));
+            insert_startup_note(core, session_id, guard.messages(), note);
         }
     }
 
@@ -2428,10 +2443,7 @@ async fn run_loop(
     let novel = novel_policy_notices(core, session_id, startup_notices).await;
     if !novel.is_empty() {
         let text = format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER));
-        let msgs = guard.messages();
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(text.clone()));
-        core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
+        insert_startup_note(core, session_id, guard.messages(), text);
     }
 
     // The provider catalog's content identity at turn start: an agent bash
@@ -2444,10 +2456,8 @@ async fn run_loop(
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
-        // distinct on-disk content.
-        let msgs = guard.messages();
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(note));
+        // distinct on-disk content, and onto the wire for the frontend too.
+        insert_startup_note(core, session_id, guard.messages(), note);
     }
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
