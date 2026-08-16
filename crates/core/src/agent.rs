@@ -3152,10 +3152,10 @@ async fn run_loop(
                                         "\n[permissions.toml is now malformed ({reason}). Every tool \
                                          call is DENIED for the rest of THIS turn - policy snapshots \
                                          only narrow within a turn, never widen - and your repair \
-                                         (write_file/edit_file/read_file on exactly this file is still \
-                                         allowed) takes effect at the START OF THE NEXT TURN, not \
-                                         this one. openmax --check cannot run until then (bash is \
-                                         denied too).]"
+                                         (write_file/edit_file on exactly this file is still allowed; \
+                                         read_file is NOT, so rewrite it from what you intended) \
+                                         takes effect at the START OF THE NEXT TURN, not this one. \
+                                         openmax --check cannot run until then (bash is denied too).]"
                                     );
                                     match &mut last.content {
                                         Some(content) => content.push_str(&note),

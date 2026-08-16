@@ -520,6 +520,17 @@ async fn an_invalidating_write_to_permissions_is_named_on_the_writing_call() {
     assert!(content.contains("permissions.toml is now malformed"), "{content}");
     assert!(content.contains("DENIED for the rest of THIS turn"), "{content}");
     assert!(content.contains("START OF THE NEXT TURN"), "{content}");
+    // The recovery guidance names only the tools that are actually available:
+    // read_file was removed from the repair carve-out, so advertising it would
+    // send the model into another immediate denial (Greptile).
+    assert!(
+        content.contains("write_file/edit_file on exactly this file is still allowed"),
+        "{content}"
+    );
+    assert!(
+        !content.contains("write_file/edit_file/read_file"),
+        "the receipt must not advertise the denied read_file: {content}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
