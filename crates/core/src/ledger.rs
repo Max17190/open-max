@@ -1302,6 +1302,24 @@ fn approve(
                         }
                     }
                 }
+                // Every code hash this act records in `also` (that is,
+                // `shas[1..]`) must now have a stored object, or a restore of
+                // that hash would fail. A bound file changed, deleted, or made
+                // unreadable since the card hashed it leaves its vouched sha
+                // unstored: reject the whole approval rather than record a hash
+                // with no restorable bytes (Greptile). Code that was already
+                // missing AT card time never entered `shas`, so this does not
+                // fire for it - that tool is simply not covered and asks again.
+                // The manifest object already written is orphaned (no record
+                // references it), never a dangling approval.
+                for code_sha in shas.iter().skip(1) {
+                    if !dir.join("objects").join(code_sha).is_file() {
+                        return Err(format!(
+                            "a bound file changed, was removed, or could not be read since it was shown, so its approved bytes ({}) are not restorable; nothing was approved - review the files and approve them again",
+                            &code_sha[..code_sha.len().min(12)]
+                        ));
+                    }
+                }
                 std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|text| hook_record_source(p, text, project_root))
@@ -1521,6 +1539,20 @@ pub fn object_state(data_dir: &Path, project_root: &Path, sha: &str) -> ObjectSt
     }
 }
 
+/// True when an approval's PRIMARY manifest bytes cannot be restored: the
+/// record approved a manifest sha but its object is missing or corrupt (a
+/// legacy or hash-only approval never stored one). `--ledger` surfaces this so
+/// a row with intact bound objects but an unrestorable manifest does not read
+/// as fully restorable (Greptile). False for non-approvals and path-only
+/// approvals, which have no manifest object to restore.
+pub fn approval_manifest_missing(data_dir: &Path, project_root: &Path, record: &Record) -> bool {
+    record.kind == Kind::Approval
+        && record
+            .sha256
+            .as_deref()
+            .is_some_and(|sha| !matches!(object_state(data_dir, project_root, sha), ObjectState::Intact))
+}
+
 /// Unix seconds as `YYYY-MM-DD HH:MM:SSZ`. Raw epoch seconds are unreadable
 /// in an audit trail, and a date crate is not worth pulling in for one line.
 pub fn format_ts(secs: u64) -> String {
@@ -1676,6 +1708,19 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
         let path = absolute_from(arg, project_root);
         if path.is_file() && inside_project(&path, project_root) {
             out.push(read_code(path));
+        }
+    }
+    // An interpreter's script argument (`/bin/sh run.sh`) that resolved to a
+    // project path but is now MISSING must bind to a None entry, exactly as a
+    // missing command-position script does. Otherwise deleting it leaves an
+    // EMPTY binding that `covers_code` reads as "nothing to cover", so the
+    // deleted tool runs ungated and a removed-tool receipt calls it
+    // cardless-restorable (Greptile). An existing script was already read by
+    // the arg loop above, so this only fires for a genuinely absent one.
+    if let Some(script) = interpreter_script(command, args) {
+        let path = absolute_from(script, project_root);
+        if inside_project(&path, project_root) && !path.is_file() {
+            out.push(BoundCode { path, sha256: None });
         }
     }
     out
@@ -2129,6 +2174,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A missing interpreter-script argument (`/bin/sh run.sh`, run.sh gone)
+    /// binds to a None entry, so the empty binding cannot read as covered.
+    /// Otherwise deleting it left an empty `bound_code`, which `covers_code`
+    /// accepts, and the removed tool was wrongly called cardless-restorable
+    /// (Greptile).
+    #[test]
+    fn a_missing_interpreter_script_arg_binds_to_none() {
+        let root = temp("interp-proj");
+        let bound = bound_code("/bin/sh", &["run.sh".to_string()], &root);
+        assert!(
+            bound.iter().any(|c| c.sha256.is_none() && c.path.ends_with("run.sh")),
+            "a missing interpreter script binds to None: {bound:?}"
+        );
+        assert!(
+            !Approvals::default().covers_code(&bound),
+            "a None binding is never covered, so the tool stays gated"
+        );
+        // With the script present the arg loop reads it (Some sha), no None.
+        std::fs::write(root.join("run.sh"), "echo hi\n").unwrap();
+        let present = bound_code("/bin/sh", &["run.sh".to_string()], &root);
+        assert!(
+            present.iter().all(|c| c.sha256.is_some()),
+            "an existing script is read, not left None: {present:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// If a bound script changes after the card hashed it but before `approve`
+    /// runs, the approval is REJECTED: recording the vouched sha in `also`
+    /// while its object cannot be stored would leave an approved hash with no
+    /// restorable bytes (Greptile). Nothing is recorded.
+    #[test]
+    fn approve_rejects_a_bound_file_changed_after_the_card() {
+        let data = temp("changed-data");
+        let root = temp("changed-proj");
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let manifest = root.join(".openmax/tools/t.toml");
+        std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
+        let script = root.join("run.sh");
+        std::fs::write(&script, "echo A\n").unwrap();
+        // The bytes the card hashed.
+        let manifest_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
+        let script_sha = sha256_hex(&std::fs::read(&script).unwrap());
+        // The script changes AFTER the card, BEFORE approve.
+        std::fs::write(&script, "echo B\n").unwrap();
+        let err = approve_capability(&data, &root, &manifest, &[manifest_sha, script_sha])
+            .expect_err("a changed bound file must be rejected");
+        assert!(err.contains("changed") && err.contains("not restorable"), "{err}");
+        assert!(
+            history(&data, &root).unwrap().is_empty(),
+            "a rejected approval appends no record"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hash-only approval stores no manifest object, so --ledger must read
+    /// its manifest as not restorable; a full (path-form) approval stores the
+    /// object and reads as restorable (Greptile).
+    #[test]
+    fn a_hash_only_approval_reads_as_manifest_not_restorable() {
+        let data = temp("mrestore-data");
+        let root = temp("mestore-proj");
+        let sha = sha256_hex(b"name = \"t\"\n");
+        approve_hash(&data, &root, &sha).unwrap();
+        let hash_only = history(&data, &root).unwrap();
+        assert!(
+            approval_manifest_missing(&data, &root, &hash_only[0]),
+            "a hash-only approval stored no manifest object to restore from"
+        );
+
+        // A full approval stores the manifest object.
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let manifest = root.join(".openmax/tools/t.toml");
+        std::fs::write(&manifest, "name = \"full\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n").unwrap();
+        let full_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
+        approve_capability(&data, &root, &manifest, std::slice::from_ref(&full_sha)).unwrap();
+        let recs = history(&data, &root).unwrap();
+        let full = recs.iter().find(|r| r.sha256.as_deref() == Some(full_sha.as_str())).unwrap();
+        assert!(
+            !approval_manifest_missing(&data, &root, full),
+            "a full approval stored the manifest bytes, so it is restorable"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_chain_links_every_record_and_detects_tampering() {
         let data = temp("chain-data");
@@ -2351,8 +2483,11 @@ mod tests {
         let data = temp("cap-data");
         let root = temp("cap-proj");
         let manifest = root.join("gate.toml");
-        let body = "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n";
+        let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
         std::fs::write(&manifest, body).unwrap();
+        // gate.sh's bytes are b"script", so its sha is the second vouched hash
+        // and its object is stored - the approval records only restorable bytes.
+        std::fs::write(root.join("gate.sh"), "script").unwrap();
         let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
         approve_capability(&data, &root, &manifest, &shas).unwrap();
 
@@ -2380,6 +2515,7 @@ mod tests {
         let manifest = root.join("gate.toml");
         let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
         std::fs::write(&manifest, body).unwrap();
+        std::fs::write(root.join("gate.sh"), "script").unwrap();
         let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
         approve_capability(&data, &root, &manifest, &shas).unwrap();
 
@@ -2397,6 +2533,7 @@ mod tests {
 
         // A rewritten script is a new hash, so it takes a new act - and the
         // chain records that too.
+        std::fs::write(root.join("gate.sh"), "rewritten script").unwrap();
         let rewritten = vec![shas[0].clone(), sha256_hex(b"rewritten script")];
         approve_capability(&data, &root, &manifest, &rewritten).unwrap();
         let records = history(&data, &root).unwrap();

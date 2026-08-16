@@ -466,10 +466,24 @@ async fn main() -> std::io::Result<()> {
                             }
                         }
                     };
+                    // The manifest object matters as much as the bound ones:
+                    // a legacy or hash-only approval can keep intact bound
+                    // objects while its PRIMARY manifest bytes were never
+                    // stored, so the row must not read as fully restorable
+                    // (Greptile). Checked from the full sha, not the short
+                    // display form.
+                    let manifest_note =
+                        if open_max_core::ledger::approval_manifest_missing(&data_dir, &project, r) {
+                            "  (manifest bytes not stored: cannot restore the manifest)"
+                        } else {
+                            ""
+                        };
                     let what = match (r.kind, short) {
                         (Kind::Change, Some(sha)) => format!("change   {sha} {where_}"),
                         (Kind::Change, None) => format!("removed  {:12} {where_}", ""),
-                        (Kind::Approval, Some(sha)) => format!("approved {sha} {where_}{bound}"),
+                        (Kind::Approval, Some(sha)) => {
+                            format!("approved {sha} {where_}{bound}{manifest_note}")
+                        }
                         (Kind::Approval, None) => {
                             format!("approved {:12} {where_} (path only)", "")
                         }
