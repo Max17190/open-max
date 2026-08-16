@@ -481,26 +481,41 @@ pub fn approval_events(data_dir: &Path, project_root: &Path) -> Vec<ApprovalEven
     verified
         .records
         .iter()
-        .filter_map(|r| {
+        .enumerate()
+        .filter_map(|(idx, r)| {
             let granted = match r.kind {
                 Kind::Approval => true,
                 Kind::PathRetired => false,
                 _ => return None,
             };
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            r.path.hash(&mut h);
-            r.sha256.hash(&mut h);
-            r.ts.hash(&mut h);
-            r.kind.as_str().hash(&mut h);
             Some(ApprovalEvent {
                 path: r.path.clone(),
                 granted,
                 session_id: r.session_id.clone(),
-                id: h.finish(),
+                id: approval_event_id(idx, r),
             })
         })
         .collect()
+}
+
+/// A per-session watermark identity for one approval/retirement record. The
+/// chain POSITION is part of it, not only the (path, sha, second, kind): an
+/// approve, retire, and re-approve of identical bytes at the same path within
+/// one Unix second would otherwise give the first and final approval the same
+/// id, and the watermark would drop the re-approval - telling the next turn
+/// the capability was retired when it is actually approved to run without a
+/// card (Greptile). The position is stable across reads (the chain is
+/// append-only and never reordered), so the same record keeps the same id
+/// from turn to turn.
+fn approval_event_id(chain_index: usize, r: &Record) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    chain_index.hash(&mut h);
+    r.path.hash(&mut h);
+    r.sha256.hash(&mut h);
+    r.ts.hash(&mut h);
+    r.kind.as_str().hash(&mut h);
+    h.finish()
 }
 
 /// History plus the interrupted-write flag, for callers that report state.
@@ -2127,6 +2142,41 @@ pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A same-second approve/retire/re-approve of identical bytes at the same
+    /// path must give the two approvals DISTINCT event ids, or the per-session
+    /// watermark drops the re-approval and the next turn is told the
+    /// capability was retired when it is approved to run without a card
+    /// (Greptile). The chain position disambiguates records the (path, sha,
+    /// second, kind) tuple cannot, and it is stable across reads.
+    #[test]
+    fn same_second_re_approval_gets_a_distinct_event_id() {
+        let approval = |ts: u64| Record {
+            v: RECORD_VERSION,
+            ts,
+            path: PathBuf::from(".openmax/tools/x.toml"),
+            sha256: Some("a".repeat(64)),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Approval,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            blocking: false,
+            prev: String::new(),
+        };
+        // Index 0: the first approval. Index 2: the re-approval after a
+        // retirement at index 1, same bytes, same Unix second.
+        let first = approval_event_id(0, &approval(1000));
+        let reapproval = approval_event_id(2, &approval(1000));
+        assert_ne!(
+            first, reapproval,
+            "a same-second re-approval must not collide with the first approval"
+        );
+        // ...and the SAME record keeps the SAME id across turns (stable
+        // position), so a real re-scan does not resurface events already seen.
+        assert_eq!(first, approval_event_id(0, &approval(1000)));
+    }
 
 
     #[test]
