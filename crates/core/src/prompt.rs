@@ -123,12 +123,26 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // The memory index rides the frozen prefix like the skills index: a line
     // per surfaced fact, bodies loaded on demand, nothing when the project
     // has no live memories so the zero-cost invariant holds.
-    if let Some((index, rows)) =
+    // Prefer the section captured in the registry's own freeze scan, so the
+    // frozen prompt and the refreeze receipt describe the same memory
+    // selection (Greptile: two separate scans could diverge). The signal is
+    // `memory_scanned` - whether THIS registry ran a scan - not whether the
+    // scan found anything: a freeze that scanned and found no memories
+    // captures `memory_section = None`, and rescanning there would re-inject a
+    // memory written after the freeze while the receipt reports no change. A
+    // registry that never scanned (builtin-only, or restored from a manifest,
+    // which keeps memory_files for the resume delta but captured no section)
+    // scans fresh, or a resumed session would render no memory index at all
+    // (Greptile).
+    let memory = if registry.memory_scanned {
+        registry.memory_section.clone()
+    } else {
         crate::memory::index_section(project_root, crate::memory::unix_now())
-    {
+    };
+    if let Some((index, rows)) = memory {
         let before = prompt.len();
         prompt.push_str(
-            "\n\nMemory (facts saved in earlier sessions; read_file one before relying on it):\n",
+            "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n",
         );
         prompt.push_str(&index);
         breakdown.components.push(("memory index".into(), prompt.len() - before));
@@ -179,7 +193,7 @@ Working files (there is no built-in plan mode or todo list):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
 - TODO.md: the running task list; check items off as you finish.\n\
 - AGENTS.md: standing project instructions; keep it short (loads at session create and on /reload).\n\
-- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line becomes an index line in future sessions. Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
+- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line is indexed at the next freeze (a write triggers one). Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -681,7 +695,7 @@ mod tests {
         .unwrap();
         let (with, breakdown) = system_prompt_with_breakdown(&dir, &registry);
         assert!(
-            with.contains("Memory (facts saved in earlier sessions"),
+            with.contains("Memory (facts saved by earlier turns or sessions"),
             "memory section must appear:\n{with}"
         );
         assert!(with.contains(
@@ -689,6 +703,67 @@ mod tests {
         ));
         assert_eq!(breakdown.memory.len(), 1);
         assert!(breakdown.components.iter().any(|(name, _)| name == "memory index"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A freeze that scanned memory and found none captures memory_files =
+    /// Some(empty) and memory_section = None. A memory written AFTER that
+    /// freeze must NOT enter the prompt - the frozen receipt reported no
+    /// memory change, so injecting one would put the prompt and the receipt
+    /// back in disagreement for the empty case (Greptile). Only a registry
+    /// that never scanned (builtin-only, from a manifest) falls back to a
+    /// fresh scan.
+    #[test]
+    fn a_scanned_empty_registry_does_not_rescan_memory() {
+        let dir = temp_project();
+        let registry = Registry::build(&dir.join("data"), &dir);
+        assert!(registry.memory_scanned, "the build scanned memory");
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/late.md"),
+            "# A fact written after the freeze\nbody.",
+        )
+        .unwrap();
+        let prompt = system_prompt(&dir, &registry);
+        assert!(
+            !prompt.contains("Memory ("),
+            "the captured empty snapshot is used, not a fresh scan:\n{prompt}"
+        );
+        // The sanctioned fallback still works: a registry that never scanned
+        // picks up the same on-disk memory.
+        let fresh = system_prompt(&dir, &Registry::builtin_only());
+        assert!(fresh.contains("Memory ("), "builtin-only scans fresh:\n{fresh}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A manifest-restored registry keeps `memory_files` (for the resume
+    /// delta) but never captured a `memory_section`, so `memory_scanned` is
+    /// false and the prompt must scan fresh - otherwise a resumed session with
+    /// live memories renders no memory index at all (Greptile). Regenerating
+    /// the prompt from such a registry must still show the memories on disk.
+    #[test]
+    fn a_manifest_restored_registry_rebuilds_the_memory_index() {
+        let dir = temp_project();
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/deploy-port.md"),
+            "# The deploy port is 7443\nSet in infra/nginx.conf.",
+        )
+        .unwrap();
+        // Freeze with the memory present, round-trip through the manifest.
+        let frozen = Registry::build(&dir.join("data"), &dir);
+        assert!(frozen.memory_scanned && frozen.memory_section.is_some());
+        let restored = Registry::from_manifest(frozen.to_manifest());
+        assert!(!restored.memory_scanned, "a manifest restore never scanned");
+        // The baseline is reset on resume, not carried from the manifest: the
+        // prompt rescans and shows current, so the first refreeze must not
+        // report a spurious delta against a stale suspend-time baseline.
+        assert!(restored.memory_files.is_none(), "the delta baseline is reset on resume");
+        let prompt = system_prompt(&dir, &restored);
+        assert!(
+            prompt.contains("The deploy port is 7443"),
+            "the resumed prompt must rebuild the memory index:\n{prompt}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

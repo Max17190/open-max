@@ -103,6 +103,23 @@ pub struct Registry {
     /// reason. Receipts and the unknown-tool error name these so a broken
     /// write is never mistaken for a live capability.
     pub broken: Vec<(PathBuf, String)>,
+    /// Memory files (stem, content hash) this freeze indexed; None for a
+    /// registry rebuilt from a manifest that predates the field, so the
+    /// first refreeze after an upgrade does not narrate every memory as new.
+    pub memory_files: Option<Vec<(String, u64)>>,
+    /// The rendered memory index section captured in the SAME scan as
+    /// `memory_files`, so the frozen prompt and the receipt cannot disagree.
+    /// `None` here is ambiguous on its own - an empty scan and a registry that
+    /// never scanned both leave it None - so `memory_scanned` disambiguates.
+    pub memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// True only when THIS registry actually ran a memory scan (a fresh
+    /// freeze). A manifest-restored registry sets `memory_files` for the
+    /// resume delta but never captured a section, so it is false and the
+    /// prompt scans fresh - otherwise a resumed session would render no
+    /// memory index at all while `memory_files.is_some()` (Greptile). A
+    /// scanned-but-empty freeze is true, so its empty selection is honored
+    /// (no rescan), which is the invariant `memory_section` exists for.
+    pub memory_scanned: bool,
     /// Schema array value form: prompt breakdown and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
@@ -131,6 +148,14 @@ pub(crate) struct ExtensionSnapshot {
     /// the fingerprint (a broken write still triggers a refreeze); keeping
     /// the reason lets that refreeze's receipt say the tool is NOT live.
     pub(crate) broken: Vec<(PathBuf, String)>,
+    /// Project memory files (stem, content hash). Memory rides the frozen
+    /// prompt's index, so a memory write moves the fingerprint and refreezes:
+    /// the fact is live from the next step, deterministically, instead of
+    /// whenever some unrelated extension file happens to change. Not ledger
+    /// files (data, not capability), so not in `files`.
+    pub(crate) memory_files: Vec<(String, u64)>,
+    /// The index section from the same scan as `memory_files`.
+    pub(crate) memory_section: Option<(String, Vec<(String, usize)>)>,
 }
 
 impl ExtensionSnapshot {
@@ -249,6 +274,24 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
+    // Memory: ONE read produces both the fingerprint bytes and the index, so
+    // the fingerprint (which decides refreeze) and the frozen index cannot be
+    // captured from two different file generations - an atomic replace between
+    // two scans could otherwise freeze the replacement's index under the
+    // original's fingerprint, and a restore-to-original would then skip the
+    // refreeze that would fix it (Greptile P1). The fingerprint hashes every
+    // VALID-named memory byte (a write to one refreezes); the index is the
+    // indexed subset of the SAME bytes. Never ledgered (data, not capability).
+    let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
+    {
+        let dir = project_root.join(crate::memory::MEMORY_DIR);
+        dir.hash(&mut h);
+        for (path, bytes) in &mem.fingerprint_files {
+            path.hash(&mut h);
+            bytes.hash(&mut h);
+        }
+    }
+    let (memory_section, memory_files) = (mem.section, mem.identities);
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
@@ -272,6 +315,8 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         skills_omitted,
         files: files_read,
         broken,
+        memory_files,
+        memory_section,
     }
 }
 
@@ -304,6 +349,9 @@ impl Registry {
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
         registry.broken = snapshot.broken;
+        registry.memory_files = Some(snapshot.memory_files);
+        registry.memory_section = snapshot.memory_section;
+        registry.memory_scanned = true;
         registry
     }
 
@@ -350,6 +398,9 @@ impl Registry {
             tools_omitted: 0,
             ext_fingerprint: 0,
             broken: Vec::new(),
+            memory_files: None,
+            memory_section: None,
+            memory_scanned: false,
             schemas,
             schemas_wire,
             by_name,
@@ -490,6 +541,11 @@ pub struct RegistryManifest {
     /// and triggers one re-freeze on the next turn (forward only).
     #[serde(default)]
     pub ext_fingerprint: u64,
+    /// Memory files (stem, content hash) the freeze indexed, so a resumed
+    /// session's first memory receipt is a real delta. Additive: absent in
+    /// older manifests, which then narrate no memory delta once.
+    #[serde(default)]
+    pub memory_files: Option<Vec<(String, u64)>>,
 }
 
 /// Current manifest format. A manifest carrying any other version is treated
@@ -549,6 +605,7 @@ impl Registry {
             })
             .collect();
         RegistryManifest {
+            memory_files: self.memory_files.clone(),
             version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
@@ -580,6 +637,16 @@ impl Registry {
             .collect();
         let mut registry = Self::assemble(external, manifest.skills);
         registry.ext_fingerprint = manifest.ext_fingerprint;
+        // A restored registry does NOT reuse the manifest's memory identities
+        // as the delta baseline. `memory_scanned` is false, so the prompt
+        // rescans and shows the CURRENT memory selection; keeping the older
+        // suspend-time identities would make the first refreeze report an
+        // offline replacement the prompt already shows as newly indexed and
+        // the old item as dropped (Greptile). memory_files stays None so the
+        // first refreeze establishes the fresh scan as the baseline with no
+        // spurious delta. (`manifest.memory_files` is retained by to_manifest
+        // for forward compatibility and diagnostics.)
+        let _ = &manifest.memory_files;
         registry
     }
 

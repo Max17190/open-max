@@ -561,3 +561,86 @@ async fn an_unrecordable_approval_does_not_claim_cardless_future_calls() {
     assert!(tool.contains("could not be recorded"), "{tool}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_memory_write_refreezes_and_is_indexed_for_the_next_step() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({
+                "path": ".openmax/memory/rotation-interval.md",
+                "content": "# archive rotation interval is 17 days\n\nSeen in corpus/doc04.txt.\n"
+            }),
+        ),
+        completion_with_text("noted"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "memory-live", &project, "remember it").await;
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let messages = second["messages"].as_array().unwrap();
+    let tool = messages.iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap();
+    assert!(tool.contains("[extension refreeze:"), "the memory write refreezes: {tool}");
+    assert!(
+        tool.contains("Memory index indexed: rotation-interval"),
+        "the receipt names the newly indexed memory: {tool}"
+    );
+    assert!(tool.contains("live in your prompt from your next step"), "{tool}");
+    let system = messages[0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("rotation-interval: archive rotation interval is 17 days"),
+        "the next request's frozen prompt carries the index line: {system}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A memory file the prompt index REJECTS (bad stem) must not be claimed
+/// live. Greptile P1: memory_files listed every readable .md, so writing
+/// `.openmax/memory/Invalid-Stem.md` refroze and told the model
+/// "Memory index indexed: Invalid-Stem" while the next prompt had no such
+/// entry. The receipt is now built from the indexed selection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_memory_name_is_never_claimed_indexed() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({
+                "path": ".openmax/memory/Invalid-Stem.md",
+                "content": "# a fact\n\nbody\n"
+            }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "bad-mem", &project, "remember badly").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let messages = second["messages"].as_array().unwrap();
+    for m in messages {
+        if let Some(c) = m["content"].as_str() {
+            assert!(
+                !c.contains("Memory index indexed: Invalid-Stem"),
+                "a rejected name must not be claimed indexed: {c}"
+            );
+        }
+    }
+    // And the frozen prompt carries no Invalid-Stem index line.
+    let system = messages[0]["content"].as_str().unwrap();
+    assert!(!system.contains("Invalid-Stem"), "the prompt omits it: {system}");
+    let _ = std::fs::remove_dir_all(dir);
+}

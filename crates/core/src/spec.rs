@@ -618,8 +618,8 @@ and forgets them. There is no global memory tier and no database.
 Fields (the file IS the contract):
 - name: the file stem, 1-64 chars of [a-z0-9-]. Anything else is ignored.
 - first non-empty line: the description, shown as the memory's index line in
-  future sessions (leading `#` stripped, capped at 160 chars). A file with no
-  describable first line is ignored.
+  the frozen prompt (leading `#` stripped, capped at 160 chars). A file with
+  no describable first line is ignored.
 - body: free-form markdown, any length, read on demand with read_file.
 
 Index: at session creation (and /reload or a re-freeze) live memories are
@@ -650,11 +650,12 @@ Supersede, do not duplicate: update the existing file when a fact changes
 (date-stamp facts that can go stale). Near-duplicate files split the access
 history that keeps a fact alive.
 
-Activation: the index refreshes at session creation, /reload, and any
-re-freeze; a memory written mid-session is already known to its author and
-enters the index from the next session. Verify what you wrote with
-`openmax --check` (it names every ignored file and why, and what the index
-currently shows).
+Activation: a memory write moves the extension fingerprint, so the harness
+re-freezes after the writing call and the fact is indexed in your prompt from
+your next step (the refreeze receipt says "Memory index indexed: <name>");
+the index also rebuilds at session creation, /reload, and any other re-freeze.
+Verify what you wrote with `openmax --check` (it names every ignored file and
+why, and what the index will show).
 
 ## Searching what was kept
 
