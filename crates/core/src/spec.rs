@@ -463,11 +463,24 @@ also does not gate `write_file`/`edit_file` at all - those are separate tools.
 So a permission rule is friction against known patterns, NOT a filesystem
 guarantee: if a user asks for a hard guarantee that some path cannot be
 written, say plainly that these gates cannot deliver one, and offer what they
-can - `approval_mode = "ask"` so every mutating call not covered by an
-approved `allow` rule is shown (an approved `allow` still runs it unprompted,
-so drop such rules for the paths you want to see), an `ask` rule so
-the patterns you name prompt rather than run, or moving the files out of the
-agent's reach. Do not hand over a confident guard that does not guard.
+can - `approval_mode = "ask"` so every call CLASSIFIED as mutating and not
+covered by an approved `allow` rule is shown (an approved `allow` still runs
+it unprompted, so drop such rules for the paths you want to see), an `ask`
+rule so the patterns you name prompt rather than run, or moving the files out
+of the agent's reach. Do not hand over a confident guard that does not guard.
+
+"Classified as mutating" is not "can mutate". For a builtin the class is
+fixed; for an external tool it is the manifest's own `mutating` flag, which is
+trusted metadata the agent writes, not an effects check the harness runs. An
+approved
+external tool that declares `mutating = false` is a native host process that
+can still write or delete any path, and `ask` mode will NOT stop it, because
+the harness took the tool at its word. So the honest recipe for "watch every
+write to X" pairs `ask` mode with an audit of every approved external tool
+that could reach X: read what each one actually runs, and if a self-declared
+read-only tool can mutate, that is the hole to close (revoke the approval, or
+gate the tool with a `deny`/`ask` rule on its name), not something `ask` mode
+will surface for you.
 
 `allow` is the only effect that removes a gate: it skips the approval prompt
 outright. The project file sits where you write, so an `allow` in it is inert
@@ -789,7 +802,7 @@ here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
-detail, reason, source_path, source_sha), `approval_settled` (approval_id,
+detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
 each recorded capability-file change and its actor), `schemas_over_budget`
 (schema_tokens, budget_tokens: the installed tools take most of what the
@@ -815,7 +828,13 @@ manifest, or the project-local code it runs - no human has approved.
 `unapproved_source` is the human boundary itself and must never be
 auto-approved; it carries `source_path` (project-relative where possible) and
 `source_sha` (first 12 hex chars), so a client that cannot prompt can print
-`openmax --approve <source_path>`. Both are empty on `gate`.
+`openmax --approve <source_path>`. Both are empty on `gate`. `env` is the list
+of environment variable NAMES the approved tool will receive (its manifest's
+`env` allowlist): a credential grant. It is omitted from the wire when empty,
+so a `gate` and a tool that forwards nothing carry no `env` key. When present,
+render it on its OWN line the card never clips - approving secrets a narrow
+terminal hid behind other detail is the failure the field exists to prevent;
+do not fold it into `detail`.
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
@@ -1034,6 +1053,31 @@ mod tests {
             );
         }
         assert!(render("stdio").unwrap().contains("openmax --check --stdio"));
+    }
+
+    /// `ask` mode prompts only on calls the harness CLASSIFIES as mutating,
+    /// and for an external tool that class is the manifest's self-declared
+    /// `mutating` flag - trusted metadata, not an effects check. A tool that
+    /// declares `mutating = false` runs unprompted even though it is host code
+    /// that can write anything, so the permissions spec must not promise `ask`
+    /// mode shows "every mutating call" without that caveat and the audit it
+    /// implies (Greptile): a reader who trusts the unqualified promise builds
+    /// a guard with a hole in it.
+    #[test]
+    fn permissions_spec_qualifies_ask_mode_with_the_classification_caveat() {
+        let text = render("permissions").unwrap();
+        assert!(
+            text.contains("CLASSIFIED as mutating"),
+            "ask-mode guidance must say it prompts on CLASSIFIED-mutating calls"
+        );
+        assert!(
+            text.contains("trusted metadata") && text.contains("not an effects check"),
+            "the spec must say the classification is trusted metadata, not an effects check"
+        );
+        assert!(
+            text.contains("audit") && text.contains("mutating = false"),
+            "the spec must advise auditing approved external tools that declare mutating = false"
+        );
     }
 
     /// A frontend author reads `--spec stdio` and is then judged by
