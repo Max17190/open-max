@@ -343,6 +343,12 @@ pub struct App {
     /// approval); writes are edge-triggered.
     presence: Presence,
     approval_hits: [Option<Rect>; 3],
+    /// Whether the last draw showed the pending approval's full credential
+    /// grant. When a grant is too large for the card (a tiny terminal clamps
+    /// it), affirmative approval (`y`/`a`) is refused: a human must not be
+    /// able to grant credential access they could not read (Greptile). True
+    /// when there is no grant to hide.
+    approval_grant_fully_shown: bool,
     perf_layout_ms: f64,
     perf_selection_ms: f64,
     header_line: Line<'static>,
@@ -565,6 +571,7 @@ impl App {
             last_content_w: 0,
             presence: Presence::Idle,
             approval_hits: [None; 3],
+            approval_grant_fully_shown: true,
             perf_layout_ms: 0.0,
             perf_selection_ms: 0.0,
             header_line: Line::default(),
@@ -1001,6 +1008,19 @@ impl App {
 
         // Approval prompt swallows keys until answered.
         if let Some((id, name, _, _, _)) = self.pending_approval.clone() {
+            // Affirmative approval (y / a) is refused while the card could not
+            // show the whole credential grant: a human must never grant
+            // credential access they could not fully read (Greptile). Deny is
+            // always allowed. The card wraps the grant, so this only bites a
+            // terminal too small to render it - enlarge and the keys work.
+            let affirmative =
+                matches!(key.code, KeyCode::Char('y' | 'Y' | 'a' | 'A'));
+            if affirmative && !self.approval_grant_fully_shown {
+                self.note(
+                    "enlarge the terminal to read the full credential grant before approving",
+                );
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.core.respond_approval(&id, true);
@@ -2541,6 +2561,11 @@ impl App {
                 } else {
                     detail
                 };
+                // Fail closed until a draw proves the grant fully fit: a key
+                // pressed before the first render must not approve a grant no
+                // frame has shown yet. A grant-free gate is shown in full at
+                // once, so it stays approvable.
+                self.approval_grant_fully_shown = env.is_empty();
                 self.pending_approval = Some((approval_id, name, summary, detail, env));
                 self.set_presence(Presence::NeedsApproval);
                 self.completion = None;
@@ -3009,6 +3034,7 @@ impl App {
         let Some((_, name, summary, detail, env)) = self.pending_approval.as_ref() else {
             return;
         };
+        let env_empty = env.is_empty();
         if area.height < 5 {
             let lines = compact_approval_lines(name, summary, detail, env, area.width, area.height);
             let height = (lines.len() as u16).min(area.height);
@@ -3028,6 +3054,10 @@ impl App {
                     height: 1,
                 });
             }
+            // A compact card cannot lay out a wrapped grant; if any env is
+            // granted, treat it as not fully shown so `y`/`a` is refused
+            // until the terminal is large enough to render the full card.
+            self.approval_grant_fully_shown = env_empty;
             return;
         }
         let block = Block::default()
@@ -3055,7 +3085,8 @@ impl App {
             .style(Style::default().bg(theme::SURFACE()))
             .render(inner, frame.buffer_mut());
 
-        if row_count >= 3 && row_count <= inner.height {
+        let fully_shown = row_count <= inner.height;
+        if row_count >= 3 && fully_shown {
             self.approval_hits = approval_choice_hit_regions(Rect {
                 x: inner.x,
                 y: inner.y + row_count - 1,
@@ -3065,6 +3096,9 @@ impl App {
         } else {
             self.approval_hits = [None; 3];
         }
+        // The grant is fully readable only when the whole card fit; a clamped
+        // card hides part of it, so affirmative approval is refused below.
+        self.approval_grant_fully_shown = env_empty || fully_shown;
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
@@ -3928,26 +3962,57 @@ fn approval_env_wrap(env: &[String], width: usize) -> Vec<String> {
     if env.is_empty() || width == 0 {
         return Vec::new();
     }
+    // The whole disclosure as one string, then wrapped so NO character is
+    // dropped: a single env name wider than the card would otherwise be
+    // clipped to an ellipsis, and a user could still approve `y`/`a` without
+    // ever seeing the full variable name (Greptile). Breaks fall at spaces so
+    // names stay whole; a name wider than the card is split by characters
+    // across lines rather than truncated.
+    wrap_str_preserving(&format!("receives env: {}", env.join(", ")), width)
+}
+
+/// Greedy word-wrap that never loses a character: words break at spaces, and a
+/// single word wider than `width` is hard-split by characters across lines.
+fn wrap_str_preserving(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
     let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::from("receives env: ");
-    for (i, name) in env.iter().enumerate() {
-        if i == 0 {
-            cur.push_str(name);
-            continue;
-        }
-        // Would ", <name>" overflow? Then close this line with a trailing
-        // comma and start a continuation line with the name.
-        if cur.chars().count() + 2 + name.chars().count() > width {
-            cur.push(',');
-            lines.push(cur);
-            cur = name.clone();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for word in s.split(' ') {
+        let wlen = word.chars().count();
+        let sep = usize::from(cur_len > 0);
+        if cur_len + sep + wlen <= width {
+            if sep == 1 {
+                cur.push(' ');
+                cur_len += 1;
+            }
+            cur.push_str(word);
+            cur_len += wlen;
+        } else if wlen <= width {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+            cur_len = wlen;
         } else {
-            cur.push_str(", ");
-            cur.push_str(name);
+            if cur_len > 0 {
+                lines.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            for ch in word.chars() {
+                if cur_len == width {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                cur.push(ch);
+                cur_len += 1;
+            }
         }
     }
-    lines.push(cur);
-    lines.into_iter().map(|l| clip(&l, width)).collect()
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// The wrapped env grant as warn-styled lines (empty when nothing is granted).
@@ -4048,6 +4113,7 @@ fn is_shift_tab(key: &KeyEvent) -> bool {
 mod tests {
     use super::{
         approval_card_lines, approval_choice_hit_regions, command_parts, compact_approval_lines,
+        wrap_str_preserving,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         is_shift_tab, paint_text_selection, parse_change_counts, plural, presence_title,
         rect_contains, save_model_selection,
@@ -5803,6 +5869,91 @@ mod tests {
         // never approves blind.
         assert!(text.contains("[y] Allow once"));
         assert!(app.approval_hits.iter().all(Option::is_some));
+        assert!(app.approval_grant_fully_shown, "the grant fit, so approval is allowed");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wrap_str_preserving_keeps_every_character() {
+        // A single token wider than the card must split by characters, never
+        // truncate: the sum of characters is conserved and no line overflows.
+        let word = "A".repeat(50);
+        let lines = wrap_str_preserving(&word, 20);
+        let kept: usize = lines.iter().map(|l| l.chars().filter(|c| *c == 'A').count()).sum();
+        assert_eq!(kept, 50, "no character may be dropped: {lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 20), "no line overflows: {lines:?}");
+        // A normal phrase breaks at spaces and keeps every word whole.
+        let wrapped = wrap_str_preserving("receives env: DEPLOY_TOKEN, AWS_SECRET_ACCESS_KEY", 26);
+        assert!(wrapped.iter().all(|l| l.chars().count() <= 26), "{wrapped:?}");
+        assert!(wrapped.join(" ").contains("AWS_SECRET_ACCESS_KEY"), "{wrapped:?}");
+    }
+
+    #[test]
+    fn a_single_long_env_name_is_shown_in_full_at_a_narrow_width() {
+        // A credential name wider than the card is wrapped across lines, so
+        // every character is on screen - it is never clipped to an ellipsis.
+        let (mut app, dir) = app_fixture();
+        let long = "AWS_SESSION_TOKEN_THAT_IS_DELIBERATELY_LONGER_THAN_THE_CARD_IS_WIDE";
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-long".into(),
+            name: "deploy".into(),
+            summary: "deploy".into(),
+            detail: "runs: ./deploy.sh".into(),
+            reason: "unapproved_source".into(),
+            source_path: ".openmax/tools/deploy.toml".into(),
+            source_sha: "abcdef012345".into(),
+            env: vec![long.into()],
+        });
+        let buffer = render_app(&mut app, 40, 20);
+        // Rows join with newlines and carry the card border; strip the
+        // newlines, spaces, and vertical border to prove the whole name
+        // survives across the wrapped lines.
+        let flat = buffer_text(&buffer).replace(['\n', ' ', '│'], "");
+        assert!(flat.contains(long), "the full env name must be on screen: {flat}");
+        assert!(app.approval_grant_fully_shown, "a tall-enough card shows it fully");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clamped_credential_grant_refuses_keyboard_approval() {
+        // A grant too large for the terminal cannot be fully read, so `y`/`a`
+        // are refused until the terminal is enlarged - a human must never
+        // grant credential access they could not see (Greptile). `n` still
+        // declines.
+        let (mut app, dir) = app_fixture();
+        let many: Vec<String> = (0..40).map(|i| format!("SECRET_NUMBER_{i:02}")).collect();
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "approval-clamp".into(),
+            name: "deploy".into(),
+            summary: "deploy".into(),
+            detail: "runs: ./deploy.sh".into(),
+            reason: "unapproved_source".into(),
+            source_path: ".openmax/tools/deploy.toml".into(),
+            source_sha: "abcdef012345".into(),
+            env: many,
+        });
+        // A short terminal cannot fit the wrapped grant.
+        let _ = render_app(&mut app, 60, 8);
+        assert!(
+            !app.approval_grant_fully_shown,
+            "a clamped grant is not fully shown"
+        );
+        // `y` is refused: the approval stays pending and the card explains why.
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.pending_approval.is_some(), "affirmative approval was refused");
+        // The refusal note lands in the scrollback; read it on a tall render
+        // where the chat area has room to show it (the note persists).
+        let text = buffer_text(&render_app(&mut app, 60, 30));
+        assert!(
+            text.contains("enlarge the terminal"),
+            "the refusal must say how to proceed: {text}"
+        );
+        // `n` still declines - a human can always say no.
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await
+            .unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
