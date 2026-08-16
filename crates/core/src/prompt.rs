@@ -755,7 +755,10 @@ mod tests {
         assert!(frozen.memory_scanned && frozen.memory_section.is_some());
         let restored = Registry::from_manifest(frozen.to_manifest());
         assert!(!restored.memory_scanned, "a manifest restore never scanned");
-        assert!(restored.memory_files.is_some(), "but it keeps files for the delta");
+        // The baseline is reset on resume, not carried from the manifest: the
+        // prompt rescans and shows current, so the first refreeze must not
+        // report a spurious delta against a stale suspend-time baseline.
+        assert!(restored.memory_files.is_none(), "the delta baseline is reset on resume");
         let prompt = system_prompt(&dir, &restored);
         assert!(
             prompt.contains("The deploy port is 7443"),

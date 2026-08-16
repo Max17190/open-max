@@ -637,7 +637,16 @@ impl Registry {
             .collect();
         let mut registry = Self::assemble(external, manifest.skills);
         registry.ext_fingerprint = manifest.ext_fingerprint;
-        registry.memory_files = manifest.memory_files;
+        // A restored registry does NOT reuse the manifest's memory identities
+        // as the delta baseline. `memory_scanned` is false, so the prompt
+        // rescans and shows the CURRENT memory selection; keeping the older
+        // suspend-time identities would make the first refreeze report an
+        // offline replacement the prompt already shows as newly indexed and
+        // the old item as dropped (Greptile). memory_files stays None so the
+        // first refreeze establishes the fresh scan as the baseline with no
+        // spurious delta. (`manifest.memory_files` is retained by to_manifest
+        // for forward compatibility and diagnostics.)
+        let _ = &manifest.memory_files;
         registry
     }
 

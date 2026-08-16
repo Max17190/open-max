@@ -23,7 +23,7 @@
 //! computed lazily at scan time from timestamps; there is no background
 //! process to schedule or crash.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -366,8 +366,18 @@ pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
         if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let mtime = dirent.metadata().and_then(|m| m.modified()).ok();
+        // Bytes AND mtime come from ONE open handle, so a file replaced during
+        // the scan cannot pair the original bytes (which the fingerprint
+        // hashes) with the replacement's fresh mtime (which scores the index):
+        // an open handle keeps reading the inode it opened, whatever a later
+        // rename points the path at (Greptile). Path-based reads of each in
+        // turn had a window between them.
+        let Ok(mut file) = std::fs::File::open(&path) else { continue };
+        let mtime = file.metadata().and_then(|m| m.modified()).ok();
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
         // The SAME bytes feed the fingerprint and the index: a describable,
         // UTF-8 file also enters the index; every valid-named file counts
         // toward the fingerprint regardless.
