@@ -357,7 +357,7 @@ pub struct MemoryFreeze {
 /// Bounded: on persistent churn the last read is self-consistent bytes with
 /// the mtime observed immediately after them.
 fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)> {
-    for _ in 0..4 {
+    for _ in 0..8 {
         let mut file = std::fs::File::open(path).ok()?;
         let before = file.metadata().and_then(|m| m.modified()).ok();
         let mut bytes = Vec::new();
@@ -367,11 +367,13 @@ fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)
             return Some((bytes, after));
         }
     }
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    let mtime = file.metadata().and_then(|m| m.modified()).ok();
-    Some((bytes, mtime))
+    // The file is being rewritten faster than it can be read coherently
+    // (pathological sub-read churn): SKIP it this freeze rather than return an
+    // incoherent body/mtime pair (Greptile). It re-enters the fingerprint and
+    // the index on the next freeze once writes settle - and because it was
+    // absent from this fingerprint, that settling changes the fingerprint and
+    // triggers the refreeze that indexes it.
+    None
 }
 
 pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
