@@ -728,3 +728,58 @@ async fn removing_a_tool_with_edited_bound_code_is_not_called_approved() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Deleting BOTH an approved manifest and its bound script in one turn must
+/// still report that the approval SURVIVES: the ledger keeps the record and
+/// the content-addressed objects, so the bytes are restorable. Recomputing
+/// bound_code after the script is gone makes covers_code fail, which used to
+/// drop the tool from the receipt entirely, hiding the surviving approval
+/// (Greptile). It is now named in a distinct clause that does not claim the
+/// deleted bytes would run without another approval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let script = project.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+    let manifest = project.join(".openmax/tools/t.toml");
+    std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    // Approve manifest + the script it runs.
+    let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
+    shas.extend(open_max_core::ledger::manifest_code(&manifest, &project).into_iter().filter_map(|c| c.sha256));
+    open_max_core::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
+    // Delete BOTH the manifest and the script in one turn.
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call("bash", serde_json::json!({ "command": "rm .openmax/tools/t.toml run.sh" })),
+        completion_with_text("gone"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "remove-both", &project, "go").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content.contains("surviving approval: t"),
+        "the surviving approval must be reported, not hidden: {content}"
+    );
+    // ...and it must NOT claim the deleted bytes run without a card.
+    assert!(
+        !content.contains("Removed approved tools: t"),
+        "deleted code cannot be called cardless-runnable: {content}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
