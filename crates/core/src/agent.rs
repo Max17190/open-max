@@ -268,6 +268,23 @@ fn report_hook_failures(
 /// cost real detours. Valid new bytes: state the launch-read rule and what
 /// this session still runs. Invalid bytes: the brick warning (next launch
 /// exits 2), delivered while the author can still repair the file.
+/// Insert a turn-start harness note just before the pending user prompt AND
+/// emit it on the wire as a `HarnessNote`. The transcript half is what the
+/// MODEL reads; the wire half is what a custom or interactive frontend reads,
+/// so a protocol-v5 client can display the state change that affects the next
+/// turn instead of it being model-only (Greptile). The empty `call_id` marks
+/// a note owned by no tool call, exactly as the policy-notice path does.
+fn insert_startup_note(
+    core: &Arc<Core>,
+    session_id: &str,
+    msgs: &mut Vec<ChatMessage>,
+    text: String,
+) {
+    let at = msgs.len().saturating_sub(1);
+    msgs.insert(at, ChatMessage::user(text.clone()));
+    core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
+}
+
 fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
     let changed = core.settings_disk_changed()?;
     Some(match changed {
@@ -311,6 +328,7 @@ fn policy_notice_hash(notice: &str) -> u64 {
 
 const POLICY_NOTE_PREFIX: &str = "[policy notice: ";
 const PERMISSION_NOTE_PREFIX: &str = "\n[permission notice: ";
+const PERMISSION_NOTE_PREFIX_CLEAN: &str = "[permission notice: ";
 const NOTICE_JOINER: &str = " | ";
 
 /// Rebuild the reported-notice set from a persisted transcript, so a resumed
@@ -1590,6 +1608,33 @@ async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_roo
         .or_insert(built);
 }
 
+/// Append a harness note to the last tool message (where the MODEL reads it)
+/// and emit it on the wire as a HarnessNote (where a custom FRONTEND reads
+/// it): the receipts the model sees were invisible to any non-TUI client,
+/// which saw only the bare tool output (dogfood, two frontend-shaped judges).
+/// The `\n` prefix keeps the transcript readable; the wire note is clean.
+fn append_and_emit_note(
+    core: &Arc<Core>,
+    session_id: &str,
+    messages: &mut [ChatMessage],
+    note: &str,
+) {
+    let call_id = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "tool")
+        .and_then(|m| m.tool_call_id.clone())
+        .unwrap_or_default();
+    if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "tool") {
+        let piece = format!("\n{note}");
+        match &mut last.content {
+            Some(content) => content.push_str(&piece),
+            None => last.content = Some(note.to_string()),
+        }
+    }
+    core.send_agent(session_id, AgentEvent::HarnessNote { call_id, text: note.to_string() });
+}
+
 /// One receipt body for both refreeze sites: what changed, what did NOT
 /// load (with the parse reason, so a broken write is never mistaken for a
 /// live capability), and which tool names became callable.
@@ -2158,16 +2203,8 @@ async fn refreeze_between_iterations(
     // in its transcript said the tool was callable. Ride the receipt on this
     // iteration's last tool result, where the model reads next. One line,
     // only when extension bytes actually changed.
-    if let Some(last_tool) = messages.iter_mut().rev().find(|m| m.role == "tool") {
-        let note = format!(
-            "\n{}",
-            refreeze_receipt_text(&changes, &added_tools, &broken, project_root)
-        );
-        match &mut last_tool.content {
-            Some(content) => content.push_str(&note),
-            None => last_tool.content = Some(note.trim_start().to_string()),
-        }
-    }
+    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, project_root);
+    append_and_emit_note(core, session_id, messages, &receipt);
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
         skills: counts.1,
@@ -2338,9 +2375,9 @@ async fn run_loop(
         // endpoint-failure path's prompt-pop still removes the prompt, while
         // the receipt - which records a refreeze that stays applied - stays.
         // Pure suffix growth relative to the previous turn: prefix-stable.
-        let msgs = guard.messages();
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(receipt));
+        // Also to the wire: the Refrozen event is a summary; the detailed
+        // receipt (which files, why one did not load) is what a frontend shows.
+        insert_startup_note(core, session_id, guard.messages(), receipt);
     }
 
     // Approvals recorded outside this running session (#199): a human at
@@ -2378,9 +2415,7 @@ async fn run_loop(
                  is live with bash: openmax --check.]",
                 fresh.join("; ")
             );
-            let msgs = guard.messages();
-            let at = msgs.len().saturating_sub(1);
-            msgs.insert(at, ChatMessage::user(note));
+            insert_startup_note(core, session_id, guard.messages(), note);
         }
     }
 
@@ -2407,12 +2442,8 @@ async fn run_loop(
     );
     let novel = novel_policy_notices(core, session_id, startup_notices).await;
     if !novel.is_empty() {
-        let msgs = guard.messages();
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(
-            at,
-            ChatMessage::user(format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER))),
-        );
+        let text = format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER));
+        insert_startup_note(core, session_id, guard.messages(), text);
     }
 
     // The provider catalog's content identity at turn start: an agent bash
@@ -2425,10 +2456,8 @@ async fn run_loop(
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
-        // distinct on-disk content.
-        let msgs = guard.messages();
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(note));
+        // distinct on-disk content, and onto the wire for the frontend too.
+        insert_startup_note(core, session_id, guard.messages(), note);
     }
 
     // Resolve named provider (or flat base_url) once per turn so settings edits
@@ -3013,6 +3042,13 @@ async fn run_loop(
                             // but only claim cardless future calls when the
                             // grant actually landed.
                             if let Some(source) = source {
+                                // Rides outcome.output, which is both the tool
+                                // message the model reads AND the ToolEnd
+                                // event's output on the wire - so no separate
+                                // HarnessNote here, or a v5 frontend renders
+                                // the receipt twice (Greptile). The notes that
+                                // DO emit HarnessNote are appended after ToolEnd
+                                // has already gone out, so the wire needs them.
                                 let note = if recorded {
                                     format!(
                                         "[approved by the user: {} ({}) — later calls of these exact \
@@ -3145,77 +3181,60 @@ async fn run_loop(
                             )
                             .await;
                             if !novel.is_empty() {
-                                if let Some(last) =
-                                    guard.messages().iter_mut().rev().find(|m| m.role == "tool")
-                                {
-                                    // The repair carve-out returns Default for
-                                    // write/edit on this file, but an earlier
-                                    // snapshot this turn may have explicitly
-                                    // DENIED one of them, and the most
-                                    // restrictive answer wins - so the receipt
-                                    // must not promise a repair tool a rule
-                                    // already blocks (Greptile). Report only the
-                                    // repair tools the effective turn policy
-                                    // still allows.
-                                    // Probe BOTH path spellings a repair call
-                                    // could use: an `arg_regex` matches the raw
-                                    // path argument, so a deny anchored to the
-                                    // relative `.openmax/permissions.toml`
-                                    // would miss an absolute-only probe and the
-                                    // receipt would advertise a tool the
-                                    // relative call is denied (Greptile). A tool
-                                    // is "allowed" only if NEITHER spelling is
-                                    // denied.
-                                    let abs = project_root
-                                        .join(".openmax/permissions.toml")
-                                        .to_string_lossy()
-                                        .into_owned();
-                                    let repair_denied = |tool: &str| {
-                                        [
-                                            abs.as_str(),
-                                            ".openmax/permissions.toml",
-                                            "./.openmax/permissions.toml",
-                                        ]
-                                        .iter()
-                                        .any(|p| {
-                                            matches!(
-                                                permissions.evaluate(
-                                                    tool,
-                                                    &serde_json::json!({ "path": p }),
-                                                ),
-                                                crate::permissions::PermissionDecision::Deny { .. }
-                                            )
-                                        })
-                                    };
-                                    let allowed: Vec<&str> = ["write_file", "edit_file"]
-                                        .into_iter()
-                                        .filter(|t| !repair_denied(t))
-                                        .collect();
-                                    let repair_clause = if allowed.is_empty() {
-                                        "a rule earlier this turn denies write_file and edit_file on \
-                                         this file too, so even the repair waits for the START OF THE \
-                                         NEXT TURN; read_file is not allowed"
-                                            .to_string()
-                                    } else {
-                                        format!(
-                                            "{} on exactly this file is still allowed and takes \
-                                             effect at the START OF THE NEXT TURN, not this one; \
-                                             read_file is NOT, so rewrite it from what you intended",
-                                            allowed.join("/")
+                                // The repair carve-out returns Default for
+                                // write/edit on this file, but an earlier
+                                // snapshot this turn may have explicitly DENIED
+                                // one of them, and the most restrictive answer
+                                // wins - so the receipt must not promise a
+                                // repair tool a rule already blocks (Greptile).
+                                // Probe every path spelling a repair call could
+                                // use (an `arg_regex` matches the raw path
+                                // argument): absolute, relative, and ./relative.
+                                // A tool is allowed only if NONE is denied.
+                                let abs = project_root
+                                    .join(".openmax/permissions.toml")
+                                    .to_string_lossy()
+                                    .into_owned();
+                                let repair_denied = |tool: &str| {
+                                    [
+                                        abs.as_str(),
+                                        ".openmax/permissions.toml",
+                                        "./.openmax/permissions.toml",
+                                    ]
+                                    .iter()
+                                    .any(|p| {
+                                        matches!(
+                                            permissions
+                                                .evaluate(tool, &serde_json::json!({ "path": p })),
+                                            crate::permissions::PermissionDecision::Deny { .. }
                                         )
-                                    };
-                                    let note = format!(
-                                        "\n[permissions.toml is now malformed ({reason}). Every tool \
-                                         call is DENIED for the rest of THIS turn - policy snapshots \
-                                         only narrow within a turn, never widen - and your repair \
-                                         ({repair_clause}). \
-                                         openmax --check cannot run until then (bash is denied too).]"
-                                    );
-                                    match &mut last.content {
-                                        Some(content) => content.push_str(&note),
-                                        None => last.content = Some(note.trim_start().to_string()),
-                                    }
-                                }
+                                    })
+                                };
+                                let allowed: Vec<&str> = ["write_file", "edit_file"]
+                                    .into_iter()
+                                    .filter(|t| !repair_denied(t))
+                                    .collect();
+                                let repair_clause = if allowed.is_empty() {
+                                    "a rule earlier this turn denies write_file and edit_file on \
+                                     this file too, so even the repair waits for the START OF THE \
+                                     NEXT TURN; read_file is not allowed"
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "{} on exactly this file is still allowed and takes effect \
+                                         at the START OF THE NEXT TURN, not this one; read_file is \
+                                         NOT, so rewrite it from what you intended",
+                                        allowed.join("/")
+                                    )
+                                };
+                                let note = format!(
+                                    "[permissions.toml is now malformed ({reason}). Every tool \
+                                     call is DENIED for the rest of THIS turn - policy snapshots \
+                                     only narrow within a turn, never widen - and your repair \
+                                     ({repair_clause}). \
+                                     openmax --check cannot run until then (bash is denied too).]"
+                                );
+                                append_and_emit_note(core, session_id, guard.messages(), &note);
                             }
                         }
                         // The agent may have just written itself an allow
@@ -3224,18 +3243,9 @@ async fn run_loop(
                         // it - not silently at the next surprise prompt.
                         let novel = novel_policy_notices(core, session_id, inert).await;
                         if !novel.is_empty() {
-                            if let Some(last) =
-                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
-                            {
-                                let note = format!(
-                                    "{PERMISSION_NOTE_PREFIX}{}]",
-                                    novel.join(NOTICE_JOINER)
-                                );
-                                match &mut last.content {
-                                    Some(content) => content.push_str(&note),
-                                    None => last.content = Some(note.trim_start().to_string()),
-                                }
-                            }
+                            let note =
+                                format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
+                            append_and_emit_note(core, session_id, guard.messages(), &note);
                         }
                         // A providers.json edit (bash: the file is outside
                         // the project root) gets a receipt too: what loaded,
@@ -3246,12 +3256,12 @@ async fn run_loop(
                             providers_seen = status.content_hash;
                             let note = match &status.parse_error {
                                 Some(err) => format!(
-                                    "\n[providers.json changed but is invalid JSON: {err}. The \
+                                    "[providers.json changed but is invalid JSON: {err}. The \
                                      provider catalog is EMPTY until this parses; any turn using \
                                      settings.provider will fail at its start.]"
                                 ),
                                 None => format!(
-                                    "\n[providers.json changed: {} provider(s) ({}). Endpoint \
+                                    "[providers.json changed: {} provider(s) ({}). Endpoint \
                                      resolution happens at turn start, so a provider or model \
                                      switch applies from the next turn; switching this session's \
                                      model is /model, which the user runs.]",
@@ -3259,14 +3269,7 @@ async fn run_loop(
                                     status.names.join(", ")
                                 ),
                             };
-                            if let Some(last) =
-                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
-                            {
-                                match &mut last.content {
-                                    Some(content) => content.push_str(&note),
-                                    None => last.content = Some(note.trim_start().to_string()),
-                                }
-                            }
+                            append_and_emit_note(core, session_id, guard.messages(), &note);
                         }
                         // A script edit revokes the approval of the tool that
                         // runs it, but moves no fingerprint: no refreeze, no
@@ -3286,19 +3289,12 @@ async fn run_loop(
                         if !revoked.is_empty() {
                             revoked.sort();
                             let note = format!(
-                                "\n[approval revoked: the code these tools run changed since a human \
+                                "[approval revoked: the code these tools run changed since a human \
                                  approved it, so the next call of each stops for a card: {}. Re-approve \
                                  the exact bytes, or prove them first with openmax --check --run-examples.]",
                                 revoked.join(", ")
                             );
-                            if let Some(last) =
-                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
-                            {
-                                match &mut last.content {
-                                    Some(content) => content.push_str(&note),
-                                    None => last.content = Some(note.trim_start().to_string()),
-                                }
-                            }
+                            append_and_emit_note(core, session_id, guard.messages(), &note);
                         }
                         // A hook file written this call: hooks are outside
                         // the extension fingerprint, so this write got no
@@ -3320,48 +3316,33 @@ async fn run_loop(
                             // re-approved. Say that, not "applies next turn".
                             let note = if let Some(blocked) = discovered.fail_closed_reason() {
                                 format!(
-                                    "\n[hook files changed. A live gate is now failing closed: \
+                                    "[hook files changed. A live gate is now failing closed: \
                                      {blocked}. From the next turn every tool call is BLOCKED \
                                      until the file is restored to its approved bytes or a human \
                                      re-approves it (openmax --approve <path>, at a terminal \
                                      outside any session).]"
                                 )
                             } else if inert.is_empty() {
-                                "\n[hook files changed. Hooks are discovered at turn start; \
+                                "[hook files changed. Hooks are discovered at turn start; \
                                  approved hooks apply from the next turn.]"
                                     .to_string()
                             } else {
                                 format!(
-                                    "\n[hook files changed. Not running: {}. Hooks activate only \
+                                    "[hook files changed. Not running: {}. Hooks activate only \
                                      after a human runs openmax --approve <path> at a terminal \
                                      outside any session; until then the guarantee is NOT in \
                                      force - say so if asked, do not claim it.]",
                                     inert.join(" | ")
                                 )
                             };
-                            if let Some(last) =
-                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
-                            {
-                                match &mut last.content {
-                                    Some(content) => content.push_str(&note),
-                                    None => last.content = Some(note.trim_start().to_string()),
-                                }
-                            }
+                            append_and_emit_note(core, session_id, guard.messages(), &note);
                         }
                         // A settings.json edit (bash: outside the project
                         // root) is inert for this session and bricks the
                         // next launch when malformed - answered on the
                         // writing call, while it is still repairable.
                         if let Some(note) = settings_drift_note(core) {
-                            if let Some(last) =
-                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
-                            {
-                                let note = format!("\n{note}");
-                                match &mut last.content {
-                                    Some(content) => content.push_str(&note),
-                                    None => last.content = Some(note.trim_start().to_string()),
-                                }
-                            }
+                            append_and_emit_note(core, session_id, guard.messages(), &note);
                         }
                     }
                 }

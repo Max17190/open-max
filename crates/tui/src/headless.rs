@@ -265,6 +265,14 @@ async fn run_turn_events(
                     );
                 }
             }
+            AgentEvent::HarnessNote { text, .. } => {
+                // The receipt the model sees; hook-authored control bytes
+                // cannot split or restyle the line (printable(), like the
+                // other harness-authored stderr text).
+                if !json {
+                    let _ = writeln!(stderr, "openmax: {}", printable(text));
+                }
+            }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if !json {
                     let _ = writeln!(

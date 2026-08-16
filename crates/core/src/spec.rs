@@ -726,14 +726,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/4)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/5)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/4","protocol_version":4,"session_id":"...","version":"...","project":"/abs/path"}.
+{"type":"hello","proto":"openmax-stdio/5","protocol_version":5,"session_id":"...","version":"...","project":"/abs/path"}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -767,7 +767,12 @@ Parse by field name, never by key order. Types: `token` (text), `thinking`
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
 the frozen tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
-(call_id, name, args), `tool_end` (call_id, ok, output), `diff` (call_id,
+(call_id, name, args), `tool_end` (call_id, ok, output), `harness_note`
+(call_id, text: a note the harness wrote into the MODEL's transcript - a
+refreeze receipt, or a policy/providers/settings/approval notice - surfaced
+here so a frontend can render what the model sees; `call_id` links it to the
+tool result it rode, or is empty for a note inserted before the next prompt
+like a turn-start receipt), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
@@ -819,6 +824,14 @@ What changed in openmax-stdio/4: `turn_refused` is new. A client written for
 /3 has never seen a turn continue after `message_done` without its own `user`
 command; under a blocking `turn_end` hook that is now a normal turn shape, and
 this event is the only line that says why.
+
+What changed in openmax-stdio/5: `harness_note` is new. Before it, the
+receipts and notices the harness writes into the model's transcript (the
+refreeze receipt, the permission/providers/settings/approval notices) were
+visible only to the model; a frontend saw a bare `tool_end` and could not
+render, e.g., that a written tool did not load or that an approval was
+revoked. A /4 client simply never saw these lines; it is safe to ignore
+`harness_note` and lose only that surfaced text.
 
 What changed in openmax-stdio/3: `budget.used_tokens` now counts the frozen
 tool schemas sent on every request, not the transcript alone. Same field,
@@ -1029,6 +1042,7 @@ mod tests {
                 args: serde_json::Value::Null,
             },
             AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new() },
+            AgentEvent::HarnessNote { call_id: String::new(), text: String::new() },
             AgentEvent::Diff {
                 call_id: String::new(),
                 path: String::new(),

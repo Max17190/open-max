@@ -101,6 +101,12 @@ pub enum AgentEvent {
     Usage { prompt_tokens: u64, completion_tokens: u64, cached_tokens: Option<u64> },
     ToolStart { call_id: String, name: String, args: serde_json::Value },
     ToolEnd { call_id: String, ok: bool, output: String },
+    /// A harness-authored note the MODEL reads in its transcript (a refreeze
+    /// receipt, a policy/providers/settings/approval notice), surfaced on the
+    /// wire so a custom frontend can render what the model sees. `call_id`
+    /// links it to the tool result it rides when it rode one, else empty (a
+    /// note inserted before the next prompt, e.g. a turn-start receipt).
+    HarnessNote { call_id: String, text: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
     /// (paths, command head) for the TUI card; may be empty.

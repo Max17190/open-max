@@ -793,3 +793,100 @@ async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The receipt the model reads also reaches the WIRE as a harness_note, so a
+/// custom frontend can render what the model sees (dogfood: two
+/// frontend-shaped judges found the tool_end output bare, the NOT-loaded
+/// receipt invisible off-transcript).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_harness_note_reaches_the_wire_for_a_broken_tool_write() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let broken = "name = \"wf\"\ndescription = \"d\"\n"; // missing command
+    let (base_url, _bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wf.toml", "content": broken }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    open_max_core::agent::start_turn(std::sync::Arc::clone(&core), "wire-note".into(), project.clone(), "go".into()).unwrap();
+    let mut note = None;
+    loop {
+        let env = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await.expect("30s").expect("open");
+        match env.event {
+            AgentEvent::HarnessNote { text, .. } => {
+                if text.contains("NOT loaded") { note = Some(text); }
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    let note = note.expect("the NOT-loaded receipt reaches the wire as a harness_note");
+    assert!(note.contains("wf.toml"), "{note}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// A turn-start receipt reaches the WIRE as a harness_note, not only the model
+/// transcript: a protocol-v5 or interactive frontend must be able to display
+/// the state change that affects the next turn (Greptile). Proven through the
+/// out-of-session approval path - a human approving at another terminal
+/// between turns - which is one of the three turn-start notes that used to be
+/// transcript-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_start_approval_note_reaches_the_wire_as_a_harness_note() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest = project.join(".openmax/tools/x.toml");
+    std::fs::write(&manifest, "name = \"x\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n").unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let (base_url, _bodies) =
+        recording_endpoint(vec![completion_with_text("one"), completion_with_text("two")]).await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+
+    // Turn 1: a plain turn that seeds the session's seen-events watermark.
+    drive_turn(&core, &mut rx, "wire-approve", &project, "hi").await;
+
+    // A human approves the tool at ANOTHER terminal (actor External: no
+    // session_id), landing a ledger event this session has not seen.
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+
+    // Turn 2: the turn-start out-of-session note must reach the wire.
+    open_max_core::agent::start_turn(
+        std::sync::Arc::clone(&core),
+        "wire-approve".into(),
+        project.clone(),
+        "again".into(),
+    )
+    .unwrap();
+    let mut note = None;
+    loop {
+        let env = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("30s")
+            .expect("open");
+        match env.event {
+            AgentEvent::HarnessNote { text, .. } => {
+                if text.contains("approval activity outside this session") {
+                    note = Some(text);
+                }
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    let note = note.expect("the out-of-session approval note reaches the wire as a harness_note");
+    assert!(note.contains("x.toml"), "{note}");
+    let _ = std::fs::remove_dir_all(dir);
+}
