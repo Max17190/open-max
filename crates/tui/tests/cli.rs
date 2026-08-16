@@ -318,6 +318,14 @@ fn approve_names_every_file_it_blesses() {
         "approving a turn_end observer must say exit status is ignored: {stdout}"
     );
 
+    // The ledger's restore promise is true for what an approval blessed:
+    // the bound script's bytes are stored at approval time, so the audit
+    // row reads as fully restorable, not "(+1 bound file, 1 not stored)".
+    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
+    let ledger = String::from_utf8_lossy(&ledger.stdout);
+    assert!(ledger.contains("(+1 bound file)"), "{ledger}");
+    assert!(!ledger.contains("not stored"), "an approval stores its bound bytes: {ledger}");
+
     // The pair is live, and rewriting the script alone revokes it.
     let out = cmd(&project, &home).arg("--check").output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));

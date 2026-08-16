@@ -1658,6 +1658,25 @@ fn refreeze_receipt_text(
             listed.join(", ")
         ));
     }
+    if !added.removed_approved.is_empty() {
+        note.push_str(&format!(
+            " Removed approved tools: {} — the approval outlives the file (identical bytes at \
+             that path would run without a card); tools never fail closed, so nothing needs \
+             forgetting (openmax --forget is for hooks).",
+            added.removed_approved.join(", ")
+        ));
+    }
+    if !added.removed_approval_survives.is_empty() {
+        note.push_str(&format!(
+            " Removed tools with a surviving approval: {} — the manifest's approval is still \
+             recorded in the ledger, so if the exact approved bytes are restored they may run \
+             without a card (a legacy or hash-only approval predates object storage, so its \
+             bytes may not be restorable from the ledger - check with openmax --ledger). The \
+             code on disk was edited or deleted, so restoring the manifest alone would ask \
+             again; nothing needs forgetting (openmax --forget is for hooks).",
+            added.removed_approval_survives.join(", ")
+        ));
+    }
     if let Some((added_m, updated_m, removed_m)) = &added.memory {
         let mut parts = Vec::new();
         if !added_m.is_empty() {
@@ -1698,6 +1717,21 @@ struct AddedTools {
     /// generations know their memory files. A memory write is now what
     /// refreezes; the receipt says the fact is indexed from the next step.
     memory: Option<(Vec<String>, Vec<String>, Vec<String>)>,
+    /// External tools present before and gone now whose CURRENT bytes a human
+    /// had approved (manifest sha approved AND the code on disk still matches).
+    /// The approval outlives the file (content-addressed), tools never fail
+    /// closed, and --forget is for hooks: say all three, or the agent hands
+    /// the human a chore that does nothing (dogfood).
+    removed_approved: Vec<String>,
+    /// Removed external tools whose MANIFEST sha was approved but whose bound
+    /// code no longer matches on disk (edited, or deleted alongside the
+    /// manifest). The approval RECORD survives in the ledger, so omitting it as
+    /// if nothing survived is wrong (Greptile); yet the current disk bytes are
+    /// not approved, so this must NOT claim they run without a card. Whether
+    /// the original bytes can actually be restored depends on whether the
+    /// approval stored objects (a legacy or hash-only approval did not), so the
+    /// clause says "may" and points at openmax --ledger. A distinct clause.
+    removed_approval_survives: Vec<String>,
 }
 
 fn classify_added_tools(
@@ -1734,11 +1768,44 @@ fn classify_added_tools(
         }
         _ => None,
     };
+    let mut removed_approved: Vec<String> = Vec::new();
+    let mut removed_approval_survives: Vec<String> = Vec::new();
+    if !old_registry.tools.is_empty() {
+        let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
+        for old_spec in &old_registry.tools {
+            let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
+            if new_registry.get(&old_spec.name).is_some() {
+                continue;
+            }
+            // Was the manifest ever approved? That signal is disk-independent:
+            // the ledger keeps the record and the content-addressed objects.
+            if !approvals.contains(&old_ext.source_sha256) {
+                continue;
+            }
+            // Does the code on disk STILL match what was approved? bound_code
+            // re-reads it, so a script edited or deleted with the manifest
+            // fails covers_code. When it matches, restoring the identical
+            // bytes runs without a card. When it does not, an approval still
+            // SURVIVES in the ledger (restorable) - reporting it as gone hides
+            // that (Greptile) - but the current bytes are not approved, so the
+            // two facts are said in two different clauses.
+            let code = crate::ledger::bound_code(&old_ext.command, &old_ext.args, project_root);
+            if approvals.covers_code(&code) {
+                removed_approved.push(old_spec.name.clone());
+            } else {
+                removed_approval_survives.push(old_spec.name.clone());
+            }
+        }
+    }
+    removed_approved.sort();
+    removed_approval_survives.sort();
     let mut out = AddedTools {
         approved: Vec::new(),
         unapproved: Vec::new(),
         modified_unapproved: Vec::new(),
         memory,
+        removed_approved,
+        removed_approval_survives,
     };
     for name in added_tool_names(old_registry, new_registry) {
         match unapproved_capability(new_registry, data_dir, project_root, &name) {

@@ -49,8 +49,10 @@ options:
                          in effect
       --approve <path>   approve the exact current content of a capability file
                          and of the project-local code it runs
-      --forget <path>    stop expecting an approved capability file to exist
-                         (after deliberately deleting one)
+      --forget <path>    stop expecting an approved HOOK file to exist (after
+                         deliberately deleting one; a missing approved hook
+                         fails closed). Tools never fail closed: a deleted
+                         approved tool needs nothing forgotten
       --run-examples     with --check, execute each tool's [example] once.
                          Unsandboxed: needs a trusted project and a tool file
                          approved with --approve, and honors permissions and
@@ -433,15 +435,65 @@ async fn main() -> std::io::Result<()> {
                         .map(|s| format!("  session {s}"))
                         .unwrap_or_default();
                     // One approval act can bless a manifest and the code it
-                    // runs; the audit has to show that it covered both.
+                    // runs; the audit has to show that it covered both - and
+                    // whether their bytes are actually stored. Approvals
+                    // recorded before objects were stored at approval time
+                    // (or by hash alone) have nothing to restore, and the
+                    // footer's recipe must not imply otherwise.
                     let bound = match r.also.len() {
                         0 => String::new(),
-                        n => format!("  (+{n} bound file{})", if n == 1 { "" } else { "s" }),
+                        n => {
+                            let stored = r
+                                .also
+                                .iter()
+                                .filter(|sha| {
+                                    matches!(
+                                        *states.entry(sha.as_str()).or_insert_with(|| {
+                                            open_max_core::ledger::object_state(&data_dir, &project, sha)
+                                        }),
+                                        ObjectState::Intact
+                                    )
+                                })
+                                .count();
+                            // Each non-intact bound object is damage too, or
+                            // the footer prints an unqualified `restore with cp`
+                            // recipe while this approval cannot be fully
+                            // restored - same accounting the manifest path does
+                            // (Greptile).
+                            damaged += n - stored;
+                            let plural = if n == 1 { "" } else { "s" };
+                            if stored == n {
+                                format!("  (+{n} bound file{plural})")
+                            } else {
+                                format!(
+                                    "  (+{n} bound file{plural}, {} not stored: approved before bytes were kept)",
+                                    n - stored
+                                )
+                            }
+                        }
                     };
+                    // The manifest object matters as much as the bound ones:
+                    // a legacy or hash-only approval can keep intact bound
+                    // objects while its PRIMARY manifest bytes were never
+                    // stored, so the row must not read as fully restorable
+                    // (Greptile). Checked from the full sha, not the short
+                    // display form.
+                    let manifest_note =
+                        if open_max_core::ledger::approval_manifest_missing(&data_dir, &project, r) {
+                            // Count it as damaged too, or the footer prints an
+                            // unqualified `restore with cp` recipe while this
+                            // very approval cannot be fully restored (Greptile).
+                            damaged += 1;
+                            "  (manifest bytes not stored: cannot restore the manifest)"
+                        } else {
+                            ""
+                        };
                     let what = match (r.kind, short) {
                         (Kind::Change, Some(sha)) => format!("change   {sha} {where_}"),
                         (Kind::Change, None) => format!("removed  {:12} {where_}", ""),
-                        (Kind::Approval, Some(sha)) => format!("approved {sha} {where_}{bound}"),
+                        (Kind::Approval, Some(sha)) => {
+                            format!("approved {sha} {where_}{bound}{manifest_note}")
+                        }
                         (Kind::Approval, None) => {
                             format!("approved {:12} {where_} (path only)", "")
                         }
