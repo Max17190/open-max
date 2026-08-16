@@ -478,9 +478,14 @@ can still write or delete any path, and `ask` mode will NOT stop it, because
 the harness took the tool at its word. So the honest recipe for "watch every
 write to X" pairs `ask` mode with an audit of every approved external tool
 that could reach X: read what each one actually runs, and if a self-declared
-read-only tool can mutate, that is the hole to close (revoke the approval, or
-gate the tool with a `deny`/`ask` rule on its name), not something `ask` mode
-will surface for you.
+read-only tool can mutate, that is the hole to close. There is no operation
+today that revokes an external tool's content approval in place - `--forget`
+retires a path or hook but leaves the approved manifest and code hashes
+standing, so the tool keeps running - so close it by one of: a `deny` (or
+`ask`) rule on the tool's name, which applies to an approved tool too because
+rules run before the content gate; editing the manifest, which changes its
+hash so the next call asks again; or deleting the tool. `ask` mode alone will
+not surface this for you.
 
 `allow` is the only effect that removes a gate: it skips the approval prompt
 outright. The project file sits where you write, so an `allow` in it is inert
@@ -1077,6 +1082,21 @@ mod tests {
         assert!(
             text.contains("audit") && text.contains("mutating = false"),
             "the spec must advise auditing approved external tools that declare mutating = false"
+        );
+        // The mitigation must be real: there is no in-place approval revoke,
+        // so the spec must say so and name what actually closes the hole -
+        // advising "revoke the approval" would send the reader to --forget,
+        // which leaves the tool's hashes standing (Greptile). Collapse the
+        // doc's line wrapping so the check does not depend on where a phrase
+        // breaks across lines.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("no operation today that revokes an external tool's content approval"),
+            "the spec must state that an external-tool approval cannot be revoked in place"
+        );
+        assert!(
+            flat.contains("editing the manifest, which changes its hash so the next call asks again"),
+            "the spec must name a mitigation that actually de-authorizes the tool"
         );
     }
 
