@@ -455,6 +455,10 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             ledger_synced: false,
             pending_syncs: Vec::new(),
             reported_policy_notices,
+            seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
+                .into_iter()
+                .map(|e| e.id)
+                .collect(),
         }
     } else {
         // No transcript on disk: start fresh, but honor a saved manifest if the
@@ -488,6 +492,10 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             ledger_synced: false,
             pending_syncs: Vec::new(),
             reported_policy_notices: Default::default(),
+            seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
+                .into_iter()
+                .map(|e| e.id)
+                .collect(),
         }
     }
 }
@@ -2333,6 +2341,47 @@ async fn run_loop(
         let msgs = guard.messages();
         let at = msgs.len().saturating_sub(1);
         msgs.insert(at, ChatMessage::user(receipt));
+    }
+
+    // Approvals recorded outside this running session (#199): a human at
+    // another terminal ran `openmax --approve`, and that reaches the session
+    // through no other channel - the refreeze receipt names FILE changes,
+    // not approvals, so a tool that asked yesterday just silently stops
+    // asking. Name any approval/retire event this session has not yet seen,
+    // skipping ones it recorded itself (the model watched those on the card).
+    {
+        let events = crate::ledger::approval_events(&core.data_dir, project_root);
+        let mut fresh: Vec<String> = Vec::new();
+        {
+            let mut map = core.sessions.lock().await;
+            if let Some(data) = map.get_mut(session_id) {
+                for e in &events {
+                    if !data.seen_ledger_events.insert(e.id) {
+                        continue;
+                    }
+                    if e.session_id.as_deref() == Some(session_id) {
+                        continue; // this session's own in-session grant
+                    }
+                    let path = e.path.strip_prefix(project_root).unwrap_or(&e.path);
+                    fresh.push(format!(
+                        "{} {}",
+                        if e.granted { "approved" } else { "approval retired for" },
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            let note = format!(
+                "[approval activity outside this session: {}. A capability whose exact bytes \
+                 were approved now runs without a card; a retired one asks again. Verify what \
+                 is live with bash: openmax --check.]",
+                fresh.join("; ")
+            );
+            let msgs = guard.messages();
+            let at = msgs.len().saturating_sub(1);
+            msgs.insert(at, ChatMessage::user(note));
+        }
     }
 
     // Discovered at turn start and re-discovered after any iteration whose

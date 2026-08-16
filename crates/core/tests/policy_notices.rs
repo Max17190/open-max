@@ -432,3 +432,54 @@ async fn a_revoked_gate_write_receipt_says_calls_are_blocked() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// An approval landed by a human at another terminal (out of session) is
+/// named at the running session's next turn start - the one channel #199
+/// said it reached through was none. The session's OWN in-session grants
+/// are not re-narrated (the model watched those on the card).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_session_approval_is_named_at_the_next_turn() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest = project.join(".openmax/tools/docsearch.toml");
+    std::fs::write(&manifest, "name = \"docsearch\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n").unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_text("turn one"),
+        completion_with_text("turn two"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    // Turn one: nothing approved yet.
+    drive_turn(&core, &mut rx, "outside", &project, "one").await;
+    // A human at another terminal approves the tool (no session_id).
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+    // Turn two: the session names the approval it did not witness.
+    drive_turn(&core, &mut rx, "outside", &project, "two").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let note = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["content"].as_str().is_some_and(|c| c.starts_with("[approval activity outside this session:"))
+        })
+        .expect("the outside approval is named");
+    let c = note["content"].as_str().unwrap();
+    assert!(c.contains("approved .openmax/tools/docsearch.toml"), "{c}");
+    // Turn one carried no such note (nothing had been approved).
+    let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert!(
+        !first["messages"].as_array().unwrap().iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("[approval activity outside"))),
+        "turn one predates the approval"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -458,6 +458,85 @@ pub fn history(data_dir: &Path, project_root: &Path) -> Result<Vec<Record>, Stri
     read_verified(&project_dir(data_dir, project_root)).map(|v| v.records)
 }
 
+/// One human act against a capability's approval state, for surfacing an
+/// approval a session did not witness (#199): the path, whether it granted
+/// or retired, the actor, and the session that recorded it (None for a CLI
+/// act outside any session). Identity is content-stable across reads.
+#[derive(Clone, Debug)]
+pub struct ApprovalEvent {
+    pub path: PathBuf,
+    pub granted: bool,
+    pub session_id: Option<String>,
+    /// A stable id for this record (path + sha + ts + kind), so a session
+    /// can remember which events it has already narrated.
+    pub id: u64,
+}
+
+/// Every approval/retirement in the chain, oldest first. Cheap: one verified
+/// read, no object hashing.
+pub fn approval_events(data_dir: &Path, project_root: &Path) -> Vec<ApprovalEvent> {
+    let dir = project_dir(data_dir, project_root);
+    let Ok(verified) = read_verified(&dir) else {
+        return Vec::new();
+    };
+    let generation = repair_generation(&dir);
+    verified
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, r)| {
+            let granted = match r.kind {
+                Kind::Approval => true,
+                Kind::PathRetired => false,
+                _ => return None,
+            };
+            Some(ApprovalEvent {
+                path: r.path.clone(),
+                granted,
+                session_id: r.session_id.clone(),
+                id: approval_event_id(generation, idx, r),
+            })
+        })
+        .collect()
+}
+
+/// How many times this project's ledger has been repaired: one quarantined
+/// log (`log.jsonl.unverified-<ts>`) per `--ledger-repair`. Durable (the files
+/// are never deleted) and constant between repairs, so it identifies the chain
+/// GENERATION without churning event ids on every read.
+fn repair_generation(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("log.jsonl.unverified-"))
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// A per-session watermark identity for one approval/retirement record. Both
+/// the chain GENERATION (how many repairs preceded it) and the chain POSITION
+/// are part of it, not only the (path, sha, second, kind): otherwise an
+/// approve/retire/re-approve of identical bytes in one Unix second collides on
+/// position (Greptile Y3), and an identical approval recorded just before and
+/// just after a `--ledger-repair` - both at position zero of their chains -
+/// collides across the repair (Greptile). A running session that watermarked
+/// the pre-repair event would then suppress the post-repair one and keep stale
+/// approval context. Both parts are stable between repairs (the chain is
+/// append-only and the quarantine count only grows on repair), so a record
+/// keeps its id from turn to turn while a genuinely new one gets a fresh id.
+fn approval_event_id(generation: u64, chain_index: usize, r: &Record) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    generation.hash(&mut h);
+    chain_index.hash(&mut h);
+    r.path.hash(&mut h);
+    r.sha256.hash(&mut h);
+    r.ts.hash(&mut h);
+    r.kind.as_str().hash(&mut h);
+    h.finish()
+}
+
 /// History plus the interrupted-write flag, for callers that report state.
 pub fn read(data_dir: &Path, project_root: &Path) -> Result<History, String> {
     read_verified(&project_dir(data_dir, project_root)).map(|v| History {
@@ -2082,6 +2161,51 @@ pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A same-second approve/retire/re-approve of identical bytes at the same
+    /// path must give the two approvals DISTINCT event ids, or the per-session
+    /// watermark drops the re-approval and the next turn is told the
+    /// capability was retired when it is approved to run without a card
+    /// (Greptile). The chain position disambiguates records the (path, sha,
+    /// second, kind) tuple cannot, and it is stable across reads.
+    #[test]
+    fn same_second_re_approval_gets_a_distinct_event_id() {
+        let approval = |ts: u64| Record {
+            v: RECORD_VERSION,
+            ts,
+            path: PathBuf::from(".openmax/tools/x.toml"),
+            sha256: Some("a".repeat(64)),
+            actor: Actor::External,
+            session_id: None,
+            kind: Kind::Approval,
+            also: Vec::new(),
+            event: None,
+            code: Vec::new(),
+            blocking: false,
+            prev: String::new(),
+        };
+        // Index 0: the first approval. Index 2: the re-approval after a
+        // retirement at index 1, same bytes, same Unix second. Same generation.
+        let first = approval_event_id(0, 0, &approval(1000));
+        let reapproval = approval_event_id(0, 2, &approval(1000));
+        assert_ne!(
+            first, reapproval,
+            "a same-second re-approval must not collide with the first approval"
+        );
+        // ...and the SAME record keeps the SAME id across turns (stable
+        // position and generation), so a real re-scan does not resurface seen.
+        assert_eq!(first, approval_event_id(0, 0, &approval(1000)));
+
+        // An identical approval at position ZERO of a chain repaired in the
+        // same second (generation 1) must NOT collide with the pre-repair one
+        // (generation 0), or the watermark drops the post-repair approval and
+        // keeps stale approval context (Greptile).
+        let post_repair = approval_event_id(1, 0, &approval(1000));
+        assert_ne!(
+            first, post_repair,
+            "an identical approval across a repair must get a distinct id"
+        );
+    }
 
 
     #[test]

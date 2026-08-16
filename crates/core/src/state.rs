@@ -84,6 +84,13 @@ pub struct SessionData {
     /// holds every turn once it holds at all, so the transcript gets one
     /// note per distinct notice - the UI keeps its per-turn events.
     pub reported_policy_notices: HashSet<u64>,
+    /// Ledger approval-event ids this session has already accounted for:
+    /// seeded from the chain at build, then advanced as new events are
+    /// narrated. An approval recorded outside the running session (a human
+    /// at another terminal, #199) reaches it through no other channel - the
+    /// refreeze receipt names file changes, not approvals - so the turn
+    /// start names any it has not seen.
+    pub seen_ledger_events: HashSet<u64>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous
