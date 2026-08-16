@@ -201,6 +201,11 @@ async fn run_turn_events(
                 reason,
                 source_path,
                 source_sha,
+                // The credential grant is for an interactive card; headless
+                // declines the one prompt it rides (unapproved_source) and
+                // names the --approve repair, so there is no card to disclose
+                // it on here.
+                env: _,
             } => {
                 let mode = core.approval_mode();
                 // Unattended auto mode covers the ordinary mutating gate, but

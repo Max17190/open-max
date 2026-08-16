@@ -1024,6 +1024,7 @@ mod tests {
                 reason: String::new(),
                 source_path: String::new(),
                 source_sha: String::new(),
+                env: Vec::new(),
             },
             AgentEvent::ApprovalSettled { approval_id: String::new(), outcome: String::new() },
             AgentEvent::Refrozen { tools: 0, skills: 0, changes: Vec::new() },

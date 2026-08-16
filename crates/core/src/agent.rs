@@ -1616,6 +1616,23 @@ fn refreeze_receipt_text(
             added.approved.join(", ")
         ));
     }
+    if !added.modified_unapproved.is_empty() {
+        let listed: Vec<String> = added
+            .modified_unapproved
+            .iter()
+            .map(|(name, path)| {
+                format!(
+                    "{name} (openmax --approve {})",
+                    crate::doctor::shell_quote(std::path::Path::new(path))
+                )
+            })
+            .collect();
+        note.push_str(&format!(
+            " Modified tools whose current bytes no human has approved - the edit revoked any \
+             earlier approval, so the next call stops for a card: {}.",
+            listed.join(", ")
+        ));
+    }
     if !added.unapproved.is_empty() {
         // Round-4 dogfooding: this line used to say "callable" for these
         // too, and the very next step was an approval card - the model
@@ -1653,19 +1670,40 @@ struct AddedTools {
     approved: Vec<String>,
     /// (name, project-relative manifest path for the --approve command)
     unapproved: Vec<(String, String)>,
+    /// Tools present before and after whose MANIFEST bytes changed and whose
+    /// current bytes no human has approved: the edit revoked (or never had)
+    /// the approval, and the next call stops for a card. Silent before -
+    /// the receipt said only "modified", and a model that then saw the card
+    /// concluded revocation was broken.
+    modified_unapproved: Vec<(String, String)>,
 }
 
 fn classify_added_tools(
-    names: Vec<String>,
+    old_registry: &Registry,
     new_registry: &Registry,
     data_dir: &Path,
     project_root: &Path,
 ) -> AddedTools {
-    let mut out = AddedTools { approved: Vec::new(), unapproved: Vec::new() };
-    for name in names {
+    let mut out = AddedTools {
+        approved: Vec::new(),
+        unapproved: Vec::new(),
+        modified_unapproved: Vec::new(),
+    };
+    for name in added_tool_names(old_registry, new_registry) {
         match unapproved_capability(new_registry, data_dir, project_root, &name) {
             Some(source) => out.unapproved.push((name, source.path)),
             None => out.approved.push(name),
+        }
+    }
+    for spec in &new_registry.tools {
+        let crate::registry::ToolKind::External(new_ext) = &spec.kind else { continue };
+        let Some(old_spec) = old_registry.get(&spec.name) else { continue };
+        let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
+        if old_ext.source_sha256 == new_ext.source_sha256 {
+            continue;
+        }
+        if let Some(source) = unapproved_capability(new_registry, data_dir, project_root, &spec.name) {
+            out.modified_unapproved.push((spec.name.clone(), source.path));
         }
     }
     out
@@ -1761,12 +1799,7 @@ async fn refreeze_if_extensions_changed(
             // else mutates the session, but stay defensive about empty
             // (taken) state.
             Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
-                let added = classify_added_tools(
-                    added_tool_names(&data.registry, &registry),
-                    &registry,
-                    &core.data_dir,
-                    project_root,
-                );
+                let added = classify_added_tools(&data.registry, &registry, &core.data_dir, project_root);
                 apply_freeze(core, session_id, data, registry, prompt, breakdown);
                 Some(added)
             }
@@ -1962,12 +1995,7 @@ async fn refreeze_between_iterations(
     };
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
     let counts = (new_registry.tools.len(), new_registry.skills.len());
-    let added_tools = classify_added_tools(
-        added_tool_names(registry, &new_registry),
-        &new_registry,
-        &core.data_dir,
-        project_root,
-    );
+    let added_tools = classify_added_tools(registry, &new_registry, &core.data_dir, project_root);
     let broken = new_registry.broken.clone();
     let new_registry = Arc::new(new_registry);
     if messages.first().is_some_and(|m| m.role == "system") {
@@ -2226,6 +2254,7 @@ async fn run_loop(
     // edit would surface turns later as an unrelated-looking resolve error.
     let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
     let mut hooks_seen = crate::hooks::hooks_fingerprint(project_root);
+    let mut approval_seen = unapproved_tool_map(&registry, &core.data_dir, project_root);
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
@@ -2761,26 +2790,80 @@ async fn run_loop(
                             // approves this exact content - the manifest and
                             // the code it runs: later runs of the same bytes
                             // need no prompt, any edit to either revokes.
-                            if let Some(source) = source {
-                                if let Err(e) = crate::ledger::approve_capability(
+                            // Whether the grant is now recorded: only then does
+                            // the receipt below promise cardless future calls.
+                            // If recording failed (e.g. the manifest changed
+                            // while the card was open), the NEXT call asks
+                            // again, so a "runs without a card" receipt would
+                            // lie (Greptile).
+                            let recorded = match source {
+                                None => false,
+                                Some(source) => match crate::ledger::approve_capability_in_session(
                                     &core.data_dir,
                                     project_root,
                                     &source.source_path,
                                     &source.shas,
+                                    session_id,
                                 ) {
-                                    core.send_agent(session_id, AgentEvent::Error {
-                                        message: format!(
-                                            "approval was granted but could not be recorded (the tool will ask again): {e}"
-                                        ),
-                                    });
-                                }
+                                    // approve() records the manifest hash and
+                                    // every bound file it could READ. When the
+                                    // manifest points at code that is missing
+                                    // or unreadable, that entry hashes to
+                                    // nothing, so `covers_code` stays false and
+                                    // the NEXT call still stops for a card - a
+                                    // "runs without a card" receipt would lie
+                                    // (Greptile). "Recorded" therefore means
+                                    // the grant now covers the exact bytes the
+                                    // gate re-reads, not merely that a record
+                                    // was written: re-run that gate and believe
+                                    // its answer.
+                                    Ok(()) => unapproved_capability(
+                                        &registry,
+                                        &core.data_dir,
+                                        project_root,
+                                        name,
+                                    )
+                                    .is_none(),
+                                    Err(e) => {
+                                        core.send_agent(session_id, AgentEvent::Error {
+                                            message: format!(
+                                                "approval was granted but could not be recorded (the tool will ask again): {e}"
+                                            ),
+                                        });
+                                        false
+                                    }
+                                },
+                            };
+                            let mut outcome = registry
+                                .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
+                                .await;
+                            // The decline path speaks; the approve path was
+                            // silent, so an approved call looked identical to
+                            // one that never stopped - and a model that saw
+                            // its edited tool re-prompt (correctly) and then
+                            // run concluded that revocation does not work,
+                            // and taught the human so. Say what just happened -
+                            // but only claim cardless future calls when the
+                            // grant actually landed.
+                            if let Some(source) = source {
+                                let note = if recorded {
+                                    format!(
+                                        "[approved by the user: {} ({}) — later calls of these exact \
+                                         bytes run without a card; any edit to the manifest or its \
+                                         code asks again]",
+                                        source.path,
+                                        short_sha(&source.sha256)
+                                    )
+                                } else {
+                                    format!(
+                                        "[the user approved this call, but the approval could not be \
+                                         recorded, so the NEXT call of {} stops for a card again]",
+                                        source.path
+                                    )
+                                };
+                                outcome.output.push_str(&format!("\n{note}"));
                             }
-                            (
-                                registry
-                                    .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
-                                    .await,
-                                false,
-                            )
+                            (outcome, false)
                         }
                         ApprovalOutcome::Declined => (tools::ToolOutcome {
                             ok: false,
@@ -2929,6 +3012,38 @@ async fn run_loop(
                                 }
                             }
                         }
+                        // A script edit revokes the approval of the tool that
+                        // runs it, but moves no fingerprint: no refreeze, no
+                        // receipt - and the model learned only when the next
+                        // call raised a card. Diff approval state per call.
+                        let approval_now = unapproved_tool_map(&registry, &core.data_dir, project_root);
+                        let mut revoked: Vec<String> = Vec::new();
+                        for (name, state) in &approval_now {
+                            if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
+                                revoked.push(format!(
+                                    "{name} (openmax --approve {})",
+                                    crate::doctor::shell_quote(std::path::Path::new(path))
+                                ));
+                            }
+                        }
+                        approval_seen = approval_now;
+                        if !revoked.is_empty() {
+                            revoked.sort();
+                            let note = format!(
+                                "\n[approval revoked: the code these tools run changed since a human \
+                                 approved it, so the next call of each stops for a card: {}. Re-approve \
+                                 the exact bytes, or prove them first with openmax --check --run-examples.]",
+                                revoked.join(", ")
+                            );
+                            if let Some(last) =
+                                guard.messages().iter_mut().rev().find(|m| m.role == "tool")
+                            {
+                                match &mut last.content {
+                                    Some(content) => content.push_str(&note),
+                                    None => last.content = Some(note.trim_start().to_string()),
+                                }
+                            }
+                        }
                         // A hook file written this call: hooks are outside
                         // the extension fingerprint, so this write got no
                         // refreeze receipt and the inertness notice would
@@ -3011,6 +3126,9 @@ async fn run_loop(
         if refrozen {
             schemas_wire = registry.schemas_wire_arc();
             known_tools = registry.tools.iter().map(|s| s.name.clone()).collect();
+            // The refreeze receipt already narrated manifest-level approval
+            // changes; resync so the per-call diff does not repeat them.
+            approval_seen = unapproved_tool_map(&registry, &core.data_dir, project_root);
             // A new generation changes what an identical call means: a tool
             // rewritten this iteration must not have its first post-refreeze
             // call vetoed as a "third repeat" of the old implementation.
@@ -3214,6 +3332,14 @@ struct UnapprovedCapability {
     /// pasted straight into `openmax --approve` from the project root.
     path: String,
     sha256: String,
+    /// `command args...` as the manifest declares it: what an approval
+    /// actually grants authority to, rendered on the card.
+    command_line: String,
+    /// The env var NAMES the manifest forwards to the child (the #206 `env`
+    /// allowlist). An approval grants the tool these secrets, so the card
+    /// must disclose them - approving credential access you cannot see is
+    /// exactly what the content gate exists to prevent (Greptile security).
+    env: Vec<String>,
     /// The manifest as the approval store keys it, for recording the grant.
     source_path: PathBuf,
     /// Every hash one approval of this capability must record: the manifest's,
@@ -3257,9 +3383,19 @@ fn unapproved_capability(
     // `openmax --approve <manifest>` blesses the pair.
     let mut shas = vec![ext.source_sha256.clone()];
     shas.extend(code.into_iter().filter_map(|c| c.sha256));
+    // Each argv token shell-quoted, so `a b`, an empty arg, or a value with
+    // quotes/metacharacters keeps its boundary on the card - a space-joined
+    // line reads as a different or ambiguous invocation (Greptile security).
+    let command_line = std::iter::once(&ext.command)
+        .chain(ext.args.iter())
+        .map(|a| crate::doctor::shell_quote(std::path::Path::new(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
     Some(UnapprovedCapability {
         path: path.display().to_string(),
         sha256: ext.source_sha256.clone(),
+        command_line,
+        env: ext.env.clone(),
         source_path: ext.source_path.clone(),
         shas,
     })
@@ -3294,6 +3430,26 @@ fn nested_session_declined_message(source: &UnapprovedCapability) -> String {
          terminal, or make the tool's first call from a session a human is watching.",
         source.path
     )
+}
+
+/// Which external tools currently lack an approval covering their exact
+/// bytes (manifest + bound code). Diffed after every mutating call so a
+/// script edit - which moves no extension fingerprint and so earns no
+/// refreeze receipt - is still announced the moment it revokes an approval.
+fn unapproved_tool_map(
+    registry: &Registry,
+    data_dir: &Path,
+    project_root: &Path,
+) -> std::collections::HashMap<String, Option<String>> {
+    registry
+        .tools
+        .iter()
+        .filter(|s| matches!(s.kind, crate::registry::ToolKind::External(_)))
+        .map(|s| {
+            let state = unapproved_capability(registry, data_dir, project_root, &s.name).map(|u| u.path);
+            (s.name.clone(), state)
+        })
+        .collect()
 }
 
 /// True when the harness itself spawned this process: every child it starts
@@ -3334,18 +3490,37 @@ async fn request_approval(
     let summary = crate::registry::summarize_call(name, args);
     let mut detail = approval_detail(args);
     if let Some(source) = source {
+        // The card must say what will EXECUTE: a content approval is a grant
+        // of host authority to that command, and a frontend cannot render
+        // "this will run X" without re-parsing the manifest itself.
+        if !source.command_line.is_empty() {
+            detail = match detail.is_empty() {
+                true => format!("runs: {}", source.command_line),
+                false => format!("runs: {} | {detail}", source.command_line),
+            };
+        }
+        // The credential grant (source.env) does NOT go here. Prepending it
+        // to a one-line detail did not make it un-hideable: the probe
+        // evidence prepended after it, and the TUI prepends provenance before
+        // clipping the line to the terminal width, so a narrow card dropped
+        // "receives env: …" while Allow stayed selectable (Greptile
+        // security). It rides the event as its own field and the frontend
+        // gives it a dedicated line the card never clips.
         // Advisory evidence, prepended so card clipping cannot hide it: a
         // sandboxed probe of exactly these bytes passed. The receipt grants
         // nothing - approving still grants real host authority - and any
-        // edit to the manifest or its code orphans it.
-        if crate::doctor::probe_passed(&core.data_dir, &source.shas) {
-            detail = match detail.is_empty() {
-                true => "probe: example passed in sandbox (no network, writes confined)".into(),
-                false => format!(
-                    "probe: example passed in sandbox (no network, writes confined) | {detail}"
-                ),
-            };
-        }
+        // edit to the manifest or its code orphans it. When no probe exists
+        // for THESE bytes, say so: the card must not silently get weaker
+        // right after an edit, which is when habituation is most dangerous.
+        let evidence = if crate::doctor::probe_passed(&core.data_dir, &source.shas) {
+            "probe: example passed in sandbox (no network, writes confined)"
+        } else {
+            "no probe for these bytes (openmax --check --run-examples proves a tool in a sandbox)"
+        };
+        detail = match detail.is_empty() {
+            true => evidence.to_string(),
+            false => format!("{evidence} | {detail}"),
+        };
     }
     core.send_agent(session_id, AgentEvent::ApprovalRequest {
         approval_id: approval_id.clone(),
@@ -3355,6 +3530,7 @@ async fn request_approval(
         reason: reason.to_string(),
         source_path: source.map(|s| s.path.clone()).unwrap_or_default(),
         source_sha: source.map(|s| short_sha(&s.sha256)).unwrap_or_default(),
+        env: source.map(|s| s.env.clone()).unwrap_or_default(),
     });
 
     let outcome = tokio::select! {
@@ -3909,6 +4085,8 @@ mod tests {
         let source = UnapprovedCapability {
             path: ".openmax/tools/danger.toml".into(),
             sha256: "a".repeat(64),
+            command_line: "./danger.sh".into(),
+            env: Vec::new(),
             source_path: PathBuf::from("/proj/.openmax/tools/danger.toml"),
             shas: vec!["a".repeat(64)],
         };
@@ -4738,6 +4916,8 @@ mod tests {
             let source = UnapprovedCapability {
                 path: ".openmax/tools/docsearch.toml".into(),
                 sha256: shas[0].clone(),
+                command_line: "./scripts/docsearch.sh".into(),
+                env: vec!["GITHUB_TOKEN".into()],
                 source_path: "/tmp/docsearch.toml".into(),
                 shas,
             };
@@ -4755,11 +4935,11 @@ mod tests {
 
         // Matching vector: the card carries the evidence.
         let task = tokio::spawn(drive(vec![sha.clone()], core.clone()));
-        let detail = loop {
-            let env = rx.recv().await.expect("event");
-            if let AgentEvent::ApprovalRequest { approval_id, detail, .. } = env.event {
+        let (detail, env_names) = loop {
+            let ev = rx.recv().await.expect("event");
+            if let AgentEvent::ApprovalRequest { approval_id, detail, env, .. } = ev.event {
                 core.respond_approval(&approval_id, false);
-                break detail;
+                break (detail, env);
             }
         };
         let _ = task.await;
@@ -4767,8 +4947,24 @@ mod tests {
             detail.starts_with("probe: example passed in sandbox"),
             "matching bytes carry the evidence first: {detail}"
         );
+        assert!(
+            detail.contains("runs: ./scripts/docsearch.sh"),
+            "the card names what will execute: {detail}"
+        );
+        // The credential grant rides its own field, never the clippable
+        // detail: a narrow card gives it a dedicated line it cannot drop.
+        assert_eq!(
+            env_names,
+            vec!["GITHUB_TOKEN".to_string()],
+            "the credential grant is structured, not folded into detail"
+        );
+        assert!(
+            !detail.contains("receives env"),
+            "env must not be buried in the clippable detail line: {detail}"
+        );
 
-        // A different vector (edited bytes): no evidence.
+        // A different vector (edited bytes): no evidence - and the card SAYS
+        // so, rather than silently getting weaker right after an edit.
         let other = "b".repeat(64);
         let task = tokio::spawn(drive(vec![other], core.clone()));
         let detail = loop {
@@ -4780,8 +4976,12 @@ mod tests {
         };
         let _ = task.await;
         assert!(
-            !detail.contains("probe:"),
+            !detail.contains("probe: example passed"),
             "unproven bytes must show no evidence: {detail}"
+        );
+        assert!(
+            detail.contains("no probe for these bytes"),
+            "the absence of evidence is stated, not implied: {detail}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5910,6 +6110,158 @@ mod tests {
             *requests.lock().unwrap(),
             1,
             "the request that cannot fit is refused, not dispatched"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One tool call to `brokentool`, so the loop stops for its content card.
+    const BROKEN_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"brokentool\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A human at the card approves an external tool whose manifest names code
+    /// that is missing (the agent wrote the .toml but not the script, or it
+    /// was deleted). approve() can only bless the manifest hash; the missing
+    /// script has no bytes to hash, so `covers_code` stays false and the NEXT
+    /// call still stops for a card. The receipt must say exactly that, not
+    /// promise cardless future calls (Greptile): a "runs without a card"
+    /// receipt teaches the model that revocation is broken, the same lesson
+    /// the whole receipt exists to prevent.
+    #[tokio::test]
+    async fn an_approval_that_cannot_cover_missing_code_says_it_asks_again() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-recv-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        // The manifest names ./missing.sh, which is never written.
+        std::fs::write(
+            project.join(".openmax/tools/brokentool.toml"),
+            "name = \"brokentool\"\ndescription = \"d\"\ncommand = \"./missing.sh\"\nmutating = false\n",
+        )
+        .unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(BROKEN_TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            // One iteration: call the tool, then the loop stops. The receipt
+            // is what the test reads, not the stop reason.
+            s.max_agent_iterations = 1;
+        }
+
+        let id = "sess-recv";
+        start_turn(core.clone(), id.into(), project.clone(), "use it".into()).unwrap();
+
+        // Drive to Done, approving the one content card the tool raises.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        core.respond_approval(&approval_id, true);
+                    }
+                    AgentEvent::Done { .. } => break,
+                    _ => {}
+                },
+                Ok(None) => panic!("event stream closed before Done"),
+                Err(_) => {}
+            }
+        }
+
+        let messages = transcript(&core, id).await;
+        let tool_msg = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "tool")
+            .and_then(|m| m.content.clone())
+            .expect("the brokentool call left a tool message");
+        assert!(
+            tool_msg.contains("stops for a card again"),
+            "an approval that cannot cover missing code must not promise cardless calls: {tool_msg}"
+        );
+        assert!(
+            !tool_msg.contains("run without a card"),
+            "the receipt claimed a cardless future call it cannot honor: {tool_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One tool call to `echoer` (a covered /bin/echo tool), so approving its
+    /// card records a clean grant.
+    const ECHOER_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"echoer\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Approving an external tool's content card DURING a session records the
+    /// grant as THIS session's act (actor Session, session id set), not as an
+    /// anonymous external one. Otherwise the turn-start reconciliation cannot
+    /// exclude the session's own grant and tells the next turn its own card
+    /// approval was "activity outside this session" (Greptile).
+    #[tokio::test]
+    async fn a_card_approval_is_recorded_as_this_session() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-card-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/echoer.toml"),
+            "name = \"echoer\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nmutating = false\n",
+        )
+        .unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(ECHOER_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.max_agent_iterations = 1;
+        }
+
+        let id = "sess-card";
+        start_turn(core.clone(), id.into(), project.clone(), "use it".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        core.respond_approval(&approval_id, true);
+                    }
+                    AgentEvent::Done { .. } => break,
+                    _ => {}
+                },
+                Ok(None) => panic!("event stream closed before Done"),
+                Err(_) => {}
+            }
+        }
+
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let approval = records
+            .iter()
+            .find(|r| matches!(r.kind, crate::ledger::Kind::Approval))
+            .expect("the card approval was recorded");
+        assert_eq!(
+            approval.session_id.as_deref(),
+            Some(id),
+            "a card approval is attributed to the session that witnessed it, not external"
         );
 
         let _ = std::fs::remove_dir_all(dir);

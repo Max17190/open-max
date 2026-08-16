@@ -1221,6 +1221,23 @@ pub fn approve_capability(
     approve(data_dir, project_root, shas, Some(path), None)
 }
 
+/// Approve a capability the way a human at THIS session's card just did, so
+/// the record carries the session id (actor `Session`). The turn-start
+/// reconciliation excludes a session's own grants by that id; without it, the
+/// session would be told the next turn that its own card approval was
+/// "activity outside this session" (Greptile). The no-session
+/// `approve_capability` stays for the CLI `--approve` path, which has no
+/// session to attribute the act to.
+pub fn approve_capability_in_session(
+    data_dir: &Path,
+    project_root: &Path,
+    path: &Path,
+    shas: &[String],
+    session_id: &str,
+) -> Result<(), String> {
+    approve(data_dir, project_root, shas, Some(path), Some(session_id))
+}
+
 /// One approval act, as one chained record: every hash it blessed, the path it
 /// was granted at, and - for a hook - the shape those bytes declared, read
 /// while they are still the approved ones. Nothing new means no record, so

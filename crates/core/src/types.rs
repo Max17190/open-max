@@ -121,6 +121,20 @@ pub enum AgentEvent {
         /// names no action anyone can take.
         source_path: String,
         source_sha: String,
+        /// The env var NAMES a `source` approval grants the tool (the #206
+        /// manifest `env` allowlist). Empty for a plain gate, or an external
+        /// tool that forwards nothing. This is a credential grant, so a
+        /// frontend MUST render it on a dedicated line the card never clips
+        /// away: approving secrets you cannot see is the exact failure the
+        /// content gate exists to stop, and a narrow terminal must not be
+        /// able to hide it behind other detail (Greptile security). Carried
+        /// as structured data, not folded into `detail`, so the frontend
+        /// controls its own un-clippable placement. Additive and defaulted:
+        /// a stream without the key deserializes unchanged, and the key is
+        /// omitted from the wire whenever it is empty, so `openmax-stdio/5`
+        /// bytes are byte-identical for every call that grants no env.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
     },
     /// The approval waiter closed (approve, deny, timeout, cancel, or drop).
     /// Frontends must clear any pending approval UI matching `approval_id`.
@@ -263,6 +277,7 @@ mod tests {
                 reason: "gate".into(),
                 source_path: String::new(),
                 source_sha: String::new(),
+                env: vec![],
             }),
             r#"{"session_id":"s1","type":"approval_request","approval_id":"ap1","name":"bash","summary":"run","detail":"ls","reason":"gate","source_path":"","source_sha":""}"#
         );
@@ -277,8 +292,26 @@ mod tests {
                 reason: "unapproved_source".into(),
                 source_path: ".openmax/tools/danger.toml".into(),
                 source_sha: "0123456789ab".into(),
+                env: vec![],
             }),
             r#"{"session_id":"s1","type":"approval_request","approval_id":"ap2","name":"danger","summary":"danger","detail":"{\"count\":3}","reason":"unapproved_source","source_path":".openmax/tools/danger.toml","source_sha":"0123456789ab"}"#
+        );
+        // A declared env allowlist rides the event as structured data, so a
+        // frontend renders the credential grant on its own un-clippable line.
+        // The key appears only when non-empty (skip_serializing_if), so the
+        // no-env cases above stay byte-identical on the /5 wire.
+        assert_eq!(
+            env(AgentEvent::ApprovalRequest {
+                approval_id: "ap3".into(),
+                name: "deploy".into(),
+                summary: "deploy".into(),
+                detail: "runs: ./deploy.sh".into(),
+                reason: "unapproved_source".into(),
+                source_path: ".openmax/tools/deploy.toml".into(),
+                source_sha: "abcdef012345".into(),
+                env: vec!["DEPLOY_TOKEN".into(), "AWS_SECRET_ACCESS_KEY".into()],
+            }),
+            r#"{"session_id":"s1","type":"approval_request","approval_id":"ap3","name":"deploy","summary":"deploy","detail":"runs: ./deploy.sh","reason":"unapproved_source","source_path":".openmax/tools/deploy.toml","source_sha":"abcdef012345","env":["DEPLOY_TOKEN","AWS_SECRET_ACCESS_KEY"]}"#
         );
         assert_eq!(
             env(AgentEvent::ApprovalSettled {
