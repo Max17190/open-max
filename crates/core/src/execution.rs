@@ -502,6 +502,11 @@ pub(crate) async fn run_process(
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         command.env("HOME", &policy.rw_scratch);
+        // Temp files land in the scratch too: without TMPDIR a shell writes
+        // heredocs and process substitutions under /tmp, which the sandbox
+        // denies - a false negative on correct code (dogfood: a working
+        // script was rewritten to appease a sandbox production never has).
+        command.env("TMPDIR", &policy.rw_scratch);
         command.env("TERM", "dumb");
         command.env("LANG", "C.UTF-8");
     } else if let Some(names) = &request.env_allowlist {
@@ -995,6 +1000,26 @@ mod tests {
         assert_eq!(got, expected, "OPENMAX_BIN must name the running executable");
     }
 
+    /// A bash heredoc (and process substitution) writes a temp file; a
+    /// probe whose sandbox denies /tmp turned that into a false negative on
+    /// correct code. TMPDIR is the scratch, so ordinary shell idioms work.
+    #[tokio::test]
+    async fn a_sandboxed_probe_can_use_bash_heredocs() {
+        let base = std::env::temp_dir().join(format!("omx-sbx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = "bash -c 'cat <<EOF\nheredoc-ok\nEOF\n' && printf %s \"$TMPDIR\"";
+        let Some(output) = run_sandboxed(sandboxed_request(&base, script)).await else {
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout.head).to_string();
+        assert!(stdout.contains("heredoc-ok"), "heredoc must work in the probe: {stdout} / {}", String::from_utf8_lossy(&output.stderr.head));
+        assert!(
+            stdout.contains(base.file_name().unwrap().to_str().unwrap()),
+            "TMPDIR points into the scratch: {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     fn sandboxed_request(scratch: &Path, script: &str) -> ProcessRequest {
         ProcessRequest {
             program: "/bin/sh".into(),
@@ -1136,7 +1161,11 @@ mod tests {
     #[tokio::test]
     async fn times_out_and_drains_output() {
         let mut request = request("/bin/sh", &["-c", "printf before; sleep 10"]);
-        request.timeout = Duration::from_millis(25);
+        // Long enough that `printf before` reliably writes before the timeout
+        // even on a loaded CI runner (a 25ms window raced process startup and
+        // flaked the head assertion on macOS), still far below the 10s sleep so
+        // the timeout is what ends it.
+        request.timeout = Duration::from_millis(500);
         let output = run_process(request, Arc::new(CancelToken::default()))
             .await
             .unwrap();

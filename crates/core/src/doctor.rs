@@ -814,7 +814,7 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
         if let Some(memory) = scan.entries.iter().find(|e| e.name == stem) {
             let visibility = if memory.in_index {
-                "in the session index".to_string()
+                "indexed at the next prompt freeze (session start, /reload, or any refreeze); a running session sees it once its prefix rebuilds".to_string()
             } else {
                 "faded from the index (unused; a read_file revives it)".to_string()
             };
@@ -2430,7 +2430,7 @@ mod tests {
         let findings = local(&root);
         match &find(&findings, "verbose.md").status {
             Status::Warn(reason) => {
-                assert!(reason.contains("in the session index"), "still indexed: {reason}");
+                assert!(reason.contains("indexed at the next prompt freeze"), "still indexed: {reason}");
                 assert!(
                     reason.contains(&format!("{}-char index cap", crate::memory::MAX_DESCRIPTION_CHARS)),
                     "the cap must be named: {reason}"
@@ -3965,7 +3965,7 @@ mod tests {
         let findings = local(&root);
         let live = find(&findings, "deploy-port.md");
         assert!(matches!(live.status, Status::Ok(_)), "{:?}", live.status);
-        assert!(live.status.summary().contains("in the session index"));
+        assert!(live.status.summary().contains("indexed at the next prompt freeze"));
 
         let bad = find(&findings, "Bad_Name.md");
         assert!(matches!(bad.status, Status::Warn(_)));
