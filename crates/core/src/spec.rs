@@ -464,10 +464,16 @@ So a permission rule is friction against known patterns, NOT a filesystem
 guarantee: if a user asks for a hard guarantee that some path cannot be
 written, say plainly that these gates cannot deliver one, and offer what they
 can - `approval_mode = "ask"` so every call CLASSIFIED as mutating and not
-covered by an approved `allow` rule is shown (an approved `allow` still runs
-it unprompted, so drop such rules for the paths you want to see), an `ask`
-rule so the patterns you name prompt rather than run, or moving the files out
-of the agent's reach. Do not hand over a confident guard that does not guard.
+covered by an approved `allow` rule is shown (an approved `allow` still runs it
+unprompted, so drop the rules that cover the path you want to see - and that is
+not only path-scoped `write_file`/`edit_file` allows: a `bash` allow matches
+COMMAND TEXT, so an approved `allow` on a `bash` command that can mutate the
+path, e.g. `truncate -s 0 src/x`, force-allows it with no prompt, and a
+`write_file`/`edit_file` rule does not constrain bash at all - so remove or
+narrow every effective allow, bash included, whose command could reach the
+path), an `ask` rule so the patterns you name prompt rather than run, or moving
+the files out of the agent's reach. Do not hand over a confident guard that
+does not guard.
 
 "Classified as mutating" is not "can mutate". For a builtin the class is
 fixed; for an external tool it is the manifest's own `mutating` flag, which is
@@ -1112,6 +1118,15 @@ mod tests {
         assert!(
             flat.contains("Only the name rule survives such a restore"),
             "the spec must name the mitigation that survives a byte-identical restore"
+        );
+        // Protecting a path from ask-mode bypass also means dropping bash
+        // allows: a bash allow matches command text, so an approved bash allow
+        // whose command mutates the path force-allows it, and path-scoped
+        // write/edit rules do not constrain bash (Greptile).
+        assert!(
+            flat.contains("a `bash` allow matches COMMAND TEXT")
+                && flat.contains("does not constrain bash"),
+            "the spec must warn that a bash allow can bypass ask mode for the path"
         );
         // Evaluation is first-match, so the gate is inert behind an earlier
         // allow: the spec must state the ordering requirement, or a reader adds
