@@ -2798,11 +2798,12 @@ async fn run_loop(
                             // lie (Greptile).
                             let recorded = match source {
                                 None => false,
-                                Some(source) => match crate::ledger::approve_capability(
+                                Some(source) => match crate::ledger::approve_capability_in_session(
                                     &core.data_dir,
                                     project_root,
                                     &source.source_path,
                                     &source.shas,
+                                    session_id,
                                 ) {
                                     // approve() records the manifest hash and
                                     // every bound file it could READ. When the
@@ -6191,6 +6192,76 @@ mod tests {
         assert!(
             !tool_msg.contains("run without a card"),
             "the receipt claimed a cardless future call it cannot honor: {tool_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One tool call to `echoer` (a covered /bin/echo tool), so approving its
+    /// card records a clean grant.
+    const ECHOER_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"echoer\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Approving an external tool's content card DURING a session records the
+    /// grant as THIS session's act (actor Session, session id set), not as an
+    /// anonymous external one. Otherwise the turn-start reconciliation cannot
+    /// exclude the session's own grant and tells the next turn its own card
+    /// approval was "activity outside this session" (Greptile).
+    #[tokio::test]
+    async fn a_card_approval_is_recorded_as_this_session() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-card-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/echoer.toml"),
+            "name = \"echoer\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nmutating = false\n",
+        )
+        .unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, _requests) = counting_endpoint(ECHOER_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.max_agent_iterations = 1;
+        }
+
+        let id = "sess-card";
+        start_turn(core.clone(), id.into(), project.clone(), "use it".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        core.respond_approval(&approval_id, true);
+                    }
+                    AgentEvent::Done { .. } => break,
+                    _ => {}
+                },
+                Ok(None) => panic!("event stream closed before Done"),
+                Err(_) => {}
+            }
+        }
+
+        let records = crate::ledger::history(&core.data_dir, &project).unwrap();
+        let approval = records
+            .iter()
+            .find(|r| matches!(r.kind, crate::ledger::Kind::Approval))
+            .expect("the card approval was recorded");
+        assert_eq!(
+            approval.session_id.as_deref(),
+            Some(id),
+            "a card approval is attributed to the session that witnessed it, not external"
         );
 
         let _ = std::fs::remove_dir_all(dir);
