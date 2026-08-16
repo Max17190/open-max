@@ -590,3 +590,58 @@ async fn editing_an_approved_gates_script_is_named_on_the_writing_call() {
     assert!(content.contains("failing closed"), "an edit to an approved gate's code is named as revoking: {content}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// When a rule earlier this turn already denied the repair tools on
+/// permissions.toml, the malformed-policy receipt must NOT claim they are
+/// still allowed: the most-restrictive turn snapshot wins, so following that
+/// guidance would hit another denial (Greptile). Here the turn-start policy
+/// denies write_file and edit_file on the file, then a bash call bricks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_repair_tool_is_not_offered_by_the_malformed_receipt() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax")).unwrap();
+    let project = project.canonicalize().unwrap();
+    // Turn-start policy: deny both repair tools on anything matching
+    // "permissions" (valid TOML, applies at turn start).
+    std::fs::write(
+        project.join(".openmax/permissions.toml"),
+        "[[rules]]\neffect = \"deny\"\ntool = \"write_file\"\narg_regex = \"permissions\"\n\
+         [[rules]]\neffect = \"deny\"\ntool = \"edit_file\"\narg_regex = \"permissions\"\n",
+    )
+    .unwrap();
+    // Bash (not denied) overwrites the policy with unparseable bytes.
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "bash",
+            serde_json::json!({ "command": "printf 'not toml {' > .openmax/permissions.toml" }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "denied-repair", &project, "brick it").await;
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("permissions.toml is now malformed"), "{content}");
+    assert!(
+        content.contains("denies write_file and edit_file"),
+        "the receipt must not offer a repair tool an earlier rule blocks: {content}"
+    );
+    assert!(
+        !content.contains("on exactly this file is still allowed"),
+        "no repair tool should be offered as available: {content}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

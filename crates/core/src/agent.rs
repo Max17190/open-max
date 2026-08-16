@@ -3148,13 +3148,47 @@ async fn run_loop(
                                 if let Some(last) =
                                     guard.messages().iter_mut().rev().find(|m| m.role == "tool")
                                 {
+                                    // The repair carve-out returns Default for
+                                    // write/edit on this file, but an earlier
+                                    // snapshot this turn may have explicitly
+                                    // DENIED one of them, and the most
+                                    // restrictive answer wins - so the receipt
+                                    // must not promise a repair tool a rule
+                                    // already blocks (Greptile). Report only the
+                                    // repair tools the effective turn policy
+                                    // still allows.
+                                    let path_arg = serde_json::json!({
+                                        "path": project_root
+                                            .join(".openmax/permissions.toml")
+                                            .to_string_lossy()
+                                    });
+                                    let allowed: Vec<&str> = ["write_file", "edit_file"]
+                                        .into_iter()
+                                        .filter(|t| {
+                                            !matches!(
+                                                permissions.evaluate(t, &path_arg),
+                                                crate::permissions::PermissionDecision::Deny { .. }
+                                            )
+                                        })
+                                        .collect();
+                                    let repair_clause = if allowed.is_empty() {
+                                        "a rule earlier this turn denies write_file and edit_file on \
+                                         this file too, so even the repair waits for the START OF THE \
+                                         NEXT TURN; read_file is not allowed"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "{} on exactly this file is still allowed and takes \
+                                             effect at the START OF THE NEXT TURN, not this one; \
+                                             read_file is NOT, so rewrite it from what you intended",
+                                            allowed.join("/")
+                                        )
+                                    };
                                     let note = format!(
                                         "\n[permissions.toml is now malformed ({reason}). Every tool \
                                          call is DENIED for the rest of THIS turn - policy snapshots \
                                          only narrow within a turn, never widen - and your repair \
-                                         (write_file/edit_file on exactly this file is still allowed; \
-                                         read_file is NOT, so rewrite it from what you intended) \
-                                         takes effect at the START OF THE NEXT TURN, not this one. \
+                                         ({repair_clause}). \
                                          openmax --check cannot run until then (bash is denied too).]"
                                     );
                                     match &mut last.content {
