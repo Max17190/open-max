@@ -1313,7 +1313,18 @@ fn approve(
                 // The manifest object already written is orphaned (no record
                 // references it), never a dangling approval.
                 for code_sha in shas.iter().skip(1) {
-                    if !dir.join("objects").join(code_sha).is_file() {
+                    // The object must exist AND hash to its own name: a mere
+                    // is_file() check would accept a pre-existing object at
+                    // objects/<sha> that holds unrelated bytes (a changed
+                    // script whose sha slot was pre-populated), so a restore
+                    // would produce bytes the reviewer never approved
+                    // (Greptile). store_object only writes bytes that hash to
+                    // the sha, so a valid object here means we stored it this
+                    // act or an earlier act stored the identical bytes.
+                    let intact = std::fs::read(dir.join("objects").join(code_sha))
+                        .map(|b| sha256_hex(&b) == *code_sha)
+                        .unwrap_or(false);
+                    if !intact {
                         return Err(format!(
                             "a bound file changed, was removed, or could not be read since it was shown, so its approved bytes ({}) are not restorable; nothing was approved - review the files and approve them again",
                             &code_sha[..code_sha.len().min(12)]
@@ -2226,6 +2237,35 @@ mod tests {
             history(&data, &root).unwrap().is_empty(),
             "a rejected approval appends no record"
         );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The object check verifies CONTENT, not just existence: a changed bound
+    /// script whose sha slot in `objects/` was pre-populated with unrelated
+    /// bytes must still be rejected, or a restore would produce bytes the
+    /// reviewer never approved (Greptile).
+    #[test]
+    fn approve_rejects_a_bound_file_whose_object_slot_is_corrupt() {
+        let data = temp("corrupt-data");
+        let root = temp("corrupt-proj");
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let manifest = root.join(".openmax/tools/t.toml");
+        std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
+        let script = root.join("run.sh");
+        std::fs::write(&script, "echo A\n").unwrap();
+        let manifest_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
+        let script_sha = sha256_hex(&std::fs::read(&script).unwrap());
+        // An unrelated object is planted at objects/<script_sha>.
+        let objects = project_dir(&data, &root).join("objects");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(objects.join(&script_sha), b"unrelated corrupt bytes").unwrap();
+        // The script changes, so the store loop will not overwrite the slot.
+        std::fs::write(&script, "echo B\n").unwrap();
+        let err = approve_capability(&data, &root, &manifest, &[manifest_sha, script_sha])
+            .expect_err("a corrupt object slot must not pass as restorable");
+        assert!(err.contains("not restorable"), "{err}");
+        assert!(history(&data, &root).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
