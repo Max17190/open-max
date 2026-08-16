@@ -349,6 +349,31 @@ pub struct MemoryFreeze {
     pub identities: Vec<(String, u64)>,
 }
 
+/// Read a memory file's bytes and its mtime as ONE coherent generation. An
+/// in-place write to the inode can replace the bytes between reading the mtime
+/// and the body (either order), pairing one generation's content with
+/// another's timestamp. Read mtime, then bytes, then mtime again; if it moved,
+/// the file changed mid-read - retry so the pair always matches (Greptile).
+/// Bounded: on persistent churn the last read is self-consistent bytes with
+/// the mtime observed immediately after them.
+fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)> {
+    for _ in 0..4 {
+        let mut file = std::fs::File::open(path).ok()?;
+        let before = file.metadata().and_then(|m| m.modified()).ok();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        let after = file.metadata().and_then(|m| m.modified()).ok();
+        if before == after {
+            return Some((bytes, after));
+        }
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let mtime = file.metadata().and_then(|m| m.modified()).ok();
+    Some((bytes, mtime))
+}
+
 pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
     let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
         return MemoryFreeze {
@@ -366,18 +391,12 @@ pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
         if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
             continue;
         }
-        // Bytes AND mtime come from ONE open handle, so a file replaced during
-        // the scan cannot pair the original bytes (which the fingerprint
-        // hashes) with the replacement's fresh mtime (which scores the index):
-        // an open handle keeps reading the inode it opened, whatever a later
-        // rename points the path at (Greptile). Path-based reads of each in
-        // turn had a window between them.
-        let Ok(mut file) = std::fs::File::open(&path) else { continue };
-        let mtime = file.metadata().and_then(|m| m.modified()).ok();
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_err() {
-            continue;
-        }
+        // Bytes AND mtime describe the SAME generation of the file, so the
+        // fingerprint (which hashes the bytes) and the index scoring (which
+        // uses the mtime) can never be captured from two different generations
+        // - a rename OR an in-place rewrite during the read would otherwise
+        // pair one generation's bytes with another's mtime (Greptile).
+        let Some((bytes, mtime)) = read_coherent(&path) else { continue };
         // The SAME bytes feed the fingerprint and the index: a describable,
         // UTF-8 file also enters the index; every valid-named file counts
         // toward the fingerprint regardless.
