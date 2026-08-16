@@ -1161,7 +1161,11 @@ mod tests {
     #[tokio::test]
     async fn times_out_and_drains_output() {
         let mut request = request("/bin/sh", &["-c", "printf before; sleep 10"]);
-        request.timeout = Duration::from_millis(25);
+        // Long enough that `printf before` reliably writes before the timeout
+        // even on a loaded CI runner (a 25ms window raced process startup and
+        // flaked the head assertion on macOS), still far below the 10s sleep so
+        // the timeout is what ends it.
+        request.timeout = Duration::from_millis(500);
         let output = run_process(request, Arc::new(CancelToken::default()))
             .await
             .unwrap();
