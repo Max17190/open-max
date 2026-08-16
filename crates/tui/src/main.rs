@@ -455,6 +455,12 @@ async fn main() -> std::io::Result<()> {
                                     )
                                 })
                                 .count();
+                            // Each non-intact bound object is damage too, or
+                            // the footer prints an unqualified `restore with cp`
+                            // recipe while this approval cannot be fully
+                            // restored - same accounting the manifest path does
+                            // (Greptile).
+                            damaged += n - stored;
                             let plural = if n == 1 { "" } else { "s" };
                             if stored == n {
                                 format!("  (+{n} bound file{plural})")

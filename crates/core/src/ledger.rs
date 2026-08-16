@@ -1728,10 +1728,33 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
     // deleted tool runs ungated and a removed-tool receipt calls it
     // cardless-restorable (Greptile). An existing script was already read by
     // the arg loop above, so this only fires for a genuinely absent one.
-    if let Some(script) = interpreter_script(command, args) {
-        let path = absolute_from(script, project_root);
-        if inside_project(&path, project_root) && !path.is_file() {
-            out.push(BoundCode { path, sha256: None });
+    // For an interpreter command, a MISSING script-like positional argument
+    // binds to None, even behind options (`python3 -O run.py`). This is
+    // deliberately more eager than `interpreter_script` (which returns None as
+    // soon as any option precedes the candidate, to avoid a --check false
+    // positive over an option VALUE like `node -p x.js`): here, gating a
+    // missing script-shaped argument is the safe direction - an empty binding
+    // would let the removed tool run ungated and read as cardless-restorable
+    // (Greptile). An existing argument was already read by the arg loop above.
+    let stem = Path::new(command.trim()).file_name().and_then(|s| s.to_str());
+    if stem.is_some_and(|s| INTERPRETERS.contains(&s)) {
+        for arg in args {
+            let arg = arg.trim();
+            if arg.is_empty() || arg.starts_with('-') {
+                continue;
+            }
+            let script_like = Path::new(arg)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e));
+            if !script_like {
+                continue;
+            }
+            let path = absolute_from(arg, project_root);
+            if inside_project(&path, project_root) && !path.is_file() {
+                out.push(BoundCode { path, sha256: None });
+            }
+            break; // the first script-like positional is the script
         }
     }
     out
@@ -2201,6 +2224,14 @@ mod tests {
         assert!(
             !Approvals::default().covers_code(&bound),
             "a None binding is never covered, so the tool stays gated"
+        );
+        // The same holds when an OPTION precedes the script (`python3 -O
+        // run.py`): interpreter_script bails on the option, but bound_code
+        // still binds the missing script-like positional to None (Greptile).
+        let with_opt = bound_code("python3", &["-O".to_string(), "run.py".to_string()], &root);
+        assert!(
+            with_opt.iter().any(|c| c.sha256.is_none() && c.path.ends_with("run.py")),
+            "a missing script behind an option still binds None: {with_opt:?}"
         );
         // With the script present the arg loop reads it (Some sha), no None.
         std::fs::write(root.join("run.sh"), "echo hi\n").unwrap();
