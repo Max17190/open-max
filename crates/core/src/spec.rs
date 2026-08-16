@@ -478,14 +478,16 @@ can still write or delete any path, and `ask` mode will NOT stop it, because
 the harness took the tool at its word. So the honest recipe for "watch every
 write to X" pairs `ask` mode with an audit of every approved external tool
 that could reach X: read what each one actually runs, and if a self-declared
-read-only tool can mutate, that is the hole to close. There is no operation
-today that revokes an external tool's content approval in place - `--forget`
-retires a path or hook but leaves the approved manifest and code hashes
-standing, so the tool keeps running - so close it by one of: a `deny` (or
-`ask`) rule on the tool's name, which applies to an approved tool too because
-rules run before the content gate; editing the manifest, which changes its
-hash so the next call asks again; or deleting the tool. `ask` mode alone will
-not surface this for you.
+read-only tool can mutate, that is the hole to close. The durable gate is a
+`deny` (or `ask`) rule on the tool's NAME: rules run before the content gate,
+so they stop even an approved tool, and they keep stopping it whatever its
+bytes become. There is no operation today that revokes an external tool's
+content approval in place - `--forget` retires a path or hook but leaves the
+approved manifest and code hashes standing - and neither editing nor deleting
+the file revokes that approval: both stop the tool as it is now, but the
+original approved bytes still match the standing approval, so restoring them
+byte-for-byte would run without a card again. Only the name rule survives such
+a restore. `ask` mode alone will not surface this for you.
 
 `allow` is the only effect that removes a gate: it skips the approval prompt
 outright. The project file sits where you write, so an `allow` in it is inert
@@ -1094,9 +1096,17 @@ mod tests {
             flat.contains("no operation today that revokes an external tool's content approval"),
             "the spec must state that an external-tool approval cannot be revoked in place"
         );
+        // The durable mitigation is a name rule; the spec must say editing or
+        // deleting the file does NOT revoke the standing approval (a
+        // byte-identical restore runs cardless), or a reader would trust a
+        // control that a restore defeats (Greptile).
         assert!(
-            flat.contains("editing the manifest, which changes its hash so the next call asks again"),
-            "the spec must name a mitigation that actually de-authorizes the tool"
+            flat.contains("neither editing nor deleting the file revokes that approval"),
+            "the spec must say edit/delete do not revoke the standing approval"
+        );
+        assert!(
+            flat.contains("Only the name rule survives such a restore"),
+            "the spec must name the mitigation that survives a byte-identical restore"
         );
     }
 
