@@ -3157,19 +3157,33 @@ async fn run_loop(
                                     // already blocks (Greptile). Report only the
                                     // repair tools the effective turn policy
                                     // still allows.
-                                    let path_arg = serde_json::json!({
-                                        "path": project_root
-                                            .join(".openmax/permissions.toml")
-                                            .to_string_lossy()
-                                    });
-                                    let allowed: Vec<&str> = ["write_file", "edit_file"]
-                                        .into_iter()
-                                        .filter(|t| {
-                                            !matches!(
-                                                permissions.evaluate(t, &path_arg),
+                                    // Probe BOTH path spellings a repair call
+                                    // could use: an `arg_regex` matches the raw
+                                    // path argument, so a deny anchored to the
+                                    // relative `.openmax/permissions.toml`
+                                    // would miss an absolute-only probe and the
+                                    // receipt would advertise a tool the
+                                    // relative call is denied (Greptile). A tool
+                                    // is "allowed" only if NEITHER spelling is
+                                    // denied.
+                                    let abs = project_root
+                                        .join(".openmax/permissions.toml")
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    let repair_denied = |tool: &str| {
+                                        [abs.as_str(), ".openmax/permissions.toml"].iter().any(|p| {
+                                            matches!(
+                                                permissions.evaluate(
+                                                    tool,
+                                                    &serde_json::json!({ "path": p }),
+                                                ),
                                                 crate::permissions::PermissionDecision::Deny { .. }
                                             )
                                         })
+                                    };
+                                    let allowed: Vec<&str> = ["write_file", "edit_file"]
+                                        .into_iter()
+                                        .filter(|t| !repair_denied(t))
                                         .collect();
                                     let repair_clause = if allowed.is_empty() {
                                         "a rule earlier this turn denies write_file and edit_file on \

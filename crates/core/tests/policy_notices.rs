@@ -607,8 +607,8 @@ async fn a_denied_repair_tool_is_not_offered_by_the_malformed_receipt() {
     // "permissions" (valid TOML, applies at turn start).
     std::fs::write(
         project.join(".openmax/permissions.toml"),
-        "[[rules]]\neffect = \"deny\"\ntool = \"write_file\"\narg_regex = \"permissions\"\n\
-         [[rules]]\neffect = \"deny\"\ntool = \"edit_file\"\narg_regex = \"permissions\"\n",
+        "[[rules]]\neffect = \"deny\"\ntool = \"write_file\"\narg_regex = \"^[.]openmax\"\n\
+         [[rules]]\neffect = \"deny\"\ntool = \"edit_file\"\narg_regex = \"^[.]openmax\"\n",
     )
     .unwrap();
     // Bash (not denied) overwrites the policy with unparseable bytes.
