@@ -251,11 +251,16 @@ impl Permissions {
     /// way it was written: from the shell, guided by the path in the deny
     /// reason and by `openmax --check`.
     fn repairs_invalid_policy(&self, tool: &str, args: &Value) -> bool {
-        // read_file is included: repairing a file you cannot read is not a
-        // repair path - the agent had to blind-rewrite a malformed
-        // permissions.toml it was denied read access to (dogfood). read_file
-        // is read-only, so it widens nothing the write path did not already.
-        if !matches!(tool, "write_file" | "edit_file" | "read_file") {
+        // Only write_file/edit_file. read_file is deliberately NOT here: a
+        // policy that denies READING this file may be protecting secrets or
+        // config stored in it, and exempting read_file would let a caller who
+        // can edit but not read append malformed TOML - forcing fail-closed -
+        // and then read the whole file back through the carve-out (Greptile
+        // security). Repair never needs a read: the file is agent-writable, so
+        // the fix is to write the intended policy, and a file only a human can
+        // read is repaired from the shell (guided by openmax --check), exactly
+        // as the global file already is.
+        if !matches!(tool, "write_file" | "edit_file") {
             return false;
         }
         let Some(invalid) = &self.invalid_path else {
@@ -573,18 +578,22 @@ mod tests {
             PermissionDecision::Default,
             "path resolution must not depend on spelling"
         );
-        // read_file on the broken file is exempt too: repairing a file you
-        // cannot read is not a repair path (dogfood - the agent had to
-        // blind-rewrite it). read-only, so it widens nothing the write did.
-        assert_eq!(
-            perms.evaluate("read_file", &json!({"path": ".openmax/permissions.toml"})),
-            PermissionDecision::Default,
-            "reading the broken file to repair it must be possible"
+        // read_file on the broken file is NOT exempt: a policy denying reads
+        // of this file may guard its contents, and a corrupt-then-read
+        // sequence would otherwise bypass that deny (Greptile). Repair is
+        // write-only.
+        assert!(
+            matches!(
+                perms.evaluate("read_file", &json!({"path": ".openmax/permissions.toml"})),
+                PermissionDecision::Deny { .. }
+            ),
+            "reading the broken policy file must fail closed, not fall through"
         );
 
         // Nothing else is exempt.
         for (tool, args) in [
             ("bash", json!({"command": "cat .openmax/permissions.toml"})),
+            ("read_file", json!({"path": ".openmax/permissions.toml"})),
             ("read_file", json!({"path": "src/main.rs"})),
             ("write_file", json!({"path": "src/main.rs"})),
         ] {

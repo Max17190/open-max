@@ -495,8 +495,10 @@ discovery: removing a deny, or FIXING a file you broke earlier this turn, does
 not take effect until the turn ends. Concretely: if a mutating call leaves
 permissions.toml malformed, the file fails closed and DENIES EVERY tool call
 (including bash, so `openmax --check` cannot run) for the rest of that turn;
-your repair to the file is allowed (write_file/edit_file/read_file on exactly
-that path stay open) but applies only from the next turn. The harness says so
+your repair to the file is allowed (write_file/edit_file on exactly that path
+stay open; read_file does NOT - a policy that denies reading this file must not
+be bypassable by corrupting it) but applies only from the next turn. The
+harness says so
 on the writing call. Between turns, verify with `openmax --check` (it reports
 the exact fail-closed reason for a malformed file).
 "#;
