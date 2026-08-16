@@ -232,62 +232,63 @@ fn load_log(project_root: &Path) -> Vec<AccessRecord> {
 /// Scan the memory directory and score every valid entry, strongest first
 /// (ties by name for determinism). Pure with respect to the filesystem: no
 /// writes, no deletions - `forget_faded` is the explicit destructive step.
-pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
-    let dir = memory_dir(project_root);
-    let Ok(read_dir) = std::fs::read_dir(&dir) else {
-        return MemoryScan::default();
-    };
-    let log = load_log(project_root);
-    let mut entries: Vec<MemoryEntry> = Vec::new();
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        // A file with no describable first line is skipped, not guessed at:
-        // openmax --check names it and the fix (write a first line).
-        let Some(description) = description_of(&text) else { continue };
-        // One physical act, one event: a write_file produces both an mtime
-        // and a logged write at the same instant, and summing them would add
-        // a permanent ln(2) of activation, outranking every honest
-        // single-event peer. Ages bucket to whole hours (matching the
-        // one-hour clamp in `activation`), and buckets deduplicate.
-        let mut hour_buckets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-            let ts = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(now);
-            hour_buckets.insert((now.saturating_sub(ts) / 3600).max(1));
-        }
-        // A gc tombstone is a horizon: a name reused after deletion starts
-        // fresh instead of inheriting the dead namesake's access history.
-        let horizon =
-            log.iter().filter(|r| r.name == name && r.kind == "gc").map(|r| r.ts).max();
-        for record in log.iter().filter(|r| {
-            r.name == name && r.kind != "gc" && horizon.is_none_or(|h| r.ts > h)
-        }) {
-            hour_buckets.insert((now.saturating_sub(record.ts) / 3600).max(1));
-        }
-        if hour_buckets.is_empty() {
-            hour_buckets.insert(1);
-        }
-        let last_event_hours = hour_buckets.first().copied().unwrap_or(1);
-        let ages: Vec<f64> = hour_buckets.into_iter().map(|h| h as f64).collect();
-        entries.push(MemoryEntry {
-            name: name.to_string(),
-            description,
-            path: format!("{MEMORY_DIR}/{name}.md"),
-            activation: activation(&ages),
-            last_event_hours,
-            in_index: false,
-        });
+/// Score one memory file into an index entry from ALREADY-READ content, or
+/// None if it has no describable first line. Kept separate from the directory
+/// walk so the fingerprint scan and the index scan can share ONE read of each
+/// file: two independent reads could otherwise freeze one generation of a
+/// file's index under another generation's fingerprint (Greptile).
+fn entry_from(
+    name: &str,
+    text: &str,
+    mtime: Option<std::time::SystemTime>,
+    log: &[AccessRecord],
+    now: u64,
+) -> Option<MemoryEntry> {
+    // A file with no describable first line is skipped, not guessed at:
+    // openmax --check names it and the fix (write a first line).
+    let description = description_of(text)?;
+    // One physical act, one event: a write_file produces both an mtime and a
+    // logged write at the same instant, and summing them would add a permanent
+    // ln(2) of activation, outranking every honest single-event peer. Ages
+    // bucket to whole hours (matching the one-hour clamp in `activation`), and
+    // buckets deduplicate.
+    let mut hour_buckets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    if let Some(mtime) = mtime {
+        let ts = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(now);
+        hour_buckets.insert((now.saturating_sub(ts) / 3600).max(1));
     }
+    // A gc tombstone is a horizon: a name reused after deletion starts fresh
+    // instead of inheriting the dead namesake's access history.
+    let horizon = log.iter().filter(|r| r.name == name && r.kind == "gc").map(|r| r.ts).max();
+    for record in
+        log.iter().filter(|r| r.name == name && r.kind != "gc" && horizon.is_none_or(|h| r.ts > h))
+    {
+        hour_buckets.insert((now.saturating_sub(record.ts) / 3600).max(1));
+    }
+    if hour_buckets.is_empty() {
+        hour_buckets.insert(1);
+    }
+    let last_event_hours = hour_buckets.first().copied().unwrap_or(1);
+    let ages: Vec<f64> = hour_buckets.into_iter().map(|h| h as f64).collect();
+    Some(MemoryEntry {
+        name: name.to_string(),
+        description,
+        path: format!("{MEMORY_DIR}/{name}.md"),
+        activation: activation(&ages),
+        last_event_hours,
+        in_index: false,
+    })
+}
+
+/// Rank entries strongest-first and greedily fill the index under the byte
+/// budget, evicting the weakest surfaced entries until the lines plus the
+/// omission trailer fit the cap.
+fn fill_index(mut entries: Vec<MemoryEntry>) -> MemoryScan {
     entries.sort_by(|a, b| {
         b.activation.partial_cmp(&a.activation).unwrap_or(std::cmp::Ordering::Equal).then(a.name.cmp(&b.name))
     });
-
-    // Greedy fill under the byte budget. Entries unused past the floor age
-    // are never eligible, however high their activation ranks them.
+    // Entries unused past the floor age are never eligible, however high their
+    // activation ranks them.
     let index_floor_hours = INDEX_FLOOR_DAYS * 24.0;
     let mut spent = 0usize;
     let mut omitted = 0usize;
@@ -304,7 +305,7 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
     }
     // The omission trailer spends the same budget the lines do: evict the
     // weakest surfaced entries until lines plus trailer fit the cap, so the
-    // documented 1500 bytes is what the prompt actually pays.
+    // documented budget is what the prompt actually pays.
     while omitted > 0 && spent + trailer_line(omitted).len() > MAX_MEMORY_BYTES {
         let Some(last_in) = entries.iter_mut().rev().find(|e| e.in_index) else { break };
         let line_len = index_line(last_in).len();
@@ -313,6 +314,74 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
         omitted += 1;
     }
     MemoryScan { entries, omitted }
+}
+
+pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
+    let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
+        return MemoryScan::default();
+    };
+    let log = load_log(project_root);
+    let mut entries: Vec<MemoryEntry> = Vec::new();
+    for dirent in read_dir.flatten() {
+        let path = dirent.path();
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mtime = dirent.metadata().and_then(|m| m.modified()).ok();
+        if let Some(entry) = entry_from(name, &text, mtime, &log, now) {
+            entries.push(entry);
+        }
+    }
+    fill_index(entries)
+}
+
+/// One read of the memory directory producing BOTH the fingerprint bytes and
+/// the index selection from the SAME bytes, so a file replaced between two
+/// separate scans can no longer freeze one generation's index under another
+/// generation's fingerprint (Greptile). The fingerprint set is every
+/// valid-named `.md` (a write to any refreezes); the index is the describable,
+/// unfaded, in-budget subset.
+pub struct MemoryFreeze {
+    pub fingerprint_files: Vec<(PathBuf, Vec<u8>)>,
+    pub section: IndexSection,
+    pub identities: Vec<(String, u64)>,
+}
+
+pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
+    let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
+        return MemoryFreeze {
+            fingerprint_files: Vec::new(),
+            section: None,
+            identities: Vec::new(),
+        };
+    };
+    let log = load_log(project_root);
+    let mut fingerprint_files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut entries: Vec<MemoryEntry> = Vec::new();
+    for dirent in read_dir.flatten() {
+        let path = dirent.path();
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mtime = dirent.metadata().and_then(|m| m.modified()).ok();
+        // The SAME bytes feed the fingerprint and the index: a describable,
+        // UTF-8 file also enters the index; every valid-named file counts
+        // toward the fingerprint regardless.
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if let Some(entry) = entry_from(name, text, mtime, &log, now) {
+                entries.push(entry);
+            }
+        }
+        fingerprint_files.push((path, bytes));
+    }
+    fingerprint_files.sort_by(|a, b| a.0.cmp(&b.0));
+    let scan = fill_index(entries);
+    let (section, identities) = section_and_identities(&scan);
+    MemoryFreeze { fingerprint_files, section, identities }
 }
 
 fn trailer_line(omitted: usize) -> String {
@@ -342,12 +411,12 @@ pub fn indexed_identities(project_root: &Path, now: u64) -> Vec<(String, u64)> {
 /// (rendered index section, per-name byte breakdown) or None when empty.
 pub type IndexSection = Option<(String, Vec<(String, usize)>)>;
 
-pub fn index_and_identities(
-    project_root: &Path,
-    now: u64,
-) -> (IndexSection, Vec<(String, u64)>) {
+/// The rendered index section and receipt identities for a completed scan.
+/// Shared by `index_and_identities` (fresh scan) and `freeze_snapshot`
+/// (fingerprint + index in one read) so all three outputs describe the same
+/// selection.
+fn section_and_identities(scan: &MemoryScan) -> (IndexSection, Vec<(String, u64)>) {
     use std::hash::{Hash, Hasher};
-    let scan = scan(project_root, now);
     let shown: Vec<&MemoryEntry> = scan.entries.iter().filter(|e| e.in_index).collect();
     let identities: Vec<(String, u64)> = shown
         .iter()
@@ -375,26 +444,11 @@ pub fn index_and_identities(
     (section, identities)
 }
 
-/// The valid-named memory `.md` files (path, content) that a write must
-/// refreeze on: only these can ever reach the index, so a write to a
-/// bad-name file triggers nothing, and the fingerprint stays deterministic
-/// from disk (no dependency on `now`, the access log, or the budget).
-pub fn indexable_files(project_root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let dir = memory_dir(project_root);
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
-    let mut out: Vec<(PathBuf, Vec<u8>)> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "md"))
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(valid_name)
-        })
-        .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+pub fn index_and_identities(
+    project_root: &Path,
+    now: u64,
+) -> (IndexSection, Vec<(String, u64)>) {
+    section_and_identities(&scan(project_root, now))
 }
 
 pub fn index_section(project_root: &Path, now: u64) -> Option<(String, Vec<(String, usize)>)> {
@@ -488,6 +542,35 @@ mod tests {
 
     const HOUR: u64 = 3600;
     const DAY: u64 = 24 * HOUR;
+
+    /// freeze_snapshot reads each memory file ONCE, so the fingerprint set
+    /// and the index it returns describe the same generation of every file -
+    /// two separate scans could freeze one generation's index under another's
+    /// fingerprint (Greptile). A describable file is in both outputs; a
+    /// valid-named file with no describable first line counts toward the
+    /// fingerprint (a write to it still refreezes) but not the index.
+    #[test]
+    fn freeze_snapshot_derives_fingerprint_and_index_from_one_read() {
+        let dir = temp_project();
+        write_memory(&dir, "good", "# The deploy port is 7443\nbody");
+        write_memory(&dir, "nodesc", "\n\n");
+        let f = freeze_snapshot(&dir, 100 * DAY);
+        let fp: Vec<String> = f
+            .fingerprint_files
+            .iter()
+            .map(|(p, _)| p.file_stem().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(fp.contains(&"good".to_string()) && fp.contains(&"nodesc".to_string()),
+            "every valid-named file counts toward the fingerprint: {fp:?}");
+        let (section, _) = f.section.clone().expect("the describable file is indexed");
+        assert!(section.contains("The deploy port is 7443"), "{section}");
+        let names: Vec<&str> = f.identities.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"good") && !names.contains(&"nodesc"),
+            "only describable files are indexed: {names:?}");
+        // The index the freeze returns matches a plain scan of the same disk:
+        // the single read did not change what gets indexed.
+        assert_eq!(f.section, index_and_identities(&dir, 100 * DAY).0);
+    }
 
     /// The decay law itself: fresher beats older, more accesses beat fewer,
     /// and one recent use revives an old memory past a fresher-but-unused one.

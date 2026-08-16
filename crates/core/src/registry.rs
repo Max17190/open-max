@@ -274,21 +274,24 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
-    // Memory: the fingerprint hashes only VALID-named memory bytes (a write
-    // to one refreezes; the prompt's index rebuilds), deterministic from
-    // disk. The receipt's memory delta is the INDEXED selection - valid,
-    // unfaded, within budget - so it can never claim a file the prompt then
-    // omits (Greptile P1). Never ledgered (data, not capability).
+    // Memory: ONE read produces both the fingerprint bytes and the index, so
+    // the fingerprint (which decides refreeze) and the frozen index cannot be
+    // captured from two different file generations - an atomic replace between
+    // two scans could otherwise freeze the replacement's index under the
+    // original's fingerprint, and a restore-to-original would then skip the
+    // refreeze that would fix it (Greptile P1). The fingerprint hashes every
+    // VALID-named memory byte (a write to one refreezes); the index is the
+    // indexed subset of the SAME bytes. Never ledgered (data, not capability).
+    let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
     {
         let dir = project_root.join(crate::memory::MEMORY_DIR);
         dir.hash(&mut h);
-        for (path, bytes) in crate::memory::indexable_files(project_root) {
+        for (path, bytes) in &mem.fingerprint_files {
             path.hash(&mut h);
             bytes.hash(&mut h);
         }
     }
-    let (memory_section, memory_files) =
-        crate::memory::index_and_identities(project_root, crate::memory::unix_now());
+    let (memory_section, memory_files) = (mem.section, mem.identities);
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
