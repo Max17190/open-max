@@ -3171,7 +3171,13 @@ async fn run_loop(
                                         .to_string_lossy()
                                         .into_owned();
                                     let repair_denied = |tool: &str| {
-                                        [abs.as_str(), ".openmax/permissions.toml"].iter().any(|p| {
+                                        [
+                                            abs.as_str(),
+                                            ".openmax/permissions.toml",
+                                            "./.openmax/permissions.toml",
+                                        ]
+                                        .iter()
+                                        .any(|p| {
                                             matches!(
                                                 permissions.evaluate(
                                                     tool,
