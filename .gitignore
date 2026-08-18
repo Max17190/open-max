@@ -17,6 +17,3 @@ target
 
 # Local contributor/agent instructions (not shipped)
 AGENTS.md
-
-# Plan-mode runtime state (written by the plan-mode hooks, never shipped)
-.openmax/state/
