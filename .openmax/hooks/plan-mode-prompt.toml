@@ -1,3 +1,0 @@
-event = "user_prompt_submit"
-command = "./scripts/plan-mode-prompt.py"
-timeout_secs = 5
