@@ -662,18 +662,21 @@ mod tests {
     fn agents_example_fits_the_injection_cap() {
         // The template lives at the workspace root, which is where development
         // and CI run this test. A packaged crate carries no copy of it and has
-        // nothing to protect, so the guard reports that and returns instead of
-        // failing on a file that was never part of the crate.
+        // nothing to protect, so an ABSENT file is reported and skipped. Only
+        // absence: a template that exists but cannot be read (permissions, an
+        // I/O fault) is a template whose size this guard failed to check, and
+        // that is a failure, not a skip.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.example.md");
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(e) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
-                    "skipping: {} is not present ({e}); this guard measures the workspace template",
+                    "skipping: {} is not present; this guard measures the workspace template",
                     path.display()
                 );
                 return;
             }
+            Err(e) => panic!("cannot read {} to measure it against the cap: {e}", path.display()),
         };
         let bytes = text.trim().len();
         assert!(
