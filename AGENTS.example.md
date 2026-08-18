@@ -18,7 +18,7 @@ Native Rust coding-agent harness: one focused loop, small tools, fast TUI, exten
 
 ## What ships
 
-Seven tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`) plus the file surfaces the system prompt names; each also loads from `~/.openmax/`, project wins on a name collision. `openmax --spec <surface>` prints a contract; `openmax --check` validates every file with reasons (run it after writing one). Hooks and permission `allow` rules wait for a human's `openmax --approve`. Headless and stdio runs need `--trust-project` once.
+Seven tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`) plus the file surfaces the system prompt names; tools, skills, prompt templates, hooks, and permissions also load from `~/.openmax/`, project wins on a name collision. `openmax --spec <surface>` prints a contract; `openmax --check` validates every file with reasons. Hooks and permission `allow` rules wait for a human's `openmax --approve`. Headless and stdio runs need `--trust-project` once.
 
 Not shipped: user keybindings, theme file hot reload, pluggable compactors, TUI plugin ABI (custom frontends speak `--stdio` JSONL).
 
