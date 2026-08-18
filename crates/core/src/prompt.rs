@@ -652,6 +652,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The shipped template must inject whole. It describes the cap it is
+    /// subject to, and it had grown past it (2,854 bytes): a project that
+    /// copied it verbatim lost every rule under "Development" to the
+    /// truncation note, mid-sentence, on every request. Bullets added to the
+    /// top push the rules at the bottom off the end, so the file is measured
+    /// here the same way agents_md() measures it.
+    #[test]
+    fn agents_example_fits_the_injection_cap() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.example.md");
+        let text = std::fs::read_to_string(&path).expect("AGENTS.example.md at the repo root");
+        let bytes = text.trim().len();
+        assert!(
+            bytes <= MAX_AGENTS_MD_BYTES,
+            "AGENTS.example.md is {bytes} bytes; agents_md() injects at most {MAX_AGENTS_MD_BYTES}, \
+             so a verbatim copy is truncated. Trim it rather than raising the cap."
+        );
+    }
+
     /// Measurement helper for cap raises (see the budget-gate comment): dumps
     /// the exact path-free payload the cap test measures so a real tokenizer
     /// can count it. Run with `--ignored --nocapture`; files land in the OS

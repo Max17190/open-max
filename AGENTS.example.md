@@ -1,6 +1,6 @@
 # Open Max (project instructions)
 
-Copy to `AGENTS.md` to inject (capped ~2KB at session create). Concrete facts only.
+Copy to `AGENTS.md` to inject (capped at 2,000 bytes at session create; the rest is cut). Concrete facts only.
 
 ## Thesis
 
@@ -18,19 +18,7 @@ Native Rust coding-agent harness: one focused loop, small tools, fast TUI, exten
 
 ## What ships
 
-Tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
-
-- Tools: `.openmax/tools/*.toml` or `~/.openmax/tools/`
-- Skills: `.agents/skills/*/SKILL.md` or `~/.openmax/skills/` (index only; read body on demand)
-- Prompt templates: `.agents/prompts/<name>.md` or `~/.openmax/prompts/` (`$ARGUMENTS`, `$1`..`$9`; user runs `/<name>`)
-- Hooks: `.openmax/hooks/*.toml` (`pre_tool_use` / `user_prompt_submit` gate; `post_tool_use` / `session_start` / `compaction` / `turn_end` observe; not in prompt)
-- Permissions: `.openmax/permissions.toml` or `~/.openmax/permissions.toml` (allow/deny/ask; not in prompt)
-- Trust: exact canonical project roots in `~/.openmax/trust.json`; headless/stdio require `--trust-project` once
-- Providers: `~/.openmax/providers.json`; `/theme` for built-in palettes
-- Built-in compaction with model-written summaries (heuristic digest fallback); tools/skills re-freeze from one immutable byte snapshot when their files change (`/reload` forces now, `/new` for clean)
-- Read-only tool fanout is bounded by `max_parallel_tools` (default 4, runtime range 1 through 32); mutation and approval stay serial
-- `openmax --check` validates every extension file with per-file reasons; run it after writing one
-- `openmax --spec <surface>` prints the full authoring contract (fields, payloads, activation) for tools, skills, prompts, hooks, permissions, providers, or stdio
+Seven tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`) plus the file surfaces the system prompt names; each also loads from `~/.openmax/`, project wins on a name collision. `openmax --spec <surface>` prints a contract; `openmax --check` validates every file with reasons (run it after writing one). Hooks and permission `allow` rules wait for a human's `openmax --approve`. Headless and stdio runs need `--trust-project` once.
 
 Not shipped: user keybindings, theme file hot reload, pluggable compactors, TUI plugin ABI (custom frontends speak `--stdio` JSONL).
 
