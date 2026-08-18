@@ -73,8 +73,6 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     let mut tools_found: Vec<Entry> = Vec::new();
-    #[allow(unused_assignments)]
-    let mut external_names: Vec<String> = Vec::new();
     let mut tool_meta: Vec<(String, PathBuf)> = Vec::new();
     // Deferred to after shadowing and the cap: a file the loader never reaches
     // has no runtime behavior to describe. Indices into `tools_found`.
@@ -97,7 +95,6 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 }
                 Ok(spec) => {
                     id = Some(spec.name.clone());
-                    external_names.push(spec.name.clone());
                     tool_meta.push((spec.name.clone(), path.clone()));
                     if let Some(reason) = source.as_deref().ok().and_then(|text| {
                         clamped_timeout_reason(
@@ -185,7 +182,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // beyond-cap tool is as dead as one naming a typo, but a warned entry is
     // still live - a tool whose command does not exist yet, or whose code
     // awaits re-approval, loads all the same, so a rule naming it matches.
-    external_names = tools_found
+    let external_names: Vec<String> = tools_found
         .iter()
         .filter(|(f, id)| id.is_some() && !matches!(f.status, Status::Err(_)))
         .filter_map(|(_, id)| id.clone())

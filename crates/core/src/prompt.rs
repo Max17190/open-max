@@ -652,6 +652,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The shipped template must inject whole. It describes the cap it is
+    /// subject to, and it had grown past it (2,854 bytes): a project that
+    /// copied it verbatim lost every rule under "Development" to the
+    /// truncation note, mid-sentence, on every request. Bullets added to the
+    /// top push the rules at the bottom off the end, so the file is measured
+    /// here the same way agents_md() measures it.
+    #[test]
+    fn agents_example_fits_the_injection_cap() {
+        // The template lives at the workspace root, which is where development
+        // and CI run this test. A packaged crate carries no copy of it and has
+        // nothing to protect, so an ABSENT file is reported and skipped. Only
+        // absence: a template that exists but cannot be read (permissions, an
+        // I/O fault) is a template whose size this guard failed to check, and
+        // that is a failure, not a skip.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.example.md");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping: {} is not present; this guard measures the workspace template",
+                    path.display()
+                );
+                return;
+            }
+            Err(e) => panic!("cannot read {} to measure it against the cap: {e}", path.display()),
+        };
+        let bytes = text.trim().len();
+        assert!(
+            bytes <= MAX_AGENTS_MD_BYTES,
+            "AGENTS.example.md is {bytes} bytes; agents_md() injects at most {MAX_AGENTS_MD_BYTES}, \
+             so a verbatim copy is truncated. Trim it rather than raising the cap."
+        );
+    }
+
     /// Measurement helper for cap raises (see the budget-gate comment): dumps
     /// the exact path-free payload the cap test measures so a real tokenizer
     /// can count it. Run with `--ignored --nocapture`; files land in the OS

@@ -21,12 +21,10 @@ use crate::theme;
 pub type Term = Terminal<CrosstermBackend<crate::FrameWriter<std::io::Stdout>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum BlockKind {
     User,
     Assistant,
     Tool,
-    Thinking,
     System,
 }
 
@@ -195,7 +193,7 @@ impl Block {
         self.selectable_chars = self.selectable.chars().count();
         let gutter = match self.kind {
             BlockKind::User => 2,
-            BlockKind::Assistant | BlockKind::Tool | BlockKind::Thinking | BlockKind::System => 0,
+            BlockKind::Assistant | BlockKind::Tool | BlockKind::System => 0,
         };
         let content_width = width.saturating_sub(gutter).max(8);
         let (wrapped, maps) = wrap_lines_mapped(self.source_lines(), content_width);
@@ -511,11 +509,6 @@ impl Transcript {
 
     pub fn offset(&self) -> usize {
         self.offset
-    }
-
-    #[allow(dead_code)]
-    pub fn is_following(&self) -> bool {
-        self.offset == 0
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -1055,17 +1048,6 @@ impl Transcript {
         self.selected = None;
     }
 
-    /// Total wrapped height and current thumb position for a 1-col scrollbar.
-    #[allow(dead_code)]
-    pub fn scrollbar(&mut self, viewport: usize) -> Option<(usize, usize, usize)> {
-        self.ensure_flat();
-        let total = self.wrapped.len();
-        if total <= viewport {
-            return None;
-        }
-        // (total, viewport, offset_from_bottom)
-        Some((total, viewport, self.offset))
-    }
 }
 
 fn line_is_blank(l: &Line<'_>) -> bool {
@@ -1390,7 +1372,7 @@ fn decorate_line(
         }
         BlockKind::Assistant => (line, 0),
         BlockKind::Tool => (surface_line(line, width, theme::SURFACE()), 0),
-        BlockKind::Thinking | BlockKind::System => (line, 0),
+        BlockKind::System => (line, 0),
     }
 }
 
