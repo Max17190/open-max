@@ -660,8 +660,21 @@ mod tests {
     /// here the same way agents_md() measures it.
     #[test]
     fn agents_example_fits_the_injection_cap() {
+        // The template lives at the workspace root, which is where development
+        // and CI run this test. A packaged crate carries no copy of it and has
+        // nothing to protect, so the guard reports that and returns instead of
+        // failing on a file that was never part of the crate.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.example.md");
-        let text = std::fs::read_to_string(&path).expect("AGENTS.example.md at the repo root");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!(
+                    "skipping: {} is not present ({e}); this guard measures the workspace template",
+                    path.display()
+                );
+                return;
+            }
+        };
         let bytes = text.trim().len();
         assert!(
             bytes <= MAX_AGENTS_MD_BYTES,
