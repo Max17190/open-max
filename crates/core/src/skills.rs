@@ -7,7 +7,8 @@
 //! project's `.agents/skills/<name>/SKILL.md` — the emerging cross-harness
 //! convention — with the project winning on name collision. A SKILL.md
 //! carries `---`-delimited frontmatter with `name:` and `description:`;
-//! only those two scalar keys are read, so no YAML dependency is needed.
+//! only those two keys are read (bare, double-quoted, or a `>`/`|` block
+//! scalar for the description), so no YAML dependency is needed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,13 +102,68 @@ pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, S
 pub(crate) fn raw_description(text: &str) -> Option<String> {
     let body = text.strip_prefix("---")?;
     let end = body.find("\n---")?;
+    frontmatter_description(&body[..end])
+}
+
+/// The `description:` value of one frontmatter block, folded to a single
+/// line. Three spellings are read: a bare value, a double-quoted value, and
+/// a YAML block scalar (`>` folded or `|` literal, with an optional `-`/`+`
+/// chomping indicator), whose value is the indented lines that follow.
+/// Multi-line values fold to one line because the index line is one line;
+/// the frontmatter's `>` says the author meant that too. The last
+/// `description:` key wins, as before. Anything more exotic (single quotes,
+/// flow mappings, anchors) reads as its literal spelling.
+pub(crate) fn frontmatter_description(block: &str) -> Option<String> {
+    let lines: Vec<&str> = block.lines().collect();
     let mut description = None;
-    for line in body[..end].lines() {
-        if let Some(v) = line.trim().strip_prefix("description:") {
-            description = Some(v.trim().trim_matches('"').replace(['\n', '\r'], " "));
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let indent = line.len() - line.trim_start().len();
+        i += 1;
+        let Some(value) = line.trim().strip_prefix("description:") else {
+            continue;
+        };
+        let value = value.trim();
+        if is_block_scalar_indicator(value) {
+            // The value is the run of lines indented deeper than the key
+            // (blank lines inside it are allowed); the run ends at the first
+            // non-blank line at or above the key's indentation.
+            let mut parts: Vec<&str> = Vec::new();
+            while i < lines.len() {
+                let next = lines[i];
+                if next.trim().is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let next_indent = next.len() - next.trim_start().len();
+                if next_indent <= indent {
+                    break;
+                }
+                parts.push(next.trim());
+                i += 1;
+            }
+            description = Some(parts.join(" "));
+        } else {
+            description = Some(value.trim_matches('"').replace(['\n', '\r'], " "));
         }
     }
     description
+}
+
+/// `>` or `|`, optionally followed by a chomping indicator (`-`, `+`) and/or
+/// an explicit indentation digit, in either order: the YAML block scalar
+/// header spellings that reach frontmatter in practice.
+fn is_block_scalar_indicator(value: &str) -> bool {
+    let mut chars = value.chars();
+    if !matches!(chars.next(), Some('>') | Some('|')) {
+        return false;
+    }
+    let rest: Vec<char> = chars.collect();
+    rest.len() <= 2
+        && rest.iter().all(|c| matches!(c, '-' | '+') || c.is_ascii_digit())
+        && rest.iter().filter(|c| matches!(c, '-' | '+')).count() <= 1
+        && rest.iter().filter(|c| c.is_ascii_digit()).count() <= 1
 }
 
 #[cfg(test)]
@@ -169,5 +225,36 @@ mod tests {
         assert_eq!(names, sorted, "must be sorted for deterministic prompts");
         assert!(skills[0].description.chars().count() <= MAX_SKILL_DESC_CHARS + 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A description written as a YAML block scalar (the multi-line spelling
+    /// third-party skill packages ship) folds to one index line. Reading the
+    /// header alone indexed such a skill as `>`, a line that says nothing.
+    #[test]
+    fn block_scalar_descriptions_fold_to_one_line() {
+        let folded = "name: stack\ndescription: >\n  Manages stacked branches.\n  Use for stack creation, sync, or merge;\n\n  whenever a stack is checked out.\nmetadata:\n  author: someone\n  version: \"0.1.0\"";
+        let spec = parse_skill_source(Path::new("SKILL.md"), &format!("---\n{folded}\n---\nbody\n"))
+            .unwrap();
+        assert_eq!(
+            spec.description,
+            "Manages stacked branches. Use for stack creation, sync, or merge; whenever a stack is checked out."
+        );
+
+        // Literal and chomping spellings read the same way; the next key at
+        // the parent's indentation ends the value.
+        for header in [">-", "|", "|+", ">2"] {
+            let text = format!("---\nname: n\ndescription: {header}\n    first line\n    second line\ntags: x\n---\nbody\n");
+            let spec = parse_skill_source(Path::new("SKILL.md"), &text).unwrap();
+            assert_eq!(spec.description, "first line second line", "header {header}");
+        }
+
+        // An indicator with nothing under it is an empty description, which
+        // --check names; it is never the indicator character itself.
+        let empty = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >\ntags: x\n---\nbody\n").unwrap();
+        assert_eq!(empty.description, "");
+
+        // A bare `>` inside a quoted or bare value is not a block header.
+        let bare = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: use > for redirects\n---\nbody\n").unwrap();
+        assert_eq!(bare.description, "use > for redirects");
     }
 }

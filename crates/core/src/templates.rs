@@ -179,15 +179,12 @@ pub(crate) fn raw_description(text: &str) -> Option<String> {
     frontmatter_description(text)
 }
 
+/// Same reader as SKILL.md (`skills::frontmatter_description`): bare,
+/// double-quoted, or a `>`/`|` block scalar folded to one line.
 fn frontmatter_description(text: &str) -> Option<String> {
     let rest = text.strip_prefix("---")?;
     let end = frontmatter_end(text)?;
-    for line in rest[..end].lines() {
-        if let Some(v) = line.trim().strip_prefix("description:") {
-            return Some(v.trim().trim_matches('"').replace(['\n', '\r'], " "));
-        }
-    }
-    None
+    crate::skills::frontmatter_description(&rest[..end])
 }
 
 /// Substitute `$ARGUMENTS` (the raw argument string) and `$1`..`$9`

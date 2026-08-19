@@ -1590,12 +1590,17 @@ fn template_description_gap(text: &str, name: &str) -> Option<String> {
 }
 
 fn skill_description_gap(text: &str, name: &str) -> Option<String> {
-    let written = crate::skills::raw_description(text).unwrap_or_default();
-    if written.trim().is_empty() {
+    let written = crate::skills::raw_description(text);
+    if written.as_deref().is_none_or(|w| w.trim().is_empty()) {
+        // A key that is present but empty (a bare `description:`, or a
+        // `>`/`|` block header with nothing indented under it) reads the
+        // same to the index as no key at all, and is named as what it is.
+        let how = if written.is_some() { "an empty" } else { "no" };
         return Some(format!(
-            "'{name}' has no `description:`, so its line in the frozen skills index is a bare name: the index line cannot say when to use it, and the model has nothing else to go on"
+            "'{name}' has {how} `description:`, so its line in the frozen skills index is a bare name: the index line cannot say when to use it, and the model has nothing else to go on"
         ));
     }
+    let written = written.unwrap_or_default();
     let cap = crate::skills::MAX_SKILL_DESC_CHARS;
     let chars = written.chars().count();
     (chars > cap).then(|| {
@@ -2198,16 +2203,35 @@ mod tests {
             root.join(".agents/skills/good/SKILL.md"),
             "---\nname: good\ndescription: cuts a release, when the changelog is ready\n---\nbody\n",
         );
+        // A block scalar with nothing under it: the key is there, the value
+        // is not, and before block scalars were read the index carried `>`.
+        write(
+            root.join(".agents/skills/hollow/SKILL.md"),
+            "---\nname: hollow\ndescription: >\n---\nbody\n",
+        );
+        // The multi-line spelling third-party packages ship: folded to one
+        // index line, and healthy.
+        write(
+            root.join(".agents/skills/folded/SKILL.md"),
+            "---\nname: folded\ndescription: >\n  Manages stacked branches.\n  Use when a stack is checked out.\nmetadata:\n  author: someone\n---\nbody\n",
+        );
 
         let findings = check_at(&root, &data);
-        for (dir, name) in [("silent", "silent"), ("blank", "blank")] {
+        for (dir, name, how) in [("silent", "silent", "no"), ("blank", "blank", "an empty"), ("hollow", "hollow", "an empty")] {
             match &find(&findings, &format!("{dir}/SKILL.md")).status {
                 Status::Warn(reason) => {
-                    assert!(reason.contains(&format!("'{name}' has no `description:`")), "{reason}");
+                    assert!(reason.contains(&format!("'{name}' has {how} `description:`")), "{reason}");
                     assert!(reason.contains("when to use it"), "{reason}");
                 }
                 other => panic!("a skill with no description must warn: {other:?}"),
             }
+        }
+        match &find(&findings, "folded/SKILL.md").status {
+            Status::Ok(summary) => assert!(
+                summary.contains("skill 'folded'"),
+                "a folded description is a healthy skill: {summary}"
+            ),
+            other => panic!("a folded block scalar description is healthy: {other:?}"),
         }
         match &find(&findings, "wordy/SKILL.md").status {
             Status::Warn(reason) => {
