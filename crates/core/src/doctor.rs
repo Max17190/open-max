@@ -758,7 +758,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 /// in the pasted repair command would run `$(cmd)` instead of naming the
 /// file. POSIX single-quoting neutralizes every metacharacter, including an
 /// embedded single quote (closed, escaped, reopened).
-pub(crate) fn shell_quote(path: &std::path::Path) -> String {
+pub fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
