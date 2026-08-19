@@ -121,10 +121,12 @@ Human approval: because of that authority, the first call of any tool file -
 mutating or not - stops for a human, who approves the exact bytes. Later calls
 of identical bytes run unprompted; any edit revokes and asks again. Approve
 at an interactive terminal outside any session with `openmax --approve
-.openmax/tools/<name>.toml` (a human act: it refuses agent-spawned processes
-and callers with no terminal, so it cannot be laundered through bash), or by
-approving the write that created it. `openmax --spec usage` lists the approval
-state of every installed tool.
+.openmax/tools/<name>.toml` (a human act: it refuses processes carrying the
+session marker and callers with no terminal, so it never happens by accident
+from a session; a shell that clears the marker or attests is a command the
+human's ask rule on bash puts in front of them), or by approving the write
+that created it. `openmax --spec usage` lists the approval state of every
+installed tool.
 
 What "the exact bytes" covers is the whole definition: the `.toml` *and* the
 project-local file its `command` (or a path in `args`) names, because that file

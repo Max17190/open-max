@@ -136,8 +136,9 @@ work in a trusted project. To harden a project:
 - `"approval_mode": "ask"` in settings.json puts every mutating call in
   front of you, or
 - keep auto mode but add an ask rule for bash in your **global**
-  `~/.openmax/permissions.toml` (outside the project root, so the agent
-  cannot edit it):
+  `~/.openmax/permissions.toml` (outside the project root, where the
+  confined file tools cannot reach it; a bash edit to it is a command this
+  very rule puts in front of you first):
 
 ```toml
 [[rules]]
@@ -146,13 +147,27 @@ tool = "bash"
 ```
 
 External tools are narrower than bash by construction: every tool's first
-run needs your approval of its exact bytes (`openmax --approve` and
-`--trust-project` refuse agent-spawned processes AND callers with no
-terminal, so an agent cannot launder a grant through `env -u` in bash;
-automation a human runs may set `OPENMAX_HUMAN_ATTEST=1`), its environment is scrubbed to
+run needs your approval of its exact bytes, its environment is scrubbed to
 a baseline plus the `env` names its approved manifest declares, and
 unapproved tool code can only ever execute as a sandboxed probe (no
 network, writes confined) via `openmax --check --run-examples`.
+
+What makes an approval a human act is worth stating exactly. `openmax
+--approve` and `--trust-project` refuse any process carrying the session
+marker every child of the harness gets, refuse callers with no terminal,
+and honor `OPENMAX_HUMAN_ATTEST=1` for automation a human runs. Those are
+walls against a grant happening by accident, and they hold against an
+agent that follows the prompt; they are not a guarantee against an agent
+that sets out to grant itself authority, because a shell the agent runs
+can clear a marker, set one, or allocate a terminal, and the ledger record
+that results is indistinguishable from yours. In `auto` mode the only trace
+is the note at the next turn start naming approval activity this session
+did not make. The hardened profile above is what closes it: with bash
+asking, the command that would arrange those markers is a command you see
+before it runs. The same holds for the permission and trust files under
+`~/.openmax/`: outside the project root, so the confined file tools cannot
+touch them, and bash can, which is why the ask rule on bash is the
+durable protection rather than the location.
 
 Residual risk to know about: an *approved* tool or a bash command can fetch
 content at runtime (`curl | sh`) that no approval ever covered. Approval
