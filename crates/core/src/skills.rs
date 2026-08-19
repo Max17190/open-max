@@ -129,13 +129,14 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
         };
         let value = value.trim();
         if let Some(explicit) = block_scalar_indent(value) {
-            // The value is the run of lines indented past the key: by at
-            // least the explicit indentation digit when the header gives
-            // one (a shallower line ends the block, so under-indented text
-            // never populates the index), else by any amount. Blank lines
-            // inside the run are allowed; the first non-blank line at or
-            // above that depth ends it.
-            let min_indent = indent + explicit.unwrap_or(1);
+            // The value is the run of lines at the block's indentation or
+            // deeper: the explicit digit when the header gives one, else the
+            // depth of the first non-blank line, which YAML infers the same
+            // way. Either way that depth must exceed the key's, and the first
+            // non-blank line shallower than it ends the block, so under- or
+            // unevenly indented text never populates the index. Blank lines
+            // inside the run are allowed.
+            let mut min_indent = explicit.map(|n| indent + n);
             let mut parts: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let next = lines[i];
@@ -144,7 +145,8 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
                     continue;
                 }
                 let next_indent = next.len() - next.trim_start().len();
-                if next_indent < min_indent {
+                let floor = *min_indent.get_or_insert(next_indent);
+                if next_indent < floor || next_indent <= indent {
                     break;
                 }
                 parts.push(next.trim());
@@ -275,6 +277,14 @@ mod tests {
         assert_eq!(deep.description, "six spaces");
         let zero = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >0\n  text\n---\nbody\n").unwrap();
         assert_eq!(zero.description, ">0", "a zero digit is not a YAML header");
+
+        // Without a digit the first content line sets the depth, as YAML
+        // infers it; a later shallower line ends the block instead of being
+        // folded in (review finding), even when it is deeper than the key.
+        let uneven = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >\n    four deep\n  two deep\n---\nbody\n").unwrap();
+        assert_eq!(uneven.description, "four deep");
+        let deeper_later = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >\n  two deep\n    four deep\n---\nbody\n").unwrap();
+        assert_eq!(deeper_later.description, "two deep four deep", "deeper continuation lines fold in");
 
         // Duplicate keys: SKILL.md keeps its last-key reading, prompt
         // templates keep their first-key reading (each as before).
