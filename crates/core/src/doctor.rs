@@ -694,18 +694,23 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let settings_path = crate::config::settings_path(data_dir);
     if settings_path.exists() {
         match crate::config::load(data_dir) {
+            // A file that parses can still refuse every turn: no endpoint, no
+            // model, or no context window resolves. Say so here, where the
+            // reader is looking, rather than at the first prompt.
             Ok(settings) => findings.push(Finding {
                 kind: "settings",
                 path: settings_path,
-                status: Status::Ok(format!(
-                    "model {} via {}; read at launch, not hot (openmax --spec settings)",
-                    if settings.model.is_empty() { "<unset>" } else { settings.model.as_str() },
-                    settings
-                        .provider
-                        .as_deref()
-                        .filter(|p| !p.trim().is_empty())
-                        .unwrap_or(if settings.base_url.is_empty() { "<no endpoint>" } else { "base_url" })
-                )),
+                status: match crate::providers::resolve(&settings, data_dir) {
+                    Ok(endpoint) => Status::Ok(format!(
+                        "model {} via {}, {}-token window; read at launch, not hot (openmax --spec settings)",
+                        endpoint.model,
+                        endpoint.provider.as_deref().unwrap_or("base_url"),
+                        endpoint.context_tokens,
+                    )),
+                    Err(reason) => Status::Warn(format!(
+                        "parses, but every turn will refuse until this resolves: {reason}; read at launch, not hot (openmax --spec settings)"
+                    )),
+                },
             }),
             Err(reason) => findings.push(Finding {
                 kind: "settings",
@@ -3673,13 +3678,28 @@ mod tests {
 
         std::fs::write(
             data.join("settings.json"),
-            r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto"}"#,
+            r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto","context_tokens":32768}"#,
         )
         .unwrap();
         let findings = check_at(&root, &data);
         let s = findings.iter().find(|f| f.kind == "settings").unwrap();
         assert!(matches!(s.status, Status::Ok(_)), "{:?}", s.status);
         assert!(s.status.summary().contains("read at launch"), "{}", s.status.summary());
+        assert!(s.status.summary().contains("32768-token window"), "{}", s.status.summary());
+
+        // Parses, launches, and then refuses every turn: the window is not
+        // guessed, so a file without one is named here rather than at the
+        // first prompt.
+        std::fs::write(
+            data.join("settings.json"),
+            r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto"}"#,
+        )
+        .unwrap();
+        let findings = check_at(&root, &data);
+        let s = findings.iter().find(|f| f.kind == "settings").unwrap();
+        assert!(matches!(s.status, Status::Warn(_)), "{:?}", s.status);
+        assert!(s.status.summary().contains("context_tokens"), "{}", s.status.summary());
+        assert!(s.status.summary().contains("every turn will refuse"), "{}", s.status.summary());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }

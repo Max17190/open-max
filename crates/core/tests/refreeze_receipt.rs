@@ -123,6 +123,7 @@ async fn the_request_after_a_refreeze_carries_the_receipt_and_the_new_tool_name(
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )
@@ -175,6 +176,7 @@ fn write_config(data: &std::path::Path, base_url: &str, project: &std::path::Pat
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )

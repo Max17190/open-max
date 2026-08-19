@@ -433,6 +433,10 @@ pub enum ResolveError {
     MissingEndpoint,
     /// No model id configured for the resolved endpoint.
     MissingModel,
+    /// No context window configured for the resolved model: neither the
+    /// provider's model entry nor settings.json says how large it is, and the
+    /// harness never guesses one.
+    MissingContextTokens,
     /// Settings named a provider that is not in providers.json.
     UnknownProvider(String),
     /// providers.json exists but is not valid JSON: every provider is
@@ -452,6 +456,10 @@ impl std::fmt::Display for ResolveError {
             ResolveError::MissingModel => write!(
                 f,
                 "no model configured: set model in ~/.openmax/settings.json"
+            ),
+            ResolveError::MissingContextTokens => write!(
+                f,
+                "no context window configured: set context_tokens in ~/.openmax/settings.json (read at launch; restart after editing) or in the model's entry in ~/.openmax/providers.json (hot) to what the endpoint actually serves; nothing is queried from the server"
             ),
             ResolveError::UnknownProvider(name) => write!(
                 f,
@@ -498,7 +506,8 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         let model_entry = p.models.iter().find(|m| m.id == model);
         let context_tokens = model_entry
             .and_then(|m| m.context_tokens)
-            .unwrap_or(settings.context_tokens)
+            .or(settings.context_tokens)
+            .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
         let mut max_tokens = model_entry
             .and_then(|m| m.max_tokens)
@@ -536,7 +545,10 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     if model.is_empty() {
         return Err(ResolveError::MissingModel);
     }
-    let context_tokens = settings.context_tokens.max(1);
+    let context_tokens = settings
+        .context_tokens
+        .ok_or(ResolveError::MissingContextTokens)?
+        .max(1);
     let max_allowed = context_tokens.saturating_sub(2048).max(1);
     let max_tokens = settings.max_tokens.max(1).min(max_allowed);
     Ok(ActiveEndpoint {
@@ -646,6 +658,7 @@ mod tests {
             base_url: "http://127.0.0.1:11434/v1".into(),
             model: "qwen".into(),
             api_key: Some("k".into()),
+            context_tokens: Some(32_768),
             ..Default::default()
         };
         let ep = resolve(&s, &dir).unwrap();
@@ -864,6 +877,7 @@ mod tests {
         let mut s = Settings {
             provider: Some("a".into()),
             model: "m".into(),
+            context_tokens: Some(32_768),
             ..Default::default()
         };
         let ep = resolve(&s, &dir).unwrap();
@@ -985,6 +999,54 @@ mod tests {
         let ep = resolve(&s, &dir).unwrap();
         assert!(ep.max_tokens + 1024 < ep.context_tokens || ep.context_tokens <= 2048);
         assert!(ep.max_tokens <= ep.context_tokens.saturating_sub(2048).max(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The window is never guessed. Absent everywhere it is a resolve error
+    /// that names both places it can be set; a per-model entry satisfies it
+    /// on its own, and settings.json satisfies it for a model the catalog
+    /// does not size.
+    #[test]
+    fn a_context_window_is_required_from_settings_or_the_model_entry() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        invalidate_providers_cache();
+
+        let flat = Settings {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "qwen".into(),
+            ..Default::default()
+        };
+        let err = resolve(&flat, &dir).unwrap_err();
+        assert!(matches!(err, ResolveError::MissingContextTokens), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("context_tokens"), "{text}");
+        assert!(text.contains("settings.json") && text.contains("providers.json"), "{text}");
+
+        write_providers(
+            &dir,
+            r#"{
+              "providers": {
+                "sized": {
+                  "base_url": "http://s/v1",
+                  "models": [{ "id": "big", "context_tokens": 200000 }, { "id": "unsized" }]
+                }
+              }
+            }"#,
+        );
+        let mut named = Settings {
+            provider: Some("sized".into()),
+            model: "big".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&named, &dir).unwrap().context_tokens, 200_000);
+
+        named.model = "unsized".into();
+        let err = resolve(&named, &dir).unwrap_err();
+        assert!(matches!(err, ResolveError::MissingContextTokens), "{err:?}");
+        named.context_tokens = Some(32_768);
+        assert_eq!(resolve(&named, &dir).unwrap().context_tokens, 32_768);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

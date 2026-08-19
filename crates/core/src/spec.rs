@@ -619,7 +619,8 @@ refuse to start (exit 2) until fixed. A missing file means defaults. The
 TUI rewrites the whole file on `/model`, `/provider`, and `/approvals`, so
 manual edits can be overwritten by the next in-app settings change.
 
-Fields (all optional in JSON; empty `base_url`/`model` fail at resolve):
+Fields (all optional in JSON; an empty `base_url`/`model` or a missing
+`context_tokens` fails at resolve, i.e. every turn refuses with the reason):
 - `provider`: named entry in providers.json; supplies base_url/credentials/
   headers when set. Flat fields below are the fallback.
 - `base_url`: OpenAI-compatible endpoint root (the harness calls
@@ -627,8 +628,12 @@ Fields (all optional in JSON; empty `base_url`/`model` fail at resolve):
 - `api_key`: literal, or `$ENV_VAR` indirection; `OPENMAX_API_KEY` also works.
 - `model`: model id sent with every request.
 - `approval_mode`: `auto` | `ask` | `readonly`.
-- `context_tokens`, `max_tokens`, `temperature`: request shaping; per-model
-  entries in providers.json override the first two.
+- `context_tokens`: the model's context window in tokens. REQUIRED here or
+  in the model's providers.json entry (which wins); no default, nothing is
+  queried from the server, and a guessed window is wrong in one direction or
+  the other. `openmax --check` warns while it is missing.
+- `max_tokens`, `temperature`: request shaping; a per-model `max_tokens` in
+  providers.json overrides.
 - `max_output_bytes`: tool-output byte cap before tail-truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced.

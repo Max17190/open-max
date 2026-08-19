@@ -131,6 +131,7 @@ async fn a_deny_rule_written_this_turn_gates_the_same_turn() {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )
@@ -213,6 +214,7 @@ async fn a_deny_live_at_turn_start_survives_its_own_removal_for_the_turn() {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )
@@ -289,6 +291,7 @@ async fn a_deny_added_mid_turn_survives_its_removal_for_the_turn() {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )
@@ -360,6 +363,7 @@ async fn a_deny_written_earlier_in_the_same_response_gates_the_next_call() {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )
@@ -426,6 +430,7 @@ async fn a_policy_written_by_a_failed_mutation_still_gates() {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )

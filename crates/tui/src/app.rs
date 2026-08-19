@@ -2328,7 +2328,7 @@ impl App {
                         s.model.clone(),
                         extensions::display_base_url(&s.base_url),
                         extensions::endpoint_host(&s.base_url).unwrap_or_else(|| s.base_url.clone()),
-                        s.context_tokens,
+                        s.context_tokens.unwrap_or(0),
                     ),
                 };
                 let block = vec![
@@ -2337,7 +2337,14 @@ impl App {
                     kv("endpoint", &endpoint),
                     kv("host", &host),
                     kv("approvals", self.core.approval_mode().as_str()),
-                    kv("context", &format!("{ctx} of {} tokens", context_tokens)),
+                    kv(
+                        "context",
+                        &if context_tokens == 0 {
+                            format!("{ctx} tokens of an unset window (context_tokens)")
+                        } else {
+                            format!("{ctx} of {context_tokens} tokens")
+                        },
+                    ),
                     kv("cache", &cache),
                     kv("ttft", &ttft),
                     kv("throughput", &throughput),

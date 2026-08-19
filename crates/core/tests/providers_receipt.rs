@@ -138,6 +138,7 @@ async fn providers_edits_valid_and_broken_are_both_narrated() {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )

@@ -118,6 +118,7 @@ async fn build_env(responses: Vec<serde_json::Value>) -> Env {
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )

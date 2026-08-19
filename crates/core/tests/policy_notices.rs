@@ -103,6 +103,7 @@ fn write_config(data: &std::path::Path, base_url: &str, project: &std::path::Pat
             "base_url": base_url,
             "model": "scripted",
             "approval_mode": "auto",
+            "context_tokens": 16384,
         })
         .to_string(),
     )
