@@ -138,7 +138,7 @@ work in a trusted project. To harden a project:
 - keep auto mode but add an ask rule for bash in your **global**
   `~/.openmax/permissions.toml` (outside the project root, where the
   confined file tools cannot reach it; a bash edit to it is a command this
-  very rule puts in front of you first):
+  very rule puts in front of you first, in the TUI and over `--stdio`):
 
 ```toml
 [[rules]]
@@ -162,12 +162,17 @@ that sets out to grant itself authority, because a shell the agent runs
 can clear a marker, set one, or allocate a terminal, and the ledger record
 that results is indistinguishable from yours. In `auto` mode the only trace
 is the note at the next turn start naming approval activity this session
-did not make. The hardened profile above is what closes it: with bash
-asking, the command that would arrange those markers is a command you see
-before it runs. The same holds for the permission and trust files under
-`~/.openmax/`: outside the project root, so the confined file tools cannot
-touch them, and bash can, which is why the ask rule on bash is the
-durable protection rather than the location.
+did not make. The hardened profile above is what closes it, where there
+is someone to ask: in the TUI and over `--stdio`, with bash asking, the
+command that would arrange those markers is a command you see before it
+runs. A headless `-p` run has no one to ask; in `auto` mode it accepts
+gate cards itself, including one raised by an explicit `ask` rule, and in
+`ask` mode it declines them, so authority-changing work under `-p` belongs
+in `ask` mode or on the `--stdio` wire with a human answering. The same
+holds for the permission and trust files under `~/.openmax/`: outside the
+project root, so the confined file tools cannot touch them, and bash can,
+which is why the ask rule on bash is the durable protection rather than
+the location.
 
 Residual risk to know about: an *approved* tool or a bash command can fetch
 content at runtime (`curl | sh`) that no approval ever covered. Approval
