@@ -1298,8 +1298,28 @@ fn print_usage_economics() {
             ToolKind::Builtin => None,
         })
         .collect();
-    if externals.is_empty() && registry.skills.is_empty() {
-        println!("no extensions installed; the frozen prompt carries zero extension cost");
+    // The frozen prompt prefix is paid on every request whether or not any
+    // tool or skill is installed: the base rules, the self-extension guide,
+    // AGENTS.md, the memory index, and the layout map all ride it. Report the
+    // real breakdown here so "what does my prompt cost" is answered truthfully
+    // and never as a false zero - a project with only an AGENTS.md or a memory
+    // note pays real bytes the old "zero extension cost" line hid.
+    let (_, breakdown) = open_max_core::prompt::system_prompt_with_breakdown(&project, &registry);
+    let schema_chars: usize = breakdown.tools.iter().map(|(_, c, _)| *c).sum();
+    let component_chars: usize = breakdown.components.iter().map(|(_, c)| *c).sum();
+    let frozen_chars = component_chars + schema_chars;
+    println!("frozen prompt prefix (paid on every request):");
+    for (name, chars) in &breakdown.components {
+        println!("  {name:<26} {chars:>7} chars  ~{} tok", chars / 4);
+    }
+    println!("  {:<26} {schema_chars:>7} chars  ~{} tok", "tool schemas", schema_chars / 4);
+    println!("  {:<26} {frozen_chars:>7} chars  ~{} tok  total", "", frozen_chars / 4);
+    println!();
+
+    if externals.is_empty() && registry.skills.is_empty() && breakdown.memory.is_empty() {
+        println!(
+            "no tool, skill, or memory extensions installed; the frozen prefix above is the harness base plus any AGENTS.md and layout map."
+        );
         return;
     }
     println!(
@@ -1352,6 +1372,16 @@ fn print_usage_economics() {
         println!(
             "{:<24} {:<6} {:>12} {:>7} {:>5} {:>5} {:>10}  -",
             skill.name, "skill", chars, entry.calls, entry.ok, entry.err, ago(entry.last_used)
+        );
+    }
+    // Memory notes ride the same frozen index as skills, so a human pricing
+    // the prompt should see each one's index-line cost beside the skills.
+    // Access counts live in the activation log (openmax --recall), not the
+    // call counters, so the call columns stay blank.
+    for (name, chars) in &breakdown.memory {
+        println!(
+            "{:<24} {:<6} {:>12} {:>7} {:>5} {:>5} {:>10}  -",
+            name, "memory", chars, "-", "-", "-", "-"
         );
     }
     println!(
