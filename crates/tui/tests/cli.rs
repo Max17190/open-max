@@ -197,29 +197,43 @@ fn run_examples_is_gated_and_reported_through_json() {
     // with its own diagnostic, and nothing is blessed by any of it. On a
     // host with no sandbox backend, the fall-back refusal keeps the old
     // unapproved-source wording; both are exit 1 here (failer always fails).
+    // A sandboxed probe can PROVE a tool passes, but a non-pass is
+    // inconclusive: the sandbox denies the network and non-scratch writes, so
+    // a tool that needs either cannot pass one, and a failure there is not
+    // proof the tool is broken (a passing probe approves nothing, so a failing
+    // one condemns nothing). So an unapproved sandbox non-pass is a `warn` that
+    // does NOT fail the check - the honest verdict is the approved host run
+    // below, where the failer errs. Exit is 0 because nothing ran with host
+    // authority. (The failer here has no network, so on a backend host it runs
+    // and exits nonzero: still inconclusive by this contract, warned not erred.)
     let out = cmd(&project, &home)
         .args(["--check", "--json", "--run-examples"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
     let value = json(&out);
     let reported = messages(&value);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unapproved sandbox non-pass must not fail the check: {reported}"
+    );
+    assert!(
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["surface"] == "example")
+            .all(|row| row["sandboxed"] == true),
+        "unapproved probes must be labeled: {value}"
+    );
     if reported.contains("cannot sandbox a probe") {
-        assert_eq!(reported.matches("cannot sandbox a probe").count(), 2, "{reported}");
+        // No sandbox backend on this host: both probes are inconclusive warns.
+        assert_eq!(reported.matches("\"warn\"").count(), 2, "{reported}");
         assert!(reported.contains("--approve"), "{reported}");
     } else {
-        assert!(reported.contains("ran in a sandbox"), "{reported}");
-        assert!(reported.contains("openmax --approve"), "{reported}");
-        assert!(reported.contains("boom"), "{reported}");
-        assert!(
-            value
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|row| row["surface"] == "example")
-                .all(|row| row["sandboxed"] == true),
-            "unapproved probes must be labeled: {value}"
-        );
+        assert!(reported.contains("ran in a sandbox"), "{reported}"); // prover passed
+        assert!(reported.contains("could not prove"), "{reported}"); // failer inconclusive
+        assert!(reported.contains("\"warn\""), "{reported}");
     }
 
     for tool in ["prover.toml", "failer.toml"] {
@@ -1378,4 +1392,46 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
     assert!(!marker.exists(), "the unapproved tool must not have run");
     let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
     assert!(!String::from_utf8_lossy(&ledger.stdout).contains("approved"), "the ledger must record no grant");
+}
+
+/// A sandboxed probe cannot prove a tool that needs the network or a write
+/// outside its scratch dir, so a probe non-pass is inconclusive, not proof the
+/// tool is broken: `openmax --check --run-examples` reports it as `warn`, not
+/// `err`, and does NOT exit nonzero on it (a passing probe approves nothing, so
+/// a failing one condemns nothing). The honest signal is the approved host run.
+/// Guards the false-`err` that failed CI and misled agents on the largest tool
+/// family (anything network-shaped). Terminal (non-JSON) path.
+#[test]
+fn an_unapproved_sandbox_non_pass_warns_and_does_not_fail_the_check() {
+    let (project, home) = fresh_dirs("probe-warn");
+    write_settings_with_mode(&home, "http://127.0.0.1:9/v1", "auto");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    // Its example always exits nonzero. Unapproved, it runs only as a sandboxed
+    // probe; the probe cannot vouch for it, but that is not the tool being
+    // broken as far as an UNAPPROVED check is concerned - the verdict waits for
+    // the approved host run.
+    std::fs::write(
+        tools.join("nonpass.toml"),
+        "name = \"nonpass\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo boom >&2; exit 3\"]\n\n[example]\n",
+    )
+    .unwrap();
+    // Trust so examples run (the endpoint is dead; trust is stored regardless).
+    cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+
+    let out = cmd(&project, &home).args(["--check", "--run-examples"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unapproved sandbox non-pass must not fail --check --run-examples:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("err  example"),
+        "a sandbox non-pass is not an err:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("warn example     nonpass"),
+        "the sandbox non-pass is reported as a warn on the tool:\n{stdout}"
+    );
 }
