@@ -1305,7 +1305,10 @@ fn print_usage_economics() {
     // and never as a false zero - a project with only an AGENTS.md or a memory
     // note pays real bytes the old "zero extension cost" line hid.
     let (_, breakdown) = open_max_core::prompt::system_prompt_with_breakdown(&project, &registry);
-    let schema_chars: usize = breakdown.tools.iter().map(|(_, c, _)| *c).sum();
+    // The whole serialized array is what rides every request, including the
+    // brackets and commas between schemas, so measure the wire bytes rather
+    // than summing each schema alone (that undercounts the array overhead).
+    let schema_chars = registry.tool_schemas_wire().len();
     let component_chars: usize = breakdown.components.iter().map(|(_, c)| *c).sum();
     let frozen_chars = component_chars + schema_chars;
     println!("frozen prompt prefix (paid on every request):");
@@ -1317,8 +1320,12 @@ fn print_usage_economics() {
     println!();
 
     if externals.is_empty() && registry.skills.is_empty() && breakdown.memory.is_empty() {
+        // `breakdown.memory` is what the frozen index currently carries, not
+        // what exists on disk: a note that faded past the 21-day index floor,
+        // or one dropped by the byte cap, is still a file. So report the index
+        // state, not an absolute "nothing installed".
         println!(
-            "no tool, skill, or memory extensions installed; the frozen prefix above is the harness base plus any AGENTS.md and layout map."
+            "no tool or skill extensions installed, and no memory note is in the frozen index; the frozen prefix above is the harness base plus any AGENTS.md and layout map (faded or byte-capped memory notes may still be on disk: openmax --recall searches them)."
         );
         return;
     }
