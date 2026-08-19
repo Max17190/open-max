@@ -102,20 +102,23 @@ pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, S
 pub(crate) fn raw_description(text: &str) -> Option<String> {
     let body = text.strip_prefix("---")?;
     let end = body.find("\n---")?;
-    frontmatter_description(&body[..end])
+    // The last `description:` key wins, as it always has for SKILL.md.
+    frontmatter_descriptions(&body[..end]).pop()
 }
 
-/// The `description:` value of one frontmatter block, folded to a single
-/// line. Three spellings are read: a bare value, a double-quoted value, and
-/// a YAML block scalar (`>` folded or `|` literal, with an optional `-`/`+`
-/// chomping indicator), whose value is the indented lines that follow.
+/// Every `description:` value of one frontmatter block, in order, each
+/// folded to a single line. Three spellings are read: a bare value, a
+/// double-quoted value, and a YAML block scalar (`>` folded or `|` literal,
+/// with an optional `-`/`+` chomping indicator and an optional explicit
+/// indentation digit), whose value is the indented lines that follow.
 /// Multi-line values fold to one line because the index line is one line;
-/// the frontmatter's `>` says the author meant that too. The last
-/// `description:` key wins, as before. Anything more exotic (single quotes,
-/// flow mappings, anchors) reads as its literal spelling.
-pub(crate) fn frontmatter_description(block: &str) -> Option<String> {
+/// the frontmatter's `>` says the author meant that too. Anything more
+/// exotic (single quotes, flow mappings, anchors) reads as its literal
+/// spelling. Callers pick first or last; each surface keeps the choice it
+/// always made.
+pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
     let lines: Vec<&str> = block.lines().collect();
-    let mut description = None;
+    let mut descriptions = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -125,10 +128,14 @@ pub(crate) fn frontmatter_description(block: &str) -> Option<String> {
             continue;
         };
         let value = value.trim();
-        if is_block_scalar_indicator(value) {
-            // The value is the run of lines indented deeper than the key
-            // (blank lines inside it are allowed); the run ends at the first
-            // non-blank line at or above the key's indentation.
+        if let Some(explicit) = block_scalar_indent(value) {
+            // The value is the run of lines indented past the key: by at
+            // least the explicit indentation digit when the header gives
+            // one (a shallower line ends the block, so under-indented text
+            // never populates the index), else by any amount. Blank lines
+            // inside the run are allowed; the first non-blank line at or
+            // above that depth ends it.
+            let min_indent = indent + explicit.unwrap_or(1);
             let mut parts: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let next = lines[i];
@@ -137,33 +144,44 @@ pub(crate) fn frontmatter_description(block: &str) -> Option<String> {
                     continue;
                 }
                 let next_indent = next.len() - next.trim_start().len();
-                if next_indent <= indent {
+                if next_indent < min_indent {
                     break;
                 }
                 parts.push(next.trim());
                 i += 1;
             }
-            description = Some(parts.join(" "));
+            descriptions.push(parts.join(" "));
         } else {
-            description = Some(value.trim_matches('"').replace(['\n', '\r'], " "));
+            descriptions.push(value.trim_matches('"').replace(['\n', '\r'], " "));
         }
     }
-    description
+    descriptions
 }
 
-/// `>` or `|`, optionally followed by a chomping indicator (`-`, `+`) and/or
-/// an explicit indentation digit, in either order: the YAML block scalar
-/// header spellings that reach frontmatter in practice.
-fn is_block_scalar_indicator(value: &str) -> bool {
+/// Whether a value is a YAML block scalar header (`>` or `|`, optionally
+/// followed by a chomping indicator (`-`, `+`) and/or an explicit indentation
+/// digit, in either order): the spellings that reach frontmatter in
+/// practice. `Some(None)` for a header without a digit, `Some(Some(n))` for
+/// one with, `None` for anything else.
+fn block_scalar_indent(value: &str) -> Option<Option<usize>> {
     let mut chars = value.chars();
     if !matches!(chars.next(), Some('>') | Some('|')) {
-        return false;
+        return None;
     }
     let rest: Vec<char> = chars.collect();
-    rest.len() <= 2
-        && rest.iter().all(|c| matches!(c, '-' | '+') || c.is_ascii_digit())
-        && rest.iter().filter(|c| matches!(c, '-' | '+')).count() <= 1
-        && rest.iter().filter(|c| c.is_ascii_digit()).count() <= 1
+    if rest.len() > 2
+        || !rest.iter().all(|c| matches!(c, '-' | '+') || c.is_ascii_digit())
+        || rest.iter().filter(|c| matches!(c, '-' | '+')).count() > 1
+        || rest.iter().filter(|c| c.is_ascii_digit()).count() > 1
+    {
+        return None;
+    }
+    let digit = rest.iter().find_map(|c| c.to_digit(10)).map(|d| d as usize);
+    // `>0` is not a header (YAML requires 1-9); read it as a plain value.
+    match digit {
+        Some(0) => None,
+        other => Some(other),
+    }
 }
 
 #[cfg(test)]
@@ -242,11 +260,28 @@ mod tests {
 
         // Literal and chomping spellings read the same way; the next key at
         // the parent's indentation ends the value.
-        for header in [">-", "|", "|+", ">2"] {
+        for header in [">-", "|", "|+", ">2", "|-2", ">2+"] {
             let text = format!("---\nname: n\ndescription: {header}\n    first line\n    second line\ntags: x\n---\nbody\n");
             let spec = parse_skill_source(Path::new("SKILL.md"), &text).unwrap();
             assert_eq!(spec.description, "first line second line", "header {header}");
         }
+
+        // An explicit indentation digit is enforced: content shallower than
+        // it ends the block, so under-indented text never reaches the index
+        // (review finding). Deeper content still reads.
+        let shallow = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >4\n  only two spaces\n---\nbody\n").unwrap();
+        assert_eq!(shallow.description, "");
+        let deep = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >4\n      six spaces\n---\nbody\n").unwrap();
+        assert_eq!(deep.description, "six spaces");
+        let zero = parse_skill_source(Path::new("SKILL.md"), "---\nname: n\ndescription: >0\n  text\n---\nbody\n").unwrap();
+        assert_eq!(zero.description, ">0", "a zero digit is not a YAML header");
+
+        // Duplicate keys: SKILL.md keeps its last-key reading, prompt
+        // templates keep their first-key reading (each as before).
+        let dupes = "description: first\ndescription: second";
+        assert_eq!(frontmatter_descriptions(dupes), vec!["first", "second"]);
+        let last = parse_skill_source(Path::new("SKILL.md"), &format!("---\nname: n\n{dupes}\n---\nbody\n")).unwrap();
+        assert_eq!(last.description, "second");
 
         // An indicator with nothing under it is an empty description, which
         // --check names; it is never the indicator character itself.

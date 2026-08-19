@@ -179,12 +179,13 @@ pub(crate) fn raw_description(text: &str) -> Option<String> {
     frontmatter_description(text)
 }
 
-/// Same reader as SKILL.md (`skills::frontmatter_description`): bare,
-/// double-quoted, or a `>`/`|` block scalar folded to one line.
+/// Same reader as SKILL.md (`skills::frontmatter_descriptions`): bare,
+/// double-quoted, or a `>`/`|` block scalar folded to one line. Templates
+/// keep the first `description:` key, as they always have.
 fn frontmatter_description(text: &str) -> Option<String> {
     let rest = text.strip_prefix("---")?;
     let end = frontmatter_end(text)?;
-    crate::skills::frontmatter_description(&rest[..end])
+    crate::skills::frontmatter_descriptions(&rest[..end]).into_iter().next()
 }
 
 /// Substitute `$ARGUMENTS` (the raw argument string) and `$1`..`$9`
@@ -392,6 +393,30 @@ mod tests {
         let root = temp_dir("empty");
         write_template(&root, "hollow", "---\ndescription: nothing\n---\n\n");
         assert!(discover_in(std::slice::from_ref(&root)).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The template reader shares SKILL.md's description parser (block
+    /// scalars fold to one line) but keeps its own first-key rule for
+    /// duplicate `description:` keys, so an existing template's popup line
+    /// does not change under it (review finding).
+    #[test]
+    fn descriptions_fold_block_scalars_and_keep_the_first_key() {
+        let root = temp_dir("desc");
+        write_template(
+            &root,
+            "folded",
+            "---\ndescription: >\n  Fix the bug in $1,\n  then run the tests.\n---\nFind the bug in $1 and fix it.\n",
+        );
+        write_template(
+            &root,
+            "twice",
+            "---\ndescription: first description\ndescription: second description\n---\nDo the thing.\n",
+        );
+        let folded = parse_template(&root.join("folded.md")).unwrap();
+        assert_eq!(folded.description, "Fix the bug in $1, then run the tests.");
+        let twice = parse_template(&root.join("twice.md")).unwrap();
+        assert_eq!(twice.description, "first description");
         let _ = std::fs::remove_dir_all(root);
     }
 }
