@@ -95,49 +95,6 @@ fn resolve_tool_calls(
     (content, tool_calls)
 }
 
-/// Detects identical tool calls repeated consecutively within one turn loop.
-struct RepeatCallTracker {
-    last_name: Option<String>,
-    last_args: Option<String>,
-    consecutive: u8,
-}
-
-impl RepeatCallTracker {
-    fn new() -> Self {
-        Self { last_name: None, last_args: None, consecutive: 0 }
-    }
-
-    /// Returns true when this would be the 3rd consecutive identical execution.
-    fn would_block(&self, name: &str, args_key: &str) -> bool {
-        self.last_name.as_deref() == Some(name)
-            && self.last_args.as_deref() == Some(args_key)
-            && self.consecutive >= 2
-    }
-
-    fn record_executed(&mut self, name: &str, args_key: &str) {
-        if self.last_name.as_deref() == Some(name) && self.last_args.as_deref() == Some(args_key) {
-            self.consecutive = self.consecutive.saturating_add(1);
-        } else {
-            self.last_name = Some(name.to_string());
-            self.last_args = Some(args_key.to_string());
-            self.consecutive = 1;
-        }
-    }
-}
-
-fn canonicalize_args(v: &Value) -> String {
-    match v {
-        Value::Object(map) => {
-            let mut pairs: Vec<_> = map.iter().collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            let sorted: serde_json::Map<String, Value> =
-                pairs.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            serde_json::to_string(&Value::Object(sorted)).unwrap_or_default()
-        }
-        other => other.to_string(),
-    }
-}
-
 /// One consecutive run of tool calls: `[start, end)`; `concurrent` when length >= 2
 /// and every call in the run is batchable.
 struct ToolCallSegment {
@@ -178,7 +135,6 @@ where
 fn batchable_call(
     call: &ToolCall,
     registry: &Registry,
-    repeat_tracker: &RepeatCallTracker,
     permissions: &TurnPermissions,
     data_dir: &Path,
     project_root: &Path,
@@ -198,10 +154,6 @@ fn batchable_call(
     match permissions.evaluate(name, &args) {
         PermissionDecision::Ask | PermissionDecision::Deny { .. } => return false,
         PermissionDecision::Allow | PermissionDecision::Default => {}
-    }
-    let args_key = canonicalize_args(&args);
-    if repeat_tracker.would_block(name, &args_key) {
-        return false;
     }
     // Same principle as Ask: a tool whose content no human has approved needs
     // the serial path, which is where the prompt and its actionable event live.
@@ -613,17 +565,15 @@ async fn execute_readonly_batch(
     ctx: &ReadonlyBatchCtx<'_>,
     calls: &[ToolCall],
     messages: &mut Vec<ChatMessage>,
-    repeat_tracker: &mut RepeatCallTracker,
 ) -> bool {
-    let mut parsed: Vec<(Value, String)> = Vec::with_capacity(calls.len());
+    let mut parsed: Vec<Value> = Vec::with_capacity(calls.len());
     let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
     for call in calls {
         let name = call.function.name.as_str();
         // batchable_call already validated the JSON; Null (impossible) would
         // just surface as a missing-argument tool error.
         let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-        let args_key = canonicalize_args(&args);
-        parsed.push((args.clone(), args_key));
+        parsed.push(args.clone());
         ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
             call_id: call.id.clone(),
             name: name.into(),
@@ -695,7 +645,7 @@ async fn execute_readonly_batch(
         .iter()
         .zip(parsed.iter())
         .zip(blocked.iter())
-        .map(|((call, (args, _)), block)| {
+        .map(|((call, args), block)| {
             let name = call.function.name.clone();
             let args = args.clone();
             let root = ctx.project_root.to_path_buf();
@@ -716,8 +666,7 @@ async fn execute_readonly_batch(
     for (i, call) in calls.iter().enumerate() {
         let outcome = &outcomes[i];
         let name = call.function.name.as_str();
-        let args_key = &parsed[i].1;
-        let args = &parsed[i].0;
+        let args = &parsed[i];
         if blocked[i].is_none() {
             count_usage(ctx.usage, ctx.registry, ctx.project_root, name, args, outcome.ok);
             let failures = ctx
@@ -748,9 +697,6 @@ async fn execute_readonly_batch(
             output: outcome.output.clone(),
         });
         messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(outcome)));
-        if blocked[i].is_none() {
-            repeat_tracker.record_executed(name, args_key);
-        }
     }
     false
 }
@@ -2518,7 +2464,6 @@ async fn run_loop(
     // Set when the model-stopped break already ran the turn_end hooks, so the
     // late call site does not run them a second time for one end.
     let mut turn_end_fired = false;
-    let mut repeat_tracker = RepeatCallTracker::new();
     // What this turn used, merged into the project usage file at turn end so
     // the agent (via openmax --spec usage) can prune its own toolbox.
     let turn_usage = std::sync::Mutex::new(TurnUsage::default());
@@ -2803,7 +2748,6 @@ async fn run_loop(
             batchable_call(
                 call,
                 &registry,
-                &repeat_tracker,
                 &permissions,
                 &core.data_dir,
                 project_root,
@@ -2833,7 +2777,6 @@ async fn run_loop(
                     &batch_ctx,
                     &tool_calls[segment.start..segment.end],
                     guard.messages(),
-                    &mut repeat_tracker,
                 )
                 .await
                 {
@@ -2866,15 +2809,6 @@ async fn run_loop(
                         continue;
                     }
                 };
-
-                let args_key = canonicalize_args(&args);
-                if repeat_tracker.would_block(name, &args_key) {
-                    let msg = "You have repeated this exact call 3 times. The result will not change. Try a different approach, or explain what you are blocked on.";
-                    core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: args.clone() });
-                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), msg.to_string()));
-                    continue;
-                }
 
                 core.send_agent(session_id, AgentEvent::ToolStart {
                     call_id: call.id.clone(),
@@ -3145,205 +3079,202 @@ async fn run_loop(
                 // Approval timeouts are not model errors; the "Error:" prefix
                 // would push small models into pointless retry loops.
                 guard.messages().push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
-                if executed {
-                    repeat_tracker.record_executed(name, &args_key);
-                    if registry.is_mutating(name) {
-                        if outcome.ok {
-                            extensions_touched = true;
-                        }
-                        // Reload here, not at iteration end: one assistant
-                        // response can carry the policy write and the call
-                        // the policy denies, and the later call must already
-                        // see the rule. Concurrent batches hold read-only
-                        // calls only, so this serial point covers every
-                        // mutation - including a failed one, because a bash
-                        // command can persist the policy file and still exit
-                        // nonzero. TurnPermissions keeps each observed
-                        // snapshot as a floor, so a reload can narrow policy
-                        // but never widen it; `deny`/`ask` need no approval,
-                        // and unapproved `allow` rules are dropped at load.
-                        let current = Permissions::discover(project_root, &core.data_dir);
-                        let inert: Vec<String> = current.notices().to_vec();
-                        // A mutation that leaves permissions.toml malformed
-                        // bricks EVERY tool call for the rest of this turn
-                        // (the snapshot floors it), and only the notices path
-                        // spoke - a wall of denies with no cause, and the
-                        // prescribed `openmax --check` needs bash, which is
-                        // now denied. Say it on the writing call, once, with
-                        // the parse reason and the turn-scoped rule.
-                        let fail_closed_now = current.fail_closed_reason().map(str::to_string);
-                        permissions.reload(current);
-                        if let Some(reason) = fail_closed_now {
-                            let novel = novel_policy_notices(
-                                core,
-                                session_id,
-                                vec![format!("permissions fail-closed: {reason}")],
-                            )
-                            .await;
-                            if !novel.is_empty() {
-                                // The repair carve-out returns Default for
-                                // write/edit on this file, but an earlier
-                                // snapshot this turn may have explicitly DENIED
-                                // one of them, and the most restrictive answer
-                                // wins - so the receipt must not promise a
-                                // repair tool a rule already blocks (Greptile).
-                                // Probe every path spelling a repair call could
-                                // use (an `arg_regex` matches the raw path
-                                // argument): absolute, relative, and ./relative.
-                                // A tool is allowed only if NONE is denied.
-                                let abs = project_root
-                                    .join(".openmax/permissions.toml")
-                                    .to_string_lossy()
-                                    .into_owned();
-                                let repair_denied = |tool: &str| {
-                                    [
-                                        abs.as_str(),
-                                        ".openmax/permissions.toml",
-                                        "./.openmax/permissions.toml",
-                                    ]
-                                    .iter()
-                                    .any(|p| {
-                                        matches!(
-                                            permissions
-                                                .evaluate(tool, &serde_json::json!({ "path": p })),
-                                            crate::permissions::PermissionDecision::Deny { .. }
-                                        )
-                                    })
-                                };
-                                let allowed: Vec<&str> = ["write_file", "edit_file"]
-                                    .into_iter()
-                                    .filter(|t| !repair_denied(t))
-                                    .collect();
-                                let repair_clause = if allowed.is_empty() {
-                                    "a rule earlier this turn denies write_file and edit_file on \
-                                     this file too, so even the repair waits for the START OF THE \
-                                     NEXT TURN; read_file is not allowed"
-                                        .to_string()
-                                } else {
-                                    format!(
-                                        "{} on exactly this file is still allowed and takes effect \
-                                         at the START OF THE NEXT TURN, not this one; read_file is \
-                                         NOT, so rewrite it from what you intended",
-                                        allowed.join("/")
-                                    )
-                                };
-                                let note = format!(
-                                    "[permissions.toml is now malformed ({reason}). Every tool \
-                                     call is DENIED for the rest of THIS turn - policy snapshots \
-                                     only narrow within a turn, never widen - and your repair \
-                                     ({repair_clause}). \
-                                     openmax --check cannot run until then (bash is denied too).]"
-                                );
-                                append_and_emit_note(core, session_id, guard.messages(), &note);
-                            }
-                        }
-                        // The agent may have just written itself an allow
-                        // rule that can never fire (#180). Say so NOW, on
-                        // this call's result, with the command that lifts
-                        // it - not silently at the next surprise prompt.
-                        let novel = novel_policy_notices(core, session_id, inert).await;
+                if executed && registry.is_mutating(name) {
+                    if outcome.ok {
+                        extensions_touched = true;
+                    }
+                    // Reload here, not at iteration end: one assistant
+                    // response can carry the policy write and the call
+                    // the policy denies, and the later call must already
+                    // see the rule. Concurrent batches hold read-only
+                    // calls only, so this serial point covers every
+                    // mutation - including a failed one, because a bash
+                    // command can persist the policy file and still exit
+                    // nonzero. TurnPermissions keeps each observed
+                    // snapshot as a floor, so a reload can narrow policy
+                    // but never widen it; `deny`/`ask` need no approval,
+                    // and unapproved `allow` rules are dropped at load.
+                    let current = Permissions::discover(project_root, &core.data_dir);
+                    let inert: Vec<String> = current.notices().to_vec();
+                    // A mutation that leaves permissions.toml malformed
+                    // bricks EVERY tool call for the rest of this turn
+                    // (the snapshot floors it), and only the notices path
+                    // spoke - a wall of denies with no cause, and the
+                    // prescribed `openmax --check` needs bash, which is
+                    // now denied. Say it on the writing call, once, with
+                    // the parse reason and the turn-scoped rule.
+                    let fail_closed_now = current.fail_closed_reason().map(str::to_string);
+                    permissions.reload(current);
+                    if let Some(reason) = fail_closed_now {
+                        let novel = novel_policy_notices(
+                            core,
+                            session_id,
+                            vec![format!("permissions fail-closed: {reason}")],
+                        )
+                        .await;
                         if !novel.is_empty() {
-                            let note =
-                                format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
-                        }
-                        // A providers.json edit (bash: the file is outside
-                        // the project root) gets a receipt too: what loaded,
-                        // when it applies - or that the catalog is EMPTY,
-                        // while the author can still fix it.
-                        let status = crate::providers::providers_status(&core.data_dir);
-                        if status.content_hash != providers_seen {
-                            providers_seen = status.content_hash;
-                            let note = match &status.parse_error {
-                                Some(err) => format!(
-                                    "[providers.json changed but is invalid JSON: {err}. The \
-                                     provider catalog is EMPTY until this parses; any turn using \
-                                     settings.provider will fail at its start.]"
-                                ),
-                                None => format!(
-                                    "[providers.json changed: {} provider(s) ({}). Endpoint \
-                                     resolution happens at turn start, so a provider or model \
-                                     switch applies from the next turn; switching this session's \
-                                     model is /model, which the user runs.]",
-                                    status.count,
-                                    status.names.join(", ")
-                                ),
+                            // The repair carve-out returns Default for
+                            // write/edit on this file, but an earlier
+                            // snapshot this turn may have explicitly DENIED
+                            // one of them, and the most restrictive answer
+                            // wins - so the receipt must not promise a
+                            // repair tool a rule already blocks (Greptile).
+                            // Probe every path spelling a repair call could
+                            // use (an `arg_regex` matches the raw path
+                            // argument): absolute, relative, and ./relative.
+                            // A tool is allowed only if NONE is denied.
+                            let abs = project_root
+                                .join(".openmax/permissions.toml")
+                                .to_string_lossy()
+                                .into_owned();
+                            let repair_denied = |tool: &str| {
+                                [
+                                    abs.as_str(),
+                                    ".openmax/permissions.toml",
+                                    "./.openmax/permissions.toml",
+                                ]
+                                .iter()
+                                .any(|p| {
+                                    matches!(
+                                        permissions
+                                            .evaluate(tool, &serde_json::json!({ "path": p })),
+                                        crate::permissions::PermissionDecision::Deny { .. }
+                                    )
+                                })
                             };
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
-                        }
-                        // A script edit revokes the approval of the tool that
-                        // runs it, but moves no fingerprint: no refreeze, no
-                        // receipt - and the model learned only when the next
-                        // call raised a card. Diff approval state per call.
-                        let approval_now = unapproved_tool_map(&registry, &core.data_dir, project_root);
-                        let mut revoked: Vec<String> = Vec::new();
-                        for (name, state) in &approval_now {
-                            if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
-                                revoked.push(format!(
-                                    "{name} (openmax --approve {})",
-                                    crate::doctor::shell_quote(std::path::Path::new(path))
-                                ));
-                            }
-                        }
-                        approval_seen = approval_now;
-                        if !revoked.is_empty() {
-                            revoked.sort();
-                            let note = format!(
-                                "[approval revoked: the code these tools run changed since a human \
-                                 approved it, so the next call of each stops for a card: {}. Re-approve \
-                                 the exact bytes, or prove them first with openmax --check --run-examples.]",
-                                revoked.join(", ")
-                            );
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
-                        }
-                        // A hook file written this call: hooks are outside
-                        // the extension fingerprint, so this write got no
-                        // refreeze receipt and the inertness notice would
-                        // otherwise land a whole turn later (dogfood: the
-                        // agent believed its gate was live for a turn).
-                        let hooks_now = crate::hooks::hooks_fingerprint(project_root);
-                        if hooks_now != hooks_seen {
-                            hooks_seen = hooks_now;
-                            let discovered = Hooks::discover(project_root, &core.data_dir);
-                            let inert: Vec<String> = discovered
-                                .notices()
+                            let allowed: Vec<&str> = ["write_file", "edit_file"]
                                 .into_iter()
-                                .map(|f| format!("'{}' on {}: {}", f.hook, f.event, f.detail))
+                                .filter(|t| !repair_denied(t))
                                 .collect();
-                            // An APPROVED gate whose bytes just changed is not
-                            // inert - it fails closed and blocks every tool
-                            // call from the next turn until restored or
-                            // re-approved. Say that, not "applies next turn".
-                            let note = if let Some(blocked) = discovered.fail_closed_reason() {
-                                format!(
-                                    "[hook files changed. A live gate is now failing closed: \
-                                     {blocked}. From the next turn every tool call is BLOCKED \
-                                     until the file is restored to its approved bytes or a human \
-                                     re-approves it (openmax --approve <path>, at a terminal \
-                                     outside any session).]"
-                                )
-                            } else if inert.is_empty() {
-                                "[hook files changed. Hooks are discovered at turn start; \
-                                 approved hooks apply from the next turn.]"
+                            let repair_clause = if allowed.is_empty() {
+                                "a rule earlier this turn denies write_file and edit_file on \
+                                 this file too, so even the repair waits for the START OF THE \
+                                 NEXT TURN; read_file is not allowed"
                                     .to_string()
                             } else {
                                 format!(
-                                    "[hook files changed. Not running: {}. Hooks activate only \
-                                     after a human runs openmax --approve <path> at a terminal \
-                                     outside any session; until then the guarantee is NOT in \
-                                     force - say so if asked, do not claim it.]",
-                                    inert.join(" | ")
+                                    "{} on exactly this file is still allowed and takes effect \
+                                     at the START OF THE NEXT TURN, not this one; read_file is \
+                                     NOT, so rewrite it from what you intended",
+                                    allowed.join("/")
                                 )
                             };
+                            let note = format!(
+                                "[permissions.toml is now malformed ({reason}). Every tool \
+                                 call is DENIED for the rest of THIS turn - policy snapshots \
+                                 only narrow within a turn, never widen - and your repair \
+                                 ({repair_clause}). \
+                                 openmax --check cannot run until then (bash is denied too).]"
+                            );
                             append_and_emit_note(core, session_id, guard.messages(), &note);
                         }
-                        // A settings.json edit (bash: outside the project
-                        // root) is inert for this session and bricks the
-                        // next launch when malformed - answered on the
-                        // writing call, while it is still repairable.
-                        if let Some(note) = settings_drift_note(core) {
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
+                    }
+                    // The agent may have just written itself an allow
+                    // rule that can never fire (#180). Say so NOW, on
+                    // this call's result, with the command that lifts
+                    // it - not silently at the next surprise prompt.
+                    let novel = novel_policy_notices(core, session_id, inert).await;
+                    if !novel.is_empty() {
+                        let note =
+                            format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
+                        append_and_emit_note(core, session_id, guard.messages(), &note);
+                    }
+                    // A providers.json edit (bash: the file is outside
+                    // the project root) gets a receipt too: what loaded,
+                    // when it applies - or that the catalog is EMPTY,
+                    // while the author can still fix it.
+                    let status = crate::providers::providers_status(&core.data_dir);
+                    if status.content_hash != providers_seen {
+                        providers_seen = status.content_hash;
+                        let note = match &status.parse_error {
+                            Some(err) => format!(
+                                "[providers.json changed but is invalid JSON: {err}. The \
+                                 provider catalog is EMPTY until this parses; any turn using \
+                                 settings.provider will fail at its start.]"
+                            ),
+                            None => format!(
+                                "[providers.json changed: {} provider(s) ({}). Endpoint \
+                                 resolution happens at turn start, so a provider or model \
+                                 switch applies from the next turn; switching this session's \
+                                 model is /model, which the user runs.]",
+                                status.count,
+                                status.names.join(", ")
+                            ),
+                        };
+                        append_and_emit_note(core, session_id, guard.messages(), &note);
+                    }
+                    // A script edit revokes the approval of the tool that
+                    // runs it, but moves no fingerprint: no refreeze, no
+                    // receipt - and the model learned only when the next
+                    // call raised a card. Diff approval state per call.
+                    let approval_now = unapproved_tool_map(&registry, &core.data_dir, project_root);
+                    let mut revoked: Vec<String> = Vec::new();
+                    for (name, state) in &approval_now {
+                        if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
+                            revoked.push(format!(
+                                "{name} (openmax --approve {})",
+                                crate::doctor::shell_quote(std::path::Path::new(path))
+                            ));
                         }
+                    }
+                    approval_seen = approval_now;
+                    if !revoked.is_empty() {
+                        revoked.sort();
+                        let note = format!(
+                            "[approval revoked: the code these tools run changed since a human \
+                             approved it, so the next call of each stops for a card: {}. Re-approve \
+                             the exact bytes, or prove them first with openmax --check --run-examples.]",
+                            revoked.join(", ")
+                        );
+                        append_and_emit_note(core, session_id, guard.messages(), &note);
+                    }
+                    // A hook file written this call: hooks are outside
+                    // the extension fingerprint, so this write got no
+                    // refreeze receipt and the inertness notice would
+                    // otherwise land a whole turn later (dogfood: the
+                    // agent believed its gate was live for a turn).
+                    let hooks_now = crate::hooks::hooks_fingerprint(project_root);
+                    if hooks_now != hooks_seen {
+                        hooks_seen = hooks_now;
+                        let discovered = Hooks::discover(project_root, &core.data_dir);
+                        let inert: Vec<String> = discovered
+                            .notices()
+                            .into_iter()
+                            .map(|f| format!("'{}' on {}: {}", f.hook, f.event, f.detail))
+                            .collect();
+                        // An APPROVED gate whose bytes just changed is not
+                        // inert - it fails closed and blocks every tool
+                        // call from the next turn until restored or
+                        // re-approved. Say that, not "applies next turn".
+                        let note = if let Some(blocked) = discovered.fail_closed_reason() {
+                            format!(
+                                "[hook files changed. A live gate is now failing closed: \
+                                 {blocked}. From the next turn every tool call is BLOCKED \
+                                 until the file is restored to its approved bytes or a human \
+                                 re-approves it (openmax --approve <path>, at a terminal \
+                                 outside any session).]"
+                            )
+                        } else if inert.is_empty() {
+                            "[hook files changed. Hooks are discovered at turn start; \
+                             approved hooks apply from the next turn.]"
+                                .to_string()
+                        } else {
+                            format!(
+                                "[hook files changed. Not running: {}. Hooks activate only \
+                                 after a human runs openmax --approve <path> at a terminal \
+                                 outside any session; until then the guarantee is NOT in \
+                                 force - say so if asked, do not claim it.]",
+                                inert.join(" | ")
+                            )
+                        };
+                        append_and_emit_note(core, session_id, guard.messages(), &note);
+                    }
+                    // A settings.json edit (bash: outside the project
+                    // root) is inert for this session and bricks the
+                    // next launch when malformed - answered on the
+                    // writing call, while it is still repairable.
+                    if let Some(note) = settings_drift_note(core) {
+                        append_and_emit_note(core, session_id, guard.messages(), &note);
                     }
                 }
             }
@@ -3366,10 +3297,6 @@ async fn run_loop(
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
             approval_seen = unapproved_tool_map(&registry, &core.data_dir, project_root);
-            // A new generation changes what an identical call means: a tool
-            // rewritten this iteration must not have its first post-refreeze
-            // call vetoed as a "third repeat" of the old implementation.
-            repeat_tracker = RepeatCallTracker::new();
         }
         // The system prompt at index 0 changed on refreeze, so the transcript
         // prefix on disk is stale: rewrite instead of append.
@@ -4168,14 +4095,13 @@ mod tests {
         .unwrap();
         std::fs::write(project.join("danger.sh"), "#!/bin/sh\necho benign\n").unwrap();
         let registry = Registry::build(&project.join("data"), &project);
-        let tracker = RepeatCallTracker::new();
         let perms = TurnPermissions::new(Permissions::default());
         let calls = vec![
             tool_call("danger", r#"{"key":"a"}"#),
             tool_call("danger", r#"{"key":"b"}"#),
         ];
         let batchable =
-            || batchable_call(&calls[0], &registry, &tracker, &perms, &data, &project);
+            || batchable_call(&calls[0], &registry, &perms, &data, &project);
         let gated = || unapproved_capability(&registry, &data, &project, "danger");
 
         assert!(gated().is_some(), "nothing approved yet");
@@ -4203,7 +4129,7 @@ mod tests {
             "a swapped payload must not reach the unattended batch path by being called twice"
         );
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &perms, &data, &project)
+            batchable_call(c, &registry, &perms, &data, &project)
         });
         assert_eq!(segments.len(), 2, "each call gets its own serial segment");
         assert!(segments.iter().all(|s| !s.concurrent));
@@ -4378,26 +4304,6 @@ mod tests {
         assert!(is_native_call_broken(&calls[1]));
     }
 
-    #[test]
-    fn repeat_tracker_blocks_third_identical_call() {
-        let mut t = RepeatCallTracker::new();
-        assert!(!t.would_block("bash", r#"{"command":"ls"}"#));
-        t.record_executed("bash", r#"{"command":"ls"}"#);
-        assert!(!t.would_block("bash", r#"{"command":"ls"}"#));
-        t.record_executed("bash", r#"{"command":"ls"}"#);
-        assert!(t.would_block("bash", r#"{"command":"ls"}"#));
-    }
-
-    #[test]
-    fn repeat_tracker_resets_on_different_call() {
-        let mut t = RepeatCallTracker::new();
-        t.record_executed("bash", r#"{"command":"ls"}"#);
-        t.record_executed("bash", r#"{"command":"ls"}"#);
-        assert!(!t.would_block("read_file", r#"{"path":"a.rs"}"#));
-        t.record_executed("read_file", r#"{"path":"a.rs"}"#);
-        assert!(!t.would_block("read_file", r#"{"path":"a.rs"}"#));
-    }
-
     fn tool_call(name: &str, args: &str) -> ToolCall {
         ToolCall {
             id: format!("call_{name}"),
@@ -4507,7 +4413,6 @@ mod tests {
         )
         .unwrap();
         let registry = Registry::build(&project.join("data"), &project);
-        let tracker = RepeatCallTracker::new();
         let perms = TurnPermissions::new(Permissions::default());
         let calls = vec![
             tool_call("peek", r#"{"key":"a"}"#),
@@ -4515,11 +4420,11 @@ mod tests {
         ];
 
         assert!(
-            !batchable_call(&calls[0], &registry, &tracker, &perms, &data_dir, &project),
+            !batchable_call(&calls[0], &registry, &perms, &data_dir, &project),
             "unapproved host code must not be eligible for the unattended batch path"
         );
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &perms, &data_dir, &project)
+            batchable_call(c, &registry, &perms, &data_dir, &project)
         });
         assert_eq!(segments.len(), 2, "each call gets its own serial segment");
         assert!(segments.iter().all(|s| !s.concurrent));
@@ -4530,9 +4435,9 @@ mod tests {
             crate::registry::ToolKind::Builtin => unreachable!("peek is external"),
         };
         crate::ledger::approve_hash(&data_dir, &project, &sha).unwrap();
-        assert!(batchable_call(&calls[0], &registry, &tracker, &perms, &data_dir, &project));
+        assert!(batchable_call(&calls[0], &registry, &perms, &data_dir, &project));
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &perms, &data_dir, &project)
+            batchable_call(c, &registry, &perms, &data_dir, &project)
         });
         assert_eq!(segments.len(), 1);
         assert!(segments[0].concurrent, "approved read-only tools still batch");
@@ -4543,7 +4448,6 @@ mod tests {
     #[test]
     fn partition_splits_readonly_runs_and_breaks_on_mutating() {
         let registry = Registry::builtin_only();
-        let tracker = RepeatCallTracker::new();
         let calls = vec![
             tool_call("read_file", r#"{"path":"a.rs"}"#),
             tool_call("read_file", r#"{"path":"b.rs"}"#),
@@ -4553,7 +4457,7 @@ mod tests {
         ];
         let empty_perms = TurnPermissions::new(Permissions::default());
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
+            batchable_call(c, &registry, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 3);
         assert!(segments[0].concurrent && segments[0].start == 0 && segments[0].end == 2);
@@ -4564,7 +4468,6 @@ mod tests {
     #[test]
     fn partition_four_readonly_tools_batch_concurrently() {
         let registry = Registry::builtin_only();
-        let tracker = RepeatCallTracker::new();
         let empty_perms = TurnPermissions::new(Permissions::default());
         let calls = vec![
             tool_call("list_dir", r#"{"path":"."}"#),
@@ -4573,7 +4476,7 @@ mod tests {
             tool_call("grep", r#"{"pattern":"fn"}"#),
         ];
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
+            batchable_call(c, &registry, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 1);
         assert!(segments[0].concurrent);
@@ -4581,7 +4484,6 @@ mod tests {
         assert!(!batchable_call(
             &tool_call("write_file", r#"{"path":"x","content":"y"}"#),
             &registry,
-            &tracker,
             &empty_perms,
             nowhere(),
             nowhere(),
@@ -4589,7 +4491,6 @@ mod tests {
         assert!(!batchable_call(
             &tool_call("nope", r#"{}"#),
             &registry,
-            &tracker,
             &empty_perms,
             nowhere(),
             nowhere(),
@@ -4669,11 +4570,10 @@ mod tests {
     #[test]
     fn partition_single_readonly_call_is_serial() {
         let registry = Registry::builtin_only();
-        let tracker = RepeatCallTracker::new();
         let calls = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
         let empty_perms = TurnPermissions::new(Permissions::default());
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
+            batchable_call(c, &registry, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 1);
         assert!(!segments[0].concurrent);
@@ -4682,7 +4582,6 @@ mod tests {
     #[test]
     fn partition_breaks_on_invalid_json_and_unknown_tools() {
         let registry = Registry::builtin_only();
-        let tracker = RepeatCallTracker::new();
         let calls = vec![
             tool_call("read_file", r#"{"path":"a.rs"}"#),
             ToolCall {
@@ -4694,7 +4593,7 @@ mod tests {
         ];
         let empty_perms = TurnPermissions::new(Permissions::default());
         let segments = partition_concurrent_runs(&calls, |c| {
-            batchable_call(c, &registry, &tracker, &empty_perms, nowhere(), nowhere())
+            batchable_call(c, &registry, &empty_perms, nowhere(), nowhere())
         });
         assert_eq!(segments.len(), 3);
         assert!(!segments[0].concurrent);
@@ -6347,6 +6246,69 @@ mod tests {
             *requests.lock().unwrap(),
             1,
             "the request that cannot fit is refused, not dispatched"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One `bash` call with fixed arguments, the shape of polling: a `wait` on
+    /// a delegated child that times out, a `git status` while a build runs, a
+    /// log tail. The arguments never change while the results do.
+    const POLL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo poll\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Identical consecutive calls all execute. A call's arguments say
+    /// nothing about whether its result will change (a `wait` that timed out,
+    /// a `git status`, a log tail), so the loop never vetoes a repeat; what
+    /// bounds a model that is genuinely stuck is the turn's iteration and
+    /// token budgets, which are governance, not a guess about the model.
+    #[tokio::test]
+    async fn identical_consecutive_calls_all_execute() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(POLL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.approval_mode = ApprovalMode::Auto;
+            s.max_agent_iterations = 4;
+        }
+
+        let id = "sess-poll";
+        start_turn(core.clone(), id.into(), project, "poll until done".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut ends: Vec<(bool, String)> = Vec::new();
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::ToolEnd { ok, output, .. } => ends.push((ok, output)),
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("max_iterations"), "the iteration cap ends the loop");
+        assert_eq!(*requests.lock().unwrap(), 4);
+        assert_eq!(ends.len(), 4, "every iteration ran its call: {ends:?}");
+        assert!(
+            ends.iter().all(|(ok, output)| *ok && output.contains("poll")),
+            "a repeated call must execute, not be vetoed: {ends:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
