@@ -6048,6 +6048,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = format!("http://{addr}/v1");
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
         }
 
         let id = "sess-hook-cancel";
@@ -6285,6 +6286,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.max_agent_tokens = Some(2000);
             s.max_agent_iterations = 10;
         }
@@ -6331,6 +6333,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.approval_mode = ApprovalMode::Auto;
             s.max_agent_iterations = 4;
         }
@@ -6394,6 +6397,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.max_agent_iterations = 2;
         }
 
@@ -6520,6 +6524,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             // One iteration: call the tool, then the loop stops. The receipt
             // is what the test reads, not the stop reason.
             s.max_agent_iterations = 1;
@@ -6599,6 +6604,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.max_agent_iterations = 1;
         }
 
@@ -6657,6 +6663,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             // Above one request's estimate and below two, so the fallback
             // charge is what refuses the second request.
             s.max_agent_tokens = Some(2000);
@@ -6690,6 +6697,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             // Below the frozen schemas alone, so no request can ever fit.
             s.max_agent_tokens = Some(200);
             s.max_agent_iterations = 4;
@@ -6744,6 +6752,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
         }
 
         let id = "sess-verify";
@@ -6819,6 +6828,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
         }
 
         start_turn(core.clone(), "sess-wire".into(), project.clone(), "ship it".into()).unwrap();
@@ -6886,6 +6896,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.max_agent_iterations = 20;
         }
 
@@ -6937,6 +6948,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.max_agent_iterations = 20;
         }
 
@@ -6989,6 +7001,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             // Higher than the continuation cap, so the cap is what stops this.
             s.max_agent_iterations = 20;
         }
@@ -7057,6 +7070,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             s.max_agent_iterations = 20;
         }
 
@@ -7105,6 +7119,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
             // Below the continuation cap, so the iteration budget binds first.
             s.max_agent_iterations = 3;
         }
@@ -7196,6 +7211,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = format!("http://{addr}/v1");
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
         }
 
         let id = "sess-cancel-verdict";
@@ -7263,6 +7279,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
         }
 
         let id = "sess-once";
@@ -7322,7 +7339,7 @@ mod tests {
             s.model = "stub".into();
             // Small enough that the builtin schemas plus the system prompt
             // exceed the send budget before the first user word.
-            s.context_tokens = 1200;
+            s.context_tokens = Some(1200);
         }
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -7446,6 +7463,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = format!("http://{addr}/v1");
             s.model = "stub".into();
+            s.context_tokens = Some(16384);
         }
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -7602,7 +7620,7 @@ mod tests {
             s.model = "stub".into();
             // Small enough that the seeded transcript overflows and whole
             // exchanges drop; large enough that the builtin schemas do not.
-            s.context_tokens = 8000;
+            s.context_tokens = Some(8000);
             s.max_tokens = 256;
         }
 
@@ -7924,6 +7942,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = "http://127.0.0.1:9".into();
             s.model = "m".into();
+            s.context_tokens = Some(16384);
             s.clone()
         };
 
@@ -8019,6 +8038,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = "http://127.0.0.1:9".into();
             s.model = "m".into();
+            s.context_tokens = Some(16384);
             s.clone()
         };
         let endpoint = crate::providers::resolve(&settings, &core.data_dir).unwrap();
@@ -8699,7 +8719,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = "http://127.0.0.1:9".into();
             s.model = "m".into();
-            s.context_tokens = 400_000;
+            s.context_tokens = Some(400_000);
             s.max_tokens = 2_048;
             s.compaction_tokens = Some(20_000);
         }
@@ -8767,7 +8787,7 @@ mod tests {
             let mut s = core.settings.lock().unwrap();
             s.base_url = "http://127.0.0.1:9".into();
             s.model = "m".into();
-            s.context_tokens = 12_288;
+            s.context_tokens = Some(12_288);
             s.max_tokens = 1_024;
         }
         // budget = 12_288 - (1_024 + 1_024) = 10_240, target 7_168. Build a

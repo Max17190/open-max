@@ -10,7 +10,10 @@
 //! For the same reason there is no default endpoint. An empty `base_url` is a
 //! hard resolve error rather than a guess at localhost, so a misconfigured
 //! install fails at startup instead of silently talking to whatever happens to
-//! be listening.
+//! be listening. There is no default context window either: the harness
+//! never queries one, and a guess compacts a large model early or lets a
+//! small one fail for length, so a missing `context_tokens` is a resolve
+//! error that names where to set it.
 
 use std::path::{Path, PathBuf};
 
@@ -73,7 +76,12 @@ pub struct Settings {
     pub api_key: Option<String>,
     pub model: String,
     pub approval_mode: ApprovalMode,
-    pub context_tokens: usize,
+    /// The model's context window in tokens. No default: the harness never
+    /// queries the server, and a guessed window is wrong in one direction or
+    /// the other (too small compacts a large model's history early, too large
+    /// lets a small model's requests fail for length). Required at resolve
+    /// unless the named provider's model entry supplies it.
+    pub context_tokens: Option<usize>,
     pub max_tokens: usize,
     pub temperature: f32,
     /// Byte cap for bash/external tool output before tail-truncation with
@@ -125,7 +133,7 @@ impl Default for Settings {
             api_key: None,
             model: String::new(),
             approval_mode: ApprovalMode::Ask,
-            context_tokens: 16384,
+            context_tokens: None,
             max_tokens: 4096,
             temperature: 0.2,
             max_output_bytes: None,

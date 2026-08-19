@@ -35,8 +35,13 @@ approval policy to defaults.
 Four more settings shape the context budget; all are optional, and a named
 provider's per-model entries override the first two.
 
-- `context_tokens` (default 16384): the model's context window. Nothing is
-  queried from the server; set this to what your model actually has.
+- `context_tokens` (required, here or in the model's `providers.json`
+  entry): the model's context window. Nothing is queried from the server,
+  and there is no default: a guessed window is wrong in one direction or the
+  other (too small compacts a large model's history early, too large lets a
+  small model's requests fail for length), so a turn refuses with a message
+  naming this field until it is set. Set it to what the server actually
+  serves for the model. `openmax --check` warns while it is missing.
 - `max_tokens` (default 4096): the completion reserve, clamped so it never
   eats the window (at most `context_tokens - 2048`).
 - `temperature` (default 0.2).

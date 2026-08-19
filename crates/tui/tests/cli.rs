@@ -41,7 +41,7 @@ fn write_settings_with_mode(home: &Path, base_url: &str, approval_mode: &str) {
     std::fs::write(
         dir.join("settings.json"),
         format!(
-            r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"{approval_mode}"}}"#
+            r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"{approval_mode}","context_tokens":16384}}"#
         ),
     )
     .unwrap();
