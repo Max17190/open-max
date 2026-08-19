@@ -7,8 +7,10 @@
 //! instead of ending it. Empty discovery costs almost nothing (one
 //! directory list). Hooks never change tool schemas, and the only hook
 //! text a model reads is a gate's refusal (a `pre_tool_use` block reason as
-//! that call's tool result, a blocking `turn_end` reason as a user message,
-//! both capped): never free-form context.
+//! that call's tool result, a blocking `turn_end` reason as a user message):
+//! never free-form context. Hook-authored reasons are clipped to
+//! MAX_REASON_CHARS; the harness's own fail-closed reasons (a revoked gate,
+//! a gate whose approved code changed) are not.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
