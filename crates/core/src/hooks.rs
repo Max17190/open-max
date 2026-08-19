@@ -5,8 +5,12 @@
 //! reason; fires even on cancel) observes unless its approved bytes set
 //! `blocking`, in which case a nonzero exit sends the turn back to the model
 //! instead of ending it. Empty discovery costs almost nothing (one
-//! directory list). Hooks never change tool schemas and never inject text
-//! into the model.
+//! directory list). Hooks never change tool schemas, and the only hook
+//! text a model reads is a gate's refusal (a `pre_tool_use` block reason as
+//! that call's tool result, a blocking `turn_end` reason as a user message):
+//! never free-form context. Hook-authored reasons are clipped to
+//! MAX_REASON_CHARS; the harness's own fail-closed reasons (a revoked gate,
+//! a gate whose approved code changed) are not.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -725,7 +729,7 @@ impl Hooks {
     /// Run all `user_prompt_submit` hooks against the text the user typed,
     /// before it enters the transcript. First block wins (nonzero exit); the
     /// blocked turn never starts and never reaches the model. Gate only:
-    /// hooks still never inject text into the context.
+    /// the reason goes to the frontend, and nothing reaches the model.
     pub async fn user_prompt_submit(
         &self,
         session_id: &str,
