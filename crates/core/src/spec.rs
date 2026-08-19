@@ -198,6 +198,15 @@ bytes (manifest plus the project-local code it names):
   A passing probe approves NOTHING: in-session calls still stop for the card
   until a human approves the bytes. On a host with no sandbox backend the
   probe is refused (never run unsandboxed) and the refusal says so.
+  Because the probe denies the network and any write outside that scratch dir,
+  a tool that needs either (a web or API tool, a tool that writes a real file)
+  CANNOT pass a sandboxed probe: the probe reports `warn` and does NOT fail
+  `--check`, because a failure under those restrictions is inconclusive, not
+  proof the tool is broken (a passing probe approves nothing, so a failing one
+  condemns nothing). Approve the bytes (`openmax --approve`) and re-run
+  `openmax --check --run-examples` to exercise the real command with host
+  authority, or write an example that avoids the network for a sandbox-provable
+  proof of life.
 - APPROVED: the example is the tool's real command with the harness's host
   authority, run in the project root with no sandbox and no snapshot, behind
   the same gates a turn applies: `pre_tool_use` hooks allow it; permission
