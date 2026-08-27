@@ -1643,6 +1643,85 @@ pub fn approval_manifest_missing(data_dir: &Path, project_root: &Path, record: &
             .is_some_and(|sha| !matches!(object_state(data_dir, project_root, sha), ObjectState::Intact))
 }
 
+/// The `(sha, path)` pairs `--ledger`'s footer may offer as `cp` restore
+/// commands for one approval's bound code: each vouched hash in `also`,
+/// paired with the project file the approved bytes named for it, intact
+/// objects only.
+///
+/// The pairing is positional because it was recorded positionally: the
+/// approval hashed the manifest's bound files in `manifest_code_source`
+/// order and `approve()` wrote them to `also` in that order. A hook record
+/// carries the named paths in `code`; a tool record carries none (`code` is
+/// filled from the hook shape only), so its paths are re-derived by parsing
+/// the STORED manifest object - the bytes the hash pins, never the live
+/// file, which may be exactly what needs restoring (Greptile). A bound file
+/// the card could not read never entered `also`, so a hash list shorter than
+/// the named-path list is ambiguous: nothing is offered then, because a
+/// guessed pairing prints a command that writes approved bytes over the
+/// wrong file.
+pub fn approval_restore_targets(
+    data_dir: &Path,
+    project_root: &Path,
+    record: &Record,
+) -> Vec<(String, PathBuf)> {
+    if record.kind != Kind::Approval || record.also.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<PathBuf> = if !record.code.is_empty() && record.code.len() == record.also.len() {
+        record.code.iter().map(PathBuf::from).collect()
+    } else {
+        let named = approved_manifest_code_paths(data_dir, project_root, record);
+        if named.len() != record.also.len() {
+            return Vec::new();
+        }
+        named
+    };
+    record
+        .also
+        .iter()
+        .zip(paths)
+        .filter(|(sha, _)| matches!(object_state(data_dir, project_root, sha.as_str()), ObjectState::Intact))
+        .map(|(sha, path)| (sha.clone(), path))
+        .collect()
+}
+
+/// The bound-code paths the approved manifest bytes name. The record's sha is
+/// what authenticates the bytes, not where they live, so the stored object
+/// and the file at the record's path are both accepted sources when their
+/// bytes hash to it - a pruned object with the manifest still installed must
+/// not hide the script restore the footer exists to print (Greptile). Empty
+/// when neither source hashes to the vouched sha (an edited manifest revokes,
+/// so its named paths are nobody's to offer), when nothing was ever stored
+/// (a hash-only approval), or when the record carries no path to parse
+/// against.
+fn approved_manifest_code_paths(
+    data_dir: &Path,
+    project_root: &Path,
+    record: &Record,
+) -> Vec<PathBuf> {
+    if record.path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Some(sha) = record.sha256.as_deref() else {
+        return Vec::new();
+    };
+    let object = project_dir(data_dir, project_root).join("objects").join(sha);
+    let Some(bytes) = [object, record.path.clone()]
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .find(|b| sha256_hex(b) == sha)
+    else {
+        return Vec::new();
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Vec::new();
+    };
+    manifest_code_source(&record.path, text, project_root)
+        .into_iter()
+        .map(|c| c.path)
+        .collect()
+}
+
 /// Unix seconds as `YYYY-MM-DD HH:MM:SSZ`. Raw epoch seconds are unreadable
 /// in an audit trail, and a date crate is not worth pulling in for one line.
 pub fn format_ts(secs: u64) -> String {
@@ -2734,6 +2813,136 @@ mod tests {
         let records = history(&data, &root).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[1].prev, sha256_hex(first_line(&data, &root).as_bytes()));
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An approved external tool records its bound script's hash in `also`
+    /// but no path list - `code` is filled from the hook shape only - so a
+    /// footer pairing `also` with `code` offered nothing: the one intact
+    /// object an operator needs after deleting the script had no cp line
+    /// (Greptile). The path comes back from the stored manifest object, the
+    /// approved bytes, never the live file, which here is already gone.
+    #[test]
+    fn an_external_tools_bound_script_gets_a_restore_target() {
+        let data = temp("tool-restore-data");
+        let root = temp("tool-restore-proj");
+        let manifest = root.join("deploy.toml");
+        let body = "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n";
+        std::fs::write(&manifest, body).unwrap();
+        std::fs::write(root.join("deploy.sh"), "script").unwrap();
+        let bound = manifest_code(&manifest, &root);
+        assert_eq!(bound.len(), 1, "the fixture binds exactly the script");
+        let script_path = bound[0].path.clone();
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        std::fs::remove_file(root.join("deploy.sh")).unwrap();
+
+        let records = history(&data, &root).unwrap();
+        assert!(records[0].code.is_empty(), "a tool record carries no path list");
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            vec![(sha256_hex(b"script"), script_path)],
+            "the intact script object is offered at the path the approved bytes name"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The record's sha authenticates the manifest bytes wherever they live:
+    /// with the stored object pruned but the manifest file still hashing to
+    /// the vouched sha, a tool's intact script object keeps its restore line
+    /// (Greptile), while an EDITED manifest file authenticates nothing.
+    #[test]
+    fn a_tools_restore_survives_a_pruned_manifest_object_via_the_authentic_file() {
+        let data = temp("tool-prune-data");
+        let root = temp("tool-prune-proj");
+        let manifest = root.join("deploy.toml");
+        let body = "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n";
+        std::fs::write(&manifest, body).unwrap();
+        std::fs::write(root.join("deploy.sh"), "script").unwrap();
+        let script_path = manifest_code(&manifest, &root)[0].path.clone();
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        std::fs::remove_file(root.join("deploy.sh")).unwrap();
+        std::fs::remove_file(project_dir(&data, &root).join("objects").join(&shas[0])).unwrap();
+
+        let records = history(&data, &root).unwrap();
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            vec![(sha256_hex(b"script"), script_path)],
+            "the on-disk manifest still hashes to the vouched sha, so it names the path"
+        );
+
+        std::fs::write(&manifest, "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./other.sh\"\n")
+            .unwrap();
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            Vec::<(String, PathBuf)>::new(),
+            "an edited manifest authenticates nothing and offers nothing"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A bound file the card could not read never enters `also`, so its
+    /// record's hash and path lists disagree in length. Positional pairing
+    /// would then print a cp that writes one file's approved bytes over
+    /// another file's path - the helper refuses instead.
+    #[test]
+    fn an_unequal_hash_and_path_list_is_refused_not_guess_paired() {
+        let data = temp("gap-data");
+        let root = temp("gap-proj");
+        let manifest = root.join("gate.toml");
+        let body = "event = \"pre_tool_use\"\ncommand = \"./wrap.sh\"\nargs = [\"helper.py\"]\n";
+        std::fs::write(&manifest, body).unwrap();
+        std::fs::write(root.join("wrap.sh"), "wrap").unwrap();
+        std::fs::write(root.join("helper.py"), "helper").unwrap();
+        // The card skips a file it cannot read; only helper.py's hash rides.
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"helper")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+
+        let records = history(&data, &root).unwrap();
+        assert_eq!(records[0].code.len(), 2, "the approved bytes name two files");
+        assert_eq!(records[0].also.len(), 1, "only one hash was vouched");
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            Vec::<(String, PathBuf)>::new(),
+            "an ambiguous pairing offers nothing rather than the wrong path"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hook record carries its named paths, so its bound-code restore
+    /// survives a manifest object that is itself missing - the record is the
+    /// pairing, no parse needed - while a bound object that is not intact is
+    /// never offered.
+    #[test]
+    fn a_hooks_recorded_paths_pair_without_the_manifest_object() {
+        let data = temp("hook-restore-data");
+        let root = temp("hook-restore-proj");
+        let manifest = root.join("gate.toml");
+        let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
+        std::fs::write(&manifest, body).unwrap();
+        std::fs::write(root.join("gate.sh"), "script").unwrap();
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        let records = history(&data, &root).unwrap();
+        let objects = project_dir(&data, &root).join("objects");
+        std::fs::remove_file(objects.join(&shas[0])).unwrap();
+
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            vec![(sha256_hex(b"script"), PathBuf::from(records[0].code[0].clone()))],
+            "the record's own path list pairs without the manifest object"
+        );
+        std::fs::remove_file(objects.join(&shas[1])).unwrap();
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            Vec::<(String, PathBuf)>::new(),
+            "a bound object that is not intact is never offered"
+        );
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
