@@ -519,12 +519,15 @@ async fn main() -> std::io::Result<()> {
                     );
                     // Record the runnable restore targets for the footer. A
                     // change record names its own path and hash; an approval
-                    // names its manifest, and - for a hook - the bound code
-                    // paths in `code` line up with the hashes in `also`, which
-                    // is the second file the deleted-hook recovery needs and
-                    // that the old footer never named. Only intact objects are
-                    // offered; a missing or corrupt one is already counted as
-                    // damage above.
+                    // names its manifest plus, per vouched hash in `also`, the
+                    // file the approved bytes bound it to - the second file
+                    // the deleted-hook recovery needs and that the old footer
+                    // never named. approval_restore_targets pairs them from
+                    // the record's own path list (hooks) or the stored
+                    // manifest object (tools record none), and refuses rather
+                    // than guesses when a card-skipped file leaves the lists
+                    // unequal. Only intact objects are offered; a missing or
+                    // corrupt one is already counted as damage above.
                     match r.kind {
                         Kind::Change => {
                             if let Some(sha) = &r.sha256 {
@@ -543,11 +546,9 @@ async fn main() -> std::io::Result<()> {
                                     restore.push((sha.clone(), r.path.clone()));
                                 }
                             }
-                            for (sha, path) in r.also.iter().zip(r.code.iter()) {
-                                if states.get(sha.as_str()).copied() == Some(ObjectState::Intact) {
-                                    restore.push((sha.clone(), std::path::PathBuf::from(path)));
-                                }
-                            }
+                            restore.extend(open_max_core::ledger::approval_restore_targets(
+                                &data_dir, &project, r,
+                            ));
                         }
                         _ => {}
                     }
