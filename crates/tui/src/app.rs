@@ -644,7 +644,14 @@ impl App {
                                 .unwrap_or(serde_json::Value::Null);
                             let summary = registry::summarize_call(&call.function.name, &args);
                             let content = tool_msg.content.as_deref().unwrap_or("");
-                            let ok = !content.starts_with("Error:");
+                            // The approval timeout is the one failure the
+                            // transcript keeps without the Error: prefix
+                            // (agent::tool_message_content, so the model
+                            // reads the instruction); classify it explicitly
+                            // or a timed-out call replays folded under a
+                            // checkmark while the live card was an open ✗.
+                            let ok = !content.starts_with("Error:")
+                                && !content.starts_with(open_max_core::agent::APPROVAL_TIMEOUT_PREFIX);
                             // Diff events are not persisted, but the result
                             // text carries the counts: a replayed edit card
                             // keeps its +N −N badge instead of demoting to a
@@ -5452,6 +5459,56 @@ mod tests {
         let text = buffer_text(&render_app(&mut app, 100, 30));
         assert!(text.contains("CHANGELOG.md"), "{text}");
         assert!(!text.contains("+3"), "read card wears a diff badge: {text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The approval timeout is persisted without the `Error:` prefix
+    /// (agent::tool_message_content keeps it verbatim so the model reads the
+    /// stop instruction), so replay must classify it as the failure it was:
+    /// the live card was open on its output with a cross, and the replayed
+    /// card must arrive the same way instead of folded under a checkmark.
+    #[test]
+    fn replay_shows_an_approval_timeout_as_the_failure_it_was() {
+        let (mut app, dir) = app_fixture();
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        let timeout = format!(
+            "{} with no response. Stop and summarize what you were about to do.",
+            open_max_core::agent::APPROVAL_TIMEOUT_PREFIX
+        );
+        let messages = vec![
+            open_max_core::types::ChatMessage::user("deploy it"),
+            open_max_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: Some(vec![open_max_core::types::ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: open_max_core::types::ToolCallFunction {
+                        name: "bash".into(),
+                        arguments: "{\"command\":\"./deploy.sh\"}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some(timeout.clone()),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+        ];
+        let mut persisted = 0usize;
+        open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
+        app.replay(&meta.id);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(
+            text.contains("timed out with no response"),
+            "a replayed timeout arrives open on its output like the live card did: {text}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

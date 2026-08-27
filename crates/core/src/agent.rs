@@ -498,8 +498,15 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
     }
 }
 
+/// The one failure persisted without the `Error: ` prefix: the model must
+/// read the timeout as an instruction to stop, not as tool noise. Everything
+/// that classifies persisted results by prefix (tool_message_content here,
+/// the TUI's replay) must share this spelling, or a timed-out call replays
+/// as a success.
+pub const APPROVAL_TIMEOUT_PREFIX: &str = "Approval request timed out";
+
 fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
-    if outcome.ok || outcome.output.starts_with("Approval request timed out") {
+    if outcome.ok || outcome.output.starts_with(APPROVAL_TIMEOUT_PREFIX) {
         outcome.output.clone()
     } else {
         format!("Error: {}", outcome.output)
@@ -3044,7 +3051,7 @@ async fn run_loop(
                         }, false),
                         ApprovalOutcome::TimedOut => (tools::ToolOutcome {
                             ok: false,
-                            output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
+                            output: format!("{APPROVAL_TIMEOUT_PREFIX} with no response. Stop and summarize what you were about to do."),
                             diff: None, ..Default::default()
                         }, false),
                         ApprovalOutcome::Cancelled => (tools::ToolOutcome {
