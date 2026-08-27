@@ -677,7 +677,7 @@ impl App {
                                 &truncate_replay_output(content),
                                 badge.as_ref(),
                             );
-                            self.transcript.push_tool(compact, content.to_string());
+                            self.transcript.push_tool(compact, content.to_string(), ok);
                             self.last_tool_output = Some(content.to_string());
                         }
                     }
@@ -2546,7 +2546,7 @@ impl App {
                     .as_ref()
                     .map(|change| change.diff.clone())
                     .unwrap_or_else(|| output.clone());
-                self.transcript.push_tool(compact, expanded.clone());
+                self.transcript.push_tool(compact, expanded.clone(), ok);
                 self.last_tool_output = Some(expanded);
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
