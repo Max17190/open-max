@@ -342,6 +342,11 @@ pub struct App {
     /// Last state written into the terminal title (idle / working / needs
     /// approval); writes are edge-triggered.
     presence: Presence,
+    /// Terminal focus as last reported by a focus-change event. None until
+    /// the terminal sends one: a terminal that never reports focus keeps the
+    /// turn-done ring silent instead of ringing at a user who is already
+    /// watching every turn end.
+    term_focus: Option<bool>,
     approval_hits: [Option<Rect>; 3],
     /// Whether the last draw showed the pending approval's full credential
     /// grant. When a grant is too large for the card (a tiny terminal clamps
@@ -570,6 +575,7 @@ impl App {
             last_tail_len: 0,
             last_content_w: 0,
             presence: Presence::Idle,
+            term_focus: None,
             approval_hits: [None; 3],
             approval_grant_fully_shown: true,
             perf_layout_ms: 0.0,
@@ -871,9 +877,15 @@ impl App {
                 }
             }
             TermEvent::Resize(_, _) => self.dirty = Dirty::all(),
+            TermEvent::FocusGained => self.on_focus_change(true),
+            TermEvent::FocusLost => self.on_focus_change(false),
             _ => {}
         }
         Ok(())
+    }
+
+    fn on_focus_change(&mut self, gained: bool) {
+        self.term_focus = Some(gained);
     }
 
     async fn on_key(&mut self, key: KeyEvent) -> std::io::Result<()> {
@@ -2788,8 +2800,12 @@ impl App {
         if self.presence == presence {
             return;
         }
+        let was = self.presence;
         self.presence = presence;
         self.emit_presence_title();
+        if turn_end_rings(was, presence, self.term_focus) {
+            self.emit_turn_done_notification();
+        }
     }
 
     fn emit_presence_title(&self) {
@@ -2799,6 +2815,18 @@ impl App {
         if self.presence == Presence::NeedsApproval {
             seq.push('\x07');
         }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
+    }
+
+    /// OSC 9 notification plus a bell for the turn-done edge. Terminals that
+    /// surface OSC 9 (as a desktop notification) usually also report focus,
+    /// so the pair only fires while the user is away; terminals that support
+    /// neither consume the OSC unrendered and never reach here at all, since
+    /// `term_focus` stays None without focus reports.
+    fn emit_turn_done_notification(&self) {
+        use std::io::Write;
+        let seq = format!("\x1b]9;{} · turn complete\x07\x07", project_label(&self.project));
         let mut out = std::io::stdout();
         let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
     }
@@ -3587,7 +3615,9 @@ const HELP_KEYS: &[(&str, &str)] = &[
 /// What this session needs from the world, stated in the terminal title so
 /// tmux window lists, tab bars, and pane supervisors can read it without an
 /// orchestrator attached. The bell rings on the idle-hands edge (an approval
-/// arriving), which tmux monitor-bell and terminal urgency hints surface.
+/// arriving), which tmux monitor-bell and terminal urgency hints surface,
+/// and on the working-to-idle edge while the terminal is known unfocused
+/// (the turn-done ring, paired with an OSC 9 notification).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Presence {
     Idle,
@@ -3595,16 +3625,30 @@ enum Presence {
     NeedsApproval,
 }
 
-fn presence_title(presence: Presence, project: &std::path::Path) -> String {
-    let base = project
+fn project_label(project: &std::path::Path) -> String {
+    project
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "openmax".into());
+        .unwrap_or_else(|| "openmax".into())
+}
+
+fn presence_title(presence: Presence, project: &std::path::Path) -> String {
+    let base = project_label(project);
     match presence {
         Presence::Idle => format!("{base} · openmax"),
         Presence::Working => format!("{base} · openmax · working"),
         Presence::NeedsApproval => format!("{base} · openmax · needs approval"),
     }
+}
+
+/// Whether a presence edge rings the turn-done notification: only the
+/// working-to-idle edge, and only when the terminal has reported itself
+/// unfocused. The needs-approval edge keeps its own unconditional bell, and
+/// an idle edge out of the approval card is the user cancelling, so they are
+/// present by definition. Unknown focus stays silent: with no focus reports
+/// the ring would fire at a watching user on every turn.
+fn turn_end_rings(was: Presence, now: Presence, term_focus: Option<bool>) -> bool {
+    was == Presence::Working && now == Presence::Idle && term_focus == Some(false)
 }
 
 /// Elapsed-time label for the live tail: tenths below ten seconds so the
@@ -4133,7 +4177,7 @@ mod tests {
         wrap_str_preserving,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         is_shift_tab, paint_text_selection, parse_change_counts, plural, presence_title,
-        rect_contains, save_model_selection,
+        rect_contains, save_model_selection, turn_end_rings,
         App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
@@ -5330,6 +5374,33 @@ mod tests {
             stop_reason: "stop".into(),
         });
         assert_eq!(app.presence, Presence::Idle);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn turn_done_ring_fires_only_on_the_unfocused_working_to_idle_edge() {
+        use Presence::*;
+        // The one ringing edge.
+        assert!(turn_end_rings(Working, Idle, Some(false)));
+        // Focused or unknown focus stays silent: without focus reports the
+        // ring would fire at a watching user on every turn.
+        assert!(!turn_end_rings(Working, Idle, Some(true)));
+        assert!(!turn_end_rings(Working, Idle, None));
+        // Cancelling out of an approval card is the user acting, and the
+        // approval edge itself already rang its own bell.
+        assert!(!turn_end_rings(NeedsApproval, Idle, Some(false)));
+        assert!(!turn_end_rings(Working, NeedsApproval, Some(false)));
+        assert!(!turn_end_rings(Idle, Working, Some(false)));
+    }
+
+    #[test]
+    fn focus_reports_track_terminal_focus() {
+        let (mut app, dir) = app_fixture();
+        assert_eq!(app.term_focus, None, "silent until the terminal reports");
+        app.on_focus_change(false);
+        assert_eq!(app.term_focus, Some(false));
+        app.on_focus_change(true);
+        assert_eq!(app.term_focus, Some(true));
         fs::remove_dir_all(dir).unwrap();
     }
 

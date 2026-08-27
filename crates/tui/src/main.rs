@@ -1067,6 +1067,8 @@ async fn main() -> std::io::Result<()> {
     // Mouse capture for wheel scrolling of the transcript. Terminals still
     // allow text selection with the usual modifier (Option on macOS).
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Focus reports gate the turn-done ring on the user being away.
+    let _ = execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
 
     let result = app::run(
         terminal,
@@ -1076,6 +1078,7 @@ async fn main() -> std::io::Result<()> {
     )
     .await;
 
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     if enhanced {
