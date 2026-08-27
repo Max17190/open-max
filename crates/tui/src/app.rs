@@ -773,7 +773,7 @@ impl App {
             }
             TermEvent::Paste(text) => {
                 if self.mode == Mode::Chat && self.pending_approval.is_none() {
-                    self.composer.insert_str(&text);
+                    self.composer.insert_paste(&text);
                     self.sync_completion();
                     self.dirty.mark_chrome();
                 }
@@ -941,6 +941,16 @@ impl App {
         self.quit_armed = false;
 
         if ctrl && key.code == KeyCode::Char('o') {
+            // A collapsed paste under the composer cursor outranks the tool
+            // block: the marker is the nearer, rarer, deliberate target.
+            if self.mode == Mode::Chat
+                && self.pending_approval.is_none()
+                && self.composer.expand_paste_at_cursor()
+            {
+                self.sync_completion();
+                self.dirty.mark_chrome();
+                return Ok(());
+            }
             if self.transcript.expand_last_tool() {
                 self.focus = Focus::Scrollback;
             } else if let Some(output) = self
@@ -3622,7 +3632,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("click in the prompt", "put the cursor there in a wrapped draft"),
     ("mouse drag", "select transcript or prompt text · y or ctrl+c copies"),
     ("double / triple click", "select the word · the whole line"),
-    ("ctrl+o / o", "expand the last tool block"),
+    ("ctrl+o / o", "expand a [pasted #N] under the cursor, else the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
     ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
     ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),

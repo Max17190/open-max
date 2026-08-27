@@ -25,6 +25,24 @@ const GUTTER: usize = 2;
 /// Rows the composer may occupy before a draft starts scrolling inside it.
 const MAX_VISIBLE_ROWS: usize = 6;
 
+/// A paste collapses to a marker at either bound: enough lines to bury the
+/// draft (the composer shows six rows), or enough characters that one
+/// logical line still drowns it (a minified blob, a stack trace one-liner).
+const PASTE_COLLAPSE_LINES: usize = 10;
+const PASTE_COLLAPSE_CHARS: usize = 1000;
+
+/// The draft stand-in for collapsed paste `index` (1-based). Content-derived
+/// and index-stamped, so two identical pastes still get distinct markers and
+/// a marker matches only while it is intact.
+fn paste_marker(index: usize, text: &str) -> String {
+    let lines = text.lines().count();
+    if lines > 1 {
+        format!("[pasted #{index}: {lines} lines]")
+    } else {
+        format!("[pasted #{index}: {} chars]", text.chars().count())
+    }
+}
+
 /// A cursor or selection endpoint as (logical line, char column).
 type Point = (usize, usize);
 
@@ -100,6 +118,15 @@ pub struct Composer {
     hist_idx: Option<usize>,
     stash: String,
     history_path: PathBuf,
+    /// Collapsed pastes, indexed by the `#N` in their draft markers. The
+    /// draft holds `[pasted #N: … lines]` while the bytes wait here; every
+    /// reader of the whole draft (`text`, and so submit, queue, history) gets
+    /// the expansion, so a marker never leaves the composer. An entry whose
+    /// marker was hand-edited or deleted simply never matches again; the
+    /// vector drains with `clear`, so nothing outlives its draft. `None` is
+    /// a spent reference: an in-place expansion consumed the bytes, and the
+    /// occupied index keeps sibling markers' numbers stable.
+    pastes: Vec<Option<String>>,
 }
 
 impl Composer {
@@ -127,11 +154,12 @@ impl Composer {
             hist_idx: None,
             stash: String::new(),
             history_path,
+            pastes: Vec::new(),
         }
     }
 
     pub fn text(&self) -> String {
-        self.lines.join("\n")
+        self.expand_pastes(&self.lines.join("\n"))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -212,6 +240,127 @@ impl Composer {
         }
     }
 
+    /// Insert a paste, collapsing a big one to a numbered marker so the
+    /// draft stays editable instead of drowning under it. The bytes live in
+    /// `pastes` and rejoin the draft when the whole text is read out (see
+    /// the field doc); `expand_paste_at_cursor` splices them back in place
+    /// for editing. Collapse and expand ship together on purpose: a
+    /// collapsed paste with no way back is worse than no collapse.
+    pub fn insert_paste(&mut self, text: &str) {
+        // Match what `insert_str` would have produced so expansion is
+        // byte-identical to the never-collapsed draft.
+        let text = text.replace('\r', "");
+        if text.lines().count() < PASTE_COLLAPSE_LINES
+            && text.chars().count() < PASTE_COLLAPSE_CHARS
+        {
+            self.insert_str(&text);
+            return;
+        }
+        let marker = paste_marker(self.pastes.len() + 1, &text);
+        self.pastes.push(Some(text));
+        self.insert_str(&marker);
+    }
+
+    fn expand_pastes(&self, text: &str) -> String {
+        // Every live marker is located in the DRAFT text first, then spliced
+        // in one pass over it. Sequential replacement rescanned text already
+        // expanded, so a marker spelling EMBEDDED in an earlier paste's
+        // content could capture a later paste's expansion (Greptile);
+        // expanded bytes are content, never search territory.
+        //
+        // Each insertion wrote its marker exactly once, so its FIRST draft
+        // occurrence is the one that expands: a hand-typed duplicate of the
+        // spelling stays literal text instead of injecting the hidden bytes
+        // a second time, and a duplicate placed BEFORE the genuine marker
+        // receives the expansion in its stead, deterministically; the
+        // cursor-anchored ctrl+o splice is how a human resolves which
+        // occurrence they mean. Span tracking through arbitrary edits would
+        // pin WHICH occurrence and is not worth its machinery for a forged
+        // marker.
+        let mut sites: Vec<(usize, usize, &str)> = Vec::new();
+        for (i, paste) in self.pastes.iter().enumerate() {
+            let Some(paste) = paste else {
+                // Spent by an in-place expansion: any surviving duplicate of
+                // its marker is literal text, never a second delivery.
+                continue;
+            };
+            let marker = paste_marker(i + 1, paste);
+            if let Some(pos) = text.find(&marker) {
+                sites.push((pos, marker.len(), paste.as_str()));
+            }
+        }
+        sites.sort_by_key(|s| s.0);
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (pos, len, paste) in sites {
+            if pos < cursor {
+                // Index-stamped markers cannot overlap; defensive all the same.
+                continue;
+            }
+            out.push_str(&text[cursor..pos]);
+            out.push_str(paste);
+            cursor = pos + len;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    /// Splice the collapsed paste whose marker sits under the cursor back
+    /// into the draft, for editing it in place. Returns false when the
+    /// cursor's row holds no intact marker under the cursor.
+    pub fn expand_paste_at_cursor(&mut self) -> bool {
+        let row_text = self.lines[self.row].clone();
+        for i in 0..self.pastes.len() {
+            let marker = match self.pastes[i].as_ref() {
+                Some(paste) => paste_marker(i + 1, paste),
+                None => continue,
+            };
+            // The occurrence UNDER the cursor, never the first in the row: a
+            // byte-identical duplicate earlier in the row must neither
+            // swallow the gesture nor receive the splice.
+            let Some(pos) = row_text.match_indices(&marker).map(|(p, _)| p).find(|&p| {
+                let start = row_text[..p].chars().count();
+                let end = start + marker.chars().count();
+                self.col >= start && self.col <= end
+            }) else {
+                continue;
+            };
+            // take() both yields the bytes and leaves the tombstone: the
+            // reference is SPENT, so a surviving duplicate is literal text
+            // on every later path instead of a second delivery, while the
+            // occupied index keeps sibling markers' numbers stable.
+            let Some(paste) = self.pastes[i].take() else {
+                continue;
+            };
+            self.on_input();
+            self.touch();
+            let before = row_text[..pos].to_string();
+            let after = row_text[pos + marker.len()..].to_string();
+            let segs: Vec<&str> = paste.split('\n').collect();
+            let mut rows: Vec<String> = Vec::with_capacity(segs.len());
+            match segs.as_slice() {
+                [only] => rows.push(format!("{before}{only}{after}")),
+                [first, mid @ .., last] => {
+                    rows.push(format!("{before}{first}"));
+                    rows.extend(mid.iter().map(|s| s.to_string()));
+                    rows.push(format!("{last}{after}"));
+                }
+                [] => rows.push(format!("{before}{after}")),
+            }
+            // Cursor lands at the end of the spliced content.
+            let last_row = self.row + rows.len() - 1;
+            let last_col = rows
+                .last()
+                .map(|r| r.chars().count() - after.chars().count())
+                .unwrap_or(0);
+            self.lines.splice(self.row..=self.row, rows);
+            self.row = last_row;
+            self.col = last_col;
+            return true;
+        }
+        false
+    }
+
     /// A new input gesture: drop the mouse selection and re-attach the
     /// viewport to the cursor.
     fn on_input(&mut self) {
@@ -266,6 +415,7 @@ impl Composer {
         self.col = 0;
         self.scroll = 0;
         self.hist_idx = None;
+        self.pastes.clear();
         self.on_input();
         self.touch();
     }
@@ -964,6 +1114,166 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn large_paste_collapses_to_a_marker_and_reads_back_expanded() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let blob = blob.trim_end().to_string();
+        composer.insert_str("before ");
+        composer.insert_paste(&blob);
+        // The draft shows one marker row, not twelve pasted rows.
+        assert_eq!(composer.lines.len(), 1);
+        assert_eq!(composer.lines[0], "before [pasted #1: 12 lines]");
+        // Every whole-draft reader gets the real bytes: submit, queueing,
+        // and history must never carry the marker.
+        assert_eq!(composer.text(), format!("before {blob}"));
+        let taken = composer.take();
+        assert_eq!(taken, format!("before {blob}"));
+        assert!(composer.pastes.is_empty(), "clear drains the paste store");
+    }
+
+    /// Ctrl+O expands the occurrence under the cursor, never the first in
+    /// the row: a byte-identical duplicate typed earlier in the row must
+    /// neither swallow the gesture nor receive the splice, and the spent
+    /// reference means the surviving duplicate is literal text on every
+    /// later path, never a second delivery.
+    #[test]
+    fn ctrl_o_expands_the_marker_under_the_cursor_not_the_first() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let blob = blob.trim_end().to_string();
+        composer.insert_paste(&blob);
+        // Type a byte-identical duplicate BEFORE the genuine marker.
+        composer.row = 0;
+        composer.col = 0;
+        composer.insert_str("[pasted #1: 12 lines] ");
+        // Cursor onto the genuine marker, just past the duplicate.
+        composer.row = 0;
+        composer.col = "[pasted #1: 12 lines] ".chars().count() + 1;
+        assert!(
+            composer.expand_paste_at_cursor(),
+            "the genuine marker under the cursor expands"
+        );
+        assert!(
+            composer.lines[0].starts_with("[pasted #1: 12 lines] line 1"),
+            "the duplicate stays and the genuine marker became content: {}",
+            composer.lines[0]
+        );
+        let text = composer.text();
+        assert_eq!(text.matches("line 12").count(), 1, "one delivery: {text}");
+        assert!(
+            text.starts_with("[pasted #1: 12 lines] "),
+            "the duplicate is literal on the submit path too: {text}"
+        );
+    }
+
+    /// A paste whose CONTENT mentions another marker's spelling must not
+    /// capture that later paste: expansion locates every marker in the
+    /// draft first and splices in one pass, never rescanning text already
+    /// expanded. Sequentially replacing let the embedded spelling inside
+    /// paste #1's expanded bytes swallow paste #2, submitting #2's genuine
+    /// marker as literal text.
+    #[test]
+    fn an_embedded_marker_spelling_never_captures_a_later_paste() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut first: Vec<String> = (1..=11).map(|i| format!("alpha {i}")).collect();
+        first.push("[pasted #2: 12 lines]".to_string());
+        composer.insert_paste(&first.join("\n"));
+        composer.insert_str(" and ");
+        let second: String = (1..=12).map(|i| format!("beta {i}\n")).collect();
+        composer.insert_paste(second.trim_end());
+        let text = composer.text();
+        assert!(
+            text.contains("[pasted #2: 12 lines] and beta 1"),
+            "the embedded spelling stays literal and the genuine marker expands: {text}"
+        );
+        assert!(
+            text.ends_with("beta 12"),
+            "the second paste expands at its own marker: {text}"
+        );
+    }
+
+    /// A hand-typed duplicate of a marker is text, not a second handle on
+    /// the hidden bytes: each insertion wrote its marker exactly once, so
+    /// exactly one occurrence expands and the duplicate stays literal
+    /// instead of injecting the paste twice.
+    #[test]
+    fn a_typed_marker_duplicate_stays_literal() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let blob = blob.trim_end().to_string();
+        composer.insert_paste(&blob);
+        // The user types the marker's exact spelling after the real one.
+        composer.insert_str(" [pasted #1: 12 lines]");
+        let text = composer.text();
+        assert_eq!(
+            text.matches("line 12").count(),
+            1,
+            "the hidden bytes expand once: {text}"
+        );
+        assert!(
+            text.ends_with(" [pasted #1: 12 lines]"),
+            "the typed duplicate stays literal: {text}"
+        );
+    }
+
+    #[test]
+    fn small_pastes_splice_literally() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_paste("just\nthree\nlines");
+        assert_eq!(composer.lines.len(), 3);
+        assert_eq!(composer.text(), "just\nthree\nlines");
+        assert!(composer.pastes.is_empty());
+    }
+
+    #[test]
+    fn a_single_line_blob_collapses_on_the_char_bound() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob = "x".repeat(2000);
+        composer.insert_paste(&blob);
+        assert_eq!(composer.lines[0], "[pasted #1: 2000 chars]");
+        assert_eq!(composer.text(), blob);
+    }
+
+    #[test]
+    fn expand_paste_at_cursor_splices_the_bytes_back_for_editing() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        composer.insert_str("head ");
+        composer.insert_paste(&blob);
+        composer.insert_str(" tail");
+        // The cursor sits after " tail", off the marker: no expansion.
+        assert!(!composer.expand_paste_at_cursor());
+        // Move onto the marker (its closing bracket) and expand in place.
+        for _ in 0..5 {
+            composer.col -= 1;
+        }
+        assert!(composer.expand_paste_at_cursor());
+        assert_eq!(composer.lines.len(), 12);
+        assert_eq!(composer.lines[0], "head line 1");
+        assert_eq!(composer.lines[11], "line 12 tail");
+        assert_eq!(composer.text(), format!("head {blob} tail"));
+        assert_eq!((composer.row, composer.col), (11, "line 12".chars().count()));
+        // Idempotent: the marker is gone, nothing expands twice.
+        assert!(!composer.expand_paste_at_cursor());
+    }
+
+    #[test]
+    fn an_edited_marker_never_expands() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12).map(|i| format!("l{i}\n")).collect();
+        composer.insert_paste(blob.trim_end());
+        // Damage the marker itself; a char merely appended after the closing
+        // bracket leaves the marker intact and expanding.
+        composer.lines[0].insert(1, '!');
+        composer.col += 1;
+        assert!(!composer.expand_paste_at_cursor());
+        assert_eq!(composer.text(), "[!pasted #1: 12 lines]");
     }
 
     #[test]
