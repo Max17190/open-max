@@ -1433,6 +1433,9 @@ fn an_unapproved_sandbox_non_pass_warns_and_does_not_fail_the_check() {
     assert!(
         stdout.contains("warn example     nonpass"),
         "the sandbox non-pass is reported as a warn on the tool:\n{stdout}"
+    );
+}
+
 /// `openmax --spec usage` must never answer "zero extension cost" while the
 /// frozen prompt is actually paying for something. A memory note rides the
 /// frozen index (prompt.rs), so a project holding only a memory file pays real
