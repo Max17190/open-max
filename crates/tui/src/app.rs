@@ -2897,6 +2897,13 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.approval_hits = [None; 3];
+        // The scrolled hint counts blocks arriving below; those arrivals mark
+        // only the chat region, so the count would go stale in the status
+        // line without this promotion. Cheap: it triggers only while both
+        // scrolled up and receiving.
+        if self.dirty.chat && self.transcript.unread() > 0 {
+            self.dirty.mark_chrome();
+        }
         if self.mode == Mode::ModelPicker {
             if let Some(picker) = &self.model_picker {
                 model_picker::render(frame, area, picker);
@@ -3533,8 +3540,8 @@ impl App {
         (&self.status_line).render(area, frame.buffer_mut());
     }
 
-    fn status_hint(&self) -> &'static str {
-        if self.composer.has_selection() {
+    fn status_hint(&self) -> std::borrow::Cow<'static, str> {
+        let hint: &'static str = if self.composer.has_selection() {
             "ctrl+c copy selection · esc clear"
         } else if self.transcript.has_text_selection() && self.focus == Focus::Scrollback {
             "y copy selection · esc clear"
@@ -3552,7 +3559,13 @@ impl App {
             "j/k block · enter fold · y copy"
         } else if self.transcript.offset() > 0 {
             // Scrolled-up wins over running: while reading, Esc follows
-            // (it does not cancel), and the hint must say so.
+            // (it does not cancel), and the hint must say so. Content that
+            // arrived below meanwhile is counted so the reader knows what
+            // the re-arm returns them to.
+            let unread = self.transcript.unread();
+            if unread > 0 {
+                return format!("↓ {unread} new · esc follow · pgup/pgdn scroll").into();
+            }
             "esc follow · pgup/pgdn scroll"
         } else if self.running {
             "enter queue · esc cancel"
@@ -3560,7 +3573,8 @@ impl App {
             "ctrl+c again to quit"
         } else {
             ""
-        }
+        };
+        hint.into()
     }
 }
 
@@ -5856,6 +5870,35 @@ mod tests {
         app.running = true;
         app.transcript.scroll_up(5);
         assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scrolled_hint_counts_blocks_arriving_below() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..30 {
+            app.transcript
+                .push(vec![Line::from(format!("history line {index:02}"))]);
+        }
+        render_app(&mut app, 40, 10);
+        app.transcript.scroll_up(5);
+        assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
+        app.note("a note landing below the scrolled view");
+        app.note("and another");
+        assert_eq!(app.status_hint(), "↓ 2 new · esc follow · pgup/pgdn scroll");
+        // The arrivals marked only the chat region; the draw must promote
+        // that to a chrome repaint or the status line shows a stale count.
+        app.dirty = Dirty::default();
+        app.dirty.mark_chat();
+        render_app(&mut app, 40, 10);
+        assert!(app.dirty.chrome, "chat dirt with unread must repaint chrome");
+        app.transcript.follow();
+        app.transcript.scroll_up(3);
+        assert_eq!(
+            app.status_hint(),
+            "esc follow · pgup/pgdn scroll",
+            "the count never resurrects for content already seen"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -237,6 +237,11 @@ pub struct Transcript {
     block_starts: Vec<usize>,
     width: u16,
     offset: usize,
+    /// Blocks appended while the view was scrolled up, so the chrome can
+    /// offer "N new" next to the re-arm hint. Cleared whenever the view
+    /// reaches the bottom again; a later scroll-up must start from zero, not
+    /// resurrect a count the user already saw.
+    unread: usize,
     selected: Option<usize>,
     text_selection: Option<TextSelection>,
     dirty: bool,
@@ -282,6 +287,7 @@ impl Transcript {
         if self.offset > 0 {
             let added = self.wrapped.len().saturating_sub(prev_len);
             self.offset = self.offset.saturating_add(added);
+            self.unread += 1;
         }
     }
 
@@ -349,6 +355,7 @@ impl Transcript {
         if self.offset > 0 {
             let added = self.wrapped.len().saturating_sub(prev_len);
             self.offset = self.offset.saturating_add(added);
+            self.unread += 1;
         }
     }
 
@@ -517,11 +524,25 @@ impl Transcript {
 
     pub fn scroll_down(&mut self, n: usize) {
         self.offset = self.offset.saturating_sub(n);
+        if self.offset == 0 {
+            self.unread = 0;
+        }
     }
 
     pub fn follow(&mut self) {
         self.offset = 0;
+        self.unread = 0;
         self.selected = None;
+    }
+
+    /// Blocks that arrived while scrolled up; 0 while at the bottom, where
+    /// everything on screen is already the newest content.
+    pub fn unread(&self) -> usize {
+        if self.offset == 0 {
+            0
+        } else {
+            self.unread
+        }
     }
 
     /// Shift a scrolled-up offset by the live-tail line delta so the visible
@@ -543,6 +564,9 @@ impl Transcript {
 
     pub fn clamp_offset(&mut self, max: usize) {
         self.offset = self.offset.min(max);
+        if self.offset == 0 {
+            self.unread = 0;
+        }
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -2325,6 +2349,39 @@ mod tests {
         t.finish_text_selection();
         assert_eq!(t.selected_text().as_deref(), Some("héllo"));
         assert_eq!(t.selection_columns(0), Some((2, 7)));
+    }
+
+    #[test]
+    fn unread_counts_blocks_while_scrolled_and_clears_at_the_bottom() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        for i in 0..10 {
+            t.push(vec![Line::from(format!("history {i}"))]);
+        }
+        assert_eq!(t.unread(), 0, "at the bottom nothing is unread");
+
+        t.scroll_up(5);
+        t.push(vec![Line::from("first arrival")]);
+        t.push_tool(vec![Line::from("⚙ tool")], "output".into());
+        assert_eq!(t.unread(), 2, "blocks landing below a scrolled view count");
+
+        // The offset grew with the arrivals (the scrolled view holds still),
+        // so returning to the bottom takes the whole current offset.
+        let offset = t.offset();
+        assert!(offset > 5, "arrivals below push the offset out");
+        t.scroll_down(offset);
+        assert_eq!(t.offset(), 0);
+        assert_eq!(t.unread(), 0, "reaching the bottom clears the count");
+
+        // A later scroll-up starts from zero; the old count must not
+        // resurrect for content the user already saw.
+        t.scroll_up(3);
+        assert_eq!(t.unread(), 0);
+        t.push(vec![Line::from("second arrival")]);
+        assert_eq!(t.unread(), 1);
+
+        t.follow();
+        assert_eq!(t.unread(), 0, "the re-arm clears the count");
     }
 
     #[test]
