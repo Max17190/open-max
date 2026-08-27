@@ -3575,19 +3575,14 @@ impl App {
             // (context fill, cache hits) would be indistinguishable. The
             // narrower tiers keep their historical shapes.
             let right = if width >= 100 {
-                let mut right = short_model.to_string();
-                if let Some((used, total)) = self.budget {
-                    let pct = (used as f64 / total.max(1) as f64 * 100.0) as u32;
-                    right.push_str(&format!("  ctx {pct}%"));
-                }
-                if let Some(cache) = self.cache_pct {
-                    right.push_str(&format!("  cache {cache}%"));
-                }
-                if self.generated_tokens > 0 {
-                    right.push_str(&format!("  out {}", compact_count(self.generated_tokens)));
-                }
-                right.push_str(&format!("  {approvals} "));
-                right
+                wide_status_right(
+                    short_model,
+                    self.budget,
+                    self.cache_pct,
+                    self.generated_tokens,
+                    &approvals,
+                    width,
+                )
             } else if width >= 78 {
                 match self.budget {
                     Some((used, total)) => format!(
@@ -3720,6 +3715,34 @@ enum Presence {
 
 /// Humanized token count for the status line: `842`, `16.8k`, `2.4M`,
 /// with a whole `.0` dropped (`17k`, never `17.0k`).
+/// The widest status tier: the labeled metrics and the approval mode are the
+/// point of the tier, so the tail is built first and the model id gives way,
+/// clipped to the width the tail leaves over. Rendering the full id let a
+/// long model name push ctx, cache, out, and the approval mode off the row.
+fn wide_status_right(
+    short_model: &str,
+    budget: Option<(usize, usize)>,
+    cache_pct: Option<u8>,
+    generated_tokens: u64,
+    approvals: &str,
+    width: usize,
+) -> String {
+    let mut tail = String::new();
+    if let Some((used, total)) = budget {
+        let pct = (used as f64 / total.max(1) as f64 * 100.0) as u32;
+        tail.push_str(&format!("  ctx {pct}%"));
+    }
+    if let Some(cache) = cache_pct {
+        tail.push_str(&format!("  cache {cache}%"));
+    }
+    if generated_tokens > 0 {
+        tail.push_str(&format!("  out {}", compact_count(generated_tokens)));
+    }
+    tail.push_str(&format!("  {approvals} "));
+    let model_max = width.saturating_sub(crate::ui::text::width(&tail));
+    format!("{}{tail}", clip(short_model, model_max))
+}
+
 fn compact_count(n: u64) -> String {
     let (value, suffix) = if n >= 1_000_000 {
         (n as f64 / 1e6, "M")
@@ -4285,6 +4308,7 @@ mod tests {
         wrap_str_preserving,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
+        wide_status_right,
         presence_title, rect_contains, save_model_selection, turn_end_rings,
         App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
@@ -6039,6 +6063,24 @@ mod tests {
         app.transcript.scroll_up(5);
         assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The wide tier's labels and approval mode are the point of the tier:
+    /// a long model id gives way instead of pushing them off the row.
+    #[test]
+    fn wide_status_keeps_its_tail_under_a_long_model_id() {
+        let long =
+            "org/some-preview-model-with-an-extremely-long-identifier-2026-08-26-instruct";
+        let right =
+            wide_status_right(long, Some((50_000, 100_000)), Some(93), 12_500, "auto", 100);
+        assert!(crate::ui::text::width(&right) <= 100, "fits the row: {right}");
+        for label in ["ctx 50%", "cache 93%", "out", "auto"] {
+            assert!(right.contains(label), "{label} survives: {right}");
+        }
+        // A short id is untouched: the tier's historical shape holds.
+        let short =
+            wide_status_right("gpt-x", Some((50_000, 100_000)), Some(93), 12_500, "auto", 100);
+        assert!(short.starts_with("gpt-x  ctx 50%"), "{short}");
     }
 
     #[test]
