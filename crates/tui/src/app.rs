@@ -2897,13 +2897,6 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.approval_hits = [None; 3];
-        // The scrolled hint counts blocks arriving below; those arrivals mark
-        // only the chat region, so the count would go stale in the status
-        // line without this promotion. Cheap: it triggers only while both
-        // scrolled up and receiving.
-        if self.dirty.chat && self.transcript.unread() > 0 {
-            self.dirty.mark_chrome();
-        }
         if self.mode == Mode::ModelPicker {
             if let Some(picker) = &self.model_picker {
                 model_picker::render(frame, area, picker);
@@ -4367,6 +4360,10 @@ mod tests {
         assert!(d.chat && d.tail && d.chrome && d.selection);
     }
 
+    /// The scrolled-up unread hint lives in the status line but is fed by
+    /// chat-region arrivals, so marking chat MUST imply marking chrome or
+    /// the count goes stale mid-stream. draw() relies on this invariant
+    /// instead of re-promoting chat to chrome per frame.
     #[test]
     fn mark_chat_also_marks_tail_and_status() {
         let mut d = Dirty::default();
