@@ -201,14 +201,19 @@ path and `openmax --check` prints the parse error.
 
 A tool file may declare one `[example]` (JSON args plus an optional
 `expect_regex`). `openmax --check --run-examples` executes each declared
-example through the real spawn path and fails the check if the call fails or
-its output does not match. Plain `--check` stays read-only and never executes
-anything; running examples is opt-in per invocation. Fuller regression suites
-stay agent-authored files - the example is the smallest honest proof that a
-freshly written tool actually runs.
+example through the real spawn path. For an approved tool the example is the
+real command on the host, and a failed call or an output mismatch fails the
+check. An unapproved tool is probed in a sandbox that denies the network and
+any write outside its scratch directory, so a non-pass there is reported as a
+warning and does not fail the check: under those restrictions it is
+inconclusive, not proof the tool is broken (a passing probe approves nothing,
+so a failing one condemns nothing). Plain `--check` stays read-only and never
+executes anything; running examples is opt-in per invocation. Fuller
+regression suites stay agent-authored files - the example is the smallest
+honest proof that a freshly written tool actually runs.
 
-Running an example is running the tool: an unsandboxed host process in the
-project root with no snapshot taken. So it passes the same gates a turn
+Running an approved example is running the tool: an unsandboxed host process
+in the project root with no snapshot taken. So it passes the same gates a turn
 applies - the project must be trusted, a human must have approved the tool
 file's exact bytes with `openmax --approve <path>`, `pre_tool_use` hooks must
 allow the call, permission rules must admit it (`deny` refuses, and so does
