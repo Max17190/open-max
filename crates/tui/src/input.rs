@@ -264,7 +264,13 @@ impl Composer {
         for (i, paste) in self.pastes.iter().enumerate() {
             let marker = paste_marker(i + 1, paste);
             if out.contains(&marker) {
-                out = out.replace(&marker, paste);
+                // Each insertion wrote its marker exactly once, so exactly
+                // one occurrence is the paste: a hand-typed duplicate of the
+                // marker's spelling stays literal text instead of injecting
+                // the hidden bytes a second time. Span tracking through
+                // arbitrary edits would also pin WHICH occurrence and is not
+                // worth its machinery for a forged marker.
+                out = out.replacen(&marker, paste, 1);
             }
         }
         out
@@ -1088,6 +1094,30 @@ mod tests {
         let taken = composer.take();
         assert_eq!(taken, format!("before {blob}"));
         assert!(composer.pastes.is_empty(), "clear drains the paste store");
+    }
+
+    /// A hand-typed duplicate of a marker is text, not a second handle on
+    /// the hidden bytes: each insertion wrote its marker exactly once, so
+    /// exactly one occurrence expands and the duplicate stays literal
+    /// instead of injecting the paste twice.
+    #[test]
+    fn a_typed_marker_duplicate_stays_literal() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let blob = blob.trim_end().to_string();
+        composer.insert_paste(&blob);
+        // The user types the marker's exact spelling after the real one.
+        composer.insert_str(" [pasted #1: 12 lines]");
+        let text = composer.text();
+        assert_eq!(
+            text.matches("line 12").count(),
+            1,
+            "the hidden bytes expand once: {text}"
+        );
+        assert!(
+            text.ends_with(" [pasted #1: 12 lines]"),
+            "the typed duplicate stays literal: {text}"
+        );
     }
 
     #[test]
