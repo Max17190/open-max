@@ -647,11 +647,13 @@ impl App {
                             // The approval timeout is the one failure the
                             // transcript keeps without the Error: prefix
                             // (agent::tool_message_content, so the model
-                            // reads the instruction); classify it explicitly
-                            // or a timed-out call replays folded under a
-                            // checkmark while the live card was an open ✗.
+                            // reads the instruction); classify it by exact
+                            // equality with the harness's own sentence. A
+                            // prefix match would mark a successful command
+                            // that merely opens with it as failed, while the
+                            // real sentence is never followed by more bytes.
                             let ok = !content.starts_with("Error:")
-                                && !content.starts_with(open_max_core::agent::APPROVAL_TIMEOUT_PREFIX);
+                                && content != open_max_core::agent::APPROVAL_TIMEOUT_MESSAGE;
                             // Diff events are not persisted, but the result
                             // text carries the counts: a replayed edit card
                             // keeps its +N −N badge instead of demoting to a
@@ -5475,23 +5477,30 @@ mod tests {
             app.project.display().to_string(),
         )
         .unwrap();
-        let timeout = format!(
-            "{} with no response. Stop and summarize what you were about to do.",
-            open_max_core::agent::APPROVAL_TIMEOUT_PREFIX
-        );
+        let timeout = open_max_core::agent::APPROVAL_TIMEOUT_MESSAGE.to_string();
         let messages = vec![
             open_max_core::types::ChatMessage::user("deploy it"),
             open_max_core::types::ChatMessage {
                 role: "assistant".into(),
                 content: Some(String::new()),
-                tool_calls: Some(vec![open_max_core::types::ToolCall {
-                    id: "c1".into(),
-                    kind: "function".into(),
-                    function: open_max_core::types::ToolCallFunction {
-                        name: "bash".into(),
-                        arguments: "{\"command\":\"./deploy.sh\"}".into(),
+                tool_calls: Some(vec![
+                    open_max_core::types::ToolCall {
+                        id: "c1".into(),
+                        kind: "function".into(),
+                        function: open_max_core::types::ToolCallFunction {
+                            name: "bash".into(),
+                            arguments: "{\"command\":\"./deploy.sh\"}".into(),
+                        },
                     },
-                }]),
+                    open_max_core::types::ToolCall {
+                        id: "c2".into(),
+                        kind: "function".into(),
+                        function: open_max_core::types::ToolCallFunction {
+                            name: "bash".into(),
+                            arguments: "{\"command\":\"./probe.sh\"}".into(),
+                        },
+                    },
+                ]),
                 tool_call_id: None,
             },
             open_max_core::types::ChatMessage {
@@ -5500,14 +5509,27 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some("c1".into()),
             },
+            // A SUCCESSFUL command whose output merely opens with the same
+            // sentence: equality, not a prefix, decides, so this replays ok
+            // and stays folded.
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some(format!("{timeout}\nprobe output continues")),
+                tool_calls: None,
+                tool_call_id: Some("c2".into()),
+            },
         ];
         let mut persisted = 0usize;
         open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
         app.replay(&meta.id);
-        let text = buffer_text(&render_app(&mut app, 100, 30));
+        let text = buffer_text(&render_app(&mut app, 100, 40));
         assert!(
             text.contains("timed out with no response"),
             "a replayed timeout arrives open on its output like the live card did: {text}"
+        );
+        assert!(
+            !text.contains("probe output continues"),
+            "a successful command that merely echoes the sentence stays folded: {text}"
         );
         fs::remove_dir_all(dir).unwrap();
     }
