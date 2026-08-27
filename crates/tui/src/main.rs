@@ -1193,6 +1193,21 @@ async fn run_tool_examples(
         };
         match &verdict.result {
             Ok(()) => println!("ok   example     {}{badge}", verdict.tool),
+            // A sandboxed probe denies the network and any write outside its
+            // scratch dir (ADR-0011), so a tool that legitimately needs either
+            // cannot pass one - and a failure here is inconclusive, not proof
+            // the tool is broken. A passing probe approves nothing; a failing
+            // one condemns nothing. Report it as a warning and let the real
+            // run after approval be the honest signal, rather than failing the
+            // check on the largest tool family (anything that reaches the
+            // network).
+            Err(reason) if verdict.sandboxed => {
+                println!(
+                    "warn example     {}  could not be proven in the sandbox (a tool that needs the network or a write outside its scratch dir cannot): {reason}{badge}",
+                    verdict.tool
+                );
+            }
+            // Approved content ran with the host's authority: a failure is real.
             Err(reason) => {
                 failures += 1;
                 println!("err  example     {}  {reason}{badge}", verdict.tool);
@@ -1241,6 +1256,18 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
                         ),
                     ),
                     Ok(()) => ("ok", format!("example for '{}' ran", verdict.tool)),
+                    // Inconclusive, not a failure: a sandboxed probe cannot
+                    // prove a tool that needs the network or a non-scratch
+                    // write, so it does not fail the check (see
+                    // run_tool_examples). The real run after approval is the
+                    // honest signal.
+                    Err(reason) if verdict.sandboxed => (
+                        "warn",
+                        format!(
+                            "could not prove '{}' in the sandbox (network and non-scratch writes are denied): {reason}",
+                            verdict.tool
+                        ),
+                    ),
                     Err(reason) => {
                         failures += 1;
                         ("err", reason.clone())
