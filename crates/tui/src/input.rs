@@ -308,6 +308,20 @@ impl Composer {
     /// Splice the collapsed paste whose marker sits under the cursor back
     /// into the draft, for editing it in place. Returns false when the
     /// cursor's row holds no intact marker under the cursor.
+    /// Append `text` at the very end of the draft on its own line, leaving
+    /// the cursor after it. Whole-block arrivals (a p-quote from the
+    /// transcript) land here: splicing at the cursor would merge them into
+    /// whatever the cursor was mid-editing, and rebuilding the draft through
+    /// text() would expand every collapsed paste marker on the way.
+    pub fn append_block(&mut self, text: &str) {
+        self.row = self.lines.len() - 1;
+        self.col = self.lines[self.row].chars().count();
+        if !self.is_empty() {
+            self.insert_str("\n");
+        }
+        self.insert_str(text);
+    }
+
     pub fn expand_paste_at_cursor(&mut self) -> bool {
         let row_text = self.lines[self.row].clone();
         for i in 0..self.pastes.len() {
@@ -1217,6 +1231,35 @@ mod tests {
             text.ends_with(" [pasted #1: 12 lines]"),
             "the typed duplicate stays literal: {text}"
         );
+    }
+
+    /// A quote appended mid-edit must not splice into the draft: with the
+    /// cursor inside "hello world", the old cursor-splice turned it into
+    /// "hello\nquoted world", silently merging the suffix into the quote.
+    #[test]
+    fn append_block_lands_at_the_end_never_mid_line() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        composer.insert_str("hello world");
+        composer.row = 0;
+        composer.col = 5; // cursor between "hello" and " world"
+        composer.append_block("quoted");
+        assert_eq!(composer.text(), "hello world\nquoted");
+    }
+
+    /// append_block must go through the splice path, never a text()
+    /// round-trip: text() expands collapsed paste markers, so a rebuild
+    /// would silently blow a collapsed paste back into the draft.
+    #[test]
+    fn append_block_never_expands_a_collapsed_paste() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        composer.insert_paste(blob.trim_end());
+        composer.append_block("quoted");
+        assert_eq!(
+            composer.lines[0], "[pasted #1: 12 lines]",
+            "the draft keeps the marker, not the blob"
+        );
+        assert_eq!(composer.lines[1], "quoted");
     }
 
     #[test]

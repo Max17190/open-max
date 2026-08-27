@@ -1216,10 +1216,10 @@ impl App {
                         self.transcript.select_prev();
                     }
                     if let Some(text) = self.transcript.selected_copy_text() {
-                        if !self.composer.is_empty() {
-                            self.composer.insert_str("\n");
-                        }
-                        self.composer.insert_str(&text);
+                        // At the end of the draft, never at the cursor: a
+                        // mid-line cursor would splice the draft's suffix
+                        // onto the quoted block.
+                        self.composer.append_block(&text);
                         self.focus = Focus::Composer;
                         self.transcript.select_last_follow();
                         self.dirty.mark_chat();
