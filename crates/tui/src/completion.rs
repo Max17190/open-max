@@ -70,6 +70,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         true,
     ),
     command("copy", "", "copy the latest assistant response", true),
+    command(
+        "export",
+        "[path]",
+        "write the whole transcript to a markdown file",
+        true,
+    ),
     command("tools", "", "list tools frozen for this session", true),
     command("skills", "", "list skills frozen for this session", true),
     command(
