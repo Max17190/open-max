@@ -1685,10 +1685,15 @@ pub fn approval_restore_targets(
         .collect()
 }
 
-/// The bound-code paths the approved manifest bytes name, read from the
-/// record's stored object. Empty when the object is missing, corrupt, or was
-/// never stored (a hash-only approval), or when the record carries no path
-/// to parse it against.
+/// The bound-code paths the approved manifest bytes name. The record's sha is
+/// what authenticates the bytes, not where they live, so the stored object
+/// and the file at the record's path are both accepted sources when their
+/// bytes hash to it - a pruned object with the manifest still installed must
+/// not hide the script restore the footer exists to print (Greptile). Empty
+/// when neither source hashes to the vouched sha (an edited manifest revokes,
+/// so its named paths are nobody's to offer), when nothing was ever stored
+/// (a hash-only approval), or when the record carries no path to parse
+/// against.
 fn approved_manifest_code_paths(
     data_dir: &Path,
     project_root: &Path,
@@ -1701,12 +1706,13 @@ fn approved_manifest_code_paths(
         return Vec::new();
     };
     let object = project_dir(data_dir, project_root).join("objects").join(sha);
-    let Ok(bytes) = std::fs::read(&object) else {
+    let Some(bytes) = [object, record.path.clone()]
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .find(|b| sha256_hex(b) == sha)
+    else {
         return Vec::new();
     };
-    if sha256_hex(&bytes) != sha {
-        return Vec::new();
-    }
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Vec::new();
     };
@@ -2838,6 +2844,42 @@ mod tests {
             approval_restore_targets(&data, &root, &records[0]),
             vec![(sha256_hex(b"script"), script_path)],
             "the intact script object is offered at the path the approved bytes name"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The record's sha authenticates the manifest bytes wherever they live:
+    /// with the stored object pruned but the manifest file still hashing to
+    /// the vouched sha, a tool's intact script object keeps its restore line
+    /// (Greptile), while an EDITED manifest file authenticates nothing.
+    #[test]
+    fn a_tools_restore_survives_a_pruned_manifest_object_via_the_authentic_file() {
+        let data = temp("tool-prune-data");
+        let root = temp("tool-prune-proj");
+        let manifest = root.join("deploy.toml");
+        let body = "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n";
+        std::fs::write(&manifest, body).unwrap();
+        std::fs::write(root.join("deploy.sh"), "script").unwrap();
+        let script_path = manifest_code(&manifest, &root)[0].path.clone();
+        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
+        approve_capability(&data, &root, &manifest, &shas).unwrap();
+        std::fs::remove_file(root.join("deploy.sh")).unwrap();
+        std::fs::remove_file(project_dir(&data, &root).join("objects").join(&shas[0])).unwrap();
+
+        let records = history(&data, &root).unwrap();
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            vec![(sha256_hex(b"script"), script_path)],
+            "the on-disk manifest still hashes to the vouched sha, so it names the path"
+        );
+
+        std::fs::write(&manifest, "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./other.sh\"\n")
+            .unwrap();
+        assert_eq!(
+            approval_restore_targets(&data, &root, &records[0]),
+            Vec::<(String, PathBuf)>::new(),
+            "an edited manifest authenticates nothing and offers nothing"
         );
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
