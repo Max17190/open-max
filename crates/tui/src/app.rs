@@ -288,6 +288,13 @@ pub struct App {
     budget: Option<(usize, usize)>,
     /// Prompt-cache hit rate of the last completion, from server usage.
     cache_pct: Option<u8>,
+    /// Completion tokens generated since this app run started (or /new),
+    /// summed from Usage events. A live meter for the status line, not an
+    /// accounting record: a resumed session counts from the resume, and
+    /// /context stays the audited view. Prompt tokens are deliberately not
+    /// summed; every request resends the history, so their sum measures
+    /// resending, not work, and cache% already tells the input story.
+    generated_tokens: u64,
     quit_armed: bool,
     spinner_i: usize,
     tick_i: u64,
@@ -548,6 +555,7 @@ impl App {
             last_assistant_response: None,
             budget: None,
             cache_pct: None,
+            generated_tokens: 0,
             quit_armed: false,
             spinner_i: 0,
             tick_i: 0,
@@ -726,6 +734,7 @@ impl App {
         self.last_assistant_response = None;
         self.budget = None;
         self.cache_pct = None;
+        self.generated_tokens = 0;
         self.completion = None;
         self.history_search = None;
         self.scroll_search = None;
@@ -2557,13 +2566,14 @@ impl App {
                 self.budget = Some((used_tokens, context_tokens));
                 self.dirty.mark_chrome();
             }
-            AgentEvent::Usage { prompt_tokens, cached_tokens, .. } => {
+            AgentEvent::Usage { prompt_tokens, completion_tokens, cached_tokens } => {
                 self.cache_pct = match cached_tokens {
                     Some(c) if prompt_tokens > 0 => {
                         Some(((c as f64 / prompt_tokens as f64) * 100.0).round() as u8)
                     }
                     _ => None,
                 };
+                self.generated_tokens += completion_tokens;
                 self.dirty.mark_chrome();
             }
             AgentEvent::ToolStart { call_id, name, args } => {
@@ -3561,7 +3571,24 @@ impl App {
                 format!(" {hint}")
             };
             let short_model = extensions::short_model(&model);
-            let right = if width >= 78 {
+            // The widest tier labels its numbers: two unlabeled percents
+            // (context fill, cache hits) would be indistinguishable. The
+            // narrower tiers keep their historical shapes.
+            let right = if width >= 100 {
+                let mut right = short_model.to_string();
+                if let Some((used, total)) = self.budget {
+                    let pct = (used as f64 / total.max(1) as f64 * 100.0) as u32;
+                    right.push_str(&format!("  ctx {pct}%"));
+                }
+                if let Some(cache) = self.cache_pct {
+                    right.push_str(&format!("  cache {cache}%"));
+                }
+                if self.generated_tokens > 0 {
+                    right.push_str(&format!("  out {}", compact_count(self.generated_tokens)));
+                }
+                right.push_str(&format!("  {approvals} "));
+                right
+            } else if width >= 78 {
                 match self.budget {
                     Some((used, total)) => format!(
                         "{short_model}  {}%  {approvals} ",
@@ -3689,6 +3716,21 @@ enum Presence {
     Idle,
     Working,
     NeedsApproval,
+}
+
+/// Humanized token count for the status line: `842`, `16.8k`, `2.4M`,
+/// with a whole `.0` dropped (`17k`, never `17.0k`).
+fn compact_count(n: u64) -> String {
+    let (value, suffix) = if n >= 1_000_000 {
+        (n as f64 / 1e6, "M")
+    } else if n >= 1_000 {
+        (n as f64 / 1e3, "k")
+    } else {
+        return n.to_string();
+    };
+    let s = format!("{value:.1}");
+    let s = s.strip_suffix(".0").unwrap_or(&s);
+    format!("{s}{suffix}")
 }
 
 fn project_label(project: &std::path::Path) -> String {
@@ -4242,8 +4284,8 @@ mod tests {
         approval_card_lines, approval_choice_hit_regions, command_parts, compact_approval_lines,
         wrap_str_preserving,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
-        is_shift_tab, paint_text_selection, parse_change_counts, plural, presence_title,
-        rect_contains, save_model_selection, turn_end_rings,
+        compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
+        presence_title, rect_contains, save_model_selection, turn_end_rings,
         App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
@@ -5996,6 +6038,49 @@ mod tests {
         app.running = true;
         app.transcript.scroll_up(5);
         assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compact_counts_read_like_a_human_wrote_them() {
+        assert_eq!(compact_count(842), "842");
+        assert_eq!(compact_count(1_000), "1k");
+        assert_eq!(compact_count(16_842), "16.8k");
+        assert_eq!(compact_count(17_000), "17k");
+        assert_eq!(compact_count(2_400_000), "2.4M");
+    }
+
+    #[test]
+    fn wide_status_line_labels_context_cache_and_generated_tokens() {
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::Budget {
+            used_tokens: 50_000,
+            context_tokens: 200_000,
+        });
+        app.on_agent_event(AgentEvent::Usage {
+            prompt_tokens: 10_000,
+            completion_tokens: 16_842,
+            cached_tokens: Some(8_700),
+        });
+        let buffer = render_app(&mut app, 120, 12);
+        let status = rows(&buffer).into_iter().rev().find(|r| r.contains("ctx")).unwrap();
+        assert!(status.contains("ctx 25%"), "status: {status}");
+        assert!(status.contains("cache 87%"), "status: {status}");
+        assert!(status.contains("out 16.8k"), "status: {status}");
+        // A second usage report accumulates generation, so the meter moves.
+        app.on_agent_event(AgentEvent::Usage {
+            prompt_tokens: 12_000,
+            completion_tokens: 158,
+            cached_tokens: Some(12_000),
+        });
+        let buffer = render_app(&mut app, 120, 12);
+        let status = rows(&buffer).into_iter().rev().find(|r| r.contains("ctx")).unwrap();
+        assert!(status.contains("out 17k"), "status: {status}");
+        assert!(status.contains("cache 100%"), "status: {status}");
+        // The historical 78-column tier keeps its unlabeled shape.
+        let buffer = render_app(&mut app, 80, 12);
+        let narrow = rows(&buffer).concat();
+        assert!(!narrow.contains("cache"), "narrow: {narrow}");
         fs::remove_dir_all(dir).unwrap();
     }
 
