@@ -127,7 +127,11 @@ impl Block {
         }
     }
 
-    fn tool(compact: Vec<Line<'static>>, full_output: String) -> Self {
+    /// `ok` picks the initial fold: successes fold to their compact card,
+    /// failures open on their output so the reason is on screen without a
+    /// keystroke (the card's one clipped diagnostic line rarely is the
+    /// reason). The user can fold either state back by hand.
+    fn tool(compact: Vec<Line<'static>>, full_output: String, ok: bool) -> Self {
         let selectable = lines_to_plain(&compact);
         let selectable_chars = selectable.chars().count();
         // Search covers the compact header plus the whole output, matching
@@ -162,11 +166,11 @@ impl Block {
             kind: BlockKind::Tool,
             raw: full_lines,
             compact: Some(compact),
-            folded: true,
+            folded: ok,
             full_output: Some(full_output),
             search_lower,
             cache_width: 0,
-            cache_folded: true,
+            cache_folded: ok,
             cache: Vec::new(),
             cache_maps: Vec::new(),
             selectable,
@@ -339,9 +343,10 @@ impl Transcript {
         self.push_kind(BlockKind::Assistant, lines);
     }
 
-    pub fn push_tool(&mut self, compact: Vec<Line<'static>>, full_output: String) {
+    /// `ok` picks the initial fold state; see [`Block::tool`].
+    pub fn push_tool(&mut self, compact: Vec<Line<'static>>, full_output: String, ok: bool) {
         if self.width == 0 {
-            self.blocks.push(Block::tool(compact, full_output));
+            self.blocks.push(Block::tool(compact, full_output, ok));
             self.dirty = true;
             return;
         }
@@ -349,7 +354,7 @@ impl Transcript {
             self.ensure_flat();
         }
         let prev_len = self.wrapped.len();
-        self.blocks.push(Block::tool(compact, full_output));
+        self.blocks.push(Block::tool(compact, full_output, ok));
         let bi = self.blocks.len() - 1;
         self.append_block_flat(bi);
         if self.offset > 0 {
@@ -1980,7 +1985,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(80);
         let compact = vec![Line::from("✓ read_file foo"), Line::from("  preview")];
-        t.push_tool(compact, "line1\nline2\nline3\nline4".into());
+        t.push_tool(compact, "line1\nline2\nline3\nline4".into(), true);
         assert_eq!(t.block_count(), 1);
         // Folded height is smaller than expanded.
         let folded = t.len();
@@ -1989,6 +1994,26 @@ mod tests {
         let expanded = t.len();
         assert!(expanded >= folded);
         assert!(t.toggle_fold_selected());
+    }
+
+    #[test]
+    fn failed_tools_arrive_unfolded_and_fold_back_by_hand() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_tool(
+            vec![Line::from("✗ bash boom"), Line::from("  error: exploded")],
+            "error: exploded\nbecause of a missing file\nat step three".into(),
+            false,
+        );
+        assert!(
+            !t.blocks[0].folded,
+            "a failure opens on its output; the reason must not cost a keystroke"
+        );
+        let open = t.len();
+        t.selected = Some(0);
+        assert!(t.toggle_fold_selected());
+        assert!(t.blocks[0].folded, "the user can still fold a failure away");
+        assert!(t.len() < open);
     }
 
     #[test]
@@ -2023,6 +2048,7 @@ mod tests {
         t.push_tool(
             vec![Line::from("✓ read_file app.rs")],
             "secret_token_xyz\nline2".into(),
+            true,
         );
         assert_eq!(t.filter_matches("check logs"), vec![0]);
         assert_eq!(t.filter_matches("looking"), vec![1]);
@@ -2040,7 +2066,7 @@ mod tests {
         let before = SEARCH_BUILDS.with(|c| c.get());
         t.push_user(vec![Line::from("check the ledger")]);
         t.push_assistant(vec![Line::from("looking at it")]);
-        t.push_tool(vec![Line::from("✓ bash")], "a very long output\nledger ok".into());
+        t.push_tool(vec![Line::from("✓ bash")], "a very long output\nledger ok".into(), true);
         assert_eq!(
             SEARCH_BUILDS.with(|c| c.get()) - before,
             3,
@@ -2070,7 +2096,7 @@ mod tests {
         for i in 0..500 {
             t.push_user(vec![Line::from(format!("user turn {i}: check the ledger"))]);
             t.push_assistant(vec![Line::from(format!("assistant reply {i} with prose"))]);
-            t.push_tool(vec![Line::from("✓ bash")], output.clone());
+            t.push_tool(vec![Line::from("✓ bash")], output.clone(), true);
         }
 
         let n = 200;
@@ -2148,6 +2174,7 @@ mod tests {
         t.push_tool(
             vec![Line::from("✓ read_file notes.md")],
             "Header MATCH here\n\n漢字テスト row\ntail line".into(),
+            true,
         );
         let texts = [
             TestBlockText("İstanbul Σ ΟΔΟΣ mixed".into()),
@@ -2223,13 +2250,13 @@ mod tests {
         // Also exercise push_tool against rebuild oracle.
         let tool_compact = vec![Line::from("✓ tool"), Line::from("  preview line")];
         let tool_out = "out1\nout2\nout3".to_string();
-        incremental.push_tool(tool_compact.clone(), tool_out.clone());
+        incremental.push_tool(tool_compact.clone(), tool_out.clone(), true);
 
         let mut oracle = Transcript::new();
         for (kind, lines) in &kind_pushes {
             oracle.push_kind(*kind, lines.clone());
         }
-        oracle.push_tool(tool_compact, tool_out);
+        oracle.push_tool(tool_compact, tool_out, true);
         oracle.set_width(W);
 
         assert_eq!(text(incremental.lines()), text(oracle.lines()));
@@ -2362,7 +2389,7 @@ mod tests {
 
         t.scroll_up(5);
         t.push(vec![Line::from("first arrival")]);
-        t.push_tool(vec![Line::from("⚙ tool")], "output".into());
+        t.push_tool(vec![Line::from("⚙ tool")], "output".into(), true);
         assert_eq!(t.unread(), 2, "blocks landing below a scrolled view count");
 
         // The offset grew with the arrivals (the scrolled view holds still),
@@ -2423,7 +2450,7 @@ mod tests {
     fn folding_a_selected_tool_clears_text_selection() {
         let mut t = Transcript::new();
         t.set_width(60);
-        t.push_tool(vec![Line::from("✓ Read file")], "line one\nline two".into());
+        t.push_tool(vec![Line::from("✓ Read file")], "line one\nline two".into(), true);
         assert!(t.begin_text_selection_at(0, 2));
         assert!(t.update_text_selection_at(0, 5));
         t.finish_text_selection();
@@ -2439,7 +2466,7 @@ mod tests {
         t.set_width(60);
         t.push_assistant(vec![Line::from("first")]);
         t.push_assistant(vec![Line::from("latest"), Line::from("response")]);
-        t.push_tool(vec![Line::from("✓ Shell")], "done".into());
+        t.push_tool(vec![Line::from("✓ Shell")], "done".into(), true);
         t.push(vec![Line::from("notice")]);
         assert_eq!(t.last_assistant_text().as_deref(), Some("latest\nresponse"));
     }

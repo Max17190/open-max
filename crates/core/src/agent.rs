@@ -498,8 +498,19 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
     }
 }
 
+/// The one failure persisted without the `Error: ` prefix: the model must
+/// read the timeout as an instruction to stop, not as tool noise. Everything
+/// that classifies persisted results (tool_message_content here, the TUI's
+/// replay) compares against this exact sentence: equality, never a prefix,
+/// so a successful command whose output merely opens with it is not misread
+/// as the harness's own timeout. Real command output virtually always
+/// carries more bytes (a trailing newline included); only a byte-exact
+/// impersonation collides, and that is accepted.
+pub const APPROVAL_TIMEOUT_MESSAGE: &str =
+    "Approval request timed out with no response. Stop and summarize what you were about to do.";
+
 fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
-    if outcome.ok || outcome.output.starts_with("Approval request timed out") {
+    if outcome.ok || outcome.output == APPROVAL_TIMEOUT_MESSAGE {
         outcome.output.clone()
     } else {
         format!("Error: {}", outcome.output)
@@ -3044,7 +3055,7 @@ async fn run_loop(
                         }, false),
                         ApprovalOutcome::TimedOut => (tools::ToolOutcome {
                             ok: false,
-                            output: "Approval request timed out with no response. Stop and summarize what you were about to do.".into(),
+                            output: APPROVAL_TIMEOUT_MESSAGE.into(),
                             diff: None, ..Default::default()
                         }, false),
                         ApprovalOutcome::Cancelled => (tools::ToolOutcome {

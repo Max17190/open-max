@@ -127,7 +127,6 @@ pub struct DiffText {
     pub removed: usize,
 }
 
-/// Unified diff with the conventional coloring, gutter-indented.
 fn clip(s: &str, max: usize) -> String {
     let clean = s.replace(['\n', '\r'], " ");
     super::text::clip(&clean, max)

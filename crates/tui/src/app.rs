@@ -644,7 +644,16 @@ impl App {
                                 .unwrap_or(serde_json::Value::Null);
                             let summary = registry::summarize_call(&call.function.name, &args);
                             let content = tool_msg.content.as_deref().unwrap_or("");
-                            let ok = !content.starts_with("Error:");
+                            // The approval timeout is the one failure the
+                            // transcript keeps without the Error: prefix
+                            // (agent::tool_message_content, so the model
+                            // reads the instruction); classify it by exact
+                            // equality with the harness's own sentence. A
+                            // prefix match would mark a successful command
+                            // that merely opens with it as failed, while the
+                            // real sentence is never followed by more bytes.
+                            let ok = !content.starts_with("Error:")
+                                && content != open_max_core::agent::APPROVAL_TIMEOUT_MESSAGE;
                             // Diff events are not persisted, but the result
                             // text carries the counts: a replayed edit card
                             // keeps its +N −N badge instead of demoting to a
@@ -677,7 +686,7 @@ impl App {
                                 &truncate_replay_output(content),
                                 badge.as_ref(),
                             );
-                            self.transcript.push_tool(compact, content.to_string());
+                            self.transcript.push_tool(compact, content.to_string(), ok);
                             self.last_tool_output = Some(content.to_string());
                         }
                     }
@@ -2546,7 +2555,7 @@ impl App {
                     .as_ref()
                     .map(|change| change.diff.clone())
                     .unwrap_or_else(|| output.clone());
-                self.transcript.push_tool(compact, expanded.clone());
+                self.transcript.push_tool(compact, expanded.clone(), ok);
                 self.last_tool_output = Some(expanded);
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
@@ -5452,6 +5461,76 @@ mod tests {
         let text = buffer_text(&render_app(&mut app, 100, 30));
         assert!(text.contains("CHANGELOG.md"), "{text}");
         assert!(!text.contains("+3"), "read card wears a diff badge: {text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The approval timeout is persisted without the `Error:` prefix
+    /// (agent::tool_message_content keeps it verbatim so the model reads the
+    /// stop instruction), so replay must classify it as the failure it was:
+    /// the live card was open on its output with a cross, and the replayed
+    /// card must arrive the same way instead of folded under a checkmark.
+    #[test]
+    fn replay_shows_an_approval_timeout_as_the_failure_it_was() {
+        let (mut app, dir) = app_fixture();
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        let timeout = open_max_core::agent::APPROVAL_TIMEOUT_MESSAGE.to_string();
+        let messages = vec![
+            open_max_core::types::ChatMessage::user("deploy it"),
+            open_max_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: Some(vec![
+                    open_max_core::types::ToolCall {
+                        id: "c1".into(),
+                        kind: "function".into(),
+                        function: open_max_core::types::ToolCallFunction {
+                            name: "bash".into(),
+                            arguments: "{\"command\":\"./deploy.sh\"}".into(),
+                        },
+                    },
+                    open_max_core::types::ToolCall {
+                        id: "c2".into(),
+                        kind: "function".into(),
+                        function: open_max_core::types::ToolCallFunction {
+                            name: "bash".into(),
+                            arguments: "{\"command\":\"./probe.sh\"}".into(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+            },
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some(timeout.clone()),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+            },
+            // A SUCCESSFUL command whose output merely opens with the same
+            // sentence: equality, not a prefix, decides, so this replays ok
+            // and stays folded.
+            open_max_core::types::ChatMessage {
+                role: "tool".into(),
+                content: Some(format!("{timeout}\nprobe output continues")),
+                tool_calls: None,
+                tool_call_id: Some("c2".into()),
+            },
+        ];
+        let mut persisted = 0usize;
+        open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
+        app.replay(&meta.id);
+        let text = buffer_text(&render_app(&mut app, 100, 40));
+        assert!(
+            text.contains("timed out with no response"),
+            "a replayed timeout arrives open on its output like the live card did: {text}"
+        );
+        assert!(
+            !text.contains("probe output continues"),
+            "a successful command that merely echoes the sentence stays folded: {text}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
