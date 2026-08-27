@@ -262,7 +262,22 @@ impl Composer {
     }
 
     fn expand_pastes(&self, text: &str) -> String {
-        let mut out = text.to_string();
+        // Every live marker is located in the DRAFT text first, then spliced
+        // in one pass over it. Sequential replacement rescanned text already
+        // expanded, so a marker spelling EMBEDDED in an earlier paste's
+        // content could capture a later paste's expansion (Greptile);
+        // expanded bytes are content, never search territory.
+        //
+        // Each insertion wrote its marker exactly once, so its FIRST draft
+        // occurrence is the one that expands: a hand-typed duplicate of the
+        // spelling stays literal text instead of injecting the hidden bytes
+        // a second time, and a duplicate placed BEFORE the genuine marker
+        // receives the expansion in its stead, deterministically; the
+        // cursor-anchored ctrl+o splice is how a human resolves which
+        // occurrence they mean. Span tracking through arbitrary edits would
+        // pin WHICH occurrence and is not worth its machinery for a forged
+        // marker.
+        let mut sites: Vec<(usize, usize, &str)> = Vec::new();
         for (i, paste) in self.pastes.iter().enumerate() {
             let Some(paste) = paste else {
                 // Spent by an in-place expansion: any surviving duplicate of
@@ -270,20 +285,23 @@ impl Composer {
                 continue;
             };
             let marker = paste_marker(i + 1, paste);
-            if out.contains(&marker) {
-                // Each insertion wrote its marker exactly once, so exactly
-                // one occurrence is the paste: a hand-typed duplicate of the
-                // marker's spelling stays literal text instead of injecting
-                // the hidden bytes a second time. A duplicate placed BEFORE
-                // the genuine marker therefore receives the expansion in its
-                // stead, deterministically; the cursor-anchored ctrl+o
-                // splice is how a human resolves which occurrence they mean.
-                // Span tracking through arbitrary edits would pin WHICH
-                // occurrence and is not worth its machinery for a forged
-                // marker.
-                out = out.replacen(&marker, paste, 1);
+            if let Some(pos) = text.find(&marker) {
+                sites.push((pos, marker.len(), paste.as_str()));
             }
         }
+        sites.sort_by_key(|s| s.0);
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (pos, len, paste) in sites {
+            if pos < cursor {
+                // Index-stamped markers cannot overlap; defensive all the same.
+                continue;
+            }
+            out.push_str(&text[cursor..pos]);
+            out.push_str(paste);
+            cursor = pos + len;
+        }
+        out.push_str(&text[cursor..]);
         out
     }
 
@@ -1148,6 +1166,32 @@ mod tests {
         assert!(
             text.starts_with("[pasted #1: 12 lines] "),
             "the duplicate is literal on the submit path too: {text}"
+        );
+    }
+
+    /// A paste whose CONTENT mentions another marker's spelling must not
+    /// capture that later paste: expansion locates every marker in the
+    /// draft first and splices in one pass, never rescanning text already
+    /// expanded. Sequentially replacing let the embedded spelling inside
+    /// paste #1's expanded bytes swallow paste #2, submitting #2's genuine
+    /// marker as literal text.
+    #[test]
+    fn an_embedded_marker_spelling_never_captures_a_later_paste() {
+        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut first: Vec<String> = (1..=11).map(|i| format!("alpha {i}")).collect();
+        first.push("[pasted #2: 12 lines]".to_string());
+        composer.insert_paste(&first.join("\n"));
+        composer.insert_str(" and ");
+        let second: String = (1..=12).map(|i| format!("beta {i}\n")).collect();
+        composer.insert_paste(second.trim_end());
+        let text = composer.text();
+        assert!(
+            text.contains("[pasted #2: 12 lines] and beta 1"),
+            "the embedded spelling stays literal and the genuine marker expands: {text}"
+        );
+        assert!(
+            text.ends_with("beta 12"),
+            "the second paste expands at its own marker: {text}"
         );
     }
 
