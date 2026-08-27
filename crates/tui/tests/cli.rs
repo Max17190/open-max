@@ -1433,5 +1433,36 @@ fn an_unapproved_sandbox_non_pass_warns_and_does_not_fail_the_check() {
     assert!(
         stdout.contains("warn example     nonpass"),
         "the sandbox non-pass is reported as a warn on the tool:\n{stdout}"
+/// `openmax --spec usage` must never answer "zero extension cost" while the
+/// frozen prompt is actually paying for something. A memory note rides the
+/// frozen index (prompt.rs), so a project holding only a memory file pays real
+/// bytes on every request; the old short-circuit printed a false zero and
+/// named nothing. The cost surface now prints the frozen-prefix breakdown and
+/// lists the memory (Judges D/E).
+#[test]
+fn spec_usage_names_memory_cost_and_never_claims_zero() {
+    let (project, home) = fresh_dirs("usage-memory");
+    let mem = project.join(".openmax").join("memory");
+    std::fs::create_dir_all(&mem).unwrap();
+    std::fs::write(
+        mem.join("staging-port.md"),
+        "# The staging deploy port is 7443 (set 2026-07-31)\nSet in infra/nginx.conf.\n",
+    )
+    .unwrap();
+
+    let out = cmd(&project, &home).args(["--spec", "usage"]).output().unwrap();
+    assert!(out.status.success(), "--spec usage exits 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("zero extension cost"),
+        "the cost surface must not claim zero while a memory is in the prompt:\n{text}"
+    );
+    assert!(
+        text.contains("frozen prompt prefix"),
+        "the frozen-prefix breakdown is always shown:\n{text}"
+    );
+    assert!(
+        text.contains("staging-port") && text.contains("memory"),
+        "the installed memory note is named with its cost:\n{text}"
     );
 }
