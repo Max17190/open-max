@@ -519,6 +519,57 @@ impl Transcript {
         self.wrapped.len()
     }
 
+    /// The whole transcript as readable markdown: every block in order, a
+    /// tool block with its full, uncapped output as an indented code block.
+    /// This is the file-shaped escape hatch: the screen folds, clips, and
+    /// caps; a file has none of those constraints, so nothing here reads
+    /// fold state or the 80-line raw cap.
+    pub fn export_text(&self) -> String {
+        let mut out = String::from("# openmax transcript\n");
+        for block in &self.blocks {
+            out.push('\n');
+            match block.kind {
+                BlockKind::User => {
+                    out.push_str("## user\n\n");
+                    out.push_str(&lines_to_plain(&block.raw));
+                    out.push('\n');
+                }
+                BlockKind::Assistant => {
+                    out.push_str("## assistant\n\n");
+                    out.push_str(&lines_to_plain(&block.raw));
+                    out.push('\n');
+                }
+                BlockKind::Tool => {
+                    let header = block
+                        .compact
+                        .as_ref()
+                        .and_then(|compact| compact.first())
+                        .map(|line| lines_to_plain(std::slice::from_ref(line)))
+                        .unwrap_or_else(|| "tool".into());
+                    out.push_str(header.trim_end());
+                    out.push('\n');
+                    if let Some(full) = &block.full_output {
+                        // Indentation, not a fence: output containing its own
+                        // backticks must not be able to break the document.
+                        for line in full.lines() {
+                            out.push_str("    ");
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                }
+                BlockKind::System => {
+                    for line in lines_to_plain(&block.raw).lines() {
+                        out.push_str("> ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn offset(&self) -> usize {
         self.offset
     }
@@ -1994,6 +2045,33 @@ mod tests {
         let expanded = t.len();
         assert!(expanded >= folded);
         assert!(t.toggle_fold_selected());
+    }
+
+    #[test]
+    fn export_covers_the_full_output_regardless_of_fold_and_screen_caps() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_user(vec![Line::from("please run it")]);
+        t.push_assistant(vec![Line::from("running now")]);
+        let output: String = (1..=100).map(|i| format!("out {i}\n")).collect();
+        t.push_tool(vec![Line::from("✓ bash cargo test")], output, true);
+        t.push(vec![Line::from("a system note")]);
+
+        let exported = t.export_text();
+        assert!(exported.starts_with("# openmax transcript\n"));
+        assert!(exported.contains("## user\n\nplease run it\n"));
+        assert!(exported.contains("## assistant\n\nrunning now\n"));
+        assert!(exported.contains("✓ bash cargo test\n"));
+        assert!(
+            exported.contains("    out 100\n"),
+            "the file carries output past the 80-line screen cap"
+        );
+        assert!(exported.contains("> a system note\n"));
+
+        // Folding is a screen concern; the file must not change with it.
+        t.selected = Some(2);
+        assert!(t.toggle_fold_selected());
+        assert_eq!(t.export_text(), exported);
     }
 
     #[test]

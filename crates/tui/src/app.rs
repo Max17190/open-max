@@ -1208,6 +1208,25 @@ impl App {
                     let _ = self.transcript.expand_last_tool();
                     return Ok(());
                 }
+                KeyCode::Char('p') => {
+                    // Copy-to-prompt: the block's source lands in the draft,
+                    // for quoting output back at the model without a
+                    // clipboard round-trip.
+                    if self.transcript.selected().is_none() {
+                        self.transcript.select_prev();
+                    }
+                    if let Some(text) = self.transcript.selected_copy_text() {
+                        // At the end of the draft, never at the cursor: a
+                        // mid-line cursor would splice the draft's suffix
+                        // onto the quoted block.
+                        self.composer.append_block(&text);
+                        self.focus = Focus::Composer;
+                        self.transcript.select_last_follow();
+                        self.dirty.mark_chat();
+                        self.dirty.mark_chrome();
+                    }
+                    return Ok(());
+                }
                 KeyCode::Char('y') => {
                     // G follows the bottom without selecting a block; y must
                     // still mean "copy the block I am looking at".
@@ -2075,6 +2094,27 @@ impl App {
             "model" => {
                 let provider = self.core.settings.lock().unwrap().provider.clone();
                 self.persist_model_selection(provider, raw_rest.to_string());
+            }
+            "export" => {
+                let target = if raw_rest.trim().is_empty() {
+                    let stem = self
+                        .session_id
+                        .as_deref()
+                        .map(|id| &id[..id.len().min(8)])
+                        .unwrap_or("session");
+                    self.project.join(format!("openmax-{stem}.md"))
+                } else {
+                    let given = std::path::PathBuf::from(raw_rest.trim());
+                    if given.is_absolute() {
+                        given
+                    } else {
+                        self.project.join(given)
+                    }
+                };
+                match std::fs::write(&target, self.transcript.export_text()) {
+                    Ok(()) => self.note(&format!("exported transcript to {}", target.display())),
+                    Err(e) => self.error(&format!("export to {} failed: {e}", target.display())),
+                }
             }
             "copy" => {
                 if let Some(text) = self
@@ -3568,7 +3608,7 @@ impl App {
         } else if self.completion.is_some() {
             "↑↓ select · enter/tab accept · esc close"
         } else if self.focus == Focus::Scrollback {
-            "j/k block · enter fold · y copy"
+            "j/k block · enter fold · y copy · p to prompt"
         } else if self.transcript.offset() > 0 {
             // Scrolled-up wins over running: while reading, Esc follows
             // (it does not cancel), and the hint must say so. Content that
@@ -5956,6 +5996,44 @@ mod tests {
         app.running = true;
         app.transcript.scroll_up(5);
         assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn slash_export_writes_the_transcript_file() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.push_user(vec![Line::from("hello there")]);
+        let output: String = (1..=100).map(|i| format!("out {i}\n")).collect();
+        app.transcript
+            .push_tool(vec![Line::from("✓ bash long job")], output, true);
+
+        app.slash("export exported.md").await;
+
+        let written = fs::read_to_string(app.project.join("exported.md")).unwrap();
+        assert!(written.contains("## user\n\nhello there\n"));
+        assert!(
+            written.contains("    out 100\n"),
+            "the export carries full tool output"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn p_in_scrollback_quotes_the_block_into_the_prompt() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.push_assistant(vec![Line::from("worth quoting")]);
+        render_app(&mut app, 60, 12);
+        app.focus = Focus::Scrollback;
+
+        app.on_term_event(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+        assert_eq!(app.composer.text(), "worth quoting");
+        assert!(matches!(app.focus, Focus::Composer));
         fs::remove_dir_all(dir).unwrap();
     }
 
