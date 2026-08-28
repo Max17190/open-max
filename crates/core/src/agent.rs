@@ -1815,17 +1815,19 @@ fn classify_added_tools(
             if new_registry.get(&old_spec.name).is_some() {
                 continue;
             }
-            // Still on disk is not removed. Its manifest may have been edited
+            // A manifest still on disk is not removed. It may have been edited
             // to broken (now in `broken`, where the refreeze receipt names it
             // "NOT loaded: X: <reason>"), or a broken higher-precedence file
             // may be withholding this valid one by shadowing its name - in the
             // shadow case the broken file's path differs from this tool's, so a
             // check against `broken` alone would miss it (Greptile). Either way
-            // the file is present, so "Removed approved tools: X - identical
-            // bytes would run without a card" is a false, contradictory clause
-            // that reads as if the file were gone. Only a manifest that left
-            // disk entirely is removed; the broken file speaks for the rest.
-            if old_ext.source_path.exists() {
+            // "Removed approved tools: X - identical bytes would run without a
+            // card" is a false, contradictory clause that reads as if the file
+            // were gone. `is_file`, not `exists`: a directory dropped at the
+            // `.toml` path is not a manifest, so the tool IS gone and stays a
+            // removal (a directory exists but is not the file). Only a manifest
+            // that left disk is removed; the broken file speaks for the rest.
+            if old_ext.source_path.is_file() {
                 continue;
             }
             // Was the manifest ever approved? That signal is disk-independent:
@@ -5184,6 +5186,45 @@ mod tests {
         assert!(
             added.removed_approved == vec!["deploy".to_string()],
             "a genuinely removed approved tool is still named: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A directory dropped at the manifest's `.toml` path is not a manifest, so
+    /// the tool is gone and stays a removal. The presence check keys on the
+    /// path being a FILE, not merely existing, or a directory at the path would
+    /// wrongly suppress the removal (Greptile).
+    #[test]
+    fn a_directory_at_the_manifest_path_is_still_a_removed_tool() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2dir-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+        crate::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("deploy").is_some());
+
+        // The manifest file is replaced by a directory at the same path.
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        assert!(manifest.exists() && !manifest.is_file(), "a directory now sits at the path");
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(new.get("deploy").is_none());
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved == vec!["deploy".to_string()],
+            "a tool whose manifest became a directory is still removed: {:?} / {:?}",
             added.removed_approved,
             added.removed_approval_survives
         );
