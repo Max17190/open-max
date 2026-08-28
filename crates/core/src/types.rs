@@ -402,15 +402,15 @@ mod tests {
     ///
     /// What it guarantees and what it does not: the compiler forces the author
     /// to add an arm, but cannot force them to also add the byte-exact
-    /// `assert_eq!` to `event_envelope_wire_is_stable` and bump `PROTO_VERSION`
-    /// - an empty `=> {}` arm compiles. Forcing the value-specific assertion at
-    /// compile time would need a variant-iteration macro (a new dependency this
-    /// harness declines) and could not express the variants with more than one
-    /// sample (Usage's Some/None, ApprovalRequest's env). So the arm is a stop
-    /// sign, not a proof: on reaching it, ADD THE GOLDEN ASSERTION AND BUMP
-    /// PROTO_VERSION. That is the same trust the hand-listed golden already
-    /// asks; the tripwire only makes forgetting it a compile error rather than
-    /// a silent gap.
+    /// `assert_eq!` to `event_envelope_wire_is_stable` and bump `PROTO_VERSION`,
+    /// because an empty `=> {}` arm still compiles. Forcing the value-specific
+    /// assertion at compile time would need a variant-iteration macro (a new
+    /// dependency this harness declines) and could not express the variants
+    /// with more than one sample (Usage's Some/None, ApprovalRequest's env). So
+    /// the arm is a stop sign, not a proof: on reaching it, add the golden
+    /// assertion above and bump `PROTO_VERSION`. That is the same trust the
+    /// hand-listed golden already asks; the tripwire only makes forgetting it a
+    /// compile error rather than a silent gap.
     #[test]
     fn every_agent_event_variant_is_pinned_in_the_golden() {
         fn _exhaustive(e: &AgentEvent) {
