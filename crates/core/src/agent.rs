@@ -1815,6 +1815,16 @@ fn classify_added_tools(
             if new_registry.get(&old_spec.name).is_some() {
                 continue;
             }
+            // Present-but-broken is not removed. An edit that breaks the
+            // manifest leaves the file on disk, so it drops out of `tools` and
+            // into `broken`, where the refreeze receipt already names it ("NOT
+            // loaded: X: <reason>"). Calling it a removed tool on top of that
+            // is a second, contradictory clause about the same file, and its
+            // "identical bytes would run without a card" reads as if the file
+            // were gone. Only a manifest that left disk entirely is removed.
+            if new_registry.broken.iter().any(|(p, _)| *p == old_ext.source_path) {
+                continue;
+            }
             // Was the manifest ever approved? That signal is disk-independent:
             // the ledger keeps the record and the content-addressed objects.
             if !approvals.contains(&old_ext.source_sha256) {
@@ -5085,6 +5095,51 @@ mod tests {
         assert!(
             receipt.iter().any(|c| c.contains("deploy.toml")),
             "the receipt must name what changed: {receipt:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A tool whose manifest an edit broke is present-but-broken, not removed:
+    /// it drops out of `tools` and into `broken`, where the refreeze receipt
+    /// already names it under "NOT loaded". Classifying it as a removed approved
+    /// tool on top of that is a second, contradictory clause about the same
+    /// file, whose "identical bytes would run without a card" reads as if the
+    /// file were gone. Only a manifest that left disk is removed.
+    #[test]
+    fn a_manifest_broken_by_an_edit_is_not_reported_as_a_removed_tool() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        // A human approved these exact bytes.
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+        crate::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("deploy").is_some(), "the valid tool must load first");
+
+        // An edit breaks the manifest; the file stays on disk.
+        std::fs::write(&manifest, "not valid toml [[[").unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(new.get("deploy").is_none(), "the broken tool drops out of tools");
+        assert!(
+            new.broken.iter().any(|(p, _)| *p == manifest),
+            "the broken manifest is kept as broken, and the receipt names it there"
+        );
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved.is_empty() && added.removed_approval_survives.is_empty(),
+            "a broken-by-edit tool is not a removed tool: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
         );
 
         let _ = std::fs::remove_dir_all(dir);
