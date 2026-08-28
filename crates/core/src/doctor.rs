@@ -1904,7 +1904,12 @@ fn wrong_extension_in(dir: &Path, want: &str, dir_label: &str) -> Vec<Finding> {
         .filter(|p| p.is_file())
         .filter(|p| {
             p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-                e != want && (CONFIG_EXTENSIONS.contains(&e) || near(e, want))
+                // A config format in the wrong dialect (.yaml where .toml is
+                // read), a near-miss of the right one (.tml), or the harness's
+                // other structured format `.toml` where `.md` is read (a prompt
+                // written as a tool). `.md` where `.toml` is read is left out on
+                // purpose: it is as likely a README as a misplaced surface file.
+                e != want && (CONFIG_EXTENSIONS.contains(&e) || e == "toml" || near(e, want))
             })
         })
         .map(|path| Finding {
@@ -4171,6 +4176,29 @@ mod tests {
             "a tool TOML sits beside the program it runs; flagging that is noise"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The harness reads two formats, so a stray `.toml` where `.md` is read (a
+    /// prompt written as a tool) is named. A stray `.md` where `.toml` is read
+    /// is left alone: a README belongs in a tool directory as easily as a
+    /// misplaced surface file would.
+    #[test]
+    fn a_toml_where_md_is_read_is_named_but_a_readme_is_not() {
+        let root = temp_project();
+        write(root.join(".agents/prompts/review.toml"), "x = 1\n");
+        write(root.join(".openmax/tools/README.md"), "# docs\n");
+
+        let findings = local(&root);
+        assert!(
+            find(&findings, "review.toml").status.summary().contains(".md only"),
+            "a prompt written as .toml must be named: {}",
+            find(&findings, "review.toml").status.summary()
+        );
+        assert!(
+            !findings.iter().any(|f| f.path.to_string_lossy().contains("README.md")),
+            "a README in a tool dir must not warn: {findings:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
