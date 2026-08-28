@@ -175,21 +175,38 @@ fn fences(content: &str) -> Vec<Fence> {
     fences
 }
 
-/// `<tool_call>{json}</tool_call>` blocks. A final unclosed tag is tolerated:
-/// streams can end mid-markup while the JSON body is already complete.
+/// `<tool_call>{json}</tool_call>` blocks. A final unclosed tag is tolerated
+/// (streams can end mid-markup while the JSON body is already complete), and so
+/// is a non-final one: when the body that runs to this tag's close does not
+/// parse and another open tag comes first, the tag was left unclosed and its
+/// real body ends at the next open, so the following call is not swallowed with
+/// it. The close-bounded body is tried first, which keeps a JSON body that
+/// itself contains the literal `<tool_call>` string intact.
 fn collect_tagged(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, usize, ToolCallFunction)>) {
     let mut from = 0;
     while let Some(rel) = content[from..].find(OPEN_TAG) {
         let start = from + rel;
         let body_start = start + OPEN_TAG.len();
-        let (body_end, end) = match content[body_start..].find(CLOSE_TAG) {
+        let rest = &content[body_start..];
+        let close = rest.find(CLOSE_TAG);
+        let (body_end, end) = match close {
             Some(rel_close) => (body_start + rel_close, body_start + rel_close + CLOSE_TAG.len()),
             None => (content.len(), content.len()),
         };
         if let Some(function) = parse_call(content[body_start..body_end].trim(), known_tools) {
             spans.push((start, end, function));
+            from = end.max(body_start);
+        } else if let Some(next_open) =
+            rest.find(OPEN_TAG).filter(|n| close.map_or(true, |c| *n < c))
+        {
+            let inner_end = body_start + next_open;
+            if let Some(function) = parse_call(content[body_start..inner_end].trim(), known_tools) {
+                spans.push((start, inner_end, function));
+            }
+            from = inner_end.max(body_start);
+        } else {
+            from = end.max(body_start);
         }
-        from = end.max(body_start);
         if from >= content.len() {
             break;
         }
@@ -441,6 +458,33 @@ mod tests {
         let (clean, calls) = extract_tool_calls(text, known()).unwrap();
         assert_eq!(clean, "Running it now.");
         assert_eq!(calls[0].function.name, "bash");
+    }
+
+    #[test]
+    fn unclosed_middle_tool_call_tag_does_not_eat_the_next_call() {
+        // The model forgot the FIRST call's close tag. The greedy close match
+        // used to fold both into one unparseable body and drop both actions as
+        // prose; each call must still be recovered.
+        let text = "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}\n<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"fn main\"}}</tool_call>";
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
+        assert_eq!(calls.len(), 2, "both calls recovered: {calls:?}");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[1].function.name, "grep");
+    }
+
+    #[test]
+    fn a_tool_call_whose_json_holds_the_open_tag_string_survives() {
+        // A call whose arguments legitimately contain the literal "<tool_call>"
+        // parses as one call: the close-bounded body is tried first, so the
+        // unclosed-tag recovery never truncates a valid JSON body.
+        let text = "<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"<tool_call>\"}}</tool_call>";
+        let (_, calls) = extract_tool_calls(text, known()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "grep");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["pattern"],
+            "<tool_call>"
+        );
     }
 
     #[test]
