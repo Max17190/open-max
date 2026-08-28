@@ -799,6 +799,14 @@ fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding>
 /// the index ignores is a Warn naming the reason and the fix, and a live one
 /// is an Ok saying whether the index currently shows it (a Warn when it shows
 /// it clipped). The check answers the question the agent actually has after
+/// A directory entry is hidden when its name begins with a dot byte. Uses
+/// to_string_lossy, not to_str, so a name whose bytes after the dot are not
+/// valid UTF-8 is still recognized as hidden rather than treated as visible,
+/// matching the skill scan's `.DS_Store` exemption.
+fn name_is_hidden(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
 /// Any `.md` file at any depth under `dir`. A memory subdirectory that holds
 /// one is notes the flat scan will never index, which is worth naming; an
 /// empty or note-free subdir is left alone as it costs nothing.
@@ -808,9 +816,8 @@ fn dir_has_md(dir: &Path) -> bool {
         let path = entry.path();
         // Skip hidden entries the way the skill scan skips `.DS_Store`: a
         // markdown file inside an editor's `.obsidian/` cache or a nested
-        // `.git` is not a memory note the author lost, and descending into
-        // them would raise the warning on tooling the author never touched.
-        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
+        // `.git` is not a memory note the author lost.
+        if path.file_name().is_some_and(name_is_hidden) {
             continue;
         }
         if path.is_dir() {
@@ -2555,6 +2562,23 @@ mod tests {
             "a note only inside a hidden descendant must not warn: {findings:?}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The hidden-descendant exemption keys on the leading byte, not on the
+    /// name being valid UTF-8: a name that begins with a dot but carries
+    /// invalid bytes after it is still hidden tooling (a `to_str` check would
+    /// drop the whole name to None and traverse it). Filesystems that reject
+    /// such names never create the directory, so the fs-level test is
+    /// effectively Linux-only; the check itself is exercised here in memory.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_dot_name_is_recognized_as_hidden() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(name_is_hidden(std::ffi::OsStr::from_bytes(b".\xffcache")));
+        assert!(name_is_hidden(std::ffi::OsStr::new(".obsidian")));
+        assert!(!name_is_hidden(std::ffi::OsStr::new("vault")));
+        // A non-dot leading byte is visible even if invalid UTF-8 follows.
+        assert!(!name_is_hidden(std::ffi::OsStr::from_bytes(b"v\xffault")));
     }
 
     #[test]
