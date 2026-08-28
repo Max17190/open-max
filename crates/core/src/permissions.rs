@@ -157,7 +157,12 @@ struct RuleFile {
 
 enum FileLoad {
     Missing,
-    Ok(Vec<Rule>),
+    /// The parsed rules and the sha256 of the exact bytes they were parsed
+    /// from, produced by one read. The hash rides along so the approval check
+    /// can vouch for the same generation of the file that is now in force,
+    /// rather than a second read that a concurrent rewrite could have changed
+    /// underneath it (the single-read discipline the hook loader uses).
+    Ok(Vec<Rule>, String),
     /// File exists but is unusable; caller must fail closed. The reason names
     /// the rule, never the file: `--check` prints the path in its own column,
     /// and the one reader who sees the reason bare - the model, through the
@@ -178,10 +183,11 @@ impl Permissions {
         for path in paths {
             match load_file(path) {
                 FileLoad::Missing => {}
-                FileLoad::Ok(mut loaded) => {
+                FileLoad::Ok(mut loaded, content_hash) => {
                     if let Some(dropped) = drop_unapproved_allows(
                         &mut loaded,
                         path,
+                        &content_hash,
                         project_root,
                         data_dir,
                     ) {
@@ -356,6 +362,7 @@ impl Permissions {
 fn drop_unapproved_allows(
     rules: &mut Vec<Rule>,
     path: &Path,
+    content_hash: &str,
     project_root: &Path,
     data_dir: &Path,
 ) -> Option<String> {
@@ -365,12 +372,12 @@ fn drop_unapproved_allows(
     if !agent_writable(path, project_root) {
         return None;
     }
-    // Any failure to verify reads as unapproved, the same direction every
-    // other approval check fails in.
-    let approved = std::fs::read(path).is_ok_and(|bytes| {
-        crate::ledger::is_approved(data_dir, project_root, &crate::ledger::sha256_hex(&bytes))
-    });
-    if approved {
+    // `content_hash` is of the exact bytes these rules were parsed from, so the
+    // verdict and the rules in force are one generation of the file, not two
+    // reads a concurrent rewrite could have split. A file that fails to read at
+    // all never reaches here (load_file returned Missing or Invalid), and both
+    // of those fail closed.
+    if crate::ledger::is_approved(data_dir, project_root, content_hash) {
         return None;
     }
     let before = rules.len();
@@ -416,8 +423,8 @@ pub(crate) fn inert_allow_reason(
     project_root: &Path,
     data_dir: &Path,
 ) -> Option<String> {
-    let FileLoad::Ok(mut rules) = load_file(path) else { return None };
-    drop_unapproved_allows(&mut rules, path, project_root, data_dir)
+    let FileLoad::Ok(mut rules, content_hash) = load_file(path) else { return None };
+    drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
 }
 
 /// Diagnose one permissions file for `openmax --check`: None when the file
@@ -428,7 +435,7 @@ pub(crate) fn inert_allow_reason(
 pub(crate) fn check_file(path: &Path) -> Option<Result<Vec<String>, String>> {
     match load_file(path) {
         FileLoad::Missing => None,
-        FileLoad::Ok(rules) => Some(Ok(rules.into_iter().map(|r| r.tool).collect())),
+        FileLoad::Ok(rules, _) => Some(Ok(rules.into_iter().map(|r| r.tool).collect())),
         FileLoad::Invalid(reason) => Some(Err(reason)),
     }
 }
@@ -451,9 +458,13 @@ fn load_file(path: &Path) -> FileLoad {
             return FileLoad::Invalid(format!("unreadable ({e}); failing closed"));
         }
     };
+    // Hash the exact bytes just read. read_to_string only returns Ok for valid
+    // UTF-8, so these bytes are byte-identical to what `openmax --approve`
+    // hashed, and every later approval check keys on this one read.
+    let content_hash = crate::ledger::sha256_hex(text.as_bytes());
     // Empty file is an intentional no-op, not a parse failure.
     if text.trim().is_empty() {
-        return FileLoad::Ok(Vec::new());
+        return FileLoad::Ok(Vec::new(), content_hash);
     }
     let file: PermissionsFile = match toml::from_str(&text) {
         Ok(f) => f,
@@ -505,7 +516,7 @@ fn load_file(path: &Path) -> FileLoad {
             source: path.to_path_buf(),
         });
     }
-    FileLoad::Ok(rules)
+    FileLoad::Ok(rules, content_hash)
 }
 
 /// How a rule's file is named back to whoever reads the message: relative to
@@ -731,6 +742,47 @@ arg_regex = "^src/"
         assert_eq!(
             perms.evaluate("bash", &json!({"command": "cargo test"})),
             PermissionDecision::Default
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The approval verdict for an allow file must key on the exact bytes the
+    /// rules in force were parsed from, decided by one read. When the check
+    /// re-read the file, a rewrite landing between the two reads could enforce
+    /// one generation's rules while vouching with another's hash. Here the
+    /// file is rewritten to unapproved bytes after the load, and the verdict
+    /// must still follow the approved bytes that produced the rules, because
+    /// those are what the loader hashed.
+    #[test]
+    fn the_allow_verdict_keys_on_the_bytes_that_were_parsed() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = root.join(".openmax").join("permissions.toml");
+        let approved = "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n";
+        write_perms(&project, approved);
+        // A human approved exactly these bytes.
+        let sha = crate::ledger::sha256_hex(approved.as_bytes());
+        crate::ledger::approve_capability(&data, &root, &project, &[sha]).unwrap();
+
+        // The rules and the hash both come from this one read of the approved
+        // bytes.
+        let FileLoad::Ok(mut rules, content_hash) = load_file(&project) else {
+            panic!("the approved file must load");
+        };
+        assert!(rules.iter().any(|r| r.effect == Effect::Allow));
+
+        // A concurrent rewrite lands: the file on disk is now unapproved.
+        write_perms(&project, &format!("{approved}# rewritten, never approved\n"));
+
+        // The verdict follows the bytes that were parsed, not the file as it
+        // now sits, so the approved allow survives.
+        let dropped =
+            drop_unapproved_allows(&mut rules, &project, &content_hash, &root, &data);
+        assert!(
+            dropped.is_none() && rules.iter().any(|r| r.effect == Effect::Allow),
+            "the approved allow must survive a rewrite that landed after the load: {dropped:?}"
         );
         let _ = std::fs::remove_dir_all(tmp);
     }
