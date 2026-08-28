@@ -799,6 +799,24 @@ fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding>
 /// the index ignores is a Warn naming the reason and the fix, and a live one
 /// is an Ok saying whether the index currently shows it (a Warn when it shows
 /// it clipped). The check answers the question the agent actually has after
+/// Any `.md` file at any depth under `dir`. A memory subdirectory that holds
+/// one is notes the flat scan will never index, which is worth naming; an
+/// empty or note-free subdir is left alone as it costs nothing.
+fn dir_has_md(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_md(&path) {
+                return true;
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            return true;
+        }
+    }
+    false
+}
+
 /// writing a memory: will a future session see this, as written?
 fn memory_findings(project_root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -810,7 +828,24 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
     for entry in read_dir.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-        if path.is_dir() || name.starts_with('.') {
+        if path.is_dir() {
+            // Memory is flat: the scan indexes only top-level `.md` files, so
+            // notes tucked into a subfolder are silently never read. Name that
+            // rather than pass it in a clean bill of health. A dotfile dir (a
+            // stray `.git`, an editor cache) is noise and stays skipped.
+            if !name.starts_with('.') && dir_has_md(&path) {
+                findings.push(Finding {
+                    kind: "memory",
+                    path,
+                    status: Status::Warn(format!(
+                        "memory is flat: .md notes under {name}/ are never indexed; \
+                         move them directly into .openmax/memory/"
+                    )),
+                });
+            }
+            continue;
+        }
+        if name.starts_with('.') {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
@@ -2467,6 +2502,34 @@ mod tests {
         }
         assert!(matches!(find(&findings, "terse.md").status, Status::Ok(_)));
         assert!(!has_errors(&findings), "memory findings never fail a check");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Memory is flat: the scan indexes only top-level `.md` files, so a note
+    /// tucked into a subfolder is silently never read. --check must name it
+    /// rather than report a clean bill of health.
+    #[test]
+    fn a_memory_note_nested_in_a_subdirectory_is_named() {
+        let root = temp_project();
+        write(root.join(".openmax/memory/adr/frozen-prefix.md"), "# a durable fact\nbody\n");
+        // A valid top-level note and the internal access log must not be
+        // dragged into the warning.
+        write(root.join(".openmax/memory/deploy-port.md"), "# The deploy port is 7443\nb\n");
+        write(root.join(".openmax/memory/.access.jsonl"), "{}\n");
+
+        let findings = local(&root);
+        let warn = find(&findings, ".openmax/memory/adr");
+        assert!(
+            warn.status.summary().contains("never indexed"),
+            "a nested memory note must be named: {}",
+            warn.status.summary()
+        );
+        assert!(matches!(warn.status, Status::Warn(_)), "it is a warning, not an error");
+        assert!(!has_errors(&findings), "memory findings never fail a check");
+        assert!(
+            findings.iter().any(|f| f.kind == "memory" && matches!(f.status, Status::Ok(_))),
+            "the healthy top-level note still reports Ok: {findings:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
