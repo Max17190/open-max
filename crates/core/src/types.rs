@@ -215,9 +215,11 @@ mod tests {
 
     /// Golden wire format for every `AgentEvent`, wrapped in its envelope
     /// exactly as `--stdio` and `--print --json` emit it. These strings are
-    /// the `openmax-stdio/4` contract: session_id first, then the `type`
+    /// the `openmax-stdio/5` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
+    /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
+    /// is added without an assertion below.
     #[test]
     fn event_envelope_wire_is_stable() {
         assert_eq!(
@@ -364,6 +366,66 @@ mod tests {
             env(AgentEvent::Error { message: "boom".into() }),
             r#"{"session_id":"s1","type":"error","message":"boom"}"#
         );
+        // HarnessNote is the event EVERY model-visible receipt rides (refreeze
+        // receipts, policy/providers/settings/approval notices), so a custom
+        // frontend renders exactly what the model saw. Its byte order was not
+        // pinned before, though it is the most load-bearing event on the wire.
+        assert_eq!(
+            env(AgentEvent::HarnessNote {
+                call_id: "c1".into(),
+                text: "[extension refreeze: callable from your next step]".into(),
+            }),
+            r#"{"session_id":"s1","type":"harness_note","call_id":"c1","text":"[extension refreeze: callable from your next step]"}"#
+        );
+        // A note inserted before the next prompt (a turn-start receipt) carries
+        // no call_id; the field is still present, so the wire stays stable.
+        assert_eq!(
+            env(AgentEvent::HarnessNote { call_id: String::new(), text: "note".into() }),
+            r#"{"session_id":"s1","type":"harness_note","call_id":"","text":"note"}"#
+        );
+        assert_eq!(
+            env(AgentEvent::Compacted {
+                tokens_before: 5000,
+                tokens_after: 1200,
+                compacted_messages: 8,
+            }),
+            r#"{"session_id":"s1","type":"compacted","tokens_before":5000,"tokens_after":1200,"compacted_messages":8}"#
+        );
+    }
+
+    /// A compile-time tripwire: adding an `AgentEvent` variant must not build
+    /// until it is byte-pinned in `event_envelope_wire_is_stable` above. This
+    /// match has no wildcard, so a new variant breaks compilation here and
+    /// points the author at the golden. It mirrors the exhaustive `Command`
+    /// dispatch on the stdio side, which already guarantees this for inbound
+    /// commands. The two events that were emittable but unpinned (HarnessNote,
+    /// Compacted) are the reason this guard exists.
+    #[test]
+    fn every_agent_event_variant_is_pinned_in_the_golden() {
+        fn _exhaustive(e: &AgentEvent) {
+            match e {
+                AgentEvent::Token { .. } => {}
+                AgentEvent::Thinking { .. } => {}
+                AgentEvent::MessageDone { .. } => {}
+                AgentEvent::Budget { .. } => {}
+                AgentEvent::Usage { .. } => {}
+                AgentEvent::ToolStart { .. } => {}
+                AgentEvent::ToolEnd { .. } => {}
+                AgentEvent::HarnessNote { .. } => {}
+                AgentEvent::Diff { .. } => {}
+                AgentEvent::ApprovalRequest { .. } => {}
+                AgentEvent::ApprovalSettled { .. } => {}
+                AgentEvent::Refrozen { .. } => {}
+                AgentEvent::Compacted { .. } => {}
+                AgentEvent::SchemasOverBudget { .. } => {}
+                AgentEvent::HookFailed { .. } => {}
+                AgentEvent::TurnRefused { .. } => {}
+                AgentEvent::Done { .. } => {}
+                AgentEvent::Error { .. } => {}
+                // No wildcard: a new variant must be added here AND byte-pinned
+                // in event_envelope_wire_is_stable, then PROTO_VERSION bumped.
+            }
+        }
     }
 
     /// The contract is round-trippable: every event deserializes from its own
