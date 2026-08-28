@@ -808,6 +808,38 @@ fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding>
 /// the index ignores is a Warn naming the reason and the fix, and a live one
 /// is an Ok saying whether the index currently shows it (a Warn when it shows
 /// it clipped). The check answers the question the agent actually has after
+/// A directory entry is hidden when its name begins with a dot byte. Uses
+/// to_string_lossy, not to_str, so a name whose bytes after the dot are not
+/// valid UTF-8 is still recognized as hidden rather than treated as visible,
+/// matching the skill scan's `.DS_Store` exemption.
+fn name_is_hidden(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
+/// Any `.md` file at any depth under `dir`. A memory subdirectory that holds
+/// one is notes the flat scan will never index, which is worth naming; an
+/// empty or note-free subdir is left alone as it costs nothing.
+fn dir_has_md(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        // Skip hidden entries the way the skill scan skips `.DS_Store`: a
+        // markdown file inside an editor's `.obsidian/` cache or a nested
+        // `.git` is not a memory note the author lost.
+        if path.file_name().is_some_and(name_is_hidden) {
+            continue;
+        }
+        if path.is_dir() {
+            if dir_has_md(&path) {
+                return true;
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            return true;
+        }
+    }
+    false
+}
+
 /// writing a memory: will a future session see this, as written?
 fn memory_findings(project_root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -819,7 +851,24 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
     for entry in read_dir.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-        if path.is_dir() || name.starts_with('.') {
+        if path.is_dir() {
+            // Memory is flat: the scan indexes only top-level `.md` files, so
+            // notes tucked into a subfolder are silently never read. Name that
+            // rather than pass it in a clean bill of health. A dotfile dir (a
+            // stray `.git`, an editor cache) is noise and stays skipped.
+            if !name.starts_with('.') && dir_has_md(&path) {
+                findings.push(Finding {
+                    kind: "memory",
+                    path,
+                    status: Status::Warn(format!(
+                        "memory is flat: .md notes under {name}/ are never indexed; \
+                         move them directly into .openmax/memory/"
+                    )),
+                });
+            }
+            continue;
+        }
+        if name.starts_with('.') {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
@@ -2556,6 +2605,68 @@ mod tests {
         assert!(matches!(find(&findings, "terse.md").status, Status::Ok(_)));
         assert!(!has_errors(&findings), "memory findings never fail a check");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Memory is flat: the scan indexes only top-level `.md` files, so a note
+    /// tucked into a subfolder is silently never read. --check must name it
+    /// rather than report a clean bill of health.
+    #[test]
+    fn a_memory_note_nested_in_a_subdirectory_is_named() {
+        let root = temp_project();
+        write(root.join(".openmax/memory/adr/frozen-prefix.md"), "# a durable fact\nbody\n");
+        // A valid top-level note and the internal access log must not be
+        // dragged into the warning.
+        write(root.join(".openmax/memory/deploy-port.md"), "# The deploy port is 7443\nb\n");
+        write(root.join(".openmax/memory/.access.jsonl"), "{}\n");
+
+        let findings = local(&root);
+        let warn = find(&findings, ".openmax/memory/adr");
+        assert!(
+            warn.status.summary().contains("never indexed"),
+            "a nested memory note must be named: {}",
+            warn.status.summary()
+        );
+        assert!(matches!(warn.status, Status::Warn(_)), "it is a warning, not an error");
+        assert!(!has_errors(&findings), "memory findings never fail a check");
+        assert!(
+            findings.iter().any(|f| f.kind == "memory" && matches!(f.status, Status::Ok(_))),
+            "the healthy top-level note still reports Ok: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A markdown file that exists only inside a hidden descendant (an editor
+    /// cache, a nested `.git`) of a memory subdir is tooling, not a lost note,
+    /// so it must not raise the flat-memory warning, the same exemption the
+    /// skill scan gives `.DS_Store`.
+    #[test]
+    fn a_memory_note_hidden_in_editor_metadata_is_not_a_lost_note() {
+        let root = temp_project();
+        write(root.join(".openmax/memory/vault/.obsidian/cache.md"), "# editor state\n");
+
+        let findings = local(&root);
+        assert!(
+            !findings.iter().any(|f| f.path.to_string_lossy().contains("vault")),
+            "a note only inside a hidden descendant must not warn: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The hidden-descendant exemption keys on the leading byte, not on the
+    /// name being valid UTF-8: a name that begins with a dot but carries
+    /// invalid bytes after it is still hidden tooling (a `to_str` check would
+    /// drop the whole name to None and traverse it). Filesystems that reject
+    /// such names never create the directory, so the fs-level test is
+    /// effectively Linux-only; the check itself is exercised here in memory.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_dot_name_is_recognized_as_hidden() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(name_is_hidden(std::ffi::OsStr::from_bytes(b".\xffcache")));
+        assert!(name_is_hidden(std::ffi::OsStr::new(".obsidian")));
+        assert!(!name_is_hidden(std::ffi::OsStr::new("vault")));
+        // A non-dot leading byte is visible even if invalid UTF-8 follows.
+        assert!(!name_is_hidden(std::ffi::OsStr::from_bytes(b"v\xffault")));
     }
 
     #[test]
