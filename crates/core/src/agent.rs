@@ -1815,14 +1815,17 @@ fn classify_added_tools(
             if new_registry.get(&old_spec.name).is_some() {
                 continue;
             }
-            // Present-but-broken is not removed. An edit that breaks the
-            // manifest leaves the file on disk, so it drops out of `tools` and
-            // into `broken`, where the refreeze receipt already names it ("NOT
-            // loaded: X: <reason>"). Calling it a removed tool on top of that
-            // is a second, contradictory clause about the same file, and its
-            // "identical bytes would run without a card" reads as if the file
-            // were gone. Only a manifest that left disk entirely is removed.
-            if new_registry.broken.iter().any(|(p, _)| *p == old_ext.source_path) {
+            // Still on disk is not removed. Its manifest may have been edited
+            // to broken (now in `broken`, where the refreeze receipt names it
+            // "NOT loaded: X: <reason>"), or a broken higher-precedence file
+            // may be withholding this valid one by shadowing its name - in the
+            // shadow case the broken file's path differs from this tool's, so a
+            // check against `broken` alone would miss it (Greptile). Either way
+            // the file is present, so "Removed approved tools: X - identical
+            // bytes would run without a card" is a false, contradictory clause
+            // that reads as if the file were gone. Only a manifest that left
+            // disk entirely is removed; the broken file speaks for the rest.
+            if old_ext.source_path.exists() {
                 continue;
             }
             // Was the manifest ever approved? That signal is disk-independent:
@@ -5138,6 +5141,49 @@ mod tests {
         assert!(
             added.removed_approved.is_empty() && added.removed_approval_survives.is_empty(),
             "a broken-by-edit tool is not a removed tool: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The disk-presence check must not over-suppress: a manifest that truly
+    /// left disk (not present, not broken, not shadowed) is still a removed
+    /// approved tool, with its surviving approval named. This is the other side
+    /// of the broken-not-removed rule, so `exists()` cannot swallow a real
+    /// removal.
+    #[test]
+    fn a_deleted_manifest_is_still_reported_as_a_removed_tool() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2d-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+        crate::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("deploy").is_some());
+
+        // The manifest leaves disk entirely.
+        std::fs::remove_file(&manifest).unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(new.get("deploy").is_none());
+        assert!(
+            !new.broken.iter().any(|(p, _)| *p == manifest),
+            "a deleted file is gone, not broken"
+        );
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved == vec!["deploy".to_string()],
+            "a genuinely removed approved tool is still named: {:?} / {:?}",
             added.removed_approved,
             added.removed_approval_survives
         );
