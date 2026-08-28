@@ -1249,10 +1249,16 @@ mod tests {
                 reason: String::new(),
                 source_path: String::new(),
                 source_sha: String::new(),
-                env: Vec::new(),
+                // A non-empty env: `skip_serializing_if` drops the key when it
+                // is empty, so an empty sample never puts `env` in the object's
+                // keys and the loop below could not enforce that the spec names
+                // this field. It carries a credential grant, so a frontend that
+                // is not told to render it is the exact failure it guards.
+                env: vec!["TOKEN".into()],
             },
             AgentEvent::ApprovalSettled { approval_id: String::new(), outcome: String::new() },
             AgentEvent::Refrozen { tools: 0, skills: 0, changes: Vec::new() },
+            AgentEvent::SchemasOverBudget { schema_tokens: 0, budget_tokens: 0 },
             AgentEvent::Compacted { tokens_before: 0, tokens_after: 0, compacted_messages: 0 },
             AgentEvent::HookFailed {
                 hook: String::new(),
