@@ -201,9 +201,18 @@ fn collect_tagged(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, u
         {
             let inner_end = body_start + next_open;
             if let Some(function) = parse_call(content[body_start..inner_end].trim(), known_tools) {
+                // A genuine unclosed tag with a valid first call: recover it and
+                // resume at the next open so the following call is not lost.
                 spans.push((start, inner_end, function));
+                from = inner_end.max(body_start);
+            } else {
+                // Bounding at the next open did not yield a call either, so this
+                // is a malformed block, not an unclosed tag. Skip past the close
+                // rather than resuming at that open tag, which may sit inside
+                // this call's own JSON string: resuming there would parse the
+                // garbage suffix as a spurious independent call (Greptile).
+                from = end.max(body_start);
             }
-            from = inner_end.max(body_start);
         } else {
             from = end.max(body_start);
         }
@@ -484,6 +493,21 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap()["pattern"],
             "<tool_call>"
+        );
+    }
+
+    #[test]
+    fn a_malformed_block_with_a_nested_tag_does_not_spawn_a_spurious_call() {
+        // The outer body is garbage and holds a literal <tool_call> with a
+        // valid-looking call after it. The unclosed-tag recovery must not
+        // resume at that inner tag and parse the suffix as a real call; when
+        // bounding at the next open still yields nothing, the whole block is
+        // dropped as prose (Greptile).
+        let text = "<tool_call>garbage <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"boom\"}}</tool_call>";
+        assert!(
+            extract_tool_calls(text, known()).is_none(),
+            "a malformed block must not spawn a call: {:?}",
+            extract_tool_calls(text, known())
         );
     }
 
