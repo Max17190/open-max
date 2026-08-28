@@ -228,7 +228,9 @@ One directory per skill with a `SKILL.md` inside: `.agents/skills/<name>/SKILL.m
 name collision.
 
 `SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
-keys are read (bare or double-quoted values, one line each):
+keys are read. Each value may be bare or double-quoted on one line, or a
+`>`/`|` block scalar folded to a single line (the spelling many packaged
+skills ship):
 - `name:` (required): the skill's index name.
 - `description:` (required in practice): one line saying what the skill does
   and when to use it; capped at 200 chars. This is the only text that enters
@@ -238,8 +240,11 @@ The body after the frontmatter is free-form markdown of any length: it loads
 only when the skill is used. A skill directory may bundle scripts and
 reference files next to SKILL.md; run them with bash.
 
-At most 50 skills are indexed, sorted by name. The prompt shows each as
-`- name: description — path/to/SKILL.md`.
+At most 50 skills are indexed, sorted by name, and the index is byte-capped at
+3000 bytes: once the sorted lines fill it the trailing skills are omitted and a
+trailer counts them, so more skills or longer descriptions can push a skill out
+of the prompt entirely (`openmax --check` names each one it drops). The prompt
+shows each indexed skill as `- name: description — path/to/SKILL.md`.
 
 Example (`.agents/skills/release/SKILL.md`):
 
@@ -711,13 +716,14 @@ Accesses are the file's mtime plus logged events in
 targets a memory path and `write` for write_file/edit_file, once per kind
 per turn). bash access is not tracked; prefer the file tools for recall.
 
-Forgetting is deliberate:
-- Below the activation of one access 21 days old, a memory leaves the index
-  (still on disk, still greppable).
-- Below the activation of one access 60 days old, the file is deleted at the
-  next session creation, leaving a `gc` tombstone line (name, sha256,
-  description) in the access log. Update or delete stale facts yourself
-  rather than letting them fade into the index of a future session.
+Forgetting keys on recency of last use, not on activation: activation only
+ranks the index, so a fact used often but not lately still fades on schedule.
+- Unused for 21 days (measured from its most recent access), a memory leaves
+  the index, still on disk and still greppable.
+- Unused for 60 days, the file is deleted at the next session creation,
+  leaving a `gc` tombstone line (name, sha256, description) in the access log.
+  Update or delete stale facts yourself rather than letting them fade into the
+  index of a future session.
 
 Supersede, do not duplicate: update the existing file when a fact changes
 (date-stamp facts that can go stale). Near-duplicate files split the access
@@ -963,6 +969,52 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ");
             assert_eq!(marked, required, "{surface}");
+        }
+    }
+
+    /// The skills spec must name the byte budget the binary enforces, not only
+    /// the count cap. `--check` names each skill the budget drops; a spec that
+    /// mentions only "50 skills" sends an author hunting for a limit they have
+    /// not hit while the real one silently ate their skill.
+    #[test]
+    fn spec_skills_names_the_index_byte_budget() {
+        assert!(
+            SKILLS.contains(&crate::prompt::MAX_SKILLS_BYTES.to_string()),
+            "the skills spec must state the {}-byte index budget",
+            crate::prompt::MAX_SKILLS_BYTES
+        );
+    }
+
+    /// The frontmatter reader folds `>`/`|` block scalars, the spelling
+    /// packaged skills most often ship; a spec that lists only bare and quoted
+    /// values steers an author away from the one that works.
+    #[test]
+    fn spec_skills_names_the_block_scalar_frontmatter() {
+        assert!(
+            SKILLS.contains("block scalar"),
+            "the skills spec must name the `>`/`|` block-scalar frontmatter form"
+        );
+    }
+
+    /// The memory floors gate on recency of last use, not on activation
+    /// (activation only ranks). The spec once described the pre-#173 activation
+    /// floors, the opposite behavior for a fact used often but not lately.
+    #[test]
+    fn spec_memory_floors_are_recency_of_last_use_not_activation() {
+        assert!(
+            !MEMORY.contains("activation of one access"),
+            "the memory spec must not describe the retired activation floors"
+        );
+        assert!(
+            MEMORY.contains("recency of last use"),
+            "the memory spec must say the floor is recency of last use"
+        );
+        for days in [crate::memory::INDEX_FLOOR_DAYS, crate::memory::GC_FLOOR_DAYS] {
+            assert!(
+                MEMORY.contains(&format!("{} days", days as u32)),
+                "the memory spec must state the {}-day floor",
+                days as u32
+            );
         }
     }
 

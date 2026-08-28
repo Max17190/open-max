@@ -49,11 +49,11 @@ const MAX_NAME_CHARS: usize = 64;
 /// the index: still on disk, still greppable, no longer spending prompt
 /// bytes. ~3 weeks without a use is where a human memory needs a cue again,
 /// however well-worn it once was.
-const INDEX_FLOOR_DAYS: f64 = 21.0;
+pub(crate) const INDEX_FLOOR_DAYS: f64 = 21.0;
 /// Unused past this many days, the file itself is deleted (a `gc` log line
 /// keeps its name, sha256, and description as the tombstone). Memory is not
 /// an archive; the session transcripts are.
-const GC_FLOOR_DAYS: f64 = 60.0;
+pub(crate) const GC_FLOOR_DAYS: f64 = 60.0;
 
 /// ACT-R base-level activation: `ln(sum(t_hours^-d))` with d = 0.5. Ages are
 /// clamped to one hour so a just-written memory contributes exactly 1.0 and
