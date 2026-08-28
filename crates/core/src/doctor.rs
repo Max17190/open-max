@@ -300,6 +300,9 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         };
                         skill_notes.push((skills_found.len(), reason));
                     }
+                    if let Some(reason) = agent_skills_name_issue(&s.name) {
+                        skill_notes.push((skills_found.len(), reason));
+                    }
                     Status::Ok(format!("skill '{}'", s.name))
                 }
                 Err(reason) => Status::Err(reason),
@@ -1962,6 +1965,41 @@ fn global_unread_paths(data_dir: &Path) -> Vec<Finding> {
     out
 }
 
+/// How a skill's frontmatter `name` departs from the Agent Skills naming rules
+/// (agentskills.io/specification: 1 to 64 characters, lowercase letters,
+/// digits, and hyphens only, no leading or trailing hyphen, no consecutive
+/// hyphens). Open Max indexes by the frontmatter name and loads the skill
+/// regardless; a standard skills consumer will not load a name that breaks
+/// these, so a violation is worth a portability advisory. The spec's
+/// name-matches-parent-directory rule is deliberately NOT checked: Open Max
+/// indexes by the frontmatter name by design, so name != dir is a first-class
+/// shape here (its own fixtures use it), and warning on it would fight the
+/// documented model rather than flag a portability defect.
+fn agent_skills_name_issue(name: &str) -> Option<String> {
+    let mut issues: Vec<&str> = Vec::new();
+    let len = name.chars().count();
+    if len == 0 || len > 64 {
+        issues.push("must be 1 to 64 characters");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        issues.push("may hold only lowercase letters, digits, and hyphens");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        issues.push("must not start or end with a hyphen");
+    }
+    if name.contains("--") {
+        issues.push("must not contain consecutive hyphens");
+    }
+    if issues.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "skill name '{name}' is not a portable Agent Skills name ({}); Open Max loads it, \
+         but a standard skills consumer will not",
+        issues.join("; ")
+    ))
+}
+
 /// A SKILL.md that only differs by case, which no filesystem guarantees to
 /// resolve the same way.
 fn miscased_skill_file(dir: &Path) -> Option<PathBuf> {
@@ -2550,6 +2588,60 @@ mod tests {
             "the miscased file must be named whether or not it loaded here: {findings:?}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A skill whose frontmatter name is not a valid Agent Skills name
+    /// (uppercase, spaces, bad hyphens, or too long) loads in Open Max but will
+    /// not port to a standard skills consumer, so --check advises it.
+    #[test]
+    fn a_nonportable_skill_name_is_advised() {
+        let root = temp_project();
+        write(
+            root.join(".agents/skills/pdftools/SKILL.md"),
+            "---\nname: PDF Tools\ndescription: work with pdfs, when the user mentions a pdf\n---\nbody\n",
+        );
+        let findings = local(&root);
+        let warn = find(&findings, "pdftools");
+        assert!(
+            warn.status.summary().contains("not a portable Agent Skills name")
+                && warn.status.summary().contains("lowercase"),
+            "a non-portable name must be advised: {}",
+            warn.status.summary()
+        );
+        assert!(!has_errors(&findings), "an advisory must not fail the check");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A conformant name draws no advisory, and a name that merely differs from
+    /// its directory is NOT flagged: Open Max indexes by the frontmatter name,
+    /// so name != dir is a first-class shape here, not a portability defect.
+    #[test]
+    fn a_conformant_name_that_differs_from_its_dir_is_not_advised() {
+        let root = temp_project();
+        write(
+            root.join(".agents/skills/review/SKILL.md"),
+            "---\nname: code-review\ndescription: reviews a diff, when a branch is ready\n---\nbody\n",
+        );
+        let findings = local(&root);
+        let f = find(&findings, "review/SKILL.md");
+        assert!(
+            matches!(f.status, Status::Ok(_)),
+            "a conformant name that differs from its dir is not advised: {:?}",
+            f.status
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_skills_name_issue_matches_the_spec_rules() {
+        for ok in ["pdf-processing", "code-review", "data42", "a"] {
+            assert!(agent_skills_name_issue(ok).is_none(), "{ok} conforms");
+        }
+        for bad in ["PDF-Processing", "pdf tools", "-pdf", "pdf-", "pdf--processing", ""] {
+            assert!(agent_skills_name_issue(bad).is_some(), "{bad:?} violates a rule");
+        }
+        assert!(agent_skills_name_issue(&"a".repeat(65)).is_some(), "65 chars is too long");
+        assert!(agent_skills_name_issue(&"a".repeat(64)).is_none(), "64 chars is the limit");
     }
 
     /// A correctly-spelled SKILL.md placed a level too deep is a depth mistake,
