@@ -394,12 +394,23 @@ mod tests {
     }
 
     /// A compile-time tripwire: adding an `AgentEvent` variant must not build
-    /// until it is byte-pinned in `event_envelope_wire_is_stable` above. This
-    /// match has no wildcard, so a new variant breaks compilation here and
-    /// points the author at the golden. It mirrors the exhaustive `Command`
-    /// dispatch on the stdio side, which already guarantees this for inbound
-    /// commands. The two events that were emittable but unpinned (HarnessNote,
-    /// Compacted) are the reason this guard exists.
+    /// until it is acknowledged here. This match has no wildcard, so a new
+    /// variant breaks compilation and points the author at the golden above.
+    /// It mirrors the exhaustive `Command` dispatch on the stdio side. The two
+    /// events that were emittable but unpinned (HarnessNote, Compacted) are the
+    /// reason this guard exists.
+    ///
+    /// What it guarantees and what it does not: the compiler forces the author
+    /// to add an arm, but cannot force them to also add the byte-exact
+    /// `assert_eq!` to `event_envelope_wire_is_stable` and bump `PROTO_VERSION`
+    /// - an empty `=> {}` arm compiles. Forcing the value-specific assertion at
+    /// compile time would need a variant-iteration macro (a new dependency this
+    /// harness declines) and could not express the variants with more than one
+    /// sample (Usage's Some/None, ApprovalRequest's env). So the arm is a stop
+    /// sign, not a proof: on reaching it, ADD THE GOLDEN ASSERTION AND BUMP
+    /// PROTO_VERSION. That is the same trust the hand-listed golden already
+    /// asks; the tripwire only makes forgetting it a compile error rather than
+    /// a silent gap.
     #[test]
     fn every_agent_event_variant_is_pinned_in_the_golden() {
         fn _exhaustive(e: &AgentEvent) {
