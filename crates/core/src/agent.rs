@@ -1816,7 +1816,8 @@ fn classify_added_tools(
                 continue;
             }
             // A manifest still on disk is not removed. It may have been edited
-            // to broken (now in `broken`, where the refreeze receipt names it
+            // to broken or turned unreadable (both now in `broken`, where the
+            // refreeze receipt names it
             // "NOT loaded: X: <reason>"), or a broken higher-precedence file
             // may be withholding this valid one by shadowing its name - in the
             // shadow case the broken file's path differs from this tool's, so a
@@ -5229,6 +5230,61 @@ mod tests {
             added.removed_approval_survives
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A manifest that stays a regular file but turns unreadable is
+    /// present-but-broken, not removed. Discovery must record the read failure
+    /// as a broken entry so the receipt's "NOT loaded" clause names it; before
+    /// that, the unreadable file was skipped entirely, and because the path is
+    /// still a file on disk the removal clauses were suppressed too, so the
+    /// approved tool vanished with no explanation anywhere (Greptile).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_manifest_is_reported_broken_not_silently_vanished() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("openmax-t2ur-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+        crate::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("deploy").is_some());
+
+        // The manifest stays a regular file but can no longer be read.
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&manifest).is_ok() {
+            // Root reads through 0o000; the scenario cannot exist, so there is
+            // nothing to measure.
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(new.get("deploy").is_none(), "the unreadable tool drops out of tools");
+        assert!(
+            new.broken
+                .iter()
+                .any(|(p, r)| *p == manifest && r.contains("unreadable")),
+            "the read failure is a broken entry the receipt can name: {:?}",
+            new.broken
+        );
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved.is_empty() && added.removed_approval_survives.is_empty(),
+            "an unreadable manifest is present-but-broken, not removed: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
+        );
+
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 

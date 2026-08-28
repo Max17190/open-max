@@ -193,7 +193,23 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         files.sort();
         for path in files {
             path.hash(&mut h);
-            let bytes = std::fs::read(&path).ok();
+            // A read failure on a file the directory listing named is a broken
+            // entry, not a silent skip: an approved tool whose manifest turned
+            // unreadable would otherwise vanish from `tools` AND `broken`, so
+            // the refreeze receipt could name it nowhere - no "NOT loaded"
+            // clause, and (because the path is still a file on disk) no removal
+            // clause either (Greptile). NotFound is the one exception: a file
+            // deleted between the listing and the read is gone, and a removal,
+            // not a broken entry.
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        broken_at.push((path.clone(), format!("unreadable: {e}"), dir_index, None));
+                    }
+                    None
+                }
+            };
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
             files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
