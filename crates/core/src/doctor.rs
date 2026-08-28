@@ -806,6 +806,13 @@ fn dir_has_md(dir: &Path) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else { return false };
     for entry in rd.flatten() {
         let path = entry.path();
+        // Skip hidden entries the way the skill scan skips `.DS_Store`: a
+        // markdown file inside an editor's `.obsidian/` cache or a nested
+        // `.git` is not a memory note the author lost, and descending into
+        // them would raise the warning on tooling the author never touched.
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
+            continue;
+        }
         if path.is_dir() {
             if dir_has_md(&path) {
                 return true;
@@ -2529,6 +2536,23 @@ mod tests {
         assert!(
             findings.iter().any(|f| f.kind == "memory" && matches!(f.status, Status::Ok(_))),
             "the healthy top-level note still reports Ok: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A markdown file that exists only inside a hidden descendant (an editor
+    /// cache, a nested `.git`) of a memory subdir is tooling, not a lost note,
+    /// so it must not raise the flat-memory warning, the same exemption the
+    /// skill scan gives `.DS_Store`.
+    #[test]
+    fn a_memory_note_hidden_in_editor_metadata_is_not_a_lost_note() {
+        let root = temp_project();
+        write(root.join(".openmax/memory/vault/.obsidian/cache.md"), "# editor state\n");
+
+        let findings = local(&root);
+        assert!(
+            !findings.iter().any(|f| f.path.to_string_lossy().contains("vault")),
+            "a note only inside a hidden descendant must not warn: {findings:?}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
