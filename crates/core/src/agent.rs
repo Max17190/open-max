@@ -3121,9 +3121,17 @@ async fn run_loop(
                 // would push small models into pointless retry loops.
                 guard.messages().push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
                 if executed && registry.is_mutating(name) {
-                    if outcome.ok {
-                        extensions_touched = true;
-                    }
+                    // Any executed mutating call may have changed extension
+                    // bytes, a FAILED one included: a bash command can persist
+                    // a tool, skill, or memory file and still exit nonzero,
+                    // the same reason the permissions reload just below is
+                    // unconditional. The between-iterations refreeze is
+                    // fingerprint-gated (a no-op when nothing on disk moved),
+                    // so this is safe to set eagerly; gating it on `outcome.ok`
+                    // instead left a written-then-failed file inactive until
+                    // the turn ended, where the next turn start then recorded
+                    // it as an out-of-session `Actor::External` edit.
+                    extensions_touched = true;
                     // Reload here, not at iteration end: one assistant
                     // response can carry the policy write and the call
                     // the policy denies, and the later call must already
@@ -5077,6 +5085,118 @@ mod tests {
         assert!(
             receipt.iter().any(|c| c.contains("deploy.toml")),
             "the receipt must name what changed: {receipt:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A bash call can write a valid tool file and still exit nonzero (a
+    /// `... && false` chain, or a heredoc that writes then a self-test that
+    /// fails). The extension refreeze runs after any mutating call, not only a
+    /// successful one, for the same reason the permissions reload does; gating
+    /// it on success left the written tool absent from the next step's schemas
+    /// and, at turn end, recorded as an out-of-session edit. The manifest here
+    /// must reach the very next request even though the call that wrote it
+    /// failed. The tool name is chosen to appear nowhere but its own schema, so
+    /// the assertion cannot pass on the prompt or transcript echo alone.
+    #[tokio::test]
+    async fn a_failed_mutating_call_that_wrote_a_tool_still_activates_it() {
+        use crate::state::Core;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        // The helper one bash call runs: write a valid manifest, then exit
+        // nonzero. The write lands on disk; the call reports failure.
+        let writer = project.join("write-tool.sh");
+        write_exec(
+            &writer,
+            "#!/bin/sh\nmkdir -p .openmax/tools\nprintf 'name = \"shipit\"\\ndescription = \"ships it\"\\ncommand = \"/bin/echo\"\\n' > .openmax/tools/shipit.toml\nexit 1\n",
+        );
+
+        // Request 1 -> that bash call; request 2 -> stop. Capture every request
+        // body so the assertion can read the tools the model was offered.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0u8; content_length];
+                if content_length > 0 && sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
+                n += 1;
+                let sse: &str = if n == 1 {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"./write-tool.sh\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                } else {
+                    STOP_SSE
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+
+        let id = "sess-failed-write";
+        start_turn(core.clone(), id.into(), project.clone(), "make me a tool".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        // The manifest is on disk and valid.
+        assert!(project.join(".openmax/tools/shipit.toml").exists());
+        // The call that wrote it failed.
+        let messages = transcript(&core, id).await;
+        assert!(
+            messages.iter().any(|m| m.role == "tool"
+                && m.content.as_deref().is_some_and(|c| c.contains("exit code 1"))),
+            "the writing call must have failed: {messages:?}"
+        );
+        // The tool it wrote reached the next request's schemas anyway. `shipit`
+        // is nowhere in the prompt or the transcript, so this can only be true
+        // if the refreeze put its schema on the wire.
+        let bodies = bodies.lock().unwrap();
+        assert!(bodies.len() >= 2, "the turn must have taken a second step: got {}", bodies.len());
+        assert!(
+            bodies[1].contains("shipit"),
+            "a tool written by a failed call must still activate for the next step: {}",
+            bodies[1]
         );
 
         let _ = std::fs::remove_dir_all(dir);
