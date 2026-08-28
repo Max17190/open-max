@@ -751,6 +751,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     findings.extend(inline_program_findings(data_dir, project_root));
     findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));
+    findings.extend(global_unread_paths(data_dir));
     findings.extend(hygiene_findings(project_root, data_dir, &tool_meta, &skill_meta));
     findings
 }
@@ -1801,6 +1802,14 @@ const PROJECT_DIRS: &[(&str, &str)] = &[
 /// Files that legitimately sit directly under a project config directory.
 const LOOSE_FILES: &[(&str, &str)] = &[(".openmax", "permissions.toml")];
 
+/// The global tier is flat: every surface sits directly under the data dir
+/// (`~/.openmax/{tools,hooks,skills,prompts}`), with no `.openmax`/`.agents`
+/// split and no memory tier. The data dir also holds legitimate non-extension
+/// files and dirs (settings.json, ledger/, sessions/), so the global net flags
+/// only a near-miss of these names or a wrong-extension file inside one, never
+/// a loose file.
+const GLOBAL_DIRS: &[&str] = &["tools", "hooks", "skills", "prompts"];
+
 /// Config-shaped extensions that suggest a file was meant to be read. Scripts
 /// are deliberately absent: a tool TOML normally sits beside the program it
 /// runs, and flagging that would be noise.
@@ -1879,6 +1888,14 @@ fn wrong_extension_files(dir: &Path, parent: &str, child: &str) -> Vec<Finding> 
         // would report the same file twice.
         _ => return Vec::new(),
     };
+    wrong_extension_in(dir, want, &format!("{parent}/{child}/"))
+}
+
+/// Files in a read directory whose extension is a recognizable config format
+/// other than `want`, or a near-miss of it (.tml, .tomll): meant to be read,
+/// silently never read. The caller names the directory in the message, so the
+/// project and global tiers share one scan.
+fn wrong_extension_in(dir: &Path, want: &str, dir_label: &str) -> Vec<Finding> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     paths.sort();
@@ -1887,18 +1904,62 @@ fn wrong_extension_files(dir: &Path, parent: &str, child: &str) -> Vec<Finding> 
         .filter(|p| p.is_file())
         .filter(|p| {
             p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-                // A recognizable config format in the wrong dialect, or a
-                // near-miss of the right one (.tml, .tomll): both are files
-                // an author meant to be read, silently never read.
-                e != want && (CONFIG_EXTENSIONS.contains(&e) || near(e, want))
+                // A config format in the wrong dialect (.yaml where .toml is
+                // read), a near-miss of the right one (.tml), or the harness's
+                // other structured format `.toml` where `.md` is read (a prompt
+                // written as a tool). `.md` where `.toml` is read is left out on
+                // purpose: it is as likely a README as a misplaced surface file.
+                e != want && (CONFIG_EXTENSIONS.contains(&e) || e == "toml" || near(e, want))
             })
         })
         .map(|path| Finding {
             kind: "path",
             path,
-            status: Status::Warn(format!("not read; {parent}/{child}/ is read as .{want} only")),
+            status: Status::Warn(format!("not read; {dir_label} is read as .{want} only")),
         })
         .collect()
+}
+
+/// The global tier's version of `unread_paths`. The data dir is flat and also
+/// holds legitimate files and dirs, so this flags only two things: a directory
+/// whose name is a near-miss of a canonical surface, and a wrong-extension file
+/// inside a canonical one. A loose file or an unrelated dir (ledger/, sessions/)
+/// is left alone. Every canonical global name is plural, so `near` alone covers
+/// the singular and one-typo misses; there is no singular name to need the
+/// `is_regular_plural` bridge the project tier gives `memory`.
+fn global_unread_paths(data_dir: &Path) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(data_dir) else { return out };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if let Some(canon) = GLOBAL_DIRS.iter().find(|c| **c == name) {
+            let want = match *canon {
+                "tools" | "hooks" => "toml",
+                "prompts" => "md",
+                // A skill is a directory holding SKILL.md, not a flat file; the
+                // skill loop already validates skills across both tiers.
+                _ => continue,
+            };
+            out.extend(wrong_extension_in(&path, want, &format!("the global {canon}/")));
+            continue;
+        }
+        if dir_is_empty(&path) {
+            continue;
+        }
+        if let Some(canon) = GLOBAL_DIRS.iter().find(|c| near(c, name)) {
+            out.push(Finding {
+                kind: "path",
+                path,
+                status: Status::Warn(format!("not read; did you mean the global {canon}/")),
+            });
+        }
+    }
+    out
 }
 
 /// A SKILL.md that only differs by case, which no filesystem guarantees to
@@ -3984,6 +4045,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The global `~/.openmax/` tier gets the same misplaced-file net as the
+    /// project tier: a wrong-extension file in a canonical dir and a near-miss
+    /// dir are named, while the data dir's legitimate files and dirs (a sibling
+    /// script, ledger/, sessions/, a loose file) stay silent. Uses a custom
+    /// data dir so the real `~/.openmax` is never read.
+    #[test]
+    fn check_covers_the_global_tier() {
+        let root = temp_project();
+        let data = root.join("data");
+        write(data.join("tools/gh.yaml"), "name: gh\n");
+        write(data.join("prompt/review.md"), "Review.\n");
+        write(data.join("tools/deploy.sh"), "#!/bin/sh\ntrue\n");
+        write(data.join("ledger/log.jsonl"), "{}\n");
+        write(data.join("sessions/index.json"), "{}\n");
+        write(data.join("notes.txt"), "scratch\n");
+
+        let findings: Vec<Finding> = check_at(&root, &data)
+            .into_iter()
+            .filter(|f| f.path.starts_with(&data))
+            .collect();
+        assert!(
+            find(&findings, "gh.yaml").status.summary().contains(".toml only"),
+            "a wrong-extension global tool must be named: {}",
+            find(&findings, "gh.yaml").status.summary()
+        );
+        assert!(
+            find(&findings, "data/prompt").status.summary().contains("prompts/"),
+            "a near-miss global dir must point at the real one: {}",
+            find(&findings, "data/prompt").status.summary()
+        );
+        for legit in ["deploy.sh", "/ledger", "/sessions", "notes.txt"] {
+            assert!(
+                !findings.iter().any(|f| f.path.to_string_lossy().contains(legit)),
+                "{legit} is legitimate and must not warn: {findings:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Memory is the one singular surface among four plural siblings, so the
     /// natural miswrite is the plural `memories`. That is three edits from
     /// `memory`, past what `near` reaches, so before this it was the lone
@@ -4076,6 +4176,29 @@ mod tests {
             "a tool TOML sits beside the program it runs; flagging that is noise"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The harness reads two formats, so a stray `.toml` where `.md` is read (a
+    /// prompt written as a tool) is named. A stray `.md` where `.toml` is read
+    /// is left alone: a README belongs in a tool directory as easily as a
+    /// misplaced surface file would.
+    #[test]
+    fn a_toml_where_md_is_read_is_named_but_a_readme_is_not() {
+        let root = temp_project();
+        write(root.join(".agents/prompts/review.toml"), "x = 1\n");
+        write(root.join(".openmax/tools/README.md"), "# docs\n");
+
+        let findings = local(&root);
+        assert!(
+            find(&findings, "review.toml").status.summary().contains(".md only"),
+            "a prompt written as .toml must be named: {}",
+            find(&findings, "review.toml").status.summary()
+        );
+        assert!(
+            !findings.iter().any(|f| f.path.to_string_lossy().contains("README.md")),
+            "a README in a tool dir must not warn: {findings:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
