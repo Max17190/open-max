@@ -699,6 +699,15 @@ mod tests {
     #[test]
     fn the_extension_surfaces_ship_empty() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // A packaged crate is not a checkout and has no index to guard. The
+        // decision is structural (`.git` is a file in a linked worktree, so
+        // exists, not is_dir) because git's diagnostics localize: matching
+        // its English stderr would turn the same skip into a panic under a
+        // non-English locale.
+        if !root.join(".git").exists() {
+            eprintln!("skipping: {} is not a git checkout", root.display());
+            return;
+        }
         let out = match std::process::Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -713,14 +722,12 @@ mod tests {
             Err(e) => panic!("cannot run git to read the surfaces: {e}"),
         };
         if !out.status.success() {
-            // A packaged crate is not a checkout and has no index to guard.
-            // Anything else is a failure this guard must not shrug off.
-            let err = String::from_utf8_lossy(&out.stderr);
-            if err.contains("not a git repository") {
-                eprintln!("skipping: {} is not a git checkout", root.display());
-                return;
-            }
-            panic!("git ls-files failed: {err}");
+            // With `.git` present every failure is real; nothing here is a
+            // skip this guard may shrug off.
+            panic!(
+                "git ls-files failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let listed = String::from_utf8_lossy(&out.stdout);
         assert!(
