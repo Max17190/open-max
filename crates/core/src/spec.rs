@@ -228,13 +228,14 @@ One directory per skill with a `SKILL.md` inside: `.agents/skills/<name>/SKILL.m
 name collision.
 
 `SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
-keys are read. Each value may be bare or double-quoted on one line, or a
-`>`/`|` block scalar folded to a single line (the spelling many packaged
-skills ship):
-- `name:` (required): the skill's index name.
+keys are read:
+- `name:` (required): the skill's index name, a bare or double-quoted value on
+  one line.
 - `description:` (required in practice): one line saying what the skill does
-  and when to use it; capped at 200 chars. This is the only text that enters
-  the prompt (~15 tokens per skill), so it must carry the "when".
+  and when to use it; capped at 200 chars. Bare or double-quoted, or a `>`/`|`
+  block scalar folded to one line (the spelling many packaged skills ship).
+  This is the only text that enters the prompt (~15 tokens per skill), so it
+  must carry the "when".
 
 The body after the frontmatter is free-form markdown of any length: it loads
 only when the skill is used. A skill directory may bundle scripts and
@@ -718,9 +719,11 @@ per turn). bash access is not tracked; prefer the file tools for recall.
 
 Forgetting keys on recency of last use, not on activation: activation only
 ranks the index, so a fact used often but not lately still fades on schedule.
-- Unused for 21 days (measured from its most recent access), a memory leaves
+Ages count in whole hours, so each boundary below is crossed once the next
+hour past it is reached.
+- Unused past 21 days (measured from its most recent access), a memory leaves
   the index, still on disk and still greppable.
-- Unused for 60 days, the file is deleted at the next session creation,
+- Unused past 60 days, the file is deleted at the next session creation,
   leaving a `gc` tombstone line (name, sha256, description) in the access log.
   Update or delete stale facts yourself rather than letting them fade into the
   index of a future session.
