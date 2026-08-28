@@ -1729,9 +1729,13 @@ fn mark_displaced_gates(entries: &mut [Entry], approved_gate: impl Fn(&Path) -> 
 }
 
 /// Directories the project tier is actually read from, as (parent, child).
+/// `memory` is the lone singular name here; its four siblings are plural, so
+/// the natural miswrite is the plural `memories`, which `near` cannot reach
+/// (see `is_regular_plural`).
 const PROJECT_DIRS: &[(&str, &str)] = &[
     (".openmax", "tools"),
     (".openmax", "hooks"),
+    (".openmax", "memory"),
     (".agents", "skills"),
     (".agents", "prompts"),
 ];
@@ -1791,8 +1795,9 @@ fn unread_paths(project_root: &Path) -> Vec<Finding> {
                     path,
                     status: Status::Warn(format!("not read; {name} live in {other}/{name}/")),
                 });
-            } else if let Some((_, c)) =
-                PROJECT_DIRS.iter().find(|(p, c)| *p == parent_name && near(c, name))
+            } else if let Some((_, c)) = PROJECT_DIRS
+                .iter()
+                .find(|(p, c)| *p == parent_name && (near(c, name) || is_regular_plural(c, name)))
             {
                 out.push(Finding {
                     kind: "path",
@@ -1810,6 +1815,10 @@ fn wrong_extension_files(dir: &Path, parent: &str, child: &str) -> Vec<Finding> 
     let want = match (parent, child) {
         (".openmax", "tools") | (".openmax", "hooks") => "toml",
         (".agents", "prompts") => "md",
+        // `.openmax/memory` is canonical but not here: memory_findings already
+        // names a non-.md file in it ("only .md files are memories"), and that
+        // message is more specific than this generic one. Listing it here too
+        // would report the same file twice.
         _ => return Vec::new(),
     };
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
@@ -1887,6 +1896,25 @@ pub(crate) fn near(a: &str, b: &str) -> bool {
         }
     }
     true
+}
+
+/// Is `candidate` the regular English plural of the singular directory name
+/// `singular`? `near` already pairs a singular canonical dir with a simple
+/// `+s` plural, because that is one trailing edit (tools/tool). It cannot
+/// bridge `y -> ies`, which is three edits, so a `memory` dir written
+/// `memories` (the plural its four sibling surfaces all use) would otherwise
+/// slip through with no diagnostic. This names that one class of miswrite.
+fn is_regular_plural(singular: &str, candidate: &str) -> bool {
+    let plural = match singular.strip_suffix('y') {
+        // English pluralizes `y` to `ies` only after a consonant (memory ->
+        // memories, not day -> daies); every other `y` word just takes `s`.
+        Some(stem) if stem.ends_with(|c: char| !"aeiou".contains(c)) => format!("{stem}ies"),
+        _ if singular.ends_with(['s', 'x', 'z']) || singular.ends_with("ch") || singular.ends_with("sh") => {
+            format!("{singular}es")
+        }
+        _ => format!("{singular}s"),
+    };
+    candidate == plural
 }
 
 fn files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
@@ -3783,6 +3811,84 @@ mod tests {
         std::fs::create_dir_all(root.join(".openmax/tool")).unwrap();
         assert!(local(&root).is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Memory is the one singular surface among four plural siblings, so the
+    /// natural miswrite is the plural `memories`. That is three edits from
+    /// `memory`, past what `near` reaches, so before this it was the lone
+    /// misplaced surface `--check` reported as a clean bill of health: the
+    /// note never loads and nothing says why.
+    #[test]
+    fn a_memory_dir_written_with_the_plural_name_is_named() {
+        let root = temp_project();
+        write(root.join(".openmax/memories/deploy-port.md"), "# The deploy port is 7443\nbody\n");
+
+        let findings = local(&root);
+        let warn = find(&findings, ".openmax/memories");
+        assert!(
+            warn.status.summary().contains(".openmax/memory/"),
+            "the plural must be pointed at the real dir: {}",
+            warn.status.summary()
+        );
+        assert!(!has_errors(&findings), "a guess about intent must not fail the run");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A single-character memory typo, and memory under the wrong parent, both
+    /// resolve to the real dir now that memory is a recognized surface.
+    #[test]
+    fn a_memory_typo_and_a_wrong_parent_both_point_at_the_real_dir() {
+        let root = temp_project();
+        write(root.join(".openmax/memry/a.md"), "# fact\nb\n");
+        write(root.join(".agents/memory/b.md"), "# fact\nb\n");
+
+        let findings = local(&root);
+        assert!(find(&findings, ".openmax/memry").status.summary().contains(".openmax/memory/"));
+        assert!(find(&findings, ".agents/memory").status.summary().contains(".openmax/memory/"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Making memory a recognized surface must not turn a healthy memory dir
+    /// into noise: a valid note reports only its own `memory` finding, and the
+    /// internal `.access.jsonl` bookkeeping file is never flagged as unread.
+    #[test]
+    fn a_healthy_memory_dir_is_not_reported_as_unread() {
+        let root = temp_project();
+        write(root.join(".openmax/memory/deploy-port.md"), "# The deploy port is 7443\nbody\n");
+        write(root.join(".openmax/memory/.access.jsonl"), "{}\n");
+
+        let findings = local(&root);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.kind == "path" && f.path.to_string_lossy().contains("memory")),
+            "a healthy memory dir must not draw an unread-path warning: {findings:?}"
+        );
+        assert!(
+            !findings.iter().any(|f| matches!(f.status, Status::Warn(_) | Status::Err(_))
+                && f.path.to_string_lossy().contains(".access.jsonl")),
+            "the internal access log is not a memory note and must not warn: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.kind == "memory" && matches!(f.status, Status::Ok(_))),
+            "the valid note should still report as a healthy memory: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regular_plural_bridges_the_ies_gap_near_cannot() {
+        // The case near() misses (three edits), which is why this exists.
+        assert!(is_regular_plural("memory", "memories"));
+        assert!(!near("memory", "memories"));
+        // Regular +s / +es, and non-plurals.
+        assert!(is_regular_plural("hook", "hooks"));
+        assert!(is_regular_plural("box", "boxes"));
+        assert!(!is_regular_plural("memory", "memory"));
+        assert!(!is_regular_plural("memory", "memoried"));
+        // A vowel before `y` takes `s`, not `ies`, so this is not a plural.
+        assert!(!is_regular_plural("day", "daies"));
+        assert!(is_regular_plural("day", "days"));
     }
 
     #[test]
