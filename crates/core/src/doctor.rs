@@ -230,18 +230,27 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     // Case-insensitive filesystems resolve skill.md here and
                     // case-sensitive ones do not, so the same repo loads this
                     // skill on one machine and silently drops it on another.
-                    let hint = match miscased_skill_file(&entry) {
-                        Some(found) => format!(", but {} is",
-                            found.file_name().unwrap_or_default().to_string_lossy()),
-                        None => String::new(),
+                    let status = if let Some(found) = miscased_skill_file(&entry) {
+                        Status::Warn(format!(
+                            "no skill loads from here: SKILL.md is not spelled exactly, but {} is",
+                            found.file_name().unwrap_or_default().to_string_lossy()
+                        ))
+                    } else if let Some(deep) = nested_skill_md(&entry) {
+                        // A correctly-spelled SKILL.md sits below, not at the
+                        // top. The registry joins SKILL.md one level down only,
+                        // so calling this a spelling mistake sends the author
+                        // renaming a file that is already named right.
+                        Status::Warn(format!(
+                            "no skill loads from here: a skill's SKILL.md sits at the top of its \
+                             directory, but the only one is deeper, at {}",
+                            deep.display()
+                        ))
+                    } else {
+                        Status::Warn(
+                            "no skill loads from here: SKILL.md is not spelled exactly".into(),
+                        )
                     };
-                    findings.push(Finding {
-                        kind: "path",
-                        path: entry,
-                        status: Status::Warn(format!(
-                            "no skill loads from here: SKILL.md is not spelled exactly{hint}"
-                        )),
-                    });
+                    findings.push(Finding { kind: "path", path: entry, status });
                 }
                 continue;
             }
@@ -1851,6 +1860,31 @@ fn dir_is_empty(dir: &Path) -> bool {
     std::fs::read_dir(dir).map(|mut rd| rd.next().is_none()).unwrap_or(true)
 }
 
+/// A correctly-spelled `SKILL.md` nested below `dir` (the caller has already
+/// ruled out one at the top). The registry joins `SKILL.md` exactly one level
+/// under the skills root, so a deeper one is a skill placed a level too far
+/// down, not a misspelling. The path is returned relative to `dir` for the
+/// message, and dot-prefixed entries are skipped so an editor cache never
+/// stands in for the real file.
+fn nested_skill_md(dir: &Path) -> Option<PathBuf> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if let Some(found) = nested_skill_md(&path) {
+                return Some(PathBuf::from(name).join(found));
+            }
+        } else if name == "SKILL.md" {
+            return Some(PathBuf::from(name));
+        }
+    }
+    None
+}
+
 /// One edit apart, counting an adjacent swap as one edit: a dropped plural, a
 /// doubled letter, a single mistyped or transposed character. Shared with the
 /// providers validator, which suggests near-miss keys the same way.
@@ -2376,6 +2410,32 @@ mod tests {
         assert!(
             some_warn_contains(&findings, "howto", "skill.md"),
             "the miscased file must be named whether or not it loaded here: {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A correctly-spelled SKILL.md placed a level too deep is a depth mistake,
+    /// not a spelling one. Calling it misspelled sends the author renaming a
+    /// file that is already right; --check must say it is too deep and where.
+    #[test]
+    fn a_skill_md_nested_too_deep_is_named_as_depth_not_spelling() {
+        let root = temp_project();
+        write(
+            root.join(".agents/skills/pdf/tools/SKILL.md"),
+            "---\nname: pdf\ndescription: work with pdfs\n---\nbody\n",
+        );
+        let findings = local(&root);
+        let warn = find(&findings, ".agents/skills/pdf");
+        assert!(
+            warn.status.summary().contains("deeper")
+                && warn.status.summary().contains("tools/SKILL.md"),
+            "a too-deep SKILL.md must be named as depth and located: {}",
+            warn.status.summary()
+        );
+        assert!(
+            !warn.status.summary().contains("not spelled exactly"),
+            "the file is spelled exactly; the reason must not say otherwise: {}",
+            warn.status.summary()
         );
         let _ = std::fs::remove_dir_all(root);
     }
