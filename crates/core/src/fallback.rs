@@ -197,7 +197,7 @@ fn collect_tagged(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, u
             spans.push((start, end, function));
             from = end.max(body_start);
         } else if let Some(next_open) =
-            rest.find(OPEN_TAG).filter(|n| close.map_or(true, |c| *n < c))
+            rest.find(OPEN_TAG).filter(|n| close.is_none_or(|c| *n < c))
         {
             let inner_end = body_start + next_open;
             if let Some(function) = parse_call(content[body_start..inner_end].trim(), known_tools) {
