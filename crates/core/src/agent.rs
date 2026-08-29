@@ -2815,9 +2815,10 @@ async fn run_loop(
             break 'turns;
         }
 
-        // True once any mutating call succeeded this iteration: only then can
-        // extension files have changed, so only then is the fingerprint
-        // re-checked before the next model request.
+        // True once any mutating call EXECUTED this iteration, a failed one
+        // included (#242: a bash write-then-selftest that exits nonzero still
+        // persisted the file): only then can extension files have changed, so
+        // only then is the fingerprint re-checked before the next request.
         //
         // Only the serial path sets this. A batched external tool is host code
         // that could also write a capability file, so a mid-turn refreeze can
