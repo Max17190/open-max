@@ -116,6 +116,10 @@ pub struct Registry {
     /// see that a broken file already explains an absent name. Empty for a
     /// manifest-restored registry.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
+    /// Same-directory skill name collisions (name, ignored path, indexed
+    /// path), for the refreeze receipt. Empty for a manifest-restored
+    /// registry, which only narrates deltas it can compute.
+    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf)>,
     /// Memory files (stem, content hash) this freeze indexed; None for a
     /// registry rebuilt from a manifest that predates the field, so the
     /// first refreeze after an upgrade does not narrate every memory as new.
@@ -164,6 +168,9 @@ pub(crate) struct ExtensionSnapshot {
     /// The tool-tier subset of `broken` with the name each file occupies
     /// (declared, or stem as the fallback), for the refreeze classifier.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
+    /// Same-directory skill name collisions: (name, ignored path, indexed
+    /// path). The receipt names these; cross-tier precedence is not here.
+    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf)>,
     /// Project memory files (stem, content hash). Memory rides the frozen
     /// prompt's index, so a memory write moves the fingerprint and refreezes:
     /// the fact is live from the next step, deterministically, instead of
@@ -281,6 +288,12 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     let external_by_name: HashMap<String, ToolSpec> =
         external_by_name.into_iter().map(|(k, (_, v))| (k, v)).collect();
     let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
+    // (name, ignored path, indexed path): two files in the SAME directory
+    // declaring one name. Cross-tier shadowing is precedence (a project
+    // definition wins over a global one, deliberately, silently); same-tier
+    // last-wins is an accident of scan order, so the refreeze receipt names
+    // it the moment it happens, the way --check already does.
+    let mut shadowed_skills: Vec<(String, PathBuf, PathBuf)> = Vec::new();
     for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -305,7 +318,13 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             match skills::parse_skill_source(&path, text) {
                 // Global is scanned first, so a project definition wins.
                 Ok(spec) => {
-                    skills_by_name.insert(spec.name.clone(), spec);
+                    let name = spec.name.clone();
+                    let winner = spec.path.clone();
+                    if let Some(prev) = skills_by_name.insert(name.clone(), spec) {
+                        if prev.path.starts_with(&dir) {
+                            shadowed_skills.push((name, prev.path, winner));
+                        }
+                    }
                 }
                 Err(reason) => broken.push((path, reason)),
             }
@@ -353,6 +372,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         files: files_read,
         broken,
         broken_tools,
+        shadowed_skills,
         memory_files,
         memory_section,
     }
@@ -389,6 +409,7 @@ impl Registry {
         registry.read_paths = snapshot.files.iter().map(|(p, _, _)| p.clone()).collect();
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
+        registry.shadowed_skills = snapshot.shadowed_skills;
         registry.memory_files = Some(snapshot.memory_files);
         registry.memory_section = snapshot.memory_section;
         registry.memory_scanned = true;
@@ -440,6 +461,7 @@ impl Registry {
             broken: Vec::new(),
             read_paths: std::collections::HashSet::new(),
             broken_tools: Vec::new(),
+            shadowed_skills: Vec::new(),
             memory_files: None,
             memory_section: None,
             memory_scanned: false,
@@ -1250,6 +1272,49 @@ mod tests {
         assert!(err.contains("invalid TOML"), "{err}");
         assert!(err.contains("invalid type"), "{err}");
         assert!(err.contains('^'), "{err}");
+    }
+
+    /// Two files in ONE directory declaring the same skill name collapse to
+    /// whichever sorts last; that accident is recorded for the receipt.
+    /// Cross-tier shadowing (a project skill over a global namesake) is
+    /// deliberate precedence and is NOT recorded.
+    #[test]
+    fn a_same_tier_skill_namesake_is_recorded_and_precedence_is_not() {
+        let dir = std::env::temp_dir().join(format!("omx-shadow-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for (d, body) in [
+            ("aa-review", "---\nname: code-review\ndescription: first\n---\nA.\n"),
+            ("zz-review", "---\nname: code-review\ndescription: second\n---\nB.\n"),
+        ] {
+            let skill = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), body).unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
+        let (name, ignored, indexed) = &snap.shadowed_skills[0];
+        assert_eq!(name, "code-review");
+        assert!(ignored.ends_with("aa-review/SKILL.md"), "{ignored:?}");
+        assert!(indexed.ends_with("zz-review/SKILL.md"), "{indexed:?}");
+
+        // The same name split across TIERS is precedence, not a collision.
+        let dir2 = std::env::temp_dir().join(format!("omx-shadow2-{}", uuid::Uuid::new_v4()));
+        let data2 = dir2.join("data");
+        let project2 = dir2.join("project");
+        for (root, d) in [(data2.join("skills"), "review"), (project2.join(".agents/skills"), "review")] {
+            let skill = root.join(d);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: code-review\ndescription: d\n---\nBody.\n",
+            )
+            .unwrap();
+        }
+        let snap2 = capture_extensions(&data2, &project2);
+        assert!(snap2.shadowed_skills.is_empty(), "{:?}", snap2.shadowed_skills);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
     }
 
     /// A same-name collision between a broken file and a loaded definition

@@ -1627,6 +1627,7 @@ fn refreeze_receipt_text(
     changes: &[String],
     added: &AddedTools,
     broken: &[(std::path::PathBuf, String)],
+    shadowed_skills: &[(String, std::path::PathBuf, std::path::PathBuf)],
     project_root: &Path,
 ) -> String {
     let what = if changes.is_empty() {
@@ -1645,6 +1646,29 @@ fn refreeze_receipt_text(
             .collect();
         note.push_str(&format!(
             " NOT loaded: {} — not callable until fixed; verify with bash: openmax --check.",
+            listed.join("; ")
+        ));
+    }
+    if !shadowed_skills.is_empty() {
+        // Two files in one directory declaring one skill name collapse to
+        // whichever sorts last, silently; --check names it, but the write
+        // that caused it deserves the truth in ITS receipt, or the author
+        // reads the index line and assumes the older file is what loaded.
+        let listed: Vec<String> = shadowed_skills
+            .iter()
+            .map(|(name, ignored, indexed)| {
+                let ignored = ignored.strip_prefix(project_root).unwrap_or(ignored);
+                let indexed = indexed.strip_prefix(project_root).unwrap_or(indexed);
+                format!(
+                    "'{name}' is declared by both {} and {}; only {} is indexed",
+                    ignored.display(),
+                    indexed.display(),
+                    indexed.display()
+                )
+            })
+            .collect();
+        note.push_str(&format!(
+            " Skill name collision: {} — rename one and verify with bash: openmax --check.",
             listed.join("; ")
         ));
     }
@@ -1976,6 +2000,7 @@ async fn refreeze_if_extensions_changed(
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
     let counts = (registry.tools.len(), registry.skills.len());
     let broken = registry.broken.clone();
+    let shadowed = registry.shadowed_skills.clone();
     let applied_added = {
         let mut sessions_map = core.sessions.lock().await;
         match sessions_map.get_mut(session_id) {
@@ -2001,7 +2026,8 @@ async fn refreeze_if_extensions_changed(
             Some((files, crate::ledger::Actor::External)),
         )
         .await;
-        let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, project_root);
+        let receipt =
+            refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root);
         core.send_agent(session_id, AgentEvent::Refrozen {
             tools: counts.0,
             skills: counts.1,
@@ -2181,6 +2207,7 @@ async fn refreeze_between_iterations(
     let counts = (new_registry.tools.len(), new_registry.skills.len());
     let added_tools = classify_added_tools(registry, &new_registry, &core.data_dir, project_root);
     let broken = new_registry.broken.clone();
+    let shadowed = new_registry.shadowed_skills.clone();
     let new_registry = Arc::new(new_registry);
     if messages.first().is_some_and(|m| m.role == "system") {
         messages[0] = ChatMessage::system(prompt);
@@ -2216,7 +2243,7 @@ async fn refreeze_between_iterations(
     // in its transcript said the tool was callable. Ride the receipt on this
     // iteration's last tool result, where the model reads next. One line,
     // only when extension bytes actually changed.
-    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, project_root);
+    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root);
     append_and_emit_note(core, session_id, messages, &receipt);
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
@@ -5116,6 +5143,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A same-directory skill namesake collapses to one index entry, and the
+    /// refreeze receipt that follows the write must say so: --check catches
+    /// it, but the author's own receipt was silent, so the index line read as
+    /// if the OLDER file were what loaded (round-5 ticket T3).
+    #[test]
+    fn refreeze_receipt_names_a_skill_shadowed_by_a_same_tier_namesake() {
+        let shadowed = vec![(
+            "code-review".to_string(),
+            std::path::PathBuf::from("/p/.agents/skills/aa-review/SKILL.md"),
+            std::path::PathBuf::from("/p/.agents/skills/zz-review/SKILL.md"),
+        )];
+        let added = AddedTools {
+            approved: Vec::new(),
+            unapproved: Vec::new(),
+            modified_unapproved: Vec::new(),
+            memory: None,
+            removed_approved: Vec::new(),
+            removed_approval_survives: Vec::new(),
+        };
+        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
+        assert!(note.contains("Skill name collision"), "{note}");
+        assert!(
+            note.contains("'code-review' is declared by both .agents/skills/aa-review/SKILL.md"),
+            "{note}"
+        );
+        assert!(
+            note.contains("only .agents/skills/zz-review/SKILL.md is indexed"),
+            "{note}"
+        );
+        assert!(note.contains("openmax --check"), "{note}");
     }
 
     /// A tool whose manifest an edit broke is present-but-broken, not removed:
