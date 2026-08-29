@@ -1182,43 +1182,19 @@ async fn run_tool_examples(
     // timeouts, so batching the report would look like a hang.
     let result = open_max_core::doctor::run_examples(project, |verdict| {
         ran += 1;
-        let badge = match verdict.sandboxed {
-            // Loud by design: the probe ran UNAPPROVED content with zero
-            // host authority; nothing was blessed by it running.
-            true => format!(
-                "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: {}]",
-                approve_command(&verdict.path)
-            ),
-            false => String::new(),
-        };
-        match &verdict.result {
-            Ok(()) => println!("ok   example     {}{badge}", verdict.tool),
-            // A sandboxed probe denies the network and any write outside its
-            // scratch dir (ADR-0011), so a tool that legitimately needs either
-            // cannot pass one - and a failure here is inconclusive, not proof
-            // the tool is broken. A passing probe approves nothing; a failing
-            // one condemns nothing. Report it as a warning and let the real
-            // run after approval be the honest signal, rather than failing the
-            // check on the largest tool family (anything that reaches the
-            // network).
-            Err(reason) if verdict.sandboxed => {
-                println!(
-                    "warn example     {}  could not be proven in the sandbox (a tool that needs the network or a write outside its scratch dir cannot): {reason}{badge}",
-                    verdict.tool
-                );
-            }
-            // Approved content ran with the host's authority: a failure is real.
-            Err(reason) => {
-                failures += 1;
-                println!("err  example     {}  {reason}{badge}", verdict.tool);
-            }
+        if !verdict.sandboxed && verdict.result.is_err() {
+            failures += 1;
         }
+        println!("{}", example_row(verdict));
         let _ = std::io::stdout().flush();
     })
     .await;
     match result {
         Err(reason) => {
-            println!("err  example     {}  {reason}", project.display());
+            println!(
+                "{}",
+                headless::printable(&format!("err  example     {}  {reason}", project.display()))
+            );
             failures += 1;
         }
         Ok(_) if ran == 0 => {
@@ -1571,6 +1547,39 @@ fn check_row(f: &open_max_core::doctor::Finding) -> String {
     headless::printable(&row)
 }
 
+/// One verdict row of `--check --run-examples`, one-lined by the same rule:
+/// the tool name is the manifest's own declaration and a failure reason often
+/// carries the example's captured stderr, both author-controlled bytes.
+fn example_row(verdict: &open_max_core::doctor::ExampleVerdict) -> String {
+    let badge = match verdict.sandboxed {
+        // Loud by design: the probe ran UNAPPROVED content with zero
+        // host authority; nothing was blessed by it running.
+        true => format!(
+            "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: {}]",
+            approve_command(&verdict.path)
+        ),
+        false => String::new(),
+    };
+    let row = match &verdict.result {
+        Ok(()) => format!("ok   example     {}{badge}", verdict.tool),
+        // A sandboxed probe denies the network and any write outside its
+        // scratch dir (ADR-0011), so a tool that legitimately needs either
+        // cannot pass one - and a failure here is inconclusive, not proof
+        // the tool is broken. A passing probe approves nothing; a failing
+        // one condemns nothing. Report it as a warning and let the real
+        // run after approval be the honest signal, rather than failing the
+        // check on the largest tool family (anything that reaches the
+        // network).
+        Err(reason) if verdict.sandboxed => format!(
+            "warn example     {}  could not be proven in the sandbox (a tool that needs the network or a write outside its scratch dir cannot): {reason}{badge}",
+            verdict.tool
+        ),
+        // Approved content ran with the host's authority: a failure is real.
+        Err(reason) => format!("err  example     {}  {reason}{badge}", verdict.tool),
+    };
+    headless::printable(&row)
+}
+
 #[cfg(test)]
 pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1624,6 +1633,33 @@ mod tests {
             super::check_row(&ok),
             "ok   skill       .agents/skills/deploy/SKILL.md  (deploy: ship the current branch)"
         );
+    }
+
+    /// Same rule for the example verdicts: the tool name is the manifest's
+    /// own declaration and a failure reason often carries captured stderr.
+    #[test]
+    fn an_example_row_is_one_line_whatever_the_tool_declares() {
+        use open_max_core::doctor::ExampleVerdict;
+        let forged = ExampleVerdict {
+            tool: "evil\nok   example     forged".into(),
+            path: std::path::PathBuf::from("/tmp/probe/tool.toml"),
+            result: Err("exit 1\n\u{1b}[31mboom\r\nsecond line".into()),
+            sandboxed: false,
+        };
+        let row = super::example_row(&forged);
+        assert!(
+            row.chars().all(|c| !c.is_control()),
+            "a control byte survived into the row: {row:?}"
+        );
+        assert!(row.starts_with("err  example"), "{row:?}");
+
+        let clean = ExampleVerdict {
+            tool: "docsearch".into(),
+            path: std::path::PathBuf::from("/tmp/probe/tool.toml"),
+            result: Ok(()),
+            sandboxed: false,
+        };
+        assert_eq!(super::example_row(&clean), "ok   example     docsearch");
     }
 
     /// --help's --spec list names every surface the binary accepts: --check
