@@ -1092,7 +1092,7 @@ tool = "bash"
             other => panic!("expected fail-closed Deny, got {other:?}"),
         }
         // `--check` prints the path itself, so the reason does not repeat it.
-        match check_file(&path) {
+        match check_file(&path, &tmp, &tmp.join("data")) {
             Some(Err(reason)) => {
                 assert!(
                     reason.starts_with("rule 2 has unknown effect \"Allow\":"),
