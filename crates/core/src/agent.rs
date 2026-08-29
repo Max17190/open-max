@@ -2519,12 +2519,18 @@ async fn run_loop(
     // until a human approves them: both were UI-only, so an agent that wrote
     // itself an allow rule kept being prompted with no stated cause. One
     // harness note per distinct notice per session, ahead of the prompt.
-    startup_notices.extend(
-        hooks
-            .notices()
-            .into_iter()
-            .map(|f| format!("hook '{}' on {} did not load: {}", f.hook, f.event, f.detail)),
-    );
+    startup_notices.extend(hooks.notices().into_iter().map(|f| {
+        // The hook stem and the parse reason are author-controlled and this
+        // text is one clause of a bracketed, `|`-joined policy note (a
+        // user-role message); a newline in either would forge a clause or
+        // close the note, so both are flattened to one line.
+        format!(
+            "hook '{}' on {} did not load: {}",
+            crate::text::one_line(&f.hook),
+            f.event,
+            crate::text::one_line(&f.detail)
+        )
+    }));
     let novel = novel_policy_notices(core, session_id, startup_notices).await;
     if !novel.is_empty() {
         let text = format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER));
@@ -3390,7 +3396,14 @@ async fn run_loop(
                         let inert: Vec<String> = discovered
                             .notices()
                             .into_iter()
-                            .map(|f| format!("'{}' on {}: {}", f.hook, f.event, f.detail))
+                            .map(|f| {
+                                format!(
+                                    "'{}' on {}: {}",
+                                    crate::text::one_line(&f.hook),
+                                    f.event,
+                                    crate::text::one_line(&f.detail)
+                                )
+                            })
                             .collect();
                         // An APPROVED gate whose bytes just changed is not
                         // inert - it fails closed and blocks every tool

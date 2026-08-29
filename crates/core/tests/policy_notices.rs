@@ -246,6 +246,44 @@ async fn a_turn_start_policy_notice_lands_once_per_session() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A broken hook's parse error is author-influenced and multi-line (the TOML
+/// caret and source line), and it rides one clause of the bracketed,
+/// `|`-joined policy note, which is a user-role message the model reads as the
+/// human's own words. A newline in the detail must not forge a second line in
+/// that note; the clause is flattened to one line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_hook_reason_cannot_forge_a_second_line_in_the_policy_note() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    // Invalid TOML: unapproved and unparseable, so it loads as an inert notice
+    // whose detail carries the multi-line parse error.
+    std::fs::write(project.join(".openmax/hooks/broken.toml"), "event = \n").unwrap();
+    let project = project.canonicalize().unwrap();
+
+    let (base_url, bodies) = recording_endpoint(vec![completion_with_text("done")]).await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "broken-hook", &project, "go").await;
+
+    let bodies = bodies.lock().unwrap();
+    let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let note = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[policy notice:")))
+        .expect("the broken hook produces a turn-start policy notice");
+    let content = note["content"].as_str().unwrap();
+    assert!(content.contains("unparseable"), "the note names the broken hook: {content}");
+    assert!(
+        !content.contains('\n'),
+        "the multi-line parse error forged a second line in the note: {content:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Once per SESSION means across the session's whole life: a resumed
 /// session (new process, hydrated transcript) must not re-narrate a still-
 /// applicable static notice the transcript already carries.
@@ -339,6 +377,51 @@ async fn a_hook_written_mid_turn_is_named_inert_on_the_writing_call() {
     assert!(content.contains("[hook files changed"), "{content}");
     assert!(content.contains("Not running"), "the hook is named inert now, not next turn: {content}");
     assert!(content.contains("openmax --approve"), "{content}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The mid-turn twin of the policy-note guard: a broken hook WRITTEN mid-turn
+/// lands its multi-line parse error in the `[hook files changed. Not running:
+/// ...]` receipt (a user-role message), and that clause must stay one line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_hook_written_mid_turn_cannot_forge_a_second_receipt_line() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/hooks/broken.toml", "content": "event = \n" }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "broken-hook-mid", &project, "write a hook").await;
+
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(content.contains("Not running"), "the broken hook is named inert: {content}");
+    // The tool result legitimately ends with a newline before the appended
+    // note; the note itself (from "[hook files changed" onward) must be one
+    // line, or the parse error forged a second.
+    let note = &content[content.find("[hook files changed").expect("the change note is present")..];
+    assert!(
+        !note.contains('\n'),
+        "the multi-line parse error forged a second receipt line: {note:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
