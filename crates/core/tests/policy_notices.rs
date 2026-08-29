@@ -469,17 +469,22 @@ async fn an_out_of_session_approval_is_named_at_the_next_turn() {
         .iter()
         .find(|m| {
             m["role"] == "user"
-                && m["content"].as_str().is_some_and(|c| c.starts_with("[approval activity outside this session:"))
+                && m["content"].as_str().is_some_and(|c| c.starts_with("[approval activity this session did not perform:"))
         })
         .expect("the outside approval is named");
     let c = note["content"].as_str().unwrap();
     assert!(c.contains("approved .openmax/tools/docsearch.toml"), "{c}");
+    // The note must not presume a benign third party: an agent process that
+    // stepped around the session marker produces the identical event, and
+    // only the human can say which it was (round-6 judge finding).
+    assert!(c.contains("another terminal") && c.contains("session marker"), "{c}");
+    assert!(c.contains("confirm it was theirs"), "{c}");
     // Turn one carried no such note (nothing had been approved).
     let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
     assert!(
         !first["messages"].as_array().unwrap().iter().any(|m| m["content"]
             .as_str()
-            .is_some_and(|c| c.starts_with("[approval activity outside"))),
+            .is_some_and(|c| c.starts_with("[approval activity"))),
         "turn one predates the approval"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -643,6 +648,72 @@ async fn a_denied_repair_tool_is_not_offered_by_the_malformed_receipt() {
     assert!(
         !content.contains("on exactly this file is still allowed"),
         "no repair tool should be offered as available: {content}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An unverifiable capability ledger does not degrade a turn quietly: the
+/// hook layer fails closed on the state and blocks the input entirely,
+/// before any model request is spent, and the error names the human repair
+/// (openmax --ledger-repair). Round-5's audit read the reconciliation's
+/// empty event list as a possible silence; the truth is the opposite of
+/// silence, and this pins it: no request leaves, the stop reason is
+/// "blocked", and the repair is named where the human looks.
+#[tokio::test]
+async fn an_unverifiable_ledger_blocks_the_turn_and_names_the_repair() {
+    let dir = std::env::temp_dir().join(format!("omx-unver-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    std::fs::write(
+        project.join(".openmax/tools/docsearch.toml"),
+        "name = \"docsearch\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![completion_with_text("turn one")]).await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    // Turn one: healthy ledger (the freeze seeds it), the turn runs.
+    drive_turn(&core, &mut rx, "unver", &project, "one").await;
+    // The log gains a tail with no pending pin: tampering, not a crash, so
+    // every verified read now refuses.
+    let log = open_max_core::ledger::project_dir(&data, &project).join("log.jsonl");
+    assert!(log.is_file(), "the first turn's sync seeded the ledger");
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str("{\"forged\": true}\n");
+    std::fs::write(&log, text).unwrap();
+    // Turn two is attempted; the input gate refuses before any request.
+    open_max_core::agent::start_turn(
+        Arc::clone(&core),
+        "unver".into(),
+        project.to_path_buf(),
+        "two".into(),
+    )
+    .unwrap();
+    let mut error_message = None;
+    let stop_reason = loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the refusal is prompt")
+            .expect("event channel stays open");
+        match envelope.event {
+            AgentEvent::Error { message } => error_message = Some(message),
+            AgentEvent::Done { stop_reason } => break stop_reason,
+            _ => {}
+        }
+    };
+    assert_eq!(stop_reason, "blocked", "the turn is refused, not run degraded");
+    let message = error_message.expect("the refusal carries an error message");
+    assert!(message.contains("input blocked"), "{message}");
+    assert!(
+        message.contains("capability ledger") && message.contains("openmax --ledger-repair"),
+        "the state and the human repair are named: {message}"
+    );
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        1,
+        "no model request is spent on a turn the gate refuses"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

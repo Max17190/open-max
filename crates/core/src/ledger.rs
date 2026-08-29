@@ -472,16 +472,24 @@ pub struct ApprovalEvent {
     pub id: u64,
 }
 
-/// Every approval/retirement in the chain, oldest first. Cheap: one verified
-/// read, no object hashing.
-pub fn approval_events(data_dir: &Path, project_root: &Path) -> Vec<ApprovalEvent> {
+/// Every approval/retirement the pin vouches for, oldest first. Cheap: one
+/// verified read, no object hashing. Only the pinned prefix is reported:
+/// an unpinned tail is bytes nobody vouched for, and enforcement treats its
+/// grants as inert (`refuse_unpinned_authority`: "they grant nothing"), so
+/// narrating one would tell the session a grant exists that the gates will
+/// not honor. When an interrupted approval is later re-pinned by a human
+/// path, its events surface then, under the same stable ids. An
+/// unverifiable chain is an error the caller must narrate, not an empty
+/// history: silence read as "no approval activity" in the one surface built
+/// to report exactly this state.
+pub fn approval_events(
+    data_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<ApprovalEvent>, String> {
     let dir = project_dir(data_dir, project_root);
-    let Ok(verified) = read_verified(&dir) else {
-        return Vec::new();
-    };
+    let verified = read_verified(&dir)?;
     let generation = repair_generation(&dir);
-    verified
-        .records
+    Ok(verified.records[..verified.pinned]
         .iter()
         .enumerate()
         .filter_map(|(idx, r)| {
@@ -497,7 +505,7 @@ pub fn approval_events(data_dir: &Path, project_root: &Path) -> Vec<ApprovalEven
                 id: approval_event_id(generation, idx, r),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// How many times this project's ledger has been repaired: one quarantined
@@ -2377,6 +2385,79 @@ mod tests {
         assert_eq!(std::fs::read_to_string(object).unwrap(), "name = \"a\"");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Narration must match enforcement: an approval record past the pinned
+    /// chain head is bytes nobody vouched for, and `refuse_unpinned_authority`
+    /// treats its grant as inert ("they grant nothing"). `approval_events`
+    /// used to iterate the FULL record list, so the turn-start reconciliation
+    /// would tell a session "approved X" for a grant the gates will not
+    /// honor. The state is built from real bytes: two real approvals, then
+    /// the chain head rewound to after the first with the pending head
+    /// vouching the second, which is exactly the interrupted-append shape.
+    #[test]
+    fn an_unpinned_approval_tail_is_not_narrated() {
+        let data = temp("unpinned-data");
+        let root = temp("unpinned-proj");
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let m1 = root.join(".openmax/tools/a.toml");
+        let m2 = root.join(".openmax/tools/b.toml");
+        std::fs::write(&m1, "name = \"a\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+            .unwrap();
+        std::fs::write(&m2, "name = \"b\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+            .unwrap();
+        let sha1 = sha256_hex(&std::fs::read(&m1).unwrap());
+        let sha2 = sha256_hex(&std::fs::read(&m2).unwrap());
+        let dir = project_dir(&data, &root);
+        approve_capability(&data, &root, &m1, std::slice::from_ref(&sha1)).unwrap();
+        let head1 = std::fs::read_to_string(chain_head_path(&dir)).unwrap();
+        approve_capability(&data, &root, &m2, std::slice::from_ref(&sha2)).unwrap();
+        let head2 = std::fs::read_to_string(chain_head_path(&dir)).unwrap();
+
+        // Rewind: the log holds both records, the pin vouches only the first,
+        // the pending head names the second (an interrupted approval write).
+        std::fs::write(chain_head_path(&dir), &head1).unwrap();
+        std::fs::write(pending_head_path(&dir), &head2).unwrap();
+
+        assert!(
+            !approved_hashes(&data, &root).unwrap().contains(&sha2),
+            "enforcement treats the unpinned grant as inert"
+        );
+        let events = approval_events(&data, &root).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "narration matches enforcement: only the vouched approval is an event: {events:?}"
+        );
+        // The record holds the canonicalized path (macOS /var vs /private/var).
+        assert_eq!(events[0].path, m1.canonicalize().unwrap());
+    }
+
+    /// An unverifiable chain is an error the caller must narrate, not an
+    /// empty history: returning no events read as "no approval activity" in
+    /// the one surface built to report approval activity, while every
+    /// enforcement path was refusing loudly on the same state.
+    #[test]
+    fn an_unverifiable_ledger_is_an_error_not_an_empty_history() {
+        let data = temp("unver-data");
+        let root = temp("unver-proj");
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let m1 = root.join(".openmax/tools/a.toml");
+        std::fs::write(&m1, "name = \"a\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+            .unwrap();
+        let sha1 = sha256_hex(&std::fs::read(&m1).unwrap());
+        approve_capability(&data, &root, &m1, std::slice::from_ref(&sha1)).unwrap();
+        assert_eq!(approval_events(&data, &root).unwrap().len(), 1);
+
+        // A tail with no pending pin is tampering, not a crash.
+        let dir = project_dir(&data, &root);
+        let mut log = std::fs::OpenOptions::new().append(true).open(log_path(&dir)).unwrap();
+        log.write_all(b"{\"forged\": true}\n").unwrap();
+        drop(log);
+        assert!(
+            approval_events(&data, &root).is_err(),
+            "an unverifiable ledger is a narratable error, never an empty history"
+        );
     }
 
     /// An approval stores what it blessed: the manifest AND every bound

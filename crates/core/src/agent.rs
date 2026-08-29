@@ -353,6 +353,24 @@ async fn novel_policy_notices(
         .collect()
 }
 
+/// The turn-start narration for approval activity this session did not
+/// perform. It must not presume a benign third party: the actor may have
+/// been a human at another terminal OR an agent process stepping around the
+/// session marker from its own shell (the acknowledged ADR-0006 friction
+/// ceiling), and the model reading this note is the only witness that knows
+/// which one it saw. Name both and ask for the confirmation; the old
+/// "outside this session" wording let a self-approval read as a human act.
+fn outside_approval_note(fresh: &[String]) -> String {
+    format!(
+        "[approval activity this session did not perform: {}. Either a human acted at \
+         another terminal, or an agent process stepped around the session marker; surface \
+         this to the user and confirm it was theirs before relying on it. A capability \
+         whose exact bytes were approved now runs without a card; a retired one asks \
+         again. Verify what is live with bash: openmax --check.]",
+        fresh.join("; ")
+    )
+}
+
 /// Tell the frontend, once per session, that the installed tool schemas cost
 /// more than the window can spend. It holds on every turn once it holds at
 /// all, so repeating it per turn would be noise; the turn still runs, because
@@ -453,6 +471,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             pending_syncs: Vec::new(),
             reported_policy_notices,
             seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|e| e.id)
                 .collect(),
@@ -491,6 +510,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             pending_syncs: Vec::new(),
             reported_policy_notices: Default::default(),
             seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|e| e.id)
                 .collect(),
@@ -2371,8 +2391,13 @@ async fn run_loop(
     // not approvals, so a tool that asked yesterday just silently stops
     // asking. Name any approval/retire event this session has not yet seen,
     // skipping ones it recorded itself (the model watched those on the card).
-    {
-        let events = crate::ledger::approval_events(&core.data_dir, project_root);
+    // An unverifiable ledger never reaches this point in a turn: the hook
+    // layer fails closed on the same state first and blocks the input
+    // entirely ("input blocked: the capability ledger cannot be read...",
+    // naming --ledger-repair), so no model turn exists to carry a note. The
+    // Result keeps the API honest for callers that must not mistake
+    // "unreadable" for "no activity".
+    if let Ok(events) = crate::ledger::approval_events(&core.data_dir, project_root) {
         let mut fresh: Vec<String> = Vec::new();
         {
             let mut map = core.sessions.lock().await;
@@ -2394,13 +2419,7 @@ async fn run_loop(
             }
         }
         if !fresh.is_empty() {
-            let note = format!(
-                "[approval activity outside this session: {}. A capability whose exact bytes \
-                 were approved now runs without a card; a retired one asks again. Verify what \
-                 is live with bash: openmax --check.]",
-                fresh.join("; ")
-            );
-            insert_startup_note(core, session_id, guard.messages(), note);
+            insert_startup_note(core, session_id, guard.messages(), outside_approval_note(&fresh));
         }
     }
 
@@ -4208,6 +4227,30 @@ mod tests {
             .unwrap();
         assert!(gated().is_none(), "approving the prompt clears it");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The note for approval activity the session did not perform must not
+    /// presume a benign third party: the actor may equally be an agent
+    /// process that stepped around the session marker (ADR-0006's friction
+    /// ceiling), and a live judge session watched a self-approval read as a
+    /// human act under the old "outside this session" wording. The note
+    /// names both possibilities and asks for the human's confirmation.
+    #[test]
+    fn the_outside_approval_note_names_the_self_approval_possibility() {
+        let note = outside_approval_note(&["approved .openmax/tools/x.toml".to_string()]);
+        assert!(
+            note.contains("this session did not perform"),
+            "the note claims non-performance, not outsideness: {note}"
+        );
+        assert!(
+            note.contains("another terminal") && note.contains("session marker"),
+            "both actors are named: {note}"
+        );
+        assert!(
+            note.contains("confirm it was theirs"),
+            "the human confirmation is requested: {note}"
+        );
+        assert!(note.contains("openmax --check"), "the verification path stays: {note}");
     }
 
     /// Approving a write approves that write and nothing more: a capability
