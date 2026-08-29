@@ -116,10 +116,11 @@ pub struct Registry {
     /// see that a broken file already explains an absent name. Empty for a
     /// manifest-restored registry.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
-    /// Same-directory skill name collisions (name, ignored path, indexed
-    /// path), for the refreeze receipt. Empty for a manifest-restored
-    /// registry, which only narrates deltas it can compute.
-    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf)>,
+    /// Same-directory skill name collisions (name, ignored path, winning
+    /// path, winner indexed), for the refreeze receipt. Empty for a
+    /// manifest-restored registry, which only narrates deltas it can
+    /// compute.
+    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf, bool)>,
     /// Memory files (stem, content hash) this freeze indexed; None for a
     /// registry rebuilt from a manifest that predates the field, so the
     /// first refreeze after an upgrade does not narrate every memory as new.
@@ -168,9 +169,10 @@ pub(crate) struct ExtensionSnapshot {
     /// The tool-tier subset of `broken` with the name each file occupies
     /// (declared, or stem as the fallback), for the refreeze classifier.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
-    /// Same-directory skill name collisions: (name, ignored path, indexed
-    /// path). The receipt names these; cross-tier precedence is not here.
-    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf)>,
+    /// Same-directory skill name collisions: (name, ignored path, winning
+    /// path, winner indexed). The receipt names these; cross-tier
+    /// precedence is not here.
+    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf, bool)>,
     /// Project memory files (stem, content hash). Memory rides the frozen
     /// prompt's index, so a memory write moves the fingerprint and refreezes:
     /// the fact is live from the next step, deterministically, instead of
@@ -288,12 +290,14 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     let external_by_name: HashMap<String, ToolSpec> =
         external_by_name.into_iter().map(|(k, (_, v))| (k, v)).collect();
     let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
-    // (name, ignored path, indexed path): two files in the SAME directory
-    // declaring one name. Cross-tier shadowing is precedence (a project
-    // definition wins over a global one, deliberately, silently); same-tier
-    // last-wins is an accident of scan order, so the refreeze receipt names
-    // it the moment it happens, the way --check already does.
-    let mut shadowed_skills: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+    // (name, ignored path, winning path, winner indexed): two files in the
+    // SAME directory declaring one name. Cross-tier shadowing is precedence
+    // (a project definition wins over a global one, deliberately, silently);
+    // same-tier last-wins is an accident of scan order, so the refreeze
+    // receipt names it the moment it happens, the way --check already does.
+    // The indexed flag is settled AFTER the skill cap below: a winner the
+    // cap drops must not be reported as indexed (Greptile).
+    let mut shadowed_skills: Vec<(String, PathBuf, PathBuf, bool)> = Vec::new();
     for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -322,7 +326,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
                     let winner = spec.path.clone();
                     if let Some(prev) = skills_by_name.insert(name.clone(), spec) {
                         if prev.path.starts_with(&dir) {
-                            shadowed_skills.push((name, prev.path, winner));
+                            shadowed_skills.push((name, prev.path, winner, false));
                         }
                     }
                 }
@@ -363,6 +367,12 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
     let skills_omitted = discovered_skills.len().saturating_sub(skills::MAX_SKILLS);
     discovered_skills.truncate(skills::MAX_SKILLS);
+    // Settle the collision winners' indexed state against the FINAL list:
+    // a winner past the cap is not indexed, and saying it is would send the
+    // author hunting for an index line that does not exist (Greptile).
+    for (_, _, winner, indexed) in &mut shadowed_skills {
+        *indexed = discovered_skills.iter().any(|s| s.path == *winner);
+    }
     ExtensionSnapshot {
         fingerprint: h.finish(),
         external,
@@ -1274,6 +1284,41 @@ mod tests {
         assert!(err.contains('^'), "{err}");
     }
 
+    /// A collision whose WINNER falls past the skill cap must not be
+    /// recorded as indexed: neither file made the prompt, and the receipt
+    /// wording branches on this flag (Greptile).
+    #[test]
+    fn a_collision_winner_past_the_cap_is_not_marked_indexed() {
+        let dir = std::env::temp_dir().join(format!("omx-shadowcap-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for i in 0..crate::skills::MAX_SKILLS {
+            let d = project.join(".agents/skills").join(format!("s{i:02}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: s{i:02}\ndescription: filler\n---\nB.\n"),
+            )
+            .unwrap();
+        }
+        for d in ["zz-a", "zz-b"] {
+            let s = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                "---\nname: zz-common\ndescription: d\n---\nB.\n",
+            )
+            .unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
+        let (name, _, winner, winner_indexed) = &snap.shadowed_skills[0];
+        assert_eq!(name, "zz-common");
+        assert!(winner.ends_with("zz-b/SKILL.md"), "{winner:?}");
+        assert!(!*winner_indexed, "the cap dropped the winner; it is not indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Two files in ONE directory declaring the same skill name collapse to
     /// whichever sorts last; that accident is recorded for the receipt.
     /// Cross-tier shadowing (a project skill over a global namesake) is
@@ -1293,10 +1338,11 @@ mod tests {
         }
         let snap = capture_extensions(&data, &project);
         assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
-        let (name, ignored, indexed) = &snap.shadowed_skills[0];
+        let (name, ignored, winner, winner_indexed) = &snap.shadowed_skills[0];
         assert_eq!(name, "code-review");
         assert!(ignored.ends_with("aa-review/SKILL.md"), "{ignored:?}");
-        assert!(indexed.ends_with("zz-review/SKILL.md"), "{indexed:?}");
+        assert!(winner.ends_with("zz-review/SKILL.md"), "{winner:?}");
+        assert!(*winner_indexed, "under the cap, the winner is in the index");
 
         // The same name split across TIERS is precedence, not a collision.
         let dir2 = std::env::temp_dir().join(format!("omx-shadow2-{}", uuid::Uuid::new_v4()));
