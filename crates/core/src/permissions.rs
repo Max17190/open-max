@@ -419,27 +419,39 @@ fn agent_writable(path: &Path, project_root: &Path) -> bool {
     candidate.starts_with(root) || path.starts_with(project_root)
 }
 
-/// Why this file's `allow` rules are not authority, for `openmax --check`.
-/// None when it has none, when it is out of the agent's reach, or when a human
-/// approved it.
-pub(crate) fn inert_allow_reason(
+/// The inert-allow verdict for one policy file: the model-facing reason and
+/// how many allow rules it covers. None when the file has no allows, when it
+/// is out of the agent's reach, or when a human approved it.
+type InertAllows = Option<(String, usize)>;
+
+/// Diagnose one permissions file for `openmax --check`: None when the file
+/// does not exist, Ok((the tool each rule names in file order, the
+/// inert-allow verdict)) when it loads, Err(reason) when the agent loop
+/// would fail closed because of it. The names come back rather than just a
+/// count because matching is exact, so a rule naming a tool that does not
+/// exist is a rule that silently never fires. One read serves every
+/// diagnostic row: the declared tool list AND the inert verdict come from
+/// the same parsed generation. Two loads let a rewrite between them make
+/// --check report a state neither revision held (Greptile reproduced
+/// "1 rules, 2 inert"); the live loader reads once, and #245 set the
+/// discipline.
+pub(crate) fn check_file(
     path: &Path,
     project_root: &Path,
     data_dir: &Path,
-) -> Option<String> {
-    let FileLoad::Ok(mut rules, content_hash) = load_file(path) else { return None };
-    drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
-}
-
-/// Diagnose one permissions file for `openmax --check`: None when the file
-/// does not exist, Ok(the tool each rule names, in file order) when it loads,
-/// Err(reason) when the agent loop would fail closed because of it. The names
-/// come back rather than just a count because matching is exact, so a rule
-/// naming a tool that does not exist is a rule that silently never fires.
-pub(crate) fn check_file(path: &Path) -> Option<Result<Vec<String>, String>> {
+) -> Option<Result<(Vec<String>, InertAllows), String>> {
     match load_file(path) {
         FileLoad::Missing => None,
-        FileLoad::Ok(rules, _) => Some(Ok(rules.into_iter().map(|r| r.tool).collect())),
+        FileLoad::Ok(mut rules, content_hash) => {
+            // The declared list (dropped allows included): the rows name
+            // each rule by index, and the summary counts the inert ones.
+            let tools: Vec<String> = rules.iter().map(|r| r.tool.clone()).collect();
+            let allows = rules.iter().filter(|r| r.effect == Effect::Allow).count();
+            let inert =
+                drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
+                    .map(|reason| (reason, allows));
+            Some(Ok((tools, inert)))
+        }
         FileLoad::Invalid(reason) => Some(Err(reason)),
     }
 }
@@ -1108,7 +1120,7 @@ tool = "bash"
             other => panic!("expected fail-closed Deny, got {other:?}"),
         }
         // `--check` prints the path itself, so the reason does not repeat it.
-        match check_file(&path) {
+        match check_file(&path, &tmp, &tmp.join("data")) {
             Some(Err(reason)) => {
                 assert!(
                     reason.starts_with("rule 2 has unknown effect \"Allow\":"),
