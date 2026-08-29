@@ -61,12 +61,13 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DIGEST_PREFIX: &str = "[context note:";
 /// Once per session, on the first tool result of the first reply whose calls
 /// were recovered from its text (fallback.rs) rather than sent as API
-/// `tool_calls`. Names the condition and its meaning: the frozen prompt asks
-/// for native calls, and a reply that leaks markup into text says the
-/// endpoint's tool-call parsing lags this model, not that the harness wants
-/// markup. Advisory, so it is a note the model reads and a frontend renders,
-/// not an error.
-const FALLBACK_RECOVERY_NOTE: &str = "[harness note: this reply carried its tool calls as text rather than as API tool_calls; the harness recognized the markup and ran them. Native tool calling is the contract; a reply that leaks call markup into text means the endpoint's tool-call parser lags this model. Reported once per session.]";
+/// `tool_calls`. States what happened, restates the rule the reply broke as
+/// an imperative (the established failure shape is a model absorbing the
+/// vocabulary while still emitting markup), and offers the endpoint-lag
+/// explanation as a possibility, not a verdict - the harness cannot see
+/// whether the model or the endpoint's parser leaked the markup. Advisory,
+/// so it is a note the model reads and a frontend renders, not an error.
+const FALLBACK_RECOVERY_NOTE: &str = "[harness note: this reply carried its tool calls as text rather than as API tool_calls; the harness recognized the markup and ran them. Emit native tool_calls and never print call markup as reply text (the frozen rules require it). If native calls keep arriving as text, the endpoint's tool-call parsing may lag this model; tell the user. Reported once per session.]";
 
 /// Whether these messages (a transcript, or the archive of what compaction
 /// dropped from it) already carry the recovery note on a tool result.
@@ -4308,6 +4309,25 @@ mod tests {
             .unwrap();
         assert!(gated().is_none(), "approving the prompt clears it");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The fallback note speaks to the model first: it restates the broken
+    /// rule as an imperative instead of asserting an endpoint cause the
+    /// harness cannot know. The old text ("means the endpoint's tool-call
+    /// parser lags") told a markup-emitting model the fault was elsewhere
+    /// while confirming the markup worked (round-7 audit).
+    #[test]
+    fn the_fallback_note_restates_the_native_call_rule() {
+        assert!(FALLBACK_RECOVERY_NOTE.contains("Emit native tool_calls"));
+        assert!(FALLBACK_RECOVERY_NOTE.contains("never print call markup"));
+        assert!(
+            FALLBACK_RECOVERY_NOTE.contains("may lag"),
+            "the endpoint explanation stays a possibility"
+        );
+        assert!(
+            !FALLBACK_RECOVERY_NOTE.contains("means the endpoint"),
+            "no asserted cause the harness cannot verify"
+        );
     }
 
     /// A ledger failure must not replace the receipt's what-changed slot with
