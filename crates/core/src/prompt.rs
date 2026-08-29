@@ -83,11 +83,27 @@ impl PromptBreakdown {
             ..Default::default()
         };
         breakdown.add_registry(registry, project_root);
-        let mut rows = persisted_memory_rows(prompt);
-        if let Some(known) = &registry.memory_files {
-            rows.retain(|(name, _)| known.iter().any(|(stem, _)| stem == name));
-        }
-        breakdown.memory = rows;
+        // The real section is the LAST heading occurrence that still holds
+        // rows after the identity filter: a lookalike in AGENTS.md filters
+        // to zero (its stems are not the freeze's), and a heading-shaped
+        // filename in the layout section carries no row-shaped lines at
+        // all. Without identities (a pre-field manifest) the last occurrence
+        // with any rows wins, which still ignores rowless lookalikes.
+        let known = registry.memory_files.as_ref();
+        breakdown.memory = persisted_memory_row_runs(prompt)
+            .into_iter()
+            .rev()
+            .find_map(|rows| {
+                let rows: Vec<(String, usize)> = match known {
+                    Some(k) => rows
+                        .into_iter()
+                        .filter(|(name, _)| k.iter().any(|(stem, _)| stem == name))
+                        .collect(),
+                    None => rows,
+                };
+                (!rows.is_empty()).then_some(rows)
+            })
+            .unwrap_or_default();
         breakdown
     }
 
@@ -283,31 +299,32 @@ fn skill_shown_path(project_root: &Path, path: &Path) -> String {
 /// bytes for a skill the section carries, zero for one the byte cap dropped
 /// (only the omission trailer mentions it). Pricing a dropped skill as if it
 /// were carried sends an agent pruning by cost after tokens nobody is paying.
-/// The memory rows a persisted prompt carries, priced from its own bytes:
-/// each index line as (name, line length including its newline), the same
-/// accounting the live scan records. Recognition is structural: the shared
-/// section header, then consecutive `- name: description — path` lines; the
-/// trailer or the next section ends the run.
-fn persisted_memory_rows(prompt: &str) -> Vec<(String, usize)> {
-    // The LAST occurrence: AGENTS.md is injected before the generated
-    // section and its user-authored bytes could contain the heading
-    // (Greptile); nothing after the real section can, because every later
-    // section renders single lines that cannot hold the heading's embedded
-    // newlines.
-    let Some(start) = prompt.rfind(MEMORY_SECTION_HEADER) else {
-        return Vec::new();
-    };
-    let body = &prompt[start + MEMORY_SECTION_HEADER.len()..];
-    let mut rows = Vec::new();
-    for line in body.lines() {
-        let Some(rest) = line.strip_prefix("- ") else { break };
-        if !line.contains(" — ") {
-            break;
+/// The row runs behind EVERY occurrence of the memory heading, in prompt
+/// order: each index line as (name, line length including its newline), the
+/// same accounting the live scan records. Recognition is structural (the
+/// shared header, then consecutive `- name: description — path` lines; the
+/// trailer or the next section ends the run), and the CALLER picks the run,
+/// because position alone cannot: AGENTS.md rides before the generated
+/// section, and a newline-bearing filename rendered by the layout section
+/// can spell the heading after it (Greptile, twice).
+fn persisted_memory_row_runs(prompt: &str) -> Vec<Vec<(String, usize)>> {
+    let mut runs = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = prompt[from..].find(MEMORY_SECTION_HEADER) {
+        let start = from + rel + MEMORY_SECTION_HEADER.len();
+        let mut rows = Vec::new();
+        for line in prompt[start..].lines() {
+            let Some(rest) = line.strip_prefix("- ") else { break };
+            if !line.contains(" — ") {
+                break;
+            }
+            let Some((name, _)) = rest.split_once(':') else { break };
+            rows.push((name.to_string(), line.len() + 1));
         }
-        let Some((name, _)) = rest.split_once(':') else { break };
-        rows.push((name.to_string(), line.len() + 1));
+        runs.push(rows);
+        from = start;
     }
-    rows
+    runs
 }
 
 pub fn skill_index_costs(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, usize)> {
@@ -835,6 +852,27 @@ mod tests {
             resumed2.memory
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A heading-shaped FILENAME rendered verbatim by a later section (the
+    /// layout map; Linux filenames may hold newlines) must not displace the
+    /// real rows: a plain last-occurrence pick started parsing there and
+    /// returned nothing (Greptile). The real section is the last occurrence
+    /// that still holds identity-passing rows.
+    #[test]
+    fn a_later_heading_with_no_rows_does_not_hide_the_memory_rows() {
+        let real = format!(
+            "{MEMORY_SECTION_HEADER}- real-fact: the build needs node 20 — .openmax/memory/real-fact.md\n"
+        );
+        let prompt = format!(
+            "You are Open Max.{real}\n\nProject layout (top levels; explore deeper with tools):\n\
+             weird-dir{MEMORY_SECTION_HEADER}src/\n"
+        );
+        let mut registry = Registry::builtin_only();
+        registry.memory_files = Some(vec![("real-fact".to_string(), 0)]);
+        let breakdown = PromptBreakdown::from_persisted(&prompt, &registry, Path::new("/p"));
+        assert_eq!(breakdown.memory.len(), 1, "{:?}", breakdown.memory);
+        assert_eq!(breakdown.memory[0].0, "real-fact");
     }
 
     #[test]
