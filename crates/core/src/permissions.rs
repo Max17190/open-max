@@ -422,9 +422,11 @@ pub(crate) fn inert_allow_reason(
     path: &Path,
     project_root: &Path,
     data_dir: &Path,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     let FileLoad::Ok(mut rules, content_hash) = load_file(path) else { return None };
+    let allows = rules.iter().filter(|r| r.effect == Effect::Allow).count();
     drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
+        .map(|reason| (reason, allows))
 }
 
 /// Diagnose one permissions file for `openmax --check`: None when the file
