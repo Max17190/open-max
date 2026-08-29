@@ -383,7 +383,13 @@ mod tests {
         assert!(prompt.contains("/reload"));
         assert!(prompt.contains("openmax --check"));
         // The guide is an index; the full per-surface contract is read on
-        // demand, and the pointer must name every surface --spec accepts.
+        // demand. The pointer is a deliberate SUBSET of --spec's surfaces
+        // (the frozen prompt pays per byte): settings, recall, and usage are
+        // omitted because they are not authoring surfaces and the moments
+        // that need them carry their own pointer (every --check settings row
+        // prints "openmax --spec settings"; the guide's memory line names
+        // --recall). the_guide_pointer_names_only_real_surfaces enforces
+        // that every named surface exists and the omission list is exact.
         assert!(prompt.contains(
             "openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio"
         ));
@@ -620,6 +626,30 @@ mod tests {
     /// history the agent cannot find is a promise, not a capability; 18 real
     /// tokens buys the pointer that makes archives and past sessions
     /// searchable instead of merely stored.
+    #[test]
+    fn the_guide_pointer_names_only_real_surfaces() {
+        // Every surface the pointer names must exist, and the omissions must
+        // be exactly the deliberate ones: settings, recall, and usage are not
+        // authoring surfaces, and the moments that need them carry their own
+        // pointer (--check settings rows print "openmax --spec settings"; the
+        // guide's memory line names --recall). A new --spec surface must
+        // either join the pointer or this list, consciously.
+        let pointer = ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory", "stdio"];
+        for s in pointer {
+            assert!(crate::spec::SURFACES.contains(&s), "the pointer names a surface --spec lacks: {s}");
+        }
+        let omitted: Vec<&str> = crate::spec::SURFACES
+            .iter()
+            .copied()
+            .filter(|s| !pointer.contains(s))
+            .collect();
+        assert_eq!(
+            omitted,
+            ["settings", "recall", "usage"],
+            "a new surface joins the pointer or the deliberate-omission list"
+        );
+    }
+
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();

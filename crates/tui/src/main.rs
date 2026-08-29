@@ -64,7 +64,7 @@ options:
                          stdin against the openmax-stdio contract instead
       --spec <surface>   print the authoring contract for one surface and
                          exit (tools, skills, prompts, hooks, permissions,
-                         providers, memory, recall, stdio, usage)
+                         providers, settings, memory, recall, stdio, usage)
       --trust-project    persist trust for this exact project root, then run
   -V, --version          print the version
   -h, --help             this help
@@ -1571,6 +1571,20 @@ pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// --help's --spec list names every surface the binary accepts: --check
+    /// rows send readers to `openmax --spec settings`, and the help text was
+    /// the one place that did not know it existed (round-7 audit).
+    #[test]
+    fn help_names_every_spec_surface() {
+        // Scoped to the --spec option block: "settings" also appears in
+        // unrelated help prose (settings.json), which must not satisfy this.
+        let start = super::HELP.find("--spec <surface>").expect("--spec is documented");
+        let block = &super::HELP[start..(start + 300).min(super::HELP.len())];
+        for surface in open_max_core::spec::SURFACES {
+            assert!(block.contains(surface), "--help's --spec list omits: {surface}");
+        }
+    }
+
     use super::*;
     use std::sync::{Arc, Mutex};
 
