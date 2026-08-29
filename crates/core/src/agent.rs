@@ -1815,20 +1815,32 @@ fn classify_added_tools(
             if new_registry.get(&old_spec.name).is_some() {
                 continue;
             }
-            // A manifest still on disk is not removed. It may have been edited
-            // to broken or turned unreadable (both now in `broken`, where the
-            // refreeze receipt names it
-            // "NOT loaded: X: <reason>"), or a broken higher-precedence file
-            // may be withholding this valid one by shadowing its name - in the
-            // shadow case the broken file's path differs from this tool's, so a
-            // check against `broken` alone would miss it (Greptile). Either way
-            // "Removed approved tools: X - identical bytes would run without a
-            // card" is a false, contradictory clause that reads as if the file
-            // were gone. `is_file`, not `exists`: a directory dropped at the
-            // `.toml` path is not a manifest, so the tool IS gone and stays a
-            // removal (a directory exists but is not the file). Only a manifest
-            // that left disk is removed; the broken file speaks for the rest.
-            if old_ext.source_path.is_file() {
+            // Removal vs present-but-inert is decided from the NEW capture's
+            // own observations, never a second disk probe: a probe races the
+            // capture it claims to describe, and it cannot see WHY a name is
+            // absent, only that a path exists - which is how a directory
+            // dropped over the manifest was called both "NOT loaded" and
+            // "removed" in one receipt, and how a broken namesake shadowing a
+            // deleted approved manifest still drew "identical bytes at that
+            // path would run", which the withheld name makes false (Greptile,
+            // twice). The receipt gets exactly ONE clause per absent name:
+            // - the capture read bytes at this path (edited broken, renamed,
+            //   withheld by an override, or past the tool cap): the NOT-loaded
+            //   clause, the New-tools clause, or the prompt's cap trailer
+            //   already narrates that file;
+            // - a broken entry sits at this path (unreadable, or a directory
+            //   over the `.toml`): the NOT-loaded clause names it;
+            // - a broken file elsewhere occupies this NAME (declared, or stem
+            //   as the fallback - the withhold pass's own key): the name is
+            //   not restorable-by-bytes, and that file's clause explains it;
+            // - otherwise the capture found no trace: the tool left disk, and
+            //   only then is it a removal.
+            if new_registry.read_paths.contains(&old_ext.source_path)
+                || new_registry
+                    .broken_tools
+                    .iter()
+                    .any(|(p, n)| *p == old_ext.source_path || *n == old_spec.name)
+            {
                 continue;
             }
             // Was the manifest ever approved? That signal is disk-independent:
@@ -5194,12 +5206,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A directory dropped at the manifest's `.toml` path is not a manifest, so
-    /// the tool is gone and stays a removal. The presence check keys on the
-    /// path being a FILE, not merely existing, or a directory at the path would
-    /// wrongly suppress the removal (Greptile).
+    /// A directory dropped at the manifest's `.toml` path lands in `broken`
+    /// ("unreadable: ..."), and the receipt's NOT-loaded clause names it. It
+    /// must not ALSO be classified as a removed approved tool: two clauses
+    /// calling the same path present-but-unreadable and gone contradict each
+    /// other, and the removal clause's "identical bytes at that path would run"
+    /// is unactionable while a directory occupies the path (Greptile). The
+    /// capture's own observation - a broken entry at this path - wins.
     #[test]
-    fn a_directory_at_the_manifest_path_is_still_a_removed_tool() {
+    fn a_directory_at_the_manifest_path_is_broken_not_doubly_removed() {
         let dir = std::env::temp_dir().join(format!("openmax-t2dir-{}", uuid::Uuid::new_v4()));
         let data = dir.join("data");
         let project = dir.join("project");
@@ -5221,11 +5236,173 @@ mod tests {
         assert!(manifest.exists() && !manifest.is_file(), "a directory now sits at the path");
         let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
         assert!(new.get("deploy").is_none());
+        assert!(
+            new.broken.iter().any(|(p, r)| *p == manifest && r.contains("unreadable")),
+            "the directory is a broken entry the receipt names: {:?}",
+            new.broken
+        );
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved.is_empty() && added.removed_approval_survives.is_empty(),
+            "the broken clause speaks alone; no contradictory removal clause: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The approved global manifest is deleted while a broken project file
+    /// declares the same tool name. Restoring the approved bytes would NOT
+    /// make the tool callable - the broken override withholds the name - so
+    /// "Removed approved tools: X (identical bytes would run without a card)"
+    /// is a false promise (Greptile). The broken file's NOT-loaded clause is
+    /// the one truthful explanation, and the match is on the DECLARED name
+    /// (the broken file's stem differs here), the same key the withhold pass
+    /// judges collisions on.
+    #[test]
+    fn a_removal_shadowed_by_a_broken_namesake_is_not_reported_removed() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2sh-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let global = data.join("tools/deploy.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        // The project directory must exist BEFORE the approval: the ledger
+        // keys its per-project store on the canonicalized project path, and a
+        // path that cannot canonicalize yet would record under a different key
+        // than every later read resolves (macOS /var vs /private/var).
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            &global,
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&global).unwrap());
+        crate::ledger::approve_capability(&data, &project, &global, std::slice::from_ref(&sha))
+            .unwrap();
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("deploy").is_some());
+        assert!(
+            crate::ledger::approved_hashes(&data, &project).unwrap().contains(&sha),
+            "the approval must record the manifest sha, or the classify probe is vacuous"
+        );
+
+        // The approved global manifest leaves disk, and a broken project file
+        // under a DIFFERENT stem declares the same name (parses as TOML, fails
+        // the spec, so the declared name is recoverable).
+        std::fs::remove_file(&global).unwrap();
+        let shadow = project.join(".openmax/tools/shipit.toml");
+        std::fs::write(&shadow, "name = \"deploy\"\ndescription = \"broken, no command\"\n")
+            .unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(new.get("deploy").is_none());
+        assert!(
+            new.broken.iter().any(|(p, _)| *p == shadow),
+            "the broken namesake is recorded: {:?}",
+            new.broken
+        );
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved.is_empty() && added.removed_approval_survives.is_empty(),
+            "a name a broken file still occupies is not a removal: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The suppression must not over-reach: a broken file at another path
+    /// occupying a DIFFERENT name explains nothing about this tool, so a
+    /// genuinely deleted approved manifest is still reported as removed.
+    #[test]
+    fn an_unrelated_broken_file_does_not_suppress_a_removal() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2un-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let manifest = project.join(".openmax/tools/deploy.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+        crate::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("deploy").is_some());
+
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/other.toml"),
+            "name = \"other\"\ndescription = \"broken, no command\"\n",
+        )
+        .unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
 
         let added = classify_added_tools(&old, &new, &data, &project);
         assert!(
             added.removed_approved == vec!["deploy".to_string()],
-            "a tool whose manifest became a directory is still removed: {:?} / {:?}",
+            "an unrelated broken file must not swallow the removal: {:?} / {:?}",
+            added.removed_approved,
+            added.removed_approval_survives
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A valid approved manifest pushed past `MAX_EXTERNAL_TOOLS` by a newly
+    /// added tool is discovered-but-not-loaded (the prompt trailer reports the
+    /// count). The file never left disk, so it is not a removed tool; the
+    /// capture read it, and that read - not a fresh disk probe - is what the
+    /// classifier consults.
+    #[test]
+    fn a_tool_pushed_past_the_cap_is_not_a_removed_tool() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2cap-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let tools_dir = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        // Fill every cap slot; "zz-deploy" sorts last, so the one added later
+        // ("aa-extra") pushes exactly it out.
+        for i in 0..(crate::registry::MAX_EXTERNAL_TOOLS - 1) {
+            std::fs::write(
+                tools_dir.join(format!("t{i:02}.toml")),
+                format!("name = \"t{i:02}\"\ndescription = \"filler\"\ncommand = \"/bin/echo\"\n"),
+            )
+            .unwrap();
+        }
+        let manifest = tools_dir.join("zz-deploy.toml");
+        std::fs::write(
+            &manifest,
+            "name = \"zz-deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+        crate::ledger::approve_capability(&data, &project, &manifest, std::slice::from_ref(&sha))
+            .unwrap();
+        assert!(
+            crate::ledger::approved_hashes(&data, &project).unwrap().contains(&sha),
+            "the approval must record the manifest sha, or the classify probe is vacuous"
+        );
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(old.get("zz-deploy").is_some(), "the approved tool holds the last cap slot");
+
+        std::fs::write(
+            tools_dir.join("aa-extra.toml"),
+            "name = \"aa-extra\"\ndescription = \"new\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert!(new.get("zz-deploy").is_none(), "the cap dropped the last-sorted tool");
+        assert_eq!(new.tools_omitted, 1, "the trailer accounts for the capped tool");
+
+        let added = classify_added_tools(&old, &new, &data, &project);
+        assert!(
+            added.removed_approved.is_empty() && added.removed_approval_survives.is_empty(),
+            "a capped-out tool never left disk and is not a removal: {:?} / {:?}",
             added.removed_approved,
             added.removed_approval_survives
         );

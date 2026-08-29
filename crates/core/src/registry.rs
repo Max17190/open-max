@@ -103,6 +103,19 @@ pub struct Registry {
     /// reason. Receipts and the unknown-tool error name these so a broken
     /// write is never mistaken for a live capability.
     pub broken: Vec<(PathBuf, String)>,
+    /// Every capability file path THIS freeze's capture actually read (tool
+    /// manifests and SKILL.mds). The refreeze classifier asks whether a path
+    /// still existed in this generation without a second disk probe, which
+    /// would race the capture it claims to describe. Empty for a
+    /// manifest-restored registry, which only ever sits on the outgoing side
+    /// of that comparison.
+    pub(crate) read_paths: std::collections::HashSet<PathBuf>,
+    /// Broken TOOL manifests with the name each occupies: the declared name,
+    /// or the file stem when the document is too broken to yield one - the
+    /// same derivation the withhold pass uses. Lets the refreeze classifier
+    /// see that a broken file already explains an absent name. Empty for a
+    /// manifest-restored registry.
+    pub(crate) broken_tools: Vec<(PathBuf, String)>,
     /// Memory files (stem, content hash) this freeze indexed; None for a
     /// registry rebuilt from a manifest that predates the field, so the
     /// first refreeze after an upgrade does not narrate every memory as new.
@@ -148,6 +161,9 @@ pub(crate) struct ExtensionSnapshot {
     /// the fingerprint (a broken write still triggers a refreeze); keeping
     /// the reason lets that refreeze's receipt say the tool is NOT live.
     pub(crate) broken: Vec<(PathBuf, String)>,
+    /// The tool-tier subset of `broken` with the name each file occupies
+    /// (declared, or stem as the fallback), for the refreeze classifier.
+    pub(crate) broken_tools: Vec<(PathBuf, String)>,
     /// Project memory files (stem, content hash). Memory rides the frozen
     /// prompt's index, so a memory write moves the fingerprint and refreezes:
     /// the fact is live from the next step, deterministically, instead of
@@ -237,6 +253,10 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // under a valid project override: the override is legitimately active,
     // and the reason says so instead of claiming the name is not callable.
     let mut broken: Vec<(PathBuf, String)> = Vec::new();
+    // (path, occupied name) per broken tool file: the refreeze classifier
+    // tells "removed" from "explained by a broken file" with this, never by
+    // re-probing disk after the capture.
+    let mut broken_tools: Vec<(PathBuf, String)> = Vec::new();
     for (path, mut reason, broken_dir, declared) in broken_at {
         let name = declared
             .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
@@ -254,6 +274,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
                     ));
                 }
             }
+            broken_tools.push((path.clone(), name));
         }
         broken.push((path, reason));
     }
@@ -331,6 +352,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         skills_omitted,
         files: files_read,
         broken,
+        broken_tools,
         memory_files,
         memory_section,
     }
@@ -364,7 +386,9 @@ impl Registry {
         registry.ext_fingerprint = snapshot.fingerprint;
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
+        registry.read_paths = snapshot.files.iter().map(|(p, _, _)| p.clone()).collect();
         registry.broken = snapshot.broken;
+        registry.broken_tools = snapshot.broken_tools;
         registry.memory_files = Some(snapshot.memory_files);
         registry.memory_section = snapshot.memory_section;
         registry.memory_scanned = true;
@@ -414,6 +438,8 @@ impl Registry {
             tools_omitted: 0,
             ext_fingerprint: 0,
             broken: Vec::new(),
+            read_paths: std::collections::HashSet::new(),
+            broken_tools: Vec::new(),
             memory_files: None,
             memory_section: None,
             memory_scanned: false,
