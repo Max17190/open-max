@@ -383,10 +383,14 @@ fn drop_unapproved_allows(
     let before = rules.len();
     rules.retain(|r| r.effect != Effect::Allow);
     let dropped = before - rules.len();
+    // The command half is pastable, so it is shell-quoted like every other
+    // printed `openmax --approve` (doctor::shell_quote's own contract): a
+    // project path with a space made the copyable command fail on a path
+    // fragment (round-7 audit, reproduced).
     Some(format!(
         "{}: {dropped} allow rule(s) are inert because they skip the approval prompt and this file sits inside the project, where the agent writes; calls fall through to approval_mode until a human approves this exact content with `openmax --approve {}`",
         path.display(),
-        path.display()
+        crate::doctor::shell_quote(path)
     ))
 }
 
@@ -415,27 +419,39 @@ fn agent_writable(path: &Path, project_root: &Path) -> bool {
     candidate.starts_with(root) || path.starts_with(project_root)
 }
 
-/// Why this file's `allow` rules are not authority, for `openmax --check`.
-/// None when it has none, when it is out of the agent's reach, or when a human
-/// approved it.
-pub(crate) fn inert_allow_reason(
+/// The inert-allow verdict for one policy file: the model-facing reason and
+/// how many allow rules it covers. None when the file has no allows, when it
+/// is out of the agent's reach, or when a human approved it.
+type InertAllows = Option<(String, usize)>;
+
+/// Diagnose one permissions file for `openmax --check`: None when the file
+/// does not exist, Ok((the tool each rule names in file order, the
+/// inert-allow verdict)) when it loads, Err(reason) when the agent loop
+/// would fail closed because of it. The names come back rather than just a
+/// count because matching is exact, so a rule naming a tool that does not
+/// exist is a rule that silently never fires. One read serves every
+/// diagnostic row: the declared tool list AND the inert verdict come from
+/// the same parsed generation. Two loads let a rewrite between them make
+/// --check report a state neither revision held (Greptile reproduced
+/// "1 rules, 2 inert"); the live loader reads once, and #245 set the
+/// discipline.
+pub(crate) fn check_file(
     path: &Path,
     project_root: &Path,
     data_dir: &Path,
-) -> Option<String> {
-    let FileLoad::Ok(mut rules, content_hash) = load_file(path) else { return None };
-    drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
-}
-
-/// Diagnose one permissions file for `openmax --check`: None when the file
-/// does not exist, Ok(the tool each rule names, in file order) when it loads,
-/// Err(reason) when the agent loop would fail closed because of it. The names
-/// come back rather than just a count because matching is exact, so a rule
-/// naming a tool that does not exist is a rule that silently never fires.
-pub(crate) fn check_file(path: &Path) -> Option<Result<Vec<String>, String>> {
+) -> Option<Result<(Vec<String>, InertAllows), String>> {
     match load_file(path) {
         FileLoad::Missing => None,
-        FileLoad::Ok(rules, _) => Some(Ok(rules.into_iter().map(|r| r.tool).collect())),
+        FileLoad::Ok(mut rules, content_hash) => {
+            // The declared list (dropped allows included): the rows name
+            // each rule by index, and the summary counts the inert ones.
+            let tools: Vec<String> = rules.iter().map(|r| r.tool.clone()).collect();
+            let allows = rules.iter().filter(|r| r.effect == Effect::Allow).count();
+            let inert =
+                drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
+                    .map(|reason| (reason, allows));
+            Some(Ok((tools, inert)))
+        }
         FileLoad::Invalid(reason) => Some(Err(reason)),
     }
 }
@@ -566,6 +582,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-perms-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The inert-allow notice's `openmax --approve <path>` half is pastable
+    /// and reaches the model as a policy notice, so a path with a space (a
+    /// plain macOS project name is enough) must be shell-quoted, or the
+    /// relayed command fails on a path fragment (round-7 audit, reproduced).
+    #[test]
+    fn the_inert_allow_notice_quotes_a_spacey_path() {
+        let tmp = tempfile_dir().join("my probe dir");
+        let perms_path = tmp.join(".openmax").join("permissions.toml");
+        write_perms(
+            &perms_path,
+            "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\narg_regex = \"^git status\"\n",
+        );
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
+        let notices = perms.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let quoted = crate::doctor::shell_quote(&perms_path);
+        assert!(
+            notices[0].contains(&format!("openmax --approve {quoted}")),
+            "the pastable command quotes the path: {}",
+            notices[0]
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// A broken policy file must stay repairable from inside the session.
@@ -1080,7 +1120,7 @@ tool = "bash"
             other => panic!("expected fail-closed Deny, got {other:?}"),
         }
         // `--check` prints the path itself, so the reason does not repeat it.
-        match check_file(&path) {
+        match check_file(&path, &tmp, &tmp.join("data")) {
             Some(Err(reason)) => {
                 assert!(
                     reason.starts_with("rule 2 has unknown effect \"Allow\":"),

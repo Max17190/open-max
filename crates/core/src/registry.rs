@@ -130,6 +130,13 @@ pub struct Registry {
     /// `None` here is ambiguous on its own - an empty scan and a registry that
     /// never scanned both leave it None - so `memory_scanned` disambiguates.
     pub memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// The memory index rows (stem, line bytes) frozen WITH the persisted
+    /// prompt, independent of the resettable resume-delta baseline above:
+    /// from_manifest clears `memory_files` so the first refreeze reports no
+    /// spurious delta, while /context still needs the freeze's own row
+    /// accounting. Carried by the manifest (version 4); a pre-field manifest
+    /// reads as absent and refreezes, so this is Some on every live path.
+    pub(crate) frozen_memory_rows: Option<Vec<(String, usize)>>,
     /// True only when THIS registry actually ran a memory scan (a fresh
     /// freeze). A manifest-restored registry sets `memory_files` for the
     /// resume delta but never captured a section, so it is false and the
@@ -448,6 +455,9 @@ impl Registry {
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
         registry.shadowed_skills = snapshot.shadowed_skills;
+        registry.frozen_memory_rows = Some(
+            snapshot.memory_section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default(),
+        );
         registry.memory_files = Some(snapshot.memory_files);
         registry.memory_section = snapshot.memory_section;
         registry.memory_scanned = true;
@@ -501,6 +511,7 @@ impl Registry {
             broken_tools: Vec::new(),
             shadowed_skills: Vec::new(),
             memory_files: None,
+            frozen_memory_rows: None,
             memory_section: None,
             memory_scanned: false,
             schemas,
@@ -648,6 +659,13 @@ pub struct RegistryManifest {
     /// older manifests, which then narrate no memory delta once.
     #[serde(default)]
     pub memory_files: Option<Vec<(String, u64)>>,
+    /// The memory index rows (stem, line bytes) frozen WITH the persisted
+    /// prompt: /context on a resumed session prices exactly these. Recorded
+    /// here because re-deriving them by parsing the persisted prompt was an
+    /// arms race against attacker-controlled bytes rendered into later
+    /// sections (Greptile, three rounds).
+    #[serde(default)]
+    pub memory_rows: Option<Vec<(String, usize)>>,
 }
 
 /// Current manifest format. A manifest carrying any other version is treated
@@ -661,7 +679,11 @@ pub struct RegistryManifest {
 /// disk (no refreeze to repair it). Bumping the version makes v2 read as
 /// absent, so the session re-freezes from disk once and picks up the real
 /// grant - the same forward-only migration this constant already promises.
-pub const MANIFEST_VERSION: u32 = 3;
+// 4: memory_rows joined the manifest (the persisted /context accounting;
+// parsing it back out of the prompt was forgeable by newline-bearing
+// filenames rendered into later sections). Old manifests read as absent
+// and refreeze, so every live manifest carries exact rows.
+pub const MANIFEST_VERSION: u32 = 4;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
@@ -708,6 +730,10 @@ impl Registry {
             .collect();
         RegistryManifest {
             memory_files: self.memory_files.clone(),
+            // The frozen channel, not a re-parse: a restored registry
+            // re-suspending must keep the accounting its persisted prompt
+            // still depends on.
+            memory_rows: self.frozen_memory_rows.clone(),
             version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
@@ -746,9 +772,11 @@ impl Registry {
         // offline replacement the prompt already shows as newly indexed and
         // the old item as dropped (Greptile). memory_files stays None so the
         // first refreeze establishes the fresh scan as the baseline with no
-        // spurious delta. (`manifest.memory_files` is retained by to_manifest
-        // for forward compatibility and diagnostics.)
-        let _ = &manifest.memory_files;
+        // spurious delta. The row accounting survives on the frozen
+        // channel: /context prices the rows of the freeze that WROTE the
+        // persisted prompt, which is precisely what the manifest carries
+        // (Greptile).
+        registry.frozen_memory_rows = manifest.memory_rows.clone();
         registry
     }
 

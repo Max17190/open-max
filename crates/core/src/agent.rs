@@ -422,13 +422,10 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             }
             (Arc::new(breakdown), persisted)
         } else {
-            let system_chars = messages
-                .first()
-                .and_then(|m| m.content.as_deref())
-                .map(str::len)
-                .unwrap_or(0);
+            let persisted_prompt =
+                messages.first().and_then(|m| m.content.as_deref()).unwrap_or("");
             (
-                Arc::new(PromptBreakdown::from_persisted(system_chars, &registry, project_root)),
+                Arc::new(PromptBreakdown::from_persisted(persisted_prompt, &registry, project_root)),
                 count,
             )
         };
@@ -2069,7 +2066,20 @@ fn ledger_changes(
 ) -> (Vec<String>, bool) {
     match crate::ledger::sync(&core.data_dir, project_root, files, actor, Some(session_id)) {
         Ok(changes) => (crate::ledger::describe(&changes, project_root), true),
-        Err(e) => (vec![format!("ledger error: {e}")], false),
+        // The error must not displace the narration: this line fills the
+        // receipt's what-changed slot, and "ledger error: ..." alone read as
+        // if the refreeze had failed. Activation never depends on the ledger,
+        // so the change is live; the caller keeps the claim queued (persisted
+        // when the ledger directory allows), so recording is deferred, not
+        // lost. Say all three, then the error.
+        Err(e) => (
+            vec![format!(
+                "extension files changed but are not yet recorded in the capability \
+                 ledger ({e}); the change is still active, and the recording claim \
+                 stays queued for a later sync"
+            )],
+            false,
+        ),
     }
 }
 
@@ -2842,9 +2852,10 @@ async fn run_loop(
             break 'turns;
         }
 
-        // True once any mutating call succeeded this iteration: only then can
-        // extension files have changed, so only then is the fingerprint
-        // re-checked before the next model request.
+        // True once any mutating call EXECUTED this iteration, a failed one
+        // included (#242: a bash write-then-selftest that exits nonzero still
+        // persisted the file): only then can extension files have changed, so
+        // only then is the fingerprint re-checked before the next request.
         //
         // Only the serial path sets this. A batched external tool is host code
         // that could also write a capability file, so a mid-turn refreeze can
@@ -4275,6 +4286,38 @@ mod tests {
         crate::ledger::approve_capability(&data, &project, &source.source_path, &source.shas)
             .unwrap();
         assert!(gated().is_none(), "approving the prompt clears it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A ledger failure must not replace the receipt's what-changed slot with
+    /// a bare "ledger error:": activation never depends on the ledger, so the
+    /// change the model just made is live either way, and the claim stays
+    /// queued for a later sync. The receipt must say those facts; leading
+    /// with the error read as if the refreeze itself had failed.
+    #[test]
+    fn a_ledger_failure_reports_deferred_recording_not_a_bare_error() {
+        let dir = std::env::temp_dir().join(format!("openmax-lf-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // A FILE at the ledger root makes every project ledger dir
+        // un-creatable, failing the sync deterministically (works even when
+        // tests run as root, unlike a permissions-based denial).
+        std::fs::write(core.data_dir.join("ledger"), b"not a dir").unwrap();
+        let files =
+            vec![(project.join(".openmax/tools/t.toml"), "sha".to_string(), b"x".to_vec())];
+        let (lines, landed) =
+            ledger_changes(&core, &project, &files, crate::ledger::Actor::Session, "s1");
+        assert!(!landed, "a failed sync must report not-landed");
+        let joined = lines.join("; ");
+        assert!(
+            joined.contains("still active") && joined.contains("queued"),
+            "the receipt says the change is live and the recording deferred: {joined}"
+        );
+        assert!(
+            !joined.starts_with("ledger error"),
+            "the error must not displace the narration: {joined}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
