@@ -116,6 +116,11 @@ pub struct Registry {
     /// see that a broken file already explains an absent name. Empty for a
     /// manifest-restored registry.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
+    /// Same-directory skill name collisions, one record per name (name,
+    /// displaced paths, winning path, winner indexed), for the refreeze
+    /// receipt. Empty for a manifest-restored registry, which only narrates
+    /// deltas it can compute.
+    pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
     /// Memory files (stem, content hash) this freeze indexed; None for a
     /// registry rebuilt from a manifest that predates the field, so the
     /// first refreeze after an upgrade does not narrate every memory as new.
@@ -171,6 +176,10 @@ pub(crate) struct ExtensionSnapshot {
     /// The tool-tier subset of `broken` with the name each file occupies
     /// (declared, or stem as the fallback), for the refreeze classifier.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
+    /// Same-directory skill name collisions, one record per name: (name,
+    /// displaced paths, winning path, winner indexed). The receipt names
+    /// these; cross-tier precedence is not here.
+    pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
     /// Project memory files (stem, content hash). Memory rides the frozen
     /// prompt's index, so a memory write moves the fingerprint and refreezes:
     /// the fact is live from the next step, deterministically, instead of
@@ -288,6 +297,17 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     let external_by_name: HashMap<String, ToolSpec> =
         external_by_name.into_iter().map(|(k, (_, v))| (k, v)).collect();
     let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
+    // (name, displaced paths, winning path, winner indexed): files in the
+    // SAME directory declaring one name. Cross-tier shadowing is precedence
+    // (a project definition wins over a global one, deliberately, silently);
+    // same-tier last-wins is an accident of scan order, so the refreeze
+    // receipt names it the moment it happens, the way --check already does.
+    // Collisions coalesce to ONE record per name (three namesakes must not
+    // report the intermediate winner as cap-dropped while the final one is
+    // indexed), and the indexed flag is settled AFTER the skill cap below:
+    // a winner the cap drops must not be reported as indexed (Greptile,
+    // both).
+    let mut shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)> = Vec::new();
     for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -312,7 +332,29 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             match skills::parse_skill_source(&path, text) {
                 // Global is scanned first, so a project definition wins.
                 Ok(spec) => {
-                    skills_by_name.insert(spec.name.clone(), spec);
+                    let name = spec.name.clone();
+                    let winner = spec.path.clone();
+                    if let Some(prev) = skills_by_name.insert(name.clone(), spec) {
+                        if prev.path.starts_with(&dir) {
+                            match shadowed_skills.iter_mut().find(|(n, ..)| *n == name) {
+                                Some((_, displaced, current, _)) => {
+                                    displaced.push(std::mem::replace(current, winner));
+                                }
+                                None => {
+                                    shadowed_skills.push((name, vec![prev.path], winner, false));
+                                }
+                            }
+                        } else {
+                            // Cross-tier precedence is deliberate and silent,
+                            // and it MOOTS any collision recorded in the losing
+                            // tier: keeping that record left its winner
+                            // pointing at a path the project definition just
+                            // displaced, and the post-cap settle then called
+                            // the name unindexed while the project skill is
+                            // active (Greptile).
+                            shadowed_skills.retain(|(n, ..)| *n != name);
+                        }
+                    }
                 }
                 Err(reason) => broken.push((path, reason)),
             }
@@ -351,6 +393,21 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
     let skills_omitted = discovered_skills.len().saturating_sub(skills::MAX_SKILLS);
     discovered_skills.truncate(skills::MAX_SKILLS);
+    // Settle the collision winners' indexed state against the RENDER's own
+    // inclusion decision, not list membership: the 50-skill cap and the
+    // 3000-byte index budget (first-fit, applied at prompt render) both
+    // drop lines, and a receipt calling a dropped line indexed sends the
+    // author hunting for it (Greptile, twice). A zero cost is a line the
+    // prompt does not carry.
+    let included: std::collections::HashSet<String> =
+        crate::prompt::skill_index_costs(project_root, &discovered_skills)
+            .into_iter()
+            .filter(|(_, cost)| *cost > 0)
+            .map(|(name, _)| name)
+            .collect();
+    for (name, _, _, indexed) in &mut shadowed_skills {
+        *indexed = included.contains(name);
+    }
     ExtensionSnapshot {
         fingerprint: h.finish(),
         external,
@@ -360,6 +417,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         files: files_read,
         broken,
         broken_tools,
+        shadowed_skills,
         memory_files,
         memory_section,
     }
@@ -396,6 +454,7 @@ impl Registry {
         registry.read_paths = snapshot.files.iter().map(|(p, _, _)| p.clone()).collect();
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
+        registry.shadowed_skills = snapshot.shadowed_skills;
         registry.frozen_memory_rows = Some(
             snapshot.memory_section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default(),
         );
@@ -450,6 +509,7 @@ impl Registry {
             broken: Vec::new(),
             read_paths: std::collections::HashSet::new(),
             broken_tools: Vec::new(),
+            shadowed_skills: Vec::new(),
             memory_files: None,
             frozen_memory_rows: None,
             memory_section: None,
@@ -1278,6 +1338,197 @@ mod tests {
         assert!(err.contains("invalid TOML"), "{err}");
         assert!(err.contains("invalid type"), "{err}");
         assert!(err.contains('^'), "{err}");
+    }
+
+    /// A collision whose WINNER falls past the skill cap must not be
+    /// recorded as indexed: neither file made the prompt, and the receipt
+    /// wording branches on this flag (Greptile).
+    #[test]
+    fn a_collision_winner_past_the_cap_is_not_marked_indexed() {
+        let dir = std::env::temp_dir().join(format!("omx-shadowcap-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for i in 0..crate::skills::MAX_SKILLS {
+            let d = project.join(".agents/skills").join(format!("s{i:02}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: s{i:02}\ndescription: filler\n---\nB.\n"),
+            )
+            .unwrap();
+        }
+        for d in ["zz-a", "zz-b"] {
+            let s = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                "---\nname: zz-common\ndescription: d\n---\nB.\n",
+            )
+            .unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
+        let (name, _, winner, winner_indexed) = &snap.shadowed_skills[0];
+        assert_eq!(name, "zz-common");
+        assert!(winner.ends_with("zz-b/SKILL.md"), "{winner:?}");
+        assert!(!*winner_indexed, "the cap dropped the winner; it is not indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A collision winner inside the 50-skill list can still lose its LINE
+    /// to the 3000-byte index budget (first-fit at render); the flag must
+    /// follow the render's own inclusion decision, or the receipt claims an
+    /// index line the prompt does not carry (Greptile).
+    #[test]
+    fn a_collision_winner_past_the_byte_budget_is_not_marked_indexed() {
+        let dir = std::env::temp_dir().join(format!("omx-shadowbb-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let long = "x".repeat(200);
+        for i in 0..14 {
+            let s = project.join(".agents/skills").join(format!("a{i:02}"));
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                format!("---\nname: a{i:02}\ndescription: {long}\n---\nB.\n"),
+            )
+            .unwrap();
+        }
+        for d in ["zz-a", "zz-b"] {
+            let s = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                format!("---\nname: zz-common\ndescription: {long}\n---\nB.\n"),
+            )
+            .unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
+        let (name, _, winner, winner_indexed) = snap.shadowed_skills[0].clone();
+        assert_eq!(name, "zz-common");
+        // Premise: the winner survives the 50-skill list but its line does
+        // not fit the byte budget.
+        let registry = Registry::from_snapshot(snap);
+        assert!(registry.skills.iter().any(|s| s.name == "zz-common"), "within the 50");
+        let costs = crate::prompt::skill_index_costs(&project, &registry.skills);
+        assert_eq!(
+            costs.iter().find(|(n, _)| n == "zz-common").map(|(_, c)| *c),
+            Some(0),
+            "the byte budget drops the line: {costs:?}"
+        );
+        assert!(winner.ends_with("zz-b/SKILL.md"), "{winner:?}");
+        assert!(!winner_indexed, "a budget-dropped line is not indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A project definition taking a name MOOTS the losing tier's collision
+    /// record: two global namesakes collide, the project override wins by
+    /// precedence, and keeping the global record made the receipt call the
+    /// name unindexed while the project skill is active (Greptile).
+    #[test]
+    fn a_project_override_moots_a_global_collision_record() {
+        let dir = std::env::temp_dir().join(format!("omx-shadowx-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for d in ["aa", "zz"] {
+            let s = data.join("skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                "---\nname: common\ndescription: global\n---\nB.\n",
+            )
+            .unwrap();
+        }
+        let s = project.join(".agents/skills/common");
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(s.join("SKILL.md"), "---\nname: common\ndescription: project\n---\nB.\n")
+            .unwrap();
+        let snap = capture_extensions(&data, &project);
+        assert!(
+            snap.shadowed_skills.is_empty(),
+            "precedence moots the losing tier's collision: {:?}",
+            snap.shadowed_skills
+        );
+        let registry = Registry::from_snapshot(snap);
+        let skill = registry.skills.iter().find(|s| s.name == "common").expect("indexed");
+        assert!(skill.path.starts_with(&project), "the project definition is the live one");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Three namesakes coalesce to ONE record: the final winner plus every
+    /// path it displaced. Recording the intermediate winner as its own entry
+    /// let the receipt call it cap-dropped while the final entry said the
+    /// name IS indexed, a contradiction about one name (Greptile).
+    #[test]
+    fn three_namesakes_coalesce_to_the_final_winner() {
+        let dir = std::env::temp_dir().join(format!("omx-shadow3-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for d in ["aa", "mm", "zz"] {
+            let s = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                "---\nname: common\ndescription: d\n---\nB.\n",
+            )
+            .unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "one record per name: {:?}", snap.shadowed_skills);
+        let (name, displaced, winner, winner_indexed) = &snap.shadowed_skills[0];
+        assert_eq!(name, "common");
+        assert_eq!(displaced.len(), 2, "{displaced:?}");
+        assert!(displaced[0].ends_with("aa/SKILL.md"), "{displaced:?}");
+        assert!(displaced[1].ends_with("mm/SKILL.md"), "{displaced:?}");
+        assert!(winner.ends_with("zz/SKILL.md"), "{winner:?}");
+        assert!(*winner_indexed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two files in ONE directory declaring the same skill name collapse to
+    /// whichever sorts last; that accident is recorded for the receipt.
+    /// Cross-tier shadowing (a project skill over a global namesake) is
+    /// deliberate precedence and is NOT recorded.
+    #[test]
+    fn a_same_tier_skill_namesake_is_recorded_and_precedence_is_not() {
+        let dir = std::env::temp_dir().join(format!("omx-shadow-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for (d, body) in [
+            ("aa-review", "---\nname: code-review\ndescription: first\n---\nA.\n"),
+            ("zz-review", "---\nname: code-review\ndescription: second\n---\nB.\n"),
+        ] {
+            let skill = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), body).unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
+        let (name, displaced, winner, winner_indexed) = &snap.shadowed_skills[0];
+        assert_eq!(name, "code-review");
+        assert_eq!(displaced.len(), 1);
+        assert!(displaced[0].ends_with("aa-review/SKILL.md"), "{displaced:?}");
+        assert!(winner.ends_with("zz-review/SKILL.md"), "{winner:?}");
+        assert!(*winner_indexed, "under the cap, the winner is in the index");
+
+        // The same name split across TIERS is precedence, not a collision.
+        let dir2 = std::env::temp_dir().join(format!("omx-shadow2-{}", uuid::Uuid::new_v4()));
+        let data2 = dir2.join("data");
+        let project2 = dir2.join("project");
+        for (root, d) in [(data2.join("skills"), "review"), (project2.join(".agents/skills"), "review")] {
+            let skill = root.join(d);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: code-review\ndescription: d\n---\nBody.\n",
+            )
+            .unwrap();
+        }
+        let snap2 = capture_extensions(&data2, &project2);
+        assert!(snap2.shadowed_skills.is_empty(), "{:?}", snap2.shadowed_skills);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
     }
 
     /// A same-name collision between a broken file and a loaded definition

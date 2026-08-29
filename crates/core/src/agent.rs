@@ -1644,6 +1644,7 @@ fn refreeze_receipt_text(
     changes: &[String],
     added: &AddedTools,
     broken: &[(std::path::PathBuf, String)],
+    shadowed_skills: &[(String, Vec<std::path::PathBuf>, std::path::PathBuf, bool)],
     project_root: &Path,
 ) -> String {
     let what = if changes.is_empty() {
@@ -1662,6 +1663,42 @@ fn refreeze_receipt_text(
             .collect();
         note.push_str(&format!(
             " NOT loaded: {} — not callable until fixed; verify with bash: openmax --check.",
+            listed.join("; ")
+        ));
+    }
+    if !shadowed_skills.is_empty() {
+        // Two files in one directory declaring one skill name collapse to
+        // whichever sorts last, silently; --check names it, but the write
+        // that caused it deserves the truth in ITS receipt, or the author
+        // reads the index line and assumes the older file is what loaded.
+        let listed: Vec<String> = shadowed_skills
+            .iter()
+            .map(|(name, displaced, winner, winner_indexed)| {
+                let winner = winner.strip_prefix(project_root).unwrap_or(winner);
+                let declarers = displaced
+                    .iter()
+                    .map(|p| p.strip_prefix(project_root).unwrap_or(p).display().to_string())
+                    .chain(std::iter::once(winner.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if *winner_indexed {
+                    format!(
+                        "'{name}' is declared by {declarers}; only {} is indexed",
+                        winner.display()
+                    )
+                } else {
+                    // The winner itself fell past the skill cap: claiming it
+                    // is indexed would send the author hunting for an index
+                    // line that does not exist (Greptile).
+                    format!(
+                        "'{name}' is declared by {declarers}; {} wins the name but the index has no room for its line (the skill cap or the byte budget; openmax --check names which), so no file of this name is indexed",
+                        winner.display()
+                    )
+                }
+            })
+            .collect();
+        note.push_str(&format!(
+            " Skill name collision: {} — rename one and verify with bash: openmax --check.",
             listed.join("; ")
         ));
     }
@@ -1993,6 +2030,7 @@ async fn refreeze_if_extensions_changed(
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
     let counts = (registry.tools.len(), registry.skills.len());
     let broken = registry.broken.clone();
+    let shadowed = registry.shadowed_skills.clone();
     let applied_added = {
         let mut sessions_map = core.sessions.lock().await;
         match sessions_map.get_mut(session_id) {
@@ -2018,7 +2056,8 @@ async fn refreeze_if_extensions_changed(
             Some((files, crate::ledger::Actor::External)),
         )
         .await;
-        let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, project_root);
+        let receipt =
+            refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root);
         core.send_agent(session_id, AgentEvent::Refrozen {
             tools: counts.0,
             skills: counts.1,
@@ -2211,6 +2250,7 @@ async fn refreeze_between_iterations(
     let counts = (new_registry.tools.len(), new_registry.skills.len());
     let added_tools = classify_added_tools(registry, &new_registry, &core.data_dir, project_root);
     let broken = new_registry.broken.clone();
+    let shadowed = new_registry.shadowed_skills.clone();
     let new_registry = Arc::new(new_registry);
     if messages.first().is_some_and(|m| m.role == "system") {
         messages[0] = ChatMessage::system(prompt);
@@ -2246,7 +2286,7 @@ async fn refreeze_between_iterations(
     // in its transcript said the tool was callable. Ride the receipt on this
     // iteration's last tool result, where the model reads next. One line,
     // only when extension bytes actually changed.
-    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, project_root);
+    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root);
     append_and_emit_note(core, session_id, messages, &receipt);
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
@@ -5204,6 +5244,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A same-directory skill namesake collapses to one index entry, and the
+    /// refreeze receipt that follows the write must say so: --check catches
+    /// it, but the author's own receipt was silent, so the index line read as
+    /// if the OLDER file were what loaded (round-5 ticket T3).
+    #[test]
+    fn refreeze_receipt_names_a_skill_shadowed_by_a_same_tier_namesake() {
+        let shadowed = vec![(
+            "code-review".to_string(),
+            vec![std::path::PathBuf::from("/p/.agents/skills/aa-review/SKILL.md")],
+            std::path::PathBuf::from("/p/.agents/skills/zz-review/SKILL.md"),
+            true,
+        )];
+        let added = AddedTools {
+            approved: Vec::new(),
+            unapproved: Vec::new(),
+            modified_unapproved: Vec::new(),
+            memory: None,
+            removed_approved: Vec::new(),
+            removed_approval_survives: Vec::new(),
+        };
+        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
+        assert!(note.contains("Skill name collision"), "{note}");
+        assert!(
+            note.contains(
+                "'code-review' is declared by .agents/skills/aa-review/SKILL.md, \
+                 .agents/skills/zz-review/SKILL.md"
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("only .agents/skills/zz-review/SKILL.md is indexed"),
+            "{note}"
+        );
+        assert!(note.contains("openmax --check"), "{note}");
+    }
+
+    /// A collision whose winner fell past the skill cap says so instead of
+    /// claiming an index line that does not exist (Greptile).
+    #[test]
+    fn the_collision_clause_says_when_the_cap_dropped_the_winner() {
+        let shadowed = vec![(
+            "zz-common".to_string(),
+            vec![std::path::PathBuf::from("/p/.agents/skills/zz-a/SKILL.md")],
+            std::path::PathBuf::from("/p/.agents/skills/zz-b/SKILL.md"),
+            false,
+        )];
+        let added = AddedTools {
+            approved: Vec::new(),
+            unapproved: Vec::new(),
+            modified_unapproved: Vec::new(),
+            memory: None,
+            removed_approved: Vec::new(),
+            removed_approval_survives: Vec::new(),
+        };
+        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
+        assert!(
+            note.contains("the index has no room for its line"),
+            "{note}"
+        );
+        assert!(note.contains("so no file of this name is indexed"), "{note}");
+        assert!(!note.contains("only .agents/skills/zz-b/SKILL.md is indexed"), "{note}");
     }
 
     /// A tool whose manifest an edit broke is present-but-broken, not removed:
