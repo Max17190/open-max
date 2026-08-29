@@ -509,6 +509,13 @@ impl Transcript {
         selected_bi: Option<usize>,
     ) {
         self.ensure_index();
+        // Prove the index covers every cache mutation instead of trusting
+        // the dirty flag's call sites: a cache edited without marking dirty
+        // would walk the loop below out of bounds.
+        debug_assert!(
+            self.total == self.blocks.iter().map(|b| b.cache.len()).sum::<usize>(),
+            "wrapped-line index went stale against the block caches",
+        );
         let end = end.min(self.total);
         let start = start.min(end);
         out.reserve(end - start);
