@@ -250,9 +250,10 @@ reference files next to SKILL.md; run them with bash.
 At most 50 skills are indexed, sorted by name, and the index is byte-capped at
 3000 bytes, first-fit in name order: a line that does not fit the remaining
 budget is omitted (and counted by a trailer), while a later, shorter line may
-still land, so shortening a description beats renaming a skill. More skills or
-longer descriptions can push a skill out of the prompt entirely
-(`openmax --check` names each one it drops). The prompt
+still land. Shortening descriptions (this skill's or an earlier one's) frees
+budget for the lines after them, and renaming changes who competes for the
+budget first. More skills or longer descriptions can push a skill out of the
+prompt entirely (`openmax --check` names each one it drops). The prompt
 shows each indexed skill as `- name: description — path/to/SKILL.md`.
 
 Example (`.agents/skills/release/SKILL.md`):
@@ -1031,11 +1032,15 @@ mod tests {
 
     #[test]
     fn spec_skills_states_first_fit_omission() {
-        // The byte cap is first-fit in name order, not a suffix cut: an
-        // author told the omissions are a suffix may rename to sort earlier
-        // when shortening the description would have worked.
+        // The byte cap is first-fit in name order, not a suffix cut, and the
+        // remediation must not overclaim either way: a minimal skill can
+        // still lose to earlier entries, where renaming is what helps
+        // (Greptile reproduced that), and shortening any earlier line frees
+        // budget for the ones after it.
         assert!(SKILLS.contains("first-fit in name order"));
         assert!(SKILLS.contains("a later, shorter line may"));
+        assert!(SKILLS.contains("this skill's or an earlier one's"));
+        assert!(SKILLS.contains("renaming changes who competes"));
     }
 
     #[test]
