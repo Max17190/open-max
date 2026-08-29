@@ -20,11 +20,12 @@ pub struct HeadlessArgs {
     pub json: bool,
 }
 
-/// Hook-authored text on a terminal-bound line: a reason or detail is often
-/// built from tool or test output, and a control byte in it (a carriage
-/// return, an ANSI escape) could split or restyle the diagnostic. One space
-/// per control byte keeps the line one line.
-fn printable(text: &str) -> String {
+/// Authored text on a terminal-bound line: a reason, detail, or file name is
+/// often built from tool or test output, and a control byte in it (a
+/// carriage return, an ANSI escape) could split or restyle the diagnostic.
+/// One space per control byte keeps the line one line. Shared with the
+/// `--check` human rows, whose path column is author-controlled too.
+pub(crate) fn printable(text: &str) -> String {
     text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 

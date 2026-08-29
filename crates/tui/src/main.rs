@@ -948,19 +948,8 @@ async fn main() -> std::io::Result<()> {
             );
             std::process::exit(0);
         }
-        use open_max_core::doctor::Status;
         for f in &findings {
-            match &f.status {
-                Status::Ok(summary) => {
-                    println!("ok   {:<11} {}  ({summary})", f.kind, f.path.display())
-                }
-                Status::Warn(reason) => {
-                    println!("warn {:<11} {}  {reason}", f.kind, f.path.display())
-                }
-                Status::Err(reason) => {
-                    println!("err  {:<11} {}  {reason}", f.kind, f.path.display())
-                }
-            }
+            println!("{}", check_row(f));
         }
         let mut example_failures = 0usize;
         if cli.run_examples {
@@ -1565,6 +1554,23 @@ fn ensure_project_trust(
 /// advances in microsecond steps on macOS, and parallel test threads routinely
 /// read the same value. The counter is what actually guarantees uniqueness;
 /// pid and clock only keep leftovers from earlier runs out of the way.
+/// One row of the `--check` human report. The whole row rides one terminal
+/// line: a file's own name is author-controlled bytes (write_file only trims
+/// the ends of a path), so a control character in it could forge a second,
+/// clean-looking row. One space per control byte, the same rule hook-authored
+/// stderr text gets. The `--json` face serializes through serde and needs no
+/// counterpart.
+fn check_row(f: &open_max_core::doctor::Finding) -> String {
+    use open_max_core::doctor::Status;
+    let path = f.path.display();
+    let row = match &f.status {
+        Status::Ok(summary) => format!("ok   {:<11} {}  ({summary})", f.kind, path),
+        Status::Warn(reason) => format!("warn {:<11} {}  {reason}", f.kind, path),
+        Status::Err(reason) => format!("err  {:<11} {}  {reason}", f.kind, path),
+    };
+    headless::printable(&row)
+}
+
 #[cfg(test)]
 pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1585,6 +1591,38 @@ mod tests {
         assert_eq!(
             super::approve_command(std::path::Path::new("/tmp/my probe dir/gate$(x).toml")),
             "openmax --approve '/tmp/my probe dir/gate$(x).toml'"
+        );
+    }
+
+    /// The path column is the file's own name, author-controlled bytes: a
+    /// control character in it (or in a diagnostic built from file content)
+    /// must not forge a second, clean-looking report row or restyle the line.
+    #[test]
+    fn a_check_row_is_one_line_whatever_the_file_is_named() {
+        use open_max_core::doctor::{Finding, Status};
+        let forged = Finding {
+            kind: "tool",
+            path: std::path::PathBuf::from(
+                ".openmax/tools/a\nok   tool        forged.toml  (schema ok)\u{1b}[31m.toml",
+            ),
+            status: Status::Err("reason with\r\ncontrol bytes".into()),
+        };
+        let row = super::check_row(&forged);
+        assert!(
+            row.chars().all(|c| !c.is_control()),
+            "a control byte survived into the row: {row:?}"
+        );
+        assert!(row.starts_with("err  tool"), "{row:?}");
+        assert!(row.ends_with("control bytes"), "{row:?}");
+
+        let ok = Finding {
+            kind: "skill",
+            path: std::path::PathBuf::from(".agents/skills/deploy/SKILL.md"),
+            status: Status::Ok("deploy: ship the current branch".into()),
+        };
+        assert_eq!(
+            super::check_row(&ok),
+            "ok   skill       .agents/skills/deploy/SKILL.md  (deploy: ship the current branch)"
         );
     }
 
