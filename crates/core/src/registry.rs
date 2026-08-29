@@ -386,11 +386,20 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
     let skills_omitted = discovered_skills.len().saturating_sub(skills::MAX_SKILLS);
     discovered_skills.truncate(skills::MAX_SKILLS);
-    // Settle the collision winners' indexed state against the FINAL list:
-    // a winner past the cap is not indexed, and saying it is would send the
-    // author hunting for an index line that does not exist (Greptile).
-    for (_, _, winner, indexed) in &mut shadowed_skills {
-        *indexed = discovered_skills.iter().any(|s| s.path == *winner);
+    // Settle the collision winners' indexed state against the RENDER's own
+    // inclusion decision, not list membership: the 50-skill cap and the
+    // 3000-byte index budget (first-fit, applied at prompt render) both
+    // drop lines, and a receipt calling a dropped line indexed sends the
+    // author hunting for it (Greptile, twice). A zero cost is a line the
+    // prompt does not carry.
+    let included: std::collections::HashSet<String> =
+        crate::prompt::skill_index_costs(project_root, &discovered_skills)
+            .into_iter()
+            .filter(|(_, cost)| *cost > 0)
+            .map(|(name, _)| name)
+            .collect();
+    for (name, _, _, indexed) in &mut shadowed_skills {
+        *indexed = included.contains(name);
     }
     ExtensionSnapshot {
         fingerprint: h.finish(),
@@ -1335,6 +1344,53 @@ mod tests {
         assert_eq!(name, "zz-common");
         assert!(winner.ends_with("zz-b/SKILL.md"), "{winner:?}");
         assert!(!*winner_indexed, "the cap dropped the winner; it is not indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A collision winner inside the 50-skill list can still lose its LINE
+    /// to the 3000-byte index budget (first-fit at render); the flag must
+    /// follow the render's own inclusion decision, or the receipt claims an
+    /// index line the prompt does not carry (Greptile).
+    #[test]
+    fn a_collision_winner_past_the_byte_budget_is_not_marked_indexed() {
+        let dir = std::env::temp_dir().join(format!("omx-shadowbb-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let long = "x".repeat(200);
+        for i in 0..14 {
+            let s = project.join(".agents/skills").join(format!("a{i:02}"));
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                format!("---\nname: a{i:02}\ndescription: {long}\n---\nB.\n"),
+            )
+            .unwrap();
+        }
+        for d in ["zz-a", "zz-b"] {
+            let s = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                format!("---\nname: zz-common\ndescription: {long}\n---\nB.\n"),
+            )
+            .unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
+        let (name, _, winner, winner_indexed) = snap.shadowed_skills[0].clone();
+        assert_eq!(name, "zz-common");
+        // Premise: the winner survives the 50-skill list but its line does
+        // not fit the byte budget.
+        let registry = Registry::from_snapshot(snap);
+        assert!(registry.skills.iter().any(|s| s.name == "zz-common"), "within the 50");
+        let costs = crate::prompt::skill_index_costs(&project, &registry.skills);
+        assert_eq!(
+            costs.iter().find(|(n, _)| n == "zz-common").map(|(_, c)| *c),
+            Some(0),
+            "the byte budget drops the line: {costs:?}"
+        );
+        assert!(winner.ends_with("zz-b/SKILL.md"), "{winner:?}");
+        assert!(!winner_indexed, "a budget-dropped line is not indexed");
         let _ = std::fs::remove_dir_all(dir);
     }
 

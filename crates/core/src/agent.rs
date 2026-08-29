@@ -1674,7 +1674,7 @@ fn refreeze_receipt_text(
                     // is indexed would send the author hunting for an index
                     // line that does not exist (Greptile).
                     format!(
-                        "'{name}' is declared by {declarers}; {} wins the name but the skill cap dropped it, so no file of this name is indexed",
+                        "'{name}' is declared by {declarers}; {} wins the name but the index has no room for its line (the skill cap or the byte budget; openmax --check names which), so no file of this name is indexed",
                         winner.display()
                     )
                 }
@@ -5214,9 +5214,10 @@ mod tests {
         };
         let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
         assert!(
-            note.contains("the skill cap dropped it, so no file of this name is indexed"),
+            note.contains("the index has no room for its line"),
             "{note}"
         );
+        assert!(note.contains("so no file of this name is indexed"), "{note}");
         assert!(!note.contains("only .agents/skills/zz-b/SKILL.md is indexed"), "{note}");
     }
 
