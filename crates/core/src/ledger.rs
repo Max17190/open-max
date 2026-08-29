@@ -963,23 +963,32 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
         // and the file is set aside, or it waits for a human to adopt it.
         with_lock(&dir, || settle_legacy_store_locked(&dir))?;
     }
-    // The pin plus the log's length name one exact chain: a different log that
-    // hashed to the same pin would be a sha256 collision on the final record.
-    // Every mutating call and every hook run asks this question, so verifying
-    // thousands of records again each time is worth avoiding - but only
-    // against a key that cannot be forged into a stale answer. A pending
-    // legacy store is part of the answer and is not covered by that key, so
-    // while one is on disk the cache steps aside.
+    // The pin plus the log's CONTENT hash name one exact chain. The previous
+    // key was (pin, byte length), and a same-length in-place rewrite of a
+    // pinned record kept both while breaking the chain, so the cache served
+    // stale approvals to the input gate and a corrupted ledger's turn still
+    // reached the provider (Greptile, live repro). Every mutating call and
+    // every hook run asks this question, so full verification (per-line
+    // parse, per-record hashing) is still worth avoiding on a hit; the price
+    // of a key that cannot be forged into a stale answer is one linear
+    // read+hash of the log per query. Only verified-Ok results are cached,
+    // and under a fixed pin only one log content verifies (any altered
+    // record breaks the chain the pin transitively names; an appended tail
+    // is either unparseable, unpinned authority that refuses, or vouched by
+    // a pending head, which bypasses the cache below), so a hit's bytes are
+    // the bytes its cached answer was verified from. A pending legacy store
+    // is part of the answer and is not covered by the key, so while one is
+    // on disk the cache steps aside.
     let pending = read_legacy_store(&dir);
     let key = pending
         .is_none()
         .then(|| {
             read_trimmed(&chain_head_path(&dir))
-                .zip(std::fs::metadata(log_path(&dir)).ok().map(|m| m.len()))
+                .zip(std::fs::read(log_path(&dir)).ok().map(|bytes| sha256_hex(&bytes)))
         })
         .flatten();
-    if let Some((pin, len)) = &key {
-        if let Some(hit) = cached_approvals(&dir, pin, *len) {
+    if let Some((pin, log_sha)) = &key {
+        if let Some(hit) = cached_approvals(&dir, pin, log_sha) {
             return Ok(hit);
         }
     }
@@ -1000,8 +1009,8 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
         }
         return Ok(approved);
     }
-    if let Some((pin, len)) = key {
-        remember_approvals(&dir, pin, len, &approved);
+    if let Some((pin, log_sha)) = key {
+        remember_approvals(&dir, pin, log_sha, &approved);
     }
     Ok(approved)
 }
@@ -1014,26 +1023,28 @@ pub fn approved_hashes(
     approvals(data_dir, project_root).map(|a| a.hashes)
 }
 
-type ApprovalCache = HashMap<PathBuf, (String, u64, Approvals)>;
+/// dir -> (pin, log content sha256, verified approvals). Content-keyed: a
+/// length-preserving rewrite must miss, or the gate is served a stale pass.
+type ApprovalCache = HashMap<PathBuf, (String, String, Approvals)>;
 
 fn approval_cache() -> &'static std::sync::Mutex<ApprovalCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<ApprovalCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn cached_approvals(dir: &Path, pin: &str, len: u64) -> Option<Approvals> {
+fn cached_approvals(dir: &Path, pin: &str, log_sha: &str) -> Option<Approvals> {
     let cache = approval_cache().lock().ok()?;
     match cache.get(dir) {
-        Some((cached_pin, cached_len, approved)) if cached_pin == pin && *cached_len == len => {
+        Some((cached_pin, cached_sha, approved)) if cached_pin == pin && cached_sha == log_sha => {
             Some(approved.clone())
         }
         _ => None,
     }
 }
 
-fn remember_approvals(dir: &Path, pin: String, len: u64, approved: &Approvals) {
+fn remember_approvals(dir: &Path, pin: String, log_sha: String, approved: &Approvals) {
     if let Ok(mut cache) = approval_cache().lock() {
-        cache.insert(dir.to_path_buf(), (pin, len, approved.clone()));
+        cache.insert(dir.to_path_buf(), (pin, log_sha, approved.clone()));
     }
 }
 
@@ -2385,6 +2396,44 @@ mod tests {
         assert_eq!(std::fs::read_to_string(object).unwrap(), "name = \"a\"");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The approvals cache key is the log's CONTENT, not its length: a
+    /// same-length in-place rewrite of a pinned record keeps the pin file
+    /// and the byte count intact while breaking the chain, and the old
+    /// (pin, len) key served the stale pass to the very gates that exist to
+    /// refuse a broken chain, so a corrupted ledger's turn still reached the
+    /// provider (Greptile, live repro).
+    #[test]
+    fn a_same_length_in_place_rewrite_is_not_served_from_the_cache() {
+        let data = temp("rewrite-data");
+        let root = temp("rewrite-proj");
+        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
+        let m1 = root.join(".openmax/tools/a.toml");
+        std::fs::write(&m1, "name = \"a\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+            .unwrap();
+        let sha1 = sha256_hex(&std::fs::read(&m1).unwrap());
+        approve_capability(&data, &root, &m1, std::slice::from_ref(&sha1)).unwrap();
+        // A verified read populates the cache.
+        assert!(approved_hashes(&data, &root).unwrap().contains(&sha1));
+
+        // Flip one hex digit of the stored hash IN PLACE: pin file, log
+        // length, and every other byte stay identical; the chain does not.
+        let log = log_path(&project_dir(&data, &root));
+        let text = std::fs::read_to_string(&log).unwrap();
+        let mut flipped = sha1.clone();
+        let first = if flipped.starts_with('a') { "b" } else { "a" };
+        flipped.replace_range(0..1, first);
+        let mutated = text.replacen(&sha1, &flipped, 1);
+        assert_ne!(mutated, text, "the record carries the hash to flip");
+        assert_eq!(mutated.len(), text.len(), "the rewrite preserves length");
+        std::fs::write(&log, &mutated).unwrap();
+
+        assert!(
+            approved_hashes(&data, &root).is_err(),
+            "a content change under an unmoved pin and length must be a verification \
+             failure, never a cache hit"
+        );
     }
 
     /// Narration must match enforcement: an approval record past the pinned

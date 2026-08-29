@@ -717,3 +717,82 @@ async fn an_unverifiable_ledger_blocks_the_turn_and_names_the_repair() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The cache half of the same guarantee, end to end: a healthy turn
+/// populates the approvals cache through the gate's own read; a same-length
+/// in-place rewrite of a pinned record then breaks the chain WITHOUT moving
+/// the pin file or the log's byte count, which the old (pin, len) cache key
+/// trusted. The gate must refuse the next turn on the fresh content, never
+/// run it on the stale cached pass (Greptile, live repro: the corrupted
+/// turn still reached the provider).
+#[tokio::test]
+async fn a_cached_approval_does_not_survive_an_in_place_ledger_rewrite() {
+    let dir = std::env::temp_dir().join(format!("omx-rewrite-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    std::fs::write(
+        project.join(".openmax/tools/docsearch.toml"),
+        "name = \"docsearch\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    // Two completions on purpose: the second must never be requested. If the
+    // stale cache passes the gate, turn two consumes it and the assertions
+    // below catch the second body.
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_text("turn one"),
+        completion_with_text("turn two must never run"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    drive_turn(&core, &mut rx, "rewrite", &project, "one").await;
+
+    // Flip one hex digit inside the first record, in place: same length,
+    // same pin file, broken chain.
+    let log = open_max_core::ledger::project_dir(&data, &project).join("log.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let first_line = text.lines().next().expect("the freeze seeded a record");
+    let record: serde_json::Value = serde_json::from_str(first_line).unwrap();
+    let sha = record["sha256"].as_str().expect("the record carries a hash").to_string();
+    let mut flipped = sha.clone();
+    let repl = if flipped.starts_with('a') { "b" } else { "a" };
+    flipped.replace_range(0..1, repl);
+    let mutated = text.replacen(&sha, &flipped, 1);
+    assert_eq!(mutated.len(), text.len(), "the rewrite preserves length");
+    assert_ne!(mutated, text);
+    std::fs::write(&log, &mutated).unwrap();
+
+    open_max_core::agent::start_turn(
+        Arc::clone(&core),
+        "rewrite".into(),
+        project.to_path_buf(),
+        "two".into(),
+    )
+    .unwrap();
+    let mut error_message = None;
+    let stop_reason = loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the refusal is prompt")
+            .expect("event channel stays open");
+        match envelope.event {
+            AgentEvent::Error { message } => error_message = Some(message),
+            AgentEvent::Done { stop_reason } => break stop_reason,
+            _ => {}
+        }
+    };
+    assert_eq!(stop_reason, "blocked", "the rewritten ledger refuses the turn");
+    let message = error_message.expect("the refusal carries an error message");
+    assert!(
+        message.contains("capability ledger") && message.contains("openmax --ledger-repair"),
+        "the state and the human repair are named: {message}"
+    );
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        1,
+        "the stale cached pass must not buy the corrupted turn a provider request"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

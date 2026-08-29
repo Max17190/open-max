@@ -2394,9 +2394,11 @@ async fn run_loop(
     // An unverifiable ledger never reaches this point in a turn: the hook
     // layer fails closed on the same state first and blocks the input
     // entirely ("input blocked: the capability ledger cannot be read...",
-    // naming --ledger-repair), so no model turn exists to carry a note. The
-    // Result keeps the API honest for callers that must not mistake
-    // "unreadable" for "no activity".
+    // naming --ledger-repair), and the approvals cache that gate reads is
+    // keyed on the log's content hash, so a rewrite cannot serve it a stale
+    // pass (Greptile: the old length-keyed cache could). The Result keeps
+    // the API honest for callers that must not mistake "unreadable" for
+    // "no activity".
     if let Ok(events) = crate::ledger::approval_events(&core.data_dir, project_root) {
         let mut fresh: Vec<String> = Vec::new();
         {
