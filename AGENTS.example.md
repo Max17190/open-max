@@ -11,7 +11,7 @@ Native Rust coding-agent harness: one focused loop, small tools, fast TUI, exten
 | Not built in | Use instead |
 | --- | --- |
 | MCP | CLI tools + skills |
-| Nested agents | Focused tools, or a child `openmax -p` / `openmax --stdio` (tmux). Skills: `parallel-explore`, `delegate`. |
+| Nested agents | Focused tools, or a child `openmax -p` / `openmax --stdio` (tmux); ask the agent to author a delegate skill when the project wants one. |
 | Plan mode | Write `PLAN.md` |
 | Background bash product | tmux sessions |
 | Built-in TODOs | Write `TODO.md` |

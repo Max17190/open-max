@@ -746,6 +746,59 @@ mod tests {
         );
     }
 
+    /// The repository's own extension surfaces ship empty. A file under
+    /// `.agents/` or `.openmax/` is installed capability that every session
+    /// working in this repo pays frozen-prompt bytes for on every request,
+    /// not an example: a shipped plan mode and a stray skill install both
+    /// proved the cost on the wire before being removed. Recipes and eval
+    /// derivations are evidence and live outside the repo; personal
+    /// capability belongs in `~/.openmax/`. The guard reads the repository
+    /// index, not the filesystem, because tracked files are what a clone
+    /// inherits, while local runtime state (a project memory note, a
+    /// personal experiment) stays free.
+    #[test]
+    fn the_extension_surfaces_ship_empty() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // A packaged crate is not a checkout and has no index to guard. The
+        // decision is structural (`.git` is a file in a linked worktree, so
+        // exists, not is_dir) because git's diagnostics localize: matching
+        // its English stderr would turn the same skip into a panic under a
+        // non-English locale.
+        if !root.join(".git").exists() {
+            eprintln!("skipping: {} is not a git checkout", root.display());
+            return;
+        }
+        let out = match std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", ".agents", ".openmax"])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: git is not available; this guard reads the repository index");
+                return;
+            }
+            Err(e) => panic!("cannot run git to read the surfaces: {e}"),
+        };
+        if !out.status.success() {
+            // With `.git` present every failure is real; nothing here is a
+            // skip this guard may shrug off.
+            panic!(
+                "git ls-files failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let listed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            listed.trim().is_empty(),
+            "tracked files on the extension surfaces; a file here bills every \
+             session's frozen prompt, so capability is asked of the agent, \
+             recipes live outside the repo, and personal capability goes in \
+             ~/.openmax/:\n{listed}"
+        );
+    }
+
     /// Measurement helper for cap raises (see the budget-gate comment): dumps
     /// the exact path-free payload the cap test measures so a real tokenizer
     /// can count it. Run with `--ignored --nocapture`; files land in the OS
