@@ -186,7 +186,7 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end. Unapproved hooks are inert; approval covers the .toml and the code it runs, and editing either revokes it (a revoked live gate then blocks tools).\n\
 - Permission rules: .openmax/permissions.toml, one [[rules]] table per rule with effect = allow|deny|ask, tool = \"<tool name>\", optional arg_regex (unanchored). Any error in this file denies every tool, so write it exactly and check it.\n\
 - Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
-A tool or skill you write goes live before your next step: the harness re-freezes after a successful mutating call and at turn start (/reload also forces it). The harness records tool/skill file changes (actor + hash); bash: openmax --ledger lists history and restorable objects. Hooks, permissions, and templates apply on their next use. Verify what you wrote with bash: openmax --check. Before writing a surface, read its full contract (fields, stdin payloads, activation) with bash: openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
+A tool or skill you write goes live before your next step: the harness re-freezes after every executed mutating call and at turn start (/reload also forces it). The harness records tool/skill file changes (actor + hash); bash: openmax --ledger lists history and restorable objects. Permissions and templates apply on next use; hooks from the next turn. Verify what you wrote with bash: openmax --check. Before writing a surface, read its full contract (fields, stdin payloads, activation) with bash: openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
 Compose beyond the loop with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.\n\
 \n\
 Working files (there is no built-in plan mode or todo list):\n\
@@ -594,6 +594,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn the_guide_states_executed_call_and_turn_granular_hooks() {
+        // #242 made a failed writer activate too; hooks are turn-granular,
+        // unlike permissions and templates. "After a successful mutating
+        // call" contradicted the receipt a failed writer earns in the same
+        // turn, and lumping hooks into "apply on their next use" invited the
+        // install-the-gate-then-prove-it shape at call granularity hooks do
+        // not have (round-7 audit). The failed-call nuance lives in --spec
+        // tools/skills, where it costs nothing until read; the guide is an
+        // index (module doc), so it carries the trigger, not the nuance.
+        assert!(SELF_EXTENSION.contains("every executed mutating call"));
+        assert!(!SELF_EXTENSION.contains("successful mutating call"));
+        assert!(SELF_EXTENSION.contains("hooks from the next turn"));
+    }
+
+    #[test]
+    fn the_guide_pointer_names_only_real_surfaces() {
+        // Every surface the pointer names must exist, and the omissions must
+        // be exactly the deliberate ones: settings, recall, and usage are not
+        // authoring surfaces, and the moments that need them carry their own
+        // pointer (--check settings rows print "openmax --spec settings"; the
+        // guide's memory line names --recall). A new --spec surface must
+        // either join the pointer or this list, consciously.
+        let pointer = ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory", "stdio"];
+        for s in pointer {
+            assert!(crate::spec::SURFACES.contains(&s), "the pointer names a surface --spec lacks: {s}");
+        }
+        let mut omitted: Vec<&str> = crate::spec::SURFACES
+            .iter()
+            .copied()
+            .filter(|s| !pointer.contains(s))
+            .collect();
+        omitted.sort_unstable();
+        // Order-independent: SURFACES declaration order is not a contract
+        // here, only the SET of deliberate omissions is (Greptile).
+        assert_eq!(
+            omitted,
+            ["recall", "settings", "usage"],
+            "a new surface joins the pointer or the deliberate-omission list"
+        );
+    }
+
     /// Budget gate for the frozen prompt prefix: base system prompt, the
     /// self-extension guide (now including the working-files contract), and
     /// the serialized builtin tool array must stay within ~1180 tokens. The
@@ -626,33 +668,6 @@ mod tests {
     /// history the agent cannot find is a promise, not a capability; 18 real
     /// tokens buys the pointer that makes archives and past sessions
     /// searchable instead of merely stored.
-    #[test]
-    fn the_guide_pointer_names_only_real_surfaces() {
-        // Every surface the pointer names must exist, and the omissions must
-        // be exactly the deliberate ones: settings, recall, and usage are not
-        // authoring surfaces, and the moments that need them carry their own
-        // pointer (--check settings rows print "openmax --spec settings"; the
-        // guide's memory line names --recall). A new --spec surface must
-        // either join the pointer or this list, consciously.
-        let pointer = ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory", "stdio"];
-        for s in pointer {
-            assert!(crate::spec::SURFACES.contains(&s), "the pointer names a surface --spec lacks: {s}");
-        }
-        let mut omitted: Vec<&str> = crate::spec::SURFACES
-            .iter()
-            .copied()
-            .filter(|s| !pointer.contains(s))
-            .collect();
-        omitted.sort_unstable();
-        // Order-independent: SURFACES declaration order is not a contract
-        // here, only the SET of deliberate omissions is (Greptile).
-        assert_eq!(
-            omitted,
-            ["recall", "settings", "usage"],
-            "a new surface joins the pointer or the deliberate-omission list"
-        );
-    }
-
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();

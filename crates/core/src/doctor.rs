@@ -633,9 +633,11 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
 
     for path in crate::permissions::permission_files(project_root) {
-        let Some(result) = crate::permissions::check_file(&path) else { continue };
+        let Some(result) = crate::permissions::check_file(&path, project_root, data_dir) else {
+            continue;
+        };
         match result {
-            Ok(rule_tools) => {
+            Ok((rule_tools, inert_verdict)) => {
                 for (i, tool) in rule_tools.iter().enumerate() {
                     if let Some(reason) = unknown_tool_reason(
                         tool,
@@ -653,19 +655,28 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 }
                 // An inert allow reads as a healthy rule count from the file
                 // alone: the rule is well-formed, it just is not authority.
-                if let Some(reason) =
-                    crate::permissions::inert_allow_reason(&path, project_root, data_dir)
-                {
+                // The summary row counts the inert ones too - it prints after
+                // the warn, so "(N rules)" alone would close the file's story
+                // claiming every rule is in force (round-7 audit, reproduced).
+                // The verdict came from the SAME read as the rule list.
+                let mut inert = 0;
+                if let Some((reason, dropped)) = inert_verdict {
+                    inert = dropped;
                     findings.push(Finding {
                         kind: "permissions",
                         path: path.clone(),
                         status: Status::Warn(reason),
                     });
                 }
+                let summary = if inert > 0 {
+                    format!("{} rules, {inert} inert until approved", rule_tools.len())
+                } else {
+                    format!("{} rules", rule_tools.len())
+                };
                 findings.push(Finding {
                     kind: "permissions",
                     path,
-                    status: Status::Ok(format!("{} rules", rule_tools.len())),
+                    status: Status::Ok(summary),
                 });
             }
             Err(reason) => {
@@ -4106,6 +4117,34 @@ mod tests {
 
     /// The report a project gets when every extension it wrote is at a path
     /// nothing reads. This used to be "no extension files found", exit 0.
+    #[test]
+    fn an_inert_allow_file_does_not_summarize_as_live_rules() {
+        // The warn names the inert allow, but the Ok summary prints after it
+        // and "(2 rules)" alone closed the file's story claiming both rules
+        // are in force; the truth is one deny in force, one allow inert.
+        let root = temp_project();
+        let data = root.join("data");
+        write(
+            root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\narg_regex = \"^git status\"\n\n[[rules]]\neffect = \"deny\"\ntool = \"bash\"\narg_regex = \"rm -rf\"\n",
+        );
+        let findings = check_at(&root, &data);
+        let summary = findings
+            .iter()
+            .filter(|f| f.kind == "permissions")
+            .find_map(|f| match &f.status {
+                Status::Ok(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the file draws a summary row");
+        assert_eq!(summary, "2 rules, 1 inert until approved", "the summary counts what is in force");
+        assert!(
+            findings.iter().any(|f| matches!(&f.status, Status::Warn(w) if w.contains("inert"))),
+            "the warn still names the inert allow"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn misplaced_files_are_reported_instead_of_looking_healthy() {
         let root = temp_project();

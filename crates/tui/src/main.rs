@@ -240,6 +240,14 @@ fn require_human(what: &str, repair: &str) {
     }
 }
 
+/// Every printed `openmax --approve` quotes its path (core's shell_quote
+/// contract): manifest paths are agent-chosen filenames, and a space or
+/// metacharacter in one turned the pastable repair into a command that
+/// failed on a path fragment (round-7 audit, reproduced).
+fn approve_command(path: &std::path::Path) -> String {
+    format!("openmax --approve {}", open_max_core::doctor::shell_quote(path))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = match parse_args() {
@@ -1189,8 +1197,8 @@ async fn run_tool_examples(
             // Loud by design: the probe ran UNAPPROVED content with zero
             // host authority; nothing was blessed by it running.
             true => format!(
-                "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: openmax --approve {}]",
-                verdict.path.display()
+                "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: {}]",
+                approve_command(&verdict.path)
             ),
             false => String::new(),
         };
@@ -1253,9 +1261,9 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
                     Ok(()) if verdict.sandboxed => (
                         "ok",
                         format!(
-                            "example for '{}' ran in a sandbox (unapproved content: no network, writes confined; approve with openmax --approve {})",
+                            "example for '{}' ran in a sandbox (unapproved content: no network, writes confined; approve with {})",
                             verdict.tool,
-                            verdict.path.display()
+                            approve_command(&verdict.path)
                         ),
                     ),
                     Ok(()) => ("ok", format!("example for '{}' ran", verdict.tool)),
@@ -1571,6 +1579,15 @@ pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approve_commands_quote_metacharacter_paths() {
+        // The path is agent-chosen; the printed command is pastable.
+        assert_eq!(
+            super::approve_command(std::path::Path::new("/tmp/my probe dir/gate$(x).toml")),
+            "openmax --approve '/tmp/my probe dir/gate$(x).toml'"
+        );
+    }
+
     /// --help's --spec list names every surface the binary accepts: --check
     /// rows send readers to `openmax --spec settings`, and the help text was
     /// the one place that did not know it existed (round-7 audit).
