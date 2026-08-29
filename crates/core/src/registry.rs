@@ -112,6 +112,13 @@ pub struct Registry {
     /// `None` here is ambiguous on its own - an empty scan and a registry that
     /// never scanned both leave it None - so `memory_scanned` disambiguates.
     pub memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// The memory identities frozen WITH the persisted prompt, independent
+    /// of the resettable resume-delta baseline above: from_manifest clears
+    /// `memory_files` so the first refreeze reports no spurious delta, but
+    /// the persisted-prompt parser still needs the freeze's stems to tell
+    /// genuine index rows from user-authored lookalikes (Greptile). None
+    /// only for a manifest that predates the field.
+    pub(crate) frozen_memory_identities: Option<Vec<(String, u64)>>,
     /// True only when THIS registry actually ran a memory scan (a fresh
     /// freeze). A manifest-restored registry sets `memory_files` for the
     /// resume delta but never captured a section, so it is false and the
@@ -349,6 +356,7 @@ impl Registry {
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
         registry.broken = snapshot.broken;
+        registry.frozen_memory_identities = Some(snapshot.memory_files.clone());
         registry.memory_files = Some(snapshot.memory_files);
         registry.memory_section = snapshot.memory_section;
         registry.memory_scanned = true;
@@ -399,6 +407,7 @@ impl Registry {
             ext_fingerprint: 0,
             broken: Vec::new(),
             memory_files: None,
+            frozen_memory_identities: None,
             memory_section: None,
             memory_scanned: false,
             schemas,
@@ -605,7 +614,10 @@ impl Registry {
             })
             .collect();
         RegistryManifest {
-            memory_files: self.memory_files.clone(),
+            // The frozen channel, not the resettable delta baseline: a
+            // restored registry re-suspending must not erase the identities
+            // its persisted prompt still depends on.
+            memory_files: self.frozen_memory_identities.clone(),
             version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
@@ -644,9 +656,11 @@ impl Registry {
         // offline replacement the prompt already shows as newly indexed and
         // the old item as dropped (Greptile). memory_files stays None so the
         // first refreeze establishes the fresh scan as the baseline with no
-        // spurious delta. (`manifest.memory_files` is retained by to_manifest
-        // for forward compatibility and diagnostics.)
-        let _ = &manifest.memory_files;
+        // spurious delta. The identities themselves survive on the frozen
+        // channel: the persisted-prompt parser filters rows by the stems of
+        // the freeze that WROTE that prompt, which is precisely what the
+        // manifest carries (Greptile).
+        registry.frozen_memory_identities = manifest.memory_files.clone();
         registry
     }
 

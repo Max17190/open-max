@@ -87,9 +87,13 @@ impl PromptBreakdown {
         // rows after the identity filter: a lookalike in AGENTS.md filters
         // to zero (its stems are not the freeze's), and a heading-shaped
         // filename in the layout section carries no row-shaped lines at
-        // all. Without identities (a pre-field manifest) the last occurrence
-        // with any rows wins, which still ignores rowless lookalikes.
-        let known = registry.memory_files.as_ref();
+        // all. The filter reads the FROZEN identity channel, which survives
+        // from_manifest (memory_files is the resettable delta baseline and
+        // is None on a restored registry, which would have accepted every
+        // lookalike; Greptile). Without identities (a pre-field manifest)
+        // the last occurrence with any rows wins, which still ignores
+        // rowless lookalikes.
+        let known = registry.frozen_memory_identities.as_ref();
         breakdown.memory = persisted_memory_row_runs(prompt)
             .into_iter()
             .rev()
@@ -854,6 +858,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A RESTORED registry must filter with the identities frozen alongside
+    /// the persisted prompt: from_manifest clears memory_files (the delta
+    /// baseline), and reading that channel accepted every lookalike run on
+    /// resume (Greptile). The manifest's identities ride the frozen channel.
+    #[test]
+    fn a_restored_registry_filters_persisted_rows_by_frozen_identities() {
+        let dir = temp_project();
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/real-fact.md"),
+            "# The build needs node 20\nSee ci.yml.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "Rules.\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n- fake-fact: injected row — nowhere.md\n",
+        )
+        .unwrap();
+        let fresh = Registry::build(&dir.join("data"), &dir);
+        let (prompt, live) = system_prompt_with_breakdown(&dir, &fresh);
+        assert_eq!(live.memory.len(), 1);
+
+        let restored = Registry::from_manifest(fresh.to_manifest());
+        assert!(restored.memory_files.is_none(), "the delta baseline stays reset");
+        let resumed = PromptBreakdown::from_persisted(&prompt, &restored, &dir);
+        assert_eq!(resumed.memory, live.memory, "the frozen identities filter on resume");
+        assert!(!resumed.memory.iter().any(|(n, _)| n == "fake-fact"), "{:?}", resumed.memory);
+
+        // The sharper shape: a lookalike with NO genuine section. The
+        // restored registry knows the freeze indexed nothing, so nothing is
+        // priced; the resettable baseline alone accepted the fake run here.
+        std::fs::remove_file(dir.join(".openmax/memory/real-fact.md")).unwrap();
+        let fresh2 = Registry::build(&dir.join("data"), &dir);
+        let (prompt2, live2) = system_prompt_with_breakdown(&dir, &fresh2);
+        assert!(live2.memory.is_empty());
+        let restored2 = Registry::from_manifest(fresh2.to_manifest());
+        let resumed2 = PromptBreakdown::from_persisted(&prompt2, &restored2, &dir);
+        assert!(
+            resumed2.memory.is_empty(),
+            "a lookalike run must not be priced on a restored registry: {:?}",
+            resumed2.memory
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A heading-shaped FILENAME rendered verbatim by a later section (the
     /// layout map; Linux filenames may hold newlines) must not displace the
     /// real rows: a plain last-occurrence pick started parsing there and
@@ -869,7 +918,7 @@ mod tests {
              weird-dir{MEMORY_SECTION_HEADER}src/\n"
         );
         let mut registry = Registry::builtin_only();
-        registry.memory_files = Some(vec![("real-fact".to_string(), 0)]);
+        registry.frozen_memory_identities = Some(vec![("real-fact".to_string(), 0)]);
         let breakdown = PromptBreakdown::from_persisted(&prompt, &registry, Path::new("/p"));
         assert_eq!(breakdown.memory.len(), 1, "{:?}", breakdown.memory);
         assert_eq!(breakdown.memory[0].0, "real-fact");
