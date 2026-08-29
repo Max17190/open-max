@@ -1627,7 +1627,7 @@ fn refreeze_receipt_text(
     changes: &[String],
     added: &AddedTools,
     broken: &[(std::path::PathBuf, String)],
-    shadowed_skills: &[(String, std::path::PathBuf, std::path::PathBuf, bool)],
+    shadowed_skills: &[(String, Vec<std::path::PathBuf>, std::path::PathBuf, bool)],
     project_root: &Path,
 ) -> String {
     let what = if changes.is_empty() {
@@ -1656,14 +1656,17 @@ fn refreeze_receipt_text(
         // reads the index line and assumes the older file is what loaded.
         let listed: Vec<String> = shadowed_skills
             .iter()
-            .map(|(name, ignored, winner, winner_indexed)| {
-                let ignored = ignored.strip_prefix(project_root).unwrap_or(ignored);
+            .map(|(name, displaced, winner, winner_indexed)| {
                 let winner = winner.strip_prefix(project_root).unwrap_or(winner);
+                let declarers = displaced
+                    .iter()
+                    .map(|p| p.strip_prefix(project_root).unwrap_or(p).display().to_string())
+                    .chain(std::iter::once(winner.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 if *winner_indexed {
                     format!(
-                        "'{name}' is declared by both {} and {}; only {} is indexed",
-                        ignored.display(),
-                        winner.display(),
+                        "'{name}' is declared by {declarers}; only {} is indexed",
                         winner.display()
                     )
                 } else {
@@ -1671,9 +1674,7 @@ fn refreeze_receipt_text(
                     // is indexed would send the author hunting for an index
                     // line that does not exist (Greptile).
                     format!(
-                        "'{name}' is declared by both {} and {}; {} wins the name but the skill cap dropped it, so neither is indexed",
-                        ignored.display(),
-                        winner.display(),
+                        "'{name}' is declared by {declarers}; {} wins the name but the skill cap dropped it, so no file of this name is indexed",
                         winner.display()
                     )
                 }
@@ -5165,7 +5166,7 @@ mod tests {
     fn refreeze_receipt_names_a_skill_shadowed_by_a_same_tier_namesake() {
         let shadowed = vec![(
             "code-review".to_string(),
-            std::path::PathBuf::from("/p/.agents/skills/aa-review/SKILL.md"),
+            vec![std::path::PathBuf::from("/p/.agents/skills/aa-review/SKILL.md")],
             std::path::PathBuf::from("/p/.agents/skills/zz-review/SKILL.md"),
             true,
         )];
@@ -5180,7 +5181,10 @@ mod tests {
         let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
         assert!(note.contains("Skill name collision"), "{note}");
         assert!(
-            note.contains("'code-review' is declared by both .agents/skills/aa-review/SKILL.md"),
+            note.contains(
+                "'code-review' is declared by .agents/skills/aa-review/SKILL.md, \
+                 .agents/skills/zz-review/SKILL.md"
+            ),
             "{note}"
         );
         assert!(
@@ -5196,7 +5200,7 @@ mod tests {
     fn the_collision_clause_says_when_the_cap_dropped_the_winner() {
         let shadowed = vec![(
             "zz-common".to_string(),
-            std::path::PathBuf::from("/p/.agents/skills/zz-a/SKILL.md"),
+            vec![std::path::PathBuf::from("/p/.agents/skills/zz-a/SKILL.md")],
             std::path::PathBuf::from("/p/.agents/skills/zz-b/SKILL.md"),
             false,
         )];
@@ -5210,7 +5214,7 @@ mod tests {
         };
         let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
         assert!(
-            note.contains("the skill cap dropped it, so neither is indexed"),
+            note.contains("the skill cap dropped it, so no file of this name is indexed"),
             "{note}"
         );
         assert!(!note.contains("only .agents/skills/zz-b/SKILL.md is indexed"), "{note}");

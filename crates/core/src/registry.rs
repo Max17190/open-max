@@ -116,11 +116,11 @@ pub struct Registry {
     /// see that a broken file already explains an absent name. Empty for a
     /// manifest-restored registry.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
-    /// Same-directory skill name collisions (name, ignored path, winning
-    /// path, winner indexed), for the refreeze receipt. Empty for a
-    /// manifest-restored registry, which only narrates deltas it can
-    /// compute.
-    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf, bool)>,
+    /// Same-directory skill name collisions, one record per name (name,
+    /// displaced paths, winning path, winner indexed), for the refreeze
+    /// receipt. Empty for a manifest-restored registry, which only narrates
+    /// deltas it can compute.
+    pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
     /// Memory files (stem, content hash) this freeze indexed; None for a
     /// registry rebuilt from a manifest that predates the field, so the
     /// first refreeze after an upgrade does not narrate every memory as new.
@@ -169,10 +169,10 @@ pub(crate) struct ExtensionSnapshot {
     /// The tool-tier subset of `broken` with the name each file occupies
     /// (declared, or stem as the fallback), for the refreeze classifier.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
-    /// Same-directory skill name collisions: (name, ignored path, winning
-    /// path, winner indexed). The receipt names these; cross-tier
-    /// precedence is not here.
-    pub(crate) shadowed_skills: Vec<(String, PathBuf, PathBuf, bool)>,
+    /// Same-directory skill name collisions, one record per name: (name,
+    /// displaced paths, winning path, winner indexed). The receipt names
+    /// these; cross-tier precedence is not here.
+    pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
     /// Project memory files (stem, content hash). Memory rides the frozen
     /// prompt's index, so a memory write moves the fingerprint and refreezes:
     /// the fact is live from the next step, deterministically, instead of
@@ -290,14 +290,17 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     let external_by_name: HashMap<String, ToolSpec> =
         external_by_name.into_iter().map(|(k, (_, v))| (k, v)).collect();
     let mut skills_by_name: HashMap<String, SkillSpec> = HashMap::new();
-    // (name, ignored path, winning path, winner indexed): two files in the
+    // (name, displaced paths, winning path, winner indexed): files in the
     // SAME directory declaring one name. Cross-tier shadowing is precedence
     // (a project definition wins over a global one, deliberately, silently);
     // same-tier last-wins is an accident of scan order, so the refreeze
     // receipt names it the moment it happens, the way --check already does.
-    // The indexed flag is settled AFTER the skill cap below: a winner the
-    // cap drops must not be reported as indexed (Greptile).
-    let mut shadowed_skills: Vec<(String, PathBuf, PathBuf, bool)> = Vec::new();
+    // Collisions coalesce to ONE record per name (three namesakes must not
+    // report the intermediate winner as cap-dropped while the final one is
+    // indexed), and the indexed flag is settled AFTER the skill cap below:
+    // a winner the cap drops must not be reported as indexed (Greptile,
+    // both).
+    let mut shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)> = Vec::new();
     for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -326,7 +329,14 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
                     let winner = spec.path.clone();
                     if let Some(prev) = skills_by_name.insert(name.clone(), spec) {
                         if prev.path.starts_with(&dir) {
-                            shadowed_skills.push((name, prev.path, winner, false));
+                            match shadowed_skills.iter_mut().find(|(n, ..)| *n == name) {
+                                Some((_, displaced, current, _)) => {
+                                    displaced.push(std::mem::replace(current, winner));
+                                }
+                                None => {
+                                    shadowed_skills.push((name, vec![prev.path], winner, false));
+                                }
+                            }
                         }
                     }
                 }
@@ -1319,6 +1329,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Three namesakes coalesce to ONE record: the final winner plus every
+    /// path it displaced. Recording the intermediate winner as its own entry
+    /// let the receipt call it cap-dropped while the final entry said the
+    /// name IS indexed, a contradiction about one name (Greptile).
+    #[test]
+    fn three_namesakes_coalesce_to_the_final_winner() {
+        let dir = std::env::temp_dir().join(format!("omx-shadow3-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for d in ["aa", "mm", "zz"] {
+            let s = project.join(".agents/skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                "---\nname: common\ndescription: d\n---\nB.\n",
+            )
+            .unwrap();
+        }
+        let snap = capture_extensions(&data, &project);
+        assert_eq!(snap.shadowed_skills.len(), 1, "one record per name: {:?}", snap.shadowed_skills);
+        let (name, displaced, winner, winner_indexed) = &snap.shadowed_skills[0];
+        assert_eq!(name, "common");
+        assert_eq!(displaced.len(), 2, "{displaced:?}");
+        assert!(displaced[0].ends_with("aa/SKILL.md"), "{displaced:?}");
+        assert!(displaced[1].ends_with("mm/SKILL.md"), "{displaced:?}");
+        assert!(winner.ends_with("zz/SKILL.md"), "{winner:?}");
+        assert!(*winner_indexed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Two files in ONE directory declaring the same skill name collapse to
     /// whichever sorts last; that accident is recorded for the receipt.
     /// Cross-tier shadowing (a project skill over a global namesake) is
@@ -1338,9 +1378,10 @@ mod tests {
         }
         let snap = capture_extensions(&data, &project);
         assert_eq!(snap.shadowed_skills.len(), 1, "{:?}", snap.shadowed_skills);
-        let (name, ignored, winner, winner_indexed) = &snap.shadowed_skills[0];
+        let (name, displaced, winner, winner_indexed) = &snap.shadowed_skills[0];
         assert_eq!(name, "code-review");
-        assert!(ignored.ends_with("aa-review/SKILL.md"), "{ignored:?}");
+        assert_eq!(displaced.len(), 1);
+        assert!(displaced[0].ends_with("aa-review/SKILL.md"), "{displaced:?}");
         assert!(winner.ends_with("zz-review/SKILL.md"), "{winner:?}");
         assert!(*winner_indexed, "under the cap, the winner is in the index");
 
