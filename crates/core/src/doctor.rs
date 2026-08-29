@@ -633,9 +633,11 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
 
     for path in crate::permissions::permission_files(project_root) {
-        let Some(result) = crate::permissions::check_file(&path) else { continue };
+        let Some(result) = crate::permissions::check_file(&path, project_root, data_dir) else {
+            continue;
+        };
         match result {
-            Ok(rule_tools) => {
+            Ok((rule_tools, inert_verdict)) => {
                 for (i, tool) in rule_tools.iter().enumerate() {
                     if let Some(reason) = unknown_tool_reason(
                         tool,
@@ -656,10 +658,9 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 // The summary row counts the inert ones too - it prints after
                 // the warn, so "(N rules)" alone would close the file's story
                 // claiming every rule is in force (round-7 audit, reproduced).
+                // The verdict came from the SAME read as the rule list.
                 let mut inert = 0;
-                if let Some((reason, dropped)) =
-                    crate::permissions::inert_allow_reason(&path, project_root, data_dir)
-                {
+                if let Some((reason, dropped)) = inert_verdict {
                     inert = dropped;
                     findings.push(Finding {
                         kind: "permissions",

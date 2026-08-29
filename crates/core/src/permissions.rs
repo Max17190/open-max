@@ -418,26 +418,36 @@ fn agent_writable(path: &Path, project_root: &Path) -> bool {
 /// Why this file's `allow` rules are not authority, for `openmax --check`.
 /// None when it has none, when it is out of the agent's reach, or when a human
 /// approved it.
-pub(crate) fn inert_allow_reason(
-    path: &Path,
-    project_root: &Path,
-    data_dir: &Path,
-) -> Option<(String, usize)> {
-    let FileLoad::Ok(mut rules, content_hash) = load_file(path) else { return None };
-    let allows = rules.iter().filter(|r| r.effect == Effect::Allow).count();
-    drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
-        .map(|reason| (reason, allows))
-}
+
 
 /// Diagnose one permissions file for `openmax --check`: None when the file
 /// does not exist, Ok(the tool each rule names, in file order) when it loads,
 /// Err(reason) when the agent loop would fail closed because of it. The names
 /// come back rather than just a count because matching is exact, so a rule
 /// naming a tool that does not exist is a rule that silently never fires.
-pub(crate) fn check_file(path: &Path) -> Option<Result<Vec<String>, String>> {
+/// One read serves every diagnostic row for a policy file: the declared
+/// per-rule tool names AND the inert-allow verdict come from the same
+/// parsed generation. Two loads let a rewrite between them make --check
+/// report a state neither revision held (Greptile reproduced
+/// "1 rules, 2 inert"); the live loader reads once, and #245 set the
+/// discipline.
+pub(crate) fn check_file(
+    path: &Path,
+    project_root: &Path,
+    data_dir: &Path,
+) -> Option<Result<(Vec<String>, Option<(String, usize)>), String>> {
     match load_file(path) {
         FileLoad::Missing => None,
-        FileLoad::Ok(rules, _) => Some(Ok(rules.into_iter().map(|r| r.tool).collect())),
+        FileLoad::Ok(mut rules, content_hash) => {
+            // The declared list (dropped allows included): the rows name
+            // each rule by index, and the summary counts the inert ones.
+            let tools: Vec<String> = rules.iter().map(|r| r.tool.clone()).collect();
+            let allows = rules.iter().filter(|r| r.effect == Effect::Allow).count();
+            let inert =
+                drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
+                    .map(|reason| (reason, allows));
+            Some(Ok((tools, inert)))
+        }
         FileLoad::Invalid(reason) => Some(Err(reason)),
     }
 }
