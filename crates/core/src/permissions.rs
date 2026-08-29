@@ -383,10 +383,14 @@ fn drop_unapproved_allows(
     let before = rules.len();
     rules.retain(|r| r.effect != Effect::Allow);
     let dropped = before - rules.len();
+    // The command half is pastable, so it is shell-quoted like every other
+    // printed `openmax --approve` (doctor::shell_quote's own contract): a
+    // project path with a space made the copyable command fail on a path
+    // fragment (round-7 audit, reproduced).
     Some(format!(
         "{}: {dropped} allow rule(s) are inert because they skip the approval prompt and this file sits inside the project, where the agent writes; calls fall through to approval_mode until a human approves this exact content with `openmax --approve {}`",
         path.display(),
-        path.display()
+        crate::doctor::shell_quote(path)
     ))
 }
 
@@ -566,6 +570,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-perms-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The inert-allow notice's `openmax --approve <path>` half is pastable
+    /// and reaches the model as a policy notice, so a path with a space (a
+    /// plain macOS project name is enough) must be shell-quoted, or the
+    /// relayed command fails on a path fragment (round-7 audit, reproduced).
+    #[test]
+    fn the_inert_allow_notice_quotes_a_spacey_path() {
+        let tmp = tempfile_dir().join("my probe dir");
+        let perms_path = tmp.join(".openmax").join("permissions.toml");
+        write_perms(
+            &perms_path,
+            "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\narg_regex = \"^git status\"\n",
+        );
+        let perms = Permissions::discover(&tmp, &tmp.join("data"));
+        let notices = perms.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let quoted = crate::doctor::shell_quote(&perms_path);
+        assert!(
+            notices[0].contains(&format!("openmax --approve {quoted}")),
+            "the pastable command quotes the path: {}",
+            notices[0]
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// A broken policy file must stay repairable from inside the session.
