@@ -1559,7 +1559,7 @@ pub fn repair(data_dir: &Path, project_root: &Path) -> Result<Repair, String> {
                 .collect();
             let approvals = parsed.iter().filter(|r| r.kind == Kind::Approval).count();
             let records = text.lines().filter(|l| !l.trim().is_empty()).count();
-            let quarantined = dir.join(format!("log.jsonl.unverified-{}", unix_now()));
+            let quarantined = free_quarantine_path(&dir, unix_now());
             if log.exists() {
                 std::fs::rename(&log, &quarantined)
                     .map_err(|e| format!("cannot quarantine {}: {e}", log.display()))?;
@@ -1583,6 +1583,28 @@ fn log_exists_then(path: &Path) -> Option<PathBuf> {
     path.exists().then(|| path.to_path_buf())
 }
 
+/// A quarantine file must never overwrite an earlier one: these files are
+/// the preserved evidence, and two repairs inside one clock second used to
+/// collapse onto one timestamped name - the second rename destroyed the
+/// first quarantine's bytes - while `repair_generation`, the count of these
+/// files, stayed flat, so event ids could repeat across chain generations.
+/// The name takes a counter until it is free; every variant keeps the
+/// `log.jsonl.unverified-` prefix the generation count keys on.
+fn free_quarantine_path(dir: &Path, ts: u64) -> PathBuf {
+    let base = dir.join(format!("log.jsonl.unverified-{ts}"));
+    if !base.exists() {
+        return base;
+    }
+    let mut n = 2u64;
+    loop {
+        let candidate = dir.join(format!("log.jsonl.unverified-{ts}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Set an unpinned authority tail aside and restore the log to its pinned
 /// prefix. The stored chain head already names the prefix's final record, so
 /// it stays; only the pending receipt goes. Atomic on the log: the tail file
@@ -1594,7 +1616,7 @@ fn quarantine_tail_locked(dir: &Path, verified: &Verified) -> Result<Repair, Str
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = &lines[verified.pinned.min(lines.len())..];
     let approvals = verified.unpinned_authority().count();
-    let quarantined = dir.join(format!("log.jsonl.unverified-{}", unix_now()));
+    let quarantined = free_quarantine_path(dir, unix_now());
     let mut tail_text = tail.join("\n");
     tail_text.push('\n');
     crate::sessions::write_atomic(&quarantined, tail_text)?;
@@ -2507,6 +2529,30 @@ mod tests {
             approval_events(&data, &root).is_err(),
             "an unverifiable ledger is a narratable error, never an empty history"
         );
+    }
+
+    /// Two repairs inside one clock second must both keep their evidence:
+    /// the second quarantine takes a counter suffix instead of landing on
+    /// the first's name (a rename there destroyed the earlier bytes), and
+    /// the generation count sees every variant (round-5 ticket T7).
+    #[test]
+    fn a_second_quarantine_in_the_same_second_keeps_both() {
+        let dir = temp("quar");
+        let ts = 1_700_000_000u64;
+        let first = free_quarantine_path(&dir, ts);
+        assert!(first.ends_with("log.jsonl.unverified-1700000000"), "{first:?}");
+        std::fs::write(&first, "one\n").unwrap();
+        let second = free_quarantine_path(&dir, ts);
+        assert!(second.ends_with("log.jsonl.unverified-1700000000-2"), "{second:?}");
+        std::fs::write(&second, "two\n").unwrap();
+        let third = free_quarantine_path(&dir, ts);
+        assert!(third.ends_with("log.jsonl.unverified-1700000000-3"), "{third:?}");
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "one\n",
+            "the first quarantine's bytes survive the second repair"
+        );
+        assert_eq!(repair_generation(&dir), 2, "every variant counts toward the generation");
     }
 
     /// An approval stores what it blessed: the manifest AND every bound

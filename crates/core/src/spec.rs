@@ -92,11 +92,13 @@ Fields:
 - `description` (required): one line; newlines are collapsed; capped at 200
   chars in the schema. Rides in every request, so keep it short and put long
   usage docs in a README the description points at.
-- `params` (optional): a JSON-schema object, written as TOML tables. Omitted
-  means "no parameters".
+- `params` (optional): a JSON-schema object, written as TOML tables;
+  `params.type = "object"` is required. Omitted means "no parameters". The
+  serialized schema is capped at 4096 bytes (every request pays for these
+  bytes); an oversized schema is rejected, not truncated.
 - `command` (required): executable path or name, spawned in the project root.
 - `args` (optional): fixed argv strings appended to `command`.
-- `timeout_secs` (optional): default 60, clamped to 1..300.
+- `timeout_secs` (optional): default 60, clamped between 1 and 300, inclusive.
 - `mutating` (optional, default false): routes calls through the ordinary
   approval_mode gate (snapshots, read-only sessions, prompts). Trusted
   metadata for scheduling and UX, not a sandbox: it never widens or narrows
@@ -107,6 +109,10 @@ Fields:
   baseline (PATH, HOME, LANG, TERM), and nothing else - API keys included -
   unless named here. The list is manifest bytes, so the credential grant is
   part of what the human approves.
+
+Unknown keys are rejected with the legal field list. At most 64 tools load,
+sorted by name; the rest are counted by the prompt trailer and named by
+`openmax --check`.
 
 Runtime contract: the harness spawns `command args...` in the project root,
 writes the call's JSON arguments to stdin as one newline-terminated line, and
@@ -162,7 +168,8 @@ description = "Directory to scan"
 ```
 
 Activation: automatic when extension bytes change, checked between
-iterations after a successful mutating call and at turn start; `/reload`
+iterations after every executed mutating call (a failed call that wrote
+the file still activates it) and at turn start; `/reload`
 forces it now. Verify the file parses with `openmax --check`. Test the
 script itself before first use:
 `echo '{"path":"src"}' | ./scripts/todo-scan.sh`.
@@ -228,7 +235,8 @@ One directory per skill with a `SKILL.md` inside: `.agents/skills/<name>/SKILL.m
 name collision.
 
 `SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
-keys are read:
+keys are read, and only at the block's top level (no leading indentation), so
+an indented key inside a nested map like `metadata:` never overrides them:
 - `name:` (required): the skill's index name, a bare or double-quoted value on
   one line.
 - `description:` (required in practice): one line saying what the skill does
@@ -242,9 +250,12 @@ only when the skill is used. A skill directory may bundle scripts and
 reference files next to SKILL.md; run them with bash.
 
 At most 50 skills are indexed, sorted by name, and the index is byte-capped at
-3000 bytes: once the sorted lines fill it the trailing skills are omitted and a
-trailer counts them, so more skills or longer descriptions can push a skill out
-of the prompt entirely (`openmax --check` names each one it drops). The prompt
+3000 bytes, first-fit in name order: a line that does not fit the remaining
+budget is omitted (and counted by a trailer), while a later, shorter line may
+still land. Shortening descriptions (this skill's or an earlier one's) frees
+budget for the lines after them, and renaming changes who competes for the
+budget first. More skills or longer descriptions can push a skill out of the
+prompt entirely (`openmax --check` names each one it drops). The prompt
 shows each indexed skill as `- name: description — path/to/SKILL.md`.
 
 Example (`.agents/skills/release/SKILL.md`):
@@ -258,7 +269,8 @@ Full instructions, checklists, and commands, read on demand.
 ```
 
 Activation: automatic when extension bytes change, checked between
-iterations after a successful mutating call and at turn start; `/reload`
+iterations after every executed mutating call (a failed call that wrote
+the file still activates it) and at turn start; `/reload`
 forces it now. Verify with `openmax --check`.
 "#;
 
@@ -313,12 +325,16 @@ Fields:
   `user_prompt_submit`, `session_start`, `compaction`, `turn_end`.
 - `command` (required): executable, spawned in the project root.
 - `args` (optional): fixed argv strings.
-- `timeout_secs` (optional): default 10, clamped to 1..60.
+- `timeout_secs` (optional): default 10, clamped between 1 and 60, inclusive.
 - `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
 - `blocking` (optional): `turn_end` only, default false. True makes the hook
   a completion gate: a nonzero exit refuses the turn's end and the reason is
   sent back as a user message. False observes only; exit status is ignored.
   Rejected on every other event, which either always gates or never does.
+
+Unknown keys are rejected with the legal field list. At most 32 hooks load
+per event, sorted by file name; the rest are dropped and `openmax --check`
+names them.
 
 Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
 call or the prompt. The block reason is the hook's stdout (or stderr if stdout
@@ -702,7 +718,7 @@ Fields (the file IS the contract):
 - body: free-form markdown, any length, read on demand with read_file.
 
 Index: at session creation (and /reload or a re-freeze) live memories are
-ranked and injected as one line each - `- name: description - path` - under a
+ranked and injected as one line each - `- name: description — path` - under a
 1500-byte budget, strongest first, with a trailer counting what did not fit.
 No memories, no section, zero prompt cost.
 
@@ -925,6 +941,24 @@ on stdin, reports each line, and exits nonzero on any violation.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No authoring surface claims the refreeze needs a SUCCESSFUL call:
+    /// #242 activates on any executed mutating call (a failed writer
+    /// included), and the permissions/settings/memory surfaces already said
+    /// so, which left tools and skills contradicting them about one event
+    /// (round-7 audit). The phrase is banned outright so a new surface
+    /// cannot reintroduce it.
+    #[test]
+    fn no_spec_surface_requires_a_successful_mutating_call() {
+        for surface in SURFACES {
+            // "usage" is assembled at runtime, not a static text.
+            let Some(text) = render(surface) else { continue };
+            assert!(
+                !text.contains("successful mutating call"),
+                "--spec {surface} claims a success requirement the code dropped in #242"
+            );
+        }
+    }
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -979,6 +1013,57 @@ mod tests {
     /// the count cap. `--check` names each skill the budget drops; a spec that
     /// mentions only "50 skills" sends an author hunting for a limit they have
     /// not hit while the real one silently ate their skill.
+    #[test]
+    fn spec_tools_names_the_caps_that_drop_or_reject() {
+        // The principle the skills spec already enforces: a spec that omits
+        // the real limit sends an author hunting for one they have not hit
+        // while the real one silently ate their file (round-7 audit).
+        assert!(
+            TOOLS.contains(&format!("At most {} tools", crate::registry::MAX_EXTERNAL_TOOLS)),
+            "--spec tools names the load cap"
+        );
+        assert!(
+            TOOLS.contains(&format!(
+                "capped at {} bytes",
+                crate::registry::MAX_EXTERNAL_PARAMS_BYTES
+            )),
+            "--spec tools names the params byte cap"
+        );
+        assert!(
+            TOOLS.contains("params.type = \"object\"` is required"),
+            "--spec tools states the required schema root"
+        );
+    }
+
+    #[test]
+    fn spec_hooks_names_the_per_event_cap() {
+        assert!(
+            HOOKS.contains(&format!("At most {} hooks", crate::hooks::MAX_HOOKS_PER_EVENT)),
+            "--spec hooks names the least visible cap: hooks have no prompt trailer"
+        );
+    }
+
+    #[test]
+    fn spec_memory_shows_the_emitted_index_line() {
+        // The template quotes the binary's own separator (memory::index_line
+        // renders an em dash); an ASCII lookalike teaches authors to grep for
+        // a line the prompt never contains.
+        assert!(MEMORY.contains("`- name: description — path`"));
+    }
+
+    #[test]
+    fn spec_skills_states_first_fit_omission() {
+        // The byte cap is first-fit in name order, not a suffix cut, and the
+        // remediation must not overclaim either way: a minimal skill can
+        // still lose to earlier entries, where renaming is what helps
+        // (Greptile reproduced that), and shortening any earlier line frees
+        // budget for the ones after it.
+        assert!(SKILLS.contains("first-fit in name order"));
+        assert!(SKILLS.contains("a later, shorter line may"));
+        assert!(SKILLS.contains("this skill's or an earlier one's"));
+        assert!(SKILLS.contains("renaming changes who competes"));
+    }
+
     #[test]
     fn spec_skills_names_the_index_byte_budget() {
         assert!(
