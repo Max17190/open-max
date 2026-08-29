@@ -1576,13 +1576,22 @@ mod tests {
     /// the one place that did not know it existed (round-7 audit).
     #[test]
     fn help_names_every_spec_surface() {
-        // Scoped to the --spec option block: "settings" also appears in
-        // unrelated help prose (settings.json), which must not satisfy this.
+        // The parenthesized list after "--spec <surface>" is parsed and
+        // compared as a SET against spec::SURFACES: a fixed window plus
+        // substring checks could be masked by unrelated prose (settings.json)
+        // or defeated by a harmless reflow (Greptile).
         let start = super::HELP.find("--spec <surface>").expect("--spec is documented");
-        let block = &super::HELP[start..(start + 300).min(super::HELP.len())];
-        for surface in open_max_core::spec::SURFACES {
-            assert!(block.contains(surface), "--help's --spec list omits: {surface}");
-        }
+        let open = super::HELP[start..].find('(').expect("the option lists its surfaces") + start;
+        let close = super::HELP[open..].find(')').expect("the list closes") + open;
+        let mut listed: Vec<&str> = super::HELP[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        listed.sort_unstable();
+        let mut surfaces: Vec<&str> = open_max_core::spec::SURFACES.to_vec();
+        surfaces.sort_unstable();
+        assert_eq!(listed, surfaces, "--help's --spec list must equal spec::SURFACES");
     }
 
     use super::*;

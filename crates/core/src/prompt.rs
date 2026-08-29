@@ -638,14 +638,17 @@ mod tests {
         for s in pointer {
             assert!(crate::spec::SURFACES.contains(&s), "the pointer names a surface --spec lacks: {s}");
         }
-        let omitted: Vec<&str> = crate::spec::SURFACES
+        let mut omitted: Vec<&str> = crate::spec::SURFACES
             .iter()
             .copied()
             .filter(|s| !pointer.contains(s))
             .collect();
+        omitted.sort_unstable();
+        // Order-independent: SURFACES declaration order is not a contract
+        // here, only the SET of deliberate omissions is (Greptile).
         assert_eq!(
             omitted,
-            ["settings", "recall", "usage"],
+            ["recall", "settings", "usage"],
             "a new surface joins the pointer or the deliberate-omission list"
         );
     }
