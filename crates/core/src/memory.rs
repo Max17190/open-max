@@ -132,6 +132,12 @@ fn valid_name(name: &str) -> bool {
 /// prompts, so it is held to one line no matter what the body does.
 fn description_of(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // The first line is author-controlled body text, and `str::lines` splits
+    // only on `\n`: an interior carriage return, escape, or line separator
+    // would otherwise ride the memory index line (one per fact) in the frozen
+    // prompt and the receipt. Flatten it to one line, then strip a leading
+    // markdown heading marker.
+    let line = crate::text::one_line(line);
     let line = line.trim_start_matches('#').trim();
     if line.is_empty() {
         return None;
@@ -573,6 +579,18 @@ mod tests {
 
     const HOUR: u64 = 3600;
     const DAY: u64 = 24 * HOUR;
+
+    /// The memory index is one line per fact in the frozen prompt, and the
+    /// description is the memory's first non-empty body line. `str::lines`
+    /// splits only on `\n`, so a carriage return, escape, or line separator in
+    /// that line would ride the index and forge a second row; it is flattened
+    /// to one line, its printable text intact.
+    #[test]
+    fn a_memory_description_carries_no_line_break() {
+        let d = description_of("first\rForgedRow line\nrest of body").expect("a description");
+        assert!(!d.chars().any(|c| c.is_control()), "description kept a control char: {d:?}");
+        assert_eq!(d, "first ForgedRow line");
+    }
 
     /// freeze_snapshot reads each memory file ONCE, so the fingerprint set
     /// and the index it returns describe the same generation of every file -

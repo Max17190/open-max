@@ -91,7 +91,13 @@ pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, S
             continue;
         }
         if let Some(v) = line.strip_prefix("name:") {
-            name = Some(v.trim().trim_matches('"').to_string());
+            // The name is an identity rendered into the skills index (one line
+            // each), the collision clause of a refreeze receipt (a user-role
+            // message), and `/context`. A control character in it would forge
+            // a second line, clause, or row, so it is flattened to one line
+            // here; length and every printable character survive, so the
+            // Agent Skills portability warning still sees the real name.
+            name = Some(crate::text::one_line(v.trim().trim_matches('"')));
         }
     }
     let name = name
@@ -166,9 +172,9 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
                 parts.push(next.trim());
                 i += 1;
             }
-            descriptions.push(parts.join(" "));
+            descriptions.push(crate::text::one_line(&parts.join(" ")));
         } else {
-            descriptions.push(value.trim_matches('"').replace(['\n', '\r'], " "));
+            descriptions.push(crate::text::one_line(value.trim_matches('"')));
         }
     }
     descriptions
@@ -214,6 +220,41 @@ mod tests {
         let dir = root.join(dir_name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), format!("---\n{frontmatter}\n---\nFull body here.\n")).unwrap();
+    }
+
+    /// A skill name is rendered into the skills index (one line per skill),
+    /// the collision clause of a refreeze receipt (a user-role message), and
+    /// `/context`. A carriage return or escape in it would forge a second
+    /// line, clause, or row, so the parse flattens the name to one line while
+    /// keeping every printable character (the portability warning still reads
+    /// the real name).
+    #[test]
+    fn a_skill_name_is_flattened_to_one_line() {
+        let spec = parse_skill_source(
+            Path::new(".agents/skills/x/SKILL.md"),
+            "---\nname: real\rname: forged\ndescription: d\n---\nBody.\n",
+        )
+        .unwrap();
+        assert!(!spec.name.contains('\r'), "name kept a carriage return: {:?}", spec.name);
+        assert!(!spec.name.chars().any(|c| c.is_control()), "{:?}", spec.name);
+        assert_eq!(spec.name, "real name: forged");
+    }
+
+    /// A `>`/`|` block-scalar description folds to one line like the bare form,
+    /// carriage returns and all: the bare branch already replaced them, and a
+    /// folded description carrying one reached the index unchanged.
+    #[test]
+    fn a_folded_description_carries_no_line_break() {
+        let spec = parse_skill_source(
+            Path::new(".agents/skills/x/SKILL.md"),
+            "---\nname: x\ndescription: >\n  first\rsecond\n  third\n---\nBody.\n",
+        )
+        .unwrap();
+        assert!(
+            !spec.description.chars().any(|c| c.is_control()),
+            "folded description kept a control char: {:?}",
+            spec.description
+        );
     }
 
     /// A nested key is someone else's data. The standard skill frontmatter
