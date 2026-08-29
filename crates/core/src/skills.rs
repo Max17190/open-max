@@ -81,7 +81,16 @@ pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, S
         .ok_or("frontmatter never closes with `---`")?;
     let mut name = None;
     for line in body[..end].lines() {
-        if let Some(v) = line.trim().strip_prefix("name:") {
+        // Only a key at the block's top level (no leading indentation) is the
+        // skill's key. An indented `name:` is someone else's data: a field of
+        // a nested map like the standard `metadata:` block, or a line inside
+        // a description block scalar (whose content is always indented past
+        // its key). Matching those let a nested key silently steal the
+        // skill's identity while --check certified the file ok.
+        if line.trim_start().len() != line.len() {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("name:") {
             name = Some(v.trim().trim_matches('"').to_string());
         }
     }
@@ -106,15 +115,17 @@ pub(crate) fn raw_description(text: &str) -> Option<String> {
     frontmatter_descriptions(&body[..end]).pop()
 }
 
-/// Every `description:` value of one frontmatter block, in order, each
-/// folded to a single line. Three spellings are read: a bare value, a
+/// Every top-level `description:` value of one frontmatter block, in order,
+/// each folded to a single line. Three spellings are read: a bare value, a
 /// double-quoted value, and a YAML block scalar (`>` folded or `|` literal,
 /// with an optional `-`/`+` chomping indicator and an optional explicit
 /// indentation digit), whose value is the indented lines that follow.
 /// Multi-line values fold to one line because the index line is one line;
 /// the frontmatter's `>` says the author meant that too. Anything more
 /// exotic (single quotes, flow mappings, anchors) reads as its literal
-/// spelling. Callers pick first or last; each surface keeps the choice it
+/// spelling. An INDENTED `description:` is someone else's data (a nested
+/// map's field, like the standard `metadata:` block) and never one of these
+/// values. Callers pick first or last; each surface keeps the choice it
 /// always made.
 pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
     let lines: Vec<&str> = block.lines().collect();
@@ -124,6 +135,9 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
         let line = lines[i];
         let indent = line.len() - line.trim_start().len();
         i += 1;
+        if indent > 0 {
+            continue;
+        }
         let Some(value) = line.trim().strip_prefix("description:") else {
             continue;
         };
@@ -200,6 +214,50 @@ mod tests {
         let dir = root.join(dir_name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), format!("---\n{frontmatter}\n---\nFull body here.\n")).unwrap();
+    }
+
+    /// A nested key is someone else's data. The standard skill frontmatter
+    /// commonly carries a `metadata:` block whose fields may be spelled
+    /// `name:`/`description:`; an indentation-blind, last-wins match let that
+    /// block silently steal the skill's identity, the frozen index carried
+    /// the stolen strings, and --check certified the file ok (round-7 audit,
+    /// reproduced on the binary). Keys are read at top level only.
+    #[test]
+    fn a_nested_frontmatter_key_does_not_override_the_skill_name() {
+        let root = temp_dir("nested");
+        write_skill(
+            &root,
+            "pdf-tools",
+            "name: pdf-tools\ndescription: Extract text and tables from PDF files.\nmetadata:\n  name: internal-scratch\n  description: not for the index",
+        );
+        let skills = discover_in(std::slice::from_ref(&root));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "pdf-tools", "the top-level name is the skill's name");
+        assert_eq!(
+            skills[0].description, "Extract text and tables from PDF files.",
+            "the top-level description is the indexed one"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A block scalar's content is always indented past its key, so a line of
+    /// it that happens to start with `name:` is prose, not the skill's key.
+    #[test]
+    fn a_block_scalar_line_spelling_name_does_not_become_the_name() {
+        let root = temp_dir("scalar-name");
+        write_skill(
+            &root,
+            "config-audit",
+            "name: config-audit\ndescription: >\n  Audits config files.\n  name: fields inside YAML are checked too.",
+        );
+        let skills = discover_in(std::slice::from_ref(&root));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "config-audit");
+        assert_eq!(
+            skills[0].description,
+            "Audits config files. name: fields inside YAML are checked too."
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

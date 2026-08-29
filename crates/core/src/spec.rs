@@ -228,7 +228,8 @@ One directory per skill with a `SKILL.md` inside: `.agents/skills/<name>/SKILL.m
 name collision.
 
 `SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
-keys are read:
+keys are read, and only at the block's top level (no leading indentation), so
+an indented key inside a nested map like `metadata:` never overrides them:
 - `name:` (required): the skill's index name, a bare or double-quoted value on
   one line.
 - `description:` (required in practice): one line saying what the skill does
