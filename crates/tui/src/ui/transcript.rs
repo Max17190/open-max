@@ -235,10 +235,13 @@ pub struct WrapAnchor {
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
-    wrapped: Vec<Line<'static>>,
-    line_block: Vec<usize>,
-    line_maps: Vec<Option<CachedLineMap>>,
+    /// First wrapped line of each block; `total` closes the last range. The
+    /// per-block caches own the only copy of every wrapped line, so
+    /// rebuilding after a fold toggle or width change is index arithmetic,
+    /// never a clone of the session's lines.
     block_starts: Vec<usize>,
+    /// Wrapped lines across all block caches.
+    total: usize,
     width: u16,
     offset: usize,
     /// Blocks appended while the view was scrolled up, so the chrome can
@@ -282,14 +285,14 @@ impl Transcript {
             return;
         }
         if self.dirty {
-            self.ensure_flat();
+            self.ensure_index();
         }
-        let prev_len = self.wrapped.len();
+        let prev_len = self.total;
         self.blocks.push(Block::new(kind, lines));
         let bi = self.blocks.len() - 1;
-        self.append_block_flat(bi);
+        self.append_block_index(bi);
         if self.offset > 0 {
-            let added = self.wrapped.len().saturating_sub(prev_len);
+            let added = self.total.saturating_sub(prev_len);
             self.offset = self.offset.saturating_add(added);
             self.unread += 1;
         }
@@ -334,8 +337,8 @@ impl Transcript {
             }
         }
         self.dirty = true;
-        self.ensure_flat();
-        self.offset = self.offset.min(self.wrapped.len());
+        self.ensure_index();
+        self.offset = self.offset.min(self.total);
         true
     }
 
@@ -351,14 +354,14 @@ impl Transcript {
             return;
         }
         if self.dirty {
-            self.ensure_flat();
+            self.ensure_index();
         }
-        let prev_len = self.wrapped.len();
+        let prev_len = self.total;
         self.blocks.push(Block::tool(compact, full_output, ok));
         let bi = self.blocks.len() - 1;
-        self.append_block_flat(bi);
+        self.append_block_index(bi);
         if self.offset > 0 {
-            let added = self.wrapped.len().saturating_sub(prev_len);
+            let added = self.total.saturating_sub(prev_len);
             self.offset = self.offset.saturating_add(added);
             self.unread += 1;
         }
@@ -375,8 +378,8 @@ impl Transcript {
                 b.invalidate();
             }
             self.dirty = true;
-            self.ensure_flat();
-            self.offset = self.offset.min(self.wrapped.len());
+            self.ensure_index();
+            self.offset = self.offset.min(self.total);
         }
     }
 
@@ -386,26 +389,25 @@ impl Transcript {
     /// widths but bounded by one block's height. None when history is empty
     /// or the position is not above the bottom.
     pub fn anchor_at(&mut self, lines_from_bottom: usize) -> Option<WrapAnchor> {
-        self.ensure_flat();
-        if lines_from_bottom == 0 || self.wrapped.is_empty() {
+        self.ensure_index();
+        if lines_from_bottom == 0 || self.total == 0 {
             return None;
         }
         let index = self
-            .wrapped
-            .len()
+            .total
             .saturating_sub(lines_from_bottom)
-            .min(self.wrapped.len() - 1);
-        let block = *self.line_block.get(index)?;
+            .min(self.total - 1);
+        let (block, lines_into_block) = self.locate(index)?;
         Some(WrapAnchor {
             block,
-            lines_into_block: index - self.block_starts[block],
+            lines_into_block,
         })
     }
 
     /// Wrapped-line distance from the bottom of history to the anchored
     /// content, after any re-wraps since capture.
     pub fn resolve_anchor(&mut self, anchor: WrapAnchor) -> usize {
-        self.ensure_flat();
+        self.ensure_index();
         let Some(&start) = self.block_starts.get(anchor.block) else {
             return 0;
         };
@@ -413,9 +415,9 @@ impl Transcript {
             .block_starts
             .get(anchor.block + 1)
             .copied()
-            .unwrap_or(self.wrapped.len());
+            .unwrap_or(self.total);
         let index = (start + anchor.lines_into_block).min(end.saturating_sub(1));
-        self.wrapped.len() - index
+        self.total - index
     }
 
     /// Place the view at an absolute distance from the bottom; the draw
@@ -433,64 +435,69 @@ impl Transcript {
         self.dirty = true;
     }
 
-    fn rebuild_flat(&mut self) {
-        self.wrapped.clear();
-        self.line_block.clear();
-        self.line_maps.clear();
+    fn rebuild_index(&mut self) {
         self.block_starts.clear();
+        self.total = 0;
         if self.width == 0 {
             self.dirty = false;
             return;
         }
-        for (bi, block) in self.blocks.iter_mut().enumerate() {
-            self.block_starts.push(self.wrapped.len());
-            block.ensure_cache(self.width);
-            for (line, map) in block.cache.iter().zip(&block.cache_maps) {
-                self.wrapped.push(line.clone());
-                self.line_block.push(bi);
-                self.line_maps.push(map.clone());
-            }
+        for bi in 0..self.blocks.len() {
+            self.block_starts.push(self.total);
+            self.blocks[bi].ensure_cache(self.width);
+            self.total += self.blocks[bi].cache.len();
         }
         self.dirty = false;
     }
 
-    /// Incrementally append one newly pushed block to the flat tables.
-    /// `bi` must be the last block; width is unchanged and tables are current.
-    fn append_block_flat(&mut self, bi: usize) {
+    /// Incrementally append one newly pushed block to the index.
+    /// `bi` must be the last block; width is unchanged and the index is
+    /// current.
+    fn append_block_index(&mut self, bi: usize) {
         self.blocks[bi].ensure_cache(self.width);
-        self.block_starts.push(self.wrapped.len());
-        // Clone out of the block cache so we can extend disjoint flat tables.
-        let lines = self.blocks[bi].cache.clone();
-        let maps = self.blocks[bi].cache_maps.clone();
-        for (line, map) in lines.into_iter().zip(maps) {
-            self.wrapped.push(line);
-            self.line_block.push(bi);
-            self.line_maps.push(map);
+        self.block_starts.push(self.total);
+        self.total += self.blocks[bi].cache.len();
+    }
+
+    fn ensure_index(&mut self) {
+        if self.dirty
+            || (self.block_starts.is_empty() && !self.blocks.is_empty() && self.width > 0)
+        {
+            self.rebuild_index();
         }
     }
 
-    fn ensure_flat(&mut self) {
-        if self.dirty || (self.wrapped.is_empty() && !self.blocks.is_empty() && self.width > 0) {
-            self.rebuild_flat();
+    /// Block owning wrapped line `idx`, and the line's offset into that
+    /// block's cache. Callers keep the index current.
+    fn locate(&self, idx: usize) -> Option<(usize, usize)> {
+        if idx >= self.total {
+            return None;
         }
+        let bi = self.block_starts.partition_point(|&start| start <= idx) - 1;
+        Some((bi, idx - self.block_starts[bi]))
     }
 
     /// Test-support oracle access: `draw_chat` paints via `fill_viewport`.
     #[cfg(test)]
-    pub fn lines(&mut self) -> &[Line<'static>] {
-        self.ensure_flat();
-        &self.wrapped
+    pub fn lines(&mut self) -> Vec<Line<'static>> {
+        self.ensure_index();
+        let mut out = Vec::new();
+        let total = self.total;
+        self.fill_viewport(&mut out, 0, total, None);
+        out
     }
 
-    /// Borrow a single wrapped history line without cloning the full buffer.
+    /// Borrow a single wrapped history line from its block's cache.
     /// Test-support oracle access.
     #[cfg(test)]
     pub fn line_at(&mut self, idx: usize) -> Option<&Line<'static>> {
-        self.ensure_flat();
-        self.wrapped.get(idx)
+        self.ensure_index();
+        let (bi, li) = self.locate(idx)?;
+        self.blocks[bi].cache.get(li)
     }
 
-    /// Clone history lines `[start, end)` into `out` once each.
+    /// Clone history lines `[start, end)` into `out` once each, straight
+    /// from the per-block caches.
     ///
     /// When `selected_bi` is `Some`, lines belonging to that block receive a
     /// quiet background. Text selection is painted later as a buffer overlay.
@@ -501,22 +508,37 @@ impl Transcript {
         end: usize,
         selected_bi: Option<usize>,
     ) {
-        self.ensure_flat();
-        let end = end.min(self.wrapped.len());
+        self.ensure_index();
+        // Prove the index covers every cache mutation instead of trusting
+        // the dirty flag's call sites: a cache edited without marking dirty
+        // would walk the loop below out of bounds.
+        debug_assert!(
+            self.total == self.blocks.iter().map(|b| b.cache.len()).sum::<usize>(),
+            "wrapped-line index went stale against the block caches",
+        );
+        let end = end.min(self.total);
         let start = start.min(end);
         out.reserve(end - start);
-        for idx in start..end {
-            let mut line = self.wrapped[idx].clone();
-            if selected_bi.is_some_and(|bi| self.line_block.get(idx) == Some(&bi)) {
+        let Some((mut bi, mut li)) = self.locate(start) else {
+            return;
+        };
+        for _ in start..end {
+            while li >= self.blocks[bi].cache.len() {
+                bi += 1;
+                li = 0;
+            }
+            let mut line = self.blocks[bi].cache[li].clone();
+            if selected_bi == Some(bi) {
                 line = surface_line(line, self.width, theme::BORDER());
             }
             out.push(line);
+            li += 1;
         }
     }
 
     pub fn len(&mut self) -> usize {
-        self.ensure_flat();
-        self.wrapped.len()
+        self.ensure_index();
+        self.total
     }
 
     /// The whole transcript as readable markdown: every block in order, a
@@ -702,8 +724,8 @@ impl Transcript {
             return;
         }
         self.selected = Some(0);
-        self.ensure_flat();
-        self.offset = self.wrapped.len();
+        self.ensure_index();
+        self.offset = self.total;
     }
 
     /// Follow the latest output and clear selection (bottom of scrollback).
@@ -712,18 +734,16 @@ impl Transcript {
     }
 
     fn scroll_to_block(&mut self, bi: usize) {
-        self.ensure_flat();
-        let Some(&start) = self.block_starts.get(bi) else {
+        self.ensure_index();
+        if bi >= self.block_starts.len() {
             return;
-        };
+        }
         let end = self
             .block_starts
             .get(bi + 1)
             .copied()
-            .unwrap_or(self.wrapped.len());
-        let total = self.wrapped.len();
-        self.offset = total.saturating_sub(end);
-        let _ = start;
+            .unwrap_or(self.total);
+        self.offset = self.total.saturating_sub(end);
     }
 
     pub fn toggle_fold_selected(&mut self) -> bool {
@@ -753,7 +773,7 @@ impl Transcript {
                 self.text_selection = None;
             }
             self.dirty = true;
-            self.ensure_flat();
+            self.ensure_index();
             true
         } else {
             self.toggle_fold_at(i)
@@ -776,7 +796,7 @@ impl Transcript {
             self.text_selection = None;
         }
         self.dirty = true;
-        self.ensure_flat();
+        self.ensure_index();
         true
     }
 
@@ -837,7 +857,7 @@ impl Transcript {
                 self.text_selection = None;
             }
             self.dirty = true;
-            self.ensure_flat();
+            self.ensure_index();
         }
         self.selected = Some(bi);
         self.scroll_to_block(bi);
@@ -1009,9 +1029,9 @@ impl Transcript {
     }
 
     fn hit_test(&mut self, line_idx: usize, x: usize) -> Option<TextPoint> {
-        self.ensure_flat();
-        let block = *self.line_block.get(line_idx)?;
-        let map = self.line_maps.get(line_idx)?.as_ref()?;
+        self.ensure_index();
+        let (block, li) = self.locate(line_idx)?;
+        let map = self.blocks[block].cache_maps.get(li)?.as_ref()?;
         let relative = x.saturating_sub(map.x_offset);
         let offset = map.start + display_column_to_char_offset(&map.text, relative);
         Some(TextPoint {
@@ -1022,17 +1042,17 @@ impl Transcript {
 
     /// Highlight columns for an absolute wrapped history line.
     pub fn selection_columns(&mut self, line_idx: usize) -> Option<(usize, usize)> {
-        self.ensure_flat();
+        self.ensure_index();
         let selection = self.text_selection?;
         if selection.is_empty() {
             return None;
         }
         let (start, end) = normalized_selection(selection);
-        let block = *self.line_block.get(line_idx)?;
+        let (block, li) = self.locate(line_idx)?;
         if block < start.block || block > end.block {
             return None;
         }
-        let map = self.line_maps.get(line_idx)?.as_ref()?;
+        let map = self.blocks[block].cache_maps.get(li)?.as_ref()?;
         let block_len = self.blocks.get(block)?.selectable_chars;
         let range_start = if block == start.block {
             start.offset
@@ -1090,11 +1110,11 @@ impl Transcript {
 
     /// Index of the nearest user block whose start is above `view_start_line`.
     fn sticky_user_block_idx(&mut self, view_start_line: usize) -> Option<usize> {
-        self.ensure_flat();
+        self.ensure_index();
         if view_start_line == 0 || self.blocks.is_empty() {
             return None;
         }
-        let bi = self.line_block.get(view_start_line).copied().unwrap_or(0);
+        let bi = self.locate(view_start_line).map(|(bi, _)| bi).unwrap_or(0);
         (0..=bi).rev().find(|&i| {
             self.blocks[i].kind == BlockKind::User && self.block_starts[i] < view_start_line
         })
@@ -1117,7 +1137,7 @@ impl Transcript {
         let Some(sel) = self.selected else {
             return false;
         };
-        self.line_block.get(line_idx) == Some(&sel)
+        self.locate(line_idx).map(|(bi, _)| bi) == Some(sel)
     }
 
     pub fn block_count(&self) -> usize {
@@ -1552,20 +1572,21 @@ mod tests {
         }
         let anchor = t.anchor_at(10).unwrap();
         assert_eq!(t.resolve_anchor(anchor), 10);
-        let block = t.line_block[t.wrapped.len() - 10];
+        let total = t.len();
+        let block = t.locate(total - 10).unwrap().0;
 
         // Wider wrap: every block collapses to fewer lines, all indices
         // shift, but the anchor still resolves into the same block.
         t.set_width(120);
         let from_bottom = t.resolve_anchor(anchor);
         assert!(from_bottom >= 1);
-        let index = t.wrapped.len() - from_bottom;
-        assert_eq!(t.line_block[index], block);
+        let index = t.len() - from_bottom;
+        assert_eq!(t.locate(index).unwrap().0, block);
 
         // And back: still the same block after a narrow re-wrap.
         t.set_width(24);
-        let index = t.wrapped.len() - t.resolve_anchor(anchor);
-        assert_eq!(t.line_block[index], block);
+        let index = t.len() - t.resolve_anchor(anchor);
+        assert_eq!(t.locate(index).unwrap().0, block);
     }
 
     #[test]
@@ -1578,7 +1599,7 @@ mod tests {
         t.push_assistant(vec![Line::from(
             "│ a literal border line long enough to wrap at this width",
         )]);
-        let rows = text(t.lines());
+        let rows = text(&t.lines());
         let wrapped: Vec<&String> = rows.iter().filter(|r| !r.trim().is_empty()).collect();
         assert!(wrapped.len() >= 2, "expected a wrap: {rows:?}");
         assert!(wrapped[0].starts_with("│ "));
@@ -1597,7 +1618,7 @@ mod tests {
         t.push_assistant(crate::ui::markdown::render(
             "```rust\nlet value = a_deliberately_long_identifier_that_wraps + another_long_identifier;\n```",
         ));
-        let rows = text(t.lines());
+        let rows = text(&t.lines());
         let code_rows: Vec<&String> = rows
             .iter()
             .filter(|row| row.contains("identifier") || row.contains("let value"))
@@ -1625,7 +1646,7 @@ mod tests {
             Some("│ literal table border")
         );
 
-        t.ensure_flat();
+        t.ensure_index();
         assert!(t.begin_text_selection_at(0, 0));
         assert!(t.update_text_selection_at(0, 21));
         t.finish_text_selection();
@@ -1651,8 +1672,8 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(crate::ui::markdown::render("```rust\nfn a() -> u32 { 1 }\n```"));
-        t.ensure_flat();
-        let li = text(&t.wrapped)
+        t.ensure_index();
+        let li = text(&t.lines())
             .iter()
             .position(|l| l.contains("fn a"))
             .unwrap();
@@ -1681,7 +1702,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_flat();
+        t.ensure_index();
 
         // Double-click on the middle of "beta", release on the same cell.
         assert!(t.select_word_at(0, 7));
@@ -1701,7 +1722,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_flat();
+        t.ensure_index();
 
         assert!(t.select_word_at(0, 7));
         assert!(t.update_text_selection_at(0, 12));
@@ -1719,7 +1740,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_flat();
+        t.ensure_index();
 
         // Word gesture on "beta", release over "gamma" with no Drag events.
         assert!(t.select_word_at(0, 7));
@@ -1734,7 +1755,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_flat();
+        t.ensure_index();
 
         assert!(t.select_word_at(0, 7));
         assert!(t.update_text_selection_at(0, 12));
@@ -1751,7 +1772,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_flat();
+        t.ensure_index();
 
         assert!(t.begin_text_selection_at(0, 0));
         t.end_text_selection_at(0, 9);
@@ -1822,7 +1843,7 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(20);
         t.push(vec![Line::from("• alpha beta gamma delta")]);
-        let rendered = text(t.lines());
+        let rendered = text(&t.lines());
         let row = rendered
             .iter()
             .position(|r| r.trim_start() == "delta")
@@ -1879,7 +1900,7 @@ mod tests {
             Line::from("first line here"),
             Line::from("second line that wraps across rows"),
         ]);
-        let rendered = text(t.lines());
+        let rendered = text(&t.lines());
         let row = rendered
             .iter()
             .position(|r| r.contains("across"))
@@ -1953,7 +1974,7 @@ mod tests {
         t.set_width(10);
         t.push(vec![Line::from("hello world wide")]);
         assert!(t.len() >= 2);
-        assert_eq!(text(t.lines())[0], "hello ");
+        assert_eq!(text(&t.lines())[0], "hello ");
     }
 
     #[test]
@@ -2310,7 +2331,7 @@ mod tests {
         for (i, (kind, lines)) in kind_pushes.iter().enumerate() {
             incremental.push_kind(*kind, lines.clone());
 
-            // Oracle: push with width 0 (blocks only), then set_width forces rebuild_flat.
+            // Oracle: push with width 0 (blocks only), then set_width builds everything.
             let mut oracle = Transcript::new();
             for (kind, lines) in kind_pushes.iter().take(i + 1) {
                 oracle.push_kind(*kind, lines.clone());
@@ -2318,8 +2339,8 @@ mod tests {
             oracle.set_width(W);
 
             assert_eq!(
-                text(incremental.lines()),
-                text(oracle.lines()),
+                text(&incremental.lines()),
+                text(&oracle.lines()),
                 "mismatch after {} kind blocks",
                 i + 1
             );
@@ -2337,7 +2358,7 @@ mod tests {
         oracle.push_tool(tool_compact, tool_out, true);
         oracle.set_width(W);
 
-        assert_eq!(text(incremental.lines()), text(oracle.lines()));
+        assert_eq!(text(&incremental.lines()), text(&oracle.lines()));
     }
 
     #[test]
@@ -2374,7 +2395,7 @@ mod tests {
             .expect("sticky after appends");
         assert_eq!(text(&[sticky]), text(&[sticky2]));
         // Absolute line maps for earlier history stay valid after appends.
-        let bi_at = t.line_block[view_start];
+        let bi_at = t.locate(view_start).unwrap().0;
         assert!(bi_at < t.block_count());
         assert!(t.line_at(view_start).is_some());
         let n = t.len();
@@ -2400,7 +2421,7 @@ mod tests {
         // Last history line belongs to a later block.
         let last = t.len() - 1;
         assert!(!t.is_selected_block_for_line(last));
-        assert_eq!(t.line_block[last], t.block_count() - 1);
+        assert_eq!(t.locate(last).unwrap().0, t.block_count() - 1);
     }
 
     #[test]
@@ -2415,7 +2436,7 @@ mod tests {
         let mut out = Vec::new();
         t.fill_viewport(&mut out, 0, n, None);
         assert_eq!(out.len(), n);
-        assert_eq!(text(&out), text(t.lines()));
+        assert_eq!(text(&out), text(&t.lines()));
 
         t.selected = Some(0);
         let mut marked = Vec::new();
@@ -2425,7 +2446,7 @@ mod tests {
         for (idx, line) in marked.iter().enumerate() {
             let selected_surface = line.style.bg == Some(theme::BORDER());
             assert_eq!(selected_surface, t.is_selected_block_for_line(idx));
-            assert_eq!(selected_surface, t.line_block[idx] == 0);
+            assert_eq!(selected_surface, t.locate(idx).unwrap().0 == 0);
         }
     }
 
@@ -2435,7 +2456,7 @@ mod tests {
         t.set_width(24);
         t.push_user(vec![Line::from("hello")]);
         t.push_assistant(vec![Line::from("world")]);
-        let rendered = text(t.lines());
+        let rendered = text(&t.lines());
         assert!(rendered[0].starts_with("❯ hello"));
         assert!(rendered[2].starts_with("world"));
         assert!(!rendered[2].starts_with('│'));
@@ -2547,6 +2568,84 @@ mod tests {
         t.push_tool(vec![Line::from("✓ Shell")], "done".into(), true);
         t.push(vec![Line::from("notice")]);
         assert_eq!(t.last_assistant_text().as_deref(), Some("latest\nresponse"));
+    }
+
+    /// The index owns no lines: what a viewport read returns for an
+    /// untouched block IS that block's cached allocation. A fold toggle
+    /// elsewhere re-wraps only the toggled block and never re-clones the
+    /// session; two live copies of the same text cannot share a heap
+    /// address, so any flat-table clone pass fails this deterministically.
+    #[test]
+    fn fold_toggle_reads_untouched_blocks_from_their_own_cache() {
+        let mut t = Transcript::new();
+        t.set_width(80);
+        t.push_assistant(vec![Line::from(String::from(
+            "stable prose that stays where it was put",
+        ))]);
+        t.push_tool(vec![Line::from("✓ bash")], "line one\nline two".into(), true);
+        t.ensure_index();
+        let cached = t.blocks[0].cache[0].spans[0].content.as_ptr();
+        assert_eq!(
+            t.line_at(0).unwrap().spans[0].content.as_ptr(),
+            cached,
+            "the transcript keeps a second cloned copy of every wrapped line"
+        );
+        assert!(t.expand_last_tool());
+        assert_eq!(
+            t.line_at(0).unwrap().spans[0].content.as_ptr(),
+            cached,
+            "a fold toggle re-cloned an untouched block's lines"
+        );
+    }
+
+    /// Fold-toggle, resize, and append cost at session scale. Not a
+    /// correctness test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_fold
+    #[test]
+    #[ignore]
+    fn measure_fold_resize_append_cost() {
+        use std::time::Instant;
+        let output = "a log line about work being done in the harness\n".repeat(40);
+        for turns in [500usize, 2_000] {
+            let mut t = Transcript::new();
+            t.set_width(120);
+            for i in 0..turns {
+                t.push_user(vec![Line::from(format!("user turn {i}: check the ledger"))]);
+                t.push_assistant(vec![Line::from(format!(
+                    "assistant reply {i}: a longer sentence of prose that wraps once or twice at a hundred and twenty columns to look like a real reply"
+                ))]);
+                t.push_tool(vec![Line::from("✓ bash")], output.clone(), true);
+            }
+            let lines = t.len();
+
+            // Each call alternates unfold/fold on the last tool block; only
+            // that block re-wraps, so this isolates the flat-table rebuild.
+            let n = 40;
+            let t0 = Instant::now();
+            for _ in 0..n {
+                assert!(t.expand_last_tool());
+            }
+            let fold_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+
+            // A settled resize: every block re-wraps and the tables rebuild.
+            let t0 = Instant::now();
+            for w in [110u16, 120, 110, 120] {
+                t.set_width(w);
+            }
+            let resize_ms = t0.elapsed().as_secs_f64() * 1e3 / 4.0;
+
+            // Append while clean: the incremental path.
+            let t0 = Instant::now();
+            for i in 0..200 {
+                t.push_assistant(vec![Line::from(format!("tail reply {i}"))]);
+            }
+            let append_us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
+
+            println!(
+                "MEASURE {} blocks / {lines} wrapped lines: fold_toggle {fold_ms:.3} ms, resize {resize_ms:.3} ms, append {append_us:.1} us",
+                turns * 3,
+            );
+        }
     }
 }
 
