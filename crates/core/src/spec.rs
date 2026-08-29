@@ -162,7 +162,8 @@ description = "Directory to scan"
 ```
 
 Activation: automatic when extension bytes change, checked between
-iterations after a successful mutating call and at turn start; `/reload`
+iterations after every executed mutating call (a failed call that wrote
+the file still activates it) and at turn start; `/reload`
 forces it now. Verify the file parses with `openmax --check`. Test the
 script itself before first use:
 `echo '{"path":"src"}' | ./scripts/todo-scan.sh`.
@@ -258,7 +259,8 @@ Full instructions, checklists, and commands, read on demand.
 ```
 
 Activation: automatic when extension bytes change, checked between
-iterations after a successful mutating call and at turn start; `/reload`
+iterations after every executed mutating call (a failed call that wrote
+the file still activates it) and at turn start; `/reload`
 forces it now. Verify with `openmax --check`.
 "#;
 
@@ -925,6 +927,24 @@ on stdin, reports each line, and exits nonzero on any violation.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No authoring surface claims the refreeze needs a SUCCESSFUL call:
+    /// #242 activates on any executed mutating call (a failed writer
+    /// included), and the permissions/settings/memory surfaces already said
+    /// so, which left tools and skills contradicting them about one event
+    /// (round-7 audit). The phrase is banned outright so a new surface
+    /// cannot reintroduce it.
+    #[test]
+    fn no_spec_surface_requires_a_successful_mutating_call() {
+        for surface in SURFACES {
+            // "usage" is assembled at runtime, not a static text.
+            let Some(text) = render(surface) else { continue };
+            assert!(
+                !text.contains("successful mutating call"),
+                "--spec {surface} claims a success requirement the code dropped in #242"
+            );
+        }
+    }
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
