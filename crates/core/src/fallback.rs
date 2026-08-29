@@ -512,6 +512,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unterminated_string_holding_a_tag_is_not_mined_for_a_call() {
+        // The reported shape: the outer JSON is malformed because its string
+        // never closes, and that unclosed string holds a raw nested tag with a
+        // valid-looking call. Neither the close-bounded body nor the body
+        // truncated at the inner open parses, so the whole block drops as
+        // prose. Resuming at the inner tag would execute quoted content.
+        let text = "<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"x <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"id\"}}</tool_call>";
+        assert!(
+            extract_tool_calls(text, known()).is_none(),
+            "quoted content inside a malformed block must not become a call: {:?}",
+            extract_tool_calls(text, known())
+        );
+    }
+
+    #[test]
     fn fenced_tool_call_block() {
         let text = "```tool_call\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.rs\"}}\n```";
         let (_, calls) = extract_tool_calls(text, known()).unwrap();
