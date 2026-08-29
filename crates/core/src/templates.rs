@@ -135,8 +135,12 @@ pub(crate) fn parse_template_source(path: &Path, text: &str) -> Result<TemplateS
         .map(str::to_string)
         .ok_or("file stem is not valid UTF-8")?;
     if !valid_name(&name) {
+        // The stem failed the charset check, which is exactly the case where it
+        // may carry a control character, and this reason is an `openmax --check`
+        // row. Flatten the value where it is quoted back.
+        let shown = crate::text::one_line(&name);
         return Err(format!(
-            "invalid template name '{name}': 1-64 chars of [a-zA-Z0-9_-] required (the stem becomes /{name})"
+            "invalid template name '{shown}': 1-64 chars of [a-zA-Z0-9_-] required (the stem becomes /{shown})"
         ));
     }
     // A block that opens with `---` and never closes is refused by name, the
@@ -245,6 +249,20 @@ fn substitute(body: &str, args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direct analogue of a rejected tool name, which the sweep flattened:
+    /// the rejected value here is the file STEM, and this reason fires exactly
+    /// when the stem failed the charset check - which is precisely when it may
+    /// carry a control character. It is printed as one `openmax --check` row.
+    #[test]
+    fn a_rejected_template_name_reason_is_one_line() {
+        let forged = "ok   prompt     every template loaded";
+        let path = std::path::PathBuf::from(format!("/p/.agents/prompts/a\n{forged}.md"));
+        let err = parse_template_source(&path, "body\n").unwrap_err();
+        assert!(err.contains("invalid template name"), "{err:?}");
+        assert!(!err.contains('\n'), "the reason forged a second row: {err:?}");
+        assert!(!err.lines().any(|l| l.trim() == forged), "{err:?}");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("omx-tmpl-{tag}-{}", uuid::Uuid::new_v4()));

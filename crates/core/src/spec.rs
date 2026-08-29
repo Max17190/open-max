@@ -61,6 +61,17 @@ const REQUIRED_FIELDS: [(&str, &str); 2] =
 /// Both manifest structs are flat, so `missing field` can only mean a
 /// top-level key: there is no nested span this discards.
 pub(crate) fn manifest_toml_error(err: &toml::de::Error, surface: &str) -> String {
+    // Flattened at the producer because this is the one reason in the harness
+    // that is multi-line BY CONSTRUCTION: `toml::de::Error`'s Display renders a
+    // caret block that quotes the manifest's own offending source line back
+    // verbatim. That reason is the agent's own bytes, and it reaches both
+    // `openmax --check` (one verdict per row) and the refreeze receipt's "NOT
+    // loaded" clause (a user-role message the model reads as the human's).
+    // Every caller inherits the rule; none has to remember it.
+    crate::text::one_line(&manifest_toml_reason(err, surface))
+}
+
+fn manifest_toml_reason(err: &toml::de::Error, surface: &str) -> String {
     let Some(field) = err
         .message()
         .strip_prefix("missing field `")

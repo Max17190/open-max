@@ -1181,7 +1181,7 @@ pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, Str
     let event = HookEvent::parse(&file.event).ok_or_else(|| {
         format!(
             "unknown event '{}': expected pre_tool_use, post_tool_use, user_prompt_submit, session_start, compaction, or turn_end",
-            file.event
+            crate::text::one_line(&file.event)
         )
     })?;
     let command = file.command.trim().to_string();
@@ -1191,7 +1191,7 @@ pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, Str
     if file.blocking && event != HookEvent::TurnEnd {
         return Err(format!(
             "blocking is only meaningful on turn_end: '{}' either always gates (pre_tool_use, user_prompt_submit) or never does",
-            file.event.trim()
+            crate::text::one_line(file.event.trim())
         ));
     }
     let tool_filter = file
@@ -2342,6 +2342,23 @@ command = "true"
             }
             PreToolResult::Allow | PreToolResult::Cancelled => panic!("expected block"),
         }
+    }
+
+    /// The rejected `event` value is quoted back into the parse reason, and
+    /// that reason is an `openmax --check` row as well as receipt text. The
+    /// receipt path was closed at `describe`, but `--check` reads the reason
+    /// straight from the parser, so the value flattens at the parser too.
+    #[test]
+    fn a_rejected_hook_event_reason_is_one_line() {
+        let forged = "ok   hook        every hook is approved";
+        let err = parse_hook_source(
+            Path::new("/p/.openmax/hooks/h.toml"),
+            &format!("event = \"a\\n{forged}\"\ncommand = \"true\"\n"),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown event"), "{err:?}");
+        assert!(!err.contains('\n'), "the reason forged a second row: {err:?}");
+        assert!(!err.lines().any(|l| l.trim() == forged), "{err:?}");
     }
 
     #[tokio::test]
