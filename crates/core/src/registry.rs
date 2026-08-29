@@ -613,10 +613,24 @@ impl Registry {
     /// a bare "unknown": the model most likely wrote (or was promised) that
     /// very file.
     fn unknown_tool_error(&self, name: &str, root: &Path) -> ToolOutcome {
-        if let Some((path, reason)) = self.broken.iter().find(|(path, _)| {
-            path.file_stem().is_some_and(|stem| stem == name)
-                || path.file_name().is_some_and(|f| f == "SKILL.md")
-                    && path.parent().and_then(|d| d.file_name()).is_some_and(|d| d == name)
+        // A broken .toml is matched by the NAME it occupies (its declared
+        // name, or the stem fallback - the registry's own key), never by
+        // stem alone: `todo-scan.toml` declaring `name = "todo_scan"` is
+        // exactly the file a caller of `todo_scan` means, and the stem match
+        // answered with a bare unknown (round-7 audit). The stem and
+        // SKILL.md matchers stay as the fallback for a manifest-restored
+        // registry, whose broken_tools list is empty.
+        let named = self
+            .broken_tools
+            .iter()
+            .find(|(_, occupied)| occupied.as_str() == name)
+            .and_then(|(p, _)| self.broken.iter().find(|(bp, _)| bp == p));
+        if let Some((path, reason)) = named.or_else(|| {
+            self.broken.iter().find(|(path, _)| {
+                path.file_stem().is_some_and(|stem| stem == name)
+                    || path.file_name().is_some_and(|f| f == "SKILL.md")
+                        && path.parent().and_then(|d| d.file_name()).is_some_and(|d| d == name)
+            })
         }) {
             let shown = path.strip_prefix(root).unwrap_or(path);
             return ToolOutcome::err(format!(
@@ -1529,6 +1543,40 @@ mod tests {
         assert!(snap2.shadowed_skills.is_empty(), "{:?}", snap2.shadowed_skills);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// A caller of `todo_scan` means the broken `todo-scan.toml` that
+    /// DECLARES that name; the unknown-tool error must link them by the
+    /// registry's own key (declared name, stem fallback), not by stem alone,
+    /// or the model concludes the file was never written (round-7 audit).
+    #[tokio::test]
+    async fn a_broken_manifest_is_named_when_its_declared_name_differs_from_its_stem() {
+        let dir = std::env::temp_dir().join(format!("omx-f9-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        // Hyphen file, underscore tool: parses as TOML, fails the spec.
+        std::fs::write(
+            project.join(".openmax/tools/todo-scan.toml"),
+            "name = \"todo_scan\"\ndescription = \"d\"\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&data, &project);
+        assert!(registry.get("todo_scan").is_none());
+        let out = registry
+            .execute(
+                "todo_scan",
+                &serde_json::json!({}),
+                &data,
+                &project,
+                crate::tools::OutputCaps::default(),
+                std::sync::Arc::new(crate::state::CancelToken::default()),
+            )
+            .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("did NOT load"), "{}", out.output);
+        assert!(out.output.contains("todo-scan.toml"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A same-name collision between a broken file and a loaded definition
