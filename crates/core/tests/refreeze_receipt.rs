@@ -880,7 +880,7 @@ async fn a_turn_start_approval_note_reaches_the_wire_as_a_harness_note() {
             .expect("open");
         match env.event {
             AgentEvent::HarnessNote { text, .. } => {
-                if text.contains("approval activity outside this session") {
+                if text.contains("approval activity this session did not perform") {
                     note = Some(text);
                 }
             }
