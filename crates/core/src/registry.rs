@@ -337,6 +337,15 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
                                     shadowed_skills.push((name, vec![prev.path], winner, false));
                                 }
                             }
+                        } else {
+                            // Cross-tier precedence is deliberate and silent,
+                            // and it MOOTS any collision recorded in the losing
+                            // tier: keeping that record left its winner
+                            // pointing at a path the project definition just
+                            // displaced, and the post-cap settle then called
+                            // the name unindexed while the project skill is
+                            // active (Greptile).
+                            shadowed_skills.retain(|(n, ..)| *n != name);
                         }
                     }
                 }
@@ -1326,6 +1335,40 @@ mod tests {
         assert_eq!(name, "zz-common");
         assert!(winner.ends_with("zz-b/SKILL.md"), "{winner:?}");
         assert!(!*winner_indexed, "the cap dropped the winner; it is not indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A project definition taking a name MOOTS the losing tier's collision
+    /// record: two global namesakes collide, the project override wins by
+    /// precedence, and keeping the global record made the receipt call the
+    /// name unindexed while the project skill is active (Greptile).
+    #[test]
+    fn a_project_override_moots_a_global_collision_record() {
+        let dir = std::env::temp_dir().join(format!("omx-shadowx-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        for d in ["aa", "zz"] {
+            let s = data.join("skills").join(d);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                "---\nname: common\ndescription: global\n---\nB.\n",
+            )
+            .unwrap();
+        }
+        let s = project.join(".agents/skills/common");
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(s.join("SKILL.md"), "---\nname: common\ndescription: project\n---\nB.\n")
+            .unwrap();
+        let snap = capture_extensions(&data, &project);
+        assert!(
+            snap.shadowed_skills.is_empty(),
+            "precedence moots the losing tier's collision: {:?}",
+            snap.shadowed_skills
+        );
+        let registry = Registry::from_snapshot(snap);
+        let skill = registry.skills.iter().find(|s| s.name == "common").expect("indexed");
+        assert!(skill.path.starts_with(&project), "the project definition is the live one");
         let _ = std::fs::remove_dir_all(dir);
     }
 
