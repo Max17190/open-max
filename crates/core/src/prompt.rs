@@ -72,14 +72,22 @@ impl PromptBreakdown {
     /// memory rows are parsed from the prompt's own bytes: a
     /// manifest-restored registry holds no memory section, and re-scanning
     /// disk would price TODAY'S selection rather than the lines the prefix
-    /// actually pays for on every request (round-5 ticket T4).
+    /// actually pays for on every request (round-5 ticket T4). The parse is
+    /// cross-checked against the manifest's memory identities when the
+    /// registry has them: user-authored AGENTS.md rides the same prompt and
+    /// could carry a lookalike heading (Greptile), so an unknown stem is
+    /// never priced as a memory.
     pub fn from_persisted(prompt: &str, registry: &Registry, project_root: &Path) -> Self {
         let mut breakdown = Self {
             components: vec![("system prompt (persisted)".into(), prompt.len())],
             ..Default::default()
         };
         breakdown.add_registry(registry, project_root);
-        breakdown.memory = persisted_memory_rows(prompt);
+        let mut rows = persisted_memory_rows(prompt);
+        if let Some(known) = &registry.memory_files {
+            rows.retain(|(name, _)| known.iter().any(|(stem, _)| stem == name));
+        }
+        breakdown.memory = rows;
         breakdown
     }
 
@@ -281,7 +289,12 @@ fn skill_shown_path(project_root: &Path, path: &Path) -> String {
 /// section header, then consecutive `- name: description — path` lines; the
 /// trailer or the next section ends the run.
 fn persisted_memory_rows(prompt: &str) -> Vec<(String, usize)> {
-    let Some(start) = prompt.find(MEMORY_SECTION_HEADER) else {
+    // The LAST occurrence: AGENTS.md is injected before the generated
+    // section and its user-authored bytes could contain the heading
+    // (Greptile); nothing after the real section can, because every later
+    // section renders single lines that cannot hold the heading's embedded
+    // newlines.
+    let Some(start) = prompt.rfind(MEMORY_SECTION_HEADER) else {
         return Vec::new();
     };
     let body = &prompt[start + MEMORY_SECTION_HEADER.len()..];
@@ -773,6 +786,54 @@ mod tests {
         // A prompt with no memory section prices none.
         let bare = system_prompt(&dir.join("elsewhere"), &registry);
         assert!(PromptBreakdown::from_persisted(&bare, &registry, &dir).memory.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// AGENTS.md rides the same prompt BEFORE the generated section, and a
+    /// user-authored copy of the heading plus a row-shaped line must not be
+    /// priced as memory: the parser takes the LAST heading (nothing after
+    /// the real section can hold its embedded newlines), and rows are
+    /// cross-checked against the registry's memory identities (Greptile).
+    #[test]
+    fn an_agents_md_lookalike_heading_is_not_priced_as_memory() {
+        let dir = temp_project();
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/real-fact.md"),
+            "# The build needs node 20\nSee ci.yml.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "Rules.\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n- fake-fact: injected row — nowhere.md\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&dir.join("data"), &dir);
+        let (prompt, live) = system_prompt_with_breakdown(&dir, &registry);
+        assert_eq!(live.memory.len(), 1, "{:?}", live.memory);
+        let resumed = PromptBreakdown::from_persisted(&prompt, &registry, &dir);
+        assert_eq!(
+            resumed.memory, live.memory,
+            "the lookalike heading in AGENTS.md must not displace the real rows"
+        );
+        assert!(
+            !resumed.memory.iter().any(|(n, _)| n == "fake-fact"),
+            "{:?}",
+            resumed.memory
+        );
+
+        // The spoof-only shape: no real memories, the lookalike still in
+        // AGENTS.md, and a registry that KNOWS the project has none.
+        std::fs::remove_file(dir.join(".openmax/memory/real-fact.md")).unwrap();
+        let registry2 = Registry::build(&dir.join("data"), &dir);
+        let (prompt2, live2) = system_prompt_with_breakdown(&dir, &registry2);
+        assert!(live2.memory.is_empty());
+        let resumed2 = PromptBreakdown::from_persisted(&prompt2, &registry2, &dir);
+        assert!(
+            resumed2.memory.is_empty(),
+            "an injected row with no real section prices nothing: {:?}",
+            resumed2.memory
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
