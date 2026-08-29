@@ -256,6 +256,27 @@ mod tests {
         std::fs::write(root.join(format!("{name}.md")), content).unwrap();
     }
 
+    /// The shared frontmatter reader matches keys at top level only: a
+    /// `description:` nested inside a `metadata:` map is that map's field,
+    /// never the template's popup line (same fix as SKILL.md's stolen
+    /// identity; the reader is one function).
+    #[test]
+    fn a_nested_description_is_not_the_template_description() {
+        let root = temp_dir("nested");
+        write_template(
+            &root,
+            "standup",
+            "---\nmetadata:\n  description: internal notes\n---\nStandup for $1.\n",
+        );
+        let templates = discover_in(std::slice::from_ref(&root));
+        assert_eq!(templates.len(), 1);
+        assert_eq!(
+            templates[0].description, "",
+            "a nested-only description leaves the popup line empty"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn discovers_and_reads_frontmatter_description() {
         let root = temp_dir("disc");
