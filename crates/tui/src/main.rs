@@ -64,7 +64,7 @@ options:
                          stdin against the openmax-stdio contract instead
       --spec <surface>   print the authoring contract for one surface and
                          exit (tools, skills, prompts, hooks, permissions,
-                         providers, memory, recall, stdio, usage)
+                         providers, settings, memory, recall, stdio, usage)
       --trust-project    persist trust for this exact project root, then run
   -V, --version          print the version
   -h, --help             this help
@@ -1586,6 +1586,29 @@ mod tests {
             super::approve_command(std::path::Path::new("/tmp/my probe dir/gate$(x).toml")),
             "openmax --approve '/tmp/my probe dir/gate$(x).toml'"
         );
+    }
+
+    /// --help's --spec list names every surface the binary accepts: --check
+    /// rows send readers to `openmax --spec settings`, and the help text was
+    /// the one place that did not know it existed (round-7 audit).
+    #[test]
+    fn help_names_every_spec_surface() {
+        // The parenthesized list after "--spec <surface>" is parsed and
+        // compared as a SET against spec::SURFACES: a fixed window plus
+        // substring checks could be masked by unrelated prose (settings.json)
+        // or defeated by a harmless reflow (Greptile).
+        let start = super::HELP.find("--spec <surface>").expect("--spec is documented");
+        let open = super::HELP[start..].find('(').expect("the option lists its surfaces") + start;
+        let close = super::HELP[open..].find(')').expect("the list closes") + open;
+        let mut listed: Vec<&str> = super::HELP[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        listed.sort_unstable();
+        let mut surfaces: Vec<&str> = open_max_core::spec::SURFACES.to_vec();
+        surfaces.sort_unstable();
+        assert_eq!(listed, surfaces, "--help's --spec list must equal spec::SURFACES");
     }
 
     use super::*;

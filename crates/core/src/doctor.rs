@@ -1854,7 +1854,8 @@ fn unread_paths(project_root: &Path) -> Vec<Finding> {
                         path,
                         status: Status::Warn(format!(
                             "nothing reads files directly in {parent_name}/; \
-                             see openmax --spec for where each surface lives"
+                             run openmax --spec tools (or skills, prompts, hooks, \
+                             permissions, memory) for where each surface lives"
                         )),
                     });
                 }
@@ -4164,6 +4165,16 @@ mod tests {
         );
         assert!(find(&findings, ".agents/prompt").status.summary().contains(".agents/prompts/"));
         assert!(find(&findings, ".openmax/deploy.toml").status.summary().contains("directly in"));
+        // The repair pointer is runnable as printed: bare `openmax --spec`
+        // errors with the full help dump, so a surface token must follow
+        // (round-7 audit; the sibling warnings already name exact targets).
+        assert!(
+            find(&findings, ".openmax/deploy.toml")
+                .status
+                .summary()
+                .contains("openmax --spec tools"),
+            "the pointer names a runnable command"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
