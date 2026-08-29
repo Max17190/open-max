@@ -31,6 +31,10 @@ const MAX_MAP_DEPTH: usize = 2;
 /// The skills index is a name+description line per skill; past this it is a
 /// prompt tax, not an index.
 pub const MAX_SKILLS_BYTES: usize = 3_000;
+/// The memory section's header, shared by prompt assembly and the persisted
+/// parser so a resumed session recognizes exactly the section it carries.
+const MEMORY_SECTION_HEADER: &str =
+    "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n";
 
 /// System prompt: short, imperative, explicit about tool use, and every line
 /// has to earn its place. Long "constitution"-style prompts measurably degrade
@@ -64,13 +68,18 @@ pub struct PromptBreakdown {
 
 impl PromptBreakdown {
     /// For resumed sessions the persisted prompt is one opaque string; the
-    /// per-tool/skill split still comes from the frozen registry.
-    pub fn from_persisted(system_chars: usize, registry: &Registry, project_root: &Path) -> Self {
+    /// per-tool/skill split still comes from the frozen registry, and the
+    /// memory rows are parsed from the prompt's own bytes: a
+    /// manifest-restored registry holds no memory section, and re-scanning
+    /// disk would price TODAY'S selection rather than the lines the prefix
+    /// actually pays for on every request (round-5 ticket T4).
+    pub fn from_persisted(prompt: &str, registry: &Registry, project_root: &Path) -> Self {
         let mut breakdown = Self {
-            components: vec![("system prompt (persisted)".into(), system_chars)],
+            components: vec![("system prompt (persisted)".into(), prompt.len())],
             ..Default::default()
         };
         breakdown.add_registry(registry, project_root);
+        breakdown.memory = persisted_memory_rows(prompt);
         breakdown
     }
 
@@ -141,9 +150,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     };
     if let Some((index, rows)) = memory {
         let before = prompt.len();
-        prompt.push_str(
-            "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n",
-        );
+        prompt.push_str(MEMORY_SECTION_HEADER);
         prompt.push_str(&index);
         breakdown.components.push(("memory index".into(), prompt.len() - before));
         breakdown.memory = rows;
@@ -268,6 +275,28 @@ fn skill_shown_path(project_root: &Path, path: &Path) -> String {
 /// bytes for a skill the section carries, zero for one the byte cap dropped
 /// (only the omission trailer mentions it). Pricing a dropped skill as if it
 /// were carried sends an agent pruning by cost after tokens nobody is paying.
+/// The memory rows a persisted prompt carries, priced from its own bytes:
+/// each index line as (name, line length including its newline), the same
+/// accounting the live scan records. Recognition is structural: the shared
+/// section header, then consecutive `- name: description — path` lines; the
+/// trailer or the next section ends the run.
+fn persisted_memory_rows(prompt: &str) -> Vec<(String, usize)> {
+    let Some(start) = prompt.find(MEMORY_SECTION_HEADER) else {
+        return Vec::new();
+    };
+    let body = &prompt[start + MEMORY_SECTION_HEADER.len()..];
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix("- ") else { break };
+        if !line.contains(" — ") {
+            break;
+        }
+        let Some((name, _)) = rest.split_once(':') else { break };
+        rows.push((name.to_string(), line.len() + 1));
+    }
+    rows
+}
+
 pub fn skill_index_costs(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, usize)> {
     skill_index_lines(project_root, skills)
         .into_iter()
@@ -496,7 +525,7 @@ mod tests {
         let costs = skill_index_costs(&dir, &registry.skills);
         assert_eq!(breakdown.skills, costs, "the breakdown is the same accounting");
         assert_eq!(
-            PromptBreakdown::from_persisted(prompt.len(), &registry, &dir).skills,
+            PromptBreakdown::from_persisted(&prompt, &registry, &dir).skills,
             costs,
             "a resumed session bills like a fresh one"
         );
@@ -714,6 +743,39 @@ mod tests {
     /// The memory index is a prompt section like the skills index: one line
     /// per surfaced fact when memories exist, and nothing at all when none
     /// do, so a memoryless project's prompt stays byte-identical.
+    #[test]
+    fn a_persisted_breakdown_prices_the_memory_index_it_carries() {
+        // A resumed session's /context used to show no memory rows while the
+        // persisted prefix paid for the section on every request (round-5
+        // ticket T4). The rows come from the prompt's own bytes and must
+        // reproduce the live scan's accounting exactly.
+        let dir = temp_project();
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/deploy-port.md"),
+            "# The deploy port is 7443\nSet in infra/nginx.conf.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".openmax/memory/api-shape.md"),
+            "# Sessions API pages by cursor, not offset\nSee crates/core.",
+        )
+        .unwrap();
+        let registry = Registry::builtin_only();
+        let (prompt, live) = system_prompt_with_breakdown(&dir, &registry);
+        assert_eq!(live.memory.len(), 2, "both memories index: {:?}", live.memory);
+
+        let resumed = PromptBreakdown::from_persisted(&prompt, &registry, &dir);
+        assert_eq!(
+            resumed.memory, live.memory,
+            "the resumed breakdown prices the same rows at the same bytes"
+        );
+        // A prompt with no memory section prices none.
+        let bare = system_prompt(&dir.join("elsewhere"), &registry);
+        assert!(PromptBreakdown::from_persisted(&bare, &registry, &dir).memory.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn memory_index_appears_only_when_memories_exist() {
         let dir = temp_project();
