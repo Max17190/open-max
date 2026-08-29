@@ -620,9 +620,14 @@ impl Registry {
         // answered with a bare unknown (round-7 audit). The stem and
         // SKILL.md matchers stay as the fallback for a manifest-restored
         // registry, whose broken_tools list is empty.
+        // Reverse scan: broken_tools accumulates global-tier files first and
+        // project-tier files after, and when BOTH tiers' manifests for one
+        // name are broken the project override is what actually withholds
+        // the tool, so it is the file to name (Greptile).
         let named = self
             .broken_tools
             .iter()
+            .rev()
             .find(|(_, occupied)| occupied.as_str() == name)
             .and_then(|(p, _)| self.broken.iter().find(|(bp, _)| bp == p));
         if let Some((path, reason)) = named.or_else(|| {
@@ -1543,6 +1548,48 @@ mod tests {
         assert!(snap2.shadowed_skills.is_empty(), "{:?}", snap2.shadowed_skills);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// When BOTH tiers' manifests for one name are broken, the error names
+    /// the project override, the file that actually withholds the tool,
+    /// not the global one that happened to be scanned first (Greptile).
+    #[tokio::test]
+    async fn a_doubly_broken_name_is_linked_to_the_project_override() {
+        let dir = std::env::temp_dir().join(format!("omx-f9p-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        std::fs::create_dir_all(data.join("tools")).unwrap();
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            data.join("tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"global\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"project\"\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&data, &project);
+        assert!(registry.get("deploy").is_none());
+        let out = registry
+            .execute(
+                "deploy",
+                &serde_json::json!({}),
+                &data,
+                &project,
+                crate::tools::OutputCaps::default(),
+                std::sync::Arc::new(crate::state::CancelToken::default()),
+            )
+            .await;
+        assert!(!out.ok);
+        assert!(out.output.contains("did NOT load"), "{}", out.output);
+        assert!(
+            out.output.contains(".openmax/tools/deploy.toml"),
+            "the project override is the named file: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A caller of `todo_scan` means the broken `todo-scan.toml` that
