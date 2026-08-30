@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use open_max_core::agent;
+use open_max_core::text::one_line;
 use open_max_core::sessions;
 use open_max_core::state::Core;
 use open_max_core::templates;
@@ -18,15 +19,6 @@ pub struct HeadlessArgs {
     pub prompts: Vec<String>,
     pub continue_session: bool,
     pub json: bool,
-}
-
-/// Authored text on a terminal-bound line: a reason, detail, or file name is
-/// often built from tool or test output, and a control byte in it (a
-/// carriage return, an ANSI escape) could split or restyle the diagnostic.
-/// One space per control byte keeps the line one line. Shared with the
-/// `--check` human rows, whose path column is author-controlled too.
-pub(crate) fn printable(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
@@ -271,7 +263,7 @@ async fn run_turn_events(
                 // cannot split or restyle the line (printable(), like the
                 // other harness-authored stderr text).
                 if !json {
-                    let _ = writeln!(stderr, "openmax: {}", printable(text));
+                    let _ = writeln!(stderr, "openmax: {}", one_line(text));
                 }
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
@@ -296,7 +288,7 @@ async fn run_turn_events(
                     let _ = writeln!(
                         stderr,
                         "openmax: hook '{hook}' failed on {event}: {}",
-                        printable(detail)
+                        one_line(detail)
                     );
                 }
             }
@@ -307,7 +299,7 @@ async fn run_turn_events(
                         "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {}",
                         continuation + 1,
                         continuation + continuations_left,
-                        printable(reason),
+                        one_line(reason),
                     );
                 }
             }
@@ -331,8 +323,11 @@ fn call_line(name: &str, summary: &str) -> String {
 }
 
 fn truncate_line(s: &str, max: usize) -> String {
-    let one_line: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-    let trimmed = one_line.trim();
+    // The same rule as every other authored line in the workspace: this
+    // preview is raw tool output on a terminal, so an ESC or a U+2028 must not
+    // survive it either (the old inline map flattened only \n and \r).
+    let flattened = one_line(s);
+    let trimmed = flattened.trim();
     if trimmed.chars().count() <= max {
         return trimmed.to_string();
     }
@@ -399,6 +394,12 @@ mod tests {
     #[test]
     fn truncate_line_flattens_and_caps_on_char_boundaries() {
         assert_eq!(truncate_line("a\nb\rc", 10), "a b c");
+        // The preview is raw tool output on a terminal. The old inline rule
+        // flattened only \n and \r, so an ESC could restyle the rest of the
+        // line and a Unicode line separator could break it; both go through
+        // the workspace's one sanitizer now.
+        assert_eq!(truncate_line("a\u{1b}[31mb", 20), "a [31mb");
+        assert_eq!(truncate_line("a\u{2028}b\u{2029}c", 20), "a b c");
         assert_eq!(truncate_line("  padded  ", 10), "padded");
         let long = "é".repeat(200);
         let cut = truncate_line(&long, 20);

@@ -29,7 +29,7 @@
 /// warning) still sees a faithful, if flattened, value. The result is exactly
 /// one line: an interpolated value can never leave its own line, its own
 /// receipt clause, or its own `--check` row.
-pub(crate) fn one_line(s: &str) -> String {
+pub fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {

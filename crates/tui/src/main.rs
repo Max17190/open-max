@@ -520,10 +520,16 @@ async fn main() -> std::io::Result<()> {
                             format!("retired  {:12} {where_} (path no longer expected)", "")
                         }
                     };
+                    // The row carries the record's stored path, which is a
+                    // capability file's own name. One record is one row, the
+                    // same rule check_row applies to a finding.
                     println!(
-                        "{} {:8} {what}{note}{session}",
-                        open_max_core::ledger::format_ts(r.ts),
-                        r.actor.as_str(),
+                        "{}",
+                        open_max_core::text::one_line(&format!(
+                            "{} {:8} {what}{note}{session}",
+                            open_max_core::ledger::format_ts(r.ts),
+                            r.actor.as_str(),
+                        ))
                     );
                     // Record the runnable restore targets for the footer. A
                     // change record names its own path and hash; an approval
@@ -730,13 +736,22 @@ async fn main() -> std::io::Result<()> {
         }
         match open_max_core::ledger::approve_capability(&default_data_dir(), &project, file, &shas) {
             Ok(()) => {
-                println!("approved {path} ({})", &sha[..12]);
+                // The one screen a human reads before vouching for bytes, so
+                // no path it lists may forge a line and claim a file the
+                // approval does not cover.
+                println!(
+                    "{}",
+                    open_max_core::text::one_line(&format!("approved {path} ({})", &sha[..12]))
+                );
                 for entry in &code {
                     let code_sha = entry.sha256.clone().unwrap_or_default();
                     println!(
-                        "  and the code it runs: {} ({})",
-                        entry.path.display(),
-                        &code_sha[..12.min(code_sha.len())]
+                        "{}",
+                        open_max_core::text::one_line(&format!(
+                            "  and the code it runs: {} ({})",
+                            entry.path.display(),
+                            &code_sha[..12.min(code_sha.len())]
+                        ))
                     );
                 }
                 if !code.is_empty() {
@@ -1193,7 +1208,10 @@ async fn run_tool_examples(
         Err(reason) => {
             println!(
                 "{}",
-                headless::printable(&format!("err  example     {}  {reason}", project.display()))
+                open_max_core::text::one_line(&format!(
+                    "err  example     {}  {reason}",
+                    project.display()
+                ))
             );
             failures += 1;
         }
@@ -1544,7 +1562,7 @@ fn check_row(f: &open_max_core::doctor::Finding) -> String {
         Status::Warn(reason) => format!("warn {:<11} {}  {reason}", f.kind, path),
         Status::Err(reason) => format!("err  {:<11} {}  {reason}", f.kind, path),
     };
-    headless::printable(&row)
+    open_max_core::text::one_line(&row)
 }
 
 /// One verdict row of `--check --run-examples`, one-lined by the same rule:
@@ -1577,7 +1595,7 @@ fn example_row(verdict: &open_max_core::doctor::ExampleVerdict) -> String {
         // Approved content ran with the host's authority: a failure is real.
         Err(reason) => format!("err  example     {}  {reason}{badge}", verdict.tool),
     };
-    headless::printable(&row)
+    open_max_core::text::one_line(&row)
 }
 
 #[cfg(test)]
@@ -1623,6 +1641,23 @@ mod tests {
         );
         assert!(row.starts_with("err  tool"), "{row:?}");
         assert!(row.ends_with("control bytes"), "{row:?}");
+
+        // The delta from the crate's old private flattener: U+2028 and U+2029
+        // are line breaks to a renderer and are NOT control characters, so an
+        // `is_control`-only rule let them through. The workspace now has one
+        // sanitizer and this row inherits its full rule.
+        let separators = Finding {
+            kind: "tool",
+            path: std::path::PathBuf::from(
+                ".openmax/tools/a\u{2028}ok   tool        forged.toml\u{2029}b.toml",
+            ),
+            status: Status::Err("reason".into()),
+        };
+        let row = super::check_row(&separators);
+        assert!(
+            !row.contains('\u{2028}') && !row.contains('\u{2029}'),
+            "a Unicode line separator survived into the row: {row:?}"
+        );
 
         let ok = Finding {
             kind: "skill",

@@ -21,7 +21,7 @@ pub mod skills;
 pub mod spec;
 pub mod state;
 pub mod templates;
-pub(crate) mod text;
+pub mod text;
 pub mod tools;
 pub mod trust;
 pub mod types;
