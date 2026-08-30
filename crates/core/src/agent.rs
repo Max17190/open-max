@@ -357,6 +357,15 @@ async fn novel_policy_notices(
     };
     notices
         .into_iter()
+        // Canonicalize BEFORE taking identity. A notice is deduped once per
+        // session by hash, and on resume that set is rebuilt by parsing the
+        // notices back out of the transcript - where they are stored one-lined.
+        // Hashing the raw text here would give a control-character-bearing
+        // notice (a permissions path, say) one identity when it is first
+        // reported and a different one when it is restored, so the session
+        // would show it again after every resume. The canonical text is the
+        // identity, and it is also what gets persisted.
+        .map(|n| crate::text::one_line(&n))
         .filter(|n| data.reported_policy_notices.insert(policy_notice_hash(n)))
         .collect()
 }
@@ -4365,6 +4374,57 @@ mod tests {
             !FALLBACK_RECOVERY_NOTE.contains("means the endpoint"),
             "no asserted cause the harness cannot verify"
         );
+    }
+
+    /// A policy notice is reported once per session, and on resume that
+    /// "already said it" set is rebuilt by parsing the notices back out of the
+    /// transcript, which stores them one-lined. So the reporter must take
+    /// identity on the SAME canonical text that gets persisted. Hashing the raw
+    /// notice gave a control-character-bearing one (a permissions path is
+    /// enough) one identity when first reported and another when restored, and
+    /// every resume showed it again (Greptile).
+    #[tokio::test]
+    async fn a_policy_notice_keeps_one_identity_across_a_resume() {
+        let dir = std::env::temp_dir().join(format!("openmax-pn-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        core.sessions.lock().await.insert("s1".to_string(), Default::default());
+
+        let raw = "permissions fail-closed: .openmax/a\nb.toml is malformed".to_string();
+        assert_ne!(
+            policy_notice_hash(&raw),
+            policy_notice_hash(&crate::text::one_line(&raw)),
+            "the fixture must change under flattening, or this proves nothing"
+        );
+
+        let reported = novel_policy_notices(&core, "s1", vec![raw.clone()]).await;
+        assert_eq!(reported.len(), 1, "the notice is novel the first time");
+
+        // The transcript holds what the note builder wrote, one-lined.
+        let persisted = vec![ChatMessage::user(format!(
+            "{POLICY_NOTE_PREFIX}{}]",
+            crate::text::one_line(&reported[0])
+        ))];
+
+        // Resume: the restored set must contain the identity the reporter
+        // recorded, or the session says it all over again.
+        let restored = rehydrate_policy_notices(&persisted);
+        let recorded = {
+            let map = core.sessions.lock().await;
+            map.get("s1").unwrap().reported_policy_notices.clone()
+        };
+        assert_eq!(
+            recorded, restored,
+            "the reporter's identity and the resumed identity must be the same set"
+        );
+
+        // And the same notice on the resumed session is not novel again.
+        core.sessions.lock().await.insert(
+            "s2".to_string(),
+            SessionData { reported_policy_notices: restored, ..Default::default() },
+        );
+        let again = novel_policy_notices(&core, "s2", vec![raw]).await;
+        assert!(again.is_empty(), "the notice fired again after a resume: {again:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The door, tested as a door. Both note funnels are given a note that a
