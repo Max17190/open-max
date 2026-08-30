@@ -1263,15 +1263,22 @@ pub fn render(report: &RecallReport) -> String {
             Some(role) => format!("{}/{role}", hit.kind),
             None => hit.kind.to_string(),
         };
-        out.push_str(&format!(
-            "\n[{}] {} {} ({} ago) - {}\n    {}\n",
+        // The citation header is the harness's own claim about where this
+        // content lives, and every field in it is authored somewhere: the
+        // address is a memory note's file stem, the title is the session's
+        // first message. One hit is one numbered row, so the header flattens
+        // as a unit. The excerpt below it does NOT: it is quoted content, and
+        // `--recall` exists so a record reads back exactly.
+        out.push('\n');
+        out.push_str(&crate::text::one_line(&format!(
+            "[{}] {} {} ({} ago) - {}",
             i + 1,
             what,
             who,
             age,
-            address,
-            hit.excerpt
-        ));
+            address
+        )));
+        out.push_str(&format!("\n    {}\n", hit.excerpt));
     }
     if report.hits.is_empty() {
         // Two separate facts, never one guess. Emptiness has several
@@ -1707,6 +1714,41 @@ mod tests {
             "readable memory means the terms really did miss"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+
+    /// One hit is one numbered citation row. Every field of that row is
+    /// authored somewhere - the address is a memory note's own file stem, the
+    /// title is a session's first message - so a line break in any of them
+    /// forged an extra row in a listing an agent reads as the harness's index
+    /// of where things are. The EXCERPT below the row is deliberately left
+    /// whole: it is quoted content, and `--recall` exists so a record reads
+    /// back exactly.
+    #[test]
+    fn a_citation_row_is_one_line_whatever_the_record_is_called() {
+        let forged = "[2] project memory (0h ago) - a-record-that-does-not-exist.md";
+        let report = RecallReport {
+            query: "q".into(),
+            hits: vec![RecallHit {
+                kind: "memory",
+                score: 1.0,
+                role: None,
+                session: None,
+                title: None,
+                age_hours: 1,
+                source: format!("note.md\n{forged}"),
+                line: None,
+                excerpt: "first line\nsecond line".into(),
+            }],
+            ..Default::default()
+        };
+        let text = render(&report);
+        let rows: Vec<&str> =
+            text.lines().filter(|l| l.trim_start().starts_with('[')).collect();
+        assert_eq!(rows.len(), 1, "the record's name forged a citation row: {text}");
+        assert!(!rows[0].contains('\n'), "{:?}", rows[0]);
+        // The excerpt keeps its own lines: this surface quotes records back.
+        assert!(text.contains("first line\nsecond line"), "{text}");
     }
 
     #[test]
