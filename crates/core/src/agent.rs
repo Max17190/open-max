@@ -299,6 +299,28 @@ fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
 /// once per session while a new or reworded one gets through. The UI channel
 /// (HookFailed events, per turn) is unchanged; this dedupe is only for the
 /// transcript, where repetition is token spend.
+/// The one canonical form of a policy notice. A notice is reported once per
+/// session, and that "already said it" set does not persist on its own: on
+/// resume it is rebuilt by parsing the notices back out of the transcript.
+/// Identity therefore has to be taken on exactly the text that gets persisted,
+/// and the text that gets persisted has to survive the round trip, which means
+/// a notice may not spell either of the two things the transcript uses to
+/// delimit it:
+///
+/// - a line break, which would forge a second clause in a user-role message
+///   the model reads as the human's own words; and
+/// - `NOTICE_JOINER`, which separates the notices inside one note. Rehydration
+///   splits on that literal, so a notice containing it was restored as
+///   fragments whose hashes matched nothing, and the session said it again
+///   after every resume (Greptile). Collapsing it needs no escape/unescape
+///   machinery on this path: the delimiter simply cannot occur in a value.
+///
+/// Identity, persistence and display are all this one text, which is what
+/// makes the once-per-session promise hold across a resume.
+fn canonical_notice(notice: &str) -> String {
+    crate::text::one_line(notice).replace(NOTICE_JOINER, " / ")
+}
+
 fn policy_notice_hash(notice: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -357,15 +379,8 @@ async fn novel_policy_notices(
     };
     notices
         .into_iter()
-        // Canonicalize BEFORE taking identity. A notice is deduped once per
-        // session by hash, and on resume that set is rebuilt by parsing the
-        // notices back out of the transcript - where they are stored one-lined.
-        // Hashing the raw text here would give a control-character-bearing
-        // notice (a permissions path, say) one identity when it is first
-        // reported and a different one when it is restored, so the session
-        // would show it again after every resume. The canonical text is the
-        // identity, and it is also what gets persisted.
-        .map(|n| crate::text::one_line(&n))
+        // Canonicalize BEFORE taking identity: see `canonical_notice`.
+        .map(|n| canonical_notice(&n))
         .filter(|n| data.reported_policy_notices.insert(policy_notice_hash(n)))
         .collect()
 }
@@ -4389,11 +4404,20 @@ mod tests {
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         core.sessions.lock().await.insert("s1".to_string(), Default::default());
 
-        let raw = "permissions fail-closed: .openmax/a\nb.toml is malformed".to_string();
+        // Both delimiters the transcript uses, in one notice: a line break
+        // (which would forge a clause) and the joiner that separates notices
+        // inside a note (which rehydration splits on).
+        let raw = "permissions fail-closed: .openmax/a\nb | c.toml is malformed".to_string();
+        let canon = canonical_notice(&raw);
         assert_ne!(
             policy_notice_hash(&raw),
-            policy_notice_hash(&crate::text::one_line(&raw)),
-            "the fixture must change under flattening, or this proves nothing"
+            policy_notice_hash(&canon),
+            "the fixture must change under canonicalization, or this proves nothing"
+        );
+        assert!(!canon.contains('\n'), "{canon:?}");
+        assert!(
+            !canon.contains(NOTICE_JOINER),
+            "a canonical notice may not spell the joiner that separates notices: {canon:?}"
         );
 
         let reported = novel_policy_notices(&core, "s1", vec![raw.clone()]).await;
@@ -4402,7 +4426,7 @@ mod tests {
         // The transcript holds what the note builder wrote, one-lined.
         let persisted = vec![ChatMessage::user(format!(
             "{POLICY_NOTE_PREFIX}{}]",
-            crate::text::one_line(&reported[0])
+            reported.join(NOTICE_JOINER)
         ))];
 
         // Resume: the restored set must contain the identity the reporter
