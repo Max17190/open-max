@@ -17,3 +17,20 @@ target
 
 # Local contributor/agent instructions (not shipped)
 AGENTS.md
+
+# Private working material. These are excluded so a clone, a CI checkout or a
+# fresh worktree cannot commit them: `.git/info/exclude` lives on one machine
+# and does not travel, so it protected only the tree it was written in. One
+# `git add -A` from anywhere else published the lot, permanently, which is not
+# a hypothetical - a measurement directory reached a public pull request that
+# way and its diff is still served. Names here are deliberate: naming a file is
+# cheap, publishing its contents is not.
+CLAUDE.md
+CONTEXT.md
+/docs/adr/
+/docs/agents/
+/.scratch/
+/rigs/
+/branding/
+skills-lock.json
+.claude/skills/
