@@ -1072,9 +1072,9 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
     }
     let max_lex = raw.iter().map(|(_, l)| *l).fold(0.0f64, f64::max);
     // Recency is a damped tiebreaker, not a peer of relevance: at equal
-    // weight, dogfooding measured the literal answer losing to a recent
-    // two-word note once the answer aged past ~5 hours, because any project
-    // touched today buries its own past. At 0.25, a document needs at least
+    // weight the literal answer loses to a recent two-word note once the
+    // answer ages past a few hours, because any project touched today buries
+    // its own past. At 0.25, a document needs at least
     // three quarters of the best lexical score before age can reorder it.
     const RECENCY_WEIGHT: f64 = 0.25;
     let mut scored: Vec<(f64, usize)> = raw

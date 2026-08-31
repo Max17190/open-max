@@ -342,7 +342,7 @@ async fn a_resumed_session_does_not_repeat_a_persisted_notice() {
 /// is NOT running (inert until a human approves it out of session). Hooks
 /// are outside the extension fingerprint, so before this the write got no
 /// receipt at all and the agent believed its gate was live for a whole turn
-/// (round-4 dogfood).
+/// with no receipt at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hook_written_mid_turn_is_named_inert_on_the_writing_call() {
     let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
@@ -559,7 +559,7 @@ async fn an_out_of_session_approval_is_named_at_the_next_turn() {
     assert!(c.contains("approved .openmax/tools/docsearch.toml"), "{c}");
     // The note must not presume a benign third party: an agent process that
     // stepped around the session marker produces the identical event, and
-    // only the human can say which it was (round-6 judge finding).
+    // only the human can say which it was.
     assert!(c.contains("another terminal") && c.contains("session marker"), "{c}");
     assert!(c.contains("confirm it was theirs"), "{c}");
     // Turn one carried no such note (nothing had been approved).
@@ -574,8 +574,8 @@ async fn an_out_of_session_approval_is_named_at_the_next_turn() {
 }
 
 /// A mutating call that leaves permissions.toml malformed bricks every tool
-/// call for the rest of the turn (dogfood: 29 silent denies, --check itself
-/// denied). The writing call now carries a receipt naming the parse reason
+/// call for the rest of the turn, silently, with even `--check` denied.
+/// The writing call now carries a receipt naming the parse reason
 /// and the turn-scoped consequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalidating_write_to_permissions_is_named_on_the_writing_call() {
@@ -626,7 +626,7 @@ async fn an_invalidating_write_to_permissions_is_named_on_the_writing_call() {
 /// Editing the SCRIPT an approved gate runs revokes the approval and fails
 /// closed, but the script is not a .toml - the hook fingerprint missed it,
 /// so the edit got no receipt and the agent learned only when its next call
-/// was blocked (dogfood). The bound code is now in the fingerprint, so the
+/// was blocked. The bound code is now in the fingerprint, so the
 /// hook-write receipt fires on the code edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editing_an_approved_gates_script_is_named_on_the_writing_call() {

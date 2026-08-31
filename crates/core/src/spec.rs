@@ -957,7 +957,7 @@ mod tests {
     /// #242 activates on any executed mutating call (a failed writer
     /// included), and the permissions/settings/memory surfaces already said
     /// so, which left tools and skills contradicting them about one event
-    /// (round-7 audit). The phrase is banned outright so a new surface
+    ///. The phrase is banned outright so a new surface
     /// cannot reintroduce it.
     #[test]
     fn no_spec_surface_requires_a_successful_mutating_call() {
@@ -1028,7 +1028,7 @@ mod tests {
     fn spec_tools_names_the_caps_that_drop_or_reject() {
         // The principle the skills spec already enforces: a spec that omits
         // the real limit sends an author hunting for one they have not hit
-        // while the real one silently ate their file (round-7 audit).
+        // while the real one silently ate their file.
         assert!(
             TOOLS.contains(&format!("At most {} tools", crate::registry::MAX_EXTERNAL_TOOLS)),
             "--spec tools names the load cap"

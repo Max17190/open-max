@@ -1386,8 +1386,8 @@ fn approve(
                 // at all, so an approved manifest deleted before any freeze
                 // saw it - and EVERY bound script, which no freeze ever
                 // reads - was unrestorable while --ledger said otherwise
-                // (dogfood: an 86-second hunt for an object that could not
-                // exist). Store the vouched manifest bytes, and each bound
+                // sending a reader hunting for an object that cannot exist.
+                // Store the vouched manifest bytes, and each bound
                 // file whose on-disk bytes hash to a sha the human vouched.
                 store_object(&dir, vouched, &bytes)?;
                 if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -2558,7 +2558,7 @@ mod tests {
     /// Two repairs inside one clock second must both keep their evidence:
     /// the second quarantine takes a counter suffix instead of landing on
     /// the first's name (a rename there destroyed the earlier bytes), and
-    /// the generation count sees every variant (round-5 ticket T7).
+    /// the generation count sees every variant.
     #[test]
     fn a_second_quarantine_in_the_same_second_keeps_both() {
         let dir = temp("quar");

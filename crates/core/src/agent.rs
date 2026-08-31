@@ -1510,7 +1510,7 @@ async fn run_compact(
     // the budget path refiring every iteration. A one-shot user command
     // cannot thrash, and inheriting the fallback made /compact answer
     // "already compact" at 27k against a 20k setting whenever two fat
-    // messages sat in the protected tail (measured in the pty rig), while
+    // messages sat in the protected tail (measured), while
     // the next turn's automatic pass compacted the same transcript. The
     // schema futility guard below still applies to both paths.
     let trigger = settings
@@ -1645,7 +1645,7 @@ async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_roo
 /// Append a harness note to the last tool message (where the MODEL reads it)
 /// and emit it on the wire as a HarnessNote (where a custom FRONTEND reads
 /// it): the receipts the model sees were invisible to any non-TUI client,
-/// which saw only the bare tool output (dogfood, two frontend-shaped judges).
+/// which saw only the bare tool output.
 /// The `\n` prefix keeps the transcript readable; the wire note is clean.
 fn append_and_emit_note(
     core: &Arc<Core>,
@@ -1762,7 +1762,7 @@ fn refreeze_receipt_text(
         ));
     }
     if !added.unapproved.is_empty() {
-        // Round-4 dogfooding: this line used to say "callable" for these
+        // This line used to say "callable" for these
         // too, and the very next step was an approval card - the model
         // called the receipt out as overselling. Registered is not callable
         // until a human blesses the bytes; say which, and how.
@@ -1857,7 +1857,7 @@ struct AddedTools {
     /// had approved (manifest sha approved AND the code on disk still matches).
     /// The approval outlives the file (content-addressed), tools never fail
     /// closed, and --forget is for hooks: say all three, or the agent hands
-    /// the human a chore that does nothing (dogfood).
+    /// the human a chore that does nothing.
     removed_approved: Vec<String>,
     /// Removed external tools whose MANIFEST sha was approved but whose bound
     /// code no longer matches on disk (edited, or deleted alongside the
@@ -3435,8 +3435,8 @@ async fn run_loop(
                     // A hook file written this call: hooks are outside
                     // the extension fingerprint, so this write got no
                     // refreeze receipt and the inertness notice would
-                    // otherwise land a whole turn later (dogfood: the
-                    // agent believed its gate was live for a turn).
+                    // otherwise land a whole turn later, leaving the
+                    // agent believing its gate was live for a whole turn.
                     let hooks_now = crate::hooks::hooks_fingerprint(project_root);
                     if hooks_now != hooks_seen {
                         hooks_seen = hooks_now;
@@ -3812,9 +3812,9 @@ fn declined_message(source: Option<&UnapprovedCapability>) -> String {
 
 /// The content-approval card in a process the harness itself spawned. There
 /// is no human on this client: whatever answers the card is the parent
-/// agent's own tool call (round-4 dogfooding watched an agent launch
-/// `openmax --stdio` from bash, receive its own card, and answer it - the
-/// grant landed in the ledger as a human act). So the card is never raised
+/// agent's own tool call: an agent that launches `openmax --stdio` from
+/// bash receives its own card, answers it, and the grant lands in the ledger
+/// as a human act. So the card is never raised
 /// here; the refusal says why and names the two real repairs.
 fn nested_session_declined_message(source: &UnapprovedCapability) -> String {
     format!(
@@ -4376,7 +4376,7 @@ mod tests {
     /// rule as an imperative instead of asserting an endpoint cause the
     /// harness cannot know. The old text ("means the endpoint's tool-call
     /// parser lags") told a markup-emitting model the fault was elsewhere
-    /// while confirming the markup worked (round-7 audit).
+    /// while confirming the markup worked.
     #[test]
     fn the_fallback_note_restates_the_native_call_rule() {
         assert!(FALLBACK_RECOVERY_NOTE.contains("Emit native tool_calls"));
@@ -5446,7 +5446,7 @@ mod tests {
     /// A same-directory skill namesake collapses to one index entry, and the
     /// refreeze receipt that follows the write must say so: --check catches
     /// it, but the author's own receipt was silent, so the index line read as
-    /// if the OLDER file were what loaded (round-5 ticket T3).
+    /// if the OLDER file were what loaded.
     #[test]
     fn refreeze_receipt_names_a_skill_shadowed_by_a_same_tier_namesake() {
         let shadowed = vec![(
@@ -6015,7 +6015,7 @@ mod tests {
     #[tokio::test]
     async fn the_approval_card_carries_probe_evidence_for_exact_bytes() {
         use crate::state::Core;
-        // A developer dogfooding openmax runs cargo test from inside a
+        // A developer may run cargo test from inside a
         // session (#83); the marker would make this process agent-spawned,
         // and the card is never raised there. No test relies on it being set.
         std::env::remove_var("OPENMAX_SESSION");
@@ -9635,7 +9635,7 @@ mod tests {
         assert!(after <= prune_target(budget), "and lands on the same target: {after}");
     }
 
-    /// Dogfooded in the pty rig: with two fat replies in the protected tail
+    /// Measured: with two fat replies in the protected tail
     /// the auto trigger falls back to the window budget (correctly, against
     /// per-iteration refiring), and /compact inheriting that fallback
     /// answered "nothing to prune" at 27k against a 20k setting, while the

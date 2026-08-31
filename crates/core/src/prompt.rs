@@ -76,7 +76,7 @@ impl PromptBreakdown {
     /// For resumed sessions the persisted prompt is one opaque string; the
     /// per-tool/skill split still comes from the frozen registry, and the
     /// memory rows come from the registry's frozen row channel, recorded by
-    /// the same freeze that wrote the prompt (round-5 ticket T4). They are
+    /// the same freeze that wrote the prompt. They are
     /// deliberately NOT parsed back out of the prompt: filenames and other
     /// author-controlled bytes are rendered into later sections, so any
     /// content-based reconstruction is forgeable (Greptile, three rounds);
@@ -734,7 +734,7 @@ mod tests {
         // call" contradicted the receipt a failed writer earns in the same
         // turn, and lumping hooks into "apply on their next use" invited the
         // install-the-gate-then-prove-it shape at call granularity hooks do
-        // not have (round-7 audit). The failed-call nuance lives in --spec
+        // not have. The failed-call nuance lives in --spec
         // tools/skills, where it costs nothing until read; the guide is an
         // index (module doc), so it carries the trigger, not the nuance.
         assert!(SELF_EXTENSION.contains("every executed mutating call"));
@@ -963,7 +963,7 @@ mod tests {
     }
 
     /// A resumed session's /context used to show no memory rows while the
-    /// persisted prefix paid for the section on every request (round-5
+    /// persisted prefix paid for the section on every request (
     /// ticket T4). The rows ride the manifest's frozen channel and must
     /// reproduce the live scan's accounting exactly, through a real
     /// to_manifest/from_manifest round trip, while the resettable delta

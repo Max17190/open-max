@@ -617,7 +617,7 @@ impl Registry {
         // name, or the stem fallback - the registry's own key), never by
         // stem alone: `todo-scan.toml` declaring `name = "todo_scan"` is
         // exactly the file a caller of `todo_scan` means, and the stem match
-        // answered with a bare unknown (round-7 audit). The stem and
+        // answered with a bare unknown. The stem and
         // SKILL.md matchers stay as the fallback for a manifest-restored
         // registry, whose broken_tools list is empty.
         // Reverse scan: broken_tools accumulates global-tier files first and
@@ -1760,7 +1760,7 @@ mod tests {
     /// A caller of `todo_scan` means the broken `todo-scan.toml` that
     /// DECLARES that name; the unknown-tool error must link them by the
     /// registry's own key (declared name, stem fallback), not by stem alone,
-    /// or the model concludes the file was never written (round-7 audit).
+    /// or the model concludes the file was never written.
     #[tokio::test]
     async fn a_broken_manifest_is_named_when_its_declared_name_differs_from_its_stem() {
         let dir = std::env::temp_dir().join(format!("omx-f9-{}", uuid::Uuid::new_v4()));

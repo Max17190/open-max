@@ -78,8 +78,8 @@ impl TurnPermissions {
         // A deny rendered from a snapshot that is no longer the newest is
         // stale wording: the file was malformed earlier this turn and floors
         // the rest of it, but the reason quotes a generation that no longer
-        // exists on disk (dogfood: the deny cited a broken regex fixed 50s
-        // earlier). If the newest snapshot no longer denies, say so.
+        // exists on disk - a deny citing a broken regex the author already
+        // fixed. If the newest snapshot no longer denies, say so.
         let newest = self.observed.len() - 1;
         if winner_idx < newest {
             if let PermissionDecision::Deny { reason } = &mut decision {
@@ -386,7 +386,7 @@ fn drop_unapproved_allows(
     // The command half is pastable, so it is shell-quoted like every other
     // printed `openmax --approve` (doctor::shell_quote's own contract): a
     // project path with a space made the copyable command fail on a path
-    // fragment (round-7 audit, reproduced).
+    // fragment (reproduced).
     Some(format!(
         "{}: {dropped} allow rule(s) are inert because they skip the approval prompt and this file sits inside the project, where the agent writes; calls fall through to approval_mode until a human approves this exact content with `openmax --approve {}`",
         path.display(),
@@ -642,7 +642,7 @@ mod tests {
     /// The inert-allow notice's `openmax --approve <path>` half is pastable
     /// and reaches the model as a policy notice, so a path with a space (a
     /// plain macOS project name is enough) must be shell-quoted, or the
-    /// relayed command fails on a path fragment (round-7 audit, reproduced).
+    /// relayed command fails on a path fragment (reproduced).
     #[test]
     fn the_inert_allow_notice_quotes_a_spacey_path() {
         let tmp = tempfile_dir().join("my probe dir");
@@ -714,7 +714,7 @@ mod tests {
     /// A deny that wins from a stale (earlier-this-turn) snapshot while the
     /// newest snapshot no longer denies gets a staleness marker: the wording
     /// otherwise quotes a file generation that no longer exists on disk
-    /// (dogfood - the deny cited a broken regex fixed 50s earlier).
+    /// - a deny citing a broken regex the author already fixed.
     #[test]
     fn a_stale_snapshot_deny_says_the_file_is_valid_now() {
         let tmp = tempfile_dir();

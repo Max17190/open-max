@@ -402,7 +402,7 @@ pub async fn run(
 
     // Paint pacing: at most one frame per MIN_DRAW_INTERVAL. A redraw that
     // arrives too early is deferred to `draw_deadline` and coalesced with
-    // everything else that lands before it (grok-build's cadence model).
+    // everything else that lands before it.
     // An idle app has no armed tick and may receive no terminal event after
     // entering the alternate screen. Paint once before waiting so first launch
     // can never sit on a blank frame until the user presses a key.
