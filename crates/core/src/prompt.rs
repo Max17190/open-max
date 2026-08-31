@@ -963,8 +963,8 @@ mod tests {
     }
 
     /// A resumed session's /context used to show no memory rows while the
-    /// persisted prefix paid for the section on every request (
-    /// ticket T4). The rows ride the manifest's frozen channel and must
+    /// persisted prefix paid for the section on every request. The rows ride
+    /// the manifest's frozen channel and must
     /// reproduce the live scan's accounting exactly, through a real
     /// to_manifest/from_manifest round trip, while the resettable delta
     /// baseline stays None.

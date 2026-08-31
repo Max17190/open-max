@@ -261,8 +261,8 @@ mod tests {
     /// commonly carries a `metadata:` block whose fields may be spelled
     /// `name:`/`description:`; an indentation-blind, last-wins match let that
     /// block silently steal the skill's identity, the frozen index carried
-    /// the stolen strings, and --check certified the file ok (
-    /// reproduced on the binary). Keys are read at top level only.
+    /// the stolen strings, and --check certified the file ok, reproduced on
+    /// the binary. Keys are read at top level only.
     #[test]
     fn a_nested_frontmatter_key_does_not_override_the_skill_name() {
         let root = temp_dir("nested");
