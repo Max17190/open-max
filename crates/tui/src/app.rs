@@ -616,15 +616,19 @@ impl App {
 
     /// Re-render a persisted session compactly on --continue.
     fn replay(&mut self, session_id: &str) {
-        // The resumed /context sentence is replay's own observation: a
-        // session with nothing persisted (a hook-rejected first submit
-        // leaves an indexed, empty one) has no frozen context to load, so
-        // resuming it IS a fresh start and the flag must not pend.
-        self.resumed_awaiting_hydration = false;
+        // The resumed /context sentence is replay's own observation. What
+        // pends it is anything the next accepted turn will restore: the
+        // frozen capability manifest (hydration prefers it even when the
+        // transcript is unreadable) or persisted messages. A session with
+        // neither (a hook-rejected first submit leaves an indexed, empty,
+        // manifest-less one) has nothing to load, so resuming it IS a
+        // fresh start.
+        let has_manifest = sessions::load_manifest(&self.core, session_id).is_some();
+        self.resumed_awaiting_hydration = has_manifest;
         let Some(messages) = sessions::load_messages(&self.core, session_id) else {
             return;
         };
-        self.resumed_awaiting_hydration = !messages.is_empty();
+        self.resumed_awaiting_hydration = has_manifest || !messages.is_empty();
         // This sitting is a new boundary; earlier boundaries render below.
         sessions::record_resume_point(&self.core, session_id, messages.len() as u64);
         let boundaries: std::collections::HashSet<u64> = sessions::meta(&self.core, session_id)
@@ -5309,6 +5313,26 @@ mod tests {
         ));
         app.replay(&meta.id);
         assert!(app.resumed_awaiting_hydration);
+
+        // A saved manifest alone also pends: hydration restores the frozen
+        // capability snapshot even when the transcript has nothing to
+        // replay, so that state is not a fresh start either.
+        let meta2 = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        open_max_core::sessions::save_manifest(
+            &app.core,
+            &meta2.id,
+            &open_max_core::registry::Registry::builtin_only().to_manifest(),
+        );
+        app.resumed_awaiting_hydration = false;
+        app.replay(&meta2.id);
+        assert!(
+            app.resumed_awaiting_hydration,
+            "a saved manifest was shown as a new session"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
