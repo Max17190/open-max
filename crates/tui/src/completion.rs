@@ -145,6 +145,9 @@ pub struct Popup {
     pub token_start: usize,
     /// Char length of the token being replaced.
     pub token_len: usize,
+    /// Matches in the full index before any keep-cap: the honest N for the
+    /// "… N more" footer. Equal to `items.len()` for uncapped kinds.
+    pub total_matches: usize,
 }
 
 impl Popup {
@@ -257,12 +260,16 @@ pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
     items
 }
 
-/// Fuzzy-filtered file items for `query` (text after the `@`).
-pub fn file_items(files: &Arc<Vec<String>>, query: &str) -> Vec<Item> {
+/// Fuzzy-filtered file items for `query` (the text after the `@`), plus the
+/// TOTAL match count before
+/// the keep-cap: the popup's "… N more" footer must count what the index
+/// matched, not what survived the cap.
+pub fn file_items(files: &Arc<Vec<String>>, query: &str) -> (Vec<Item>, usize) {
     let mut scored: Vec<(i32, &String)> = files
         .iter()
         .filter_map(|path| fuzzy_score(path, query).map(|s| (s, path)))
         .collect();
+    let total_matches = scored.len();
     // Only the top MAX_VISIBLE * 3 survive: select them in O(n), then order
     // just that head, instead of fully sorting every match (an empty query
     // matches the whole index). The comparator is total — paths are unique —
@@ -278,7 +285,7 @@ pub fn file_items(files: &Arc<Vec<String>>, query: &str) -> Vec<Item> {
         scored.truncate(keep);
     }
     scored.sort_unstable_by(rank);
-    scored
+    let items = scored
         .into_iter()
         .map(|(_, path)| Item {
             insert: format!("@{path} "),
@@ -286,7 +293,8 @@ pub fn file_items(files: &Arc<Vec<String>>, query: &str) -> Vec<Item> {
             detail: String::new(),
             submits: false,
         })
-        .collect()
+        .collect();
+    (items, total_matches)
 }
 
 /// Case-insensitive subsequence match. Higher is better: filename hits beat
@@ -385,7 +393,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     let first = popup
         .selected
         .saturating_sub(visible - 1)
-        .min(popup.items.len() - visible);
+        .min(popup.total_matches - visible);
     let mut lines = Vec::with_capacity(visible);
     for (i, item) in popup.items.iter().enumerate().skip(first).take(visible) {
         let selected = i == popup.selected;
@@ -429,9 +437,9 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
         }
         lines.push(line);
     }
-    if popup.items.len() > visible {
+    if popup.total_matches > visible {
         lines.push(Line::from(Span::styled(
-            format!("  … {} more (keep typing)", popup.items.len() - visible),
+            format!("  … {} more (keep typing)", popup.total_matches - visible),
             Style::default()
                 .fg(theme::DIM())
                 .add_modifier(Modifier::ITALIC),
@@ -517,9 +525,32 @@ mod tests {
             "crates/tui/src/main.rs".to_string(),
             "assets/apple.png".to_string(),
         ]);
-        let items = file_items(&files, "app");
+        let (items, total) = file_items(&files, "app");
+        assert_eq!(total, 2, "main.rs and app.rs both match");
         assert_eq!(items[0].label, "src/app.rs");
         assert_eq!(items[0].insert, "@src/app.rs ");
+    }
+
+    /// The "… N more" footer counts the INDEX's matches, not the keep-cap
+    /// survivors: on a large tree the old footer said 12 whatever the truth.
+    #[test]
+    fn the_more_footer_counts_all_matches_not_the_cap() {
+        let files = Arc::new((0..100).map(|i| format!("src/file_{i:03}.rs")).collect::<Vec<_>>());
+        let (items, total) = file_items(&files, "file");
+        assert_eq!(items.len(), MAX_VISIBLE * 3);
+        assert_eq!(total, 100);
+        let p = Popup {
+            kind: Kind::File,
+            items,
+            selected: 0,
+            token_start: 0,
+            token_len: 1,
+            total_matches: total,
+        };
+        let lines = render_lines(&p, 80, false);
+        let text: String =
+            lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("… 94 more"), "{text}");
     }
 
     #[test]
@@ -530,12 +561,15 @@ mod tests {
 
     #[test]
     fn popup_selection_wraps() {
+        let items = slash_items("", &[]);
+        let total_matches = items.len();
         let mut p = Popup {
             kind: Kind::Slash,
-            items: slash_items("", &[]),
+            items,
             selected: 0,
             token_start: 0,
             token_len: 1,
+            total_matches,
         };
         p.prev();
         assert_eq!(p.selected, p.items.len() - 1);
@@ -545,12 +579,15 @@ mod tests {
 
     #[test]
     fn render_windows_around_selection() {
+        let items = slash_items("", &[]);
+        let total_matches = items.len();
         let mut p = Popup {
             kind: Kind::Slash,
-            items: slash_items("", &[]),
+            items,
             selected: 0,
             token_start: 0,
             token_len: 1,
+            total_matches,
         };
         p.selected = p.items.len() - 1;
         let lines = render_lines(&p, 80, false);
@@ -708,6 +745,7 @@ mod tests {
         );
         for query in ["", "app", "file0", "rs"] {
             let got: Vec<String> = file_items(&files, query)
+                .0
                 .into_iter()
                 .map(|i| i.label)
                 .collect();

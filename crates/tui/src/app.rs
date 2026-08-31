@@ -1875,15 +1875,26 @@ impl App {
                         .map(|t| (t.name, t.description))
                         .collect();
                 }
-                let items = match kind {
-                    completion::Kind::Slash => completion::slash_items(&query, &self.templates),
+                let (items, total_matches) = match kind {
+                    completion::Kind::Slash => {
+                        // Slash items are never capped: the total is the list.
+                        let items = completion::slash_items(&query, &self.templates);
+                        let total = items.len();
+                        (items, total)
+                    }
                     completion::Kind::File => match &self.file_index {
                         Some(files) => completion::file_items(files, &query),
-                        None => Vec::new(),
+                        None => (Vec::new(), 0),
                     },
                 };
-                self.completion =
-                    Some(completion::Popup { kind, items, selected: 0, token_start, token_len });
+                self.completion = Some(completion::Popup {
+                    kind,
+                    items,
+                    selected: 0,
+                    token_start,
+                    token_len,
+                    total_matches,
+                });
             }
         }
     }
@@ -3720,7 +3731,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("g / G in history", "top of scrollback · follow latest"),
     ("/ at the start", "command menu · tab or enter completes"),
     ("@", "mention a project file (fuzzy search)"),
-    ("ctrl+r", "search prompt history"),
+    ("ctrl+r", "search prompt history (all projects)"),
     ("ctrl+f", "find in conversation"),
     ("n / N after find", "next or previous match in scrollback"),
     ("esc", "follow latest · cancel turn · return to composer"),
@@ -3887,6 +3898,14 @@ fn history_search_lines(
             marker,
             Span::styled(clip(&one_line, width.saturating_sub(4)), style),
         ]));
+    }
+    // The window shows six; without this the other N look like they do not
+    // exist, unlike the sibling completion popup which always says so.
+    if items.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more (keep typing)", items.len() - visible),
+            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+        )));
     }
     lines
 }
@@ -5336,6 +5355,17 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Six visible of N: the matches past the window must not look
+    /// nonexistent; the sibling completion popup already says so.
+    #[test]
+    fn history_search_names_the_matches_it_hides() {
+        let items: Vec<String> = (0..10).map(|i| format!("prompt {i}")).collect();
+        let lines = super::history_search_lines("prompt", 0, &items, 80);
+        let text: String =
+            lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("… 4 more (keep typing)"), "{text}");
+    }
+
     /// A fully typed `@` file mention is mid-prompt, not a finished command:
     /// Enter must accept it and keep composing (the separator closes the
     /// popup), never submit the draft out from under the user.
@@ -5354,6 +5384,7 @@ mod tests {
             selected: 0,
             token_start: 8,
             token_len: 10,
+            total_matches: 1,
         });
 
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
