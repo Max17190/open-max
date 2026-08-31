@@ -197,8 +197,16 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
             if !literal {
                 while i < lines.len() {
                     let next = lines[i];
+                    // A blank line inside a plain scalar is a fold, not an
+                    // end: YAML keeps reading while the following lines stay
+                    // deeper than the key. Breaking here dropped everything
+                    // after the first blank, which is the same truncation
+                    // this change exists to remove, one paragraph in. The
+                    // block-scalar branch above already skips blanks; these
+                    // two loops answer the same question and must agree.
                     if next.trim().is_empty() {
-                        break;
+                        i += 1;
+                        continue;
                     }
                     let next_indent = next.len() - next.trim_start().len();
                     if next_indent <= indent {
@@ -407,6 +415,23 @@ mod tests {
         .unwrap();
         assert_eq!(sibling.description, "one two");
         assert_eq!(sibling.name, "n");
+
+        // A blank line between continuation lines is a fold, not an end.
+        let blanked = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: n\ndescription: first para\n  still first\n\n  second para\ntags: x\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(blanked.description, "first para still first second para");
+
+        // ...but a blank followed by a sibling key still ends the value.
+        let ended = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: n\ndescription: only this\n\ntags: x\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(ended.description, "only this");
+        assert_eq!(ended.name, "n");
 
         // A single-line description is unchanged.
         let single = parse_skill_source(
