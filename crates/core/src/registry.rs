@@ -1072,7 +1072,6 @@ fn validate_subschema(schema: &Value, path: &str) -> Result<(), String> {
         ));
     };
     let declared = match map.get("type") {
-        None => None,
         Some(Value::String(t)) if JSON_SCHEMA_TYPES.contains(&t.as_str()) => Some(t.as_str()),
         Some(other) => {
             return Err(format!(
@@ -1080,6 +1079,24 @@ fn validate_subschema(schema: &Value, path: &str) -> Result<(), String> {
                 crate::text::one_line(path),
                 JSON_SCHEMA_TYPES.join(", "),
                 crate::text::one_line(&other.to_string())
+            ));
+        }
+        // An `enum` alone is a complete, legal schema and a common way to
+        // write a closed set, so it stands without a type. Anything else
+        // without one is not a parameter the model can be asked to fill, and
+        // it is what a dotted TOML header silently produces: writing
+        // `[params.properties.user.name]` creates a `user` table holding a
+        // `name` key and no type at all, which looks like a nested object and
+        // is not one.
+        None if map.contains_key("enum") => None,
+        None => {
+            return Err(format!(
+                "{}.type is required: every parameter says what it holds (one of {}). A \
+                 dotted header like [params.properties.a.b] makes this shape by accident - \
+                 write [params.properties.a] with type = \"object\" and put b under its own \
+                 properties table.",
+                crate::text::one_line(path),
+                JSON_SCHEMA_TYPES.join(", ")
             ));
         }
     };
@@ -1556,6 +1573,26 @@ mod tests {
         // Nested `required` is checked at its own level, not just the root.
         let e = err("[params.properties.o]\ntype = \"object\"\nrequired = [\"ghost\"]\n");
         assert!(e.contains("params.properties.o.required names 'ghost'"), "{e:?}");
+
+        // A subschema with no type at all is not a parameter the model can be
+        // asked to fill, and it is what a dotted TOML header produces by
+        // accident: `[params.properties.user.name]` makes a `user` table
+        // holding a `name` key and no type, which looks like a nested object
+        // and is not one.
+        let e = err("[params.properties.user.name]\ntype = \"string\"\n");
+        assert!(e.contains("params.properties.user.type is required"), "{e:?}");
+        let e = err("[params.properties.recs]\ntype = \"array\"\n[params.properties.recs.items]\ndescription = \"d\"\n");
+        assert!(e.contains("params.properties.recs.items.type is required"), "{e:?}");
+        let e = err("[params.properties.o]\ntype = \"object\"\n[params.properties.o.properties.enabled]\ndescription = \"d\"\n");
+        assert!(e.contains("params.properties.o.properties.enabled.type is required"), "{e:?}");
+
+        // An `enum` alone is a complete schema and a common way to write a
+        // closed set, so it stands without a type.
+        parse_tool_source(
+            Path::new("t.toml"),
+            &manifest("[params.properties.mode]\nenum = [\"x\", \"y\"]\n"),
+        )
+        .expect("an enum-only property is legal");
 
         // Every reason is one line, so one bad schema is one --check row.
         for body in [
