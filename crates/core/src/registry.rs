@@ -1053,6 +1053,151 @@ pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, Str
 /// the top level must be `type = "object"`, `properties` values must be
 /// objects, and the serialized schema must fit the per-tool byte cap that
 /// bounds its cost in the frozen prompt prefix.
+/// Every JSON Schema type the wire accepts. A property typed anything else is
+/// not a schema the endpoint will take, and the most common wrong spellings are
+/// the author's own language: `int`, `str`, `float`, `bool`, `list`, `dict`.
+const JSON_SCHEMA_TYPES: [&str; 7] =
+    ["object", "array", "string", "number", "integer", "boolean", "null"];
+
+/// One subschema, checked to the depth the wire cares about. Recursive because
+/// a nested object's `properties` is a schema map like any other, and checking
+/// only the top level is how a bare string one level down reached the endpoint.
+/// `path` names the offending key the way the author wrote it, so the reason
+/// points at a line in their file rather than at a JSON pointer.
+fn validate_subschema(schema: &Value, path: &str) -> Result<(), String> {
+    let Some(map) = schema.as_object() else {
+        return Err(format!(
+            "{} must be a table describing one parameter, not a bare value",
+            crate::text::one_line(path)
+        ));
+    };
+    let declared = match map.get("type") {
+        Some(Value::String(t)) if JSON_SCHEMA_TYPES.contains(&t.as_str()) => Some(t.as_str()),
+        Some(other) => {
+            return Err(format!(
+                "{}.type must be one of {}, not {}",
+                crate::text::one_line(path),
+                JSON_SCHEMA_TYPES.join(", "),
+                crate::text::one_line(&other.to_string())
+            ));
+        }
+        // An `enum` alone is a complete, legal schema and a common way to
+        // write a closed set, so it stands without a type. Anything else
+        // without one is not a parameter the model can be asked to fill, and
+        // it is what a dotted TOML header silently produces: writing
+        // `[params.properties.user.name]` creates a `user` table holding a
+        // `name` key and no type at all, which looks like a nested object and
+        // is not one.
+        None if map.contains_key("enum") => None,
+        None => {
+            return Err(format!(
+                "{}.type is required: every parameter says what it holds (one of {}). A \
+                 dotted header like [params.properties.a.b] makes this shape by accident - \
+                 write [params.properties.a] with type = \"object\" and put b under its own \
+                 properties table.",
+                crate::text::one_line(path),
+                JSON_SCHEMA_TYPES.join(", ")
+            ));
+        }
+    };
+    if let Some(description) = map.get("description") {
+        if !description.is_string() {
+            return Err(format!(
+                "{}.description must be a string",
+                crate::text::one_line(path)
+            ));
+        }
+    }
+    if let Some(values) = map.get("enum") {
+        match values.as_array() {
+            Some(list) if !list.is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "{}.enum must be a non-empty array of the allowed values, written on one \
+                     line as enum = [\"a\", \"b\"]",
+                    crate::text::one_line(path)
+                ));
+            }
+        }
+    }
+    // An array parameter with no `items` is not a complete schema, and an
+    // endpoint that validates its tool definitions rejects the whole request
+    // rather than the one tool.
+    if declared == Some("array") {
+        match map.get("items") {
+            Some(items) if items.is_object() => validate_subschema(items, &format!("{path}.items"))?,
+            Some(_) => {
+                return Err(format!(
+                    "{}.items must be a table describing the element type",
+                    crate::text::one_line(path)
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "{} has type = \"array\" but no items: an array parameter must say what it \
+                     holds",
+                    crate::text::one_line(path)
+                ));
+            }
+        }
+    }
+    validate_properties(map, path)
+}
+
+/// The `properties` map and the `required` list of one schema level.
+fn validate_properties(map: &serde_json::Map<String, Value>, path: &str) -> Result<(), String> {
+    let names = match map.get("properties") {
+        None => None,
+        Some(properties) => {
+            let Some(entries) = properties.as_object() else {
+                return Err(format!(
+                    "{}.properties must be a table of parameters",
+                    crate::text::one_line(path)
+                ));
+            };
+            for (key, schema) in entries {
+                validate_subschema(schema, &format!("{path}.properties.{key}"))?;
+            }
+            Some(entries)
+        }
+    };
+    // `required` is the keyword an author is most likely to get wrong, because
+    // TOML makes the wrong form look right: `[params.required]` opens a TABLE,
+    // which serializes to an object, while the wire demands an array of names.
+    if let Some(required) = map.get("required") {
+        let Some(list) = required.as_array() else {
+            return Err(format!(
+                "{}.required must be an array of property names: write it as \
+                 required = [\"a\", \"b\"] on one line, not as a table (a table is an object \
+                 on the wire and the endpoint rejects the whole request)",
+                crate::text::one_line(path)
+            ));
+        };
+        for name in list {
+            let Some(name) = name.as_str() else {
+                return Err(format!(
+                    "{}.required must list property names as strings, not {}",
+                    crate::text::one_line(path),
+                    crate::text::one_line(&name.to_string())
+                ));
+            };
+            if !names.is_some_and(|n| n.contains_key(name)) {
+                return Err(format!(
+                    "{}.required names '{}', which is not in {}.properties",
+                    crate::text::one_line(path),
+                    crate::text::one_line(name),
+                    crate::text::one_line(path)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Structural checks on a tool's `params`, not a JSON-Schema engine: the set of
+/// shapes an endpoint refuses. It matters more than a local nicety because the
+/// serialized schema rides the FROZEN PREFIX, so a tool the harness accepts and
+/// the endpoint does not takes down every request in the session, not one call.
 fn validate_params_schema(params: &Value) -> Result<(), String> {
     match params.get("type").and_then(Value::as_str) {
         Some("object") => {}
@@ -1064,59 +1209,9 @@ fn validate_params_schema(params: &Value) -> Result<(), String> {
         }
         None => return Err("params.type = \"object\" is required".into()),
     }
-    if let Some(properties) = params.get("properties") {
-        let Some(map) = properties.as_object() else {
-            return Err("params.properties must be an object".into());
-        };
-        for (key, schema) in map {
-            if !schema.is_object() {
-                return Err(format!(
-                    "params.properties.{} must be an object",
-                    crate::text::one_line(key)
-                ));
-            }
-        }
-    }
-    // `required` is the keyword an author is most likely to get wrong here,
-    // because TOML makes the wrong form look right: `[params.required]` opens
-    // a TABLE, which serializes to an object, while the wire demands an array
-    // of names. Nothing above catches it, so the manifest passes `--check`,
-    // its schema joins the frozen prefix, and the endpoint then rejects EVERY
-    // request in the session with a 400 that names a JSON pointer and not the
-    // file. That is one bad tool bricking a whole session, which is exactly
-    // the failure verification exists to convert into an explanation.
-    // The concrete shape this rejects: `[params.required]` with a placeholder
-    // key, which the endpoint answers with `/required: {"_":["query"]} is not
-    // of type "array"` and no mention of which file caused it.
-    if let Some(required) = params.get("required") {
-        let Some(names) = required.as_array() else {
-            return Err(
-                "params.required must be an array of property names: write it as \
-                 required = [\"a\", \"b\"] on one line, not as a [params.required] \
-                 table (a table is an object on the wire and the endpoint rejects the \
-                 whole request)"
-                    .into(),
-            );
-        };
-        for name in names {
-            let Some(name) = name.as_str() else {
-                return Err(format!(
-                    "params.required must list property names as strings, not {}",
-                    crate::text::one_line(&name.to_string())
-                ));
-            };
-            if !params
-                .get("properties")
-                .and_then(Value::as_object)
-                .is_some_and(|p| p.contains_key(name))
-            {
-                return Err(format!(
-                    "params.required names '{}', which is not in params.properties",
-                    crate::text::one_line(name)
-                ));
-            }
-        }
-    }
+    let map = params.as_object().expect("params.type read implies an object");
+    validate_properties(map, "params")?;
+
     let bytes = params.to_string().len();
     if bytes > MAX_EXTERNAL_PARAMS_BYTES {
         return Err(format!(
@@ -1434,6 +1529,94 @@ mod tests {
         let err = parse_tool_source(Path::new("t.toml"), bad_env).unwrap_err();
         assert!(err.contains("invalid env var name"), "{err:?}");
         assert!(!err.contains('\n'), "{err:?}");
+    }
+
+    /// Every shape below passed `--check` before this: each one loaded, joined
+    /// the frozen prefix, and left the session's fate to whether the endpoint
+    /// happened to tolerate it. The blast radius is the reason this is checked
+    /// at all - a tool schema is not per-call, it is resent with every request.
+    #[test]
+    fn a_params_schema_the_wire_refuses_is_rejected_at_its_depth() {
+        let manifest = |body: &str| {
+            format!("name = \"t\"\ndescription = \"d\"\ncommand = \"c\"\n[params]\ntype = \"object\"\n{body}")
+        };
+        let err = |body: &str| {
+            parse_tool_source(Path::new("t.toml"), &manifest(body))
+                .expect_err("this shape must be refused")
+        };
+
+        // Only the TOP level used to be checked, so a bare value one level
+        // down rode straight through.
+        let e = err("[params.properties.outer]\ntype = \"object\"\nproperties = { inner = \"x\" }\n");
+        assert!(e.contains("params.properties.outer.properties.inner"), "{e:?}");
+
+        // The author's own language, not JSON Schema's.
+        for wrong in ["int", "str", "float", "bool", "list", "dict"] {
+            let e = err(&format!("[params.properties.n]\ntype = \"{wrong}\"\n"));
+            assert!(e.contains("must be one of"), "{wrong}: {e:?}");
+            assert!(e.contains(wrong), "{wrong}: {e:?}");
+        }
+
+        // An array that never says what it holds is an incomplete schema.
+        let e = err("[params.properties.xs]\ntype = \"array\"\n");
+        assert!(e.contains("no items"), "{e:?}");
+        let e = err("[params.properties.xs]\ntype = \"array\"\nitems = \"string\"\n");
+        assert!(e.contains("items must be a table"), "{e:?}");
+
+        // TOML's table habit turns a list keyword into an object.
+        let e = err("[params.properties.mode]\ntype = \"string\"\n[params.properties.mode.enum]\n_ = [\"a\"]\n");
+        assert!(e.contains("enum must be a non-empty array"), "{e:?}");
+
+        let e = err("[params.properties.p]\ntype = \"string\"\ndescription = 12\n");
+        assert!(e.contains("description must be a string"), "{e:?}");
+
+        // Nested `required` is checked at its own level, not just the root.
+        let e = err("[params.properties.o]\ntype = \"object\"\nrequired = [\"ghost\"]\n");
+        assert!(e.contains("params.properties.o.required names 'ghost'"), "{e:?}");
+
+        // A subschema with no type at all is not a parameter the model can be
+        // asked to fill, and it is what a dotted TOML header produces by
+        // accident: `[params.properties.user.name]` makes a `user` table
+        // holding a `name` key and no type, which looks like a nested object
+        // and is not one.
+        let e = err("[params.properties.user.name]\ntype = \"string\"\n");
+        assert!(e.contains("params.properties.user.type is required"), "{e:?}");
+        let e = err("[params.properties.recs]\ntype = \"array\"\n[params.properties.recs.items]\ndescription = \"d\"\n");
+        assert!(e.contains("params.properties.recs.items.type is required"), "{e:?}");
+        let e = err("[params.properties.o]\ntype = \"object\"\n[params.properties.o.properties.enabled]\ndescription = \"d\"\n");
+        assert!(e.contains("params.properties.o.properties.enabled.type is required"), "{e:?}");
+
+        // An `enum` alone is a complete schema and a common way to write a
+        // closed set, so it stands without a type.
+        parse_tool_source(
+            Path::new("t.toml"),
+            &manifest("[params.properties.mode]\nenum = [\"x\", \"y\"]\n"),
+        )
+        .expect("an enum-only property is legal");
+
+        // Every reason is one line, so one bad schema is one --check row.
+        for body in [
+            "[params.properties.xs]\ntype = \"array\"\n",
+            "[params.properties.n]\ntype = \"int\"\n",
+        ] {
+            assert!(!err(body).contains('\n'), "{body:?}");
+        }
+    }
+
+    /// A schema that IS valid must keep loading: nesting, arrays of objects,
+    /// enums and required lists are all ordinary things to write.
+    #[test]
+    fn a_well_formed_nested_schema_still_loads() {
+        let text = concat!(
+            "name = \"t\"\ndescription = \"d\"\ncommand = \"c\"\n",
+            "[params]\ntype = \"object\"\nrequired = [\"who\"]\n",
+            "[params.properties.who]\ntype = \"string\"\ndescription = \"a name\"\n",
+            "[params.properties.mode]\ntype = \"string\"\nenum = [\"fast\", \"slow\"]\n",
+            "[params.properties.xs]\ntype = \"array\"\n",
+            "[params.properties.xs.items]\ntype = \"object\"\nrequired = [\"id\"]\n",
+            "[params.properties.xs.items.properties.id]\ntype = \"integer\"\n",
+        );
+        parse_tool_source(Path::new("t.toml"), text).expect("a valid nested schema loads");
     }
 
     /// A manifest of exactly the shape an agent produces here. TOML makes the
