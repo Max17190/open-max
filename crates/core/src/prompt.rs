@@ -826,9 +826,26 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
+        const CAP: usize = 5_360;
         assert!(
-            total <= 5_360,
-            "frozen prompt budget exceeded: base rules + guide (path-free) {path_free} + builtin tools {tool_chars} = {total} chars (cap 5360 ≈ 1215 tokens with a typical checkout path)",
+            total <= CAP,
+            "frozen prompt budget exceeded by {} chars: base rules + guide (path-free) \
+             {path_free} + builtin tools {tool_chars} = {total}, cap {CAP} (~1215 real \
+             tokens with a typical checkout path).\n\
+             \n\
+             This cap is a budget, not a ceiling someone forgot to raise, and it is nearly \
+             spent: every new extension surface has to be announced in the self-extension \
+             guide, and the guide is what most of these bytes are. Raising it is allowed and \
+             has been done before (see this test's doc comment for each raise and what it \
+             bought), but it is a deliberate decision that carries the measurement, never a \
+             bumped number: run\n\
+             \n\
+             cargo test -p open-max-core --lib -- dump_frozen_prompt_payload_for_tokenizer \
+             --ignored --nocapture\n\
+             \n\
+             count the dumped payload with a real tokenizer (the char estimate here runs \
+             ~9% high), and put that token number and what it buys in the PR.",
+            total - CAP,
         );
         let _ = std::fs::remove_dir_all(dir);
     }
