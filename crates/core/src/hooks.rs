@@ -919,10 +919,10 @@ fn resolve_for_repair(path: &Path) -> Option<PathBuf> {
 /// (the `--approve` receipt): what the human just activated, in the loop's
 /// own words, from the same bytes the approval hashed. None for anything that
 /// is not a hook manifest or does not parse; the approval output already
-/// carries the parse story elsewhere. Round 4's dogfooding is the reason the
-/// turn_end observer spells out what it will not do: all six weak-tier
-/// authoring runs handed a human an observer described as a completion gate,
-/// and the human's approval is the last place the mismatch can be caught.
+/// carries the parse story elsewhere. The turn_end observer spells out what
+/// it will not do because an observer described as a completion gate is the
+/// mismatch a human is most likely to approve by accident, and that approval
+/// is the last place it can be caught.
 pub fn approved_shape_line(path: &Path, project_root: &Path, bytes: &[u8]) -> Option<String> {
     if !is_hook_manifest(path, project_root) {
         return None;
@@ -1149,8 +1149,8 @@ pub(crate) fn hooks_fingerprint(project_root: &Path) -> u64 {
             // A hook's receipt must fire when the CODE it runs changes, not
             // only its manifest: editing an approved gate's script revokes
             // the approval and fails closed, but the script is not a .toml,
-            // so a fingerprint over manifests alone missed it (dogfood: an
-            // approved live gate silently revoked, no receipt). Fold each
+            // so a fingerprint over manifests alone missed it, silently
+            // revoking an approved live gate with no receipt. Fold each
             // hook's bound project-local files in.
             if let Some(text) = bytes.as_ref().and_then(|b| std::str::from_utf8(b).ok()) {
                 for code in crate::ledger::manifest_code_source(&path, text, project_root) {

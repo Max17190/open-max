@@ -208,9 +208,9 @@ fn flush_prompt_tokens(
 /// (`--approve`, `--trust-project`). Two walls, both required to pass:
 ///
 /// 1. Not agent-spawned: the `OPENMAX_SESSION` marker every child carries.
-///    Round-4 dogfooding showed this alone is one `env -u` away - an agent
-///    hitting the in-session refusal reached for `env -u OPENMAX_SESSION
-///    openmax --approve` on its FIRST attempt, and the ledger recorded the
+///    That marker alone is one `env -u` away: an agent hitting the
+///    in-session refusal reaches for `env -u OPENMAX_SESSION
+///    openmax --approve` immediately, and the ledger records the
 ///    result as a human act.
 /// 2. An interactive terminal on stdin - the same wall `--forget` and
 ///    `--ledger-repair` already stand behind. A `bash` tool call has piped
@@ -218,7 +218,7 @@ fn flush_prompt_tokens(
 ///    conjured without allocating a pty (the documented ~20-line ceiling,
 ///    now the SAME ceiling for granting authority as for removing it).
 ///
-/// Human automation (CI, eval rigs, `cargo test`) has no terminal and is
+/// Human automation (CI, test automation, `cargo test`) has no terminal and is
 /// still a human act: `OPENMAX_HUMAN_ATTEST=1` states that explicitly. It
 /// is honored only when the session marker is ABSENT, and it is a variable
 /// a human sets on purpose - never one a session exports to its children -
@@ -243,7 +243,7 @@ fn require_human(what: &str, repair: &str) {
 /// Every printed `openmax --approve` quotes its path (core's shell_quote
 /// contract): manifest paths are agent-chosen filenames, and a space or
 /// metacharacter in one turned the pastable repair into a command that
-/// failed on a path fragment (round-7 audit, reproduced).
+/// failed on a path fragment (reproduced).
 fn approve_command(path: &std::path::Path) -> String {
     format!("openmax --approve {}", open_max_core::doctor::shell_quote(path))
 }
@@ -1699,7 +1699,7 @@ mod tests {
 
     /// --help's --spec list names every surface the binary accepts: --check
     /// rows send readers to `openmax --spec settings`, and the help text was
-    /// the one place that did not know it existed (round-7 audit).
+    /// the one place that did not know it existed.
     #[test]
     fn help_names_every_spec_surface() {
         // The parenthesized list after "--spec <surface>" is parsed and

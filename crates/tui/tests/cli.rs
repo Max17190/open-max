@@ -52,7 +52,7 @@ fn cmd(project: &Path, home: &Path) -> Command {
     c.current_dir(project);
     c.env("HOME", home);
     c.env_remove("OPENMAX_API_KEY");
-    // A developer dogfooding openmax runs cargo test from inside a session;
+    // A developer may run cargo test from inside a session;
     // the harness marks such children and trust would refuse (#83).
     c.env_remove("OPENMAX_SESSION");
     // Tests are human-run automation with no terminal: attest it, so
@@ -64,8 +64,8 @@ fn cmd(project: &Path, home: &Path) -> Command {
 /// The authority-granting commands refuse a caller with no terminal and no
 /// attestation, even with the session marker absent: `env -u
 /// OPENMAX_SESSION openmax --approve` from an agent's bash (piped stdio, no
-/// tty) is exactly this shape, and round-4 dogfooding watched an agent
-/// reach for it on its first attempt.
+/// tty) is exactly this shape, and it is the first thing an agent reaches
+/// for when the in-session refusal blocks it.
 #[test]
 fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
     let (project, home) = fresh_dirs("noterminal");
@@ -1284,8 +1284,8 @@ fn an_attested_parent_does_not_let_a_bash_child_approve() {
         std::fs::set_permissions(project.join("gate.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     std::fs::write(hooks.join("gate.toml"), "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n").unwrap();
-    // The scripted turn: one bash call that does exactly what the dogfood
-    // agent did, from a parent that IS attested (cmd() sets it).
+    // The scripted turn: one bash call of exactly that shape, from a parent
+    // that IS attested (cmd() sets it).
     let bypass = format!(
         "env -u OPENMAX_SESSION {} --approve .openmax/hooks/gate.toml < /dev/null; echo \"exit=$?\"",
         openmax_bin()
@@ -1305,10 +1305,10 @@ fn an_attested_parent_does_not_let_a_bash_child_approve() {
     );
 }
 
-/// A process the harness itself spawned has no human on its client. Round-4
-/// dogfooding watched an agent launch `openmax --stdio` from bash, receive
-/// its own unapproved_source card over the pipe, answer it, and land a
-/// standing grant in the ledger as a human act. The card is never raised in
+/// A process the harness itself spawned has no human on its client: an agent
+/// that launches `openmax --stdio` from bash receives its own
+/// unapproved_source card over the pipe, answers it, and lands a standing
+/// grant in the ledger as a human act. The card is never raised in
 /// an agent-spawned process: the call is declined with the reason, an eager
 /// client's `approve` finds nothing to answer, and the ledger stays empty.
 #[test]

@@ -139,7 +139,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             // Loaded but never approved: the same state a
                             // hook reports as inert. A tool is not inert -
                             // its first call prompts - but "ok" read as
-                            // "callable now" to round-4's models, opposite
+                            // "callable now" to weaker models, opposite
                             // the hook line for the same gate. Say so.
                             None if !crate::ledger::is_approved(
                                 data_dir,
@@ -501,7 +501,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 // write card shows a clipped preview, and a
                                 // preview is not shown bytes. For a
                                 // non-blocking turn_end the shape rides
-                                // along: this is the line a round-4 author
+                                // along: this is the line an author
                                 // read before handing an observer to a human
                                 // as a completion gate, three out of three
                                 // weak-tier runs.
@@ -527,7 +527,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             // turn, and that is the whole of what it does. For
                             // the one event with two shapes the ok line says
                             // which one loaded: all three weak-tier authors in
-                            // round 4 wrote an observer while stating the
+                            // an author wrote an observer while stating the
                             // harness would block on nonzero exit, and this
                             // line is where they looked.
                             None => {
@@ -657,7 +657,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 // alone: the rule is well-formed, it just is not authority.
                 // The summary row counts the inert ones too - it prints after
                 // the warn, so "(N rules)" alone would close the file's story
-                // claiming every rule is in force (round-7 audit, reproduced).
+                // claiming every rule is in force (reproduced).
                 // The verdict came from the SAME read as the rule list.
                 let mut inert = 0;
                 if let Some((reason, dropped)) = inert_verdict {
@@ -3493,7 +3493,7 @@ mod tests {
         assert!(ghost.status.summary().contains("does not exist"), "{}", ghost.status.summary());
         // A loadable but never-approved tool is not "ok": its first call
         // stops for approval, and --check says so (the same disclosure a
-        // hook gets, previously missing for tools - dogfood finding).
+        // hook gets, previously missing for tools).
         let real = findings.iter().find(|f| f.path.ends_with("real.toml")).unwrap();
         assert!(matches!(real.status, Status::Warn(_)), "{:?}", real.status);
         assert!(real.status.summary().contains("no human has approved"), "{}", real.status.summary());
@@ -3547,7 +3547,7 @@ mod tests {
     }
 
     /// The inline-program warning's repair must name a destination that makes
-    /// sense: round 4 caught it prescribing "move the program into
+    /// sense: testing caught it prescribing "move the program into
     /// data/sales.csv" - the data file the program reads - because the repair
     /// clause reused the read target as the destination.
     #[test]
@@ -3838,7 +3838,7 @@ mod tests {
             find(&findings, "verify.toml").status
         );
         // The observer shape says the one thing separating it from the gate
-        // its author may have meant: all three weak-tier round-4 authors
+        // its author may have meant: weaker models consistently
         // wrote exactly this file while stating nonzero exit would block. It
         // must ride the message on both sides of approval, because the
         // authoring model only ever reads the unapproved one.
@@ -4167,7 +4167,7 @@ mod tests {
         assert!(find(&findings, ".openmax/deploy.toml").status.summary().contains("directly in"));
         // The repair pointer is runnable as printed: bare `openmax --spec`
         // errors with the full help dump, so a surface token must follow
-        // (round-7 audit; the sibling warnings already name exact targets).
+        // (the sibling warnings already name exact targets).
         assert!(
             find(&findings, ".openmax/deploy.toml")
                 .status

@@ -504,8 +504,8 @@ pub(crate) async fn run_process(
         command.env("HOME", &policy.rw_scratch);
         // Temp files land in the scratch too: without TMPDIR a shell writes
         // heredocs and process substitutions under /tmp, which the sandbox
-        // denies - a false negative on correct code (dogfood: a working
-        // script was rewritten to appease a sandbox production never has).
+        // denies - a false negative on correct code, which costs a working
+        // script a rewrite to appease a sandbox production never has.
         command.env("TMPDIR", &policy.rw_scratch);
         command.env("TERM", "dumb");
         command.env("LANG", "C.UTF-8");
@@ -532,16 +532,16 @@ pub(crate) async fn run_process(
     // env_clear so the marker survives the scrub.
     command.env("OPENMAX_SESSION", "1");
     // The human attestation must never reach an agent-spawned child: a
-    // session launched under an attested shell (CI, an eval rig) would
+    // session launched under an attested shell (CI, test automation) would
     // otherwise hand every bash call a ready-made bypass - unset the marker,
     // inherit the attestation, grant authority. Stripped unconditionally;
     // no child of the harness is the human.
     command.env_remove("OPENMAX_HUMAN_ATTEST");
     // Name the binary that is running this session. Every spec tells the
-    // agent to shell out to `openmax --check` / `--spec`, and round-4
-    // dogfooding hit a PATH `openmax` twelve days older than the harness
-    // hosting the session, teaching claims that build had since retracted -
-    // both printed the same version string. `$OPENMAX_BIN` is the same
+    // agent to shell out to `openmax --check` / `--spec`, and a PATH
+    // `openmax` can be an older build than the harness hosting the session,
+    // teaching claims that build has since retracted - both print the same
+    // version string. `$OPENMAX_BIN` is the same
     // build by construction. Not applied under a sandbox: a probe gets no
     // handle to the harness.
     if request.sandbox.is_none() {
@@ -1234,8 +1234,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
-    /// One dogfooding machine reached 95 MB of spill logs in a month because
-    /// nothing ever deleted them. Writing a new log is the moment the
+    /// Unpruned, this directory grows without bound: tens of megabytes of
+    /// spill logs accumulate in a month because nothing ever deletes them. Writing a new log is the moment the
     /// directory grows, so it is also the moment old logs age out; files the
     /// harness did not write are never touched.
     #[cfg(unix)]

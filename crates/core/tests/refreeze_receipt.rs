@@ -319,9 +319,9 @@ async fn a_turn_start_refreeze_note_reaches_the_model() {
 }
 
 /// The receipt must not oversell: an unapproved tool is registered, and its
-/// first call stops for a human. Round-4 dogfooding watched the receipt say
-/// "callable" and the very next step raise an approval card - the model
-/// itself named the receipt as dishonest. Approved bytes keep "callable".
+/// first call stops for a human. A receipt that says "callable" and is
+/// followed immediately by an approval card is dishonest, and a model reading
+/// it will say so. Approved bytes keep "callable".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_receipt_distinguishes_callable_from_registered_pending_approval() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
@@ -797,9 +797,8 @@ async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval
 }
 
 /// The receipt the model reads also reaches the WIRE as a harness_note, so a
-/// custom frontend can render what the model sees (dogfood: two
-/// frontend-shaped judges found the tool_end output bare, the NOT-loaded
-/// receipt invisible off-transcript).
+/// custom frontend can render what the model sees. Without it the tool_end
+/// output is bare and the NOT-loaded receipt is invisible off-transcript.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_harness_note_reaches_the_wire_for_a_broken_tool_write() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
