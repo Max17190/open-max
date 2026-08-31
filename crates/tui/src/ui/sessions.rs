@@ -51,21 +51,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SessionsState, now: u64) {
     let rows_budget = area.height.saturating_sub(3) as usize;
     let first = state.selected.saturating_sub(rows_budget.saturating_sub(1));
     for (i, item) in state.items.iter().enumerate().skip(first).take(rows_budget) {
-        let marker = if i == state.selected {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
-        } else {
-            Span::raw("  ")
-        };
-        let title_style = if i == state.selected {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(vec![
-            marker,
-            Span::styled(super::text::pad_right(&clip(&item.title, 50), 52), title_style),
-            Span::styled(age(item.updated_at, now), Style::default().fg(theme::DIM())),
-        ]));
+        lines.push(session_row(item, i == state.selected, now, area.width));
     }
 
     if let Some(id) = &state.confirm_delete {
@@ -94,6 +80,35 @@ fn clip(s: &str, max: usize) -> String {
     super::text::clip(s, max)
 }
 
+/// One picker row: marker, title, age. The title yields cells to the age at
+/// narrow widths: recency is the panel's only ordering signal, and the
+/// leading half of a title is its unique half, so the age must never be the
+/// part that falls off the edge.
+fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line<'static> {
+    let marker = if selected {
+        Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
+    } else {
+        Span::raw("  ")
+    };
+    let title_style = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let age_txt = age(item.updated_at, now);
+    let title_w = (width as usize)
+        .saturating_sub(2 + age_txt.len() + 1)
+        .clamp(8, 52);
+    Line::from(vec![
+        marker,
+        Span::styled(
+            super::text::pad_right(&clip(&item.title, title_w.saturating_sub(2)), title_w),
+            title_style,
+        ),
+        Span::styled(age_txt, Style::default().fg(theme::DIM())),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +119,36 @@ mod tests {
         assert_eq!(age(1_000, 1_000 + 5 * 60), "5m ago");
         assert_eq!(age(1_000, 1_000 + 3 * 3_600), "3h ago");
         assert_eq!(age(1_000, 1_000 + 2 * 86_400), "2d ago");
+    }
+
+    /// At narrow widths the age must survive whole and the row must fit:
+    /// recency is the panel's only ordering signal, so the title is what
+    /// yields. Wide panels keep the fixed 52-cell title column.
+    #[test]
+    fn a_narrow_panel_keeps_the_age_and_yields_title_cells() {
+        let meta = SessionMeta {
+            id: "x".into(),
+            project: "/p".into(),
+            title: "a title long enough to be clipped at narrow widths for sure".into(),
+            created_at: 0,
+            updated_at: 0,
+            resume_points: vec![],
+            system_insert_shifted: false,
+        };
+        let now = 15 * 60; // renders as "15m ago"
+        let plain: String = session_row(&meta, false, now, 44)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(plain.ends_with("15m ago"), "the age fell off the row: {plain:?}");
+        assert!(plain.chars().count() <= 44, "row overflows the panel: {plain:?}");
+
+        let wide: String = session_row(&meta, false, now, 140)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(wide.chars().count(), 2 + 52 + "15m ago".len());
     }
 }
