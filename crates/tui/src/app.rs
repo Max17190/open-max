@@ -607,7 +607,6 @@ impl App {
             match sessions::latest(&self.core, &project) {
                 Some(meta) => {
                     self.session_id = Some(meta.id.clone());
-                    self.resumed_awaiting_hydration = true;
                     self.replay(&meta.id);
                 }
                 None => self.note("no previous session here; starting fresh"),
@@ -617,9 +616,15 @@ impl App {
 
     /// Re-render a persisted session compactly on --continue.
     fn replay(&mut self, session_id: &str) {
+        // The resumed /context sentence is replay's own observation: a
+        // session with nothing persisted (a hook-rejected first submit
+        // leaves an indexed, empty one) has no frozen context to load, so
+        // resuming it IS a fresh start and the flag must not pend.
+        self.resumed_awaiting_hydration = false;
         let Some(messages) = sessions::load_messages(&self.core, session_id) else {
             return;
         };
+        self.resumed_awaiting_hydration = !messages.is_empty();
         // This sitting is a new boundary; earlier boundaries render below.
         sessions::record_resume_point(&self.core, session_id, messages.len() as u64);
         let boundaries: std::collections::HashSet<u64> = sessions::meta(&self.core, session_id)
@@ -1949,7 +1954,6 @@ impl App {
                     }
                     self.reset_for_new_session();
                     self.session_id = Some(id.clone());
-                    self.resumed_awaiting_hydration = true;
                     self.replay(&id);
                 }
             }
@@ -5279,6 +5283,32 @@ mod tests {
             app.context_provenance(true),
             crate::ui::context::Provenance::Frozen
         );
+
+        // The flag is replay's own observation: resuming a session with
+        // nothing persisted (a hook-rejected first submit leaves an
+        // indexed, empty one) is a fresh start, and only a session with
+        // messages pends the resumed sentence.
+        app.resumed_awaiting_hydration = false;
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        app.replay(&meta.id);
+        assert!(
+            !app.resumed_awaiting_hydration,
+            "an empty session pended the resumed sentence"
+        );
+        let mut persisted = 0usize;
+        assert!(open_max_core::sessions::save_messages(
+            &app.core,
+            &meta.id,
+            &[open_max_core::types::ChatMessage::user("hello")],
+            &mut persisted,
+            false,
+        ));
+        app.replay(&meta.id);
+        assert!(app.resumed_awaiting_hydration);
         fs::remove_dir_all(dir).unwrap();
     }
 
