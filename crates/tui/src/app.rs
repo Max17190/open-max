@@ -2313,9 +2313,20 @@ impl App {
                     .map(|id| open_max_core::sessions::load_usage(&self.core, id))
                     .as_deref()
                     .and_then(open_max_core::sessions::cache_hit_totals);
+                // A session id with no hydrated entry is a resumed session
+                // before its next message: the breakdown just computed is
+                // today's-config preview, not the session's own frozen one,
+                // and the header must say so.
+                let provenance = if is_frozen {
+                    context::Provenance::Frozen
+                } else if self.session_id.is_some() {
+                    context::Provenance::ResumedPending
+                } else {
+                    context::Provenance::NewPreview
+                };
                 self.transcript.push(context::context_block(
                     &breakdown,
-                    is_frozen,
+                    provenance,
                     self.budget,
                     self.cache_pct,
                     session_cache,

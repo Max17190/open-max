@@ -10,9 +10,13 @@ use ratatui::text::{Line, Span};
 
 use crate::theme;
 
+/// Label column width: one wider than the longest label the core mints
+/// ("system prompt (persisted)", 25), so every token column aligns.
+const LABEL_W: usize = 26;
+
 fn row(label: &str, tokens: usize, detail: &str) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(format!("  {label:<22}"), Style::default().fg(theme::ACCENT())),
+        Span::styled(format!("  {label:<LABEL_W$}"), Style::default().fg(theme::ACCENT())),
         Span::raw(format!("~{tokens:>5} tok")),
     ];
     if !detail.is_empty() {
@@ -21,9 +25,23 @@ fn row(label: &str, tokens: usize, detail: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// What the header may truthfully claim about the numbers below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provenance {
+    /// A hydrated session's own frozen breakdown.
+    Frozen,
+    /// No session yet: what the next new session would freeze from today's
+    /// config.
+    NewPreview,
+    /// A resumed session before its next message: its frozen breakdown is
+    /// not loaded yet, so the numbers below are still today's-config
+    /// preview, not the session's own.
+    ResumedPending,
+}
+
 pub fn context_block(
     breakdown: &PromptBreakdown,
-    frozen: bool,
+    provenance: Provenance,
     budget: Option<(usize, usize)>,
     cache_pct: Option<u8>,
     // Cached and total prompt tokens over the whole session, when the
@@ -32,10 +50,18 @@ pub fn context_block(
     session_cache: Option<(u64, u64)>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let header = if frozen {
-        "context (frozen at session creation; config changes apply to /new sessions)"
-    } else {
-        "context (preview of the next new session)"
+    let header = match provenance {
+        Provenance::Frozen => {
+            "context (frozen at session creation; config changes apply to /new sessions)"
+        }
+        Provenance::NewPreview => "context (preview of the next new session)",
+        // A resumed session continues with its OWN frozen prompt, which is
+        // not loaded until its next message runs; claiming these numbers
+        // preview "the next new session" would describe nothing that can
+        // happen from here.
+        Provenance::ResumedPending => {
+            "context (preview from today's config; the resumed session's frozen context loads with its next message)"
+        }
     };
     lines.push(Line::from(Span::styled(
         header.to_string(),
@@ -90,14 +116,17 @@ pub fn context_block(
     }
 
     lines.push(Line::from(Span::styled(
-        format!("  {}", "─".repeat(34)),
+        format!("  {}", "─".repeat(38)),
         Style::default().fg(theme::DIM()),
     )));
     lines.push(row("total prompt prefix", tok(total_chars), ""));
 
     if let Some(pct) = cache_pct {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<22}", "cache hit (last turn)"), Style::default().fg(theme::ACCENT())),
+            Span::styled(
+                format!("  {:<LABEL_W$}", "cache hit (last turn)"),
+                Style::default().fg(theme::ACCENT()),
+            ),
             Span::raw(format!("{pct:>6} %")),
         ]));
     }
@@ -105,7 +134,7 @@ pub fn context_block(
         let pct = (cached as f64 / prompt as f64 * 100.0).round() as u64;
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<22}", "cache hit (session)"),
+                format!("  {:<LABEL_W$}", "cache hit (session)"),
                 Style::default().fg(theme::ACCENT()),
             ),
             Span::raw(format!("{pct:>6} %")),
@@ -119,7 +148,10 @@ pub fn context_block(
         // Transcript plus the tool schemas above, the same total the budget
         // enforces, so this row and compaction never disagree.
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<22}", "context used"), Style::default().fg(theme::ACCENT())),
+            Span::styled(
+                format!("  {:<LABEL_W$}", "context used"),
+                Style::default().fg(theme::ACCENT()),
+            ),
             Span::raw(format!("~{used:>5} tok")),
             Span::styled(
                 format!("   of {total} ({}%)", (used as f64 / total.max(1) as f64 * 100.0) as u32),
@@ -128,4 +160,45 @@ pub fn context_block(
         ]));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// "system prompt (persisted)" is the longest label the core mints and
+    /// the one every hydrated session shows; its token column must sit in
+    /// the same column as every other row's.
+    #[test]
+    fn the_longest_label_keeps_its_column() {
+        let a = plain(&row("base rules", 100, ""));
+        let b = plain(&row("system prompt (persisted)", 100, ""));
+        assert_eq!(a.find('~'), b.find('~'), "{a:?} vs {b:?}");
+    }
+
+    /// Three provenances, three true sentences. A resumed session's next
+    /// message continues THAT session, so its header may not promise a
+    /// preview of "the next new session", and it must say the numbers are
+    /// not the session's own yet.
+    #[test]
+    fn the_header_tells_the_resumed_session_the_truth() {
+        let bd = PromptBreakdown::default();
+        let heads: Vec<String> =
+            [Provenance::Frozen, Provenance::NewPreview, Provenance::ResumedPending]
+                .into_iter()
+                .map(|p| plain(&context_block(&bd, p, None, None, None)[0]))
+                .collect();
+        assert!(heads[2].contains("resumed session"), "{:?}", heads[2]);
+        assert!(
+            !heads[2].contains("next new session"),
+            "the resumed header still promises a new-session preview: {:?}",
+            heads[2]
+        );
+        assert_ne!(heads[0], heads[2]);
+        assert_ne!(heads[1], heads[2]);
+    }
 }
