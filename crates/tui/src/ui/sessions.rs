@@ -96,9 +96,12 @@ fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line
         Style::default()
     };
     let age_txt = age(item.updated_at, now);
+    // No floor: at absurdly narrow widths the title goes first, whole. A
+    // floored title column would push the age off the edge, and the age is
+    // the one cell-for-cell reservation this row exists to keep.
     let title_w = (width as usize)
         .saturating_sub(2 + age_txt.len() + 1)
-        .clamp(8, 52);
+        .min(52);
     Line::from(vec![
         marker,
         Span::styled(
@@ -143,6 +146,16 @@ mod tests {
             .collect();
         assert!(plain.ends_with("15m ago"), "the age fell off the row: {plain:?}");
         assert!(plain.chars().count() <= 44, "row overflows the panel: {plain:?}");
+
+        // Narrower than marker + any title + age: the title goes first,
+        // whole; the age still paints inside the panel.
+        let tiny: String = session_row(&meta, false, now, 15)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(tiny.ends_with("15m ago"), "the age fell off at 15 cols: {tiny:?}");
+        assert!(tiny.chars().count() <= 15, "row overflows a 15-col panel: {tiny:?}");
 
         let wide: String = session_row(&meta, false, now, 140)
             .spans
