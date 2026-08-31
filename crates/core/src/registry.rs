@@ -1085,9 +1085,9 @@ fn validate_params_schema(params: &Value) -> Result<(), String> {
     // request in the session with a 400 that names a JSON pointer and not the
     // file. That is one bad tool bricking a whole session, which is exactly
     // the failure verification exists to convert into an explanation.
-    // Observed in a dogfood run: an agent wrote `[params.required]` with a
-    // placeholder key and the turn died on `/required: {"_":["query"]} is not
-    // of type "array"`.
+    // The concrete shape this rejects: `[params.required]` with a placeholder
+    // key, which the endpoint answers with `/required: {"_":["query"]} is not
+    // of type "array"` and no mention of which file caused it.
     if let Some(required) = params.get("required") {
         let Some(names) = required.as_array() else {
             return Err(
@@ -1436,7 +1436,7 @@ mod tests {
         assert!(!err.contains('\n'), "{err:?}");
     }
 
-    /// The exact manifest an agent wrote in a dogfood run. TOML makes the
+    /// A manifest of exactly the shape an agent produces here. TOML makes the
     /// wrong shape look right - `[params.required]` opens a table - and
     /// nothing here used to look at `required`, so `--check` vouched for it,
     /// the schema joined the frozen prefix, and the endpoint then rejected
