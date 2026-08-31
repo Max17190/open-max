@@ -96,9 +96,17 @@ fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line
         Style::default()
     };
     let age_txt = age(item.updated_at, now);
-    // No floor: at absurdly narrow widths the title goes first, whole. A
-    // floored title column would push the age off the edge, and the age is
-    // the one cell-for-cell reservation this row exists to keep.
+    // Below marker + age nothing else can fit: emit the age alone, clipped
+    // as a last resort, so no width class ever overflows the panel. Above
+    // that, no floor: the title goes first, whole. A floored title column
+    // would push the age off the edge, and the age is the one cell-for-cell
+    // reservation this row exists to keep.
+    if (width as usize) < 2 + age_txt.len() {
+        return Line::from(Span::styled(
+            clip(&age_txt, width as usize),
+            Style::default().fg(theme::DIM()),
+        ));
+    }
     let title_w = (width as usize)
         .saturating_sub(2 + age_txt.len() + 1)
         .min(52);
@@ -156,6 +164,24 @@ mod tests {
             .collect();
         assert!(tiny.ends_with("15m ago"), "the age fell off at 15 cols: {tiny:?}");
         assert!(tiny.chars().count() <= 15, "row overflows a 15-col panel: {tiny:?}");
+
+        // Below marker + age the row degrades to the age alone; at any
+        // width the row must fit, and while the age physically fits it
+        // must be whole.
+        for w in [8u16, 7] {
+            let bare: String = session_row(&meta, true, now, w)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(bare, "15m ago", "width {w}: {bare:?}");
+        }
+        let clipped: String = session_row(&meta, false, now, 5)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(clipped.chars().count() <= 5, "width 5 overflows: {clipped:?}");
 
         let wide: String = session_row(&meta, false, now, 140)
             .spans
