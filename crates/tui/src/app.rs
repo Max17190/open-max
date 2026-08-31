@@ -1312,10 +1312,12 @@ impl App {
                 if let Some(id) = &self.session_id {
                     self.core.cancel(id);
                 }
-            } else if self.focus == Focus::Scrollback {
-                self.focus = Focus::Composer;
-                self.transcript.clear_selection();
             }
+            // No Scrollback arm: a scrollback-focused Esc already matched
+            // and returned inside the scrollback block above, which
+            // refocuses the composer and clears the selection (it never
+            // follows; a second Esc from the composer does, via the
+            // scrolled branch here). This chain can never see that focus.
             return Ok(());
         }
 
