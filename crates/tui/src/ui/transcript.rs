@@ -2243,6 +2243,57 @@ mod tests {
         );
     }
 
+    /// The whole find keystroke at marathon scale: the filter scan plus the
+    /// previews the popup rebuilds for its visible rows on every new query.
+    /// Not a correctness test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_find_keystroke
+    #[test]
+    #[ignore]
+    fn measure_find_keystroke_cost_at_scale() {
+        use std::time::Instant;
+        let output = "a log line about work being done in the harness\n".repeat(40);
+        for turns in [500usize, 3_400] {
+            let mut t = Transcript::new();
+            t.set_width(120);
+            for i in 0..turns {
+                t.push_user(vec![Line::from(format!("user turn {i}: check the ledger"))]);
+                t.push_assistant(vec![Line::from(format!(
+                    "assistant reply {i}: prose that mentions the harness and its ledger work"
+                ))]);
+                t.push_tool(vec![Line::from("✓ bash")], output.clone(), true);
+            }
+            let bytes: usize = t.blocks.iter().map(|b| b.search_lower.len()).sum();
+
+            // A keystroke extending "ledge" to "ledger": filter every block,
+            // then rebuild the previews for the popup's visible rows on the
+            // fresh query. The popup caps visible rows at 6
+            // (scroll_search_lines), so the measure must too.
+            let n = 50;
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let matches = std::hint::black_box(t.filter_matches("ledger"));
+                for &bi in matches.iter().take(6) {
+                    std::hint::black_box(t.block_preview(bi, "ledger"));
+                }
+            }
+            let hit_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+
+            // The no-match keystroke ("zzzq"): the scan still walks every
+            // block's text end to end, with no previews after.
+            let t0 = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(t.filter_matches("zzzq"));
+            }
+            let miss_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+
+            println!(
+                "MEASURE find keystroke {} blocks / {:.1} MB searched: hit+previews {hit_ms:.3} ms, miss {miss_ms:.3} ms",
+                turns * 3,
+                bytes as f64 / 1e6,
+            );
+        }
+    }
+
     /// The cached preview path must return exactly what the uncached
     /// implementation returned: rebuild the full text, lowercase per line,
     /// prefer the first line containing the query, else the first non-empty

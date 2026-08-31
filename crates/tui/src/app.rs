@@ -5580,6 +5580,80 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Opening a marathon session from the /resume picker: the width is
+    /// already set from prior paints, replay pushes every persisted message
+    /// through the incremental append path, then one frame paints. Not a
+    /// correctness test; run with:
+    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_replay
+    #[test]
+    #[ignore]
+    fn measure_replay_cost() {
+        use std::time::Instant;
+        let output = "a log line about work being done in the harness\n".repeat(40);
+        for turns in [250usize, 1_000] {
+            let (mut app, dir) = app_fixture();
+            let meta = open_max_core::sessions::create(
+                &app.core,
+                app.project.display().to_string(),
+            )
+            .unwrap();
+            let mut messages = Vec::new();
+            for i in 0..turns {
+                messages.push(open_max_core::types::ChatMessage::user(format!(
+                    "user turn {i}: check the ledger and refactor the module"
+                )));
+                messages.push(open_max_core::types::ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(format!(
+                        "Reply {i} with **markdown**, a bullet list:\n\n- alpha item long enough to wrap at some widths\n- beta item\n\n```rust\nlet value = compute(input);\n```\n"
+                    )),
+                    tool_calls: Some(vec![open_max_core::types::ToolCall {
+                        id: format!("c{i}"),
+                        kind: "function".into(),
+                        function: open_max_core::types::ToolCallFunction {
+                            name: "bash".into(),
+                            arguments: "{\"command\":\"cargo test\"}".into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                });
+                messages.push(open_max_core::types::ChatMessage {
+                    role: "tool".into(),
+                    content: Some(output.clone()),
+                    tool_calls: None,
+                    tool_call_id: Some(format!("c{i}")),
+                });
+            }
+            let mut persisted = 0usize;
+            // An unpersisted fixture would replay nothing and publish a
+            // misleadingly fast number; the measure fails instead.
+            assert!(
+                open_max_core::sessions::save_messages(
+                    &app.core,
+                    &meta.id,
+                    &messages,
+                    &mut persisted,
+                    false,
+                ),
+                "measure fixture failed to persist the session"
+            );
+
+            // Establish the width first, the /resume-picker shape.
+            std::hint::black_box(render_app(&mut app, 140, 40));
+            let t0 = Instant::now();
+            app.replay(&meta.id);
+            let replay_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let t0 = Instant::now();
+            std::hint::black_box(render_app(&mut app, 140, 40));
+            let paint_ms = t0.elapsed().as_secs_f64() * 1e3;
+            println!(
+                "MEASURE replay {} messages ({turns} turns): replay {replay_ms:.1} ms, next paint {paint_ms:.1} ms",
+                messages.len(),
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     /// The approval timeout is persisted without the `Error:` prefix
     /// (agent::tool_message_content keeps it verbatim so the model reads the
     /// stop instruction), so replay must classify it as the failure it was:
