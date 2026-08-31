@@ -568,12 +568,17 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> 
 
 /// Sessions for one project, most recently updated first.
 pub fn list(core: &Core, project: &str) -> Vec<SessionMeta> {
-    let mut metas: Vec<SessionMeta> = load_index(core)
+    let mut metas: Vec<(usize, SessionMeta)> = load_index(core)
         .into_iter()
-        .filter(|m| m.project == project)
+        .enumerate()
+        .filter(|(_, m)| m.project == project)
         .collect();
-    metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
-    metas
+    // updated_at is whole seconds and the index is append-ordered, so two
+    // sessions touched in the same second tie on the timestamp alone; the
+    // later index entry is the newer one and must sort first, or latest()
+    // hands --continue an older same-second sibling.
+    metas.sort_by_key(|(i, m)| std::cmp::Reverse((m.updated_at, *i)));
+    metas.into_iter().map(|(_, m)| m).collect()
 }
 
 /// Most recent session for a project, if any (used by --continue).
@@ -891,6 +896,30 @@ mod tests {
 
         shift_resume_points_for_note_insert(&core, id);
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![1, 4, 8]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Sessions touched within the same second: the index is append-ordered
+    /// and updated_at is whole seconds, so the timestamp alone cannot order
+    /// them and a stable sort would keep the OLDEST first. The later index
+    /// entry is the newer session and must win, or --continue silently
+    /// resumes an older same-second sibling and the /resume panel inverts.
+    #[test]
+    fn same_second_sessions_list_newest_first() {
+        let dir = std::env::temp_dir().join(format!("openmax-tie-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let a = create(&core, "/tmp/tie".into()).unwrap().id;
+        let b = create(&core, "/tmp/tie".into()).unwrap().id;
+        let c = create(&core, "/tmp/tie".into()).unwrap().id;
+        with_index(&core, |metas| {
+            for m in metas.iter_mut() {
+                m.updated_at = 1_000;
+            }
+        })
+        .unwrap();
+        let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![c.clone(), b, a]);
+        assert_eq!(latest(&core, "/tmp/tie").unwrap().id, c);
         let _ = std::fs::remove_dir_all(dir);
     }
 
