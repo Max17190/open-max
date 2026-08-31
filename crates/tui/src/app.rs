@@ -1314,9 +1314,10 @@ impl App {
                 }
             }
             // No Scrollback arm: a scrollback-focused Esc already matched
-            // and returned inside the scrollback block above (offset
-            // permitting, follow; otherwise refocus and clear selection),
-            // so this chain can never see that focus.
+            // and returned inside the scrollback block above, which
+            // refocuses the composer and clears the selection (it never
+            // follows; a second Esc from the composer does, via the
+            // scrolled branch here). This chain can never see that focus.
             return Ok(());
         }
 
