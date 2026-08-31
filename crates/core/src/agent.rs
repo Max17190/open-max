@@ -410,6 +410,7 @@ fn outside_approval_note(fresh: &[String]) -> String {
 async fn report_schemas_over_budget(
     core: &Arc<Core>,
     session_id: &str,
+    msgs: &mut Vec<ChatMessage>,
     schema_tokens: usize,
     budget_tokens: usize,
 ) {
@@ -427,6 +428,27 @@ async fn report_schemas_over_budget(
             schema_tokens,
             budget_tokens,
         });
+        // The frontend is not the party that can act on this. The AGENT
+        // installed these tools, `--spec usage` prices them one by one, and
+        // retiring one is a file it can delete - but until now the advisory
+        // existed only as a wire event, so the human saw it and the agent
+        // never did. It goes in the transcript for the same reason every
+        // other receipt does: the reader who can fix a thing has to be told.
+        //
+        // Written straight into the transcript rather than through
+        // `insert_startup_note`, which would also emit a HarnessNote: the wire
+        // already carries this as the structured SchemasOverBudget event, and
+        // a note beside it renders the same advisory twice (the same reason
+        // the post-approval receipt rides `outcome.output`).
+        let note = crate::text::one_line(&format!(
+            "[tool schemas cost ~{schema_tokens} tokens of the ~{budget_tokens} this context \
+             window can spend on a request. They are resent whole every request, so history \
+             compacts early and a long turn may not fit at all. Price each tool with bash: \
+             openmax --spec usage, retire one you are not using (delete its .toml), or raise \
+             context_tokens for this model.]"
+        ));
+        let at = msgs.len().saturating_sub(1);
+        msgs.insert(at, ChatMessage::user(note));
     }
 }
 
@@ -2667,7 +2689,8 @@ async fn run_loop(
         let schema_tokens = estimate_tokens(schemas_wire.len());
         let budget = context_tokens.saturating_sub(max_tokens + 1024);
         if schemas_outgrow_budget(budget, schema_tokens) {
-            report_schemas_over_budget(core, session_id, schema_tokens, budget).await;
+            report_schemas_over_budget(core, session_id, guard.messages(), schema_tokens, budget)
+                .await;
         }
         let trigger =
             compaction_trigger(budget, schema_tokens, settings.compaction_tokens, guard.messages());
@@ -9804,8 +9827,9 @@ mod tests {
             core.sessions.lock().await.insert(id.to_string(), data);
         }
 
+        let mut msgs = vec![ChatMessage::user("hello")];
         for _ in 0..3 {
-            report_schemas_over_budget(&core, id, 6800, 3072).await;
+            report_schemas_over_budget(&core, id, &mut msgs, 6800, 3072).await;
         }
         let mut reports = Vec::new();
         while let Ok(env) = rx.try_recv() {
@@ -9814,6 +9838,20 @@ mod tests {
             }
         }
         assert_eq!(reports, vec![(6800, 3072)], "advisory must fire once with the real numbers");
+
+        // The agent installed these tools and is the only party that can
+        // retire one, so the advisory has to reach the transcript too - and
+        // exactly once, like the wire event beside it.
+        let notes: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.contains("tool schemas cost"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{msgs:?}");
+        assert!(notes[0].contains("~6800"), "{:?}", notes[0]);
+        assert!(notes[0].contains("~3072"), "{:?}", notes[0]);
+        assert!(notes[0].contains("openmax --spec usage"), "{:?}", notes[0]);
+        assert!(!notes[0].contains('\n'), "one note is one line: {:?}", notes[0]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
