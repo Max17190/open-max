@@ -2265,13 +2265,14 @@ mod tests {
             let bytes: usize = t.blocks.iter().map(|b| b.search_lower.len()).sum();
 
             // A keystroke extending "ledge" to "ledger": filter every block,
-            // then rebuild the preview for the first 12 visible rows, the way
-            // the popup does for a fresh query.
+            // then rebuild the previews for the popup's visible rows on the
+            // fresh query. The popup caps visible rows at 6
+            // (scroll_search_lines), so the measure must too.
             let n = 50;
             let t0 = Instant::now();
             for _ in 0..n {
                 let matches = std::hint::black_box(t.filter_matches("ledger"));
-                for &bi in matches.iter().take(12) {
+                for &bi in matches.iter().take(6) {
                     std::hint::black_box(t.block_preview(bi, "ledger"));
                 }
             }

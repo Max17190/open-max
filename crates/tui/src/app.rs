@@ -5625,12 +5625,17 @@ mod tests {
                 });
             }
             let mut persisted = 0usize;
-            open_max_core::sessions::save_messages(
-                &app.core,
-                &meta.id,
-                &messages,
-                &mut persisted,
-                false,
+            // An unpersisted fixture would replay nothing and publish a
+            // misleadingly fast number; the measure fails instead.
+            assert!(
+                open_max_core::sessions::save_messages(
+                    &app.core,
+                    &meta.id,
+                    &messages,
+                    &mut persisted,
+                    false,
+                ),
+                "measure fixture failed to persist the session"
             );
 
             // Establish the width first, the /resume-picker shape.
