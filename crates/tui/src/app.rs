@@ -237,6 +237,11 @@ pub struct App {
     core: Arc<Core>,
     project: PathBuf,
     session_id: Option<String>,
+    /// A /resume (or --continue) picked this session and no turn has
+    /// hydrated it yet: /context's numbers are still today's-config
+    /// preview, not the session's own. A freshly created id never sets
+    /// this, so a hook-rejected first submit stays a new-session preview.
+    resumed_awaiting_hydration: bool,
     mode: Mode,
     composer: Composer,
     model_picker: Option<model_picker::ModelPickerState>,
@@ -522,6 +527,7 @@ impl App {
             core,
             project,
             session_id: None,
+            resumed_awaiting_hydration: false,
             pending_submit: None,
             mode: Mode::Chat,
             model_picker: None,
@@ -610,9 +616,19 @@ impl App {
 
     /// Re-render a persisted session compactly on --continue.
     fn replay(&mut self, session_id: &str) {
+        // The resumed /context sentence is replay's own observation. What
+        // pends it is anything the next accepted turn will restore: the
+        // frozen capability manifest (hydration prefers it even when the
+        // transcript is unreadable) or persisted messages. A session with
+        // neither (a hook-rejected first submit leaves an indexed, empty,
+        // manifest-less one) has nothing to load, so resuming it IS a
+        // fresh start.
+        let has_manifest = sessions::load_manifest(&self.core, session_id).is_some();
+        self.resumed_awaiting_hydration = has_manifest;
         let Some(messages) = sessions::load_messages(&self.core, session_id) else {
             return;
         };
+        self.resumed_awaiting_hydration = has_manifest || !messages.is_empty();
         // This sitting is a new boundary; earlier boundaries render below.
         sessions::record_resume_point(&self.core, session_id, messages.len() as u64);
         let boundaries: std::collections::HashSet<u64> = sessions::meta(&self.core, session_id)
@@ -705,6 +721,20 @@ impl App {
         self.note("continuing previous session");
     }
 
+    /// What the /context header may truthfully claim. Only a session a
+    /// resume actually picked (and no turn has hydrated yet) is
+    /// ResumedPending: a freshly created id, including one left behind by a
+    /// hook-rejected first submit, still previews the next new session.
+    fn context_provenance(&self, is_frozen: bool) -> context::Provenance {
+        if is_frozen {
+            context::Provenance::Frozen
+        } else if self.resumed_awaiting_hydration {
+            context::Provenance::ResumedPending
+        } else {
+            context::Provenance::NewPreview
+        }
+    }
+
     /// Clear transcript and per-session UI state for `/new`.
     fn reset_for_new_session(&mut self) {
         if self.running {
@@ -713,6 +743,7 @@ impl App {
             }
         }
         self.session_id = None;
+        self.resumed_awaiting_hydration = false;
         self.transcript = Transcript::new();
         self.running = false;
         // Session-scoped like `running`: the old session's receipt is
@@ -1885,6 +1916,7 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            self.resumed_awaiting_hydration = false;
                         }
                         if panel.items.is_empty() {
                             self.mode = Mode::Chat;
@@ -1976,6 +2008,7 @@ impl App {
                 let meta = sessions::create(&self.core, self.project.display().to_string())
                     .map_err(std::io::Error::other)?;
                 self.session_id = Some(meta.id.clone());
+                self.resumed_awaiting_hydration = false;
                 meta.id
             }
         };
@@ -2313,9 +2346,10 @@ impl App {
                     .map(|id| open_max_core::sessions::load_usage(&self.core, id))
                     .as_deref()
                     .and_then(open_max_core::sessions::cache_hit_totals);
+                let provenance = self.context_provenance(is_frozen);
                 self.transcript.push(context::context_block(
                     &breakdown,
-                    is_frozen,
+                    provenance,
                     self.budget,
                     self.cache_pct,
                     session_cache,
@@ -5228,6 +5262,76 @@ mod tests {
         assert!(
             app.transcript.block_count() > 0,
             "the bare command should have produced output"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A session id alone is not a resumed session: a hook-rejected first
+    /// submit leaves an allocated id with no hydration, and its /context
+    /// must keep previewing the next new session. Only an actual resume
+    /// pick pends the resumed sentence, and hydration wins over both.
+    #[test]
+    fn context_provenance_distinguishes_fresh_ids_from_resumed_sessions() {
+        let (mut app, dir) = app_fixture();
+        app.session_id = Some("allocated-but-never-hydrated".into());
+        assert_eq!(
+            app.context_provenance(false),
+            crate::ui::context::Provenance::NewPreview
+        );
+        app.resumed_awaiting_hydration = true;
+        assert_eq!(
+            app.context_provenance(false),
+            crate::ui::context::Provenance::ResumedPending
+        );
+        assert_eq!(
+            app.context_provenance(true),
+            crate::ui::context::Provenance::Frozen
+        );
+
+        // The flag is replay's own observation: resuming a session with
+        // nothing persisted (a hook-rejected first submit leaves an
+        // indexed, empty one) is a fresh start, and only a session with
+        // messages pends the resumed sentence.
+        app.resumed_awaiting_hydration = false;
+        let meta = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        app.replay(&meta.id);
+        assert!(
+            !app.resumed_awaiting_hydration,
+            "an empty session pended the resumed sentence"
+        );
+        let mut persisted = 0usize;
+        assert!(open_max_core::sessions::save_messages(
+            &app.core,
+            &meta.id,
+            &[open_max_core::types::ChatMessage::user("hello")],
+            &mut persisted,
+            false,
+        ));
+        app.replay(&meta.id);
+        assert!(app.resumed_awaiting_hydration);
+
+        // A saved manifest alone also pends: hydration restores the frozen
+        // capability snapshot even when the transcript has nothing to
+        // replay, so that state is not a fresh start either.
+        let meta2 = open_max_core::sessions::create(
+            &app.core,
+            app.project.display().to_string(),
+        )
+        .unwrap();
+        open_max_core::sessions::save_manifest(
+            &app.core,
+            &meta2.id,
+            &open_max_core::registry::Registry::builtin_only().to_manifest(),
+        );
+        app.resumed_awaiting_hydration = false;
+        app.replay(&meta2.id);
+        assert!(
+            app.resumed_awaiting_hydration,
+            "a saved manifest was shown as a new session"
         );
         fs::remove_dir_all(dir).unwrap();
     }
