@@ -731,19 +731,30 @@ pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
         return;
     }
     let _ = with_index(core, |metas| {
-        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+        // Re-appended for the same reason touch() re-appends: this bump
+        // rides the session's first message, exactly when it becomes the
+        // most recent one.
+        if let Some(i) = metas.iter().position(|m| m.id == id) {
+            let mut m = metas.remove(i);
             if m.title == UNTITLED {
                 m.title = title;
             }
             m.updated_at = now();
+            metas.push(m);
         }
     });
 }
 
 pub fn touch(core: &Core, id: &str) {
     let _ = with_index(core, |metas| {
-        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+        // Re-append rather than update in place: updated_at is whole
+        // seconds, so within one second only index position can order
+        // sessions, and the position must therefore track last activity,
+        // not creation.
+        if let Some(i) = metas.iter().position(|m| m.id == id) {
+            let mut m = metas.remove(i);
             m.updated_at = now();
+            metas.push(m);
         }
     });
 }
@@ -918,8 +929,23 @@ mod tests {
         })
         .unwrap();
         let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
-        assert_eq!(listed, vec![c.clone(), b, a]);
+        assert_eq!(listed, vec![c.clone(), b.clone(), a.clone()]);
         assert_eq!(latest(&core, "/tmp/tie").unwrap().id, c);
+
+        // Touch recency inside the same second: touching the OLDEST session
+        // must make it the latest, so the touched entry re-appends instead
+        // of keeping its creation slot. touch() stamps now(); flatten every
+        // stamp back to one value so only position can decide.
+        touch(&core, &a);
+        with_index(&core, |metas| {
+            for m in metas.iter_mut() {
+                m.updated_at = 1_000;
+            }
+        })
+        .unwrap();
+        assert_eq!(latest(&core, "/tmp/tie").unwrap().id, a);
+        let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![a, c, b]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
