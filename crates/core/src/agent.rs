@@ -447,8 +447,15 @@ async fn report_schemas_over_budget(
              openmax --spec usage, retire one you are not using (delete its .toml), or raise \
              context_tokens for this model.]"
         ));
-        let at = msgs.len().saturating_sub(1);
-        msgs.insert(at, ChatMessage::user(note));
+        // APPENDED, never inserted before the tail. `insert_startup_note`
+        // inserts at len-1 because at turn start the tail is the user's own
+        // message; here the tail is `assistant(tool_calls)` followed by its
+        // `tool` replies, and putting a user message between a tool call and
+        // its reply is a transcript the provider rejects outright. This runs
+        // at the top of an iteration, where the previous iteration's replies
+        // are all appended, so the sequence is complete and the note lands
+        // after it.
+        msgs.push(ChatMessage::user(note));
     }
 }
 
@@ -9848,6 +9855,31 @@ mod tests {
             .filter(|c| c.contains("tool schemas cost"))
             .collect();
         assert_eq!(notes.len(), 1, "{msgs:?}");
+
+        // The tail mid-turn is an assistant tool call and its reply. A user
+        // message between the two is a transcript the provider rejects, so
+        // the advisory has to land AFTER the pair, never before the last
+        // message the way a turn-start note does.
+        let mut mid_turn = vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(None, Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: crate::types::ToolCallFunction {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            }])),
+            ChatMessage::tool("call_1", "contents"),
+        ];
+        core.sessions.lock().await.insert("mid".to_string(), Default::default());
+        report_schemas_over_budget(&core, "mid", &mut mid_turn, 6800, 3072).await;
+        let roles: Vec<&str> = mid_turn.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "tool", "user"],
+            "the advisory must not split a tool call from its reply: {roles:?}"
+        );
         assert!(notes[0].contains("~6800"), "{:?}", notes[0]);
         assert!(notes[0].contains("~3072"), "{:?}", notes[0]);
         assert!(notes[0].contains("openmax --spec usage"), "{:?}", notes[0]);
