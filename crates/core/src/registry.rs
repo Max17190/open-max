@@ -1077,6 +1077,46 @@ fn validate_params_schema(params: &Value) -> Result<(), String> {
             }
         }
     }
+    // `required` is the keyword an author is most likely to get wrong here,
+    // because TOML makes the wrong form look right: `[params.required]` opens
+    // a TABLE, which serializes to an object, while the wire demands an array
+    // of names. Nothing above catches it, so the manifest passes `--check`,
+    // its schema joins the frozen prefix, and the endpoint then rejects EVERY
+    // request in the session with a 400 that names a JSON pointer and not the
+    // file. That is one bad tool bricking a whole session, which is exactly
+    // the failure verification exists to convert into an explanation.
+    // Observed in a dogfood run: an agent wrote `[params.required]` with a
+    // placeholder key and the turn died on `/required: {"_":["query"]} is not
+    // of type "array"`.
+    if let Some(required) = params.get("required") {
+        let Some(names) = required.as_array() else {
+            return Err(
+                "params.required must be an array of property names: write it as \
+                 required = [\"a\", \"b\"] on one line, not as a [params.required] \
+                 table (a table is an object on the wire and the endpoint rejects the \
+                 whole request)"
+                    .into(),
+            );
+        };
+        for name in names {
+            let Some(name) = name.as_str() else {
+                return Err(format!(
+                    "params.required must list property names as strings, not {}",
+                    crate::text::one_line(&name.to_string())
+                ));
+            };
+            if !params
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|p| p.contains_key(name))
+            {
+                return Err(format!(
+                    "params.required names '{}', which is not in params.properties",
+                    crate::text::one_line(name)
+                ));
+            }
+        }
+    }
     let bytes = params.to_string().len();
     if bytes > MAX_EXTERNAL_PARAMS_BYTES {
         return Err(format!(
@@ -1394,6 +1434,47 @@ mod tests {
         let err = parse_tool_source(Path::new("t.toml"), bad_env).unwrap_err();
         assert!(err.contains("invalid env var name"), "{err:?}");
         assert!(!err.contains('\n'), "{err:?}");
+    }
+
+    /// The exact manifest an agent wrote in a dogfood run. TOML makes the
+    /// wrong shape look right - `[params.required]` opens a table - and
+    /// nothing here used to look at `required`, so `--check` vouched for it,
+    /// the schema joined the frozen prefix, and the endpoint then rejected
+    /// EVERY request in the session with `/required: {"_":["query"]} is not of
+    /// type "array"`. One tool bricked the session it was written in, which is
+    /// the failure this verification exists to prevent.
+    #[test]
+    fn a_params_required_table_is_rejected_before_the_wire_sees_it() {
+        let text = concat!(
+            "name = \"docsearch\"\n",
+            "description = \"d\"\n",
+            "command = \"c\"\n",
+            "[params]\n",
+            "type = \"object\"\n",
+            "[params.properties.query]\n",
+            "type = \"string\"\n",
+            "[params.required]\n",
+            "_ = [\"query\"]\n",
+        );
+        let err = parse_tool_source(Path::new("t.toml"), text).unwrap_err();
+        assert!(err.contains("params.required"), "{err:?}");
+        assert!(err.contains("array of property names"), "{err:?}");
+        assert!(!err.contains('\n'), "{err:?}");
+
+        // The correct spelling still loads.
+        let ok = text.replace("[params.required]\n_ = [\"query\"]\n", "");
+        let ok = ok.replace("[params.properties.query]", "required = [\"query\"]\n[params.properties.query]");
+        parse_tool_source(Path::new("t.toml"), &ok).expect("an array of names is valid");
+
+        // A name no property declares is refused too: the endpoint would take
+        // it and the tool would then be uncallable for a reason nothing names.
+        let ghost = text.replace("[params.required]\n_ = [\"query\"]\n", "");
+        let ghost = ghost.replace(
+            "[params.properties.query]",
+            "required = [\"missing\"]\n[params.properties.query]",
+        );
+        let err = parse_tool_source(Path::new("t.toml"), &ghost).unwrap_err();
+        assert!(err.contains("not in params.properties"), "{err:?}");
     }
 
     /// The same rule for the schema check beside it: a TOML multiline string
