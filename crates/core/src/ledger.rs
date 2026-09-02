@@ -564,22 +564,6 @@ fn head(records: &[Record]) -> HashMap<PathBuf, Option<String>> {
     map
 }
 
-/// Verify the hash chain; returns the number of intact records or the index
-/// where the chain breaks.
-pub fn verify_chain(records_text: &str) -> Result<usize, usize> {
-    let mut prev = String::new();
-    for (i, line) in records_text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
-        let Ok(record) = serde_json::from_str::<Record>(line) else {
-            return Err(i);
-        };
-        if record.prev != prev {
-            return Err(i);
-        }
-        prev = sha256_hex(line.as_bytes());
-    }
-    Ok(records_text.lines().filter(|l| !l.trim().is_empty()).count())
-}
-
 /// Record the difference between the ledger head and `files` (the exact
 /// generation a freeze read: path -> (sha256, bytes)). New and changed files
 /// get `actor` (or `Initial` when the ledger is empty), removed paths get a
@@ -2288,6 +2272,23 @@ pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify the hash chain; returns the number of intact records or the
+    /// index where the chain breaks. A test oracle: production verification
+    /// goes through `read_verified`, which also checks the pin.
+    fn verify_chain(records_text: &str) -> Result<usize, usize> {
+        let mut prev = String::new();
+        for (i, line) in records_text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            let Ok(record) = serde_json::from_str::<Record>(line) else {
+                return Err(i);
+            };
+            if record.prev != prev {
+                return Err(i);
+            }
+            prev = sha256_hex(line.as_bytes());
+        }
+        Ok(records_text.lines().filter(|l| !l.trim().is_empty()).count())
+    }
 
     /// `describe` builds the receipt's leading "what changed" clause out of the
     /// agent's own filename, so a path carrying a line break forged a line

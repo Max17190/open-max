@@ -73,11 +73,9 @@ pub(crate) struct ProcessRequest {
 /// pre-sandbox refusal, never silently unsandboxed.
 #[derive(Clone, Debug)]
 pub(crate) struct SandboxPolicy {
-    /// The project root the probe may read (documentation of intent; reads
-    /// are broadly allowed - see above - but the cwd and inputs live here).
-    #[allow(dead_code)]
-    pub ro_root: PathBuf,
-    /// The one directory the probe may write; also its HOME.
+    /// The one directory the probe may write; also its HOME. Reads are
+    /// broadly allowed (see above); the cwd and inputs live in the project
+    /// root the caller already passes to the spawn.
     pub rw_scratch: PathBuf,
 }
 
@@ -1033,10 +1031,7 @@ mod tests {
                 spill_dir: None,
                 spill_bytes_per_stream: 0,
             },
-            sandbox: Some(SandboxPolicy {
-                ro_root: scratch.to_path_buf(),
-                rw_scratch: scratch.to_path_buf(),
-            }),
+            sandbox: Some(SandboxPolicy { rw_scratch: scratch.to_path_buf() }),
             env_allowlist: None,
         }
     }
