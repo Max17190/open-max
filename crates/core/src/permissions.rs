@@ -261,8 +261,8 @@ impl Permissions {
         // policy that denies READING this file may be protecting secrets or
         // config stored in it, and exempting read_file would let a caller who
         // can edit but not read append malformed TOML - forcing fail-closed -
-        // and then read the whole file back through the carve-out (Greptile
-        // security). Repair never needs a read: the file is agent-writable, so
+        // and then read the whole file back through the carve-out. Repair
+        // never needs a read: the file is agent-writable, so
         // the fix is to write the intended policy, and a file only a human can
         // read is repaired from the shell (guided by openmax --check), exactly
         // as the global file already is.
@@ -432,7 +432,7 @@ type InertAllows = Option<(String, usize)>;
 /// exist is a rule that silently never fires. One read serves every
 /// diagnostic row: the declared tool list AND the inert verdict come from
 /// the same parsed generation. Two loads let a rewrite between them make
-/// --check report a state neither revision held (Greptile reproduced
+/// --check report a state neither revision held (a reproduced report read
 /// "1 rules, 2 inert"); the live loader reads once, and #245 set the
 /// discipline.
 pub(crate) fn check_file(
@@ -686,7 +686,7 @@ mod tests {
         );
         // read_file on the broken file is NOT exempt: a policy denying reads
         // of this file may guard its contents, and a corrupt-then-read
-        // sequence would otherwise bypass that deny (Greptile). Repair is
+        // sequence would otherwise bypass that deny. Repair is
         // write-only.
         assert!(
             matches!(

@@ -133,7 +133,7 @@ pub enum AgentEvent {
         /// frontend MUST render it on a dedicated line the card never clips
         /// away: approving secrets you cannot see is the exact failure the
         /// content gate exists to stop, and a narrow terminal must not be
-        /// able to hide it behind other detail (Greptile security). Carried
+        /// able to hide it behind other detail. Carried
         /// as structured data, not folded into `detail`, so the frontend
         /// controls its own un-clippable placement. Additive and defaulted:
         /// a stream without the key deserializes unchanged, and the key is

@@ -363,7 +363,7 @@ pub struct App {
     /// Whether the last draw showed the pending approval's full credential
     /// grant. When a grant is too large for the card (a tiny terminal clamps
     /// it), affirmative approval (`y`/`a`) is refused: a human must not be
-    /// able to grant credential access they could not read (Greptile). True
+    /// able to grant credential access they could not read. True
     /// when there is no grant to hide.
     approval_grant_fully_shown: bool,
     perf_layout_ms: f64,
@@ -1081,7 +1081,7 @@ impl App {
         if let Some((id, name, _, _, _)) = self.pending_approval.clone() {
             // Affirmative approval (y / a) is refused while the card could not
             // show the whole credential grant: a human must never grant
-            // credential access they could not fully read (Greptile). Deny is
+            // credential access they could not fully read. Deny is
             // always allowed. The card wraps the grant, so this only bites a
             // terminal too small to render it - enlarge and the keys work.
             let affirmative =
@@ -2753,7 +2753,7 @@ impl App {
                 // hook-write note produced no screen change, and Refrozen
                 // shows only its generic toolbox summary, not the NOT-loaded
                 // reason), so ignoring it dropped harness corrections a
-                // stdio client would see (Greptile). The bracket prefix is
+                // stdio client would see. The bracket prefix is
                 // stripped for a cleaner line; the text is already the model's.
                 let shown = text.trim().trim_start_matches('[').trim_end_matches(']');
                 self.note(shown);
@@ -4123,7 +4123,7 @@ fn approval_choice_line() -> Line<'static> {
 /// The card's middle line, with the declared env allowlist given the FIRST
 /// claim on the width. Folding "receives env: …" into the tail of a clipped
 /// detail string let a narrow card drop the credential grant while Allow
-/// stayed selectable (Greptile security). Here the grant leads, warn-styled,
+/// stayed selectable. Here the grant leads, warn-styled,
 /// and is clipped only against the whole width, so a long env list truncates
 /// but the disclosure itself is never hidden; the ordinary detail fills
 /// whatever width is left. The card layout stays exactly three lines, so the
@@ -4201,7 +4201,7 @@ fn compact_approval_lines(
 /// The declared env allowlist, wrapped so EVERY granted name is visible - a
 /// single clipped line dropped later names behind an ellipsis while Allow
 /// stayed selectable, and every one of those names is forwarded to the host
-/// process (Greptile). The first line carries the `receives env:` label;
+/// process. The first line carries the `receives env:` label;
 /// continuation lines carry the rest of the comma list. A lone name wider
 /// than the card is hard-clipped (unavoidable), but a multi-name list never
 /// loses a name to width. The card grows to fit these (see `desired_input_h`).
@@ -4212,7 +4212,7 @@ fn approval_env_wrap(env: &[String], width: usize) -> Vec<String> {
     // The whole disclosure as one string, then wrapped so NO character is
     // dropped: a single env name wider than the card would otherwise be
     // clipped to an ellipsis, and a user could still approve `y`/`a` without
-    // ever seeing the full variable name (Greptile). Breaks fall at spaces so
+    // ever seeing the full variable name. Breaks fall at spaces so
     // names stay whole; a name wider than the card is split by characters
     // across lines rather than truncated.
     wrap_str_preserving(&format!("receives env: {}", env.join(", ")), width)
@@ -6468,7 +6468,7 @@ mod tests {
     fn narrow_approval_card_still_shows_the_env_grant() {
         // A 40-column card with a long detail: folding "receives env: …"
         // into the tail of one clipped detail line let the credential grant
-        // fall off while Allow stayed selectable (Greptile security). The
+        // fall off while Allow stayed selectable. The
         // grant now leads its own line, so a narrow terminal cannot hide it.
         let (mut app, dir) = app_fixture();
         app.on_agent_event(AgentEvent::ApprovalRequest {
@@ -6489,7 +6489,7 @@ mod tests {
         );
         // EVERY granted secret must be visible, not just the first: a single
         // clipped line dropped the later names behind an ellipsis while Allow
-        // stayed selectable (Greptile). The grant wraps instead.
+        // stayed selectable. The grant wraps instead.
         assert!(
             text.contains("DEPLOY_TOKEN"),
             "the first granted secret must be visible: {text}"
@@ -6551,7 +6551,7 @@ mod tests {
     async fn a_clamped_credential_grant_refuses_keyboard_approval() {
         // A grant too large for the terminal cannot be fully read, so `y`/`a`
         // are refused until the terminal is enlarged - a human must never
-        // grant credential access they could not see (Greptile). `n` still
+        // grant credential access they could not see. `n` still
         // declines.
         let (mut app, dir) = app_fixture();
         let many: Vec<String> = (0..40).map(|i| format!("SECRET_NUMBER_{i:02}")).collect();

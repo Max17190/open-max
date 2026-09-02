@@ -1065,8 +1065,8 @@ mod tests {
     fn spec_skills_states_first_fit_omission() {
         // The byte cap is first-fit in name order, not a suffix cut, and the
         // remediation must not overclaim either way: a minimal skill can
-        // still lose to earlier entries, where renaming is what helps
-        // (Greptile reproduced that), and shortening any earlier line frees
+        // still lose to earlier entries, where renaming is what helps,
+        // and shortening any earlier line frees
         // budget for the ones after it.
         assert!(SKILLS.contains("first-fit in name order"));
         assert!(SKILLS.contains("a later, shorter line may"));
@@ -1245,7 +1245,7 @@ mod tests {
     /// declares `mutating = false` runs unprompted even though it is host code
     /// that can write anything, so the permissions spec must not promise `ask`
     /// mode shows "every mutating call" without that caveat and the audit it
-    /// implies (Greptile): a reader who trusts the unqualified promise builds
+    /// implies: a reader who trusts the unqualified promise builds
     /// a guard with a hole in it.
     #[test]
     fn permissions_spec_qualifies_ask_mode_with_the_classification_caveat() {
@@ -1265,7 +1265,7 @@ mod tests {
         // The mitigation must be real: there is no in-place approval revoke,
         // so the spec must say so and name what actually closes the hole -
         // advising "revoke the approval" would send the reader to --forget,
-        // which leaves the tool's hashes standing (Greptile). Collapse the
+        // which leaves the tool's hashes standing. Collapse the
         // doc's line wrapping so the check does not depend on where a phrase
         // breaks across lines.
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1276,7 +1276,7 @@ mod tests {
         // The durable mitigation is a name rule; the spec must say editing or
         // deleting the file does NOT revoke the standing approval (a
         // byte-identical restore runs cardless), or a reader would trust a
-        // control that a restore defeats (Greptile).
+        // control that a restore defeats.
         assert!(
             flat.contains("neither editing nor deleting the file revokes that approval"),
             "the spec must say edit/delete do not revoke the standing approval"
@@ -1288,7 +1288,7 @@ mod tests {
         // Protecting a path from ask-mode bypass also means dropping bash
         // allows: a bash allow matches command text, so an approved bash allow
         // whose command mutates the path force-allows it, and path-scoped
-        // write/edit rules do not constrain bash (Greptile).
+        // write/edit rules do not constrain bash.
         assert!(
             flat.contains("a `bash` allow matches COMMAND TEXT")
                 && flat.contains("does not constrain bash"),
@@ -1296,7 +1296,7 @@ mod tests {
         );
         // Evaluation is first-match, so the gate is inert behind an earlier
         // allow: the spec must state the ordering requirement, or a reader adds
-        // a deny below an approved allow and it never fires (Greptile).
+        // a deny below an approved allow and it never fires.
         assert!(
             flat.contains("evaluation is FIRST-MATCH") && flat.contains("earlier `allow`"),
             "the spec must say a name gate is shadowed by an earlier allow"

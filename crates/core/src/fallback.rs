@@ -210,7 +210,7 @@ fn collect_tagged(content: &str, known_tools: &[&str], spans: &mut Vec<(usize, u
                 // is a malformed block, not an unclosed tag. Skip past the close
                 // rather than resuming at that open tag, which may sit inside
                 // this call's own JSON string: resuming there would parse the
-                // garbage suffix as a spurious independent call (Greptile).
+                // garbage suffix as a spurious independent call.
                 from = end.max(body_start);
             }
         } else {
@@ -502,7 +502,7 @@ mod tests {
         // valid-looking call after it. The unclosed-tag recovery must not
         // resume at that inner tag and parse the suffix as a real call; when
         // bounding at the next open still yields nothing, the whole block is
-        // dropped as prose (Greptile).
+        // dropped as prose.
         let text = "<tool_call>garbage <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"boom\"}}</tool_call>";
         assert!(
             extract_tool_calls(text, known()).is_none(),
