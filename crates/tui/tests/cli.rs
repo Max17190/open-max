@@ -908,10 +908,12 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
     assert_eq!(request["source_sha"].as_str().unwrap().len(), 12);
     assert_eq!(request["summary"], "peek", "a summary must never be empty");
 
-    // The operator running headless gets a command, not a placeholder.
+    // The operator running headless gets a command, not a placeholder, and
+    // the path is quoted the way every other printed --approve line is, so
+    // a file the agent named survives the paste.
     assert!(
-        stderr.contains("openmax --approve .openmax/tools/peek.toml"),
-        "stderr must name the real file: {stderr}"
+        stderr.contains("openmax --approve '.openmax/tools/peek.toml'"),
+        "stderr must name the real file, quoted: {stderr}"
     );
     assert!(!stderr.contains("<its .toml>"), "{stderr}");
 

@@ -211,9 +211,7 @@ async fn run_turn_events(
                     // The path is the whole point of the line: a script's
                     // operator has to be able to copy the command and run it.
                     let hint = if reason == "unapproved_source" {
-                        format!(
-                            "a human must approve this tool's content first: openmax --approve {source_path} ({source_sha})"
-                        )
+                        approve_hint(source_path, source_sha)
                     } else {
                         "set approval_mode to auto for unattended mutating tools".to_string()
                     };
@@ -336,6 +334,16 @@ fn truncate_line(s: &str, max: usize) -> String {
     out
 }
 
+/// The line an operator copies when a headless run declines the content
+/// gate. The path is the whole point of the line, and it is a file the agent
+/// named, so it must survive a paste into a shell unchanged.
+fn approve_hint(source_path: &str, source_sha: &str) -> String {
+    format!(
+        "a human must approve this tool's content first: openmax --approve {} ({source_sha})",
+        open_max_core::doctor::shell_quote(std::path::Path::new(source_path))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +397,19 @@ mod tests {
             assert_eq!(code, 1, "stop reason {stop_reason}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A tool file the agent named can carry a space or a shell
+    /// metacharacter; the pasted repair command must name that file, not run
+    /// part of it.
+    #[test]
+    fn the_approve_hint_quotes_the_path_an_operator_pastes() {
+        let hint = super::approve_hint(".openmax/tools/my $(x) tool.toml", "abc123def456");
+        assert!(
+            hint.contains("openmax --approve '.openmax/tools/my $(x) tool.toml'"),
+            "{hint}"
+        );
+        assert!(hint.ends_with("(abc123def456)"), "{hint}");
     }
 
     #[test]

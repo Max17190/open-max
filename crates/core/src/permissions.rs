@@ -89,7 +89,9 @@ impl TurnPermissions {
                 );
                 if newest_ok {
                     reason.push_str(
-                        " (this denies from a permissions snapshot observed earlier this turn;                          the file on disk is valid now and applies from the next turn - within a                          turn policy only narrows)",
+                        " (this denies from a permissions snapshot observed earlier this turn; \
+                         the file on disk is valid now and applies from the next turn - within a \
+                         turn policy only narrows)",
                     );
                 }
             }
@@ -730,7 +732,13 @@ mod tests {
         // it), but the reason now says the file is valid and applies next turn.
         match turn.evaluate("write_file", &json!({"path": "src/main.rs"})) {
             PermissionDecision::Deny { reason } => {
-                assert!(reason.contains("valid now and applies from the next turn"), "{reason}");
+                assert!(
+                    reason.contains(
+                        "observed earlier this turn; the file on disk is valid now and applies \
+                         from the next turn - within a turn policy only narrows)"
+                    ),
+                    "the clause must read as one sentence, not carry source line breaks: {reason}"
+                );
             }
             other => panic!("stale fail-closed snapshot must still floor the turn: {other:?}"),
         }

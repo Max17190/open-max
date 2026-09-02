@@ -429,18 +429,6 @@ pub fn index_line(entry: &MemoryEntry) -> String {
     format!("- {}: {} — {}\n", entry.name, entry.description, entry.path)
 }
 
-/// The injected index section, or None when nothing qualifies so the
-/// zero-memory prompt stays byte-identical to a memoryless build.
-/// (name, index-line hash) for exactly the memories that WILL be in the
-/// frozen prompt's index: valid-named, not faded, within the byte budget.
-/// The refreeze receipt's "indexed" claim is built from this, so it can
-/// never name a file the prompt then omits (bad stem, expired, over-budget).
-/// The hash covers the rendered index line, so editing a description that
-/// changes the line is a delta while an unrelated body edit is not.
-pub fn indexed_identities(project_root: &Path, now: u64) -> Vec<(String, u64)> {
-    index_and_identities(project_root, now).1
-}
-
 /// One scan producing BOTH the rendered index section (for the frozen prompt)
 /// AND the receipt identities (for the refreeze receipt), so the two can
 /// never disagree - a memory changed between two separate scans could make
@@ -481,30 +469,19 @@ fn section_and_identities(scan: &MemoryScan) -> (IndexSection, Vec<(String, u64)
     (section, identities)
 }
 
-pub fn index_and_identities(
-    project_root: &Path,
-    now: u64,
-) -> (IndexSection, Vec<(String, u64)>) {
+/// A fresh scan's section and identities, for tests that compare a
+/// snapshot against what a plain scan would render.
+#[cfg(test)]
+fn index_and_identities(project_root: &Path, now: u64) -> (IndexSection, Vec<(String, u64)>) {
     section_and_identities(&scan(project_root, now))
 }
 
-pub fn index_section(project_root: &Path, now: u64) -> Option<(String, Vec<(String, usize)>)> {
-    let scan = scan(project_root, now);
-    let shown: Vec<&MemoryEntry> = scan.entries.iter().filter(|e| e.in_index).collect();
-    if shown.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let mut breakdown = Vec::new();
-    for entry in &shown {
-        let line = index_line(entry);
-        breakdown.push((entry.name.clone(), line.len()));
-        out.push_str(&line);
-    }
-    if scan.omitted > 0 {
-        out.push_str(&trailer_line(scan.omitted));
-    }
-    Some((out, breakdown))
+/// The injected index section from a fresh scan, or None when nothing
+/// qualifies so the zero-memory prompt stays byte-identical to a memoryless
+/// build. The same renderer `freeze_snapshot` uses, so a registry that never
+/// scanned renders exactly what a freeze would have.
+pub fn index_section(project_root: &Path, now: u64) -> IndexSection {
+    section_and_identities(&scan(project_root, now)).0
 }
 
 /// Delete memories unused past the GC floor age, logging a tombstone (name,

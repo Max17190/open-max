@@ -433,9 +433,10 @@ fn declared_tool_name(text: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Compatibility helper for diagnostics and tests that only need the content
-/// identity. Activation paths should retain and parse the full snapshot.
-pub fn extensions_fingerprint(data_dir: &Path, project_root: &Path) -> u64 {
+/// Test helper for the content identity alone. Activation paths retain and
+/// parse the full snapshot.
+#[cfg(test)]
+fn extensions_fingerprint(data_dir: &Path, project_root: &Path) -> u64 {
     capture_extensions(data_dir, project_root).fingerprint
 }
 
@@ -595,10 +596,7 @@ impl Registry {
     ) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
             Some(ToolKind::External(tool)) => {
-                let sandbox = execution::SandboxPolicy {
-                    ro_root: root.to_path_buf(),
-                    rw_scratch: scratch.to_path_buf(),
-                };
+                let sandbox = execution::SandboxPolicy { rw_scratch: scratch.to_path_buf() };
                 spawn_external(name, &tool, args, data_dir, root, caps, cancel, Some(sandbox))
                     .await
             }
