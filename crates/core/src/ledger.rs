@@ -1415,8 +1415,8 @@ fn approve(
                     // is_file() check would accept a pre-existing object at
                     // objects/<sha> that holds unrelated bytes (a changed
                     // script whose sha slot was pre-populated), so a restore
-                    // would produce bytes the reviewer never approved
-                    //. store_object only writes bytes that hash to
+                    // would produce bytes the reviewer never approved.
+                    // store_object only writes bytes that hash to
                     // the sha, so a valid object here means we stored it this
                     // act or an earlier act stored the identical bytes.
                     let intact = std::fs::read(dir.join("objects").join(code_sha))
@@ -1933,8 +1933,8 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
     // soon as any option precedes the candidate, to avoid a --check false
     // positive over an option VALUE like `node -p x.js`): here, gating a
     // missing script-shaped argument is the safe direction - an empty binding
-    // would let the removed tool run ungated and read as cardless-restorable
-    //. An existing argument was already read by the arg loop above.
+    // would let the removed tool run ungated and read as cardless-restorable.
+    // An existing argument was already read by the arg loop above.
     let stem = Path::new(command.trim()).file_name().and_then(|s| s.to_str());
     if stem.is_some_and(|s| INTERPRETERS.contains(&s)) {
         for arg in args {
@@ -2309,8 +2309,8 @@ mod tests {
     /// A same-second approve/retire/re-approve of identical bytes at the same
     /// path must give the two approvals DISTINCT event ids, or the per-session
     /// watermark drops the re-approval and the next turn is told the
-    /// capability was retired when it is approved to run without a card
-    ///. The chain position disambiguates records the (path, sha,
+    /// capability was retired when it is approved to run without a card.
+    /// The chain position disambiguates records the (path, sha,
     /// second, kind) tuple cannot, and it is stable across reads.
     #[test]
     fn same_second_re_approval_gets_a_distinct_event_id() {
@@ -2614,8 +2614,7 @@ mod tests {
     /// A missing interpreter-script argument (`/bin/sh run.sh`, run.sh gone)
     /// binds to a None entry, so the empty binding cannot read as covered.
     /// Otherwise deleting it left an empty `bound_code`, which `covers_code`
-    /// accepts, and the removed tool was wrongly called cardless-restorable
-    ///.
+    /// accepts, and the removed tool was wrongly called cardless-restorable.
     #[test]
     fn a_missing_interpreter_script_arg_binds_to_none() {
         let root = temp("interp-proj");
@@ -3020,8 +3019,8 @@ mod tests {
     /// An approved external tool records its bound script's hash in `also`
     /// but no path list - `code` is filled from the hook shape only - so a
     /// footer pairing `also` with `code` offered nothing: the one intact
-    /// object an operator needs after deleting the script had no cp line
-    ///. The path comes back from the stored manifest object, the
+    /// object an operator needs after deleting the script had no cp line.
+    /// The path comes back from the stored manifest object, the
     /// approved bytes, never the live file, which here is already gone.
     #[test]
     fn an_external_tools_bound_script_gets_a_restore_target() {
@@ -3051,8 +3050,8 @@ mod tests {
 
     /// The record's sha authenticates the manifest bytes wherever they live:
     /// with the stored object pruned but the manifest file still hashing to
-    /// the vouched sha, a tool's intact script object keeps its restore line
-    ///, while an EDITED manifest file authenticates nothing.
+    /// the vouched sha, a tool's intact script object keeps its restore line,
+    /// while an EDITED manifest file authenticates nothing.
     #[test]
     fn a_tools_restore_survives_a_pruned_manifest_object_via_the_authentic_file() {
         let data = temp("tool-prune-data");

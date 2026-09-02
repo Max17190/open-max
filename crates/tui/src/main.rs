@@ -473,8 +473,7 @@ async fn main() -> std::io::Result<()> {
                             // Each non-intact bound object is damage too, or
                             // the footer prints an unqualified `restore with cp`
                             // recipe while this approval cannot be fully
-                            // restored - same accounting the manifest path does
-                            //.
+                            // restored - same accounting the manifest path does.
                             damaged += n - stored;
                             let plural = if n == 1 { "" } else { "s" };
                             if stored == n {
@@ -490,8 +489,8 @@ async fn main() -> std::io::Result<()> {
                     // The manifest object matters as much as the bound ones:
                     // a legacy or hash-only approval can keep intact bound
                     // objects while its PRIMARY manifest bytes were never
-                    // stored, so the row must not read as fully restorable
-                    //. Checked from the full sha, not the short
+                    // stored, so the row must not read as fully restorable.
+                    // Checked from the full sha, not the short
                     // display form.
                     let manifest_note =
                         if open_max_core::ledger::approval_manifest_missing(&data_dir, &project, r) {

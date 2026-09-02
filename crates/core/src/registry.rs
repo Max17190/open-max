@@ -792,8 +792,7 @@ impl Registry {
         // first refreeze establishes the fresh scan as the baseline with no
         // spurious delta. The row accounting survives on the frozen
         // channel: /context prices the rows of the freeze that WROTE the
-        // persisted prompt, which is precisely what the manifest carries
-        //.
+        // persisted prompt, which is precisely what the manifest carries.
         registry.frozen_memory_rows = manifest.memory_rows.clone();
         registry
     }

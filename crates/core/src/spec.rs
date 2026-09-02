@@ -1065,8 +1065,8 @@ mod tests {
     fn spec_skills_states_first_fit_omission() {
         // The byte cap is first-fit in name order, not a suffix cut, and the
         // remediation must not overclaim either way: a minimal skill can
-        // still lose to earlier entries, where renaming is what helps
-        //, and shortening any earlier line frees
+        // still lose to earlier entries, where renaming is what helps,
+        // and shortening any earlier line frees
         // budget for the ones after it.
         assert!(SKILLS.contains("first-fit in name order"));
         assert!(SKILLS.contains("a later, shorter line may"));

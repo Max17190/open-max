@@ -735,8 +735,8 @@ async fn removing_a_tool_with_edited_bound_code_is_not_called_approved() {
 /// still report that the approval SURVIVES: the ledger keeps the record and
 /// the content-addressed objects, so the bytes are restorable. Recomputing
 /// bound_code after the script is gone makes covers_code fail, which used to
-/// drop the tool from the receipt entirely, hiding the surviving approval
-///. It is now named in a distinct clause that does not claim the
+/// drop the tool from the receipt entirely, hiding the surviving approval.
+/// It is now named in a distinct clause that does not claim the
 /// deleted bytes would run without another approval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval() {

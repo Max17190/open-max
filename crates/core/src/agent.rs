@@ -3163,8 +3163,8 @@ async fn run_loop(
                                     // or unreadable, that entry hashes to
                                     // nothing, so `covers_code` stays false and
                                     // the NEXT call still stops for a card - a
-                                    // "runs without a card" receipt would lie
-                                    //. "Recorded" therefore means
+                                    // "runs without a card" receipt would lie.
+                                    // "Recorded" therefore means
                                     // the grant now covers the exact bytes the
                                     // gate re-reads, not merely that a record
                                     // was written: re-run that gate and believe

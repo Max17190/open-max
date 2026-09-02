@@ -152,8 +152,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // memory written after the freeze while the receipt reports no change. A
     // registry that never scanned (builtin-only, or restored from a manifest,
     // which keeps memory_files for the resume delta but captured no section)
-    // scans fresh, or a resumed session would render no memory index at all
-    //.
+    // scans fresh, or a resumed session would render no memory index at all.
     let memory = if registry.memory_scanned {
         registry.memory_section.clone()
     } else {
