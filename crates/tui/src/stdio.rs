@@ -5,8 +5,9 @@
 //! openmax) can drive a complete interactive session, approvals included.
 //!
 //! Protocol (`openmax-stdio/5`), one JSON object per line. The normative
-//! reference (every field of every line) lives in README under "stdio
-//! protocol"; `crates/core/src/types.rs` golden tests pin the event wire.
+//! reference (every field of every line) is `docs/stdio-protocol.md`, kept in
+//! step with `openmax --spec stdio`; `crates/core/src/types.rs` golden tests
+//! pin the event wire.
 //!
 //! stdin commands:
 //!   {"cmd":"user","text":"..."}                      start a turn
