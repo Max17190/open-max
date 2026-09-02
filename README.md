@@ -44,7 +44,7 @@ The design starts with one question: **What is the smallest capability Open Max 
 | Lifecycle policy and events | Process hooks and permission files |
 | Compaction integration | The built-in model summary plus the `compaction` hook event |
 | Model endpoints | `providers.json`, including local servers, gateways, and private proxies |
-| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/3` |
+| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/5` |
 
 These are deliberate boundaries, not placeholders for hidden orchestration products. Open Max does not carry an MCP host, nested-agent scheduler, plan mode, background-job product, built-in TODO database, user-keybinding engine, pluggable compactor, or TUI plugin ABI. The agent composes those richer workflows from the same host tools a developer can inspect, edit, test, and remove.
 
@@ -142,7 +142,7 @@ Sessions, settings, tools, and skills stay under `~/.openmax/` and your project 
 - [Configuration](docs/configuration.md): settings, approvals, providers, project trust
 - [Usage](docs/usage.md): CLI flags, keybindings, slash commands
 - [Extending](docs/extending.md): tools, skills, templates, hooks, permissions, validation, freezing
-- [stdio protocol](docs/stdio-protocol.md): the `openmax-stdio/3` contract for custom frontends
+- [stdio protocol](docs/stdio-protocol.md): the `openmax-stdio/5` contract for custom frontends
 
 ## Development
 

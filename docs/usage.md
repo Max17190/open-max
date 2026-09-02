@@ -39,7 +39,7 @@ each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
 `approval_mode`; for unattended runs set `"approval_mode": "auto"`.
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
-and one openmax driving another (see the `delegate` skill). It is specified in
+and one openmax driving another. It is specified in
 [stdio protocol](stdio-protocol.md).
 
 ## Keys

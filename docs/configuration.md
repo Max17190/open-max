@@ -11,6 +11,7 @@ optional `~/.openmax/providers.json` for a catalog of named endpoints.
   "model": "qwen2.5-coder:7b",
   "api_key": null,
   "approval_mode": "ask",
+  "context_tokens": 32768,
   "max_parallel_tools": 4
 }
 ```

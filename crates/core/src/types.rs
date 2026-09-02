@@ -190,8 +190,12 @@ pub enum AgentEvent {
     /// provider's `finish_reason` on a normal end, or one of the harness's own:
     /// `truncated` (the stream ended with no completion signal, so the reply is
     /// incomplete and any tool calls it carried were refused; an `Error`
-    /// precedes it), `max_iterations`, `blocked`,
-    /// `cancelled`, `error`, `refused`.
+    /// precedes it), `max_iterations`, `budget_exhausted` (the per-turn
+    /// `max_agent_tokens` cap refused the next request at admission),
+    /// `unverified` (a blocking `turn_end` hook refused the completion more
+    /// times than the harness honors, or its refusal could not be persisted),
+    /// `blocked`, `cancelled`, `error`, and `refused` (a frontend answered a
+    /// command that started no turn).
     Done { stop_reason: String },
     Error { message: String },
 }
