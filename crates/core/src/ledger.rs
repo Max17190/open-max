@@ -526,9 +526,9 @@ fn repair_generation(dir: &Path) -> u64 {
 /// the chain GENERATION (how many repairs preceded it) and the chain POSITION
 /// are part of it, not only the (path, sha, second, kind): otherwise an
 /// approve/retire/re-approve of identical bytes in one Unix second collides on
-/// position (Greptile Y3), and an identical approval recorded just before and
+/// position, and an identical approval recorded just before and
 /// just after a `--ledger-repair` - both at position zero of their chains -
-/// collides across the repair (Greptile). A running session that watermarked
+/// collides across the repair. A running session that watermarked
 /// the pre-repair event would then suppress the post-repair one and keep stale
 /// approval context. Both parts are stable between repairs (the chain is
 /// append-only and the quarantine count only grows on repair), so a record
@@ -967,7 +967,7 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
     // key was (pin, byte length), and a same-length in-place rewrite of a
     // pinned record kept both while breaking the chain, so the cache served
     // stale approvals to the input gate and a corrupted ledger's turn still
-    // reached the provider (Greptile, live repro). Every mutating call and
+    // reached the provider. Every mutating call and
     // every hook run asks this question, so full verification (per-line
     // parse, per-record hashing) is still worth avoiding on a hit; the price
     // of a key that cannot be forged into a stale answer is one linear
@@ -1323,7 +1323,7 @@ pub fn approve_capability(
 /// the record carries the session id (actor `Session`). The turn-start
 /// reconciliation excludes a session's own grants by that id; without it, the
 /// session would be told the next turn that its own card approval was
-/// "activity outside this session" (Greptile). The no-session
+/// "activity outside this session". The no-session
 /// `approve_capability` stays for the CLI `--approve` path, which has no
 /// session to attribute the act to.
 pub fn approve_capability_in_session(
@@ -1405,7 +1405,7 @@ fn approve(
                 // that hash would fail. A bound file changed, deleted, or made
                 // unreadable since the card hashed it leaves its vouched sha
                 // unstored: reject the whole approval rather than record a hash
-                // with no restorable bytes (Greptile). Code that was already
+                // with no restorable bytes. Code that was already
                 // missing AT card time never entered `shas`, so this does not
                 // fire for it - that tool is simply not covered and asks again.
                 // The manifest object already written is orphaned (no record
@@ -1416,7 +1416,7 @@ fn approve(
                     // objects/<sha> that holds unrelated bytes (a changed
                     // script whose sha slot was pre-populated), so a restore
                     // would produce bytes the reviewer never approved
-                    // (Greptile). store_object only writes bytes that hash to
+                    //. store_object only writes bytes that hash to
                     // the sha, so a valid object here means we stored it this
                     // act or an earlier act stored the identical bytes.
                     let intact = std::fs::read(dir.join("objects").join(code_sha))
@@ -1674,7 +1674,7 @@ pub fn object_state(data_dir: &Path, project_root: &Path, sha: &str) -> ObjectSt
 /// record approved a manifest sha but its object is missing or corrupt (a
 /// legacy or hash-only approval never stored one). `--ledger` surfaces this so
 /// a row with intact bound objects but an unrestorable manifest does not read
-/// as fully restorable (Greptile). False for non-approvals and path-only
+/// as fully restorable. False for non-approvals and path-only
 /// approvals, which have no manifest object to restore.
 pub fn approval_manifest_missing(data_dir: &Path, project_root: &Path, record: &Record) -> bool {
     record.kind == Kind::Approval
@@ -1695,7 +1695,7 @@ pub fn approval_manifest_missing(data_dir: &Path, project_root: &Path, record: &
 /// carries the named paths in `code`; a tool record carries none (`code` is
 /// filled from the hook shape only), so its paths are re-derived by parsing
 /// the STORED manifest object - the bytes the hash pins, never the live
-/// file, which may be exactly what needs restoring (Greptile). A bound file
+/// file, which may be exactly what needs restoring. A bound file
 /// the card could not read never entered `also`, so a hash list shorter than
 /// the named-path list is ambiguous: nothing is offered then, because a
 /// guessed pairing prints a command that writes approved bytes over the
@@ -1730,7 +1730,7 @@ pub fn approval_restore_targets(
 /// what authenticates the bytes, not where they live, so the stored object
 /// and the file at the record's path are both accepted sources when their
 /// bytes hash to it - a pruned object with the manifest still installed must
-/// not hide the script restore the footer exists to print (Greptile). Empty
+/// not hide the script restore the footer exists to print. Empty
 /// when neither source hashes to the vouched sha (an edited manifest revokes,
 /// so its named paths are nobody's to offer), when nothing was ever stored
 /// (a hash-only approval), or when the record carries no path to parse
@@ -1925,7 +1925,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
     // missing command-position script does. Otherwise deleting it leaves an
     // EMPTY binding that `covers_code` reads as "nothing to cover", so the
     // deleted tool runs ungated and a removed-tool receipt calls it
-    // cardless-restorable (Greptile). An existing script was already read by
+    // cardless-restorable. An existing script was already read by
     // the arg loop above, so this only fires for a genuinely absent one.
     // For an interpreter command, a MISSING script-like positional argument
     // binds to None, even behind options (`python3 -O run.py`). This is
@@ -1934,7 +1934,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
     // positive over an option VALUE like `node -p x.js`): here, gating a
     // missing script-shaped argument is the safe direction - an empty binding
     // would let the removed tool run ungated and read as cardless-restorable
-    // (Greptile). An existing argument was already read by the arg loop above.
+    //. An existing argument was already read by the arg loop above.
     let stem = Path::new(command.trim()).file_name().and_then(|s| s.to_str());
     if stem.is_some_and(|s| INTERPRETERS.contains(&s)) {
         for arg in args {
@@ -2310,7 +2310,7 @@ mod tests {
     /// path must give the two approvals DISTINCT event ids, or the per-session
     /// watermark drops the re-approval and the next turn is told the
     /// capability was retired when it is approved to run without a card
-    /// (Greptile). The chain position disambiguates records the (path, sha,
+    ///. The chain position disambiguates records the (path, sha,
     /// second, kind) tuple cannot, and it is stable across reads.
     #[test]
     fn same_second_re_approval_gets_a_distinct_event_id() {
@@ -2343,7 +2343,7 @@ mod tests {
         // An identical approval at position ZERO of a chain repaired in the
         // same second (generation 1) must NOT collide with the pre-repair one
         // (generation 0), or the watermark drops the post-repair approval and
-        // keeps stale approval context (Greptile).
+        // keeps stale approval context.
         let post_repair = approval_event_id(1, 0, &approval(1000));
         assert_ne!(
             first, post_repair,
@@ -2449,7 +2449,7 @@ mod tests {
     /// and the byte count intact while breaking the chain, and the old
     /// (pin, len) key served the stale pass to the very gates that exist to
     /// refuse a broken chain, so a corrupted ledger's turn still reached the
-    /// provider (Greptile, live repro).
+    /// provider.
     #[test]
     fn a_same_length_in_place_rewrite_is_not_served_from_the_cache() {
         let data = temp("rewrite-data");
@@ -2615,7 +2615,7 @@ mod tests {
     /// binds to a None entry, so the empty binding cannot read as covered.
     /// Otherwise deleting it left an empty `bound_code`, which `covers_code`
     /// accepts, and the removed tool was wrongly called cardless-restorable
-    /// (Greptile).
+    ///.
     #[test]
     fn a_missing_interpreter_script_arg_binds_to_none() {
         let root = temp("interp-proj");
@@ -2630,7 +2630,7 @@ mod tests {
         );
         // The same holds when an OPTION precedes the script (`python3 -O
         // run.py`): interpreter_script bails on the option, but bound_code
-        // still binds the missing script-like positional to None (Greptile).
+        // still binds the missing script-like positional to None.
         let with_opt = bound_code("python3", &["-O".to_string(), "run.py".to_string()], &root);
         assert!(
             with_opt.iter().any(|c| c.sha256.is_none() && c.path.ends_with("run.py")),
@@ -2649,7 +2649,7 @@ mod tests {
     /// If a bound script changes after the card hashed it but before `approve`
     /// runs, the approval is REJECTED: recording the vouched sha in `also`
     /// while its object cannot be stored would leave an approved hash with no
-    /// restorable bytes (Greptile). Nothing is recorded.
+    /// restorable bytes. Nothing is recorded.
     #[test]
     fn approve_rejects_a_bound_file_changed_after_the_card() {
         let data = temp("changed-data");
@@ -2678,7 +2678,7 @@ mod tests {
     /// The object check verifies CONTENT, not just existence: a changed bound
     /// script whose sha slot in `objects/` was pre-populated with unrelated
     /// bytes must still be rejected, or a restore would produce bytes the
-    /// reviewer never approved (Greptile).
+    /// reviewer never approved.
     #[test]
     fn approve_rejects_a_bound_file_whose_object_slot_is_corrupt() {
         let data = temp("corrupt-data");
@@ -2706,7 +2706,7 @@ mod tests {
 
     /// A hash-only approval stores no manifest object, so --ledger must read
     /// its manifest as not restorable; a full (path-form) approval stores the
-    /// object and reads as restorable (Greptile).
+    /// object and reads as restorable.
     #[test]
     fn a_hash_only_approval_reads_as_manifest_not_restorable() {
         let data = temp("mrestore-data");
@@ -3021,7 +3021,7 @@ mod tests {
     /// but no path list - `code` is filled from the hook shape only - so a
     /// footer pairing `also` with `code` offered nothing: the one intact
     /// object an operator needs after deleting the script had no cp line
-    /// (Greptile). The path comes back from the stored manifest object, the
+    ///. The path comes back from the stored manifest object, the
     /// approved bytes, never the live file, which here is already gone.
     #[test]
     fn an_external_tools_bound_script_gets_a_restore_target() {
@@ -3052,7 +3052,7 @@ mod tests {
     /// The record's sha authenticates the manifest bytes wherever they live:
     /// with the stored object pruned but the manifest file still hashing to
     /// the vouched sha, a tool's intact script object keeps its restore line
-    /// (Greptile), while an EDITED manifest file authenticates nothing.
+    ///, while an EDITED manifest file authenticates nothing.
     #[test]
     fn a_tools_restore_survives_a_pruned_manifest_object_via_the_authentic_file() {
         let data = temp("tool-prune-data");

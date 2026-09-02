@@ -265,7 +265,7 @@ impl Composer {
         // Every live marker is located in the DRAFT text first, then spliced
         // in one pass over it. Sequential replacement rescanned text already
         // expanded, so a marker spelling EMBEDDED in an earlier paste's
-        // content could capture a later paste's expansion (Greptile);
+        // content could capture a later paste's expansion;
         // expanded bytes are content, never search territory.
         //
         // Each insertion wrote its marker exactly once, so its FIRST draft

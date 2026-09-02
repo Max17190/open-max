@@ -611,7 +611,7 @@ async fn an_invalidating_write_to_permissions_is_named_on_the_writing_call() {
     assert!(content.contains("START OF THE NEXT TURN"), "{content}");
     // The recovery guidance names only the tools that are actually available:
     // read_file was removed from the repair carve-out, so advertising it would
-    // send the model into another immediate denial (Greptile).
+    // send the model into another immediate denial.
     assert!(
         content.contains("write_file/edit_file on exactly this file is still allowed"),
         "{content}"
@@ -683,7 +683,7 @@ async fn editing_an_approved_gates_script_is_named_on_the_writing_call() {
 /// When a rule earlier this turn already denied the repair tools on
 /// permissions.toml, the malformed-policy receipt must NOT claim they are
 /// still allowed: the most-restrictive turn snapshot wins, so following that
-/// guidance would hit another denial (Greptile). Here the turn-start policy
+/// guidance would hit another denial. Here the turn-start policy
 /// denies write_file and edit_file on the file, then a bash call bricks it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_denied_repair_tool_is_not_offered_by_the_malformed_receipt() {
@@ -806,8 +806,8 @@ async fn an_unverifiable_ledger_blocks_the_turn_and_names_the_repair() {
 /// in-place rewrite of a pinned record then breaks the chain WITHOUT moving
 /// the pin file or the log's byte count, which the old (pin, len) cache key
 /// trusted. The gate must refuse the next turn on the fresh content, never
-/// run it on the stale cached pass (Greptile, live repro: the corrupted
-/// turn still reached the provider).
+/// run it on the stale cached pass (the corrupted turn once reached the
+/// provider).
 #[tokio::test]
 async fn a_cached_approval_does_not_survive_an_in_place_ledger_rewrite() {
     let dir = std::env::temp_dir().join(format!("omx-rewrite-{}", uuid::Uuid::new_v4()));

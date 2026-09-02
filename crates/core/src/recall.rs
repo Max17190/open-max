@@ -2048,7 +2048,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Dogfooding's highest-impact bug: the window centered on the leftmost
+    /// The window once centered on the leftmost
     /// match of ANY term, so adding "the" to a query hid the needle inside
     /// the hit that had just been found. It centers on the rarest term, with
     /// offsets valid on the original text even when lowercasing changes byte
@@ -2070,7 +2070,7 @@ mod tests {
         assert!(excerpt.contains("DRIFTNEEDLE-5150"), "offsets must map back through lowercasing: {excerpt}");
     }
 
-    /// Dogfooding measured the crossover: at equal weight, a verbatim answer
+    /// The measured crossover: at equal weight, a verbatim answer
     /// older than ~5 hours lost to a recent note sharing two words. Damped,
     /// relevance dominates at any age and recency still breaks real ties.
     #[test]

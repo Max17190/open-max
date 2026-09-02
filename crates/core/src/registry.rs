@@ -141,7 +141,7 @@ pub struct Registry {
     /// freeze). A manifest-restored registry sets `memory_files` for the
     /// resume delta but never captured a section, so it is false and the
     /// prompt scans fresh - otherwise a resumed session would render no
-    /// memory index at all while `memory_files.is_some()` (Greptile). A
+    /// memory index at all while `memory_files.is_some()`. A
     /// scanned-but-empty freeze is true, so its empty selection is honored
     /// (no rescan), which is the invariant `memory_section` exists for.
     pub memory_scanned: bool,
@@ -230,7 +230,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             // unreadable would otherwise vanish from `tools` AND `broken`, so
             // the refreeze receipt could name it nowhere - no "NOT loaded"
             // clause, and (because the path is still a file on disk) no removal
-            // clause either (Greptile). NotFound is the one exception: a file
+            // clause either. NotFound is the one exception: a file
             // deleted between the listing and the read is gone, and a removal,
             // not a broken entry.
             let bytes = match std::fs::read(&path) {
@@ -305,8 +305,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // Collisions coalesce to ONE record per name (three namesakes must not
     // report the intermediate winner as cap-dropped while the final one is
     // indexed), and the indexed flag is settled AFTER the skill cap below:
-    // a winner the cap drops must not be reported as indexed (Greptile,
-    // both).
+    // a winner the cap drops must not be reported as indexed.
     let mut shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)> = Vec::new();
     for dir in skills::skill_dirs(data_dir, project_root) {
         dir.hash(&mut h);
@@ -351,7 +350,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
                             // pointing at a path the project definition just
                             // displaced, and the post-cap settle then called
                             // the name unindexed while the project skill is
-                            // active (Greptile).
+                            // active.
                             shadowed_skills.retain(|(n, ..)| *n != name);
                         }
                     }
@@ -365,7 +364,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // captured from two different file generations - an atomic replace between
     // two scans could otherwise freeze the replacement's index under the
     // original's fingerprint, and a restore-to-original would then skip the
-    // refreeze that would fix it (Greptile P1). The fingerprint hashes every
+    // refreeze that would fix it. The fingerprint hashes every
     // VALID-named memory byte (a write to one refreezes); the index is the
     // indexed subset of the SAME bytes. Never ledgered (data, not capability).
     let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
@@ -397,7 +396,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // inclusion decision, not list membership: the 50-skill cap and the
     // 3000-byte index budget (first-fit, applied at prompt render) both
     // drop lines, and a receipt calling a dropped line indexed sends the
-    // author hunting for it (Greptile, twice). A zero cost is a line the
+    // author hunting for it. A zero cost is a line the
     // prompt does not carry.
     let included: std::collections::HashSet<String> =
         crate::prompt::skill_index_costs(project_root, &discovered_skills)
@@ -623,7 +622,7 @@ impl Registry {
         // Reverse scan: broken_tools accumulates global-tier files first and
         // project-tier files after, and when BOTH tiers' manifests for one
         // name are broken the project override is what actually withholds
-        // the tool, so it is the file to name (Greptile).
+        // the tool, so it is the file to name.
         let named = self
             .broken_tools
             .iter()
@@ -682,7 +681,7 @@ pub struct RegistryManifest {
     /// prompt: /context on a resumed session prices exactly these. Recorded
     /// here because re-deriving them by parsing the persisted prompt was an
     /// arms race against attacker-controlled bytes rendered into later
-    /// sections (Greptile, three rounds).
+    /// sections.
     #[serde(default)]
     pub memory_rows: Option<Vec<(String, usize)>>,
 }
@@ -789,12 +788,12 @@ impl Registry {
         // rescans and shows the CURRENT memory selection; keeping the older
         // suspend-time identities would make the first refreeze report an
         // offline replacement the prompt already shows as newly indexed and
-        // the old item as dropped (Greptile). memory_files stays None so the
+        // the old item as dropped. memory_files stays None so the
         // first refreeze establishes the fresh scan as the baseline with no
         // spurious delta. The row accounting survives on the frozen
         // channel: /context prices the rows of the freeze that WROTE the
         // persisted prompt, which is precisely what the manifest carries
-        // (Greptile).
+        //.
         registry.frozen_memory_rows = manifest.memory_rows.clone();
         registry
     }
@@ -1709,7 +1708,7 @@ mod tests {
 
     /// A collision whose WINNER falls past the skill cap must not be
     /// recorded as indexed: neither file made the prompt, and the receipt
-    /// wording branches on this flag (Greptile).
+    /// wording branches on this flag.
     #[test]
     fn a_collision_winner_past_the_cap_is_not_marked_indexed() {
         let dir = std::env::temp_dir().join(format!("omx-shadowcap-{}", uuid::Uuid::new_v4()));
@@ -1745,7 +1744,7 @@ mod tests {
     /// A collision winner inside the 50-skill list can still lose its LINE
     /// to the 3000-byte index budget (first-fit at render); the flag must
     /// follow the render's own inclusion decision, or the receipt claims an
-    /// index line the prompt does not carry (Greptile).
+    /// index line the prompt does not carry.
     #[test]
     fn a_collision_winner_past_the_byte_budget_is_not_marked_indexed() {
         let dir = std::env::temp_dir().join(format!("omx-shadowbb-{}", uuid::Uuid::new_v4()));
@@ -1792,7 +1791,7 @@ mod tests {
     /// A project definition taking a name MOOTS the losing tier's collision
     /// record: two global namesakes collide, the project override wins by
     /// precedence, and keeping the global record made the receipt call the
-    /// name unindexed while the project skill is active (Greptile).
+    /// name unindexed while the project skill is active.
     #[test]
     fn a_project_override_moots_a_global_collision_record() {
         let dir = std::env::temp_dir().join(format!("omx-shadowx-{}", uuid::Uuid::new_v4()));
@@ -1826,7 +1825,7 @@ mod tests {
     /// Three namesakes coalesce to ONE record: the final winner plus every
     /// path it displaced. Recording the intermediate winner as its own entry
     /// let the receipt call it cap-dropped while the final entry said the
-    /// name IS indexed, a contradiction about one name (Greptile).
+    /// name IS indexed, a contradiction about one name.
     #[test]
     fn three_namesakes_coalesce_to_the_final_winner() {
         let dir = std::env::temp_dir().join(format!("omx-shadow3-{}", uuid::Uuid::new_v4()));
@@ -1900,7 +1899,7 @@ mod tests {
 
     /// When BOTH tiers' manifests for one name are broken, the error names
     /// the project override, the file that actually withholds the tool,
-    /// not the global one that happened to be scanned first (Greptile).
+    /// not the global one that happened to be scanned first.
     #[tokio::test]
     async fn a_doubly_broken_name_is_linked_to_the_project_override() {
         let dir = std::env::temp_dir().join(format!("omx-f9p-{}", uuid::Uuid::new_v4()));

@@ -79,7 +79,7 @@ impl PromptBreakdown {
     /// the same freeze that wrote the prompt. They are
     /// deliberately NOT parsed back out of the prompt: filenames and other
     /// author-controlled bytes are rendered into later sections, so any
-    /// content-based reconstruction is forgeable (Greptile, three rounds);
+    /// content-based reconstruction is forgeable;
     /// and re-scanning disk would price TODAY'S selection rather than the
     /// lines the prefix actually pays for. A manifest predating the row
     /// field reads as version-absent and refreezes, so the channel is Some
@@ -145,7 +145,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // has no live memories so the zero-cost invariant holds.
     // Prefer the section captured in the registry's own freeze scan, so the
     // frozen prompt and the refreeze receipt describe the same memory
-    // selection (Greptile: two separate scans could diverge). The signal is
+    // selection (two separate scans could diverge). The signal is
     // `memory_scanned` - whether THIS registry ran a scan - not whether the
     // scan found anything: a freeze that scanned and found no memories
     // captures `memory_section = None`, and rescanning there would re-inject a
@@ -153,7 +153,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     // registry that never scanned (builtin-only, or restored from a manifest,
     // which keeps memory_files for the resume delta but captured no section)
     // scans fresh, or a resumed session would render no memory index at all
-    // (Greptile).
+    //.
     let memory = if registry.memory_scanned {
         registry.memory_section.clone()
     } else {
@@ -761,7 +761,7 @@ mod tests {
             .collect();
         omitted.sort_unstable();
         // Order-independent: SURFACES declaration order is not a contract
-        // here, only the SET of deliberate omissions is (Greptile).
+        // here, only the SET of deliberate omissions is.
         assert_eq!(
             omitted,
             ["recall", "settings", "usage"],
@@ -1003,7 +1003,7 @@ mod tests {
     /// filenames and user-authored AGENTS.md render into the same prompt, so
     /// any content-based parse is forgeable, including a forged run reusing
     /// a GENUINE stem after a newline-bearing filename spelled the section
-    /// header (Greptile, three escalations). The frozen channel prices the
+    /// header. The frozen channel prices the
     /// freeze's own rows whatever the prompt bytes say, and an empty channel
     /// prices nothing.
     #[test]
@@ -1057,7 +1057,7 @@ mod tests {
     /// Some(empty) and memory_section = None. A memory written AFTER that
     /// freeze must NOT enter the prompt - the frozen receipt reported no
     /// memory change, so injecting one would put the prompt and the receipt
-    /// back in disagreement for the empty case (Greptile). Only a registry
+    /// back in disagreement for the empty case. Only a registry
     /// that never scanned (builtin-only, from a manifest) falls back to a
     /// fresh scan.
     #[test]
@@ -1086,7 +1086,7 @@ mod tests {
     /// A manifest-restored registry keeps `memory_files` (for the resume
     /// delta) but never captured a `memory_section`, so `memory_scanned` is
     /// false and the prompt must scan fresh - otherwise a resumed session with
-    /// live memories renders no memory index at all (Greptile). Regenerating
+    /// live memories renders no memory index at all. Regenerating
     /// the prompt from such a registry must still show the memories on disk.
     #[test]
     fn a_manifest_restored_registry_rebuilds_the_memory_index() {

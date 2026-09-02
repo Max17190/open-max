@@ -474,7 +474,7 @@ async fn main() -> std::io::Result<()> {
                             // the footer prints an unqualified `restore with cp`
                             // recipe while this approval cannot be fully
                             // restored - same accounting the manifest path does
-                            // (Greptile).
+                            //.
                             damaged += n - stored;
                             let plural = if n == 1 { "" } else { "s" };
                             if stored == n {
@@ -491,13 +491,13 @@ async fn main() -> std::io::Result<()> {
                     // a legacy or hash-only approval can keep intact bound
                     // objects while its PRIMARY manifest bytes were never
                     // stored, so the row must not read as fully restorable
-                    // (Greptile). Checked from the full sha, not the short
+                    //. Checked from the full sha, not the short
                     // display form.
                     let manifest_note =
                         if open_max_core::ledger::approval_manifest_missing(&data_dir, &project, r) {
                             // Count it as damaged too, or the footer prints an
                             // unqualified `restore with cp` recipe while this
-                            // very approval cannot be fully restored (Greptile).
+                            // very approval cannot be fully restored.
                             damaged += 1;
                             "  (manifest bytes not stored: cannot restore the manifest)"
                         } else {
@@ -1705,7 +1705,7 @@ mod tests {
         // The parenthesized list after "--spec <surface>" is parsed and
         // compared as a SET against spec::SURFACES: a fixed window plus
         // substring checks could be masked by unrelated prose (settings.json)
-        // or defeated by a harmless reflow (Greptile).
+        // or defeated by a harmless reflow.
         let start = super::HELP.find("--spec <surface>").expect("--spec is documented");
         let open = super::HELP[start..].find('(').expect("the option lists its surfaces") + start;
         let close = super::HELP[open..].find(')').expect("the list closes") + open;

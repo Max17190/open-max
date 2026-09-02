@@ -234,18 +234,11 @@ fn report_hook_failures(
     }
 }
 
-/// A settings.json drift note, when the file moved outside this process's
-/// own writes. Settings are launch-frozen by design (base_url/api_key are
-/// credential routing, approval_mode hot-adoption would be self-approval),
-/// so an agent edit is inert for this process - and, unstated, that silence
-/// cost real detours. Valid new bytes: state the launch-read rule and what
-/// this session still runs. Invalid bytes: the brick warning (next launch
-/// exits 2), delivered while the author can still repair the file.
 /// Insert a turn-start harness note just before the pending user prompt AND
 /// emit it on the wire as a `HarnessNote`. The transcript half is what the
 /// MODEL reads; the wire half is what a custom or interactive frontend reads,
 /// so a protocol-v5 client can display the state change that affects the next
-/// turn instead of it being model-only (Greptile). The empty `call_id` marks
+/// turn instead of it being model-only. The empty `call_id` marks
 /// a note owned by no tool call, exactly as the policy-notice path does.
 fn insert_startup_note(
     core: &Arc<Core>,
@@ -265,6 +258,13 @@ fn insert_startup_note(
     core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
 }
 
+/// A settings.json drift note, when the file moved outside this process's
+/// own writes. Settings are launch-frozen by design (base_url/api_key are
+/// credential routing, approval_mode hot-adoption would be self-approval),
+/// so an agent edit is inert for this process - and, unstated, that silence
+/// cost real detours. Valid new bytes: state the launch-read rule and what
+/// this session still runs. Invalid bytes: the brick warning (next launch
+/// exits 2), delivered while the author can still repair the file.
 fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
     let changed = core.settings_disk_changed()?;
     Some(match changed {
@@ -293,12 +293,6 @@ fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
     })
 }
 
-/// Filter to policy notices this session has not yet narrated to the model,
-/// and mark them reported. Identity is the full notice text - it embeds the
-/// file path, which is the identity that matters - so a static problem notes
-/// once per session while a new or reworded one gets through. The UI channel
-/// (HookFailed events, per turn) is unchanged; this dedupe is only for the
-/// transcript, where repetition is token spend.
 /// The one canonical form of a policy notice. A notice is reported once per
 /// session, and that "already said it" set does not persist on its own: on
 /// resume it is rebuilt by parsing the notices back out of the transcript.
@@ -312,7 +306,7 @@ fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
 /// - `NOTICE_JOINER`, which separates the notices inside one note. Rehydration
 ///   splits on that literal, so a notice containing it was restored as
 ///   fragments whose hashes matched nothing, and the session said it again
-///   after every resume (Greptile). Collapsing it needs no escape/unescape
+///   after every resume. Collapsing it needs no escape/unescape
 ///   machinery on this path: the delimiter simply cannot occur in a value.
 ///
 /// Identity, persistence and display are all this one text, which is what
@@ -365,6 +359,12 @@ fn rehydrate_policy_notices(messages: &[ChatMessage]) -> HashSet<u64> {
     seen
 }
 
+/// Filter to policy notices this session has not yet narrated to the model,
+/// and mark them reported. Identity is the full notice text - it embeds the
+/// file path, which is the identity that matters - so a static problem notes
+/// once per session while a new or reworded one gets through. The UI channel
+/// (HookFailed events, per turn) is unchanged; this dedupe is only for the
+/// transcript, where repetition is token spend.
 async fn novel_policy_notices(
     core: &Arc<Core>,
     session_id: &str,
@@ -923,7 +923,7 @@ impl CompactionDigest {
     fn record_message(&mut self, msg: &ChatMessage) {
         self.message_count += 1;
         self.dropped.push(msg.clone());
-        // Cap by chars so a single tool-call-heavy assistant message cannot
+        // Cap by bytes so a single tool-call-heavy assistant message cannot
         // blow past the summary-request budget after the size check.
         let remaining = self.text_cap.saturating_sub(self.dropped_text.len());
         if remaining > 0 {
@@ -1085,13 +1085,14 @@ impl CompactionDigest {
     }
 }
 
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
+const MAX_SUMMARY_BYTES: usize = 1_200;
+
 /// One small completion against the session's own endpoint turns the dropped
 /// exchanges into a real summary; the heuristic digest note is the fallback
 /// whenever this returns None (error, timeout, cancel, or empty reply). One
 /// request per compaction, which is rare by construction (hysteresis prune).
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(25);
-const MAX_SUMMARY_BYTES: usize = 1_200;
-
+///
 /// `core` and `session_id` are taken only to bill this request: the
 /// summarizer is a real model call against the same endpoint, and a ledger
 /// that advertises what each request cost cannot quietly omit the one request
@@ -1405,12 +1406,6 @@ pub async fn reload_session(
     Ok((counts.0, counts.1, reload_receipt))
 }
 
-/// Force one compaction cycle now, outside any turn: prune to the same
-/// hysteresis target the budget path uses, settle everything a prune owes
-/// (archive, note, record, hook), and persist. The work runs off the
-/// caller's loop because the note upgrade is a real model request; the
-/// receipt arrives as a `Compacted` event, failures as `Error`. Claims the
-/// session exactly like a turn so the two can never interleave.
 /// The numbers one forced compaction reports. Built inside the guarded task,
 /// emitted by the wrapper only after the claim releases: the receipt is the
 /// frontend's cue to resume (queued prompts fire on it), so a receipt sent
@@ -1423,6 +1418,12 @@ struct CompactReceipt {
     context_tokens: usize,
 }
 
+/// Force one compaction cycle now, outside any turn: prune to the same
+/// hysteresis target the budget path uses, settle everything a prune owes
+/// (archive, note, record, hook), and persist. The work runs off the
+/// caller's loop because the note upgrade is a real model request; the
+/// receipt arrives as a `Compacted` event, failures as `Error`. Claims the
+/// session exactly like a turn so the two can never interleave.
 pub fn compact_session(
     core: &Arc<Core>,
     session_id: &str,
@@ -1641,11 +1642,6 @@ fn apply_freeze(
     sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
 }
 
-/// The self-modification loop closes here: at turn start, capture one immutable
-/// generation of extension bytes. If its fingerprint no longer matches the
-/// session's registry, activate that exact generation and rebuild the prompt in
-/// place. An unchanged generation preserves the prompt cache; a tool the agent
-/// wrote last turn is callable on this one without /new or /reload.
 /// Load a session into the in-memory map if this process has not seen it yet.
 /// Resuming with `-c` or `/resume` starts with an empty map, and the freeze
 /// check only inspects sessions it can find there.
@@ -1754,7 +1750,7 @@ fn refreeze_receipt_text(
                 } else {
                     // The winner itself fell past the skill cap: claiming it
                     // is indexed would send the author hunting for an index
-                    // line that does not exist (Greptile).
+                    // line that does not exist.
                     format!(
                         "'{name}' is declared by {declarers}; {} wins the name but the index has no room for its line (the skill cap or the byte budget; openmax --check names which), so no file of this name is indexed",
                         winner.display()
@@ -1891,7 +1887,7 @@ struct AddedTools {
     /// Removed external tools whose MANIFEST sha was approved but whose bound
     /// code no longer matches on disk (edited, or deleted alongside the
     /// manifest). The approval RECORD survives in the ledger, so omitting it as
-    /// if nothing survived is wrong (Greptile); yet the current disk bytes are
+    /// if nothing survived is wrong; yet the current disk bytes are
     /// not approved, so this must NOT claim they run without a card. Whether
     /// the original bytes can actually be restored depends on whether the
     /// approval stored objects (a legacy or hash-only approval did not), so the
@@ -1949,8 +1945,8 @@ fn classify_added_tools(
             // dropped over the manifest was called both "NOT loaded" and
             // "removed" in one receipt, and how a broken namesake shadowing a
             // deleted approved manifest still drew "identical bytes at that
-            // path would run", which the withheld name makes false (Greptile,
-            // twice). The receipt gets exactly ONE clause per absent name:
+            // path would run", which the withheld name makes false. The
+            // receipt gets exactly ONE clause per absent name:
             // - the capture read bytes at this path (edited broken, renamed,
             //   withheld by an override, or past the tool cap): the NOT-loaded
             //   clause, the New-tools clause, or the prompt's cap trailer
@@ -1980,7 +1976,7 @@ fn classify_added_tools(
             // fails covers_code. When it matches, restoring the identical
             // bytes runs without a card. When it does not, an approval still
             // SURVIVES in the ledger (restorable) - reporting it as gone hides
-            // that (Greptile) - but the current bytes are not approved, so the
+            // that - but the current bytes are not approved, so the
             // two facts are said in two different clauses.
             let code = crate::ledger::bound_code(&old_ext.command, &old_ext.args, project_root);
             if approvals.covers_code(&code) {
@@ -2034,6 +2030,11 @@ fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
         .collect()
 }
 
+/// The self-modification loop closes here: at turn start, capture one immutable
+/// generation of extension bytes. If its fingerprint no longer matches the
+/// session's registry, activate that exact generation and rebuild the prompt in
+/// place. An unchanged generation preserves the prompt cache; a tool the agent
+/// wrote last turn is callable on this one without /new or /reload.
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
@@ -2547,7 +2548,7 @@ async fn run_loop(
     // entirely ("input blocked: the capability ledger cannot be read...",
     // naming --ledger-repair), and the approvals cache that gate reads is
     // keyed on the log's content hash, so a rewrite cannot serve it a stale
-    // pass (Greptile: the old length-keyed cache could). The Result keeps
+    // pass (the old length-keyed cache could). The Result keeps
     // the API honest for callers that must not mistake "unreadable" for
     // "no activity".
     if let Ok(events) = crate::ledger::approval_events(&core.data_dir, project_root) {
@@ -3146,7 +3147,7 @@ async fn run_loop(
                             // If recording failed (e.g. the manifest changed
                             // while the card was open), the NEXT call asks
                             // again, so a "runs without a card" receipt would
-                            // lie (Greptile).
+                            // lie.
                             let recorded = match source {
                                 None => false,
                                 Some(source) => match crate::ledger::approve_capability_in_session(
@@ -3163,7 +3164,7 @@ async fn run_loop(
                                     // nothing, so `covers_code` stays false and
                                     // the NEXT call still stops for a card - a
                                     // "runs without a card" receipt would lie
-                                    // (Greptile). "Recorded" therefore means
+                                    //. "Recorded" therefore means
                                     // the grant now covers the exact bytes the
                                     // gate re-reads, not merely that a record
                                     // was written: re-run that gate and believe
@@ -3201,7 +3202,7 @@ async fn run_loop(
                                 // message the model reads AND the ToolEnd
                                 // event's output on the wire - so no separate
                                 // HarnessNote here, or a v5 frontend renders
-                                // the receipt twice (Greptile). The notes that
+                                // the receipt twice. The notes that
                                 // DO emit HarnessNote are appended after ToolEnd
                                 // has already gone out, so the wire needs them.
                                 let note = if recorded {
@@ -3352,7 +3353,7 @@ async fn run_loop(
                             // snapshot this turn may have explicitly DENIED
                             // one of them, and the most restrictive answer
                             // wins - so the receipt must not promise a
-                            // repair tool a rule already blocks (Greptile).
+                            // repair tool a rule already blocks.
                             // Probe every path spelling a repair call could
                             // use (an `arg_regex` matches the raw path
                             // argument): absolute, relative, and ./relative.
@@ -3762,7 +3763,7 @@ struct UnapprovedCapability {
     /// The env var NAMES the manifest forwards to the child (the #206 `env`
     /// allowlist). An approval grants the tool these secrets, so the card
     /// must disclose them - approving credential access you cannot see is
-    /// exactly what the content gate exists to prevent (Greptile security).
+    /// exactly what the content gate exists to prevent.
     env: Vec<String>,
     /// The manifest as the approval store keys it, for recording the grant.
     source_path: PathBuf,
@@ -3809,7 +3810,7 @@ fn unapproved_capability(
     shas.extend(code.into_iter().filter_map(|c| c.sha256));
     // Each argv token shell-quoted, so `a b`, an empty arg, or a value with
     // quotes/metacharacters keeps its boundary on the card - a space-joined
-    // line reads as a different or ambiguous invocation (Greptile security).
+    // line reads as a different or ambiguous invocation.
     let command_line = std::iter::once(&ext.command)
         .chain(ext.args.iter())
         .map(|a| crate::doctor::shell_quote(std::path::Path::new(a)))
@@ -3927,9 +3928,9 @@ async fn request_approval(
         // to a one-line detail did not make it un-hideable: the probe
         // evidence prepended after it, and the TUI prepends provenance before
         // clipping the line to the terminal width, so a narrow card dropped
-        // "receives env: …" while Allow stayed selectable (Greptile
-        // security). It rides the event as its own field and the frontend
-        // gives it a dedicated line the card never clips.
+        // "receives env: …" while Allow stayed selectable. It rides the event
+        // as its own field and the frontend gives it a dedicated line the
+        // card never clips.
         // Advisory evidence, prepended so card clipping cannot hide it: a
         // sandboxed probe of exactly these bytes passed. The receipt grants
         // nothing - approving still grants real host authority - and any
@@ -4427,7 +4428,7 @@ mod tests {
     /// identity on the SAME canonical text that gets persisted. Hashing the raw
     /// notice gave a control-character-bearing one (a permissions path is
     /// enough) one identity when first reported and another when restored, and
-    /// every resume showed it again (Greptile).
+    /// every resume showed it again.
     #[tokio::test]
     async fn a_policy_notice_keeps_one_identity_across_a_resume() {
         let dir = std::env::temp_dir().join(format!("openmax-pn-{}", uuid::Uuid::new_v4()));
@@ -5510,7 +5511,7 @@ mod tests {
     }
 
     /// A collision whose winner fell past the skill cap says so instead of
-    /// claiming an index line that does not exist (Greptile).
+    /// claiming an index line that does not exist.
     #[test]
     fn the_collision_clause_says_when_the_cap_dropped_the_winner() {
         let shadowed = vec![(
@@ -5672,7 +5673,7 @@ mod tests {
     /// must not ALSO be classified as a removed approved tool: two clauses
     /// calling the same path present-but-unreadable and gone contradict each
     /// other, and the removal clause's "identical bytes at that path would run"
-    /// is unactionable while a directory occupies the path (Greptile). The
+    /// is unactionable while a directory occupies the path. The
     /// capture's own observation - a broken entry at this path - wins.
     #[test]
     fn a_directory_at_the_manifest_path_is_broken_not_doubly_removed() {
@@ -5718,7 +5719,7 @@ mod tests {
     /// declares the same tool name. Restoring the approved bytes would NOT
     /// make the tool callable - the broken override withholds the name - so
     /// "Removed approved tools: X (identical bytes would run without a card)"
-    /// is a false promise (Greptile). The broken file's NOT-loaded clause is
+    /// is a false promise. The broken file's NOT-loaded clause is
     /// the one truthful explanation, and the match is on the DECLARED name
     /// (the broken file's stem differs here), the same key the withhold pass
     /// judges collisions on.
@@ -5876,7 +5877,7 @@ mod tests {
     /// as a broken entry so the receipt's "NOT loaded" clause names it; before
     /// that, the unreadable file was skipped entirely, and because the path is
     /// still a file on disk the removal clauses were suppressed too, so the
-    /// approved tool vanished with no explanation anywhere (Greptile).
+    /// approved tool vanished with no explanation anywhere.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_manifest_is_reported_broken_not_silently_vanished() {
@@ -7410,8 +7411,8 @@ mod tests {
 
         // A restart after a compaction dropped the exchange that carried the
         // note: the transcript on disk no longer has it, the archive does,
-        // and the resumed session still does not say it again (Greptile,
-        // twice: first the resume, then the resume after a prune). Simulated
+        // and the resumed session still does not say it again (first the
+        // resume, then the resume after a prune). Simulated
         // the way a prune lands on disk: the exchange appended to the archive,
         // the transcript rewritten without it.
         let mut on_disk = transcript(&core, id).await;
@@ -7467,7 +7468,7 @@ mod tests {
     /// was deleted). approve() can only bless the manifest hash; the missing
     /// script has no bytes to hash, so `covers_code` stays false and the NEXT
     /// call still stops for a card. The receipt must say exactly that, not
-    /// promise cardless future calls (Greptile): a "runs without a card"
+    /// promise cardless future calls: a "runs without a card"
     /// receipt teaches the model that revocation is broken, the same lesson
     /// the whole receipt exists to prevent.
     #[tokio::test]
@@ -7550,7 +7551,7 @@ mod tests {
     /// grant as THIS session's act (actor Session, session id set), not as an
     /// anonymous external one. Otherwise the turn-start reconciliation cannot
     /// exclude the session's own grant and tells the next turn its own card
-    /// approval was "activity outside this session" (Greptile).
+    /// approval was "activity outside this session".
     #[tokio::test]
     async fn a_card_approval_is_recorded_as_this_session() {
         use crate::state::Core;

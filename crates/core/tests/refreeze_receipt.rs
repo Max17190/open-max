@@ -517,7 +517,7 @@ async fn a_script_only_edit_announces_the_revocation_on_the_writing_call() {
 
 /// If the approval cannot be recorded (the manifest changed while the card
 /// was open), the receipt must NOT claim later calls run without a card -
-/// the next call asks again (Greptile). It says the recording failed.
+/// the next call asks again. It says the recording failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unrecordable_approval_does_not_claim_cardless_future_calls() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
@@ -605,7 +605,7 @@ async fn a_memory_write_refreezes_and_is_indexed_for_the_next_step() {
 }
 
 /// A memory file the prompt index REJECTS (bad stem) must not be claimed
-/// live. Greptile P1: memory_files listed every readable .md, so writing
+/// live. Before this fix, memory_files listed every readable .md, so writing
 /// `.openmax/memory/Invalid-Stem.md` refroze and told the model
 /// "Memory index indexed: Invalid-Stem" while the next prompt had no such
 /// entry. The receipt is now built from the indexed selection.
@@ -690,7 +690,7 @@ async fn removing_an_approved_tool_says_the_approval_outlives_it() {
 /// Deleting a tool whose SCRIPT was edited (manifest unchanged, but the
 /// bound code no longer matches what was approved) must NOT be classified
 /// as a removed-approved tool: the runtime gate would ask again, so the
-/// receipt cannot claim 'would run without a card' (Greptile).
+/// receipt cannot claim 'would run without a card'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_a_tool_with_edited_bound_code_is_not_called_approved() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
@@ -736,7 +736,7 @@ async fn removing_a_tool_with_edited_bound_code_is_not_called_approved() {
 /// the content-addressed objects, so the bytes are restorable. Recomputing
 /// bound_code after the script is gone makes covers_code fail, which used to
 /// drop the tool from the receipt entirely, hiding the surviving approval
-/// (Greptile). It is now named in a distinct clause that does not claim the
+///. It is now named in a distinct clause that does not claim the
 /// deleted bytes would run without another approval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval() {
@@ -784,7 +784,7 @@ async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval
         "deleted code cannot be called cardless-runnable: {content}"
     );
     // Restorability is qualified, not promised: a legacy or hash-only approval
-    // keeps the sha without storing objects, so the claim is "may" (Greptile).
+    // keeps the sha without storing objects, so the claim is "may".
     assert!(
         content.contains("may run without a card"),
         "the receipt must not overstate object restorability: {content}"
@@ -836,7 +836,7 @@ async fn a_harness_note_reaches_the_wire_for_a_broken_tool_write() {
 }
 /// A turn-start receipt reaches the WIRE as a harness_note, not only the model
 /// transcript: a protocol-v5 or interactive frontend must be able to display
-/// the state change that affects the next turn (Greptile). Proven through the
+/// the state change that affects the next turn. Proven through the
 /// out-of-session approval path - a human approving at another terminal
 /// between turns - which is one of the three turn-start notes that used to be
 /// transcript-only.

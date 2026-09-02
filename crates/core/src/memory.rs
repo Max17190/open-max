@@ -242,7 +242,7 @@ fn load_log(project_root: &Path) -> Vec<AccessRecord> {
 /// None if it has no describable first line. Kept separate from the directory
 /// walk so the fingerprint scan and the index scan can share ONE read of each
 /// file: two independent reads could otherwise freeze one generation of a
-/// file's index under another generation's fingerprint (Greptile).
+/// file's index under another generation's fingerprint.
 fn entry_from(
     name: &str,
     text: &str,
@@ -346,7 +346,7 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
 /// One read of the memory directory producing BOTH the fingerprint bytes and
 /// the index selection from the SAME bytes, so a file replaced between two
 /// separate scans can no longer freeze one generation's index under another
-/// generation's fingerprint (Greptile). The fingerprint set is every
+/// generation's fingerprint. The fingerprint set is every
 /// valid-named `.md` (a write to any refreezes); the index is the describable,
 /// unfaded, in-budget subset.
 pub struct MemoryFreeze {
@@ -359,7 +359,7 @@ pub struct MemoryFreeze {
 /// in-place write to the inode can replace the bytes between reading the mtime
 /// and the body (either order), pairing one generation's content with
 /// another's timestamp. Read mtime, then bytes, then mtime again; if it moved,
-/// the file changed mid-read - retry so the pair always matches (Greptile).
+/// the file changed mid-read - retry so the pair always matches.
 /// Bounded: on persistent churn the last read is self-consistent bytes with
 /// the mtime observed immediately after them.
 fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)> {
@@ -375,7 +375,7 @@ fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)
     }
     // The file is being rewritten faster than it can be read coherently
     // (pathological sub-read churn): SKIP it this freeze rather than return an
-    // incoherent body/mtime pair (Greptile). It re-enters the fingerprint and
+    // incoherent body/mtime pair. It re-enters the fingerprint and
     // the index on the next freeze once writes settle - and because it was
     // absent from this fingerprint, that settling changes the fingerprint and
     // triggers the refreeze that indexes it.
@@ -403,7 +403,7 @@ pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
         // fingerprint (which hashes the bytes) and the index scoring (which
         // uses the mtime) can never be captured from two different generations
         // - a rename OR an in-place rewrite during the read would otherwise
-        // pair one generation's bytes with another's mtime (Greptile).
+        // pair one generation's bytes with another's mtime.
         let Some((bytes, mtime)) = read_coherent(&path) else { continue };
         // The SAME bytes feed the fingerprint and the index: a describable,
         // UTF-8 file also enters the index; every valid-named file counts
@@ -444,7 +444,7 @@ pub fn indexed_identities(project_root: &Path, now: u64) -> Vec<(String, u64)> {
 /// One scan producing BOTH the rendered index section (for the frozen prompt)
 /// AND the receipt identities (for the refreeze receipt), so the two can
 /// never disagree - a memory changed between two separate scans could make
-/// the receipt claim a fact live that the next prompt then omits (Greptile).
+/// the receipt claim a fact live that the next prompt then omits.
 /// (rendered index section, per-name byte breakdown) or None when empty.
 pub type IndexSection = Option<(String, Vec<(String, usize)>)>;
 
@@ -595,7 +595,7 @@ mod tests {
     /// freeze_snapshot reads each memory file ONCE, so the fingerprint set
     /// and the index it returns describe the same generation of every file -
     /// two separate scans could freeze one generation's index under another's
-    /// fingerprint (Greptile). A describable file is in both outputs; a
+    /// fingerprint. A describable file is in both outputs; a
     /// valid-named file with no describable first line counts toward the
     /// fingerprint (a write to it still refreezes) but not the index.
     #[test]

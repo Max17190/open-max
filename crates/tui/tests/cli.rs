@@ -1268,7 +1268,7 @@ fn a_new_session_reuses_the_previous_session_prefix() {
     );
 }
 
-/// Greptile's repro: a session launched under an attested shell must not
+/// A session launched under an attested shell must not
 /// hand its bash children a bypass. The child unsets the marker; the
 /// attestation must already be gone; --approve refuses for lack of a
 /// terminal.

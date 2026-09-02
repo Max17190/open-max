@@ -4028,7 +4028,7 @@ mod tests {
 
     /// settings.json is launch-read and fail-closed, so --check must name a
     /// file that will refuse the next launch - it is how the drift receipt's
-    /// "fix it now" gets confirmed. Dogfooding found the gap: a bricking file
+    /// "fix it now" gets confirmed. The gap this pins: a bricking file
     /// got a silent exit 0 from --check while -p exited 2 on it.
     #[test]
     fn check_names_a_settings_file_that_would_brick_the_next_launch() {
