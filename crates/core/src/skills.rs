@@ -388,9 +388,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A description written as a YAML block scalar (the multi-line spelling
-    /// third-party skill packages ship) folds to one index line. Reading the
-    /// header alone indexed such a skill as `>`, a line that says nothing.
     /// A PLAIN scalar that wraps is ordinary YAML, and every standard
     /// consumer folds it into one string. Reading only the first line
     /// indexed a description the file does not state, and the index line is
@@ -442,6 +439,9 @@ mod tests {
         assert_eq!(single.description, "just one line");
     }
 
+    /// A description written as a YAML block scalar (the multi-line spelling
+    /// third-party skill packages ship) folds to one index line. Reading the
+    /// header alone indexed such a skill as `>`, a line that says nothing.
     #[test]
     fn block_scalar_descriptions_fold_to_one_line() {
         let folded = "name: stack\ndescription: >\n  Manages stacked branches.\n  Use for stack creation, sync, or merge;\n\n  whenever a stack is checked out.\nmetadata:\n  author: someone\n  version: \"0.1.0\"";
