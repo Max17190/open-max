@@ -37,11 +37,16 @@ libc = "0.2"
 # `dist generate`, with ONE hand-edit: the "Install dist" step fetches the
 # upstream installer, checks it against a pinned sha256, and only then runs it,
 # because that job holds `contents: write` and its `dist` binary is what
-# publishes the release. Regenerating drops that step. After any
-# `dist generate`, re-apply it and re-pin the hash whenever the version below
-# changes.
+# publishes the release.
+#
+# `allow-dirty = ["ci"]` is what lets that edit survive: without it `dist plan`
+# fails the job because the checked-in workflow no longer matches what it would
+# generate. The cost is that dist will no longer update the workflow for us, so
+# bumping cargo-dist-version below means regenerating by hand, re-applying the
+# verification step, and re-pinning its hash in the same commit.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
+allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell"]
 targets = [
