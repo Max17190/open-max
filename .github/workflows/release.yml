@@ -146,7 +146,26 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        # LOCAL EDIT, not generated; see the note on the same step in `plan`.
+        #
+        # These are the jobs that BUILD the shipped binaries, so this is the
+        # install that matters most. `plan`'s verified `dist` cannot be reused
+        # here: it is cached as a Linux x86_64 binary and these jobs run on
+        # macOS and arm64 too. Every matrix entry resolves `install_dist.run`
+        # to this same platform-detecting script, so it is fetched and verified
+        # here exactly as in `plan` rather than piped straight into `sh`.
+        # A future target needing a different install method would have to
+        # revisit this, since the generated matrix value is no longer used.
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh \
+            -o cargo-dist-installer.sh
+          echo "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5  cargo-dist-installer.sh" \
+            | shasum -a 256 --check --strict -
+          sh cargo-dist-installer.sh
+          rm -f cargo-dist-installer.sh
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
