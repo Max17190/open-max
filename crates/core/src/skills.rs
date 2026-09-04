@@ -174,7 +174,49 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
             }
             descriptions.push(crate::text::one_line(&parts.join(" ")));
         } else {
-            descriptions.push(crate::text::one_line(value.trim_matches('"')));
+            // A PLAIN scalar folds its continuation lines too: YAML joins any
+            // following run that is indented deeper than the key, and every
+            // standard consumer reads the whole thing. Taking only the first
+            // line silently indexed a different description than the file
+            // states, and the index line is what a model reads to decide
+            // whether to open the skill at all. The run ends at the first
+            // non-blank line no deeper than the key, so a sibling key never
+            // joins the value. A quoted value is a single token by
+            // definition and takes no continuation.
+            let raw = value.trim_matches('"');
+            // A quoted value is one token by definition. A value that OPENS
+            // like a block-scalar header but is not a legal one (`>0`, a zero
+            // indent digit) stays literal and takes no continuation either:
+            // folding there would silently rescue a malformed header instead
+            // of leaving it visibly wrong.
+            let literal = value.starts_with('"')
+                || value.starts_with('\'')
+                || value.starts_with('>')
+                || value.starts_with('|');
+            let mut parts: Vec<&str> = vec![raw];
+            if !literal {
+                while i < lines.len() {
+                    let next = lines[i];
+                    // A blank line inside a plain scalar is a fold, not an
+                    // end: YAML keeps reading while the following lines stay
+                    // deeper than the key. Breaking here dropped everything
+                    // after the first blank, which is the same truncation
+                    // this change exists to remove, one paragraph in. The
+                    // block-scalar branch above already skips blanks; these
+                    // two loops answer the same question and must agree.
+                    if next.trim().is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    let next_indent = next.len() - next.trim_start().len();
+                    if next_indent <= indent {
+                        break;
+                    }
+                    parts.push(next.trim());
+                    i += 1;
+                }
+            }
+            descriptions.push(crate::text::one_line(&parts.join(" ")));
         }
     }
     descriptions
@@ -344,6 +386,57 @@ mod tests {
         assert_eq!(names, sorted, "must be sorted for deterministic prompts");
         assert!(skills[0].description.chars().count() <= MAX_SKILL_DESC_CHARS + 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A PLAIN scalar that wraps is ordinary YAML, and every standard
+    /// consumer folds it into one string. Reading only the first line
+    /// indexed a description the file does not state, and the index line is
+    /// the whole of what a model sees before deciding whether to open the
+    /// skill - so the harness advertised a capability by a truncated
+    /// sentence while `--check` called the file healthy.
+    #[test]
+    fn a_wrapped_plain_description_is_read_whole() {
+        let text = "---\nname: n\ndescription: this description continues\n  onto a second line and a\n  third, which YAML folds\n---\nbody\n";
+        let spec = parse_skill_source(Path::new("SKILL.md"), text).unwrap();
+        assert_eq!(
+            spec.description,
+            "this description continues onto a second line and a third, which YAML folds"
+        );
+
+        // A sibling key at the key's own depth ends the value; it never folds
+        // in, so the description cannot swallow the rest of the frontmatter.
+        let sibling = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: n\ndescription: one\n  two\ntags: x\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(sibling.description, "one two");
+        assert_eq!(sibling.name, "n");
+
+        // A blank line between continuation lines is a fold, not an end.
+        let blanked = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: n\ndescription: first para\n  still first\n\n  second para\ntags: x\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(blanked.description, "first para still first second para");
+
+        // ...but a blank followed by a sibling key still ends the value.
+        let ended = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: n\ndescription: only this\n\ntags: x\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(ended.description, "only this");
+        assert_eq!(ended.name, "n");
+
+        // A single-line description is unchanged.
+        let single = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: n\ndescription: just one line\ntags: x\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(single.description, "just one line");
     }
 
     /// A description written as a YAML block scalar (the multi-line spelling
