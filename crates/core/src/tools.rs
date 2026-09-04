@@ -1023,11 +1023,36 @@ async fn bash_tool(
                     true => (true, text),
                     false => (false, format!("{}\n{text}", describe_exit(status))),
                 };
+                // A backgrounded server dies with the call and the exit status
+                // is still 0, so without this the next step is a request to a
+                // port nothing is listening on.
+                let text = match output.background_terminated {
+                    true => format!("{text}\n{BACKGROUND_TERMINATED_NOTE}"),
+                    false => text,
+                };
                 ToolOutcome::from_process(ok, text, &output, truncated)
             }
         },
     }
 }
+
+/// Each bash call runs in its own process group, and the group is terminated
+/// when the call returns, so a backgrounded process does not outlive it. The
+/// exit status is still the shell's, which means a caller that started a server
+/// sees success and an absent server, with nothing connecting the two.
+///
+/// `setsid` is named as a conditional, not a recipe: it is util-linux and does
+/// not exist on macOS, where the harness also runs. A named tmux session is the
+/// answer that holds on both, and is what this project already documents for
+/// durable background work.
+pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
+    "[openmax: this command left running background processes, and they were ",
+    "terminated when it returned. Every bash call runs in its own process group ",
+    "and that group is cleaned up on exit, so `&`, `nohup` and `disown` do not ",
+    "survive the call. To keep something running, start it in a named tmux ",
+    "session you can inspect and reattach, or, on Linux only, detach it from the ",
+    "group with `setsid`.]"
+);
 
 /// Describe a non-success exit honestly. A signal kill has no exit code, and
 /// the former "exit code -1" pointed diagnosis at a code nothing returned;
@@ -1253,6 +1278,9 @@ mod tests {
             stderr,
             log_path,
             log_truncated,
+            // This helper builds outputs for rendering tests; none of them
+            // background anything.
+            background_terminated: false,
         }
     }
 
@@ -1399,6 +1427,55 @@ mod tests {
         );
         assert!(out.output.contains("about-to-die"), "output before the kill survives: {}", out.output);
         assert!(!out.output.contains("exit code"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A backgrounded process does not outlive the call that started it: the
+    /// process group is cleaned up on exit while the exit status stays the
+    /// shell's zero. A caller that started a server was handed success and no
+    /// server, with nothing in the result connecting the two, so it retried and
+    /// then reported success against a port nothing was listening on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminated_background_process_is_reported() {
+        let root = temp_project();
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "sleep 30 & echo started"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        // The command succeeded. That is precisely why the note has to exist:
+        // success is what the caller would otherwise act on.
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("started"), "{}", out.output);
+        assert!(
+            out.output.contains("were terminated when it returned"),
+            "a killed background process must be reported: {}",
+            out.output
+        );
+        // The escape it names has to exist on this platform; `setsid` is
+        // util-linux and absent on macOS, so tmux is the one always offered.
+        assert!(out.output.contains("tmux"), "{}", out.output);
+
+        // A command that leaves nothing behind says nothing, or the note
+        // becomes noise on every call and stops being read.
+        let plain = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "echo plain"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(plain.ok, "{}", plain.output);
+        assert!(
+            !plain.output.contains("were terminated when it returned"),
+            "no background children, no note: {}",
+            plain.output
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
