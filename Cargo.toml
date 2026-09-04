@@ -32,6 +32,14 @@ libc = "0.2"
 # `v<version>` builds every target below and publishes them to a GitHub Release
 # with a shell installer. Unix only: the harness has 32 `cfg(unix)` blocks and
 # no Windows implementation, so no Windows target or PowerShell installer.
+#
+# `.github/workflows/release.yml` is generated from this config by
+# `dist generate`, with ONE hand-edit: the "Install dist" step fetches the
+# upstream installer, checks it against a pinned sha256, and only then runs it,
+# because that job holds `contents: write` and its `dist` binary is what
+# publishes the release. Regenerating drops that step. After any
+# `dist generate`, re-apply it and re-pin the hash whenever the version below
+# changes.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"

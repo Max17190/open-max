@@ -61,10 +61,28 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # LOCAL EDIT, not generated. `dist generate` rewrites this file and
+        # restores the upstream one-line `curl | sh`; re-apply this step after
+        # regenerating (Cargo.toml's dist config carries the same note).
+        #
+        # This job holds `contents: write`, and the `dist` binary produced here
+        # is cached and restored by the jobs that upload artifacts and create
+        # the GitHub Release. Piping an unverified remote script into `sh`
+        # therefore puts release-publishing authority behind whatever that URL
+        # serves at the time. Upstream publishes no checksum for the installer
+        # script, so the hash below is pinned here: fetch, verify, then run, and
+        # fail closed if the asset ever changes under the tag. Re-pin it in the
+        # same commit that bumps cargo-dist-version.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh \
+            -o cargo-dist-installer.sh
+          echo "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5  cargo-dist-installer.sh" \
+            | sha256sum --check --strict -
+          sh cargo-dist-installer.sh
+          rm -f cargo-dist-installer.sh
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
