@@ -269,9 +269,19 @@ pub fn tool_schemas() -> &'static Value {
     })
 }
 
-/// Resolve a model-supplied relative path, refusing escapes from the project root.
+/// Resolve a model-supplied path, refusing escapes from the project root.
+///
+/// A ROOT-ABSOLUTE path names itself, not a path relative to the root.
+/// Stripping its leading `/` re-rooted it: under root `/app`, `/app/x` became
+/// `/app/app/x`, and the call still reported success, so `read_file` said "No
+/// such file" for a file that existed and `write_file` landed bytes at a path
+/// the model never named. `Path::join` already does the right thing here (an
+/// absolute argument replaces the root), and the escape check below is what
+/// decides the path is allowed: absolute paths under the root resolve to
+/// themselves, and one outside is refused as an escape instead of being
+/// silently rewritten into the project.
 fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let rel = rel.trim().trim_start_matches('/');
+    let rel = rel.trim();
     let joined = if rel.is_empty() || rel == "." { root.to_path_buf() } else { root.join(rel) };
     // Canonicalize the deepest existing ancestor so traversal via `..` is caught
     // even for paths that don't exist yet (e.g. write_file targets).
@@ -711,7 +721,12 @@ fn touches_git(rel: &Path) -> bool {
 /// Model-issued patterns routinely arrive scoped `./like/this` or
 /// `/like/this`. Matching runs against root-relative paths, so either prefix
 /// makes a pattern that can never match anything; both mean
-/// project-root-relative here, exactly as `resolve()` reads path arguments.
+/// project-root-relative here.
+///
+/// This is deliberately NOT what `resolve()` does with a path argument. A glob
+/// is matched against root-relative candidates, so there is no such thing as an
+/// absolute pattern to honor, while a root-absolute path argument names a real
+/// location and resolves to itself.
 fn normalize_pattern(pattern: &str) -> &str {
     let mut p = pattern;
     loop {
@@ -1419,6 +1434,44 @@ mod tests {
         assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
         assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");
         assert!(!out.output.contains("noise line 1 "), "head should be dropped");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A root-absolute path names itself. Stripping its leading `/` joined it
+    /// to the root a second time, so under root `/app` the path `/app/x`
+    /// became `/app/app/x` while the call still reported success: bytes landed
+    /// where the model never named them, and reading back the path it did name
+    /// said the file was missing.
+    #[test]
+    fn a_root_absolute_path_resolves_to_itself() {
+        let root = std::env::temp_dir().join(format!("openmax-abs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let abs = root.join("eigen.py");
+        let abs_str = abs.to_str().unwrap().to_string();
+
+        let wrote = write_file(&root, &json!({"path": abs_str, "content": "print(1)\n"}));
+        assert!(wrote.ok, "{}", wrote.output);
+        assert!(abs.exists(), "write must land at the path the model named: {abs_str}");
+        // The re-rooted twin is what the old code produced; it must not exist.
+        let re_rooted = root.join(abs_str.trim_start_matches('/'));
+        assert!(!re_rooted.exists(), "path was re-rooted to {}", re_rooted.display());
+
+        let read = read_file(&root, &json!({"path": abs_str}));
+        assert!(read.ok, "{}", read.output);
+        assert!(read.output.contains("print(1)"), "{}", read.output);
+
+        // An absolute path outside the root is still refused, and refused as an
+        // escape rather than quietly rewritten into the project.
+        let outside = read_file(&root, &json!({"path": "/etc/hosts"}));
+        assert!(!outside.ok, "reading outside the root must fail: {}", outside.output);
+        assert!(
+            outside.output.contains("escapes the project root"),
+            "{}",
+            outside.output
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
