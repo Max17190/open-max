@@ -50,7 +50,33 @@ These are deliberate boundaries, not placeholders for hidden orchestration produ
 
 ## Install
 
-**Requirements:** [Rust](https://rustup.rs).
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Max17190/open-max/releases/latest/download/open-max-tui-installer.sh | sh
+```
+
+That is the whole install. No Rust toolchain, no build: the script picks the
+right prebuilt binary for your machine, checks it against the published
+SHA-256 (skipped, with a message, on a system with no `sha256sum`), and puts
+`openmax` in `~/.openmax/bin` next to the settings and sessions the harness
+already keeps there. It adds that directory to your `PATH` through your shell
+profile, so open a new shell (or `source ~/.openmax/bin/env`) and run `openmax`.
+
+macOS and Linux, x86_64 and arm64. Linux gets a glibc build, or a static musl
+build automatically when glibc is older than 2.31, so it also runs on Alpine and
+inside slim containers. Windows is not supported.
+
+Pass `--no-modify-path` to leave your `PATH` alone, or set
+`OPEN_MAX_TUI_INSTALL_DIR` to install somewhere else:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Max17190/open-max/releases/latest/download/open-max-tui-installer.sh | sh -s -- --no-modify-path
+```
+
+Every [release](https://github.com/Max17190/open-max/releases) also carries the
+plain tarballs and a `sha256.sum`, so you can download and verify by hand
+instead of piping a script into a shell.
+
+**From source** instead, which needs [Rust](https://rustup.rs):
 
 ```sh
 git clone https://github.com/Max17190/open-max.git
@@ -58,7 +84,7 @@ cd open-max
 cargo install --path crates/tui --locked
 ```
 
-Or run from source with `cargo run --release -p open-max-tui`.
+Or run it in place with `cargo run --release -p open-max-tui`.
 
 ## Configure
 

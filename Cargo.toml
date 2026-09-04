@@ -28,6 +28,41 @@ sha2 = "0.10"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 libc = "0.2"
 
+# Prebuilt binaries, so installing does not require a Rust toolchain. Tagging
+# `v<version>` builds every target below and publishes them to a GitHub Release
+# with a shell installer. Unix only: the harness has 32 `cfg(unix)` blocks and
+# no Windows implementation, so no Windows target or PowerShell installer.
+#
+# `.github/workflows/release.yml` is generated from this config by
+# `dist generate`, with ONE hand-edit: the "Install dist" step fetches the
+# upstream installer, checks it against a pinned sha256, and only then runs it,
+# because that job holds `contents: write` and its `dist` binary is what
+# publishes the release.
+#
+# `allow-dirty = ["ci"]` is what lets that edit survive: without it `dist plan`
+# fails the job because the checked-in workflow no longer matches what it would
+# generate. The cost is that dist will no longer update the workflow for us, so
+# bumping cargo-dist-version below means regenerating by hand, re-applying the
+# verification step, and re-pinning its hash in the same commit.
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+allow-dirty = ["ci"]
+ci = "github"
+installers = ["shell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+# The harness already owns ~/.openmax for settings and sessions, so the binary
+# lands beside them and uninstalling is removing one directory. Installing into
+# ~/.cargo/bin would fake a Rust install on a machine that needs no Rust.
+install-path = "~/.openmax/bin"
+install-updater = false
+
 # Lean, fast binaries: thin LTO and symbol stripping keep the harness tiny so
 # the model gets the machine.
 [profile.release]
@@ -35,3 +70,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 opt-level = "s"
+
+# cargo-dist builds with `--profile dist`. Inherit release so a published binary
+# carries the same thin LTO, one codegen unit, stripped symbols and size
+# optimization the CI size gate measures, rather than a second, untuned shape.
+[profile.dist]
+inherits = "release"
