@@ -59,7 +59,7 @@ brew install Max17190/tap/openmax
 Or without Homebrew:
 
 ```sh
-curl -fsSL https://github.com/Max17190/open-max/releases/latest/download/openmax-installer.sh | sh
+curl -fsSL https://useopenmax.dev/install.sh | sh
 ```
 
 Either way there is no Rust toolchain and no build. The script picks the right
@@ -77,8 +77,11 @@ Pass `--no-modify-path` to leave your `PATH` alone, or set
 `OPENMAX_INSTALL_DIR` to install somewhere else:
 
 ```sh
-curl -fsSL https://github.com/Max17190/open-max/releases/latest/download/openmax-installer.sh | sh -s -- --no-modify-path
+curl -fsSL https://useopenmax.dev/install.sh | sh -s -- --no-modify-path
 ```
+
+`useopenmax.dev/install.sh` redirects to the current release's installer, so it
+follows new releases without the link changing.
 
 Every [release](https://github.com/Max17190/open-max/releases) also carries the
 plain tarballs and a `sha256.sum`, so you can download and verify by hand
