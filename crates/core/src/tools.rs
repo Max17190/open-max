@@ -1018,7 +1018,16 @@ async fn bash_tool(
                 )
             }
             Termination::Exited(status) => {
-                let (text, truncated) = render_process_output(&output, caps.command_bytes);
+                // The note is the harness speaking, not captured output, but it
+                // still has to fit the caller's cap, which `max_output_bytes`
+                // can set as low as 1000 bytes. Reserve its length instead of
+                // letting a fixed annotation push the result past the limit.
+                let reserved = match output.background_terminated {
+                    true => BACKGROUND_TERMINATED_NOTE.len() + 1,
+                    false => 0,
+                };
+                let budget = caps.command_bytes.saturating_sub(reserved).max(1);
+                let (text, truncated) = render_process_output(&output, budget);
                 let (ok, text) = match status.success() {
                     true => (true, text),
                     false => (false, format!("{}\n{text}", describe_exit(status))),
@@ -1459,6 +1468,31 @@ mod tests {
         // The escape it names has to exist on this platform; `setsid` is
         // util-linux and absent on macOS, so tmux is the one always offered.
         assert!(out.output.contains("tmux"), "{}", out.output);
+
+        // The note is reserved out of the cap, not added on top of it: a small
+        // `max_output_bytes` must still bound the whole result.
+        let tight = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
+            OutputCaps { command_bytes: 1_000 },
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(
+            tight.output.contains("were terminated when it returned"),
+            "{}",
+            tight.output
+        );
+        // `render_process_output` adds its own truncation notice outside
+        // max_bytes by design, so the cap was never an exact total; what this
+        // pins is that OUR note is carved out of the budget rather than added
+        // on top of it. Without the reservation this lands near 1_600.
+        assert!(
+            tight.output.len() <= 1_300,
+            "note must be reserved from the cap, not appended past it: {} bytes",
+            tight.output.len()
+        );
 
         // A command that leaves nothing behind says nothing, or the note
         // becomes noise on every call and stops being read.
