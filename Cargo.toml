@@ -8,6 +8,9 @@ edition = "2021"
 license = "MIT"
 authors = ["Open Max contributors"]
 repository = "https://github.com/Max17190/open-max"
+# `homepage` and each package's `description` are what the generated Homebrew
+# formula shows; without them the formula is anonymous.
+homepage = "https://github.com/Max17190/open-max"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -46,9 +49,16 @@ libc = "0.2"
 # verification step, and re-pinning its hash in the same commit.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
-allow-dirty = ["ci"]
 ci = "github"
-installers = ["shell"]
+installers = ["shell", "homebrew"]
+# Homebrew's core tap does not accept third-party prebuilt binaries, so the
+# formula goes to a tap we own. `publish-jobs` is what actually pushes it on a
+# tagged release; without it the formula is only a release asset and the tap
+# stays empty. The push needs a HOMEBREW_TAP_TOKEN secret, because the
+# workflow's own GITHUB_TOKEN cannot write to another repository.
+tap = "Max17190/homebrew-tap"
+publish-jobs = ["homebrew"]
+allow-dirty = ["ci"]
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",

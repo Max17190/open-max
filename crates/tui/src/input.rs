@@ -1799,7 +1799,7 @@ mod tests {
 
     /// Insertion cost of a paste, the case the segment splice in
     /// `insert_str` exists for. Not a correctness test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_paste
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_paste
     #[test]
     #[ignore]
     fn measure_paste_cost() {
@@ -1821,7 +1821,7 @@ mod tests {
 
     /// Wrap cost for a draft the size of a real paste. Not a correctness
     /// test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_wrap
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_wrap
     #[test]
     #[ignore]
     fn measure_wrap_cost_per_frame() {

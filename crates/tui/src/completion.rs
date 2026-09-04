@@ -768,7 +768,7 @@ mod tests {
     }
 
     /// Popup filter cost at index scale. Not a correctness test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_file_filter
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_file_filter
     #[test]
     #[ignore]
     fn measure_file_filter_cost_per_keystroke() {

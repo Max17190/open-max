@@ -5721,7 +5721,7 @@ mod tests {
     /// already set from prior paints, replay pushes every persisted message
     /// through the incremental append path, then one frame paints. Not a
     /// correctness test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_replay
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_replay
     #[test]
     #[ignore]
     fn measure_replay_cost() {

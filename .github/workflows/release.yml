@@ -66,13 +66,12 @@ jobs:
         # regenerating (Cargo.toml's dist config carries the same note).
         #
         # This job holds `contents: write`, and the `dist` binary produced here
-        # is cached and restored by the jobs that upload artifacts and create
-        # the GitHub Release. Piping an unverified remote script into `sh`
-        # therefore puts release-publishing authority behind whatever that URL
-        # serves at the time. Upstream publishes no checksum for the installer
-        # script, so the hash below is pinned here: fetch, verify, then run, and
-        # fail closed if the asset ever changes under the tag. Re-pin it in the
-        # same commit that bumps cargo-dist-version.
+        # is cached and restored by the jobs that create the GitHub Release, so
+        # piping an unverified remote script into `sh` puts release-publishing
+        # authority behind whatever that URL serves. Upstream publishes no
+        # checksum for the installer script, so the hash is pinned here: fetch,
+        # verify, then run, and fail closed if the asset changes under the tag.
+        # Re-pin it in the same commit that bumps cargo-dist-version.
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +79,7 @@ jobs:
             https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh \
             -o cargo-dist-installer.sh
           echo "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5  cargo-dist-installer.sh" \
-            | sha256sum --check --strict -
+            | shasum -a 256 --check --strict -
           sh cargo-dist-installer.sh
           rm -f cargo-dist-installer.sh
       - name: Cache dist
@@ -148,14 +147,11 @@ jobs:
       - name: Install dist
         # LOCAL EDIT, not generated; see the note on the same step in `plan`.
         #
-        # These are the jobs that BUILD the shipped binaries, so this is the
-        # install that matters most. `plan`'s verified `dist` cannot be reused
-        # here: it is cached as a Linux x86_64 binary and these jobs run on
-        # macOS and arm64 too. Every matrix entry resolves `install_dist.run`
-        # to this same platform-detecting script, so it is fetched and verified
-        # here exactly as in `plan` rather than piped straight into `sh`.
-        # A future target needing a different install method would have to
-        # revisit this, since the generated matrix value is no longer used.
+        # These jobs BUILD the shipped binaries, so this is the install that
+        # matters most. `plan`'s verified `dist` cannot be reused: it is cached
+        # as a Linux x86_64 binary and these jobs also run on macOS and arm64.
+        # Every matrix entry resolves `install_dist.run` to this same
+        # platform-detecting script, so it is verified here instead.
         shell: bash
         run: |
           set -euo pipefail
@@ -315,14 +311,61 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  publish-homebrew-formula:
+    needs:
+      - plan
+      - host
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ needs.plan.outputs.val }}
+      GITHUB_USER: "axo bot"
+      GITHUB_EMAIL: "admin+bot@axo.dev"
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          repository: "Max17190/homebrew-tap"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      # So we have access to the formula
+      - name: Fetch homebrew formulae
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+      # This is extra complex because you can make your Formula name not match your app name
+      # so we need to find releases with a *.rb file, and publish with that filename.
+      - name: Commit formula files
+        run: |
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            name=$(echo "$filename" | sed "s/\.rb$//")
+            version=$(echo "$release" | jq .app_version --raw-output)
+
+            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+            brew update
+            # We avoid reformatting user-provided data such as the app description and homepage.
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+
+            git add "Formula/${filename}"
+            git commit -m "${name} ${version}"
+          done
+          git push
+
   announce:
     needs:
       - plan
       - host
+      - publish-homebrew-formula
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

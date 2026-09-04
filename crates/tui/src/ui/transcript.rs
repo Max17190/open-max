@@ -1990,7 +1990,7 @@ mod tests {
     // Release-only diagnostic for the synchronous resize path. It is ignored
     // in normal CI because elapsed-time assertions are machine-dependent.
     // Run with:
-    //   cargo test -p open-max-tui --release -- --ignored --nocapture measure_transcript_resize
+    //   cargo test -p openmax --release -- --ignored --nocapture measure_transcript_resize
     #[test]
     #[ignore]
     fn measure_transcript_resize_cost() {
@@ -2184,7 +2184,7 @@ mod tests {
     }
 
     /// Find keystroke cost at session scale. Not a correctness test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_find
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_find
     #[test]
     #[ignore]
     fn measure_find_filter_cost() {
@@ -2246,7 +2246,7 @@ mod tests {
     /// The whole find keystroke at marathon scale: the filter scan plus the
     /// previews the popup rebuilds for its visible rows on every new query.
     /// Not a correctness test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_find_keystroke
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_find_keystroke
     #[test]
     #[ignore]
     fn measure_find_keystroke_cost_at_scale() {
@@ -2651,7 +2651,7 @@ mod tests {
 
     /// Fold-toggle, resize, and append cost at session scale. Not a
     /// correctness test; run with:
-    ///   cargo test -p open-max-tui --bin openmax --release -- --ignored --nocapture measure_fold
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_fold
     #[test]
     #[ignore]
     fn measure_fold_resize_append_cost() {
