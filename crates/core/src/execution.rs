@@ -157,6 +157,12 @@ pub(crate) struct ProcessOutput {
     pub log_path: Option<PathBuf>,
     /// True when either stream exceeded its configured spill cap.
     pub log_truncated: bool,
+    /// True when the command exited normally but left process-group members
+    /// behind that this call then terminated. Only a NORMAL exit sets it: a
+    /// cancel or a timeout kills the group by design and already says so.
+    /// Callers must surface it, because the caller who backgrounded a server
+    /// otherwise sees a clean exit and no server.
+    pub background_terminated: bool,
 }
 
 #[derive(Debug)]
@@ -596,7 +602,8 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let termination = supervise_child(&mut child, pid, request.timeout, &cancel).await?;
+    let (termination, background_terminated) =
+        supervise_child(&mut child, pid, request.timeout, &cancel).await?;
 
     if let Some(task) = stdin_task {
         finish_stdin_task(task).await;
@@ -632,6 +639,7 @@ pub(crate) async fn run_process(
         stderr: stderr.stream,
         log_path,
         log_truncated,
+        background_terminated,
     })
 }
 
@@ -798,22 +806,28 @@ async fn supervise_child(
     pid: Option<u32>,
     timeout: Duration,
     cancel: &CancelToken,
-) -> Result<Termination, ProcessError> {
+) -> Result<(Termination, bool), ProcessError> {
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
             // A shell can exit while ordinary background descendants retain the
             // group. Those belong to this invocation, so clean them up too.
-            terminate_remaining_group(pid).await;
-            Ok(Termination::Exited(status))
+            //
+            // This is the rule that makes `some-server &` look like it worked
+            // and then serve nothing: the shell returns, the group is killed,
+            // and the caller is handed a successful exit. Report it so the
+            // caller learns the rule from the result instead of from a failing
+            // request later.
+            let background_terminated = terminate_remaining_group(pid).await;
+            Ok((Termination::Exited(status), background_terminated))
         }
         _ = cancel.cancelled() => {
             terminate_process_group(child, pid).await?;
-            Ok(Termination::Cancelled)
+            Ok((Termination::Cancelled, false))
         }
         _ = tokio::time::sleep(timeout) => {
             terminate_process_group(child, pid).await?;
-            Ok(Termination::TimedOut)
+            Ok((Termination::TimedOut, false))
         }
     }
 }
@@ -829,19 +843,22 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
             child.wait().await.map_err(ProcessError::Wait)?;
         }
     }
-    terminate_remaining_group(pid).await;
+    let _ = terminate_remaining_group(pid).await;
     Ok(())
 }
 
-async fn terminate_remaining_group(pid: Option<u32>) {
+/// Returns true when group members outlived the leader and were terminated
+/// here, which is the caller's only signal that a backgrounded child is gone.
+async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     // The leader may already have exited. Give remaining group members the
     // same grace period, then kill the group unconditionally if still present.
     if !process_group_exists(pid) {
-        return;
+        return false;
     }
     send_termination_group(pid);
     tokio::time::sleep(TERMINATION_GRACE).await;
     send_kill_group(pid);
+    true
 }
 
 #[cfg(unix)]
