@@ -4,7 +4,7 @@
 //!
 //! The fast check asserts the call-count contract against a counting sink.
 //! The ignored run prints timings for realistic frame sizes:
-//!   cargo test -p open-max-tui --test frame_io -- --ignored --nocapture
+//!   cargo test -p openmax --test frame_io -- --ignored --nocapture
 
 use std::io::{LineWriter, Write};
 

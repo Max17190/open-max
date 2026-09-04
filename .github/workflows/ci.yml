@@ -58,7 +58,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release -p open-max-tui --locked
+        run: cargo build --release -p openmax --locked
 
       # Soft gate: warn via workflow annotation, but do not fail the job.
       - name: Check binary size

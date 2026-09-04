@@ -567,7 +567,7 @@ mod tests {
 
     // Streaming-cost comparison for a long code reply (the coding-agent hot
     // case). Not a correctness test; run with:
-    //   cargo test -p open-max-tui --release -- --ignored --nocapture measure_stream
+    //   cargo test -p openmax --release -- --ignored --nocapture measure_stream
     #[test]
     #[ignore]
     fn measure_stream_render_cost() {

@@ -29,7 +29,7 @@ Not shipped: user keybindings, theme file hot reload, pluggable compactors, TUI 
 ## Development
 
 - Small focused diffs; inspect before edit; match style.
-- Verify: `cargo check`, `cargo test`; release: `cargo build --release -p open-max-tui`.
+- Verify: `cargo check`, `cargo test`; release: `cargo build --release -p openmax`.
 - Prefer skill/tool/hook/permission file first. Always-on costs tokens.
 - Never invent paths or claim missing features.
 - Branches: professional kebab-case, no agent prefixes. Conventional commits; no agent co-authors. No em dashes.
