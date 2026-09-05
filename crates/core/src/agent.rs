@@ -54,6 +54,7 @@ use crate::tools;
 use crate::types::{estimate_tokens, AgentEvent, ChatMessage, ToolCall};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
+const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
 /// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
 /// with no perceptible latency.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
@@ -444,6 +445,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             )
         };
         let reported_policy_notices = rehydrate_policy_notices(&messages);
+        let reported_approval_mode = rehydrate_approval_mode(&messages);
         // Once per session means once per session's record: the note rides a
         // tool result, so a resumed session finds it in the transcript, or in
         // the compaction archive if a prune has since dropped that exchange,
@@ -458,6 +460,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices,
+            reported_approval_mode,
             seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
                 .unwrap_or_default()
                 .into_iter()
@@ -489,6 +492,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices: Default::default(),
+            reported_approval_mode: None,
             seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
                 .unwrap_or_default()
                 .into_iter()
@@ -524,8 +528,9 @@ struct ReadonlyBatchCtx<'a> {
     project_root: &'a Path,
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
-    hooks: &'a Hooks,
-    permissions: &'a TurnPermissions,
+    hooks: &'a mut Hooks,
+    permissions: &'a mut TurnPermissions,
+    policy_mode: &'a mut ApprovalMode,
     parallelism: usize,
     /// Turn-local usage accumulator, flushed once at turn end.
     usage: &'a std::sync::Mutex<TurnUsage>,
@@ -601,7 +606,7 @@ where
 /// Returns true when the user cancelled mid-gate so the turn should stop
 /// before more tools run (matches the serial tool path).
 async fn execute_readonly_batch(
-    ctx: &ReadonlyBatchCtx<'_>,
+    ctx: &mut ReadonlyBatchCtx<'_>,
     calls: &[ToolCall],
     messages: &mut Vec<ChatMessage>,
 ) -> bool {
@@ -620,11 +625,28 @@ async fn execute_readonly_batch(
         });
         // hooks pre → permissions → content gate. approval_mode is skipped
         // because batchable_call excludes mutating tools.
-        let block = match ctx
-            .hooks
-            .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
-            .await
-        {
+        let mode = *ctx.policy_mode;
+        let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
+        refresh_approval_policy(ctx.core, ctx.session_id, ctx.project_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
+        if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
+            // Nothing has executed. Refuse the batch without replaying hooks,
+            // which may have side effects even for a non-mutating tool.
+            for (index, pending) in calls.iter().enumerate() {
+                if index >= parsed.len() {
+                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
+                        call_id: pending.id.clone(),
+                        name: pending.function.name.clone(),
+                        args: serde_json::from_str(&pending.function.arguments).unwrap_or(Value::Null),
+                    });
+                }
+                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
+                    call_id: pending.id.clone(), ok: false, output: POLICY_CHANGED_DURING_HOOK.into(),
+                });
+                messages.push(ChatMessage::tool(pending.id.clone(), format!("Error: {POLICY_CHANGED_DURING_HOOK}")));
+            }
+            return false;
+        }
+        let block = match pre {
             PreToolResult::Block { reason } => Some(tools::ToolOutcome {
                 ok: false,
                 output: reason,
@@ -650,22 +672,23 @@ async fn execute_readonly_batch(
                     diff: None, ..Default::default()
                 }),
                 // Ask is excluded from batching (see batchable_call); if it
-                // still lands here, block rather than silently auto-run.
-                PermissionDecision::Ask => Some(tools::ToolOutcome {
+                // still lands here outside auto, refuse the batch call.
+                PermissionDecision::Ask if ctx.core.approval_mode(ctx.project_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
                     ok: false,
                     output: "permission rule requires approval; re-run outside a concurrent batch"
                         .into(),
                     diff: None, ..Default::default()
                 }),
                 // Allow/Default: readonly batch tools are non-mutating.
-                PermissionDecision::Allow | PermissionDecision::Default => None,
+                PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
             },
         };
         // Unapproved content is excluded from batching (see batchable_call) so
         // the serial path can prompt; if one still lands here, block rather
-        // than run host code no human approved. The two sites share the one
+        // than run unapproved host code outside auto. The sites share one
         // predicate, so the batch path cannot drift away from the gate again.
         let block = block.or_else(|| {
+            if ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto { return None; }
             unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
                 |source| tools::ToolOutcome {
                     ok: false,
@@ -678,6 +701,7 @@ async fn execute_readonly_batch(
         blocked.push(block);
     }
 
+    let data_dir = &ctx.core.data_dir;
     let futures: Vec<_> = calls
         .iter()
         .zip(parsed.iter())
@@ -694,7 +718,7 @@ async fn execute_readonly_batch(
                 if let Some(outcome) = blocked_outcome {
                     return outcome;
                 }
-                registry.execute(&name, &args, &ctx.core.data_dir, &root, caps, cancel).await
+                registry.execute(&name, &args, data_dir, &root, caps, cancel).await
             }
         })
         .collect();
@@ -1555,7 +1579,7 @@ async fn run_compact(
         });
     }
     let client = ChatClient::from_endpoint(&endpoint);
-    let hooks = Hooks::discover(project_root, &core.data_dir);
+    let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
     let ctx = CompactionCtx { core, session_id, project_root, client: &client, hooks: &hooks, cancelled };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, schema_tokens, true, &mut spend).await {
@@ -1667,6 +1691,7 @@ fn refreeze_receipt_text(
     broken: &[(std::path::PathBuf, String)],
     shadowed_skills: &[(String, Vec<std::path::PathBuf>, std::path::PathBuf, bool)],
     project_root: &Path,
+    mode: ApprovalMode,
 ) -> String {
     let what = if changes.is_empty() {
         "extension files changed".to_string()
@@ -1729,7 +1754,17 @@ fn refreeze_receipt_text(
             added.approved.join(", ")
         ));
     }
-    if !added.modified_unapproved.is_empty() {
+    if mode == ApprovalMode::Auto {
+        let names: Vec<&str> = added.unapproved.iter().chain(&added.modified_unapproved)
+            .map(|(name, _)| name.as_str()).collect();
+        if !names.is_empty() {
+            note.push_str(&format!(" Tools available under auto without content approval: {}. No approval hashes were granted.", names.join(", ")));
+        }
+    }
+    if mode == ApprovalMode::Readonly && (!added.unapproved.is_empty() || !added.modified_unapproved.is_empty()) {
+        note.push_str(" Unapproved tool content is disabled in readonly mode.");
+    }
+    if mode == ApprovalMode::Ask && !added.modified_unapproved.is_empty() {
         let listed: Vec<String> = added
             .modified_unapproved
             .iter()
@@ -1746,7 +1781,7 @@ fn refreeze_receipt_text(
             listed.join(", ")
         ));
     }
-    if !added.unapproved.is_empty() {
+    if mode == ApprovalMode::Ask && !added.unapproved.is_empty() {
         // This line used to say "callable" for these
         // too, and the very next step was an approval card - the model
         // called the receipt out as overselling. Registered is not callable
@@ -2078,7 +2113,7 @@ async fn refreeze_if_extensions_changed(
             settle_ledger(core, session_id, project_root, files, crate::ledger::Actor::External)
                 .await;
         let receipt =
-            refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root);
+            refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root, core.approval_mode(project_root));
         core.send_agent(session_id, AgentEvent::Refrozen {
             tools: counts.0,
             skills: counts.1,
@@ -2255,7 +2290,7 @@ async fn refreeze_between_iterations(
     // in its transcript said the tool was callable. Ride the receipt on this
     // iteration's last tool result, where the model reads next. One line,
     // only when extension bytes actually changed.
-    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root);
+    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root, core.approval_mode(project_root));
     append_and_emit_note(core, session_id, messages, &receipt);
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
@@ -2340,6 +2375,66 @@ fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::Jo
     })
 }
 
+fn execution_policy_note(mode: ApprovalMode) -> String {
+    let detail = match mode {
+        ApprovalMode::Auto => "carry out authorized work, including extension creation and repair, without asking for confirmation. Valid tools, hooks, and permission allows need no content approval. Deny rules and validation still apply",
+        ApprovalMode::Ask => "mutating calls and unapproved tool content require confirmation unless the applicable gate permits them. Hooks and project permission allows require content approval",
+        ApprovalMode::Readonly => "mutating calls and calls requiring approval are disabled",
+    };
+    format!("[execution policy: {} for this trusted project; {detail}.]", mode.as_str())
+}
+
+fn rehydrate_approval_mode(messages: &[ChatMessage]) -> Option<ApprovalMode> {
+    let notes = [ApprovalMode::Auto, ApprovalMode::Ask, ApprovalMode::Readonly]
+        .map(|mode| (mode, execution_policy_note(mode)));
+    // Recover only the last visible notice. If wording changes or compaction
+    // removed it, emit the current policy again. This never grants authority.
+    messages.iter().rev()
+        .filter(|m| m.role == "user" || m.role == "tool")
+        .filter_map(|m| m.content.as_deref())
+        .flat_map(|content| content.lines().rev())
+        .find_map(|line| notes.iter().find(|(_, text)| line == text).map(|(mode, _)| *mode))
+}
+
+async fn refresh_approval_policy(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    mode: &mut ApprovalMode,
+    hooks: &mut Hooks,
+    permissions: &mut TurnPermissions,
+    messages: &mut Vec<ChatMessage>,
+) {
+    let current = core.approval_mode(project_root);
+    if current != *mode {
+        *mode = current;
+        *hooks = Hooks::discover_for_mode(project_root, &core.data_dir, current);
+        permissions.reload(Permissions::discover_for_mode(project_root, &core.data_dir, current));
+        report_hook_failures(core, session_id, hooks.notices());
+    }
+    // Keep provider tool-call/reply adjacency intact. A mode selected before
+    // a batch has any reply is narrated at the next completed reply instead.
+    let Some(last_role) = messages.last().map(|m| m.role.as_str()) else { return };
+    let on_tool = last_role == "tool";
+    if !on_tool && last_role != "user" { return; }
+    let changed = {
+        let mut sessions = core.sessions.lock().await;
+        sessions.get_mut(session_id).is_some_and(|session| {
+            if session.reported_approval_mode == Some(current) { return false; }
+            session.reported_approval_mode = Some(current);
+            true
+        })
+    };
+    if changed {
+        let text = execution_policy_note(current);
+        if on_tool {
+            append_and_emit_note(core, session_id, messages, &text);
+        } else {
+            insert_startup_note(core, session_id, messages, text);
+        }
+    }
+}
+
 async fn run_loop(
     core: &Arc<Core>,
     session_id: &str,
@@ -2351,7 +2446,8 @@ async fn run_loop(
     // Discover hooks first: user_prompt_submit gates the input before it
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
-    let hooks = Hooks::discover(project_root, &core.data_dir);
+    let mut policy_mode = core.approval_mode(project_root);
+    let mut hooks = Hooks::discover_for_mode(project_root, &core.data_dir, policy_mode);
     // A hook that exists but did not load says so every turn. Inert is a
     // policy the user wrote down and is not getting, so it must not be
     // something they only discover by running `openmax --check`.
@@ -2480,7 +2576,7 @@ async fn run_loop(
     // restriction waits for the next turn's fresh discovery. Permissions
     // never enter the prompt, so a reload costs one small file parse and no
     // cache.
-    let turn_start_policy = Permissions::discover(project_root, &core.data_dir);
+    let turn_start_policy = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
     let mut startup_notices: Vec<String> = turn_start_policy.notices().to_vec();
     let mut permissions = TurnPermissions::new(turn_start_policy);
     // Hooks that exist but did not load, and allow rules that are inert
@@ -2584,6 +2680,7 @@ async fn run_loop(
     let max_iterations = settings.max_agent_iterations.max(1);
 
     'turns: for _ in 0..max_iterations {
+        refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
         // The tool schemas are re-sent whole on every request, so they are as
         // real as the transcript. Read per iteration: a mid-turn refreeze
         // swaps the wire bytes, and the overhead must follow the current
@@ -2648,6 +2745,7 @@ async fn run_loop(
             }
         };
 
+        refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
         spend.record(core, session_id, used, &result);
 
         // Only the API tool_calls field carries executable calls.
@@ -2807,26 +2905,28 @@ async fn run_loop(
         });
 
         'calls: for segment in segments {
+            refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
             if cancelled.is_cancelled() {
                 stop_reason = "cancelled".into();
                 break 'turns;
             }
 
             if segment.concurrent {
-                let batch_ctx = ReadonlyBatchCtx {
+                let mut batch_ctx = ReadonlyBatchCtx {
                     core,
                     session_id,
                     registry: &registry,
                     project_root,
                     caps,
                     cancelled: cancelled.clone(),
-                    hooks: &hooks,
-                    permissions: &permissions,
+                    hooks: &mut hooks,
+                    permissions: &mut permissions,
+                    policy_mode: &mut policy_mode,
                     parallelism: parallel_tool_limit(settings.max_parallel_tools),
                     usage: &turn_usage,
                 };
                 if execute_readonly_batch(
-                    &batch_ctx,
+                    &mut batch_ctx,
                     &tool_calls[segment.start..segment.end],
                     guard.messages(),
                 )
@@ -2839,6 +2939,7 @@ async fn run_loop(
             }
 
             for call in &tool_calls[segment.start..segment.end] {
+                refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
                 if cancelled.is_cancelled() {
                     stop_reason = "cancelled".into();
                     break 'turns;
@@ -2870,10 +2971,15 @@ async fn run_loop(
 
                 // Order: hooks pre → permissions → approval_mode → execute.
                 // Denies never prompt the user.
-                match hooks
-                    .pre_tool_use(session_id, name, &args, project_root, &cancelled)
-                    .await
-                {
+                // Refuse an admission interrupted by a mode selection. Never
+                // replay completed hooks, which can have side effects.
+                let mode = policy_mode;
+                let mut pre = hooks.pre_tool_use(session_id, name, &args, project_root, &cancelled).await;
+                refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+                if mode != policy_mode && !matches!(pre, PreToolResult::Cancelled) {
+                    pre = PreToolResult::Block { reason: POLICY_CHANGED_DURING_HOOK.into() };
+                }
+                match pre {
                     PreToolResult::Block { reason } => {
                         core.send_agent(session_id, AgentEvent::ToolEnd {
                             call_id: call.id.clone(),
@@ -2932,21 +3038,14 @@ async fn run_loop(
                     continue;
                 }
 
-                // Read live so "[a]lways" during an approval prompt takes effect
+                // Read live so selecting auto on an approval card takes effect
                 // for the rest of this turn, not just the next one.
-                let approval_mode = core.approval_mode();
-                // Allow skips the approval prompt; Ask forces it (even in auto).
-                // Readonly still blocks mutating tools regardless of Allow.
+                let approval_mode = core.approval_mode(project_root);
                 let force_allow = matches!(perm, PermissionDecision::Allow);
                 let force_ask = matches!(perm, PermissionDecision::Ask);
-                // An external tool whose defining file no human has approved
-                // (by exact content hash) always prompts - even in auto mode,
-                // even under a permissions Allow rule, both of which the agent
-                // can write for itself. This is the invariant that makes
-                // same-turn self-extension safe: the agent can grow its own
-                // action space but cannot grant it unattended host authority.
-                let unapproved_source =
-                    unapproved_capability(&registry, &core.data_dir, project_root, name);
+                let unapproved_source = (approval_mode != ApprovalMode::Auto)
+                    .then(|| unapproved_capability(&registry, &core.data_dir, project_root, name))
+                    .flatten();
                 let mut executed = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
                     (tools::ToolOutcome {
@@ -2954,15 +3053,30 @@ async fn run_loop(
                         output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
                         diff: None, ..Default::default()
                     }, false)
-                } else if unapproved_source.is_some()
-                    || (!force_allow
-                        && (force_ask || (registry.is_mutating(name) && approval_mode == ApprovalMode::Ask)))
+                } else if approval_mode == ApprovalMode::Readonly
+                    && (unapproved_source.is_some() || force_ask)
+                {
+                    (tools::ToolOutcome {
+                        ok: false,
+                        output: "This session is read-only; calls requiring approval are disabled.".into(),
+                        ..Default::default()
+                    }, false)
+                } else if approval_mode == ApprovalMode::Ask
+                    && (unapproved_source.is_some() || (!force_allow && (force_ask || registry.is_mutating(name))))
                 {
                     let source = unapproved_source.as_ref();
                     let approval_reason =
                         if source.is_some() { "unapproved_source" } else { "gate" };
                     match request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await {
+                        ApprovalOutcome::Approved if core.approval_mode(project_root) == ApprovalMode::Readonly => {
+                            (tools::ToolOutcome {
+                                ok: false,
+                                output: "This session is now read-only; the pending action was not executed.".into(),
+                                ..Default::default()
+                            }, false)
+                        }
                         ApprovalOutcome::Approved => {
+                            let source = source.filter(|_| core.approval_mode(project_root) != ApprovalMode::Auto);
                             executed = true;
                             // Approving the first run of an unapproved tool
                             // approves this exact content - the manifest and
@@ -3155,7 +3269,7 @@ async fn run_loop(
                     // snapshot as a floor, so a reload can narrow policy
                     // but never widen it; `deny`/`ask` need no approval,
                     // and unapproved `allow` rules are dropped at load.
-                    let current = Permissions::discover(project_root, &core.data_dir);
+                    let current = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
                     let inert: Vec<String> = current.notices().to_vec();
                     // A mutation that leaves permissions.toml malformed
                     // bricks EVERY tool call for the rest of this turn
@@ -3281,12 +3395,14 @@ async fn run_loop(
                     approval_seen = approval_now;
                     if !revoked.is_empty() {
                         revoked.sort();
-                        let note = format!(
+                        let note = if core.approval_mode(project_root) == ApprovalMode::Auto {
+                            format!("[tool code changed: {}. Auto continues without content approval; saved approvals were not extended to these bytes.]", revoked.join(", "))
+                        } else { format!(
                             "[approval revoked: the code these tools run changed since a human \
                              approved it, so the next call of each stops for a card: {}. Re-approve \
                              the exact bytes, or prove them first with openmax --check --run-examples.]",
                             revoked.join(", ")
-                        );
+                        ) };
                         append_and_emit_note(core, session_id, guard.messages(), &note);
                     }
                     // A hook file written this call: hooks are outside
@@ -3297,7 +3413,7 @@ async fn run_loop(
                     let hooks_now = crate::hooks::hooks_fingerprint(project_root);
                     if hooks_now != hooks_seen {
                         hooks_seen = hooks_now;
-                        let discovered = Hooks::discover(project_root, &core.data_dir);
+                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
                         let inert: Vec<String> = discovered
                             .notices()
                             .into_iter()
@@ -3314,7 +3430,12 @@ async fn run_loop(
                         // inert - it fails closed and blocks every tool
                         // call from the next turn until restored or
                         // re-approved. Say that, not "applies next turn".
-                        let note = if let Some(blocked) = discovered.fail_closed_reason() {
+                        let note = if core.approval_mode(project_root) == ApprovalMode::Auto {
+                            match discovered.fail_closed_reason() {
+                                Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}]"),
+                                None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.]".into(),
+                            }
+                        } else if let Some(blocked) = discovered.fail_closed_reason() {
                             format!(
                                 "[hook files changed. A live gate is now failing closed: \
                                  {blocked}. From the next turn every tool call is BLOCKED \
@@ -3353,8 +3474,7 @@ async fn run_loop(
         // next model request, so a tool the agent writes in iteration N is
         // callable in iteration N+1 without ending the turn. One deliberate
         // prompt-cache re-prefill, and only when extension bytes actually
-        // changed; hooks keep their per-turn discovery, because an
-        // agent-written hook is inert until a human approves it anyway
+        // changed; hook file edits keep their per-turn discovery timing
         // (permissions reload per mutating call, above).
         let refrozen = extensions_touched
             && refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
@@ -4165,7 +4285,7 @@ mod tests {
         std::fs::File::open(&path).unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
         let (core, _rx) = Core::new(dir.join("data")).unwrap();
-        core.set_run_approval_mode(ApprovalMode::Readonly);
+        core.settings.lock().unwrap().approval_mode = ApprovalMode::Readonly;
 
         let data = build_session_data(&core, "fresh", &project);
 
@@ -5206,7 +5326,7 @@ mod tests {
             removed_approved: Vec::new(),
             removed_approval_survives: Vec::new(),
         };
-        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
+        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"), ApprovalMode::Ask);
         assert!(note.contains("Skill name collision"), "{note}");
         assert!(
             note.contains(
@@ -5240,7 +5360,7 @@ mod tests {
             removed_approved: Vec::new(),
             removed_approval_survives: Vec::new(),
         };
-        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"));
+        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"), ApprovalMode::Ask);
         assert!(
             note.contains("the index has no room for its line"),
             "{note}"
@@ -5281,7 +5401,7 @@ mod tests {
             removed_approval_survives: Vec::new(),
         };
         let changes = vec![format!(".openmax/tools/c\n{forged}.toml added (initial)")];
-        let note = refreeze_receipt_text(&changes, &added, &broken, &shadowed, Path::new("/p"));
+        let note = refreeze_receipt_text(&changes, &added, &broken, &shadowed, Path::new("/p"), ApprovalMode::Ask);
         assert!(
             !note.contains('\n'),
             "a clause forged a second receipt line: {note:?}"
@@ -7033,6 +7153,235 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n",
     );
+
+    #[tokio::test]
+    async fn a_mode_change_during_a_serial_pre_hook_refreshes_permission_allows() {
+        mode_change_during_pre_hook(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_during_a_batch_pre_hook_refreshes_permission_allows() {
+        mode_change_during_pre_hook(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_never_replays_serial_pre_hook_side_effects() {
+        mode_change_during_pre_hook(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_never_replays_batch_pre_hook_side_effects() {
+        mode_change_during_pre_hook(true, true).await;
+    }
+
+    async fn mode_change_during_pre_hook(batch: bool, approved_hook: bool) {
+        let dir = std::env::temp_dir().join(format!("omx-mode-hook-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join(".openmax/hooks")).unwrap();
+        std::fs::write(root.join("a.txt"), "read succeeded").unwrap();
+        std::fs::write(root.join(".openmax/hooks/wait.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"hook.sh\"]\n").unwrap();
+        std::fs::write(root.join("hook.sh"), "echo ran >> hook-effects; touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
+        if batch {
+            std::fs::write(root.join("hook.sh"), "echo ran >> hook-effects; if [ ! -e first ]; then touch first; exit 0; fi; touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
+        }
+        let tool = if batch { "read_file" } else { "bash" };
+        std::fs::write(root.join(".openmax/permissions.toml"), format!(
+            "[[rules]]\neffect = \"allow\"\ntool = \"{tool}\"\n[[rules]]\neffect = \"ask\"\ntool = \"{tool}\"\n"
+        )).unwrap();
+        let count = if batch { 3 } else { 1 };
+        let args = if batch { serde_json::json!({"path":"a.txt"}) } else { serde_json::json!({"command":"echo ran"}) };
+        let calls: Vec<_> = (0..count).map(|i| serde_json::json!({
+            "index":i,"id":format!("call-{i}"),"function":{"name":tool,"arguments":args.to_string()}
+        })).collect();
+        let response = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        let (base_url, _) = counting_endpoint(&format!("data: {response}\n\ndata: [DONE]\n\n")).await;
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &root).unwrap();
+        if approved_hook {
+            let manifest = root.join(".openmax/hooks/wait.toml");
+            let shas = [manifest.clone(), root.join("hook.sh")].map(|path| crate::ledger::sha256_hex(&std::fs::read(path).unwrap()));
+            crate::ledger::approve_capability(&core.data_dir, &root, &manifest, &shas).unwrap();
+        }
+        core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = base_url;
+            settings.model = "stub".into();
+            settings.context_tokens = Some(16384);
+            settings.max_agent_iterations = 1;
+        }
+        start_turn(core.clone(), "s".into(), root.clone(), "go".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("ready").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.expect("the pre hook must start");
+        core.set_project_approval_mode(&root, ApprovalMode::Ask).unwrap();
+        std::fs::write(root.join("release"), "").unwrap();
+        let mut results = Vec::new();
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            match env.event {
+                AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(&approval_id, false); }
+                AgentEvent::ToolEnd { ok, .. } => results.push(ok),
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(results, vec![false; count], "auto-loaded allows must not survive a switch to ask during a hook");
+        assert_eq!(std::fs::read_to_string(root.join("hook-effects")).unwrap().lines().count(), if batch { 2 } else { 1 },
+            "an explicit mode change must not replay completed pre hooks");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_only_reports_a_changed_execution_policy() {
+        let dir = std::env::temp_dir().join(format!("omx-policy-resume-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let (core, _) = Core::new(dir.join("data")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &root).unwrap();
+        for on_tool in [false, true] {
+            let id = sessions::create(&core, root.display().to_string()).unwrap().id;
+            core.sessions.lock().await.insert(id.clone(), build_session_data(&core, &id, &root));
+            core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
+            let mut mode = ApprovalMode::Auto;
+            let mut hooks = Hooks::discover_for_mode(&root, &core.data_dir, mode);
+            let mut permissions = TurnPermissions::new(Permissions::discover_for_mode(&root, &core.data_dir, mode));
+            let mut messages = vec![ChatMessage::system("test"), ChatMessage::user("go")];
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+            if on_tool { messages.push(ChatMessage::tool("call", "result")); }
+            core.set_project_approval_mode(&root, ApprovalMode::Ask).unwrap();
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+            let mut persisted = 0;
+            assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+            core.sessions.lock().await.remove(&id);
+            ensure_session_hydrated(&core, &id, &root).await;
+            let mut resumed = core.sessions.lock().await.get(&id).unwrap().messages.clone();
+            resumed.push(ChatMessage::user("continue"));
+            let before = serde_json::to_value(&resumed).unwrap();
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut resumed).await;
+            assert_eq!(serde_json::to_value(&resumed).unwrap(), before, "resume must not repeat the last visible policy");
+            core.set_project_approval_mode(&root, ApprovalMode::Readonly).unwrap();
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut resumed).await;
+            assert_eq!(resumed.len(), messages.len() + 2, "a changed mode still needs a notice");
+            assert!(resumed[resumed.len() - 2].content.as_deref().unwrap().contains("execution policy: readonly"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_refreshes_hooks_permissions_and_the_model_notice() {
+        let dir = std::env::temp_dir().join(format!("omx-live-mode-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join(".openmax/hooks")).unwrap();
+        std::fs::write(root.join(".openmax/hooks/a.toml"), "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n").unwrap();
+        std::fs::write(root.join(".openmax/permissions.toml"), "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n").unwrap();
+        let (core, _) = Core::new(dir.join("data")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &root).unwrap();
+        core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
+        core.sessions.lock().await.insert("s".into(), SessionData::default());
+        let mut mode = ApprovalMode::Auto;
+        let mut hooks = Hooks::discover_for_mode(&root, &core.data_dir, mode);
+        let mut permissions = TurnPermissions::new(Permissions::discover_for_mode(&root, &core.data_dir, mode));
+        let mut messages = vec![ChatMessage::user("go")];
+        assert!(!hooks.is_empty());
+        assert_eq!(permissions.evaluate("bash", &serde_json::json!({})), PermissionDecision::Allow);
+        core.set_project_approval_mode(&root, ApprovalMode::Ask).unwrap();
+        refresh_approval_policy(&core, "s", &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+        assert!(hooks.is_empty());
+        assert_eq!(permissions.evaluate("bash", &serde_json::json!({})), PermissionDecision::Default);
+        assert!(messages[0].content.as_deref().unwrap().contains("execution policy: ask"));
+        core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
+        refresh_approval_policy(&core, "s", &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+        assert!(!hooks.is_empty());
+        assert!(messages[1].content.as_deref().unwrap().contains("execution policy: auto"));
+        let count = messages.len();
+        refresh_approval_policy(&core, "s", &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+        assert_eq!(messages.len(), count, "unchanged policy must not add prompt cost");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn auto_runs_unapproved_extensions_and_repairs_without_cards() {
+        let dir = std::env::temp_dir().join(format!("openmax-auto-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+        let manifest = project.join(".openmax/tools/brokentool.toml");
+        std::fs::write(&manifest,
+            "name = \"brokentool\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"tool.sh\"]\nmutating = true\n"
+        ).unwrap();
+        std::fs::write(project.join(".openmax/hooks/observe.toml"),
+            "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"hook.sh\"]\n"
+        ).unwrap();
+        std::fs::write(project.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"ask\"\ntool = \"brokentool\"\n"
+        ).unwrap();
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, _) = counting_endpoint(BROKEN_TOOL_SSE).await;
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = base_url;
+            settings.model = "stub".into();
+            settings.context_tokens = Some(16384);
+            settings.max_agent_iterations = 1;
+        }
+        core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
+        for generation in ["created", "repaired"] {
+            std::fs::write(project.join("tool.sh"), format!("echo {generation} > tool-result\n")).unwrap();
+            std::fs::write(project.join("hook.sh"), format!("echo {generation} > hook-result\n")).unwrap();
+            start_turn(core.clone(), generation.into(), project.clone(), "use it".into()).unwrap();
+            let mut cards = 0;
+            loop {
+                let env = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+                match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        cards += 1;
+                        core.respond_approval(&approval_id, false);
+                    }
+                    AgentEvent::Done { .. } => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(cards, 0, "auto must not ask for extension or permission approval");
+            assert_eq!(std::fs::read_to_string(project.join("tool-result")).unwrap().trim(), generation);
+            assert_eq!(std::fs::read_to_string(project.join("hook-result")).unwrap().trim(), generation);
+            assert!(!crate::ledger::is_approved(&core.data_dir, &project,
+                &crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())));
+        }
+        for (mode, rule, expected_cards, readonly_on_card) in [
+            (ApprovalMode::Auto, "deny", 0, false),
+            (ApprovalMode::Readonly, "ask", 0, false),
+            (ApprovalMode::Ask, "ask", 1, false),
+            (ApprovalMode::Ask, "ask", 1, true),
+        ] {
+            core.set_project_approval_mode(&project, mode).unwrap();
+            std::fs::remove_file(project.join("tool-result")).ok();
+            std::fs::write(project.join(".openmax/permissions.toml"),
+                format!("[[rules]]\neffect = \"{rule}\"\ntool = \"brokentool\"\n")
+            ).unwrap();
+            start_turn(core.clone(), format!("{}-{readonly_on_card}", mode.as_str()), project.clone(), "use it".into()).unwrap();
+            let mut cards = 0;
+            loop {
+                let env = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+                match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        cards += 1;
+                        if readonly_on_card {
+                            core.set_project_approval_mode(&project, ApprovalMode::Readonly).unwrap();
+                        }
+                        core.respond_approval(&approval_id, readonly_on_card);
+                    }
+                    AgentEvent::Done { .. } => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(cards, expected_cards, "{mode:?}");
+            assert!(!project.join("tool-result").exists(), "{mode:?} must not run this call");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A human at the card approves an external tool whose manifest names code
     /// that is missing (the agent wrote the .toml but not the script, or it

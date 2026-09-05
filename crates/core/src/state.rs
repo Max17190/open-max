@@ -67,6 +67,8 @@ pub struct SessionData {
     /// holds every turn once it holds at all, so the transcript gets one
     /// note per distinct notice - the UI keeps its per-turn events.
     pub reported_policy_notices: HashSet<u64>,
+    /// Last execution mode narrated to the model, updated only when it changes.
+    pub reported_approval_mode: Option<crate::config::ApprovalMode>,
     /// Ledger approval-event ids this session has already accounted for:
     /// seeded from the chain at build, then advanced as new events are
     /// narrated. An approval recorded outside the running session (a human
@@ -118,13 +120,10 @@ impl CancelToken {
 pub struct Core {
     pub data_dir: PathBuf,
     pub settings: Mutex<Settings>,
-    /// Approval mode for this run only, set by a front end's cycle key or an
-    /// "allow for run" answer. Deliberately outside [`Settings`]: every save
-    /// path serializes that whole struct, so a run-scoped widening kept there
-    /// would ride along on the next unrelated `/model` or `/provider` write
-    /// and outlive the run it was promised to. Read through
-    /// [`Core::approval_mode`], never off `settings` directly.
-    run_approval_mode: Mutex<Option<crate::config::ApprovalMode>>,
+    /// Project-scoped choices, frozen at launch except for explicit frontend
+    /// changes. Kept outside Settings so unrelated saves cannot widen the
+    /// default for other projects.
+    project_approval_modes: Mutex<std::collections::BTreeMap<PathBuf, crate::config::ApprovalMode>>,
     /// Live sessions keyed by session id; hydrated from disk on first use.
     pub sessions: tokio::sync::Mutex<HashMap<String, SessionData>>,
     /// Sessions with an agent turn currently in flight.
@@ -173,40 +172,29 @@ fn settings_file_fingerprint(data_dir: &std::path::Path) -> SettingsFingerprint 
 }
 
 impl Core {
-    /// The approval mode in force: a run-scoped override if one is set,
-    /// otherwise what `settings.json` says. Every gate reads this, so where a
-    /// mode came from never changes what it means.
-    ///
-    /// Takes the `settings` lock on the fallback path, so never call it while
-    /// already holding that lock: it is a plain non-reentrant mutex.
-    pub fn approval_mode(&self) -> crate::config::ApprovalMode {
-        self.run_approval_mode
+    /// The choice for this exact canonical project, or the settings default.
+    /// Never call while holding the settings lock.
+    pub fn approval_mode(&self, project_root: &std::path::Path) -> crate::config::ApprovalMode {
+        let canonical = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        self.project_approval_modes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .unwrap_or_else(|| {
-                self.settings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .approval_mode
-            })
+            .get(&canonical)
+            .copied()
+            .unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
     }
 
-    /// Set the mode for this run without touching what is on disk.
-    pub fn set_run_approval_mode(&self, mode: crate::config::ApprovalMode) {
-        *self
-            .run_approval_mode
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(mode);
-    }
-
-    /// Drop the run override so the persisted mode governs again. Callers that
-    /// write `settings.approval_mode` must call this, or the explicit,
-    /// persisted choice would stay masked by a stale run-scoped one.
-    pub fn clear_run_approval_mode(&self) {
-        *self
-            .run_approval_mode
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+    /// Persist before changing the live gate. A failed save leaves both the
+    /// acknowledged choice and the live execution policy unchanged.
+    pub fn set_project_approval_mode(
+        &self,
+        project_root: &std::path::Path,
+        mode: crate::config::ApprovalMode,
+    ) -> Result<(), String> {
+        let mut modes = self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner());
+        let canonical = crate::trust::set_approval_mode(&self.data_dir, project_root, mode)?;
+        modes.insert(canonical, mode);
+        Ok(())
     }
 
     pub fn new(
@@ -216,10 +204,11 @@ impl Core {
         let _ = std::fs::create_dir_all(&data_dir);
         let settings = crate::config::load(&data_dir)?;
         let core_data_dir = data_dir.clone();
+        let modes = crate::trust::approval_modes(&data_dir)?;
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
-            run_approval_mode: Mutex::new(None),
+            project_approval_modes: Mutex::new(modes),
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
@@ -258,7 +247,7 @@ impl Core {
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
-            run_approval_mode: Mutex::new(None),
+            project_approval_modes: Mutex::new(Default::default()),
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
@@ -357,6 +346,33 @@ pub fn default_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_mode_is_scoped_frozen_and_saved_before_activation() {
+        use crate::config::ApprovalMode;
+        let dir = std::env::temp_dir().join(format!("omx-mode-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let data = dir.join("data");
+        let (core, _) = Core::new(data.clone()).unwrap();
+        assert!(core.set_project_approval_mode(&project, ApprovalMode::Auto).is_err());
+        crate::trust::trust_project(&data, &project).unwrap();
+        core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
+        let (restarted, _) = Core::new(data.clone()).unwrap();
+        assert_eq!(restarted.approval_mode(&project), ApprovalMode::Auto);
+        assert_eq!(restarted.approval_mode(&other), ApprovalMode::Ask);
+        crate::trust::set_approval_mode(&data, &project, ApprovalMode::Readonly).unwrap();
+        assert_eq!(core.approval_mode(&project), ApprovalMode::Auto, "disk edits are not adopted hot");
+        assert_eq!(Core::new(data.clone()).unwrap().0.approval_mode(&project), ApprovalMode::Readonly);
+        std::fs::remove_file(data.join("trust.json")).unwrap();
+        std::fs::create_dir(data.join("trust.json")).unwrap();
+        assert!(core.set_project_approval_mode(&project, ApprovalMode::Ask).is_err());
+        assert_eq!(core.approval_mode(&project), ApprovalMode::Auto, "a failed save must leave the live policy unchanged");
+        assert!(Core::new(data).is_err(), "unreadable authority state fails closed at launch");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn cancel_token_wakes_waiters_immediately() {

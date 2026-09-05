@@ -5,7 +5,10 @@
 //! repository behavior starts, not after extension processes load.
 //! Decisions are exact canonical paths in `~/.openmax/trust.json`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use crate::config::ApprovalMode;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -18,6 +21,8 @@ struct TrustFile {
     version: u32,
     #[serde(default)]
     projects: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    approval_modes: BTreeMap<PathBuf, ApprovalMode>,
 }
 
 impl Default for TrustFile {
@@ -25,6 +30,7 @@ impl Default for TrustFile {
         Self {
             version: TRUST_VERSION,
             projects: Vec::new(),
+            approval_modes: BTreeMap::new(),
         }
     }
 }
@@ -84,6 +90,52 @@ pub fn is_trusted(data_dir: &Path, project_root: &Path) -> Result<bool, String> 
 /// Persist trust for the exact canonical project root.
 pub fn trust_project(data_dir: &Path, project_root: &Path) -> Result<PathBuf, String> {
     let canonical = canonical_project(project_root)?;
+    update(data_dir, |file| {
+        file.projects.push(canonical.clone());
+        file.projects.sort();
+        file.projects.dedup();
+        Ok(())
+    })?;
+    Ok(canonical)
+}
+
+/// Snapshot project choices at launch. They are never adopted from disk
+/// during a turn; only a frontend's explicit selection changes the live mode.
+pub(crate) fn approval_modes(data_dir: &Path) -> Result<BTreeMap<PathBuf, ApprovalMode>, String> {
+    let file = load(data_dir)?;
+    Ok(file.approval_modes.into_iter().filter(|(root, _)| {
+        file.projects.iter().any(|trusted| root.starts_with(trusted))
+    }).collect())
+}
+
+/// Resolve a fresh process's mode, also used by the diagnostic CLI.
+pub(crate) fn approval_mode(data_dir: &Path, project_root: &Path, default: ApprovalMode) -> Result<ApprovalMode, String> {
+    let canonical = canonical_project(project_root)?;
+    Ok(approval_modes(data_dir)?.get(&canonical).copied().unwrap_or(default))
+}
+
+/// Save an explicit choice for one canonical project, without changing the
+/// default for other projects or granting any content approvals.
+pub(crate) fn set_approval_mode(
+    data_dir: &Path,
+    project_root: &Path,
+    mode: ApprovalMode,
+) -> Result<PathBuf, String> {
+    if std::env::var_os("OPENMAX_SESSION").is_some() {
+        return Err("approval mode changes require a human-controlled frontend; this process was started by an agent".into());
+    }
+    let canonical = canonical_project(project_root)?;
+    update(data_dir, |file| {
+        if !file.projects.iter().any(|root| canonical.starts_with(root)) {
+            return Err(format!("project {} is not trusted", canonical.display()));
+        }
+        file.approval_modes.insert(canonical.clone(), mode);
+        Ok(())
+    })?;
+    Ok(canonical)
+}
+
+fn update(data_dir: &Path, change: impl FnOnce(&mut TrustFile) -> Result<(), String>) -> Result<(), String> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
     let lock_path = trust_lock_path(data_dir);
@@ -98,15 +150,11 @@ pub fn trust_project(data_dir: &Path, project_root: &Path) -> Result<PathBuf, St
         .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
 
     let mut file = load(data_dir)?;
-    if !file.projects.iter().any(|p| p == &canonical) {
-        file.projects.push(canonical.clone());
-        file.projects.sort();
-        file.projects.dedup();
-    }
+    change(&mut file)?;
     let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
     crate::sessions::write_atomic(&trust_path(data_dir), json)?;
     FileExt::unlock(&lock).map_err(|e| format!("cannot unlock {}: {e}", lock_path.display()))?;
-    Ok(canonical)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -173,6 +221,34 @@ mod tests {
         assert!(trust_project(&data, &project).is_err());
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn concurrent_mode_selections_preserve_both_projects() {
+        let data = temp_dir("modes-data");
+        let a = temp_dir("mode-a");
+        let b = temp_dir("mode-b");
+        trust_project(&data, &a).unwrap();
+        trust_project(&data, &b).unwrap();
+        let handles: Vec<_> = [(a.clone(), ApprovalMode::Auto), (b.clone(), ApprovalMode::Readonly)]
+            .into_iter().map(|(root, mode)| {
+                let data = data.clone();
+                std::thread::spawn(move || set_approval_mode(&data, &root, mode).unwrap())
+            }).collect();
+        for handle in handles { handle.join().unwrap(); }
+        assert_eq!(approval_mode(&data, &a, ApprovalMode::Ask).unwrap(), ApprovalMode::Auto);
+        assert_eq!(approval_mode(&data, &b, ApprovalMode::Ask).unwrap(), ApprovalMode::Readonly);
+        let child = a.join("nested");
+        std::fs::create_dir(&child).unwrap();
+        assert_eq!(approval_mode(&data, &child, ApprovalMode::Ask).unwrap(), ApprovalMode::Ask);
+        #[cfg(unix)] {
+            let alias = data.join("alias");
+            std::os::unix::fs::symlink(&a, &alias).unwrap();
+            assert_eq!(approval_mode(&data, &alias, ApprovalMode::Ask).unwrap(), ApprovalMode::Auto);
+        }
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
     }
 
     #[test]

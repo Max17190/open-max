@@ -221,24 +221,15 @@ async fn run_turn_events(
                 // it on here.
                 env: _,
             } => {
-                let mode = core.approval_mode();
-                // Unattended auto mode covers the ordinary mutating gate, but
-                // never the human boundary itself: the first run of
-                // capability content no human has approved always needs a
-                // person (interactively, or via openmax --approve).
-                let approve = mode == open_max_core::config::ApprovalMode::Auto
-                    && reason != "unapproved_source";
-                if !approve {
-                    // The path is the whole point of the line: a script's
-                    // operator has to be able to copy the command and run it.
-                    let hint = if reason == "unapproved_source" {
-                        approve_hint(source_path, source_sha)
-                    } else {
-                        "set approval_mode to auto for unattended mutating tools".to_string()
-                    };
-                    let _ = writeln!(stderr, "openmax: declining {}; {hint}", call_line(name, summary));
-                }
-                core.respond_approval(approval_id, approve);
+                // The core never asks in auto. An unattended frontend must
+                // decline every request that does reach it.
+                let hint = if reason == "unapproved_source" {
+                    approve_hint(source_path, source_sha)
+                } else {
+                    "select /approvals auto in this project for unattended work".to_string()
+                };
+                let _ = writeln!(stderr, "openmax: declining {}; {hint}", call_line(name, summary));
+                core.respond_approval(approval_id, false);
             }
             AgentEvent::Error { message } => {
                 if !json {

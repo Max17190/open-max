@@ -276,6 +276,19 @@ impl Hooks {
         Self::discover_dirs(project_root, data_dir, &hook_dirs(project_root))
     }
 
+    /// Auto authorizes the current validated files. It grants no hashes in
+    /// the content ledger, so ask mode still requires content approval later.
+    pub fn discover_for_mode(project_root: &Path, data_dir: &Path, mode: crate::config::ApprovalMode) -> Self {
+        if mode != crate::config::ApprovalMode::Auto {
+            return Self::discover(project_root, data_dir);
+        }
+        let mut hooks = discover_in_dirs(&hook_dirs(project_root));
+        hooks.repair_paths = hooks.invalid.iter().map(|(path, _)| path.clone()).collect();
+        hooks.apply_cap();
+        hooks.repair_paths.extend(hooks.not_running.iter().map(|(path, _)| path.clone()));
+        hooks
+    }
+
     /// The same discovery against an explicit dir list - the list the
     /// approval reconciliation judges shadowing against.
     fn discover_dirs(project_root: &Path, data_dir: &Path, dirs: &[PathBuf]) -> Self {
@@ -614,7 +627,7 @@ impl Hooks {
         }
         if !self.not_running.is_empty() {
             parts.push(format!(
-                "approved gate hook(s) still hold their approved content but cannot run, failing closed until they can (see openmax --check): {}",
+                "gate hook(s) cannot run, failing closed until they can (see openmax --check): {}",
                 describe(&self.not_running)
             ));
         }

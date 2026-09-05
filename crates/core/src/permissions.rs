@@ -179,20 +179,28 @@ impl Permissions {
         Self::from_files(project_root, &permission_files(project_root), data_dir)
     }
 
+    pub fn discover_for_mode(project_root: &Path, data_dir: &Path, mode: crate::config::ApprovalMode) -> Self {
+        Self::from_files_for_mode(project_root, &permission_files(project_root), data_dir, mode)
+    }
+
     fn from_files(project_root: &Path, paths: &[PathBuf], data_dir: &Path) -> Self {
+        Self::from_files_for_mode(project_root, paths, data_dir, crate::config::ApprovalMode::Ask)
+    }
+
+    fn from_files_for_mode(project_root: &Path, paths: &[PathBuf], data_dir: &Path, mode: crate::config::ApprovalMode) -> Self {
         let mut rules = Vec::new();
         let mut inert_allows = Vec::new();
         for path in paths {
             match load_file(path) {
                 FileLoad::Missing => {}
                 FileLoad::Ok(mut loaded, content_hash) => {
-                    if let Some(dropped) = drop_unapproved_allows(
+                    if let Some(dropped) = (mode != crate::config::ApprovalMode::Auto).then(|| drop_unapproved_allows(
                         &mut loaded,
                         path,
                         &content_hash,
                         project_root,
                         data_dir,
-                    ) {
+                    )).flatten() {
                         inert_allows.push(dropped);
                     }
                     rules.append(&mut loaded);
@@ -437,10 +445,20 @@ type InertAllows = Option<(String, usize)>;
 /// --check report a state neither revision held (a reproduced report read
 /// "1 rules, 2 inert"); the live loader reads once, and #245 set the
 /// discipline.
+#[cfg(test)]
 pub(crate) fn check_file(
     path: &Path,
     project_root: &Path,
     data_dir: &Path,
+) -> Option<Result<(Vec<String>, InertAllows), String>> {
+    check_file_for_mode(path, project_root, data_dir, crate::config::ApprovalMode::Ask)
+}
+
+pub(crate) fn check_file_for_mode(
+    path: &Path,
+    project_root: &Path,
+    data_dir: &Path,
+    mode: crate::config::ApprovalMode,
 ) -> Option<Result<(Vec<String>, InertAllows), String>> {
     match load_file(path) {
         FileLoad::Missing => None,
@@ -450,7 +468,8 @@ pub(crate) fn check_file(
             let tools: Vec<String> = rules.iter().map(|r| r.tool.clone()).collect();
             let allows = rules.iter().filter(|r| r.effect == Effect::Allow).count();
             let inert =
-                drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)
+                (mode != crate::config::ApprovalMode::Auto)
+                    .then(|| drop_unapproved_allows(&mut rules, path, &content_hash, project_root, data_dir)).flatten()
                     .map(|reason| (reason, allows));
             Some(Ok((tools, inert)))
         }

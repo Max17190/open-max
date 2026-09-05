@@ -751,7 +751,7 @@ fn two_calls_to_an_unapproved_tool_cannot_batch_past_the_gate() {
         ],
         record,
     );
-    write_settings_with_mode(&home, &base_url, "auto");
+    write_settings_with_mode(&home, &base_url, "ask");
 
     let tools = project.join(".openmax").join("tools");
     std::fs::create_dir_all(&tools).unwrap();
@@ -804,8 +804,8 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
         ],
         record.clone(),
     );
-    // auto mode: nothing but the content boundary can produce a prompt here.
-    write_settings_with_mode(&home, &base_url, "auto");
+    // The tool declares itself non-mutating, so only its content gate asks.
+    write_settings_with_mode(&home, &base_url, "ask");
 
     let tools = project.join(".openmax").join("tools");
     std::fs::create_dir_all(&tools).unwrap();
@@ -1281,7 +1281,7 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
         (sse_tool_call("selfapprove", serde_json::json!({})), true),
         (sse_text("done"), true),
     ]);
-    write_settings_with_mode(&home, &base_url, "auto");
+    write_settings_with_mode(&home, &base_url, "ask");
     // Trust as the human first (attested), then run the nested session the
     // way an agent's bash would: session marker set, piped stdio, no tty.
     {
@@ -1356,7 +1356,7 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
 #[test]
 fn an_unapproved_sandbox_non_pass_warns_and_does_not_fail_the_check() {
     let (project, home) = fresh_dirs("probe-warn");
-    write_settings_with_mode(&home, "http://127.0.0.1:9/v1", "auto");
+    write_settings_with_mode(&home, "http://127.0.0.1:9/v1", "ask");
     let tools = project.join(".openmax").join("tools");
     std::fs::create_dir_all(&tools).unwrap();
     // Its example always exits nonzero. Unapproved, it runs only as a sandboxed
@@ -1420,4 +1420,39 @@ fn spec_usage_names_memory_cost_and_never_claims_zero() {
         text.contains("staging-port") && text.contains("memory"),
         "the installed memory note is named with its cost:\n{text}"
     );
+}
+
+#[test]
+fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
+    let (project, home) = fresh_dirs("saved-auto");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    std::fs::write(project.join(".openmax/tools/create.toml"),
+        "name = \"create\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo saved-auto > result\"]\nmutating = true\n"
+    ).unwrap();
+    let (base_url, _, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("create", serde_json::json!({})), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings(&home, &base_url);
+    let mut select = cmd(&project, &home).args(["--trust-project", "--stdio"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    select.stdin.take().unwrap().write_all(b"{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}\n{\"cmd\":\"quit\"}\n").unwrap();
+    let selected = select.wait_with_output().unwrap();
+    assert!(selected.status.success(), "{}", String::from_utf8_lossy(&selected.stderr));
+    let selected = String::from_utf8(selected.stdout).unwrap();
+    assert!(selected.contains("\"type\":\"approval_mode\""), "{selected}");
+
+    let mut child = cmd(&project, &home).arg("--stdio").env("OPENMAX_SESSION", "parent")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"{\"cmd\":\"approval_mode\",\"mode\":\"ask\"}\n{\"cmd\":\"quit\"}\n").unwrap();
+    let denied = child.wait_with_output().unwrap();
+    let denied = String::from_utf8(denied.stdout).unwrap();
+    assert!(denied.contains("human-controlled frontend"), "{denied}");
+
+    let output = cmd(&project, &home).args(["-p", "run create"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string(project.join("result")).unwrap(), "saved-auto\n");
+    let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(".openmax/settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["approval_mode"], "ask", "the global default must not change");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }

@@ -1101,9 +1101,7 @@ impl App {
                     self.core.respond_approval(&id, false);
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.core.set_run_approval_mode(config::ApprovalMode::Auto);
-                    self.core.respond_approval(&id, true);
-                    self.note("approvals set to auto for this run (change with /approvals)");
+                    self.respond_approval_choice(1);
                 }
                 _ => {
                     let _ = name;
@@ -1438,30 +1436,26 @@ impl App {
         }
     }
 
-    /// Cycle how much the agent may do without asking, for this run.
-    ///
-    /// Deliberately not persisted. `/approvals` is the path that writes
-    /// settings.json, because widening the trust boundary for every future
-    /// session in a project should cost a typed command. A key one slip away
-    /// from `auto` must not do it quietly, so the change lives and dies with
-    /// the run and the acknowledgement says exactly that. This mirrors the
-    /// approval card's "allow for run", which is already run-scoped.
-    fn cycle_approval_mode(&mut self) {
-        let mode = self.core.approval_mode().next();
-        self.core.set_run_approval_mode(mode);
-        // Terse on purpose: cycling to the mode you want costs one line per
-        // press, and the status line already carries the live value. It stays
-        // a transcript note because below 54 columns the status line drops the
-        // mode entirely, and a widened trust boundary must never be silent.
-        self.note(&format!(
-            "approvals: {} for this run (/approvals persists)",
-            mode.as_str(),
-        ));
-        // The status line carries the live mode; nothing else repaints.
-        self.dirty.mark_chrome();
+    /// All mode selectors save the same project-scoped choice.
+    fn select_approval_mode(&mut self, mode: config::ApprovalMode) -> bool {
+        match self.core.set_project_approval_mode(&self.project, mode) {
+            Ok(()) => {
+                self.note(&format!("approvals: {} for this project (saved)", mode.as_str()));
+                self.dirty.mark_chrome();
+                true
+            }
+            Err(reason) => {
+                self.note(&format!("approval mode unchanged: {reason}"));
+                false
+            }
+        }
     }
 
-    /// Approval hit regions use the fixed order allow once, allow for run,
+    fn cycle_approval_mode(&mut self) {
+        self.select_approval_mode(self.core.approval_mode(&self.project).next());
+    }
+
+    /// Approval hit regions use the fixed order allow once, auto for project,
     /// deny. Keyboard handling remains the authoritative path.
     fn respond_approval_choice(&mut self, choice: usize) {
         let Some((id, _, _, _, _)) = self.pending_approval.clone() else {
@@ -1470,9 +1464,9 @@ impl App {
         match choice {
             0 => self.core.respond_approval(&id, true),
             1 => {
-                self.core.set_run_approval_mode(config::ApprovalMode::Auto);
-                self.core.respond_approval(&id, true);
-                self.note("approvals set to auto for this run (change with /approvals)");
+                if self.select_approval_mode(config::ApprovalMode::Auto) {
+                    self.core.respond_approval(&id, true);
+                }
             }
             2 => self.core.respond_approval(&id, false),
             _ => {}
@@ -2256,17 +2250,7 @@ impl App {
                 }
             }
             "approvals" => match rest.first().and_then(|m| config::ApprovalMode::parse(m)) {
-                Some(mode) => {
-                    {
-                        let mut s = self.core.settings.lock().unwrap();
-                        s.approval_mode = mode;
-                        let _ = self.core.save_settings(&s);
-                    }
-                    // An explicit persisted choice outranks a run override,
-                    // which would otherwise keep masking it.
-                    self.core.clear_run_approval_mode();
-                    self.note(&format!("approvals: {}", mode.as_str()));
-                }
+                Some(mode) => { self.select_approval_mode(mode); }
                 None => self.note("usage: /approvals auto|ask|readonly"),
             },
             "resume" => {
@@ -2463,7 +2447,7 @@ impl App {
                     kv("model", &model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
-                    kv("approvals", self.core.approval_mode().as_str()),
+                    kv("approvals", self.core.approval_mode(&self.project).as_str()),
                     kv(
                         "context",
                         &if context_tokens == 0 {
@@ -3608,7 +3592,7 @@ impl App {
             self.status_width = area.width;
             // Read the mode before taking the settings lock: the accessor
             // takes it too, and this mutex is not reentrant.
-            let approvals = self.core.approval_mode().as_str().to_string();
+            let approvals = self.core.approval_mode(&self.project).as_str().to_string();
             let model = self.core.settings.lock().unwrap().model.clone();
             let width = area.width as usize;
             let hint = self.status_hint();
@@ -3669,7 +3653,7 @@ impl App {
         } else if self.transcript.has_text_selection() {
             "ctrl+c copy selection · esc clear"
         } else if self.pending_approval.is_some() {
-            "y allow once · a allow for run · n deny"
+            "y allow once · a auto for project · n deny"
         } else if self.history_search.is_some() {
             "↑↓ pick · enter insert · esc close"
         } else if self.scroll_search.is_some() {
@@ -3727,7 +3711,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "queue the message for after this turn"),
     ("tab", "focus conversation ↔ composer"),
-    ("shift+tab", "cycle approvals for this run: ask → auto → readonly"),
+    ("shift+tab", "cycle saved project approvals: ask → auto → readonly"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
     ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
@@ -4105,7 +4089,7 @@ fn paint_text_selection(
 }
 
 const APPROVAL_LABELS: [&str; 3] =
-    ["▸ [y] Allow once", "   [a] Allow for run", "   [n] Deny"];
+    ["▸ [y] Allow once", " [a] Auto for project", " [n] Deny"];
 
 fn approval_choice_line() -> Line<'static> {
     Line::from(vec![
@@ -4391,6 +4375,7 @@ mod tests {
     fn app_fixture() -> (App, std::path::PathBuf) {
         let dir = crate::test_temp_dir("openmax-app-render");
         let (core, _rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
         let app = App::new(core, dir.clone(), files_tx);
         (app, dir)
@@ -4822,6 +4807,17 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn selected_auto_survives_restart_for_this_project_only() {
+        let (mut app, dir) = app_fixture();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        let (restarted, _) = Core::new(dir.clone()).unwrap();
+        assert_eq!(restarted.approval_mode(&app.project), config::ApprovalMode::Auto);
+        assert_eq!(config::load(&dir).unwrap().approval_mode, config::ApprovalMode::Ask);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn shift_tab_events() -> [KeyEvent; 2] {
         [
             // What most terminals send (CSI Z), reported with no modifier.
@@ -4850,7 +4846,7 @@ mod tests {
     async fn shift_tab_cycles_approvals_in_both_encodings() {
         for key in shift_tab_events() {
             let (mut app, dir) = app_fixture();
-            let mode = |app: &App| app.core.approval_mode();
+            let mode = |app: &App| app.core.approval_mode(&app.project);
             assert_eq!(mode(&app), config::ApprovalMode::Ask, "fixture default");
 
             app.on_key(key).await.unwrap();
@@ -4863,10 +4859,9 @@ mod tests {
         }
     }
 
-    /// The trust boundary only widens for every future session through a typed
-    /// command. A keystroke must not write settings.json.
+    /// A saved project choice must not change the global settings default.
     #[tokio::test]
-    async fn shift_tab_does_not_persist_the_widened_mode() {
+    async fn shift_tab_does_not_change_the_global_default() {
         let (mut app, dir) = app_fixture();
         let on_disk = {
             let settings = app.core.settings.lock().unwrap().clone();
@@ -4880,7 +4875,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.core.approval_mode(),
+            app.core.approval_mode(&app.project),
             config::ApprovalMode::Auto,
             "the run should see the new mode",
         );
@@ -4911,7 +4906,7 @@ mod tests {
                 "shift+tab did not wrap to the last item",
             );
             assert_eq!(
-                app.core.approval_mode(),
+                app.core.approval_mode(&app.project),
                 config::ApprovalMode::Ask,
                 "an open popup let the key through to the trust boundary",
             );
@@ -4928,7 +4923,7 @@ mod tests {
             ));
             app.on_key(key).await.unwrap();
             assert_eq!(
-                app.core.approval_mode(),
+                app.core.approval_mode(&app.project),
                 config::ApprovalMode::Ask,
                 "shift+tab changed approvals out from under a pending card",
             );
@@ -4972,11 +4967,9 @@ mod tests {
         }
     }
 
-    /// The leak this design exists to prevent: every save path serializes the
-    /// whole `Settings`, so a run-scoped mode kept there would ride along on
-    /// the next unrelated write and outlive the run.
+    /// Model saves serialize Settings, so the project mode lives separately.
     #[tokio::test]
-    async fn an_unrelated_save_cannot_persist_the_run_scoped_mode() {
+    async fn an_unrelated_save_cannot_change_the_approval_default() {
         let (mut app, dir) = app_fixture();
         {
             let settings = app.core.settings.lock().unwrap().clone();
@@ -4986,7 +4979,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Auto);
+        assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
 
         // Any later write of the shared settings: picking a model.
         app.persist_model_selection(Some("alpha".into()), "some/model".into());
@@ -4994,19 +4987,19 @@ mod tests {
         assert_eq!(
             config::load(&dir).unwrap().approval_mode,
             config::ApprovalMode::Ask,
-            "a model save carried the run-scoped approval mode to disk",
+            "a model save carried the project approval mode to disk",
         );
         assert_eq!(
-            app.core.approval_mode(),
+            app.core.approval_mode(&app.project),
             config::ApprovalMode::Auto,
             "the run should still see its own mode",
         );
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The approval card's "allow for run" is run-scoped for the same reason.
+    /// The card saves project authority without widening the global default.
     #[tokio::test]
-    async fn allow_for_run_does_not_reach_disk_either() {
+    async fn auto_for_project_does_not_change_the_global_default() {
         let (mut app, dir) = app_fixture();
         {
             let settings = app.core.settings.lock().unwrap().clone();
@@ -5018,36 +5011,35 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await
             .unwrap();
-        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Auto);
+        assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
 
         app.persist_model_selection(None, "some/model".into());
         assert_eq!(
             config::load(&dir).unwrap().approval_mode,
             config::ApprovalMode::Ask,
-            "allow-for-run reached disk through an unrelated save",
+            "project auto reached global settings through an unrelated save",
         );
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A typed, persisted choice has to outrank a run override, or it would
-    /// stay masked for the rest of the session.
+    /// A typed choice replaces the mode selected by the cycle key.
     #[tokio::test]
-    async fn typed_approvals_command_outranks_a_run_override() {
+    async fn typed_approvals_command_replaces_the_project_choice() {
         let (mut app, dir) = app_fixture();
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Auto);
+        assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
 
         app.handle_submit("/approvals readonly".into()).await.unwrap();
 
         assert_eq!(
-            app.core.approval_mode(),
+            app.core.approval_mode(&app.project),
             config::ApprovalMode::Readonly,
-            "the run override kept masking the typed choice",
+            "the previous choice kept masking the typed choice",
         );
         assert_eq!(
-            config::load(&dir).unwrap().approval_mode,
+            Core::new(dir.clone()).unwrap().0.approval_mode(&app.project),
             config::ApprovalMode::Readonly,
         );
         fs::remove_dir_all(dir).unwrap();
@@ -5062,7 +5054,7 @@ mod tests {
             .await
             .unwrap();
         assert!(app.focus == Focus::Scrollback);
-        assert_eq!(app.core.approval_mode(), config::ApprovalMode::Ask);
+        assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Ask);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6440,7 +6432,7 @@ mod tests {
         let pending_text = buffer_text(&pending);
         assert!(pending_text.contains("Approval"));
         assert!(pending_text.contains("[y] Allow once"));
-        assert!(pending_text.contains("[a] Allow for run"));
+        assert!(pending_text.contains("[a] Auto for project"));
         assert!(!pending_text.contains("keep this draft"));
         assert!(app.approval_hits.iter().all(Option::is_some));
 
@@ -6460,7 +6452,7 @@ mod tests {
         assert!(text.contains("Shell"));
         assert!(text.contains("cargo test"));
         assert!(text.contains("[y] Allow once"));
-        assert!(text.contains("[a] Allow for run"));
+        assert!(text.contains("[a] Auto for project"));
         assert!(text.contains("[n] Deny"));
     }
 

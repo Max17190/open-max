@@ -36,7 +36,8 @@ does. See [extending](extending.md#proof-of-life).
 
 In print mode, text goes to stdout and tool progress to stderr. With `--json`,
 each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
-`approval_mode`; for unattended runs set `"approval_mode": "auto"`.
+`approval_mode`; select `/approvals auto` once in the trusted project for
+unattended runs.
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
@@ -54,7 +55,7 @@ and one openmax driving another. It is specified in
 | **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Cycle approvals for this run: `ask` → `auto` → `readonly` (`/approvals` persists) |
+| **Shift+Tab** | Cycle and save project approvals: `ask` → `auto` → `readonly` |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** twice | Quit |
 
@@ -67,7 +68,7 @@ and one openmax driving another. It is specified in
 | `/model <id>` | Set an exact model id on the active endpoint |
 | `/copy` | Copy the latest assistant response |
 | `/provider [name]` | List or switch providers |
-| `/approvals auto\|ask\|readonly` | Mutating tool gates |
+| `/approvals auto\|ask\|readonly` | Save this project's execution mode |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/reload` | Force a re-freeze now (it also happens automatically when extension files change) |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |

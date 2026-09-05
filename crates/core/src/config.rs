@@ -19,17 +19,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Gate for mutating tools. Parsed strictly: an unrecognized value is a
+/// Execution policy for tools and extensions. Parsed strictly: an unrecognized value is a
 /// configuration error, never a silent fallback, because a typo here would
 /// otherwise weaken the approval gate the user asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
-    /// Run everything without prompting.
+    /// Skip confirmation and extension content grants; retain deny rules and validation.
     Auto,
-    /// Prompt before mutating tools.
+    /// Prompt for mutating tools and unapproved external content.
     Ask,
-    /// Block mutating tools entirely.
+    /// Block mutating tools and calls requiring approval.
     Readonly,
 }
 
