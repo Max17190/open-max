@@ -1793,8 +1793,7 @@ fn refreeze_receipt_text(
         note.push_str(&format!(
             " Removed tools with a surviving approval: {} — the manifest's approval is still \
              recorded in the ledger, so if the exact approved bytes are restored they may run \
-             without a card (a legacy or hash-only approval predates object storage, so its \
-             bytes may not be restorable from the ledger - check with openmax --ledger). The \
+             without a card (openmax --ledger says whether it still holds those bytes). The \
              code on disk was edited or deleted, so restoring the manifest alone would ask \
              again; nothing needs forgetting (openmax --forget is for hooks).",
             added.removed_approval_survives.join(", ")
@@ -1860,8 +1859,8 @@ struct AddedTools {
     /// if nothing survived is wrong; yet the current disk bytes are
     /// not approved, so this must NOT claim they run without a card. Whether
     /// the original bytes can actually be restored depends on whether the
-    /// approval stored objects (a legacy or hash-only approval did not), so the
-    /// clause says "may" and points at openmax --ledger. A distinct clause.
+    /// ledger's stored objects are still intact, so the clause says "may" and
+    /// points at openmax --ledger. A distinct clause.
     removed_approval_survives: Vec<String>,
 }
 
