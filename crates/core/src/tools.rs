@@ -467,9 +467,8 @@ fn make_diff(root: &Path, path: &Path, old: &str, new: &str) -> DiffInfo {
     diff_strings(&rel_display(root, path), old, new)
 }
 
-/// Unified diff between two versions of a file. Shared with the cumulative
-/// thread diff command in lib.rs.
-pub fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
+/// Unified diff between two versions of a file.
+fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
     let text_diff = TextDiff::from_lines(old, new);
     let mut added = 0;
     let mut removed = 0;

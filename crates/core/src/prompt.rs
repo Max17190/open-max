@@ -42,18 +42,9 @@ const MAX_SKILL_NAME_SHOWN: usize = 64;
 const MEMORY_SECTION_HEADER: &str =
     "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n";
 
-/// System prompt: short, imperative, explicit about tool use, and every line
-/// has to earn its place. Long "constitution"-style prompts measurably degrade
-/// model performance, and the degradation starts well below the context limit,
-/// so brevity here is a quality decision before it is a token one.
-///
-/// Grounding context (AGENTS.md, a shallow layout map) is appended here, once,
-/// at session creation: the prompt is persisted with the session, so the token
-/// prefix stays byte-stable across every turn — which is what keeps the
-/// server-side prompt cache warm. Without the map, a session typically opens
-/// with two or three list_dir/glob calls just to learn the layout, and each
-/// of those is a full prefill+decode round trip.
-pub fn system_prompt(project_root: &Path, registry: &Registry) -> String {
+/// The prompt text alone, for tests that only assert on its content.
+#[cfg(test)]
+fn system_prompt(project_root: &Path, registry: &Registry) -> String {
     system_prompt_with_breakdown(project_root, registry).0
 }
 
@@ -107,6 +98,17 @@ impl PromptBreakdown {
     }
 }
 
+/// System prompt: short, imperative, explicit about tool use, and every line
+/// has to earn its place. Long "constitution"-style prompts measurably degrade
+/// model performance, and the degradation starts well below the context limit,
+/// so brevity here is a quality decision before it is a token one.
+///
+/// Grounding context (AGENTS.md, a shallow layout map) is appended here, once,
+/// at session creation: the prompt is persisted with the session, so the token
+/// prefix stays byte-stable across every turn, which is what keeps the
+/// server-side prompt cache warm. Without the map, a session typically opens
+/// with two or three list_dir/glob calls just to learn the layout, and each
+/// of those is a full prefill+decode round trip.
 pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
