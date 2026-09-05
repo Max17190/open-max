@@ -744,7 +744,7 @@ async fn main() -> std::io::Result<()> {
                 let shape_path =
                     if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
                 if let Some(line) =
-                    open_max_core::hooks::approved_shape_line(&shape_path, &project, &bytes)
+                    open_max_core::hooks::approved_shape_line(&shape_path, &project, &default_data_dir(), &bytes)
                 {
                     println!("{line}");
                 }

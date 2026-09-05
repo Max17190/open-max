@@ -133,6 +133,10 @@ pub struct Core {
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Serializes read-modify-write cycles on the session index file.
     pub sessions_lock: Mutex<()>,
+    /// Process ownership lasts as long as writable session state is attached.
+    pub(crate) session_owners: Mutex<HashMap<String, crate::sessions::SessionOwner>>,
+    /// Panic restorations must finish before the terminal receipt releases a turn.
+    pub(crate) message_restorations: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Content hash of settings.json as this process last knew it: the bytes
     /// read at launch, refreshed by [`Core::save_settings`]. Settings are
     /// launch-frozen, so any other change to the file is drift this process
@@ -214,6 +218,8 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
+            session_owners: Default::default(),
+            message_restorations: Default::default(),
             settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             events: tx,
         });
@@ -253,6 +259,8 @@ impl Core {
             cancel_flags: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
+            session_owners: Default::default(),
+            message_restorations: Default::default(),
             settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             events: tx,
         });

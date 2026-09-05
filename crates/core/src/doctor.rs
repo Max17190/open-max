@@ -409,7 +409,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut hook_extras: Vec<Finding> = Vec::new();
     // Indices into `hooks_found`, emitted only for the entries that load.
     let mut hook_clamps: Vec<(usize, String)> = Vec::new();
-    for dir in crate::hooks::hook_dirs(project_root) {
+    for dir in crate::hooks::hook_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "toml") {
             // Hooks resolve by file stem, and the first stem to appear claims
             // it whether or not the file parses.
@@ -648,7 +648,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // human finds out which file it means.
     if let Some(approvals) = (!auto).then(|| crate::ledger::approvals(data_dir, project_root).ok()).flatten() {
         for path in approvals.live_paths() {
-            if path.exists() || !crate::hooks::is_hook_manifest(path, project_root) {
+            if path.exists() || !crate::hooks::is_hook_manifest(path, project_root, data_dir) {
                 continue;
             }
             findings.push(Finding {
@@ -662,7 +662,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
 
-    for path in crate::permissions::permission_files(project_root) {
+    for path in crate::permissions::permission_files(data_dir, project_root) {
         let Some(result) = crate::permissions::check_file_for_mode(&path, project_root, data_dir, mode) else {
             continue;
         };
@@ -822,7 +822,7 @@ fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding>
             }
         }
     }
-    for dir in crate::hooks::hook_dirs(project_root) {
+    for dir in crate::hooks::hook_dirs(data_dir, project_root) {
         for path in files_with_extension(&dir, "toml") {
             if let Ok(hook) = crate::hooks::parse_hook_file(&path) {
                 warn("hook", path.clone(), &hook.command, &hook.args);
@@ -2136,6 +2136,42 @@ mod tests {
             .iter()
             .find(|f| f.path.to_string_lossy().contains(needle))
             .unwrap_or_else(|| panic!("no finding for {needle}"))
+    }
+
+    #[test]
+    fn global_hooks_and_permissions_follow_the_supplied_data_directory() {
+        use crate::config::ApprovalMode;
+        use crate::permissions::{PermissionDecision, Permissions};
+        let base = std::env::temp_dir().join(format!("openmax-global-{}", uuid::Uuid::new_v4()));
+        let project = base.join("project");
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(first.join("hooks")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let hook = first.join("hooks/check.toml");
+        std::fs::write(&hook, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        std::fs::write(first.join("permissions.toml"), "[[rules]]\neffect = \"deny\"\ntool = \"bash\"\n").unwrap();
+        std::fs::write(second.join("permissions.toml"), "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n").unwrap();
+        let args = serde_json::json!({"command": "echo test"});
+        for mode in [ApprovalMode::Auto, ApprovalMode::Ask, ApprovalMode::Readonly] {
+            assert!(matches!(Permissions::discover_for_mode(&project, &first, mode).evaluate("bash", &args), PermissionDecision::Deny { .. }));
+        }
+        assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Auto).evaluate("bash", &args), PermissionDecision::Allow));
+        assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Ask).evaluate("bash", &args), PermissionDecision::Allow));
+        assert!(!crate::hooks::Hooks::discover_for_mode(&project, &first, ApprovalMode::Auto).is_empty());
+        assert!(crate::hooks::Hooks::discover_for_mode(&project, &second, ApprovalMode::Auto).is_empty());
+        let fingerprint = crate::hooks::hooks_fingerprint(&first, &project);
+        let unrelated = crate::hooks::hooks_fingerprint(&second, &project);
+        std::fs::write(&hook, "event = \"pre_tool_use\"\ncommand = \"/bin/false\"\n").unwrap();
+        assert_ne!(crate::hooks::hooks_fingerprint(&first, &project), fingerprint);
+        assert_eq!(crate::hooks::hooks_fingerprint(&second, &project), unrelated);
+        assert!(check_at(&project, &first).iter().any(|f| f.path == hook));
+        assert!(!check_at(&project, &second).iter().any(|f| f.path == hook));
+        std::fs::create_dir_all(project.join(".openmax")).unwrap();
+        std::fs::write(project.join(".openmax/permissions.toml"), "[[rules]]\neffect = \"deny\"\ntool = \"bash\"\n").unwrap();
+        assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Auto).evaluate("bash", &args), PermissionDecision::Deny { .. }));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// A capability whose script was rewritten after approval must not read

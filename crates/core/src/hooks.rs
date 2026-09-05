@@ -273,7 +273,7 @@ impl Hooks {
     /// disk. Discovery is one directory list per turn, so there is nothing
     /// worth that risk.
     pub fn discover(project_root: &Path, data_dir: &Path) -> Self {
-        Self::discover_dirs(project_root, data_dir, &hook_dirs(project_root))
+        Self::discover_dirs(project_root, data_dir, &hook_dirs(data_dir, project_root))
     }
 
     /// Auto authorizes the current validated files. It grants no hashes in
@@ -282,7 +282,7 @@ impl Hooks {
         if mode != crate::config::ApprovalMode::Auto {
             return Self::discover(project_root, data_dir);
         }
-        let mut hooks = discover_in_dirs(&hook_dirs(project_root));
+        let mut hooks = discover_in_dirs(&hook_dirs(data_dir, project_root));
         hooks.repair_paths = hooks.invalid.iter().map(|(path, _)| path.clone()).collect();
         hooks.apply_cap();
         hooks.repair_paths.extend(hooks.not_running.iter().map(|(path, _)| path.clone()));
@@ -299,8 +299,8 @@ impl Hooks {
 
     /// Keep only hooks whose exact content a human approved - the TOML *and*
     /// the project-local code it runs. Hooks run with host authority on every
-    /// matching call with no per-invocation gate, so they are the one
-    /// capability file that is inert until approved: `openmax --approve
+    /// matching call with no per-invocation gate. Outside auto mode they
+    /// remain inert until approved: `openmax --approve
     /// <path>`, a human act from outside any agent turn. An in-session
     /// write approval approves the write and nothing more - the card shows
     /// a clipped preview, and a preview is not shown bytes.
@@ -938,8 +938,8 @@ fn resolve_for_repair(path: &Path) -> Option<PathBuf> {
 /// it will not do because an observer described as a completion gate is the
 /// mismatch a human is most likely to approve by accident, and that approval
 /// is the last place it can be caught.
-pub fn approved_shape_line(path: &Path, project_root: &Path, bytes: &[u8]) -> Option<String> {
-    if !is_hook_manifest(path, project_root) {
+pub fn approved_shape_line(path: &Path, project_root: &Path, data_dir: &Path, bytes: &[u8]) -> Option<String> {
+    if !is_hook_manifest(path, project_root, data_dir) {
         return None;
     }
     let text = std::str::from_utf8(bytes).ok()?;
@@ -951,8 +951,8 @@ pub fn approved_shape_line(path: &Path, project_root: &Path, bytes: &[u8]) -> Op
     })
 }
 
-pub(crate) fn is_hook_manifest(path: &Path, project_root: &Path) -> bool {
-    manifest_in_dirs(path, &hook_dirs(project_root))
+pub(crate) fn is_hook_manifest(path: &Path, project_root: &Path, data_dir: &Path) -> bool {
+    manifest_in_dirs(path, &hook_dirs(data_dir, project_root))
 }
 
 /// The same question against the dirs a discovery actually read, so
@@ -1131,24 +1131,19 @@ fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-pub(crate) fn hook_dirs(project_root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![project_root.join(".openmax").join("hooks")];
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".openmax").join("hooks"));
-    }
-    dirs
+pub(crate) fn hook_dirs(data_dir: &Path, project_root: &Path) -> Vec<PathBuf> {
+    vec![project_root.join(".openmax/hooks"), data_dir.join("hooks")]
 }
 
 /// Content identity of every hook manifest on disk (paths + bytes), for the
 /// mid-turn "you just wrote a hook" receipt: hooks are outside the
-/// extension fingerprint (they are discovered per turn, since an
-/// agent-written hook is inert until a human approves it), so a write to
+/// extension fingerprint (they are discovered per turn), so a write to
 /// one otherwise gets no receipt at all until the next turn's policy notice
 /// - a whole turn in which the agent may believe its gate is live.
-pub(crate) fn hooks_fingerprint(project_root: &Path) -> u64 {
+pub(crate) fn hooks_fingerprint(data_dir: &Path, project_root: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for dir in hook_dirs(project_root) {
+    for dir in hook_dirs(data_dir, project_root) {
         dir.hash(&mut h);
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut files: Vec<PathBuf> = rd
@@ -1980,7 +1975,7 @@ mod tests {
     }
 
     fn approve_all_hooks(project: &Path, data: &Path) {
-        for dir in hook_dirs(project) {
+        for dir in hook_dirs(data, project) {
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
             for entry in rd.flatten() {
                 approve_hook_file(project, data, &entry.path());

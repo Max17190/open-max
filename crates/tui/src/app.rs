@@ -618,15 +618,20 @@ impl App {
     fn replay(&mut self, session_id: &str) {
         // The resumed /context sentence is replay's own observation. What
         // pends it is anything the next accepted turn will restore: the
-        // frozen capability manifest (hydration prefers it even when the
-        // transcript is unreadable) or persisted messages. A session with
+        // frozen capability manifest or readable persisted messages. A session with
         // neither (a hook-rejected first submit leaves an indexed, empty,
         // manifest-less one) has nothing to load, so resuming it IS a
         // fresh start.
         let has_manifest = sessions::load_manifest(&self.core, session_id).is_some();
         self.resumed_awaiting_hydration = has_manifest;
-        let Some(messages) = sessions::load_messages(&self.core, session_id) else {
+        if let Err(e) = sessions::attach(&self.core, session_id) {
+            self.error(&e);
             return;
+        }
+        let messages = match sessions::load_messages(&self.core, session_id) {
+            Ok(Some(messages)) => messages,
+            Ok(None) => return,
+            Err(e) => { self.error(&e); return; }
         };
         self.resumed_awaiting_hydration = has_manifest || !messages.is_empty();
         // This sitting is a new boundary; earlier boundaries render below.
@@ -736,10 +741,16 @@ impl App {
     }
 
     /// Clear transcript and per-session UI state for `/new`.
-    fn reset_for_new_session(&mut self) {
+    fn reset_for_new_session(&mut self) -> bool {
         if self.running {
             if let Some(id) = &self.session_id {
                 self.core.cancel(id);
+            }
+        }
+        if let Some(id) = &self.session_id {
+            if let Err(e) = sessions::detach(&self.core, id) {
+                self.error(&e);
+                return false;
             }
         }
         self.session_id = None;
@@ -797,6 +808,7 @@ impl App {
         self.transcript.follow();
         self.dirty.mark_chat();
         self.dirty.mark_chrome();
+        true
     }
 
     // ---------- terminal events ----------
@@ -1963,7 +1975,14 @@ impl App {
                         self.note("already in this session");
                         return;
                     }
-                    self.reset_for_new_session();
+                    if let Err(e) = sessions::attach(&self.core, &id) {
+                        self.error(&e);
+                        return;
+                    }
+                    if !self.reset_for_new_session() {
+                        let _ = sessions::detach(&self.core, &id);
+                        return;
+                    }
                     self.session_id = Some(id.clone());
                     self.replay(&id);
                 }
@@ -2299,14 +2318,7 @@ impl App {
                 }
             },
             "new" => {
-                let old_id = self.session_id.clone();
-                self.reset_for_new_session();
-                if let Some(id) = old_id {
-                    if let Ok(mut sessions) = self.core.sessions.try_lock() {
-                        sessions.remove(&id);
-                    }
-                }
-                self.note("new session");
+                if self.reset_for_new_session() { self.note("new session"); }
             }
             "context" => {
                 // A hydrated session shows its frozen breakdown; before any

@@ -53,6 +53,72 @@ pub struct SessionMeta {
     pub resume_points: Vec<u64>,
 }
 
+/// The lock file is never removed: unlinking it would let a second inode
+/// acquire the same session name while the first owner still holds its lock.
+pub(crate) struct SessionOwner {
+    _file: std::fs::File,
+    detach: bool,
+}
+
+/// Claim a writable attachment before reading its transcript or running hooks.
+/// Repeated calls from this core share ownership, including between turns.
+pub fn attach(core: &Core, id: &str) -> Result<(), String> {
+    claim_session(core, id, true, true)
+}
+
+/// A finishing turn may still persist after its frontend detached. Such a
+/// write retains ownership without cancelling the requested cleanup.
+pub(crate) fn ensure_owned(core: &Core, id: &str) -> Result<(), String> {
+    claim_session(core, id, true, false)
+}
+
+fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Result<(), String> {
+    use fs2::FileExt;
+    let mut owners = core.session_owners.lock().unwrap();
+    if let Some(owner) = owners.get_mut(id) {
+        if reactivate {
+            load_messages(core, id)?;
+            owner.detach = false;
+        }
+        return Ok(());
+    }
+    let path = sessions_dir(core).join(format!("{id}.lock"));
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+        .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
+    file.try_lock_exclusive().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            format!("session {id} is already open in another process; close it there or start a new session")
+        } else { format!("cannot lock session {id}: {e}") }
+    })?;
+    if validate { load_messages(core, id)?; }
+    owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
+    Ok(())
+}
+
+/// Release idle state, or defer release until an in-flight turn has settled.
+/// The caller may switch frontends immediately after requesting cancellation.
+pub fn detach(core: &Core, id: &str) -> Result<(), String> {
+    let mut state = core.sessions.try_lock().map_err(|_| "session state is busy; try again")?;
+    let running = core.running.lock().unwrap();
+    let mut owners = core.session_owners.lock().unwrap();
+    if running.contains(id) {
+        if let Some(owner) = owners.get_mut(id) { owner.detach = true; }
+    } else {
+        state.remove(id);
+        owners.remove(id);
+    }
+    Ok(())
+}
+
+/// Called under both the session map and running locks, after turn cleanup.
+pub(crate) fn finish_detach(core: &Core, id: &str, state: &mut std::collections::HashMap<String, crate::state::SessionData>) {
+    let mut owners = core.session_owners.lock().unwrap();
+    if owners.get(id).is_some_and(|owner| owner.detach) {
+        state.remove(id);
+        owners.remove(id);
+    }
+}
+
 pub const UNTITLED: &str = "New session";
 
 fn now() -> u64 {
@@ -150,6 +216,10 @@ pub struct TokenUsage {
 /// is a record of work already done, so a full disk must not fail the turn
 /// that succeeded.
 pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
+    if let Err(message) = ensure_owned(core, id) {
+        core.send_agent(id, AgentEvent::Error { message });
+        return;
+    }
     let _guard = core.sessions_lock.lock().unwrap();
     if !still_indexed_locked(core, id) {
         return;
@@ -287,6 +357,10 @@ pub fn load_archive(core: &Core, id: &str) -> Vec<ChatMessage> {
 /// means a session that predates manifests and resolves to built-ins until
 /// its first turn re-freezes it from disk.
 pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::RegistryManifest) {
+    if let Err(message) = ensure_owned(core, id) {
+        core.send_agent(id, AgentEvent::Error { message });
+        return;
+    }
     let Ok(json) = serde_json::to_string_pretty(manifest) else {
         return;
     };
@@ -557,12 +631,14 @@ pub(crate) fn commit_compaction(
     record: Option<&CompactionRecord>,
     before_len: usize,
 ) -> Result<(), String> {
+    ensure_owned(core, id)?;
     let _store = lock_store(core)?;
     let mut metas = match read_index(core) {
         IndexRead::Loaded(metas) => metas,
         _ => return Err("compaction requires a readable session index".into()),
     };
     let meta = metas.iter_mut().find(|m| m.id == id).ok_or("compaction session was deleted")?;
+    load_messages_locked(core, id)?;
     let undo = CompactionUndo {
         id: id.to_string(),
         messages: optional_bytes(&messages_path(core, id))?,
@@ -640,6 +716,7 @@ fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
 }
 
 fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
     // Serialize the whole tail first, then one write. Callers must heal on
     // failure (rewrite the full file) so a partial write cannot be re-appended
     // and duplicate complete lines when `persisted` is left unchanged.
@@ -651,8 +728,17 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(path)
         .map_err(|e| e.to_string())?;
+    // A complete JSON record need not end in a newline. Separate the next
+    // record rather than turning two valid messages into one damaged line.
+    if file.metadata().map_err(|e| e.to_string())?.len() > 0 {
+        file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+        let mut last = [0u8];
+        file.read_exact(&mut last).map_err(|e| e.to_string())?;
+        if last[0] != b'\n' { buf.insert(0, '\n'); }
+    }
     file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
     file.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -703,6 +789,7 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 /// truncation-only prune inserts its note at 2; hydration of a transcript
 /// saved without its system prompt inserts that prompt at 0.
 pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
+    ensure_owned(core, id)?;
     with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             for p in &mut m.resume_points {
@@ -718,6 +805,10 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<
 /// messages already on disk. Index zero is an empty session, not a
 /// boundary; repeats (resuming again before any new turn) are deduplicated.
 pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
+    if let Err(message) = ensure_owned(core, id) {
+        core.send_agent(id, AgentEvent::Error { message });
+        return;
+    }
     if message_index == 0 {
         return;
     }
@@ -731,6 +822,8 @@ pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
 }
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
+    // Explicit deletion may remove damaged data, but never a foreign writer.
+    claim_session(core, id, false, false)?;
     // Stop the session's work before removing its files. A frontend may
     // delete the session it is currently running, and a turn that keeps going
     // keeps writing: every sidecar here is opened with `create`, so an
@@ -760,6 +853,8 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     let _ = std::fs::remove_file(compaction_path(core, id));
     let _ = std::fs::remove_file(archive_path(core, id));
     let _ = std::fs::remove_file(usage_path(core, id));
+    drop(_store);
+    let _ = detach(core, id);
     Ok(())
 }
 
@@ -786,6 +881,10 @@ pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
 
 /// Set the title from the first user message, once.
 pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
+    if let Err(message) = ensure_owned(core, id) {
+        core.send_agent(id, AgentEvent::Error { message });
+        return;
+    }
     let title = title.trim().chars().take(48).collect::<String>();
     if title.is_empty() {
         return;
@@ -806,6 +905,10 @@ pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
 }
 
 pub fn touch(core: &Core, id: &str) {
+    if let Err(message) = ensure_owned(core, id) {
+        core.send_agent(id, AgentEvent::Error { message });
+        return;
+    }
     let _ = with_index(core, |metas| {
         // Re-append rather than update in place: updated_at is whole
         // seconds, so within one second only index position can order
@@ -830,27 +933,33 @@ pub(crate) fn touch_at(core: &Core, id: &str, ts: u64) {
     });
 }
 
-/// Load persisted messages as JSONL only. Corrupt lines are skipped silently
-/// so a partially damaged file still yields whatever could be parsed. Returns
-/// `None` when the file is missing, empty, or wholly unparseable — callers
-/// treat that as "no transcript on disk".
-pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
-    let _store = lock_store(core).ok()?;
+/// Load the authoritative transcript. Only a missing file is a fresh session.
+/// A damaged or unreadable record must survive for explicit recovery.
+pub fn load_messages(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, String> {
+    let _store = lock_store(core)?;
+    load_messages_locked(core, id)
+}
+
+fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, String> {
     let path = messages_path(core, id);
-    let text = std::fs::read_to_string(&path).ok()?;
-    if text.trim().is_empty() {
-        return None;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("transcript {} is unreadable: {e}; original file preserved", path.display())),
+    };
+    let mut parsed = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() { continue; }
+        let message = serde_json::from_str(line).map_err(|e| format!(
+            "transcript {} is damaged at line {}: {e}; original file preserved",
+            path.display(), index + 1,
+        ))?;
+        parsed.push(message);
     }
-    let parsed: Vec<ChatMessage> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
     if parsed.is_empty() {
-        None
-    } else {
-        Some(parsed)
+        return Err(format!("transcript {} is empty; original file preserved", path.display()));
     }
+    Ok(Some(parsed))
 }
 
 /// Persist messages. Appends only new tail lines when possible; rewrites the
@@ -867,6 +976,10 @@ pub fn load_messages(core: &Core, id: &str) -> Option<Vec<ChatMessage>> {
 /// may ignore it; a caller about to act on the recorded state (a refusal
 /// continuation) must not.
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) -> bool {
+    if let Err(message) = ensure_owned(core, id) {
+        core.send_agent(id, AgentEvent::Error { message });
+        return false;
+    }
     let path = messages_path(core, id);
     let _store = match lock_store(core) {
         Ok(store) => store,
@@ -895,14 +1008,21 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         }
         return true;
     }
-    // `persisted` at zero means nothing of this session's is on disk yet. A
-    // non-empty file there is one `load_messages` could not read (it hands
-    // back None for a file it cannot parse), and appending to it would join
-    // this session's first line onto whatever its last line is, losing that
-    // message at the next load. Replace it instead.
-    let needs_rewrite = rewrite
-        || messages.len() < *persisted
-        || (*persisted == 0 && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0));
+    let needs_rewrite = rewrite || messages.len() < *persisted;
+    // Validate before replacing existing bytes. A failed append below may
+    // rewrite our own partial append, but a damaged input is never repaired
+    // implicitly. Ordinary tail appends do not reparse the growing history.
+    if needs_rewrite || *persisted == 0 {
+        let checked = load_messages_locked(core, id).and_then(|loaded| {
+            if loaded.is_some() && *persisted == 0 && !needs_rewrite {
+                Err("an existing transcript must be loaded before appending".into())
+            } else { Ok(()) }
+        });
+        if let Err(message) = checked {
+            core.send_agent(id, AgentEvent::Error { message });
+            return false;
+        }
+    }
 
     let result = if needs_rewrite {
         write_jsonl(&path, messages)
@@ -983,7 +1103,7 @@ mod tests {
             }
             drop(core);
             let (core, _rx) = Core::new(dir.clone()).unwrap();
-            assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap()).unwrap(), serde_json::to_value(&original).unwrap(), "stage {stage}");
+            assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap(), "stage {stage}");
             assert_eq!(std::fs::read(archive_path(&core, &id)).unwrap(), original_archive, "stage {stage}");
             assert_eq!(std::fs::read(compaction_path(&core, &id)).unwrap(), original_records, "stage {stage}");
             assert_eq!(meta(&core, &id).unwrap().resume_points, vec![4]);
@@ -992,7 +1112,7 @@ mod tests {
             assert_eq!(load_archive(&core, &id).len(), 4, "retry appends each archived message once");
             assert_eq!(load_compaction(&core, &id).len(), 2);
             assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3]);
-            assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap()).unwrap(), serde_json::to_value(&candidate).unwrap());
+            assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&candidate).unwrap());
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -1044,7 +1164,7 @@ mod tests {
         assert!(pending_compaction_path(&core).exists());
         std::fs::remove_dir(&path).unwrap();
         std::fs::rename(&backup, &path).unwrap();
-        assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
+        assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
         assert_eq!(load_archive(&core, &id).len(), 1);
         assert!(!pending_compaction_path(&core).exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -1319,7 +1439,7 @@ mod tests {
         delete(&core, &id).unwrap();
         let mut persisted = 0usize;
         save_messages(&core, &id, &[ChatMessage::user("late")], &mut persisted, true);
-        assert!(load_messages(&core, &id).is_none(), "a deleted transcript stays deleted");
+        assert!(load_messages(&core, &id).unwrap().is_none(), "a deleted transcript stays deleted");
         save_manifest(&core, &id, &crate::registry::RegistryManifest {
             version: 1,
             external_tools: Vec::new(),
@@ -1538,17 +1658,55 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_corrupt_messages_file_loads_as_none() {
-        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = &create(&core, "/tmp/p".into()).unwrap().id;
+    fn damaged_transcripts_refuse_loading_saving_and_compaction() {
+        let dir = std::env::temp_dir().join(format!("openmax-damage-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let path = messages_path(&core, &id);
+        assert!(load_messages(&core, &id).unwrap().is_none());
+        let good = b"{\"role\":\"user\",\"content\":\"keep\"}\n";
+        let cases = [
+            Vec::new(), b"{torn".to_vec(), vec![0xff],
+            [good.as_slice(), b"{broken middle}\n", good.as_slice()].concat(),
+            [good.as_slice(), b"{torn tail"].concat(),
+        ];
+        for bytes in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            let error = load_messages(&core, &id).unwrap_err();
+            assert!(error.contains("transcript"), "{error}");
+            if bytes.windows(6).any(|w| w == b"broken") { assert!(error.contains("line 2"), "{error}"); }
+            for rewrite in [false, true] {
+                let mut persisted = 0;
+                assert!(!save_messages(&core, &id, &[ChatMessage::system("replacement")], &mut persisted, rewrite));
+                assert_eq!(persisted, 0);
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+            assert!(commit_compaction(&core, &id, &[ChatMessage::system("replacement")], &[], None, 1).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e.event, AgentEvent::Error { .. })));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_messages(&core, &id).unwrap_err().contains("unreadable"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
-        std::fs::write(messages_path(&core, id), "").unwrap();
-        assert!(load_messages(&core, id).is_none());
-
-        std::fs::write(messages_path(&core, id), "not valid json\n{broken\n").unwrap();
-        assert!(load_messages(&core, id).is_none());
-
+    #[test]
+    fn a_complete_final_record_without_newline_remains_resumable() {
+        let dir = std::env::temp_dir().join(format!("openmax-line-end-{}", uuid::Uuid::new_v4()));
+        let (core, _) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        std::fs::write(messages_path(&core, &id), r#"{"role":"user","content":"keep"}"#).unwrap();
+        let mut messages = load_messages(&core, &id).unwrap().unwrap();
+        let mut persisted = messages.len();
+        messages.push(ChatMessage::user("next"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), 2);
+        // Damage after attachment must also survive a rewrite or compaction.
+        std::fs::write(messages_path(&core, &id), b"{damage after loading").unwrap();
+        assert!(!save_messages(&core, &id, &messages, &mut persisted, true));
+        assert!(commit_compaction(&core, &id, &messages, &[], None, 2).is_err());
+        assert_eq!(std::fs::read(messages_path(&core, &id)).unwrap(), b"{damage after loading");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1576,7 +1734,7 @@ mod tests {
         assert_eq!(second.matches('\n').count(), 3);
         assert!(second.ends_with('\n'));
 
-        let loaded = load_messages(&core, id).unwrap();
+        let loaded = load_messages(&core, id).unwrap().unwrap();
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[2].content.as_deref(), Some("hi"));
 
@@ -1590,39 +1748,42 @@ mod tests {
         let id = &create(&core, "/tmp/p".into()).unwrap().id;
         let path = messages_path(&core, id);
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
-        assert!(load_messages(&core, id).is_none());
+        assert!(load_messages(&core, id).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A file `load_messages` could not read is not history to append to:
-    /// its last line has no newline of ours, so the first appended record
-    /// would share that line and be skipped at the next load. The first
-    /// save of a session that persisted nothing yet replaces such a file.
     #[test]
-    fn the_first_save_replaces_an_unreadable_transcript_instead_of_appending() {
-        let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
+    fn a_damaged_record_between_tool_call_and_reply_is_not_skipped() {
+        let dir = std::env::temp_dir().join(format!("openmax-pair-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = &create(&core, "/tmp/p".into()).unwrap().id;
-        let path = messages_path(&core, id);
-        std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
-        assert!(load_messages(&core, id).is_none());
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let bytes = concat!(
+            "{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}\n",
+            "{damaged reply}\n",
+            "{\"role\":\"user\",\"content\":\"continue\"}\n",
+        );
+        std::fs::write(messages_path(&core, &id), bytes).unwrap();
+        assert!(load_messages(&core, &id).unwrap_err().contains("line 2"));
+        assert_eq!(std::fs::read_to_string(messages_path(&core, &id)).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
-        let mut persisted = 0usize;
-        let messages = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
-        assert!(save_messages(&core, id, &messages, &mut persisted, false));
-        assert_eq!(persisted, 2);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.trim_start().starts_with('['), "the unreadable file was appended to:\n{text}");
-        let loaded = load_messages(&core, id).unwrap();
-        assert_eq!(loaded.len(), 2, "every saved message loads back");
-        assert_eq!(loaded[1].content.as_deref(), Some("hello"));
-
-        // From here on saves append, as they always did.
-        let mut longer = messages.clone();
-        longer.push(ChatMessage::assistant(Some("hi".into()), None));
-        assert!(save_messages(&core, id, &longer, &mut persisted, false));
-        assert_eq!(persisted, 3);
-        assert_eq!(load_messages(&core, id).unwrap().len(), 3);
+    #[test]
+    fn attachments_exclude_other_cores_until_detached() {
+        let dir = std::env::temp_dir().join(format!("openmax-owner-{}", uuid::Uuid::new_v4()));
+        let (first, _rx) = Core::new(dir.clone()).unwrap();
+        let (second, _rx2) = Core::new(dir.clone()).unwrap();
+        let id = create(&first, "/tmp/p".into()).unwrap().id;
+        attach(&first, &id).unwrap();
+        assert!(attach(&second, &id).unwrap_err().contains("another process"));
+        assert!(delete(&second, &id).is_err());
+        assert!(!save_messages(&second, &id, &[ChatMessage::user("foreign")], &mut 0, false));
+        assert!(load_messages(&second, &id).unwrap().is_none(), "read-only access stays available");
+        let other = create(&second, "/tmp/p".into()).unwrap().id;
+        attach(&second, &other).unwrap();
+        detach(&first, &id).unwrap();
+        attach(&second, &id).unwrap();
+        assert!(dir.join("sessions").join(format!("{id}.lock")).exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1717,7 +1878,7 @@ mod tests {
         assert_eq!(text.matches('\n').count(), 4);
         assert!(text.ends_with('\n'));
 
-        let loaded = load_messages(&core, id).unwrap();
+        let loaded = load_messages(&core, id).unwrap().unwrap();
         assert_eq!(loaded.len(), 4);
         assert_eq!(loaded[1].content.as_deref(), Some("one"));
         assert_eq!(loaded[2].content.as_deref(), Some("two"));
@@ -1750,7 +1911,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches('\n').count(), 1);
         assert!(text.ends_with('\n'));
-        let loaded = load_messages(&core, id).unwrap();
+        let loaded = load_messages(&core, id).unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content.as_deref(), Some("kept"));
 
