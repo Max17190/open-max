@@ -63,13 +63,25 @@ pub(crate) struct SessionOwner {
 /// Claim a writable attachment before reading its transcript or running hooks.
 /// Repeated calls from this core share ownership, including between turns.
 pub fn attach(core: &Core, id: &str) -> Result<(), String> {
-    claim_session(core, id, true)
+    claim_session(core, id, true, true)
 }
 
-fn claim_session(core: &Core, id: &str, validate: bool) -> Result<(), String> {
+/// A finishing turn may still persist after its frontend detached. Such a
+/// write retains ownership without cancelling the requested cleanup.
+pub(crate) fn ensure_owned(core: &Core, id: &str) -> Result<(), String> {
+    claim_session(core, id, true, false)
+}
+
+fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Result<(), String> {
     use fs2::FileExt;
     let mut owners = core.session_owners.lock().unwrap();
-    if owners.contains_key(id) { return Ok(()); }
+    if let Some(owner) = owners.get_mut(id) {
+        if reactivate {
+            load_messages(core, id)?;
+            owner.detach = false;
+        }
+        return Ok(());
+    }
     let path = sessions_dir(core).join(format!("{id}.lock"));
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
@@ -204,7 +216,7 @@ pub struct TokenUsage {
 /// is a record of work already done, so a full disk must not fail the turn
 /// that succeeded.
 pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
-    if let Err(message) = attach(core, id) {
+    if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
@@ -345,7 +357,7 @@ pub fn load_archive(core: &Core, id: &str) -> Vec<ChatMessage> {
 /// means a session that predates manifests and resolves to built-ins until
 /// its first turn re-freezes it from disk.
 pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::RegistryManifest) {
-    if let Err(message) = attach(core, id) {
+    if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
@@ -619,7 +631,7 @@ pub(crate) fn commit_compaction(
     record: Option<&CompactionRecord>,
     before_len: usize,
 ) -> Result<(), String> {
-    attach(core, id)?;
+    ensure_owned(core, id)?;
     let _store = lock_store(core)?;
     let mut metas = match read_index(core) {
         IndexRead::Loaded(metas) => metas,
@@ -777,7 +789,7 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 /// truncation-only prune inserts its note at 2; hydration of a transcript
 /// saved without its system prompt inserts that prompt at 0.
 pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
-    attach(core, id)?;
+    ensure_owned(core, id)?;
     with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             for p in &mut m.resume_points {
@@ -793,7 +805,7 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<
 /// messages already on disk. Index zero is an empty session, not a
 /// boundary; repeats (resuming again before any new turn) are deduplicated.
 pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
-    if let Err(message) = attach(core, id) {
+    if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
@@ -811,7 +823,7 @@ pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     // Explicit deletion may remove damaged data, but never a foreign writer.
-    claim_session(core, id, false)?;
+    claim_session(core, id, false, false)?;
     // Stop the session's work before removing its files. A frontend may
     // delete the session it is currently running, and a turn that keeps going
     // keeps writing: every sidecar here is opened with `create`, so an
@@ -869,7 +881,7 @@ pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
 
 /// Set the title from the first user message, once.
 pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
-    if let Err(message) = attach(core, id) {
+    if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
@@ -893,7 +905,7 @@ pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
 }
 
 pub fn touch(core: &Core, id: &str) {
-    if let Err(message) = attach(core, id) {
+    if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
@@ -964,7 +976,7 @@ fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>
 /// may ignore it; a caller about to act on the recorded state (a refusal
 /// continuation) must not.
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) -> bool {
-    if let Err(message) = attach(core, id) {
+    if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return false;
     }

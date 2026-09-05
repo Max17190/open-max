@@ -412,7 +412,7 @@ async fn report_schemas_over_budget(
 }
 
 fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<SessionData, String> {
-    sessions::attach(core, session_id)?;
+    sessions::ensure_owned(core, session_id)?;
     Ok(if let Some(mut messages) = sessions::load_messages(core, session_id)? {
         // Resume: registry frozen at creation — manifest if present, else built-ins only.
         let registry = if let Some(manifest) = sessions::load_manifest(core, session_id) {
@@ -4289,6 +4289,40 @@ mod tests {
             sessions::attach(&other, &id).unwrap();
             sessions::detach(&other, &id).unwrap();
             assert!(rx.try_recv().is_err(), "one terminal receipt per turn");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reopening_a_settling_session_keeps_its_attachment() {
+        let dir = std::env::temp_dir().join(format!("openmax-reopen-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let (other, _) = Core::new(dir.clone()).unwrap();
+        for reopen in [false, true] {
+            let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+            sessions::attach(&core, &id).unwrap();
+            core.sessions.lock().await.insert(id.clone(), SessionData::default());
+            core.running.lock().unwrap().insert(id.clone());
+            let (release, ready) = tokio::sync::oneshot::channel::<()>();
+            spawn_guarded_turn(core.clone(), id.clone(), async move {
+                ready.await.unwrap();
+                "cancelled".into()
+            });
+            sessions::detach(&core, &id).unwrap();
+            if reopen { sessions::attach(&core, &id).unwrap(); }
+            // Finishing work is not a new frontend attachment. These writes
+            // must preserve a deferred detach unless the user reopened it.
+            assert!(sessions::save_messages(&core, &id, &[ChatMessage::user("settled")], &mut 0, true));
+            sessions::touch(&core, &id);
+            release.send(()).unwrap();
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+                if matches!(event.event, AgentEvent::Done { .. }) { break; }
+            }
+            assert_eq!(core.sessions.lock().await.contains_key(&id), reopen, "reopen={reopen}");
+            assert_eq!(sessions::attach(&other, &id).is_err(), reopen, "reopen={reopen}");
+            sessions::detach(&core, &id).unwrap();
+            sessions::detach(&other, &id).unwrap();
         }
         let _ = std::fs::remove_dir_all(dir);
     }
