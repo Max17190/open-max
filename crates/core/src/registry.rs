@@ -528,7 +528,7 @@ impl Registry {
         self.get(name).map(|s| s.mutating).unwrap_or(false)
     }
 
-    /// Every tool name, in frozen order. Feeds the fallback call parser.
+    /// Every tool name, in frozen order.
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.iter().map(|s| s.name.clone()).collect()
     }
