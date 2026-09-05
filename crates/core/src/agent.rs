@@ -6530,6 +6530,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A resumed session's prompt is the persisted one, and the manifest's
+    /// memory identities describe the index that prompt carries. The first
+    /// refreeze rebuilds the prompt from a fresh scan, so the delta from those
+    /// identities is exactly what the model's next prompt gains and loses,
+    /// and the receipt has to name it. Without that baseline the receipt said
+    /// only "extension files changed", and the model could not tell which
+    /// fact had moved.
+    #[tokio::test]
+    async fn a_resumed_session_names_the_memory_it_gained_on_its_first_turn() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        let memory = project.join(crate::memory::MEMORY_DIR);
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("deploy-port.md"), "# deploy port is 8080\n").unwrap();
+
+        // A prior sitting: the prompt froze with one memory line, and the
+        // manifest recorded that index beside the transcript.
+        {
+            let mut data = build_session_data(&core, id, &project);
+            assert!(
+                data.messages[0].content.as_deref().unwrap().contains("deploy port is 8080"),
+                "the frozen prompt carries the fact"
+            );
+            data.messages.push(ChatMessage::user("hi"));
+            let mut persisted = 0usize;
+            assert!(sessions::save_messages(&core, id, &data.messages, &mut persisted, true));
+        }
+
+        // Between sittings the fact changed and another appeared.
+        std::fs::write(memory.join("deploy-port.md"), "# deploy port is 9090\n").unwrap();
+        std::fs::write(memory.join("ci-lane.md"), "# ci runs on the fast lane\n").unwrap();
+
+        // Fresh process, exactly as after `-c`: the registry is restored from
+        // the manifest and the turn-start refreeze reports what moved.
+        assert!(core.sessions.lock().await.is_empty());
+        ensure_session_hydrated(&core, id, &project).await;
+        let receipt = refreeze_if_extensions_changed(&core, id, &project)
+            .await
+            .expect("a memory edit moves the fingerprint");
+        assert!(receipt.contains("Memory index"), "the receipt names the index: {receipt}");
+        assert!(receipt.contains("indexed: ci-lane"), "{receipt}");
+        assert!(receipt.contains("updated: deploy-port"), "{receipt}");
+        let map = core.sessions.lock().await;
+        let prompt = map.get(id).unwrap().messages[0].content.clone().unwrap();
+        assert!(prompt.contains("deploy port is 9090") && prompt.contains("ci-lane"), "{prompt}");
+        drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The public core boundary enforces trust even when a frontend bypasses
     /// the first-party CLI.
     #[tokio::test]

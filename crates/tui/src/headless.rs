@@ -249,11 +249,14 @@ async fn run_turn_events(
             }
             AgentEvent::Refrozen { tools, skills, changes } => {
                 if !json {
-                    let _ = writeln!(
-                        stderr,
-                        "openmax: re-frozen ({tools} tools, {skills} skills): {}",
-                        changes.join(", ")
-                    );
+                    // `changes` names capability files the ledger recorded; a
+                    // refreeze driven by memory files alone records none, and
+                    // the line must not end in a colon with nothing after it.
+                    let what = match changes.is_empty() {
+                        true => String::new(),
+                        false => format!(": {}", changes.join(", ")),
+                    };
+                    let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills){what}");
                 }
             }
             AgentEvent::HarnessNote { text, .. } => {
