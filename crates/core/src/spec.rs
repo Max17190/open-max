@@ -1,8 +1,9 @@
 //! `openmax --spec <surface>`: the complete authoring contract for each
 //! extension surface, printed by the binary that enforces it.
 //!
-//! The frozen prompt lists extension paths. This module supplies the contracts
-//! the agent reads on demand (via bash), the same progressive disclosure skills
+//! The frozen prompt names the extension surfaces and this command. This
+//! module supplies the contracts the agent reads on demand (via bash), the
+//! same progressive disclosure skills
 //! use, so knowing the exact grammar of a hook payload or a permissions rule
 //! costs zero prompt tokens until the moment it is needed. Every fenced
 //! example below is written to disk and run through the real extension
