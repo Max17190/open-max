@@ -8,6 +8,12 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+# The npm package cannot be called `openmax`: that name belongs to an unrelated
+# 2015 media-library binding that is still published. The BINARY is unaffected
+# and stays `openmax`, so the package name is only ever typed at install time.
+[package.metadata.dist]
+npm-package = "openmax-cli"
+
 [[bin]]
 name = "openmax"
 path = "src/main.rs"

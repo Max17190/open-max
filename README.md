@@ -62,6 +62,18 @@ Or without Homebrew:
 curl -fsSL https://useopenmax.dev/install.sh | sh
 ```
 
+Or with bun or npm, if you already have a JavaScript runtime:
+
+```sh
+bun install -g openmax-cli    # or: npm install -g openmax-cli
+```
+
+The command is `openmax` either way; only the package name carries the `-cli`,
+because `openmax` on npm belongs to an unrelated 2015 package. This path fetches
+the same native binary, so it is the one install that needs Node or Bun present.
+Bun blocks install scripts by default, which is fine here: the binary is fetched
+on first run instead, once, and cached.
+
 Either way there is no Rust toolchain and no build. The script picks the right
 prebuilt binary for your machine, checks it against the published SHA-256
 (skipped, with a message, on a system with no `sha256sum`), and puts `openmax`
