@@ -12,9 +12,10 @@
 //! the life of the session, and a test fails the build if the base prompt plus
 //! built-in schemas exceeds its budget.
 //!
-//! The guide itself is an index, not a manual. It names the extension surfaces
-//! and their paths in a few hundred tokens; the full authoring contract for
-//! each lives in `spec` and costs nothing until the agent asks for it.
+//! The guide itself is a pointer, not a manual. It names the extension
+//! surfaces and the command that prints each contract in about a hundred
+//! tokens; paths, formats, and activation rules live in `spec` and cost
+//! nothing until the agent asks for them.
 
 use std::path::Path;
 
@@ -192,22 +193,14 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     (prompt, breakdown)
 }
 
-/// Discoverable file and process contracts, paid in every frozen prompt.
-/// Formats and approval details live in --spec and load only when needed.
-/// Workflow choices belong to the task and project instructions.
-const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user asks for a reusable capability:\n\
-- Tools: .openmax/tools/<name>.toml\n\
-- Skills: .agents/skills/<name>/SKILL.md\n\
-- Prompt templates: .agents/prompts/<name>.md\n\
-- Hooks: .openmax/hooks/<name>.toml\n\
-- Permissions: .openmax/permissions.toml\n\
-- Providers: ~/.openmax/providers.json (edit with bash).\n\
-- Memory: .openmax/memory/<name>.md, one durable fact per file.\n\
-Before creating or changing these files, use bash: openmax --spec <surface> to read the format, approval, and activation rules.\n\
+/// The extension pointer, paid in every frozen prompt: which surfaces exist
+/// and the one command that prints each surface's contract. Paths, formats,
+/// approval, and activation rules all live in `--spec`, read on demand, so
+/// the prefix carries the index and never the manual. Every line here is
+/// resent on every request for the life of the session.
+const SELF_EXTENSION: &str = "\n\nWhen the user asks for a reusable capability (tool, skill, prompt template, hook, permission rule, provider, or memory), read its contract first with bash: openmax --spec <surface>. It gives the file path, format, approval, and activation rules; verify with openmax --check.\n\
 Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
-Verify with openmax --check. Tools and skills refresh after every executed mutating call and at turn start (/reload forces it). Templates apply on next use; hooks from the next turn.\n\
-Use openmax --ledger for tool/skill history and restorable objects, and openmax --recall \"<query>\" for past sessions, archives, and memory.\n\
-Compose workflows with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.";
+Past sessions and memories: openmax --recall \"<query>\"; capability-file history and restore: openmax --ledger. Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -406,34 +399,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The self-extension guide is part of every frozen prompt: the agent
-    /// must be able to find extension files, their contracts, and activation.
+    /// The extension pointer is part of every frozen prompt: the agent must
+    /// be able to find the surfaces, the command that prints each contract,
+    /// the verifier, and preserved history. Paths, formats, and activation
+    /// timing live in the contracts, not here: the prefix is resent on every
+    /// request, and the manual that used to ride it measured over a quarter
+    /// of the fixed payload before it was cut to this pointer.
     #[test]
     fn prompt_carries_self_extension_guide() {
         let dir = temp_project();
         let prompt = builtin_prompt(&dir);
-        assert!(prompt.contains("Extend yourself by writing files"));
-        assert!(prompt.contains(".openmax/tools/<name>.toml"));
-        assert!(prompt.contains(".agents/prompts/<name>.md"));
-        assert!(prompt.contains("/reload"));
-        assert!(prompt.contains("openmax --check"));
-        // The guide is an index; the full per-surface contract is read on
-        // demand. The pointer is a deliberate SUBSET of --spec's surfaces
-        // (the frozen prompt pays per byte): settings, recall, and usage are
-        // omitted because they are not authoring surfaces and the moments
-        // that need them carry their own pointer (every --check settings row
-        // prints "openmax --spec settings"; the guide's memory line names
-        // --recall). the_guide_pointer_names_only_real_surfaces enforces
-        // that every named surface exists and the omission list is exact.
+        assert!(prompt.contains("reusable capability"));
         assert!(prompt.contains("openmax --spec <surface>"));
-        assert!(prompt.contains("providers.json"));
-        assert!(prompt.contains("edit with bash"));
-        assert!(prompt.contains("CLI-backed tools + skills"));
-        assert!(prompt.contains("openmax -p or openmax --stdio"));
-        assert!(prompt.contains("tmux for durable or parallel processes"));
-        assert!(prompt.contains("stdio protocol for custom frontends"));
-        assert!(prompt.contains(".openmax/memory/<name>.md"));
+        assert!(prompt.contains("activation rules"));
+        assert!(prompt.contains("openmax --check"));
         assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
+        // The ledger is the only route to a capability file's approved
+        // versions and their restoration commands; neither --spec nor
+        // --recall exposes that, so the pointer has to.
+        assert!(prompt.contains("openmax --ledger"), "capability history must be findable");
+        assert!(prompt.contains("openmax -p or openmax --stdio"));
+        assert!(prompt.contains("tmux"));
+        // The per-surface paths moved into the contracts the pointer names.
+        // A path here is prefix bytes every request pays for a file the
+        // model writes at most a few times per session.
+        assert!(!prompt.contains(".openmax/tools/<name>.toml"));
+        assert!(!prompt.contains(".agents/skills/<name>/SKILL.md"));
+        assert!(!prompt.contains("providers.json"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -708,19 +700,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Activation timing is contract detail: tools and skills activate on
+    /// the executed mutating call that wrote them and at turn start, hooks
+    /// from the next turn, templates on next use, permission rules at turn
+    /// start (one-directional within a turn), providers on the next turn's
+    /// re-read, and a memory write through the extension fingerprint. It
+    /// lives in the surface specs the pointer sends the model to. The
+    /// pointer promises those specs carry it, so both halves are pinned
+    /// here for every authoring surface the pointer names: the prefix stays
+    /// free of the nuance, and each contract still states its trigger.
     #[test]
-    fn the_guide_states_executed_call_and_turn_granular_hooks() {
-        // #242 made a failed writer activate too; hooks are turn-granular,
-        // unlike permissions and templates. "After a successful mutating
-        // call" contradicted the receipt a failed writer earns in the same
-        // turn, and lumping hooks into "apply on their next use" invited the
-        // install-the-gate-then-prove-it shape at call granularity hooks do
-        // not have. The failed-call nuance lives in --spec
-        // tools/skills, where it costs nothing until read; the guide is an
-        // index (module doc), so it carries the trigger, not the nuance.
-        assert!(SELF_EXTENSION.contains("every executed mutating call"));
-        assert!(!SELF_EXTENSION.contains("successful mutating call"));
-        assert!(SELF_EXTENSION.contains("hooks from the next turn"));
+    fn the_guide_defers_activation_timing_to_the_contracts() {
+        assert!(SELF_EXTENSION.contains("activation rules"));
+        assert!(!SELF_EXTENSION.contains("mutating call"));
+        assert!(!SELF_EXTENSION.contains("next turn"));
+        let states = |surface: &str, trigger: &str| {
+            let spec = crate::spec::render(surface).expect("the contract renders");
+            assert!(spec.contains(trigger), "{surface} spec must state its activation trigger: {trigger:?}");
+        };
+        states("tools", "every executed mutating call");
+        states("skills", "every executed mutating call");
+        states("hooks", "apply from the next turn");
+        states("prompts", "Activation: next invocation");
+        states("permissions", "rules are re-read at turn start");
+        states("providers", "providers.json is re-read every turn");
+        states("memory", "a memory write moves the extension fingerprint");
     }
 
     #[test]
@@ -756,10 +760,12 @@ mod tests {
         );
     }
 
-    /// The path-free base rules, extension guide, and builtin schemas must
-    /// fit in 4,000 bytes. Grounding sections have separate caps. Measure the
-    /// payload with dump_frozen_prompt_payload_for_tokenizer and a real
-    /// tokenizer before changing this budget; provider framing is not included.
+    /// The path-free base rules, extension pointer, and builtin schemas must
+    /// fit in 3,500 bytes (the payload measured 3,412 bytes, 770 tokens on a
+    /// current tokenizer, when the cap was set). Grounding sections have
+    /// separate caps. Measure the payload with
+    /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
+    /// changing this budget; provider framing is not included.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -785,7 +791,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 4_000;
+        const CAP: usize = 3_500;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \

@@ -7126,10 +7126,14 @@ mod tests {
 
         // Every reply costs the same 1500 the provider reports and the cap
         // sits between one and two of those charges, so the second request is
-        // the one admission refuses: the 500 left cannot fit a request the
-        // loop estimates at well over that.
-        let sse = format!(
-            "{TOOL_SSE}data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1000,\"completion_tokens\":500}}}}\n\n"
+        // the one admission refuses: the 500 left cannot fit any request,
+        // because the frozen schemas alone estimate above it. The usage chunk
+        // rides before `[DONE]`, where a provider sends it; the client stops
+        // reading at `[DONE]`, so a chunk after it would never be charged and
+        // the test would be measuring the fallback estimate instead.
+        let sse = TOOL_SSE.replace(
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500}}\n\ndata: [DONE]\n\n",
         );
         let (base_url, requests) = counting_endpoint(&sse).await;
         {
@@ -7613,7 +7617,12 @@ mod tests {
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        // A large read: the second request carries this result, so it
+        // outgrows the cap by a margin no prefix trim or growth can erase,
+        // while the first request (prefix plus one line) fits under it
+        // comfortably. A cap tuned to the exact prefix size would silently
+        // flip to admitting both requests the day the prompt shrank.
+        std::fs::write(project.join("a.txt"), "hello\n".repeat(2_000)).unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
         // No usage chunk at all: what a local backend without accounting sends.
@@ -7623,8 +7632,9 @@ mod tests {
             s.base_url = base_url;
             s.model = "stub".into();
             s.context_tokens = Some(16384);
-            // Above one request's estimate and below two, so the fallback
-            // charge is what refuses the second request.
+            // Above the first request's estimate and below the first charge
+            // plus the second request, so the fallback charge is what refuses
+            // the second request.
             s.max_agent_tokens = Some(2000);
             s.max_agent_iterations = 4;
         }
