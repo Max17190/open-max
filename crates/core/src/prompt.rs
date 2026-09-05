@@ -963,10 +963,9 @@ mod tests {
 
     /// A resumed session's /context used to show no memory rows while the
     /// persisted prefix paid for the section on every request. The rows ride
-    /// the manifest's frozen channel and must
-    /// reproduce the live scan's accounting exactly, through a real
-    /// to_manifest/from_manifest round trip, while the resettable delta
-    /// baseline stays None.
+    /// the manifest's frozen channel and must reproduce the live scan's
+    /// accounting exactly, through a real to_manifest/from_manifest round
+    /// trip, beside the delta baseline the same manifest carries.
     #[test]
     fn a_persisted_breakdown_prices_the_memory_index_it_carries() {
         let dir = temp_project();
@@ -989,7 +988,7 @@ mod tests {
         assert_eq!(resumed_fresh.memory, live.memory, "the fresh channel matches the scan");
 
         let restored = Registry::from_manifest(fresh.to_manifest());
-        assert!(restored.memory_files.is_none(), "the delta baseline stays reset");
+        assert_eq!(restored.memory_files, fresh.memory_files, "the delta baseline survives the trip");
         let resumed = PromptBreakdown::from_persisted(&prompt, &restored, &dir);
         assert_eq!(
             resumed.memory, live.memory,
@@ -1082,11 +1081,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A manifest-restored registry keeps `memory_files` (for the resume
-    /// delta) but never captured a `memory_section`, so `memory_scanned` is
-    /// false and the prompt must scan fresh - otherwise a resumed session with
-    /// live memories renders no memory index at all. Regenerating
-    /// the prompt from such a registry must still show the memories on disk.
+    /// A manifest-restored registry keeps `memory_files` (the resume
+    /// delta's baseline) but never captured a `memory_section`, so
+    /// `memory_scanned` is false and a prompt built from it must scan fresh -
+    /// otherwise a resumed session with live memories renders no memory
+    /// index at all. Regenerating the prompt from such a registry must still
+    /// show the memories on disk.
     #[test]
     fn a_manifest_restored_registry_rebuilds_the_memory_index() {
         let dir = temp_project();
@@ -1101,10 +1101,10 @@ mod tests {
         assert!(frozen.memory_scanned && frozen.memory_section.is_some());
         let restored = Registry::from_manifest(frozen.to_manifest());
         assert!(!restored.memory_scanned, "a manifest restore never scanned");
-        // The baseline is reset on resume, not carried from the manifest: the
-        // prompt rescans and shows current, so the first refreeze must not
-        // report a spurious delta against a stale suspend-time baseline.
-        assert!(restored.memory_files.is_none(), "the delta baseline is reset on resume");
+        // The baseline is the manifest's: it describes the index the
+        // persisted prompt carries, which is what the first refreeze's
+        // receipt must diff against.
+        assert_eq!(restored.memory_files, frozen.memory_files, "the baseline is carried");
         let prompt = system_prompt(&dir, &restored);
         assert!(
             prompt.contains("The deploy port is 7443"),

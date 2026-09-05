@@ -131,18 +131,18 @@ pub struct Registry {
     /// never scanned both leave it None - so `memory_scanned` disambiguates.
     pub memory_section: Option<(String, Vec<(String, usize)>)>,
     /// The memory index rows (stem, line bytes) frozen WITH the persisted
-    /// prompt, independent of the resettable resume-delta baseline above:
-    /// from_manifest clears `memory_files` so the first refreeze reports no
-    /// spurious delta, while /context still needs the freeze's own row
-    /// accounting. Carried by the manifest (version 4); a pre-field manifest
-    /// reads as absent and refreezes, so this is Some on every live path.
+    /// prompt, kept apart from `memory_files` because the two answer
+    /// different questions: this is what /context prices, that is the
+    /// receipt's delta baseline. Carried by the manifest (version 4); a
+    /// pre-field manifest reads as absent and refreezes, so this is Some on
+    /// every live path.
     pub(crate) frozen_memory_rows: Option<Vec<(String, usize)>>,
     /// True only when THIS registry actually ran a memory scan (a fresh
-    /// freeze). A manifest-restored registry sets `memory_files` for the
-    /// resume delta but never captured a section, so it is false and the
-    /// prompt scans fresh - otherwise a resumed session would render no
-    /// memory index at all while `memory_files.is_some()`. A
-    /// scanned-but-empty freeze is true, so its empty selection is honored
+    /// freeze). A manifest-restored registry carries `memory_files` as the
+    /// resume delta's baseline but never captured a section, so it is false
+    /// and a prompt built from it scans fresh - otherwise a resumed session
+    /// would render no memory index at all while `memory_files.is_some()`.
+    /// A scanned-but-empty freeze is true, so its empty selection is honored
     /// (no rescan), which is the invariant `memory_section` exists for.
     pub memory_scanned: bool,
     /// Schema array value form: prompt breakdown and tests walk this.
@@ -781,16 +781,17 @@ impl Registry {
             .collect();
         let mut registry = Self::assemble(external, manifest.skills);
         registry.ext_fingerprint = manifest.ext_fingerprint;
-        // A restored registry does NOT reuse the manifest's memory identities
-        // as the delta baseline. `memory_scanned` is false, so the prompt
-        // rescans and shows the CURRENT memory selection; keeping the older
-        // suspend-time identities would make the first refreeze report an
-        // offline replacement the prompt already shows as newly indexed and
-        // the old item as dropped. memory_files stays None so the
-        // first refreeze establishes the fresh scan as the baseline with no
-        // spurious delta. The row accounting survives on the frozen
-        // channel: /context prices the rows of the freeze that WROTE the
-        // persisted prompt, which is precisely what the manifest carries.
+        // The manifest's memory identities are the baseline for the first
+        // refreeze's memory receipt. A resumed session's prompt is the
+        // persisted one, whose memory section those identities describe, and
+        // the model reads it until that refreeze rebuilds it: the delta from
+        // them to the fresh scan is exactly what the next prompt gains and
+        // loses. `memory_scanned` stays false, because this registry captured
+        // no section of its own, so a prompt built from it (a transcript that
+        // lost its system line) scans fresh. The row accounting rides the
+        // frozen channel: /context prices the rows of the freeze that WROTE
+        // the persisted prompt, which is precisely what the manifest carries.
+        registry.memory_files = manifest.memory_files.clone();
         registry.frozen_memory_rows = manifest.memory_rows.clone();
         registry
     }
