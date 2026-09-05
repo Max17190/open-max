@@ -90,7 +90,8 @@ pub fn estimate_tokens(chars: usize) -> usize {
 pub enum AgentEvent {
     Token { text: String },
     Thinking { text: String },
-    /// One assistant message finalized (tool-call markup already stripped).
+    /// One assistant message finalized (a leaked leading think block already
+    /// stripped).
     /// A run of Token deltas always ends in exactly one MessageDone.
     MessageDone { text: String },
     /// Estimated context usage at the start of a completion.
