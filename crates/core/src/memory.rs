@@ -1,20 +1,17 @@
 //! Project memory: `.openmax/memory/<name>.md`, one durable fact per file,
 //! written by the agent with the file tools it already has.
 //!
-//! The harness owns exactly three things here, all arithmetic: which memories
-//! surface (an index line each in the frozen prompt, ranked by activation),
-//! how activation is computed (recency and frequency of real use), and when a
-//! memory is forgotten (deleted once it goes unused past a floor age). The
-//! content, the writing, and any deliberate recall beyond the index (grep,
-//! read_file) belong to the agent. No database, no daemon, no embedding: the
-//! directory is the memory, and forgetting is a feature - an index that only
-//! ever grows becomes a prompt tax, and stale facts poison context.
+//! The harness ranks memories for a bounded prompt index using recency and
+//! frequency of observed file-tool access. Old entries leave the index but
+//! stay on disk for search. Content, writing, and deletion belong to the
+//! user and agent: missing access events do not establish that a fact is
+//! obsolete, and the log does not observe bash, grep, or external tools.
 //!
 //! Activation is ACT-R's base-level learning rule, the rational-analysis fit
 //! to human forgetting (Anderson & Schooler 1991): each past access at age
 //! `t` hours contributes `t^-0.5`, and activation is the log of the sum, so
 //! recency and frequency trade off in one number and one use of an old memory
-//! revives it. Activation only ranks, though; the floors gate on the age of
+//! revives it. Activation only ranks, though; the index gates on the age of
 //! the most recent use, because the power-law sum lets `n` accesses outlast a
 //! single-access activation floor for `n^2` floor-ages, and a fact leaned on
 //! hourly for a week would otherwise spend decades in the index. Events come
@@ -47,13 +44,8 @@ const MAX_NAME_CHARS: usize = 64;
 
 /// A memory whose most recent use is older than this many days drops out of
 /// the index: still on disk, still greppable, no longer spending prompt
-/// bytes. ~3 weeks without a use is where a human memory needs a cue again,
-/// however well-worn it once was.
+/// bytes. This is an index policy, not an estimate of a fact's useful life.
 pub(crate) const INDEX_FLOOR_DAYS: f64 = 21.0;
-/// Unused past this many days, the file itself is deleted (a `gc` log line
-/// keeps its name, sha256, and description as the tombstone). Memory is not
-/// an archive; the session transcripts are.
-pub(crate) const GC_FLOOR_DAYS: f64 = 60.0;
 
 /// ACT-R base-level activation: `ln(sum(t_hours^-d))` with d = 0.5. Ages are
 /// clamped to one hour so a just-written memory contributes exactly 1.0 and
@@ -69,7 +61,7 @@ fn activation(ages_hours: &[f64]) -> f64 {
 pub struct AccessRecord {
     pub name: String,
     pub ts: u64,
-    /// `read` | `write` | `gc`
+    /// `read` | `write`; legacy `gc` records delimit earlier file lifetimes.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
@@ -84,8 +76,8 @@ pub struct MemoryEntry {
     /// Project-relative path, as the index line shows it.
     pub path: String,
     pub activation: f64,
-    /// Age in hours of the most recent event; the index and GC floors gate
-    /// on this, not on activation, so frequency raises rank, never lifespan.
+    /// Age in hours of the most recent event; the index floor gates on this,
+    /// not on activation, so frequency raises rank, never index lifespan.
     pub last_event_hours: u64,
     /// True when the entry made it into the injected index.
     pub in_index: bool,
@@ -237,7 +229,7 @@ fn load_log(project_root: &Path) -> Vec<AccessRecord> {
 
 /// Scan the memory directory and score every valid entry, strongest first
 /// (ties by name for determinism). Pure with respect to the filesystem: no
-/// writes, no deletions - `forget_faded` is the explicit destructive step.
+/// writes or deletions.
 /// Score one memory file into an index entry from ALREADY-READ content, or
 /// None if it has no describable first line. Kept separate from the directory
 /// walk so the fingerprint scan and the index scan can share ONE read of each
@@ -484,45 +476,6 @@ pub fn index_section(project_root: &Path, now: u64) -> IndexSection {
     section_and_identities(&scan(project_root, now)).0
 }
 
-/// Delete memories unused past the GC floor age, logging a tombstone (name,
-/// sha256, description) per deletion so what was forgotten stays sayable
-/// even though the content is gone. Runs at session creation only: never
-/// mid-session, never on resume, so a prune cannot yank a file the live
-/// prompt still indexes.
-pub fn forget_faded(project_root: &Path, now: u64) -> Vec<String> {
-    let gc_floor_hours = GC_FLOOR_DAYS * 24.0;
-    let scan = scan(project_root, now);
-    let mut forgotten = Vec::new();
-    for entry in scan.entries.iter().filter(|e| e.last_event_hours as f64 > gc_floor_hours) {
-        let path = project_root.join(&entry.path);
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let record = AccessRecord {
-            name: entry.name.clone(),
-            ts: now,
-            kind: "gc".into(),
-            sha256: Some(crate::ledger::sha256_hex(&bytes)),
-            description: Some(entry.description.clone()),
-        };
-        let Ok(line) = serde_json::to_string(&record) else { continue };
-        // Tombstone first, delete second: a memory may outlive its GC round
-        // when the log cannot be written, but no memory ever vanishes
-        // untombstoned. If the delete then fails, the stale tombstone is
-        // harmless (scan ignores gc records; the file keeps scoring) and the
-        // next round appends a fresh one.
-        let logged = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path(project_root))
-            .and_then(|mut f| writeln!(f, "{line}"))
-            .is_ok();
-        if !logged || std::fs::remove_file(&path).is_err() {
-            continue;
-        }
-        forgotten.push(entry.name.clone());
-    }
-    forgotten
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,11 +613,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// mtime alone cannot fade (editing the file is a use); fading needs the
-    /// clock to outrun every event, which tests simulate with old log entries
-    /// and a backdated file time via the log-only scoring of a deleted mtime.
+    /// Fading removes an index entry without discarding the fact. An observed
+    /// read can surface it again without rewriting the file.
     #[test]
-    fn faded_memories_leave_the_index_and_gc_deletes_with_tombstone() {
+    fn faded_memories_leave_the_index_and_reads_revive_them() {
         let root = temp_project();
         let now = unix_now();
         write_memory(&root, "stale-fact", "# A fact from another era");
@@ -684,34 +636,13 @@ mod tests {
         let live = revived.entries.iter().find(|e| e.name == "live-fact").unwrap();
         assert!(live.in_index, "one recall must restore index presence");
 
-        // 90 days out, the unread one crosses the GC floor and is deleted.
-        // The revival above is itself 60 days stale by then, so live-fact
-        // needs a use inside the GC window: staleness is measured from the
-        // last use, not bought off by history.
-        let gc_now = now + 90 * DAY;
-        log_access(&root, "live-fact", gc_now - DAY, "read");
-        let forgotten = forget_faded(&root, gc_now);
-        assert_eq!(forgotten, vec!["stale-fact".to_string()]);
-        assert!(!root.join(MEMORY_DIR).join("stale-fact.md").exists());
-        assert!(
-            root.join(MEMORY_DIR).join("live-fact.md").exists(),
-            "the recently used memory survives GC"
-        );
-        let tombstone = load_log(&root)
-            .into_iter()
-            .find(|r| r.kind == "gc")
-            .expect("gc must log a tombstone");
-        assert_eq!(tombstone.name, "stale-fact");
-        assert!(tombstone.sha256.is_some());
-        assert_eq!(tombstone.description.as_deref(), Some("A fact from another era"));
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// Frequency raises rank, never lifespan: a memory read hourly for most
     /// of a week and then abandoned must fade on the same clock as one read
     /// once. Against a single-access activation floor, 40 accesses would
-    /// outlast the floor for 40^2 floor-ages (~92 years in the index,
-    /// centuries on disk).
+    /// outlast the floor for 40^2 floor-ages (~92 years in the index).
     #[test]
     fn a_frequent_memory_still_fades_once_it_goes_stale() {
         let root = temp_project();
@@ -729,8 +660,6 @@ mod tests {
              (activation {})",
             entry.activation
         );
-        let forgotten = forget_faded(&root, stale_now);
-        assert_eq!(forgotten, vec!["hot-then-dropped".to_string()], "and GC agrees: stale is stale");
         let _ = std::fs::remove_dir_all(root);
     }
 

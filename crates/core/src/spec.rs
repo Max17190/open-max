@@ -718,8 +718,8 @@ harness's own hand and takes effect on the next request - no restart.
 const MEMORY: &str = r#"# Project memory
 
 One durable fact per markdown file: `.openmax/memory/<name>.md`. The agent
-writes these with the ordinary file tools; the harness only scores, surfaces,
-and forgets them. There is no global memory tier and no database.
+writes these with the ordinary file tools; the harness only scores and surfaces
+them. There is no global memory tier and no database.
 
 Fields (the file IS the contract):
 - name: the file stem, 1-64 chars of [a-z0-9-]. Anything else is ignored.
@@ -750,10 +750,9 @@ Ages count in whole hours, so each boundary below is crossed once the next
 hour past it is reached.
 - Unused past 21 days (measured from its most recent access), a memory leaves
   the index, still on disk and still greppable.
-- Unused past 60 days, the file is deleted at the next session creation,
-  leaving a `gc` tombstone line (name, sha256, description) in the access log.
-  Update or delete stale facts yourself rather than letting them fade into the
-  index of a future session.
+- Files are never deleted automatically. Access tracking is incomplete, so
+  lack of observed use does not establish that a fact is obsolete. Update or
+  delete stale facts yourself. Legacy `gc` log records remain readable.
 
 Supersede, do not duplicate: update the existing file when a fact changes
 (date-stamp facts that can go stale). Near-duplicate files split the access
@@ -1107,13 +1106,8 @@ mod tests {
             MEMORY.contains("recency of last use"),
             "the memory spec must say the floor is recency of last use"
         );
-        for days in [crate::memory::INDEX_FLOOR_DAYS, crate::memory::GC_FLOOR_DAYS] {
-            assert!(
-                MEMORY.contains(&format!("{} days", days as u32)),
-                "the memory spec must state the {}-day floor",
-                days as u32
-            );
-        }
+        let days = crate::memory::INDEX_FLOOR_DAYS as u32;
+        assert!(MEMORY.contains(&format!("{days} days")), "the memory spec must state the index floor");
     }
 
     /// The printed contract cannot drift from the parsers: each example is

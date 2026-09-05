@@ -212,7 +212,7 @@ Working files (there is no built-in plan mode or todo list):\n\
 - PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
 - TODO.md: the running task list; check items off as you finish.\n\
 - AGENTS.md: standing project instructions; keep it short (loads at session create and on /reload).\n\
-- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line is indexed at the next freeze (a write triggers one). Update or delete stale facts; files never read fade from the index and are deleted after ~60 days. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
+- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line is indexed at the next freeze (a write triggers one). Update or delete stale facts; unused files fade from the index but stay searchable on disk. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file

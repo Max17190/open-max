@@ -69,24 +69,11 @@ git tag -a "${tag}" -m "${version}"
 # above) the tag still lands, and a tag is what starts a release, so the
 # published binaries would come from a commit that never reached main.
 if ! git push --quiet --atomic origin main "${tag}"; then
-  # A non-zero exit does not prove nothing was published: the push can succeed
-  # on the remote and lose its acknowledgement. Ask the remote before undoing
-  # anything, or a dropped connection would roll back a release that is already
-  # building and report the opposite of what happened.
-  if [ -n "$(git ls-remote --tags origin "refs/tags/${tag}" 2>/dev/null)" ]; then
-    echo "push reported an error but ${tag} is on the remote; it is publishing." >&2
-    echo "run 'git pull' to resynchronise." >&2
-    exit 1
-  fi
-  # Undo the local commit and tag so a retry starts clean and does not skip a
-  # number. Safe because both were created moments ago by this script, on a
-  # tree it verified was clean.
-  if [ "$(git log -1 --format=%s)" = "release: ${version}" ]; then
-    git tag -d "${tag}" >/dev/null
-    git reset --quiet --hard HEAD~1
-  fi
-  echo "push rejected; nothing was published and the local bump was undone." >&2
-  echo "run 'git pull --rebase' and try again." >&2
+  # A failed push may have lost its acknowledgement after publishing. Keep
+  # the exact commit and tag so either outcome can be inspected and recovered.
+  echo "push reported an error; publication status is unknown." >&2
+  echo "local release commit and ${tag} were kept." >&2
+  echo "inspect 'git ls-remote --tags origin refs/tags/${tag}' and the release workflow before retrying." >&2
   exit 1
 fi
 

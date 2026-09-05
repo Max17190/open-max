@@ -438,14 +438,6 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
 /// the same `*.tmp`.
-///
-/// Replacement strategy:
-/// 1. Try `rename(tmp → path)` (atomic replace on Unix; works when missing
-///    on every platform).
-/// 2. If that fails and `path` exists (Windows), move `path` aside to a unique
-///    `.bak`, rename `tmp → path`, then drop the backup. If the install rename
-///    fails, restore the backup so a transient error never erases the prior
-///    data file.
 pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     let parent = path
         .parent()
@@ -462,47 +454,16 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
-    // Never treat a directory as a replaceable destination (would move the dir
-    // aside as `.bak` and leave an orphaned tree).
+    // Reject directories, including symlinks to directories.
     if path.is_dir() {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{} is a directory", path.display()));
     }
-    if std::fs::rename(&tmp, path).is_ok() {
-        return Ok(());
-    }
-    if !path.exists() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("failed to install {}", path.display()));
-    }
-    let backup = parent.join(format!("{base}.{id}.bak"));
-    if let Err(e) = std::fs::rename(path, &backup) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.to_string());
-    }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&backup);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(e) => {
-            // Prior content is still in `backup`; put it back at the canonical
-            // path before failing so loaders keep working. Prefer rename; if
-            // that fails (e.g. path recreated/locked), fall back to copy.
             let _ = std::fs::remove_file(&tmp);
-            if std::fs::rename(&backup, path).is_ok() {
-                return Err(e.to_string());
-            }
-            match std::fs::copy(&backup, path) {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&backup);
-                    Err(e.to_string())
-                }
-                Err(ce) => Err(format!(
-                    "install failed ({e}); restore rename/copy failed ({ce}); prior data at {}",
-                    backup.display()
-                )),
-            }
+            Err(e.to_string())
         }
     }
 }

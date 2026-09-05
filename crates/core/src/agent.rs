@@ -504,7 +504,6 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             registry,
             prompt_breakdown,
             persisted_count,
-            snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
             fallback_recovery_reported,
@@ -531,18 +530,12 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             // would look like a self-modification and re-freeze for nothing.
             sessions::save_manifest(core, session_id, &registry.to_manifest());
         }
-        // Session creation is the one consolidation boundary: memories the
-        // decay law says are gone are deleted (tombstoned in the access log)
-        // before the index freezes into the prompt, and never mid-session,
-        // so a live prompt cannot index a file that no longer exists.
-        let _ = crate::memory::forget_faded(project_root, crate::memory::unix_now());
         let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
         SessionData {
             messages: vec![ChatMessage::system(prompt)],
             registry,
             prompt_breakdown: Arc::new(breakdown),
             persisted_count: 0,
-            snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
             fallback_recovery_reported: false,
@@ -678,10 +671,8 @@ async fn execute_readonly_batch(
             name: name.into(),
             args: args.clone(),
         });
-        // hooks pre → permissions → content gate. approval_mode and
-        // snapshot_file are skipped because both only ever act on mutating
-        // tools, which batchable_call excludes: that exclusion is what makes
-        // the shorter sequence equivalent, not an assumption about intent.
+        // hooks pre → permissions → content gate. approval_mode is skipped
+        // because batchable_call excludes mutating tools.
         let block = match ctx
             .hooks
             .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
@@ -3000,10 +2991,6 @@ async fn run_loop(
                     continue;
                 }
 
-                if registry.is_mutating(name) {
-                    snapshot_file(core, session_id, project_root, &args).await;
-                }
-
                 // Read live so "[a]lways" during an approval prompt takes effect
                 // for the rest of this turn, not just the next one.
                 let approval_mode = core.approval_mode();
@@ -3506,17 +3493,6 @@ async fn run_loop(
         );
     }
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
-}
-
-/// Record a file's pre-edit content the first time this session touches it,
-/// enabling cumulative per-file diffs.
-async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, args: &Value) {
-    let Some(rel) = args["path"].as_str() else { return };
-    let content = std::fs::read_to_string(project_root.join(rel)).unwrap_or_default();
-    let mut sessions_map = core.sessions.lock().await;
-    if let Some(data) = sessions_map.get_mut(session_id) {
-        data.snapshots.entry(rel.to_string()).or_insert(content);
-    }
 }
 
 /// Persist transcript to disk without cloning it back into SessionData.
@@ -4193,6 +4169,29 @@ fn prune_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_session_keeps_faded_memory_files() {
+        let dir = std::env::temp_dir().join(format!("openmax-memory-retain-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        let memory_dir = project.join(crate::memory::MEMORY_DIR);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let path = memory_dir.join("rarely-needed.md");
+        let body = "# Recovery procedure\nKeep the full procedure even when it leaves the index.\n";
+        std::fs::write(&path, body).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(90 * 24 * 60 * 60);
+        std::fs::File::open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        core.set_run_approval_mode(ApprovalMode::Readonly);
+
+        let data = build_session_data(&core, "fresh", &project);
+
+        assert!(!data.messages[0].content.as_deref().unwrap().contains("Recovery procedure"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        assert!(!memory_dir.join(".access.jsonl").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// Hooks are inert until a human approves their exact content - the file
     /// and the code it runs, exactly what `openmax --approve` blesses. Tests

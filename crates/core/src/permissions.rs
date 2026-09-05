@@ -479,8 +479,13 @@ fn invalid(reason: String) -> FileLoad {
 }
 
 fn load_file(path: &Path) -> FileLoad {
-    if !path.is_file() {
-        return FileLoad::Missing;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileLoad::Missing,
+        Err(e) => return invalid(format!("unreadable ({e}); failing closed")),
+    };
+    if !metadata.is_file() && !(metadata.is_symlink() && path.is_file()) {
+        return invalid("not a readable regular file; failing closed".into());
     }
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -584,6 +589,20 @@ fn arg_haystack(tool: &str, args: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn non_file_permissions_fail_closed() {
+        let dir = tempfile_dir();
+        let path = dir.join(".openmax/permissions.toml");
+        std::fs::create_dir_all(&path).unwrap();
+        let policy = Permissions::from_files(&dir, std::slice::from_ref(&path), &dir.join("data"));
+        assert!(matches!(
+            policy.evaluate("bash", &json!({"command": "echo should-not-run"})),
+            PermissionDecision::Deny { .. }
+        ));
+        assert!(matches!(load_file(&path), FileLoad::Invalid(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn write_perms(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {

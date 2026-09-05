@@ -43,9 +43,6 @@ pub struct SessionData {
     pub prompt_breakdown: Arc<crate::prompt::PromptBreakdown>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,
-    /// File content captured on first touch by a mutating tool, so the UI can
-    /// show a cumulative diff per file at any point in the session.
-    pub snapshots: HashMap<String, String>,
     /// Process-unique id of the turn that last took `messages`; a restore is
     /// only valid while this still matches the taker (guards against a newer
     /// turn or a recreated session reusing the id).
