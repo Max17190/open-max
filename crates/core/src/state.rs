@@ -65,17 +65,11 @@ pub struct SessionData {
     /// recorded - and the next mid-turn sync would sweep them up as the
     /// agent's own work.
     pub ledger_synced: bool,
-    /// Deferred ledger syncs, oldest first: (extension generation, actor). A
-    /// sync that cannot land is held here with the attribution it was owed,
-    /// and every sync path drains this queue in order before adding its own
-    /// claim - the head must never advance past an unlanded one, or its
-    /// changes get recorded later under whoever syncs next, and that
-    /// misattribution is permanent. Every distinct generation observed
-    /// across a broken window stays queued (dropping one would erase its
-    /// content from history); only an entry identical to the queue tail is
-    /// skipped, which is what keeps unchanged turn starts from growing this
-    /// by one per turn.
-    pub pending_syncs: Vec<(ExtensionGeneration, crate::ledger::Actor)>,
+    /// A turn-start generation the ledger could not record. Held so a later
+    /// mid-turn sync lands it as external work first: the delta that sync
+    /// records would otherwise span a human's pre-session edits and file
+    /// them as the agent's. In memory only; see `agent::settle_ledger`.
+    pub unrecorded_external: Option<ExtensionGeneration>,
     /// Content hashes of policy notices (inert allow rules, hooks that did
     /// not load) already narrated to the MODEL this session. The condition
     /// holds every turn once it holds at all, so the transcript gets one
