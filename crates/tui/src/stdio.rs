@@ -59,7 +59,7 @@ pub const PROTO_VERSION: u32 = 5;
 enum Command {
     User { text: String },
     Approve { approval_id: String, approved: bool },
-    /// Set the approval gate for mutating tools; persisted like /approvals.
+    /// Save this trusted project's execution mode, like /approvals.
     ApprovalMode { mode: String },
     /// Re-freeze tools, skills, and prompt from current config, like /reload.
     Reload,
@@ -233,18 +233,9 @@ async fn drive_loop<W: Write>(
                                 // success: the acknowledged state, the live
                                 // state, and the on-disk state must never
                                 // disagree about how mutating tools are gated.
-                                let saved = {
-                                    let mut next = core.settings.lock().unwrap().clone();
-                                    next.approval_mode = parsed;
-                                    core.save_settings(&next)
-                                };
+                                let saved = core.set_project_approval_mode(&project, parsed);
                                 match saved {
                                     Ok(()) => {
-                                        core.settings.lock().unwrap().approval_mode = parsed;
-                                        // Any write to the persisted mode drops
-                                        // a run override, or the explicit choice
-                                        // would stay masked.
-                                        core.clear_run_approval_mode();
                                         emit(
                                             out,
                                             &serde_json::json!({
@@ -998,18 +989,21 @@ mod tests {
 
     #[tokio::test]
     async fn approval_mode_command_persists_and_acknowledges() {
-        let (lines, _code, core) = drive_commands(vec![
-            Command::ApprovalMode { mode: "auto".into() },
-            Command::ApprovalMode { mode: "sometimes".into() },
-        ])
-        .await;
+        let (lines, _code, core, dir) = drive_in_project(
+            |root| { open_max_core::trust::trust_project(root, root).unwrap(); },
+            false,
+            vec![
+                Command::ApprovalMode { mode: "auto".into() },
+                Command::ApprovalMode { mode: "sometimes".into() },
+            ],
+        ).await;
         assert_eq!(lines[0]["type"], "approval_mode");
         assert_eq!(lines[0]["mode"], "auto");
         assert_eq!(lines[1]["type"], "protocol_error");
-        assert_eq!(
-            core.settings.lock().unwrap().approval_mode,
-            open_max_core::config::ApprovalMode::Auto
-        );
+        assert_eq!(core.approval_mode(&dir), open_max_core::config::ApprovalMode::Auto);
+        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&dir), open_max_core::config::ApprovalMode::Auto);
+        assert_eq!(core.settings.lock().unwrap().approval_mode, open_max_core::config::ApprovalMode::Ask);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Every stdin command the reader accepts and every bespoke stdout line

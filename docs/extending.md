@@ -138,7 +138,11 @@ streams carry verbatim. Nothing a hook prints changes what the model receives. H
 like external tools and `bash`, run as native host processes with inherited
 filesystem, environment, credentials, and network access.
 
-Unknown keys in a hook file are rejected, and a hook file that a human approved
+In `auto`, valid hooks run without content approval, including after edits.
+Malformed hooks block tools until repaired or removed; rewriting the broken
+manifest remains available. File changes activate at the next turn.
+
+In `ask` and `readonly`, unknown keys in a hook file are rejected, and a hook file that a human approved
 and that no longer parses blocks every tool call until it is fixed or removed
 (fail closed, like permissions): a broken file might have been a gate, and
 `openmax --check` prints the reason. A file no human ever approved never ran,
@@ -155,7 +159,9 @@ parents still cannot be aimed outside the project.
 
 Optional rules under `.openmax/permissions.toml` or
 `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty
-discovery is free. First match wins. Order: hooks pre → permissions →
+discovery is free. First match wins. In `auto`, valid `allow` rules need no
+content approval and `ask` rules do not prompt; `deny` still blocks. In `ask`,
+project `allow` rules require content approval. Order: hooks pre → permissions →
 `approval_mode` → execute → hooks post.
 
 ```toml
@@ -201,7 +207,9 @@ path and `openmax --check` prints the parse error.
 
 A tool file may declare one `[example]` (JSON args plus an optional
 `expect_regex`). `openmax --check --run-examples` executes each declared
-example through the real spawn path. For an approved tool the example is the
+example through the real spawn path. In `auto`, valid tools run with host
+authority without content approval, behind hook gates and permission denies.
+In `ask` or `readonly`, for an approved tool the example is the
 real command on the host, and a failed call or an output mismatch fails the
 check. An unapproved tool is probed in a sandbox that denies the network and
 any write outside its scratch directory, so a non-pass there is reported as a
@@ -214,10 +222,10 @@ honest proof that a freshly written tool actually runs.
 
 Running an approved example is running the tool: an unsandboxed host process
 in the project root with no snapshot taken. So it passes the same gates a turn
-applies - the project must be trusted, a human must have approved the tool
+applies. The project must be trusted. Outside `auto`, a human must have approved the tool
 file's exact bytes with `openmax --approve <path>`, `pre_tool_use` hooks must
 allow the call, permission rules must admit it (`deny` refuses, and so does
-`ask`: nothing here can prompt, so write `effect = "allow"` for a tool whose
+`ask` outside auto: nothing here can prompt, so write `effect = "allow"` for a tool whose
 example should run unattended), and `approval_mode` still governs
 `mutating` tools (`readonly` refuses them; `ask` refuses them when the process
 was started from an agent session, because there is nobody to prompt). Each
@@ -266,11 +274,13 @@ so there is nothing to check". A name that is not on `PATH`, a script that has
 not been written yet, or a spelling this platform does not parse as a path all
 leave the definition unapproved until the file exists.
 
-Three hard rules ride on this, with no rule language to widen them:
+The following content requirements apply in `ask` and `readonly`. In `auto`,
+new and repaired tools and hooks need no content grants. Switching back
+restores these requirements; running under auto does not bless their hashes:
 
 - An external tool whose definition no human has approved always prompts on
-  its first run - even in `auto` mode, even under a permissions `allow` rule,
-  both of which the agent can write for itself. Approving that run approves the
+  its first run in `ask`, even under a permissions `allow` rule. In
+  `readonly` it is refused. Approving a call in `ask` approves the
   exact content; later runs of the same bytes are unattended. Every external
   tool is covered, whatever its `mutating` field says: that field is metadata
   the agent writes, while the call itself spawns a native host process with
@@ -326,7 +336,7 @@ Approvals happen two ways: answering the `unapproved_source` prompt an
 external tool raises on its first call - the card names the manifest and its
 hash, and approving blesses the manifest and the code it runs - and `openmax
 --approve <path>` for everything else (a hook, a file that arrived from a
-clone or an installer, an auto-mode write). Approving an in-session
+clone or an installer, a file created in auto that you now want to use in ask). Approving an in-session
 `write_file` or `edit_file` of a capability file approves that write and
 nothing more: the approval card shows a clipped preview of the arguments, and
 a preview is not shown bytes, so a tool the agent writes still prompts on its

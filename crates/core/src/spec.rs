@@ -134,17 +134,21 @@ Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
 native host process with the network and filesystem authority of Open Max;
 its environment is the scrubbed baseline plus the manifest's `env` list.
 
-Human approval: because of that authority, the first call of any tool file -
-mutating or not - stops for a human, who approves the exact bytes. Later calls
-of identical bytes run unprompted; any edit revokes and asks again. Approve
-at an interactive terminal outside any session with `openmax --approve
-.openmax/tools/<name>.toml` (a human act: it refuses processes carrying the
-session marker and callers with no terminal, so it never happens by accident
-from a session; a shell that clears the marker or attests is a command the
-human's ask rule on bash puts in front of them), or by approving the write
-that created it. `openmax --spec usage` lists the approval state of every
-installed tool.
+Execution policy: in auto, valid tools run without confirmation or content
+grants, including after edits. Deny rules and hook gates still apply. In ask,
+the first call of any unapproved tool file, mutating or not, requires a human
+content approval, even under a permission allow rule. Later calls of the same
+bytes need no content approval, but the mutating/permission gate still applies.
+Readonly refuses mutating calls and calls requiring confirmation.
 
+Select /approvals auto|ask|readonly or Shift+Tab in a human-controlled frontend.
+The choice persists for this exact trusted project across launches, including
+headless/stdio. Other projects retain their own choice or settings default.
+Running in auto does not grant hashes: switching back to ask restores content
+requirements. Approve specific bytes with openmax --approve <manifest> or the
+content card in ask. Approving a file write approves only that write.
+
+The following content binding applies when content approval is required.
 What "the exact bytes" covers is the whole definition: the `.toml` *and* the
 project-local file its `command` (or a path in `args`) names, because that file
 is the code that actually runs and the agent can rewrite it after the fact.
@@ -203,8 +207,12 @@ capped rendering a tool call returns (the tail, once output exceeds the cap),
 so a token printed early by a noisy command can scroll out of the window.
 Plain `--check` never executes anything.
 
-How an example runs depends on whether a human has approved the tool's exact
-bytes (manifest plus the project-local code it names):
+In auto, examples run the real host command without content approval, behind
+hook gates and permission denies. Permission ask rules do not prompt or block
+in auto. Validation, output limits, and execution reports still apply.
+
+Outside auto, an example's execution depends on whether a human has approved
+the tool's exact bytes (manifest plus the project-local code it names):
 
 - UNAPPROVED (the common case while you are still writing it): the example
   runs as a SANDBOXED PROBE - no network, writes confined to a scratch dir
@@ -403,7 +411,14 @@ Each run receives one JSON payload on stdin, as one newline-terminated line:
   `continuations_left` is what remains before the harness overrides the hook.
   A hook without `blocking` always sees `blockable` false.
 
-Approval: a hook is inert until a human approves its exact content - the
+In auto, valid hooks run without content approval, including new and repaired
+hooks. Malformed hook files and over-cap gates block tools until fixed;
+write_file/edit_file on the offending manifest remain available for repair.
+Hook edits apply from the next turn. Explicit mode changes refresh policy
+before subsequent calls. Execution failures are reported and no hashes are
+automatically granted. Removing a hook in auto removes that policy.
+
+In ask/readonly, a hook is inert until a human approves its exact content - the
 `.toml` *and* the project-local file its `command` (or a path in `args`) names,
 because that file is the code that actually runs and the agent can rewrite it.
 `openmax --approve <hook.toml>` approves the pair and prints both; an
@@ -417,7 +432,8 @@ runtime is not covered, so a gate written that way can be defanged by editing
 the file it sources. Name a script in `args` instead - `openmax --check` warns
 when inline text reads a project file.
 
-Fail closed, four ways, all reported by `openmax --check`:
+Outside auto, content approval can fail closed in the following ways, all
+reported by `openmax --check`:
 - A hook file that exists but does not parse blocks every tool until it is
   fixed or removed (a broken file might have been a gate), unless a valid
   project file shadows its stem - or unless no human ever approved that path,
@@ -544,16 +560,20 @@ original approved bytes still match the standing approval, so restoring them
 byte-for-byte would run without a card again. Only the name rule survives such
 a restore. `ask` mode alone will not surface this for you.
 
-`allow` is the only effect that removes a gate: it skips the approval prompt
-outright. The project file sits where you write, so an `allow` in it is inert
+In auto, valid allow rules require no content grant, ask rules do not prompt,
+and deny rules still block. First-match order still applies; an earlier allow
+can shadow a later deny. Mode changes do not erase earlier deny snapshots.
+
+In ask, `allow` skips the ordinary approval prompt but never an unapproved
+tool's content gate. A project `allow` is inert
 until a human approves that exact content with
 `openmax --approve .openmax/permissions.toml`; until then those calls fall
 through to `approval_mode` and the human is asked. Editing the file revokes
 the approval, as with any other capability content. `deny` and `ask` only add
-friction and always apply. The global file is outside the project root, where
+friction outside auto. Deny applies in every mode. The global file is outside the project root, where
 your file tools cannot write, so its `allow` rules need no approval. Writing
-yourself an `allow` rule therefore grants nothing; ask the user to approve the
-file when they want the prompts gone.
+yourself an `allow` rule in ask therefore grants nothing; ask the user to
+approve the file when they want those prompts gone.
 
 Rules never enter the prompt and are re-read every turn; an empty or missing
 file changes nothing. Fail closed: an unreadable or malformed file denies
@@ -658,7 +678,7 @@ session; tell the user instead (see the model-switch recipe below).
 Parsing is strict and fail-closed: a file that exists but does not parse,
 uses an unknown key, or sets an unrecognized value makes the NEXT launch
 refuse to start (exit 2) until fixed. A missing file means defaults. The
-TUI rewrites the whole file on `/model`, `/provider`, and `/approvals`, so
+TUI rewrites the whole file on `/model` and `/provider`, so
 manual edits can be overwritten by the next in-app settings change.
 
 Fields (all optional in JSON; an empty `base_url`/`model` or a missing
@@ -669,7 +689,12 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   `chat/completions` on it). No default, never a localhost fallback.
 - `api_key`: literal, or `$ENV_VAR` indirection; `OPENMAX_API_KEY` also works.
 - `model`: model id sent with every request.
-- `approval_mode`: `auto` | `ask` | `readonly`.
+- `approval_mode`: `auto` | `ask` | `readonly`; default ask. Used only when
+  this project has no saved choice. /approvals, Shift+Tab, and the card's
+  Auto for project choice persist in trust.json under the canonical root,
+  not in settings.json. They do not change other projects. Auto includes
+  extension execution without content approvals; deny rules and validation
+  still apply. Agent-spawned clients cannot change the saved mode.
 - `context_tokens`: the model's context window in tokens. REQUIRED here or
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or
@@ -839,7 +864,8 @@ Commands, one JSON object per line:
 - {"cmd":"approve","approval_id":"...","approved":true|false} answers a
   pending approval.
 - {"cmd":"approval_mode","mode":"auto"|"ask"|"readonly"} sets the gate for
-  mutating tools, persisted to settings like the TUI's /approvals. Answered
+  this trusted project, saved in trust.json like the TUI's /approvals.
+  Agent-spawned clients cannot change it. Answered
   by {"type":"approval_mode","mode":"..."} once the new mode is saved, or a
   `protocol_error` naming the legal values; on a save failure the mode is
   unchanged and the error says so.
@@ -897,8 +923,10 @@ counters are the numbers the hook's payload carried for this attempt), `done`
 `approval_request.reason` is `gate` (approval_mode or a permission rule) or
 `unapproved_source`: a call of an external tool whose exact bytes - the
 manifest, or the project-local code it runs - no human has approved.
-`unapproved_source` is the human boundary itself and must never be
-auto-approved; it carries `source_path` (project-relative where possible) and
+Only ask mode emits approval requests. Auto dispatches valid extensions
+without content grants; readonly refuses calls requiring approval. A pending
+ask request still needs an answer or cancellation after a mode change.
+Unattended clients must decline `unapproved_source` requests; it carries `source_path` (project-relative where possible) and
 `source_sha` (first 12 hex chars), so a client that cannot prompt can print
 `openmax --approve <source_path>`. Both are empty on `gate`. `env` is the list
 of environment variable NAMES the approved tool will receive (its manifest's

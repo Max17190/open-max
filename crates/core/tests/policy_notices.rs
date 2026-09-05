@@ -102,7 +102,7 @@ fn write_config(data: &std::path::Path, base_url: &str, project: &std::path::Pat
         serde_json::json!({
             "base_url": base_url,
             "model": "scripted",
-            "approval_mode": "auto",
+            "approval_mode": "ask",
             "context_tokens": 16384,
         })
         .to_string(),
@@ -128,8 +128,10 @@ async fn drive_turn(
             .await
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
-        if matches!(envelope.event, AgentEvent::Done { .. }) {
-            break;
+        match envelope.event {
+            AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(&approval_id, true); }
+            AgentEvent::Done { .. } => break,
+            _ => {}
         }
     }
     // Done precedes the running flag clearing; wait for idle before the

@@ -41,7 +41,7 @@ One JSON object per line.
 | --- | --- | --- |
 | `user` | `text` | Start a turn with the text |
 | `approve` | `approval_id`, `approved` (bool) | Answer a pending approval |
-| `approval_mode` | `mode` (`auto`, `ask`, or `readonly`) | Set and persist the approval gate; answered by an `approval_mode` line, or a `protocol_error` naming the legal values (on a save failure the mode is unchanged and the error says so) |
+| `approval_mode` | `mode` (`auto`, `ask`, or `readonly`) | Save the execution mode for this trusted project; answered by an `approval_mode` line, or a `protocol_error` naming the legal values (on a save failure the mode is unchanged and the error says so) |
 | `reload` | none | Re-freeze tools, skills, and prompt from current config; answered by `refrozen`, or `protocol_error` while a turn is in flight |
 | `cancel` | none | Cancel the running turn |
 | `quit` | none | Drain the in-flight turn, then exit |
@@ -84,6 +84,12 @@ Example event line:
 ```json
 {"session_id":"s1","type":"tool_start","call_id":"c1","name":"read_file","args":{"path":"a.rs"}}
 ```
+
+Mode selection uses the same canonical project choice as the TUI and survives
+restart. Agent-spawned clients cannot change it. In `auto`, the core emits no
+approval requests, including for new extension content or permission `ask`
+rules. Deny rules and validation still apply. A request emitted while in `ask`
+remains pending until answered or cancelled, even if the mode then changes.
 
 `approval_request.env` is the list of environment variable names the approved
 tool will receive (its manifest's `env` allowlist): a credential grant. It is

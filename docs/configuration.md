@@ -64,14 +64,32 @@ lossless record. The `compaction` hook observes each prune.
 
 ## Approvals
 
-`write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use
-`auto` for unattended runs or `readonly` to block mutating tools. Approvals and
-permissions decide whether Open Max dispatches a tool call; they are not OS
-isolation.
+Select the mode with `/approvals auto|ask|readonly`, **Shift+Tab**, or the
+approval card's **Auto for project** choice. Every selector saves the same
+choice in `~/.openmax/trust.json` for this exact canonical project path.
+It survives new sessions and restarts, including headless and stdio runs.
+Other projects keep their own choice or the `settings.json` default, which
+is `ask`. Symlink aliases share the choice; nested projects have their own.
 
-`/approvals auto|ask|readonly` writes the mode to `settings.json`. **Shift+Tab**
-cycles the three for the current run only, so a keystroke never widens what
-future sessions in the project may do.
+- `auto` runs authorized work without confirmation, including newly created
+  or repaired tools, hooks, and project permission `allow` rules. It ignores
+  permission `ask` requests. It does not create content approval records.
+- `ask` prompts for mutating calls unless a permission `allow` applies, and
+  always prompts for unapproved external tool content. Hooks and project
+  permission `allow` rules still require content approval.
+- `readonly` blocks mutating calls and calls that would require confirmation.
+
+Deny rules, hook gates, parsing, output limits, and execution reports remain
+active in every mode. Rules are still first-match and cannot relax during a
+turn. Hook file edits apply at the next turn; explicit mode changes refresh
+policy before subsequent calls. A failed save leaves the active mode unchanged.
+Returning to `ask` restores content requirements for anything created in `auto`.
+
+Only a human-controlled frontend can select a saved mode. Agent-spawned
+processes can use an existing choice but cannot change it through the mode
+command. Trust and settings are read at process launch; editing either file
+from a tool does not change that process's chosen mode. These controls govern
+dispatch and are not OS isolation.
 
 ## Multiple providers
 
@@ -134,54 +152,19 @@ code.
 
 ## Hardened profile
 
-The honest answer to "lock the agent down" is configuration the harness
-already has, not a sandbox. In auto mode, `bash` runs unprompted with the
-full authority of your account; that is the deliberate default for fluid
-work in a trusted project. To harden a project:
+Use `/approvals ask` when you want confirmation. In `auto`, bash and valid
+extensions run with your account's host authority without a prompt. A
+permission `ask` rule does not override that choice. Use `deny` to prohibit a
+tool or command pattern, or switch to `readonly` to disable mutating calls.
 
-- `"approval_mode": "ask"` in settings.json puts every mutating call in
-  front of you, or
-- keep auto mode but add an ask rule for bash in your **global**
-  `~/.openmax/permissions.toml` (outside the project root, where the
-  confined file tools cannot reach it; a bash edit to it is a command this
-  very rule puts in front of you first, in the TUI and over `--stdio`):
+External tools receive a scrubbed baseline environment plus the variable names
+listed in their manifests. In `ask`, content approval covers the manifest and
+the project-local code it names. It cannot cover code fetched or selected at
+runtime. Prefer scripts named in manifest arguments when that binding matters.
 
-```toml
-[[rules]]
-effect = "ask"
-tool = "bash"
-```
-
-External tools are narrower than bash by construction: every tool's first
-run needs your approval of its exact bytes, its environment is scrubbed to
-a baseline plus the `env` names its approved manifest declares, and
-unapproved tool code can only ever execute as a sandboxed probe (no
-network, writes confined) via `openmax --check --run-examples`.
-
-What makes an approval a human act is worth stating exactly. `openmax
---approve` and `--trust-project` refuse any process carrying the session
-marker every child of the harness gets, refuse callers with no terminal,
-and honor `OPENMAX_HUMAN_ATTEST=1` for automation a human runs. Those are
-walls against a grant happening by accident, and they hold against an
-agent that follows the prompt; they are not a guarantee against an agent
-that sets out to grant itself authority, because a shell the agent runs
-can clear a marker, set one, or allocate a terminal, and the ledger record
-that results is indistinguishable from yours. In `auto` mode the only trace
-is the note at the next turn start naming approval activity this session
-did not make. The hardened profile above is what closes it, where there
-is someone to ask: in the TUI and over `--stdio`, with bash asking, the
-command that would arrange those markers is a command you see before it
-runs. A headless `-p` run has no one to ask; in `auto` mode it accepts
-gate cards itself, including one raised by an explicit `ask` rule, and in
-`ask` mode it declines them, so authority-changing work under `-p` belongs
-in `ask` mode or on the `--stdio` wire with a human answering. The same
-holds for the permission and trust files under `~/.openmax/`: outside the
-project root, so the confined file tools cannot touch them, and bash can,
-which is why the ask rule on bash is the durable protection rather than
-the location.
-
-Residual risk to know about: an *approved* tool or a bash command can fetch
-content at runtime (`curl | sh`) that no approval ever covered. Approval
-binds bytes on disk at approval time, deliberately - pinning runtime
-fetches is unbounded. Review what you approve, and prefer tools whose code
-lives in project files where the approval reaches it.
+Trust grants, content grants, and saved mode changes reject processes carrying
+`OPENMAX_SESSION`. This prevents a normal child agent from treating its own
+commands as human decisions. It is not a sandbox: an agent with unrestricted
+bash can alter environment markers or files outside the project. Headless
+runs decline any approval request; use a human-controlled TUI or stdio frontend
+for work that needs `ask` mode decisions.

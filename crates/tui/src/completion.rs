@@ -59,7 +59,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     command(
         "approvals",
         "auto|ask|readonly",
-        "how mutating tools are gated",
+        "save this project's execution mode",
         false,
     ),
     command("new", "", "start a fresh session", true),

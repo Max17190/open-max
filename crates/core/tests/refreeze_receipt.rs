@@ -175,7 +175,7 @@ fn write_config(data: &std::path::Path, base_url: &str, project: &std::path::Pat
         serde_json::json!({
             "base_url": base_url,
             "model": "scripted",
-            "approval_mode": "auto",
+            "approval_mode": "ask",
             "context_tokens": 16384,
         })
         .to_string(),
@@ -201,8 +201,10 @@ async fn drive_turn(
             .await
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
-        if matches!(envelope.event, AgentEvent::Done { .. }) {
-            break;
+        match envelope.event {
+            AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(&approval_id, true); }
+            AgentEvent::Done { .. } => break,
+            _ => {}
         }
     }
     // Done is emitted before the session's `running` flag clears; a second
@@ -823,6 +825,7 @@ async fn a_harness_note_reaches_the_wire_for_a_broken_tool_write() {
         let env = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await.expect("30s").expect("open");
         match env.event {
+            AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(&approval_id, true); }
             AgentEvent::HarnessNote { text, .. } => {
                 if text.contains("NOT loaded") { note = Some(text); }
             }

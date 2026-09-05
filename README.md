@@ -127,6 +127,12 @@ Edit `~/.openmax/settings.json`:
 
 `base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. Set `context_tokens` to the context window the server actually serves for that model; nothing is queried, and a guessed window is wrong in one direction or the other. There is no default endpoint, model, or window: until all three are configured (here or through a named provider), Open Max refuses to start a turn with an error that says exactly what to set.
 
+`/approvals auto` saves the execution choice for the current trusted project.
+Shift+Tab and the approval card's Auto for project choice save the same setting.
+Auto covers extension creation and repair without further confirmation;
+validation, deny rules, and execution reports remain active. See
+[approval modes](docs/configuration.md#approvals).
+
 A settings file that exists but does not parse, uses an unknown key, or sets an unrecognized `approval_mode` is a startup error (fail closed): Open Max exits with the parse reason instead of silently reverting your endpoint and approval policy to defaults.
 
 Named endpoints in `providers.json` and `compat` flags for picky gateways are covered in [configuration](docs/configuration.md).

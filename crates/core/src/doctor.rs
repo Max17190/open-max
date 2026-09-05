@@ -71,6 +71,15 @@ type Entry = (Finding, Option<String>);
 
 pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let default = crate::config::load(data_dir).map(|s| s.approval_mode).unwrap_or(crate::config::ApprovalMode::Ask);
+    let mode = match crate::trust::approval_mode(data_dir, project_root, default) {
+        Ok(mode) => mode,
+        Err(reason) => {
+            findings.push(Finding { kind: "trust", path: data_dir.join("trust.json"), status: Status::Err(reason) });
+            crate::config::ApprovalMode::Ask
+        }
+    };
+    let auto = mode == crate::config::ApprovalMode::Auto;
 
     let mut tools_found: Vec<Entry> = Vec::new();
     let mut tool_meta: Vec<(String, PathBuf)> = Vec::new();
@@ -123,6 +132,10 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     });
                     match (missing, external) {
                         (Some((_, reason)), _) => Status::Warn(reason),
+                        (None, Some(_)) if auto => Status::Ok(format!("tool '{}' (auto: no content approval required)", spec.name)),
+                        (None, Some(_)) if mode == crate::config::ApprovalMode::Readonly && spec.mutating => {
+                            Status::Warn(format!("tool '{}' is mutating and disabled in readonly", spec.name))
+                        }
                         (None, Some(ext)) => match stale_code_reason(
                             data_dir,
                             project_root,
@@ -133,6 +146,13 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             // The tool still runs; it asks again first, which
                             // is the point. Silence here is what let a swapped
                             // script read as a healthy tool.
+                            Some(changed) if mode == crate::config::ApprovalMode::Readonly => {
+                                Status::Warn(format!("{changed}; readonly refuses unapproved content"))
+                            }
+                            None if mode == crate::config::ApprovalMode::Readonly
+                                && !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) => {
+                                Status::Warn(format!("tool '{}' has unapproved content and is disabled in readonly", spec.name))
+                            }
                             Some(changed) => Status::Warn(format!(
                                 "{changed}, so the next call asks for approval again"
                             )),
@@ -449,7 +469,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         (!crate::ledger::is_approved(data_dir, project_root, &h.source_sha256))
                             .then(|| "its content is not approved".to_string())
                     });
-                    match unapproved {
+                    match unapproved.filter(|_| !auto) {
                         Some(mut reason) => {
                             let approvals = crate::ledger::approvals(data_dir, project_root).ok();
                             let was_live =
@@ -573,7 +593,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // approved it is the loop failing every tool call closed, so --check has
     // to say that rather than leave a human reading "never loads" while their
     // session refuses to run.
-    if let Ok(approvals) = crate::ledger::approvals(data_dir, project_root) {
+    if let Some(approvals) = (!auto).then(|| crate::ledger::approvals(data_dir, project_root).ok()).flatten() {
         mark_displaced_gates(&mut hooks_found, |path| {
             approvals
                 .approved_hook(path)
@@ -603,6 +623,16 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             }
         }
     }
+    if auto {
+        let hooks = crate::hooks::Hooks::discover_for_mode(project_root, data_dir, mode);
+        if let Some(reason) = hooks.fail_closed_reason() {
+            hook_extras.push(Finding {
+                kind: "hook",
+                path: project_root.join(".openmax/hooks"),
+                status: Status::Err(reason),
+            });
+        }
+    }
     hook_extras.extend(clamp_findings(
         "hook",
         &hooks_found,
@@ -616,7 +646,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // approved paths are the source of truth for what should be there. This
     // is the same reconciliation the loop fails closed on; --check is where a
     // human finds out which file it means.
-    if let Ok(approvals) = crate::ledger::approvals(data_dir, project_root) {
+    if let Some(approvals) = (!auto).then(|| crate::ledger::approvals(data_dir, project_root).ok()).flatten() {
         for path in approvals.live_paths() {
             if path.exists() || !crate::hooks::is_hook_manifest(path, project_root) {
                 continue;
@@ -633,7 +663,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
 
     for path in crate::permissions::permission_files(project_root) {
-        let Some(result) = crate::permissions::check_file(&path, project_root, data_dir) else {
+        let Some(result) = crate::permissions::check_file_for_mode(&path, project_root, data_dir, mode) else {
             continue;
         };
         match result {
@@ -1026,7 +1056,7 @@ impl ExampleGates {
             // A rule that singles this tool out for a prompt cannot be honored
             // in a batch, and a rule the user wrote for one tool is too
             // specific to answer with "a human typed the command".
-            PermissionDecision::Ask => {
+            PermissionDecision::Ask if self.approval_mode != ApprovalMode::Auto => {
                 return Err(
                     "permission rule requires human approval of this tool; examples cannot prompt (change the rule to effect = \"allow\" to run it unattended)"
                         .into(),
@@ -1037,7 +1067,10 @@ impl ExampleGates {
             // question below - whether a person is attached to this process -
             // because permissions.toml is a file the agent can write for
             // itself; trust and the content approval are the human decisions.
-            PermissionDecision::Allow | PermissionDecision::Default => {}
+            PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => {}
+        }
+        if self.approval_mode == ApprovalMode::Auto {
+            return Ok(Admission::Host);
         }
         // Unapproved content probes in a sandbox instead of refusing. The
         // flat refusal protected nothing an agent could not already do with
@@ -1132,10 +1165,11 @@ async fn run_examples_within(
     // approval_mode this run has to honor).
     let settings = crate::config::load(data_dir)?;
     let caps = crate::tools::OutputCaps::from_settings(&settings);
+    let mode = crate::trust::approval_mode(data_dir, project_root, settings.approval_mode)?;
     let gates = ExampleGates {
-        hooks: crate::hooks::Hooks::discover(project_root, data_dir),
-        permissions: crate::permissions::Permissions::discover(project_root, data_dir),
-        approval_mode: settings.approval_mode,
+        hooks: crate::hooks::Hooks::discover_for_mode(project_root, data_dir, mode),
+        permissions: crate::permissions::Permissions::discover_for_mode(project_root, data_dir, mode),
+        approval_mode: mode,
         agent_spawned: std::env::var_os("OPENMAX_SESSION").is_some(),
     };
 
@@ -2091,7 +2125,7 @@ mod tests {
     /// extensions must not leak into an assertion.
     fn local(root: &Path) -> Vec<Finding> {
         let root = root.to_string_lossy().to_string();
-        check(Path::new(&root))
+        check_at(Path::new(&root), &Path::new(&root).join("test-data"))
             .into_iter()
             .filter(|f| f.path.to_string_lossy().starts_with(&root))
             .collect()
@@ -2854,6 +2888,35 @@ mod tests {
             .iter()
             .find(|v| v.tool == tool)
             .unwrap_or_else(|| panic!("no verdict for {tool}"))
+    }
+
+    #[tokio::test]
+    async fn project_auto_diagnostics_and_examples_use_the_execution_policy() {
+        let root = temp_project();
+        let data = root.join("data");
+        crate::trust::trust_project(&data, &root).unwrap();
+        crate::trust::set_approval_mode(&data, &root, crate::config::ApprovalMode::Auto).unwrap();
+        write(root.join(".openmax/tools/create.toml"),
+            "name = \"create\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo ran > result\"]\nmutating = true\n[example]\nargs = {}\n");
+        write(root.join(".openmax/hooks/observe.toml"),
+            "event = \"post_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n");
+        write(root.join(".openmax/permissions.toml"),
+            "[[rules]]\neffect = \"allow\"\ntool = \"read_file\"\n[[rules]]\neffect = \"ask\"\ntool = \"create\"\n");
+        let findings = check_at(&root, &data);
+        for name in ["create.toml", "observe.toml", "permissions.toml"] {
+            assert!(matches!(find(&findings, name).status, Status::Ok(_)), "{findings:?}");
+        }
+        let result = run_examples_at(&root, &data, |_| {}).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].result.is_ok(), "{:?}", result[0]);
+        assert!(!result[0].sandboxed);
+        assert_eq!(std::fs::read_to_string(root.join("result")).unwrap(), "ran\n");
+        crate::trust::set_approval_mode(&data, &root, crate::config::ApprovalMode::Readonly).unwrap();
+        assert!(find(&check_at(&root, &data), "create.toml").status.summary().contains("disabled in readonly"));
+        crate::trust::set_approval_mode(&data, &root, crate::config::ApprovalMode::Auto).unwrap();
+        write(root.join(".openmax/hooks/observe.toml"), "event = [broken");
+        assert!(check_at(&root, &data).iter().any(|f| f.status.summary().contains("failing closed")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
