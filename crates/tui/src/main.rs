@@ -438,10 +438,9 @@ async fn main() -> std::io::Result<()> {
                         .unwrap_or_default();
                     // One approval act can bless a manifest and the code it
                     // runs; the audit has to show that it covered both - and
-                    // whether their bytes are actually stored. Approvals
-                    // recorded before objects were stored at approval time
-                    // (or by hash alone) have nothing to restore, and the
-                    // footer's recipe must not imply otherwise.
+                    // whether their bytes are actually stored. A bound object
+                    // that is missing or corrupt has nothing to restore, and
+                    // the footer's recipe must not imply otherwise.
                     let bound = match r.also.len() {
                         0 => String::new(),
                         n => {
@@ -467,16 +466,16 @@ async fn main() -> std::io::Result<()> {
                                 format!("  (+{n} bound file{plural})")
                             } else {
                                 format!(
-                                    "  (+{n} bound file{plural}, {} not stored: approved before bytes were kept)",
+                                    "  (+{n} bound file{plural}, {} with no intact object)",
                                     n - stored
                                 )
                             }
                         }
                     };
                     // The manifest object matters as much as the bound ones:
-                    // a legacy or hash-only approval can keep intact bound
-                    // objects while its PRIMARY manifest bytes were never
-                    // stored, so the row must not read as fully restorable.
+                    // a damaged store can keep intact bound objects while the
+                    // PRIMARY manifest object is missing or corrupt, so the
+                    // row must not read as fully restorable.
                     // Checked from the full sha, not the short
                     // display form.
                     let manifest_note =
@@ -498,10 +497,6 @@ async fn main() -> std::io::Result<()> {
                         (Kind::Approval, None) => {
                             format!("approved {:12} {where_} (path only)", "")
                         }
-                        (Kind::ApprovalsImported, _) => format!(
-                            "imported {:12} pre-chain approvals from {where_}",
-                            ""
-                        ),
                         (Kind::PathRetired, _) => {
                             format!("retired  {:12} {where_} (path no longer expected)", "")
                         }

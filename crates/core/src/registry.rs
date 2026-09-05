@@ -796,9 +796,10 @@ impl Registry {
         registry
     }
 
-    /// True when the registry carries anything beyond the built-ins; an
-    /// all-builtin session needs no manifest file at all.
-    pub fn has_extensions(&self) -> bool {
+
+    /// True when the registry carries anything beyond the built-ins.
+    #[cfg(test)]
+    pub(crate) fn has_extensions(&self) -> bool {
         !self.skills.is_empty()
             || self.tools.iter().any(|s| !matches!(s.kind, ToolKind::Builtin))
     }
