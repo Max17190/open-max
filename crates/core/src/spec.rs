@@ -924,27 +924,6 @@ While a client is live, approvals are forwarded and openmax waits for an
 `approve`; after quit or EOF, pending and later approvals are declined so
 shutdown drains promptly.
 
-What changed in openmax-stdio/4: `turn_refused` is new. A client written for
-/3 has never seen a turn continue after `message_done` without its own `user`
-command; under a blocking `turn_end` hook that is now a normal turn shape, and
-this event is the only line that says why.
-
-What changed in openmax-stdio/5: `harness_note` is new. Before it, the
-receipts and notices the harness writes into the model's transcript (the
-refreeze receipt, the permission/providers/settings/approval notices) were
-visible only to the model; a frontend saw a bare `tool_end` and could not
-render, e.g., that a written tool did not load or that an approval was
-revoked. A /4 client simply never saw these lines; it is safe to ignore
-`harness_note` and lose only that surfaced text.
-
-What changed in openmax-stdio/3: `budget.used_tokens` now counts the frozen
-tool schemas sent on every request, not the transcript alone. Same field,
-same type, larger value (a zero-extension session reports ~1270 where /2
-reported ~720), and it is now exactly the total compaction enforces against
-`context_tokens`; thresholds calibrated against the /2 meaning must be
-re-calibrated. `schemas_over_budget` is new and additive, and so is
-`compacted`.
-
 Validate a stream against the contract: `openmax --check --stdio` reads JSONL
 on stdin, reports each line, and exits nonzero on any violation.
 "#;
