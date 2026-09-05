@@ -13,6 +13,97 @@ fn openmax_bin() -> &'static str {
     env!("CARGO_BIN_EXE_openmax")
 }
 
+/// Bound a regression's child lifetime even if a broken admission path hangs.
+fn finish_with_deadline(mut child: std::process::Child) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() { return child.wait_with_output().unwrap(); }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("child did not finish: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn an_idle_stdio_owner_excludes_continuation_until_process_exit() {
+    let (project, home) = fresh_dirs("session-owner");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    write_settings(&home, &format!("http://{}/v1", server.local_addr().unwrap()));
+    let mut owner = cmd(&project, &home).args(["--trust-project", "--stdio"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let stdout = owner.stdout.take().unwrap();
+    let (hello_tx, hello_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        let _ = hello_tx.send(line);
+    });
+    let hello = match hello_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(line) => line,
+        Err(e) => { let _ = owner.kill(); let _ = owner.wait(); panic!("missing handshake: {e}"); }
+    };
+    reader.join().unwrap();
+    let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+    let id = hello["session_id"].as_str().unwrap();
+    let transcript = home.join(".openmax/sessions").join(format!("{id}.messages.json"));
+    let competitors = [vec!["--continue", "-p", "must not run"], vec!["--continue", "--stdio"]];
+    for args in competitors {
+        let output = finish_with_deadline(cmd(&project, &home).args(args)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("already open in another process"));
+        assert!(!transcript.exists());
+    }
+    assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "a refused attachment cannot contact the model");
+    let independent = finish_with_deadline(cmd(&project, &home).arg("--stdio")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    assert!(independent.status.success(), "a separate session remains usable");
+    // An abrupt exit must release the OS lock without a cleanup command.
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let resumed = finish_with_deadline(cmd(&project, &home).args(["--continue", "--stdio"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+    let resumed: serde_json::Value = serde_json::from_slice(resumed.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(resumed["session_id"], id);
+    assert_eq!(resumed["continued"], true);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn damaged_continuation_preserves_bytes_before_hooks_or_provider_requests() {
+    let (project, home) = fresh_dirs("damaged-continuation");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    write_settings_with_mode(&home, &format!("http://{}/v1", server.local_addr().unwrap()), "auto");
+    let data = home.join(".openmax");
+    let canonical = std::fs::canonicalize(&project).unwrap();
+    let (core, _) = open_max_core::state::Core::new(data.clone()).unwrap();
+    let id = open_max_core::sessions::create(&core, canonical.display().to_string()).unwrap().id;
+    drop(core);
+    let transcript = data.join("sessions").join(format!("{id}.messages.json"));
+    let bytes = b"{\"role\":\"user\",\"content\":\"preserve\"}\n{torn record";
+    std::fs::write(&transcript, bytes).unwrap();
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    std::fs::write(project.join(".openmax/hooks/submit.toml"),
+        "event = \"user_prompt_submit\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch should-not-run\"]\n").unwrap();
+    for args in [vec!["--trust-project", "--continue", "-p", "hello"], vec!["--trust-project", "--continue", "--stdio"]] {
+        let output = finish_with_deadline(cmd(&project, &home).args(args)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("line 2") && error.contains("preserved"), "{error}");
+        assert_eq!(std::fs::read(&transcript).unwrap(), bytes);
+        assert!(!project.join("should-not-run").exists());
+    }
+    assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// A fresh project dir plus a fresh HOME, so trust and settings never leak
 /// between tests or into the developer's real ~/.openmax.
 fn fresh_dirs(tag: &str) -> (PathBuf, PathBuf) {

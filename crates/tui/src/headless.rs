@@ -76,13 +76,6 @@ async fn run_prompts(
     let mut stderr = io::stderr();
 
     for prompt in &args.prompts {
-        // Wait until the previous turn's spawn has cleared `running`. Done is
-        // emitted before that cleanup, so starting immediately races.
-        if !wait_until_idle(core, session_id).await {
-            eprintln!("openmax: timed out waiting for the previous turn to finish");
-            return 1;
-        }
-
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
         // would, so hooks and the transcript see the expanded text.
@@ -116,22 +109,6 @@ async fn run_prompts(
     }
 
     exit_code
-}
-
-/// Spin until the session is not marked running (or time out).
-pub(crate) async fn wait_until_idle(core: &Arc<Core>, session_id: &str) -> bool {
-    if !core.is_running(session_id) {
-        return true;
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        if !core.is_running(session_id) {
-            return true;
-        }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    !core.is_running(session_id)
 }
 
 async fn run_turn_events(

@@ -411,8 +411,9 @@ async fn report_schemas_over_budget(
     }
 }
 
-fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> SessionData {
-    if let Some(mut messages) = sessions::load_messages(core, session_id) {
+fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<SessionData, String> {
+    sessions::attach(core, session_id)?;
+    Ok(if let Some(mut messages) = sessions::load_messages(core, session_id)? {
         // Resume: registry frozen at creation — manifest if present, else built-ins only.
         let registry = if let Some(manifest) = sessions::load_manifest(core, session_id) {
             Arc::new(Registry::from_manifest(manifest))
@@ -468,8 +469,8 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
                 .collect(),
         }
     } else {
-        // No transcript on disk: start fresh, but honor a saved manifest if the
-        // messages file was lost or emptied without wiping the registry snapshot.
+        // No transcript on disk: start fresh, honoring a manifest saved
+        // before the session wrote its first message.
         let (registry, had_manifest) = if let Some(manifest) = sessions::load_manifest(core, session_id) {
             (Arc::new(Registry::from_manifest(manifest)), true)
         } else {
@@ -499,7 +500,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
                 .map(|e| e.id)
                 .collect(),
         }
-    }
+    })
 }
 
 /// The one failure persisted without the `Error: ` prefix: the model must
@@ -1276,6 +1277,7 @@ pub fn start_turn(
         if running.contains(&session_id) {
             return Err("the agent is already working in this session".into());
         }
+        sessions::attach(&core, &session_id)?;
         core.cancel_flags
             .lock()
             .unwrap()
@@ -1291,7 +1293,7 @@ pub fn start_turn(
         let (core, session_id, project_root) =
             (core.clone(), session_id.clone(), project_root.clone());
         async move {
-            run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await;
+            run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await
         }
     };
     spawn_guarded_turn(core, session_id, turn);
@@ -1308,29 +1310,37 @@ pub fn start_turn(
 /// loop in its own task turns that unwind into an ordinary error report.
 fn spawn_guarded_turn<F>(core: Arc<Core>, session_id: String, turn: F)
 where
-    F: std::future::Future<Output = ()> + Send + 'static,
+    F: std::future::Future<Output = String> + Send + 'static,
 {
     tokio::spawn(async move {
-        if let Err(join) = tokio::spawn(turn).await {
-            let detail = if join.is_cancelled() {
-                "the turn task was dropped".to_string()
-            } else {
-                panic_detail(join.into_panic())
-            };
-            core.send_agent(
-                &session_id,
-                AgentEvent::Error { message: format!("the turn ended unexpectedly: {detail}") },
-            );
-            core.send_agent(&session_id, AgentEvent::Done { stop_reason: "error".into() });
-        }
-        // Released together, under the same outer lock the turn claimed them
-        // with. Dropping `running` first would let a client that just saw
-        // `done` start the next turn in the gap and have its fresh cancel
-        // token deleted by the line below, leaving a turn nobody can stop.
-        let mut running = core.running.lock().unwrap();
-        core.cancel_flags.lock().unwrap().remove(&session_id);
-        running.remove(&session_id);
+        let stop_reason = match tokio::spawn(turn).await {
+            Ok(reason) => reason,
+            Err(join) => {
+                let detail = if join.is_cancelled() {
+                    "the turn task was dropped".to_string()
+                } else { panic_detail(join.into_panic()) };
+                core.send_agent(&session_id, AgentEvent::Error {
+                    message: format!("the turn ended unexpectedly: {detail}"),
+                });
+                "error".into()
+            }
+        };
+        // Settle and publish under the admission lock. A consumer can start
+        // immediately on Done without a late cleanup deleting its new token.
+        finish_session_work(&core, &session_id, vec![AgentEvent::Done { stop_reason }]).await;
     });
+}
+
+/// Both turns and manual compactions publish receipts only after settlement.
+async fn finish_session_work(core: &Core, id: &str, events: Vec<AgentEvent>) {
+    let restoration = core.message_restorations.lock().unwrap().remove(id);
+    if let Some(restoration) = restoration { let _ = restoration.await; }
+    let mut state = core.sessions.lock().await;
+    let mut running = core.running.lock().unwrap();
+    core.cancel_flags.lock().unwrap().remove(id);
+    running.remove(id);
+    sessions::finish_detach(core, id, &mut state);
+    for event in events { core.send_agent(id, event); }
 }
 
 /// Recover the message a panic carried, for the error event that replaces it.
@@ -1363,6 +1373,7 @@ pub async fn reload_session(
     if core.is_running(session_id) {
         return Err("a turn is in flight; run /reload after it finishes".into());
     }
+    sessions::attach(core, session_id)?;
     let root = project_root.to_path_buf();
     let dd = core.data_dir.clone();
     let mut snapshot =
@@ -1373,21 +1384,7 @@ pub async fn reload_session(
     let registry = Registry::from_snapshot(snapshot);
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
 
-    // Hydrate first if the session was resumed but never ran a turn, so the
-    // reload applies to the real transcript rather than a fresh one - and so
-    // the settlement below has a session to hold its generation in if it fails.
-    let hydrated = core.sessions.lock().await.contains_key(session_id);
-    if !hydrated {
-        let core_clone = core.clone();
-        let session_id_owned = session_id.to_string();
-        let project_root_owned = project_root.to_path_buf();
-        let built = tokio::task::spawn_blocking(move || {
-            build_session_data(&core_clone, &session_id_owned, &project_root_owned)
-        })
-        .await
-        .map_err(|e| format!("reload hydration failed: {e}"))?;
-        core.sessions.lock().await.entry(session_id.to_string()).or_insert(built);
-    }
+    ensure_session_hydrated(core, session_id, project_root).await?;
 
     let counts = (registry.tools.len(), registry.skills.len());
     {
@@ -1453,6 +1450,7 @@ pub fn compact_session(
         if running.contains(session_id) {
             return Err("the agent is already working in this session".into());
         }
+        sessions::attach(core, session_id)?;
         core.cancel_flags
             .lock()
             .unwrap()
@@ -1485,29 +1483,14 @@ pub fn compact_session(
                 Err(format!("compaction ended unexpectedly: {detail}"))
             }
         };
-        {
-            // Released together, under the same outer lock the claim took
-            // them with, for the same reason spawn_guarded_turn does; and
-            // strictly before the receipt below, because the receipt is the
-            // frontend's cue to submit queued input against this session.
-            let mut running = core.running.lock().unwrap();
-            core.cancel_flags.lock().unwrap().remove(&session_id);
-            running.remove(&session_id);
-        }
-        match outcome {
-            Ok(receipt) => {
-                core.send_agent(&session_id, AgentEvent::Budget {
-                    used_tokens: receipt.tokens_after,
-                    context_tokens: receipt.context_tokens,
-                });
-                core.send_agent(&session_id, AgentEvent::Compacted {
-                    tokens_before: receipt.tokens_before,
-                    tokens_after: receipt.tokens_after,
-                    compacted_messages: receipt.compacted_messages,
-                });
-            }
-            Err(message) => core.send_agent(&session_id, AgentEvent::Error { message }),
-        }
+        let events = match outcome {
+            Ok(receipt) => vec![
+                AgentEvent::Budget { used_tokens: receipt.tokens_after, context_tokens: receipt.context_tokens },
+                AgentEvent::Compacted { tokens_before: receipt.tokens_before, tokens_after: receipt.tokens_after, compacted_messages: receipt.compacted_messages },
+            ],
+            Err(message) => vec![AgentEvent::Error { message }],
+        };
+        finish_session_work(&core, &session_id, events).await;
     });
     Ok(())
 }
@@ -1523,7 +1506,7 @@ async fn run_compact(
     project_root: &Path,
     cancelled: &Arc<CancelToken>,
 ) -> Result<CompactReceipt, String> {
-    ensure_session_hydrated(core, session_id, project_root).await;
+    ensure_session_hydrated(core, session_id, project_root).await?;
     let settings = core.settings.lock().unwrap().clone();
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
@@ -1629,26 +1612,18 @@ fn apply_freeze(
 /// Load a session into the in-memory map if this process has not seen it yet.
 /// Resuming with `-c` or `/resume` starts with an empty map, and the freeze
 /// check only inspects sessions it can find there.
-async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_root: &Path) {
+async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<(), String> {
     if core.sessions.lock().await.contains_key(session_id) {
-        return;
+        return Ok(());
     }
     let core_clone = core.clone();
     let session_id_owned = session_id.to_string();
     let project_root_owned = project_root.to_path_buf();
-    let Ok(built) = tokio::task::spawn_blocking(move || {
+    let built = tokio::task::spawn_blocking(move || {
         build_session_data(&core_clone, &session_id_owned, &project_root_owned)
-    })
-    .await
-    else {
-        // Leave the map untouched; the turn's own hydration path reports it.
-        return;
-    };
-    core.sessions
-        .lock()
-        .await
-        .entry(session_id.to_string())
-        .or_insert(built);
+    }).await.map_err(|e| format!("session hydration failed: {e}"))??;
+    core.sessions.lock().await.entry(session_id.to_string()).or_insert(built);
+    Ok(())
 }
 
 /// Append a harness note to the last tool message (where the MODEL reads it)
@@ -2442,7 +2417,7 @@ async fn run_loop(
     user_text: String,
     settings: Settings,
     cancelled: Arc<CancelToken>,
-) {
+) -> String {
     // Discover hooks first: user_prompt_submit gates the input before it
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
@@ -2460,13 +2435,11 @@ async fn run_loop(
             core.send_agent(session_id, AgentEvent::Error {
                 message: format!("input blocked: {reason}"),
             });
-            core.send_agent(session_id, AgentEvent::Done { stop_reason: "blocked".into() });
-            return;
+            return "blocked".into();
         }
         PreToolResult::Cancelled => {
             // Esc while the gate runs is cancellation, not policy rejection.
-            core.send_agent(session_id, AgentEvent::Done { stop_reason: "cancelled".into() });
-            return;
+            return "cancelled".into();
         }
         PreToolResult::Allow => {}
     }
@@ -2478,7 +2451,10 @@ async fn run_loop(
     // from the persisted manifest, so it has to be in the map for the check to
     // compare that registry against disk; otherwise the first turn after every
     // resume silently runs without the extensions the agent already wrote.
-    ensure_session_hydrated(core, session_id, project_root).await;
+    if let Err(message) = ensure_session_hydrated(core, session_id, project_root).await {
+        core.send_agent(session_id, AgentEvent::Error { message });
+        return "error".into();
+    }
 
     // Self-modification: pick up extension files written since the last
     // freeze before this turn's schemas and prompt are locked in.
@@ -2487,33 +2463,12 @@ async fn run_loop(
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
     let (messages, mut registry, take_seq, first_turn) = {
-        {
-            let mut sessions_map = core.sessions.lock().await;
-            if let Some(data) = sessions_map.get_mut(session_id) {
-                let first_turn = data.messages.len() <= 1;
-                data.messages.push(ChatMessage::user(user_text));
-                let (messages, seq) = take_messages(data);
-                let registry = data.registry.clone();
-                (messages, registry, seq, first_turn)
-            } else {
-                drop(sessions_map);
-                let core_clone = core.clone();
-                let session_id_owned = session_id.to_string();
-                let project_root_owned = project_root.to_path_buf();
-                let built = tokio::task::spawn_blocking(move || {
-                    build_session_data(&core_clone, &session_id_owned, &project_root_owned)
-                })
-                .await
-                .expect("session hydration task panicked");
-                let mut sessions_map = core.sessions.lock().await;
-                let data = sessions_map.entry(session_id.to_string()).or_insert(built);
-                let first_turn = data.messages.len() <= 1;
-                data.messages.push(ChatMessage::user(user_text));
-                let (messages, seq) = take_messages(data);
-                let registry = data.registry.clone();
-                (messages, registry, seq, first_turn)
-            }
-        }
+        let mut sessions_map = core.sessions.lock().await;
+        let data = sessions_map.get_mut(session_id).expect("session was hydrated");
+        let first_turn = data.messages.len() <= 1;
+        data.messages.push(ChatMessage::user(user_text));
+        let (messages, seq) = take_messages(data);
+        (messages, data.registry.clone(), seq, first_turn)
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
@@ -2606,7 +2561,7 @@ async fn run_loop(
     // outside the project root, so no refreeze covers it), and a malformed
     // edit would surface turns later as an unrelated-looking resolve error.
     let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
-    let mut hooks_seen = crate::hooks::hooks_fingerprint(project_root);
+    let mut hooks_seen = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
     let mut approval_seen = unapproved_tool_map(&registry, &core.data_dir, project_root);
 
     if let Some(note) = settings_drift_note(core) {
@@ -2642,8 +2597,7 @@ async fn run_loop(
                     .await
                     .failures,
             );
-            core.send_agent(session_id, AgentEvent::Done { stop_reason: "error".into() });
-            return;
+            return "error".into();
         }
     };
     let client = ChatClient::from_endpoint(&endpoint);
@@ -3410,7 +3364,7 @@ async fn run_loop(
                     // refreeze receipt and the inertness notice would
                     // otherwise land a whole turn later, leaving the
                     // agent believing its gate was live for a whole turn.
-                    let hooks_now = crate::hooks::hooks_fingerprint(project_root);
+                    let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
                     if hooks_now != hooks_seen {
                         hooks_seen = hooks_now;
                         let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
@@ -3533,7 +3487,7 @@ async fn run_loop(
                 .failures,
         );
     }
-    core.send_agent(session_id, AgentEvent::Done { stop_reason });
+    stop_reason
 }
 
 /// Persist transcript to disk without cloning it back into SessionData.
@@ -3630,12 +3584,14 @@ impl Drop for MessageGuard {
                 // hand the restore to the runtime instead.
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let core = self.core.clone();
-                    let session_id = std::mem::take(&mut self.session_id);
+                    let session_id = self.session_id.clone();
                     let take_seq = self.take_seq;
-                    handle.spawn(async move {
+                    let restoration = handle.spawn(async move {
                         let mut map = core.sessions.lock().await;
                         restore_if_current(&mut map, &session_id, take_seq, messages);
                     });
+                    self.core.message_restorations.lock().unwrap()
+                        .insert(self.session_id.clone(), restoration);
                 }
                 // No runtime means process teardown; disk saves bound the loss.
             }
@@ -4236,7 +4192,7 @@ mod tests {
             settings.context_tokens = Some(12_288);
             settings.max_tokens = 1_024;
         }
-        let mut data = build_session_data(&core, &id, &project);
+        let mut data = build_session_data(&core, &id, &project).unwrap();
         while data.messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_500 {
             data.messages.push(ChatMessage::user("q ".repeat(400)));
             data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
@@ -4262,13 +4218,96 @@ mod tests {
         assert!(result.is_err(), "{failed_file} failure must refuse compaction");
         let messages = core.sessions.lock().await.get(&id).unwrap().messages.clone();
         assert_eq!(serde_json::to_value(messages).unwrap(), original, "{failed_file}: live transcript");
-        assert_eq!(serde_json::to_value(sessions::load_messages(&core, &id).unwrap()).unwrap(), original,
+        assert_eq!(serde_json::to_value(sessions::load_messages(&core, &id).unwrap().unwrap()).unwrap(), original,
             "{failed_file}: saved transcript");
         assert_eq!(sessions::meta(&core, &id).unwrap().resume_points, vec![10]);
         assert!(sessions::load_archive(&core, &id).is_empty(), "a failed attempt must not leave archive records to duplicate on retry");
         let retried = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
         assert!(retried.compacted_messages > 0);
         assert!(!sessions::load_archive(&core, &id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn panic_restoration_finishes_before_done() {
+        let dir = std::env::temp_dir().join(format!("openmax-restore-done-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        core.sessions.lock().await.insert(id.clone(), SessionData {
+            take_seq: 1, ..Default::default()
+        });
+        core.running.lock().unwrap().insert(id.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
+        let worker = core.clone();
+        let worker_id = id.clone();
+        spawn_guarded_turn(core.clone(), id.clone(), async move {
+            let _guard = MessageGuard::new(worker, &worker_id, vec![ChatMessage::user("retain me")], 1);
+            ready_tx.send(()).unwrap();
+            panic_rx.await.unwrap();
+            panic!("restore under contention");
+        });
+        ready_rx.await.unwrap();
+        let state = core.sessions.lock().await;
+        panic_tx.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(error.event, AgentEvent::Error { .. }));
+        assert!(rx.try_recv().is_err());
+        drop(state);
+        let done = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(done.event, AgentEvent::Done { .. }));
+        assert_eq!(core.sessions.lock().await[&id].messages[0].content.as_deref(), Some("retain me"));
+        assert!(!core.is_running(&id));
+        assert!(core.message_restorations.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_settles_state_and_deferred_detachment_before_receipt() {
+        let dir = std::env::temp_dir().join(format!("openmax-done-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let (other, _) = Core::new(dir.clone()).unwrap();
+        let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        for reason in ["stop", "cancelled", "blocked", "error"] {
+            sessions::attach(&core, &id).unwrap();
+            core.sessions.lock().await.insert(id.clone(), SessionData::default());
+            core.running.lock().unwrap().insert(id.clone());
+            core.cancel_flags.lock().unwrap().insert(id.clone(), Arc::new(CancelToken::default()));
+            let (release, ready) = tokio::sync::oneshot::channel::<()>();
+            spawn_guarded_turn(core.clone(), id.clone(), async move {
+                ready.await.unwrap();
+                reason.into()
+            });
+            sessions::detach(&core, &id).unwrap();
+            assert!(sessions::attach(&other, &id).is_err(), "active work retains ownership");
+            release.send(()).unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            assert!(matches!(event.event, AgentEvent::Done { stop_reason } if stop_reason == reason));
+            assert!(!core.is_running(&id));
+            assert!(!core.cancel_flags.lock().unwrap().contains_key(&id));
+            assert!(!core.sessions.lock().await.contains_key(&id));
+            sessions::attach(&other, &id).unwrap();
+            sessions::detach(&other, &id).unwrap();
+            assert!(rx.try_recv().is_err(), "one terminal receipt per turn");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn detached_session_rehydrates_the_next_owners_history() {
+        let dir = std::env::temp_dir().join(format!("openmax-reattach-{}", uuid::Uuid::new_v4()));
+        let (first, _) = Core::new(dir.clone()).unwrap();
+        let (second, _) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&first, project.display().to_string()).unwrap().id;
+        ensure_session_hydrated(&first, &id, &project).await.unwrap();
+        sessions::detach(&first, &id).unwrap();
+        let history = vec![ChatMessage::system("persisted"), ChatMessage::user("new owner wrote this")];
+        assert!(sessions::save_messages(&second, &id, &history, &mut 0, true));
+        sessions::detach(&second, &id).unwrap();
+        ensure_session_hydrated(&first, &id, &project).await.unwrap();
+        assert_eq!(first.sessions.lock().await[&id].messages[1].content.as_deref(), Some("new owner wrote this"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4287,7 +4326,7 @@ mod tests {
         let (core, _rx) = Core::new(dir.join("data")).unwrap();
         core.settings.lock().unwrap().approval_mode = ApprovalMode::Readonly;
 
-        let data = build_session_data(&core, "fresh", &project);
+        let data = build_session_data(&core, "fresh", &project).unwrap();
 
         assert!(!data.messages[0].content.as_deref().unwrap().contains("Recovery procedure"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
@@ -4323,7 +4362,7 @@ mod tests {
             settings.max_tokens = 1_024;
             settings.max_agent_tokens = Some(cap);
         }
-        let mut data = build_session_data(&core, &id, &project);
+        let mut data = build_session_data(&core, &id, &project).unwrap();
         while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 8_500 {
             data.messages.push(ChatMessage::user("q ".repeat(400)));
             data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
@@ -5025,7 +5064,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let data = build_session_data(&core, id, &project);
+            let data = build_session_data(&core, id, &project).unwrap();
             core.sessions.lock().await.insert(id.to_string(), data);
         }
 
@@ -5070,7 +5109,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let data = build_session_data(&core, id, &project);
+            let data = build_session_data(&core, id, &project).unwrap();
             core.sessions.lock().await.insert(id.to_string(), data);
         }
 
@@ -5137,7 +5176,7 @@ mod tests {
         }
         sessions::save_manifest(&core, id, &legacy);
 
-        let data = build_session_data(&core, id, &project);
+        let data = build_session_data(&core, id, &project).unwrap();
         match &data.registry.get("needs").expect("tool present").kind {
             crate::registry::ToolKind::External(t) => assert_eq!(
                 t.env,
@@ -5167,7 +5206,7 @@ mod tests {
         sessions::save_manifest(&core, id, &original.to_manifest());
         std::fs::remove_dir_all(project.join(".openmax/tools")).unwrap();
 
-        let data = build_session_data(&core, id, &project);
+        let data = build_session_data(&core, id, &project).unwrap();
         assert_eq!(data.messages[0].role, "system");
         assert!(data.registry.is_mutating("deploy"));
         assert_eq!(
@@ -5189,7 +5228,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
         {
-            let mut data = build_session_data(&core, id, &project);
+            let mut data = build_session_data(&core, id, &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             data.messages.push(ChatMessage::assistant(Some("hello".into()), None));
             assert!(data.registry.get("deploy").is_none());
@@ -5241,7 +5280,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let mut data = build_session_data(&core, id, &project);
+            let mut data = build_session_data(&core, id, &project).unwrap();
             data.messages.push(ChatMessage::user("write a deploy tool"));
             core.sessions.lock().await.insert(id.to_string(), data);
         }
@@ -5987,7 +6026,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let mut data = build_session_data(&core, id, &project);
+            let mut data = build_session_data(&core, id, &project).unwrap();
             data.messages.push(ChatMessage::user("write a deploy tool"));
             core.sessions.lock().await.insert(id.to_string(), data);
         }
@@ -6056,7 +6095,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let mut data = build_session_data(&core, id, &project);
+            let mut data = build_session_data(&core, id, &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert(id.to_string(), data);
         }
@@ -6131,7 +6170,7 @@ mod tests {
         // An earlier session's first turn writes the baseline (Initial, since
         // the ledger has never seen this project).
         {
-            let mut data = build_session_data(&core, "earlier", &project);
+            let mut data = build_session_data(&core, "earlier", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("earlier".into(), data);
         }
@@ -6150,7 +6189,7 @@ mod tests {
         // A fresh session freezes v2 straight from disk: fingerprints agree,
         // so nothing refreezes - but the ledger must still meet v2.
         {
-            let mut data = build_session_data(&core, "later", &project);
+            let mut data = build_session_data(&core, "later", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("later".into(), data);
         }
@@ -6197,7 +6236,7 @@ mod tests {
         std::fs::write(&manifest, v1).unwrap();
 
         {
-            let mut data = build_session_data(&core, "earlier", &project);
+            let mut data = build_session_data(&core, "earlier", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("earlier".into(), data);
         }
@@ -6213,7 +6252,7 @@ mod tests {
         std::fs::write(&log, format!("{intact}not json")).unwrap();
 
         {
-            let mut data = build_session_data(&core, "later", &project);
+            let mut data = build_session_data(&core, "later", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("later".into(), data);
         }
@@ -6263,7 +6302,7 @@ mod tests {
         let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
         std::fs::write(&deploy, v1).unwrap();
         {
-            let mut data = build_session_data(&core, "earlier", &project);
+            let mut data = build_session_data(&core, "earlier", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("earlier".into(), data);
         }
@@ -6279,7 +6318,7 @@ mod tests {
 
         // First turn start fails and holds the External generation.
         {
-            let mut data = build_session_data(&core, "later", &project);
+            let mut data = build_session_data(&core, "later", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("later".into(), data);
         }
@@ -6369,7 +6408,7 @@ mod tests {
         let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
         std::fs::write(&deploy, v1).unwrap();
         {
-            let mut data = build_session_data(&core, "earlier", &project);
+            let mut data = build_session_data(&core, "earlier", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("earlier".into(), data);
         }
@@ -6382,7 +6421,7 @@ mod tests {
         let intact = std::fs::read_to_string(&log).unwrap();
         std::fs::write(&log, format!("{intact}not json")).unwrap();
         {
-            let mut data = build_session_data(&core, "later", &project);
+            let mut data = build_session_data(&core, "later", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("later".into(), data);
         }
@@ -6463,7 +6502,7 @@ mod tests {
         let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
         std::fs::write(&deploy, v1).unwrap();
         {
-            let mut data = build_session_data(&core, "s", &project);
+            let mut data = build_session_data(&core, "s", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("s".into(), data);
         }
@@ -6521,7 +6560,7 @@ mod tests {
         let v1 = "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n";
         std::fs::write(&deploy, v1).unwrap();
         {
-            let mut data = build_session_data(&core, "s", &project);
+            let mut data = build_session_data(&core, "s", &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert("s".into(), data);
         }
@@ -6580,7 +6619,7 @@ mod tests {
         // A prior session: transcript and manifest land on disk with no
         // extensions installed yet.
         {
-            let mut data = build_session_data(&core, id, &project);
+            let mut data = build_session_data(&core, id, &project).unwrap();
             data.messages.push(ChatMessage::user("hi"));
             data.messages.push(ChatMessage::assistant(Some("hello".into()), None));
             let mut persisted = 0usize;
@@ -6598,7 +6637,7 @@ mod tests {
 
         // Fresh process: nothing is in the map yet, exactly as after `-c`.
         assert!(core.sessions.lock().await.is_empty());
-        ensure_session_hydrated(&core, id, &project).await;
+        ensure_session_hydrated(&core, id, &project).await.unwrap();
         refreeze_if_extensions_changed(&core, id, &project).await;
 
         let map = core.sessions.lock().await;
@@ -6635,7 +6674,7 @@ mod tests {
         // A prior sitting: the prompt froze with one memory line, and the
         // manifest recorded that index beside the transcript.
         {
-            let mut data = build_session_data(&core, id, &project);
+            let mut data = build_session_data(&core, id, &project).unwrap();
             assert!(
                 data.messages[0].content.as_deref().unwrap().contains("deploy port is 8080"),
                 "the frozen prompt carries the fact"
@@ -6652,7 +6691,7 @@ mod tests {
         // Fresh process, exactly as after `-c`: the registry is restored from
         // the manifest and the turn-start refreeze reports what moved.
         assert!(core.sessions.lock().await.is_empty());
-        ensure_session_hydrated(&core, id, &project).await;
+        ensure_session_hydrated(&core, id, &project).await.unwrap();
         let receipt = refreeze_if_extensions_changed(&core, id, &project)
             .await
             .expect("a memory edit moves the fingerprint");
@@ -6722,7 +6761,7 @@ mod tests {
         // Pre-seed a system-only session so we can assert the blocked text
         // never lands in the transcript.
         {
-            let data = build_session_data(&core, &id, &project);
+            let data = build_session_data(&core, &id, &project).unwrap();
             core.sessions.lock().await.insert(id.clone(), data);
         }
 
@@ -7242,7 +7281,7 @@ mod tests {
         crate::trust::trust_project(&core.data_dir, &root).unwrap();
         for on_tool in [false, true] {
             let id = sessions::create(&core, root.display().to_string()).unwrap().id;
-            core.sessions.lock().await.insert(id.clone(), build_session_data(&core, &id, &root));
+            core.sessions.lock().await.insert(id.clone(), build_session_data(&core, &id, &root).unwrap());
             core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
             let mut mode = ApprovalMode::Auto;
             let mut hooks = Hooks::discover_for_mode(&root, &core.data_dir, mode);
@@ -7255,7 +7294,7 @@ mod tests {
             let mut persisted = 0;
             assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
             core.sessions.lock().await.remove(&id);
-            ensure_session_hydrated(&core, &id, &root).await;
+            ensure_session_hydrated(&core, &id, &root).await.unwrap();
             let mut resumed = core.sessions.lock().await.get(&id).unwrap().messages.clone();
             resumed.push(ChatMessage::user("continue"));
             let before = serde_json::to_value(&resumed).unwrap();
@@ -8403,7 +8442,7 @@ mod tests {
         let mut persisted = 0usize;
         sessions::save_messages(&core, id, &[ChatMessage::user("hello")], &mut persisted, false);
 
-        let data = build_session_data(&core, id, Path::new("."));
+        let data = build_session_data(&core, id, Path::new(".")).unwrap();
         assert_eq!(data.messages[0].role, "system");
         assert_eq!(data.messages[1].role, "user");
         // The insert is persisted at hydration itself, not deferred to the
@@ -8412,7 +8451,7 @@ mod tests {
         // strand the two stores against each other.
         assert_eq!(data.persisted_count, 2, "the rewrite lands at hydration");
         assert_eq!(
-            sessions::load_messages(&core, id).unwrap()[0].role,
+            sessions::load_messages(&core, id).unwrap().unwrap()[0].role,
             "system",
             "and the system line is on disk"
         );
@@ -8440,7 +8479,7 @@ mod tests {
 
         // A prior sitting left a transcript too fat for the window below.
         let seeded = {
-            let mut data = build_session_data(&core, &id, &project);
+            let mut data = build_session_data(&core, &id, &project).unwrap();
             for i in 0..14 {
                 data.messages
                     .push(ChatMessage::user(format!("request {i}: {}", "x".repeat(2000))));
@@ -8564,7 +8603,7 @@ mod tests {
         );
         sessions::record_resume_point(&core, id, 2);
 
-        let data = build_session_data(&core, id, Path::new("."));
+        let data = build_session_data(&core, id, Path::new(".")).unwrap();
         assert_eq!(data.messages[0].role, "system");
         assert_eq!(data.messages.len(), 3);
         assert_eq!(
@@ -8572,7 +8611,7 @@ mod tests {
             3,
             "the rewrite lands during hydration, so the next save appends"
         );
-        let on_disk = sessions::load_messages(&core, id).unwrap();
+        let on_disk = sessions::load_messages(&core, id).unwrap().unwrap();
         assert_eq!(on_disk[0].role, "system", "the file takes the current shape");
         assert_eq!(on_disk.len(), 3);
         assert_eq!(
@@ -8580,7 +8619,7 @@ mod tests {
             vec![3],
             "the boundary follows the message it marked"
         );
-        let again = build_session_data(&core, id, Path::new("."));
+        let again = build_session_data(&core, id, Path::new(".")).unwrap();
         assert_eq!(again.messages.len(), 3, "a second hydration inserts nothing");
         assert_eq!(
             sessions::meta(&core, id).unwrap().resume_points,
@@ -9519,7 +9558,7 @@ mod tests {
             s.compaction_tokens = Some(20_000);
         }
         {
-            let mut data = build_session_data(&core, &id, &project);
+            let mut data = build_session_data(&core, &id, &project).unwrap();
             for _ in 0..3 {
                 data.messages.push(ChatMessage::user("next part please"));
                 data.messages.push(ChatMessage::assistant(Some("a".repeat(33_000)), None));
@@ -9588,7 +9627,7 @@ mod tests {
         // budget = 12_288 - (1_024 + 1_024) = 10_240, target 7_168. Build a
         // transcript that only a forced prune will touch.
         {
-            let mut data = build_session_data(&core, &id, &project);
+            let mut data = build_session_data(&core, &id, &project).unwrap();
             while data.messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_500 {
                 data.messages.push(ChatMessage::user("q ".repeat(400)));
                 data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
@@ -9633,7 +9672,7 @@ mod tests {
         }
         assert!(!core.is_running(&id), "the claim must release");
         assert!(sessions::last_compaction(&core, &id).is_some(), "the record sidecar lands");
-        let on_disk = sessions::load_messages(&core, &id).unwrap();
+        let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
         assert!(
             on_disk.len() > 2
                 && on_disk[2]
@@ -9658,7 +9697,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let data = build_session_data(&core, id, &project);
+            let data = build_session_data(&core, id, &project).unwrap();
             core.sessions.lock().await.insert(id.to_string(), data);
         }
 
@@ -9729,7 +9768,7 @@ mod tests {
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         {
-            let data = build_session_data(&core, id, &project);
+            let data = build_session_data(&core, id, &project).unwrap();
             core.sessions.lock().await.insert(id.to_string(), data);
         }
         let (mut messages, mut registry) = {

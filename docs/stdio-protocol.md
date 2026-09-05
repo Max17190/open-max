@@ -33,6 +33,10 @@ whole line at 256 KiB of content; `truncated` says whether anything was cut.
 The session file on disk remains the full record. No live events are replayed,
 so a `token` stream always means a running turn.
 
+A continued session must have a readable transcript and no other writable
+owner. Failure is reported on stderr with a nonzero exit before the handshake.
+The process retains ownership while waiting for commands, including between turns.
+
 ## Commands (stdin)
 
 One JSON object per line.
@@ -108,6 +112,9 @@ carried for this attempt: refusals honored before this one, and how many the
 harness had left to honor.
 
 ## Turn guarantees
+
+For an admitted turn, `done` is emitted after the core releases its running
+state and cancellation token. A client may submit the next turn immediately.
 
 Every `user` command is answered by exactly one `done`, and `done` is the only
 guaranteed terminator: never block waiting for another event. On a normal turn

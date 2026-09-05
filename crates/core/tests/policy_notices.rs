@@ -314,7 +314,7 @@ async fn a_resumed_session_does_not_repeat_a_persisted_notice() {
         .id;
     drive_turn(&core, &mut rx, &session, &project, "turn one").await;
     assert!(
-        open_max_core::sessions::load_messages(&core, &session).is_some(),
+        open_max_core::sessions::load_messages(&core, &session).unwrap().is_some(),
         "the transcript must be on disk for this to be a real resume"
     );
     drop(rx);

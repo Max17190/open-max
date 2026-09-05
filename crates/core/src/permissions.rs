@@ -176,11 +176,11 @@ impl Permissions {
     /// Discover rules under project `.openmax/permissions.toml` then global
     /// `~/.openmax/permissions.toml`. Project rules are listed first so they win.
     pub fn discover(project_root: &Path, data_dir: &Path) -> Self {
-        Self::from_files(project_root, &permission_files(project_root), data_dir)
+        Self::from_files(project_root, &permission_files(data_dir, project_root), data_dir)
     }
 
     pub fn discover_for_mode(project_root: &Path, data_dir: &Path, mode: crate::config::ApprovalMode) -> Self {
-        Self::from_files_for_mode(project_root, &permission_files(project_root), data_dir, mode)
+        Self::from_files_for_mode(project_root, &permission_files(data_dir, project_root), data_dir, mode)
     }
 
     fn from_files(project_root: &Path, paths: &[PathBuf], data_dir: &Path) -> Self {
@@ -477,12 +477,8 @@ pub(crate) fn check_file_for_mode(
     }
 }
 
-pub(crate) fn permission_files(project_root: &Path) -> Vec<PathBuf> {
-    let mut files = vec![project_root.join(".openmax").join("permissions.toml")];
-    if let Some(home) = std::env::var_os("HOME") {
-        files.push(PathBuf::from(home).join(".openmax").join("permissions.toml"));
-    }
-    files
+pub(crate) fn permission_files(data_dir: &Path, project_root: &Path) -> Vec<PathBuf> {
+    vec![project_root.join(".openmax/permissions.toml"), data_dir.join("permissions.toml")]
 }
 
 /// Every fail-closed reason this loader produces, flattened to one line.

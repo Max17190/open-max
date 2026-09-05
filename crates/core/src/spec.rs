@@ -936,6 +936,11 @@ render it on its OWN line the card never clips - approving secrets a narrow
 terminal hid behind other detail is the failure the field exists to prevent;
 do not fold it into `detail`.
 
+For an admitted turn, `done` follows cleanup of running state and the cancellation
+token; the client may immediately submit another turn. A continued session is
+claimed before the handshake and stays owned between turns. An unreadable or
+damaged transcript, or a competing owner, causes a nonzero exit before hello.
+
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
 untrusted project) still gets one, with stop_reason `refused`, after the

@@ -97,14 +97,23 @@ pub async fn run(
         }
     };
 
+    if let Err(e) = sessions::attach(&core, &session_id) {
+        eprintln!("openmax: {e}");
+        return 1;
+    }
+    let history = if continued {
+        match sessions::load_messages(&core, &session_id) {
+            Ok(messages) => messages.unwrap_or_default(),
+            Err(e) => { eprintln!("openmax: {e}"); return 1; }
+        }
+    } else { Vec::new() };
     let mut stdout = std::io::stdout();
     emit(&mut stdout, &hello_value(&session_id, &project_key, continued));
     if continued {
         // One bounded history line so an attaching frontend can render what
         // came before, without replaying synthetic live events (a replayed
         // `token` stream would be indistinguishable from a running turn).
-        let messages = sessions::load_messages(&core, &session_id).unwrap_or_default();
-        emit(&mut stdout, &transcript_value(&session_id, &messages));
+        emit(&mut stdout, &transcript_value(&session_id, &history));
     }
     let stdin_rx = spawn_stdin_reader();
     drive(core, core_rx, session_id, project, stdin_rx, &mut stdout, !continued).await
@@ -279,7 +288,7 @@ async fn drive_loop<W: Write>(
                             refuse(out, &session_id, "user text is empty");
                             continue;
                         }
-                        if running || !crate::headless::wait_until_idle(&core, &session_id).await {
+                        if running {
                             // The in-flight turn owns the next `done`; a second
                             // one here would tell the client that turn ended.
                             protocol_error(out, "a turn is in flight; wait for done");

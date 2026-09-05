@@ -30,7 +30,8 @@ with the same exit code, so the agent can parse its own verification.
 `openmax --check --run-examples` adds one `example` surface row per declared
 `[example]`, in text and in JSON, and fails the check when one fails. It is
 the only `--check` mode that executes anything, so it needs a trusted project
-and a tool file approved with `openmax --approve <path>`, and it honors
+and follows the saved project mode. Auto runs valid examples without content
+approval; ask uses the documented approval and sandbox rules. It honors
 permission rules, `pre_tool_use` hooks, and `approval_mode` exactly as a turn
 does. See [extending](extending.md#proof-of-life).
 
@@ -42,6 +43,17 @@ unattended runs.
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
 [stdio protocol](stdio-protocol.md).
+
+A writable session can be open in only one process at a time, including while
+it is idle. Close it in the other process or start a new session to continue
+working. `/new` and switching sessions release the old attachment after any
+in-flight work settles. A process exit releases its session locks. Read-only
+history and recall remain available.
+
+A damaged or unreadable transcript stops continuation with its path and the
+failure reason. Open Max preserves the original bytes and does not silently
+skip records or replace the transcript. Repair or recover a copy explicitly
+before resuming. A session that has never saved messages can still start fresh.
 
 ## Keys
 
