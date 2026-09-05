@@ -860,8 +860,10 @@ bounded per message and in total (`truncated` says whether anything was cut),
 with the session file remaining the full record. No synthetic live events are
 replayed, so a `token` stream always means a running turn.
 
-Events: every line carries `session_id`, a `type` discriminator, then fields.
-Parse by field name, never by key order. Types: `token` (text), `thinking`
+Events: every event line carries `session_id`, a `type` discriminator, then
+fields. Parse by field name, never by key order. Only two lines carry no
+`session_id`: `protocol_error` and the `approval_mode` acknowledgement
+(`hello` and `transcript` are not events either, but carry one). Types: `token` (text), `thinking`
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
 the frozen tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
