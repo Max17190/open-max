@@ -69,6 +69,15 @@ git tag -a "${tag}" -m "${version}"
 # above) the tag still lands, and a tag is what starts a release, so the
 # published binaries would come from a commit that never reached main.
 if ! git push --quiet --atomic origin main "${tag}"; then
+  # A non-zero exit does not prove nothing was published: the push can succeed
+  # on the remote and lose its acknowledgement. Ask the remote before undoing
+  # anything, or a dropped connection would roll back a release that is already
+  # building and report the opposite of what happened.
+  if [ -n "$(git ls-remote --tags origin "refs/tags/${tag}" 2>/dev/null)" ]; then
+    echo "push reported an error but ${tag} is on the remote; it is publishing." >&2
+    echo "run 'git pull' to resynchronise." >&2
+    exit 1
+  fi
   # Undo the local commit and tag so a retry starts clean and does not skip a
   # number. Safe because both were created moments ago by this script, on a
   # tree it verified was clean.
