@@ -59,14 +59,6 @@ pub struct SessionData {
     /// `tool_calls`. Advisory, once per session: the condition says something
     /// about the endpoint and model pairing, not about one reply.
     pub fallback_recovery_reported: bool,
-    /// The legacy system-insert migration shifted this session's boundaries
-    /// in memory, but the index write that records the shift failed. While
-    /// this holds, no transcript save may land: persisting the inserted
-    /// system line without its marker would strand the boundaries one
-    /// message early forever, because the next hydration cannot tell an
-    /// unrecorded shift from no shift. Every save path first retries the
-    /// shift and clears this on success.
-    pub system_insert_unrecorded: bool,
     /// Whether the ledger has reconciled with the extension files this session
     /// froze. False until the first turn start: a freeze reads disk directly,
     /// so changes made while no session was running would otherwise never be

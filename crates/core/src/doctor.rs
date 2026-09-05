@@ -745,23 +745,6 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
 
-    // An inherited approval store explains, in one line, why a capability that
-    // worked yesterday now asks or fails closed. Without it the hook findings
-    // above read as "its content changed" for content nobody touched.
-    if let Some(pending) = crate::ledger::pending_legacy(data_dir, project_root) {
-        let status = if pending.malformed {
-            Status::Err(
-                "an inherited approval store that does not parse: nothing in it is in effect, and it cannot be adopted until it is fixed or deleted".into(),
-            )
-        } else {
-            Status::Err(format!(
-                "an approval store inherited from an older release: {} hash(es) and {} remembered hook shape(s) are NOT in effect, so approvals here ask again and a capability it says was installed fails closed. `openmax --adopt-approvals` inherits it after showing you what it claims; deleting the file discards it",
-                pending.hashes, pending.shapes
-            ))
-        };
-        findings.push(Finding { kind: "approvals", path: pending.path, status });
-    }
-
     findings.extend(inline_program_findings(data_dir, project_root));
     findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));

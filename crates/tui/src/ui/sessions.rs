@@ -144,7 +144,6 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             resume_points: vec![],
-            system_insert_shifted: false,
         };
         let now = 15 * 60; // renders as "15m ago"
         let plain: String = session_row(&meta, false, now, 44)

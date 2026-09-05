@@ -468,36 +468,20 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             Arc::new(Registry::builtin_only())
         };
         let count = messages.len();
+        // The prompt lives at index 0. A transcript without it there is from
+        // a build that predates the rule (none was ever released): give the
+        // model its prompt and rewrite the file into the current shape, so
+        // every later save is a plain append. Every replay boundary moves
+        // down one with it, after the rewrite lands: a crash between the two
+        // leaves the boundaries where they were, which is where an unshifted
+        // transcript would have put them anyway, never one message too far.
         let needs_system = messages.first().map(|m| m.role.as_str()) != Some("system");
-        let mut system_insert_unrecorded = false;
         let (prompt_breakdown, persisted_count) = if needs_system {
             let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
             messages.insert(0, ChatMessage::system(prompt));
-            // Every absolute index just moved down one, boundaries included,
-            // and the migration spans two stores that cannot share one
-            // atomic write. The marker-carrying shift lands strictly first,
-            // then the rewrite, here rather than at the first save: a turn
-            // used to be able to fail in between (provider resolution) with
-            // the shift persisted against a still-systemless transcript,
-            // drifting the boundaries again on every restart. Any crash
-            // interleaving now replays to the same place: marker present
-            // means the shift never repeats, transcript present means this
-            // branch never reruns. If the index write itself failed, the
-            // insert must not become durable either - the saves are fenced
-            // on `system_insert_unrecorded` until a retried shift lands.
             let mut persisted = 0usize;
-            if sessions::shift_resume_points_for_system_insert(core, session_id) {
-                sessions::save_messages(core, session_id, &messages, &mut persisted, true);
-            } else {
-                system_insert_unrecorded = true;
-                core.send_agent(
-                    session_id,
-                    AgentEvent::Error {
-                        message: "warning: the session index is not writable; the transcript \
-                                  migration is deferred and nothing will persist until it lands"
-                            .into(),
-                    },
-                );
+            if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
+                sessions::shift_resume_points_for_insert(core, session_id, 0);
             }
             (Arc::new(breakdown), persisted)
         } else {
@@ -524,7 +508,6 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             take_seq: 0,
             schemas_over_budget_reported: false,
             fallback_recovery_reported,
-            system_insert_unrecorded,
             ledger_synced: false,
             pending_syncs: Vec::new(),
             reported_policy_notices,
@@ -563,7 +546,6 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             take_seq: 0,
             schemas_over_budget_reported: false,
             fallback_recovery_reported: false,
-            system_insert_unrecorded: false,
             ledger_synced: false,
             pending_syncs: Vec::new(),
             reported_policy_notices: Default::default(),
@@ -1576,7 +1558,7 @@ async fn run_compact(
     if after_len < before_len {
         sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
     } else if after_len > before_len {
-        sessions::shift_resume_points_for_note_insert(core, session_id);
+        sessions::shift_resume_points_for_insert(core, session_id, 2);
     }
     let compacted_messages = compaction.as_ref().map(|d| d.message_count).unwrap_or(0);
     if let Some(digest) = compaction {
@@ -1619,25 +1601,13 @@ fn apply_freeze(
     if data.messages.first().is_some_and(|m| m.role == "system") {
         data.messages[0] = ChatMessage::system(prompt);
     } else {
+        // Hydration guarantees system-at-0; this is for callers that
+        // assembled messages by other means.
         data.messages.insert(0, ChatMessage::system(prompt));
-        // Every absolute index just moved down one, boundaries included.
-        // Hydration guarantees system-at-0, so this branch is for callers
-        // that assembled messages by other means; the same fencing rule
-        // applies (the insert must not persist before its marker).
-        data.system_insert_unrecorded =
-            !sessions::shift_resume_points_for_system_insert(core, session_id);
     }
     data.registry = Arc::new(registry);
     data.prompt_breakdown = Arc::new(breakdown);
     sessions::save_manifest(core, session_id, &data.registry.to_manifest());
-    if data.system_insert_unrecorded {
-        // Same fence as the save wrapper: retry the deferred shift, and hold
-        // the rewrite back if the index still cannot record it.
-        if !sessions::shift_resume_points_for_system_insert(core, session_id) {
-            return;
-        }
-        data.system_insert_unrecorded = false;
-    }
     data.persisted_count = 0;
     sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
 }
@@ -2710,7 +2680,7 @@ async fn run_loop(
         if after_len < before_len {
             sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
         } else if after_len > before_len {
-            sessions::shift_resume_points_for_note_insert(core, session_id);
+            sessions::shift_resume_points_for_insert(core, session_id, 2);
         }
         if let Some(digest) = compaction {
             let ctx = CompactionCtx {
@@ -3624,31 +3594,10 @@ async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, 
 /// Persist transcript to disk without cloning it back into SessionData.
 /// The turn owns `messages` until `MessageGuard` commits on drop/finish.
 /// True when the transcript is durable on disk after this call (see
-/// `sessions::save_messages`); the fenced-migration drop is false.
+/// `sessions::save_messages`).
 async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) -> bool {
     let mut sessions_map = core.sessions.lock().await;
     if let Some(data) = sessions_map.get_mut(session_id) {
-        // A deferred system-insert migration fences every save: the inserted
-        // line must never become durable before the marker that records its
-        // boundary shift. Retry the shift; if the index is still unwritable,
-        // drop the save loudly rather than persist the two stores against
-        // each other.
-        if data.system_insert_unrecorded {
-            return if sessions::shift_resume_points_for_system_insert(core, session_id) {
-                data.system_insert_unrecorded = false;
-                sessions::save_messages(core, session_id, messages, &mut data.persisted_count, true)
-            } else {
-                core.send_agent(
-                    session_id,
-                    AgentEvent::Error {
-                        message: "warning: transcript not persisted; the session index is not \
-                                  writable and the deferred migration cannot land"
-                            .into(),
-                    },
-                );
-                false
-            };
-        }
         sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite)
     } else {
         false
@@ -8618,13 +8567,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Boundaries recorded against a systemless legacy transcript are disk
-    /// indices. The hydration that injects a system message moves every disk
-    /// index down one, so the boundaries must move with it, and exactly
-    /// once: the shift is marker-guarded, so neither a second hydration nor
-    /// a crash-interrupted first one can move them again.
+    /// A transcript saved without the prompt at index 0 (no released build
+    /// writes one) is loaded with the prompt in place and rewritten in that
+    /// shape at once, so the model is never sent a turn without its rules and
+    /// every later save is an append onto a transcript that already fits.
+    /// Its replay boundaries are disk indices, so they move down one with
+    /// the insert, and only once: the rewritten transcript needs no insert.
     #[test]
-    fn injecting_system_on_hydration_shifts_resume_points_exactly_once() {
+    fn a_systemless_transcript_gains_its_prompt_on_hydration() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -8645,122 +8595,26 @@ mod tests {
 
         let data = build_session_data(&core, id, Path::new("."));
         assert_eq!(data.messages[0].role, "system");
+        assert_eq!(data.messages.len(), 3);
+        assert_eq!(
+            data.persisted_count,
+            3,
+            "the rewrite lands during hydration, so the next save appends"
+        );
+        let on_disk = sessions::load_messages(&core, id).unwrap();
+        assert_eq!(on_disk[0].role, "system", "the file takes the current shape");
+        assert_eq!(on_disk.len(), 3);
         assert_eq!(
             sessions::meta(&core, id).unwrap().resume_points,
             vec![3],
-            "the boundary must follow the system insert"
+            "the boundary follows the message it marked"
         );
         let again = build_session_data(&core, id, Path::new("."));
-        assert_eq!(again.messages[0].role, "system");
+        assert_eq!(again.messages.len(), 3, "a second hydration inserts nothing");
         assert_eq!(
             sessions::meta(&core, id).unwrap().resume_points,
             vec![3],
-            "a second hydration must not shift the boundary again"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The migration spans two stores, so a crash can land between the
-    /// boundary shift (index) and the system insert (transcript). The shift
-    /// records itself in the same atomic index write, so the interrupted
-    /// hydration is completed, not repeated: the transcript gets its system
-    /// line and the boundary stays where the first shift put it.
-    #[test]
-    fn an_interrupted_system_insert_migration_completes_without_reshifting() {
-        use crate::state::Core;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
-        let mut persisted = 0usize;
-        sessions::save_messages(
-            &core,
-            id,
-            &[
-                ChatMessage::user("hello"),
-                ChatMessage::assistant(Some("hi".into()), None),
-            ],
-            &mut persisted,
-            false,
-        );
-        sessions::record_resume_point(&core, id, 2);
-        // The crash state: the shift and its marker landed, the transcript
-        // rewrite did not. This is the only interleaving a crash can leave,
-        // because hydration orders the shift strictly first.
-        assert!(sessions::shift_resume_points_for_system_insert(&core, id));
-        assert_eq!(sessions::meta(&core, id).unwrap().resume_points, vec![3]);
-        assert_eq!(
-            sessions::load_messages(&core, id).unwrap()[0].role,
-            "user",
-            "the crash left the transcript systemless"
-        );
-
-        let data = build_session_data(&core, id, Path::new("."));
-        assert_eq!(data.messages[0].role, "system");
-        assert_eq!(
-            sessions::load_messages(&core, id).unwrap()[0].role,
-            "system",
-            "recovery completes the interrupted rewrite"
-        );
-        assert_eq!(
-            sessions::meta(&core, id).unwrap().resume_points,
-            vec![3],
-            "and the boundary is not shifted a second time"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The other half of the migration's two-store problem: the index write
-    /// FAILS while the transcript store still works. Persisting the system
-    /// insert then would strand the boundaries one early forever, because a
-    /// system-prefixed transcript with no marker is indistinguishable from a
-    /// modern session. So a failed shift holds the rewrite back entirely,
-    /// and the migration completes on the next hydration that can record it.
-    #[test]
-    fn a_failed_boundary_shift_holds_back_the_transcript_rewrite() {
-        use crate::state::Core;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
-        let mut persisted = 0usize;
-        sessions::save_messages(
-            &core,
-            id,
-            &[
-                ChatMessage::user("hello"),
-                ChatMessage::assistant(Some("hi".into()), None),
-            ],
-            &mut persisted,
-            false,
-        );
-        sessions::record_resume_point(&core, id, 2);
-        let index_path = core.data_dir.join("sessions").join("index.json");
-        let good_index = std::fs::read_to_string(&index_path).unwrap();
-
-        // The index write fails (damaged index is the refusal path #170
-        // introduced); the transcript store still works.
-        std::fs::write(&index_path, "[{\"id\": \"trunc").unwrap();
-        let data = build_session_data(&core, id, Path::new("."));
-        assert_eq!(data.messages[0].role, "system", "the model still gets its prompt");
-        assert!(data.system_insert_unrecorded, "and the failed shift is remembered");
-        assert_eq!(
-            sessions::load_messages(&core, id).unwrap()[0].role,
-            "user",
-            "but the insert must not become durable before its marker"
-        );
-
-        // The store heals; the next hydration completes the migration whole.
-        std::fs::write(&index_path, good_index).unwrap();
-        let healed = build_session_data(&core, id, Path::new("."));
-        assert!(!healed.system_insert_unrecorded);
-        assert_eq!(sessions::load_messages(&core, id).unwrap()[0].role, "system");
-        assert_eq!(
-            sessions::meta(&core, id).unwrap().resume_points,
-            vec![3],
-            "the boundary shifted exactly once, after the index could record it"
+            "and shifts nothing"
         );
 
         let _ = std::fs::remove_dir_all(dir);
