@@ -50,14 +50,14 @@ libc = "0.2"
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
-installers = ["shell", "homebrew"]
+installers = ["shell", "homebrew", "npm"]
 # Homebrew's core tap does not accept third-party prebuilt binaries, so the
 # formula goes to a tap we own. `publish-jobs` is what actually pushes it on a
 # tagged release; without it the formula is only a release asset and the tap
 # stays empty. The push needs a HOMEBREW_TAP_TOKEN secret, because the
 # workflow's own GITHUB_TOKEN cannot write to another repository.
 tap = "Max17190/homebrew-tap"
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "npm"]
 allow-dirty = ["ci"]
 targets = [
     "aarch64-apple-darwin",
