@@ -43,9 +43,6 @@ pub struct SessionData {
     pub prompt_breakdown: Arc<crate::prompt::PromptBreakdown>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,
-    /// File content captured on first touch by a mutating tool, so the UI can
-    /// show a cumulative diff per file at any point in the session.
-    pub snapshots: HashMap<String, String>,
     /// Process-unique id of the turn that last took `messages`; a restore is
     /// only valid while this still matches the taker (guards against a newer
     /// turn or a recreated session reusing the id).
@@ -54,11 +51,6 @@ pub struct SessionData {
     /// context window. The condition holds on every turn once it holds at all,
     /// so the advisory is emitted once and not per turn.
     pub schemas_over_budget_reported: bool,
-    /// Whether this session already reported that a reply's tool calls were
-    /// recovered from its text (fallback.rs) rather than arriving as API
-    /// `tool_calls`. Advisory, once per session: the condition says something
-    /// about the endpoint and model pairing, not about one reply.
-    pub fallback_recovery_reported: bool,
     /// Whether the ledger has reconciled with the extension files this session
     /// froze. False until the first turn start: a freeze reads disk directly,
     /// so changes made while no session was running would otherwise never be

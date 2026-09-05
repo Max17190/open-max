@@ -42,9 +42,8 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::client::{ChatClient, StreamDelta, TRUNCATED};
+use crate::client::{ChatClient, CompletionResult, StreamDelta, TRUNCATED};
 use crate::config::{ApprovalMode, Settings};
-use crate::fallback;
 use crate::hooks::{Hooks, PreToolResult};
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
@@ -59,24 +58,6 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// with no perceptible latency.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DIGEST_PREFIX: &str = "[context note:";
-/// Once per session, on the first tool result of the first reply whose calls
-/// were recovered from its text (fallback.rs) rather than sent as API
-/// `tool_calls`. States what happened, restates the rule the reply broke as
-/// an imperative (the established failure shape is a model absorbing the
-/// vocabulary while still emitting markup), and offers the endpoint-lag
-/// explanation as a possibility, not a verdict - the harness cannot see
-/// whether the model or the endpoint's parser leaked the markup. Advisory,
-/// so it is a note the model reads and a frontend renders, not an error.
-const FALLBACK_RECOVERY_NOTE: &str = "[harness note: this reply carried its tool calls as text rather than as API tool_calls; the harness recognized the markup and ran them. Emit native tool_calls and never print call markup as reply text (the frozen rules require it). If native calls keep arriving as text, the endpoint's tool-call parsing may lag this model; tell the user. Reported once per session.]";
-
-/// Whether these messages (a transcript, or the archive of what compaction
-/// dropped from it) already carry the recovery note on a tool result.
-fn carries_fallback_recovery_note(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|m| {
-        m.role == "tool" && m.content.as_deref().is_some_and(|c| c.contains(FALLBACK_RECOVERY_NOTE))
-    })
-}
-
 /// Outcome of a mutating-tool approval prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalOutcome {
@@ -84,36 +65,6 @@ enum ApprovalOutcome {
     Declined,
     Cancelled,
     TimedOut,
-}
-
-/// True when a native server tool call cannot be executed as-is.
-fn is_native_call_broken(call: &ToolCall) -> bool {
-    call.function.name.is_empty()
-        || serde_json::from_str::<Value>(&call.function.arguments).is_err()
-}
-
-/// When every native call is broken, try to recover calls from content markup.
-/// Broken natives are only discarded if the markup actually yields calls;
-/// otherwise they are kept so each one gets its per-call error (which tells
-/// the model to retry) instead of vanishing silently. The flag says whether
-/// the calls returned came out of the text: the one path by which a call
-/// reaches the loop from anywhere but the API's own `tool_calls`.
-fn resolve_tool_calls(
-    mut content: String,
-    mut tool_calls: Vec<ToolCall>,
-    known_tools: &[String],
-) -> (String, Vec<ToolCall>, bool) {
-    let all_broken = !tool_calls.is_empty() && tool_calls.iter().all(is_native_call_broken);
-    let mut recovered = false;
-    if tool_calls.is_empty() || all_broken {
-        let names: Vec<&str> = known_tools.iter().map(String::as_str).collect();
-        if let Some((clean, calls)) = fallback::extract_tool_calls(&content, &names) {
-            content = clean;
-            tool_calls = calls;
-            recovered = true;
-        }
-    }
-    (content, tool_calls, recovered)
 }
 
 /// One consecutive run of tool calls: `[start, end)`; `concurrent` when length >= 2
@@ -481,7 +432,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             messages.insert(0, ChatMessage::system(prompt));
             let mut persisted = 0usize;
             if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
-                sessions::shift_resume_points_for_insert(core, session_id, 0);
+                let _ = sessions::shift_resume_points_for_insert(core, session_id, 0);
             }
             (Arc::new(breakdown), persisted)
         } else {
@@ -497,17 +448,13 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         // tool result, so a resumed session finds it in the transcript, or in
         // the compaction archive if a prune has since dropped that exchange,
         // and does not repeat it.
-        let fallback_recovery_reported = carries_fallback_recovery_note(&messages)
-            || carries_fallback_recovery_note(&sessions::load_archive(core, session_id));
         SessionData {
             messages,
             registry,
             prompt_breakdown,
             persisted_count,
-            snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
-            fallback_recovery_reported,
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices,
@@ -531,21 +478,14 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             // would look like a self-modification and re-freeze for nothing.
             sessions::save_manifest(core, session_id, &registry.to_manifest());
         }
-        // Session creation is the one consolidation boundary: memories the
-        // decay law says are gone are deleted (tombstoned in the access log)
-        // before the index freezes into the prompt, and never mid-session,
-        // so a live prompt cannot index a file that no longer exists.
-        let _ = crate::memory::forget_faded(project_root, crate::memory::unix_now());
         let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
         SessionData {
             messages: vec![ChatMessage::system(prompt)],
             registry,
             prompt_breakdown: Arc::new(breakdown),
             persisted_count: 0,
-            snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
-            fallback_recovery_reported: false,
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices: Default::default(),
@@ -678,10 +618,8 @@ async fn execute_readonly_batch(
             name: name.into(),
             args: args.clone(),
         });
-        // hooks pre → permissions → content gate. approval_mode and
-        // snapshot_file are skipped because both only ever act on mutating
-        // tools, which batchable_call excludes: that exclusion is what makes
-        // the shorter sequence equivalent, not an assumption about intent.
+        // hooks pre → permissions → content gate. approval_mode is skipped
+        // because batchable_call excludes mutating tools.
         let block = match ctx
             .hooks
             .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
@@ -1086,6 +1024,7 @@ async fn summarize_compaction(
     client: &ChatClient,
     digest: &CompactionDigest,
     cancelled: &Arc<CancelToken>,
+    spend: &mut RequestSpend,
 ) -> Option<String> {
     if digest.dropped_text.trim().is_empty() {
         return None;
@@ -1110,23 +1049,23 @@ async fn summarize_compaction(
         ),
         ChatMessage::user(digest.dropped_text.clone()),
     ];
-    let result = tokio::time::timeout(
+    let estimated = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+    if !spend.admits(estimated) { return None; }
+    let result = match tokio::time::timeout(
         SUMMARY_TIMEOUT,
         client.stream_chat(&messages, "[]", cancelled.clone(), |_| {}),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if let Some(u) = result.usage {
-        sessions::append_usage(core, session_id, &sessions::TokenUsage {
-            ts: sessions::unix_now(),
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            cached_tokens: u.cached_tokens,
-        });
-    }
+    ).await {
+        Ok(Ok(result)) => result,
+        _ => {
+            // Without a completed response, reserve the configured output cap.
+            spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(client.max_tokens));
+            return None;
+        }
+    };
+    spend.record(core, session_id, estimated, &result);
+    if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" { return None; }
     let mut summary = result.content;
-    if let Some(clean) = fallback::strip_leading_think(&summary) {
+    if let Some(clean) = crate::client::strip_leading_think(&summary) {
         summary = clean;
     }
     let summary = summary.trim().replace(['\n', '\r'], " ");
@@ -1144,6 +1083,41 @@ fn is_digest_message(msg: &ChatMessage) -> bool {
         && msg.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX))
 }
 
+/// One admission counter for every model request made during a turn.
+struct RequestSpend {
+    tokens: usize,
+    limit: Option<usize>,
+}
+
+impl RequestSpend {
+    fn new(limit: Option<usize>) -> Self { Self { tokens: 0, limit } }
+
+    fn admits(&self, estimated: usize) -> bool {
+        self.limit.is_none_or(|cap| self.tokens.saturating_add(estimated) <= cap)
+    }
+
+    fn record(&mut self, core: &Core, session_id: &str, estimated: usize, result: &CompletionResult) {
+        let charged = if let Some(u) = result.usage {
+            sessions::append_usage(core, session_id, &sessions::TokenUsage {
+                ts: sessions::unix_now(),
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                cached_tokens: u.cached_tokens,
+            });
+            core.send_agent(session_id, AgentEvent::Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                cached_tokens: u.cached_tokens,
+            });
+            u.prompt_tokens.saturating_add(u.completion_tokens) as usize
+        } else {
+            estimated.saturating_add(estimate_tokens(result.content.len()
+                + result.tool_calls.iter().map(|c| c.function.arguments.len()).sum::<usize>()))
+        };
+        self.tokens = self.tokens.saturating_add(charged);
+    }
+}
+
 /// What settling a compaction digest needs from its caller. Borrowed whole,
 /// like `ReadonlyBatchCtx`, so the budget path and the forced `/compact`
 /// share one settlement instead of drifting copies.
@@ -1156,25 +1130,18 @@ struct CompactionCtx<'a> {
     cancelled: &'a Arc<CancelToken>,
 }
 
-/// Everything a prune owes once the transcript is rewritten: the lossless
-/// archive, the digest note upgrade, the compaction record, and the
-/// compaction hook.
-async fn apply_compaction_digest(
+/// Preserve the originals and prepare the candidate's digest. The record and
+/// hook are emitted only after the candidate transcript has been persisted.
+async fn prepare_compaction_digest(
     ctx: &CompactionCtx<'_>,
     messages: &mut [ChatMessage],
     mut digest: CompactionDigest,
-) {
-    let CompactionCtx { core, session_id, project_root, client, hooks, cancelled } = *ctx;
-    // The lossless record behind the note's address, written before
-    // the transcript rewrite below makes the edits permanent: both
-    // the pre-truncation originals and the dropped messages. `&` so
-    // both appends are attempted; a failed archive must not be
-    // advertised, so the address is withheld unless both landed.
-    let archived = sessions::append_archive(core, session_id, &digest.truncated)
-        & sessions::append_archive(core, session_id, &digest.dropped);
+    spend: &mut RequestSpend,
+) -> (Vec<ChatMessage>, Option<sessions::CompactionRecord>) {
+    let CompactionCtx { core, session_id, client, cancelled, .. } = *ctx;
     if digest.message_count == 0 {
         // Truncation-only: upgrade the note the prune just inserted with the
-        // address, now that the archive has honored it. Matched by content,
+        // address. This candidate stays private until commit. Matched by content,
         // not by position: index 2 may instead hold an earlier prune's real
         // digest note, which carries a summary and Files touched this note
         // does not. No summarizer request (dropped_text is empty so
@@ -1183,15 +1150,16 @@ async fn apply_compaction_digest(
         // the structured carry-forward absorb_prior depends on), and no
         // compaction hook, which today fires only for real compactions.
         let inserted = digest.format_truncation_only(None);
-        if archived
-            && messages.len() > 2
+        if messages.len() > 2
             && is_digest_message(&messages[2])
             && messages[2].content.as_deref() == Some(inserted.as_str())
         {
-            let archive = sessions::archive_display(core, session_id);
-            messages[2] = ChatMessage::user(digest.format_truncation_only(Some(&archive)));
+            let path = sessions::archive_display(core, session_id);
+            messages[2] = ChatMessage::user(digest.format_truncation_only(Some(&path)));
         }
-        return;
+        let mut archive = digest.truncated;
+        archive.extend(digest.dropped);
+        return (archive, None);
     }
     // Structured fields from the previous record carry forward by
     // code: the prune may have dropped the old digest note, whose
@@ -1199,24 +1167,65 @@ async fn apply_compaction_digest(
     if let Some(prior) = sessions::last_compaction(core, session_id) {
         digest.absorb_prior(&prior);
     }
-    let archive = archived.then(|| sessions::archive_display(core, session_id));
+    let path = sessions::archive_display(core, session_id);
     // Upgrade the heuristic note to a model-written summary when
     // the endpoint cooperates; the note at index 2 was just
     // inserted by the prune, so replacing it here keeps one
     // digest message.
-    let note = match summarize_compaction(core, session_id, client, &digest, cancelled).await {
-        Some(summary) => digest.format_with_summary(&summary, archive.as_deref()),
-        None => digest.format(archive.as_deref()),
+    let note = match summarize_compaction(core, session_id, client, &digest, cancelled, spend).await {
+        Some(summary) => digest.format_with_summary(&summary, Some(&path)),
+        None => digest.format(Some(&path)),
     };
     if messages.len() > 2 && is_digest_message(&messages[2]) {
         messages[2] = ChatMessage::user(note.clone());
     }
     let record = digest.to_record(note);
-    sessions::append_compaction(core, session_id, &record);
-    if let Ok(value) = serde_json::to_value(&record) {
-        let failures = hooks.compaction(session_id, project_root, &value, cancelled).await;
-        report_hook_failures(core, session_id, failures);
+    let mut archive = digest.truncated;
+    archive.extend(digest.dropped);
+    (archive, Some(record))
+}
+
+/// A failed archive or transcript write must not discard the live history.
+/// Clone only when a prune is needed; ordinary requests keep their owned vec.
+async fn compact_messages(
+    ctx: &CompactionCtx<'_>,
+    messages: &mut Vec<ChatMessage>,
+    trigger: usize,
+    schema_tokens: usize,
+    force: bool,
+    spend: &mut RequestSpend,
+) -> Result<usize, String> {
+    let total = schema_tokens + messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+    if (!force && total <= trigger) || schemas_exceed_budget(trigger, schema_tokens) {
+        return Ok(0);
     }
+    if let Some(reason) = sessions::index_diagnostic(ctx.core) {
+        return Err(format!("compaction refused: {reason}"));
+    }
+    let mut candidate = messages.clone();
+    let (changed, digest) = if force {
+        prune_transcript(&mut candidate, trigger, schema_tokens, total)
+    } else {
+        enforce_budget(&mut candidate, trigger, schema_tokens)
+    };
+    if !changed { return Ok(0); }
+    let dropped = digest.as_ref().map(|d| d.message_count).unwrap_or(0);
+    let (archive, record) = match digest {
+        Some(digest) => prepare_compaction_digest(ctx, &mut candidate, digest, spend).await,
+        None => (Vec::new(), None),
+    };
+    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, record.as_ref(), messages.len())?;
+    if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
+        data.persisted_count = candidate.len();
+    }
+    *messages = candidate;
+    if let Some(record) = record {
+        if let Ok(value) = serde_json::to_value(&record) {
+            let failures = ctx.hooks.compaction(ctx.session_id, ctx.project_root, &value, ctx.cancelled).await;
+            report_hook_failures(ctx.core, ctx.session_id, failures);
+        }
+    }
+    Ok(dropped)
 }
 
 /// Kick off one agent turn in a session. Errors if that session is already running.
@@ -1232,6 +1241,7 @@ pub fn start_turn(
             project_root.display()
         ));
     }
+    sessions::recover_compaction(&core)?;
     let cancelled = Arc::new(CancelToken::default());
     {
         // `running` is the outer lock for both pieces of turn state. Claiming
@@ -1544,32 +1554,19 @@ async fn run_compact(
             context_tokens: endpoint.context_tokens,
         });
     }
-    let before_len = guard.messages().len() as u64;
-    let (_, compaction) =
-        prune_transcript(guard.messages(), trigger, schema_tokens, tokens_before);
-    let after_len = guard.messages().len() as u64;
-    if after_len < before_len {
-        sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
-    } else if after_len > before_len {
-        sessions::shift_resume_points_for_insert(core, session_id, 2);
-    }
-    let compacted_messages = compaction.as_ref().map(|d| d.message_count).unwrap_or(0);
-    if let Some(digest) = compaction {
-        let client = ChatClient::from_endpoint(&endpoint);
-        let hooks = Hooks::discover(project_root, &core.data_dir);
-        let ctx = CompactionCtx {
-            core,
-            session_id,
-            project_root,
-            client: &client,
-            hooks: &hooks,
-            cancelled,
-        };
-        apply_compaction_digest(&ctx, guard.messages(), digest).await;
-    }
+    let client = ChatClient::from_endpoint(&endpoint);
+    let hooks = Hooks::discover(project_root, &core.data_dir);
+    let ctx = CompactionCtx { core, session_id, project_root, client: &client, hooks: &hooks, cancelled };
+    let mut spend = RequestSpend::new(settings.max_agent_tokens);
+    let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, schema_tokens, true, &mut spend).await {
+        Ok(count) => count,
+        Err(reason) => {
+            guard.commit().await;
+            return Err(reason);
+        }
+    };
     let tokens_after =
         schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
-    save_messages(core, session_id, guard.messages(), true).await;
     sessions::touch(core, session_id);
     guard.commit().await;
     Ok(CompactReceipt {
@@ -2558,7 +2555,6 @@ async fn run_loop(
     // tool schema bytes without re-serializing the Value array. `mut` because
     // a mid-turn refreeze swaps in the next generation between iterations.
     let mut schemas_wire = registry.schemas_wire_arc();
-    let mut known_tools: Vec<String> = registry.tools.iter().map(|s| s.name.clone()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
@@ -2575,7 +2571,7 @@ async fn run_loop(
     // What every request of this turn has cost so far, and how many turn_end
     // refusals the turn has already honored. Both are turn-scoped: a
     // continuation is more of the same turn, so it spends the same budgets.
-    let mut spent_tokens: usize = 0;
+    let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let mut continuation: usize = 0;
     // Set when the model-stopped break already ran the turn_end hooks, so the
     // late call site does not run them a second time for one end.
@@ -2600,35 +2596,13 @@ async fn run_loop(
         }
         let trigger =
             compaction_trigger(budget, schema_tokens, settings.compaction_tokens, guard.messages());
-        let before_len = guard.messages().len() as u64;
-        let (budget_changed, compaction) = enforce_budget(guard.messages(), trigger, schema_tokens);
-        // The prune rewrote absolute message indices; resume boundaries in
-        // the session meta must follow or replay dividers drift.
-        let after_len = guard.messages().len() as u64;
-        if after_len < before_len {
-            sessions::shift_resume_points_for_prune(core, session_id, before_len - after_len);
-        } else if after_len > before_len {
-            sessions::shift_resume_points_for_insert(core, session_id, 2);
-        }
-        if let Some(digest) = compaction {
-            let ctx = CompactionCtx {
-                core,
-                session_id,
-                project_root,
-                client: &client,
-                hooks: &hooks,
-                cancelled: &cancelled,
-            };
-            apply_compaction_digest(&ctx, guard.messages(), digest).await;
-        }
-        // The prune's sidecars (resume shift, archive, compaction record) are
-        // on disk by now, so the rewritten transcript must land before the
-        // request below: a crash mid-stream would otherwise leave them
-        // describing a prune the persisted transcript never had, and the
-        // shifted resume boundaries would drift for good. The manual /compact
-        // path already persists at this point.
-        if budget_changed {
-            save_messages(core, session_id, guard.messages(), true).await;
+        let ctx = CompactionCtx {
+            core, session_id, project_root, client: &client, hooks: &hooks, cancelled: &cancelled,
+        };
+        if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, schema_tokens, false, &mut spend).await {
+            core.send_agent(session_id, AgentEvent::Error { message });
+            stop_reason = "error".into();
+            break 'turns;
         }
         let used = schema_tokens
             + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
@@ -2638,14 +2612,11 @@ async fn run_loop(
         // Checked after compaction so a prune gets its chance to shrink the
         // request under the cap first, and never mid-stream: a request in
         // flight is already paid for. The reply side is not reserved, so the
-        // last admitted request may run past the cap by at most `max_tokens`;
-        // a cap the first request cannot fit ends the turn before it spends
-        // anything.
-        if let Some(cap) = settings.max_agent_tokens {
-            if spent_tokens.saturating_add(used) > cap {
-                stop_reason = "budget_exhausted".into();
-                break 'turns;
-            }
+        // last admitted request can exceed the cap by its output and any
+        // input-estimation error.
+        if !spend.admits(used) {
+            stop_reason = "budget_exhausted".into();
+            break 'turns;
         }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used, context_tokens });
 
@@ -2677,53 +2648,16 @@ async fn run_loop(
             }
         };
 
-        if let Some(u) = result.usage {
-            // Kept, not just broadcast: the live event tells the current
-            // frontend what this turn cost, and nothing else ever learns it.
-            // Prefix-cache behaviour is only visible in this number, and a
-            // regression in it is silent by construction.
-            sessions::append_usage(core, session_id, &sessions::TokenUsage {
-                ts: sessions::unix_now(),
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                cached_tokens: u.cached_tokens,
-            });
-            core.send_agent(session_id, AgentEvent::Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                cached_tokens: u.cached_tokens,
-            });
-        }
+        spend.record(core, session_id, used, &result);
 
-        // Charge the turn for the request that just returned. A provider that
-        // reports nothing is charged the numbers this iteration already
-        // computed - the request-side estimate that fed the budget event, plus
-        // the reply it produced - so silence about usage cannot buy a turn an
-        // unbounded number of requests.
-        spent_tokens = spent_tokens.saturating_add(match result.usage {
-            Some(u) => u.prompt_tokens.saturating_add(u.completion_tokens) as usize,
-            None => used.saturating_add(estimate_tokens(
-                result.content.len()
-                    + result
-                        .tool_calls
-                        .iter()
-                        .map(|c| c.function.arguments.len())
-                        .sum::<usize>(),
-            )),
-        });
-
-        // Prefer structured calls from the server; when there are none (or all
-        // are broken), recover calls from raw markup in the content (see fallback.rs).
+        // Only the API tool_calls field carries executable calls.
         let mut content = result.content.clone();
-        let mut tool_calls = result.tool_calls.clone();
+        let tool_calls = result.tool_calls.clone();
         // Reasoning leaked into content is display-only: persisting it would
         // re-prefill dead tokens on every later turn.
-        if let Some(clean) = fallback::strip_leading_think(&content) {
+        if let Some(clean) = crate::client::strip_leading_think(&content) {
             content = clean;
         }
-        let recovered_by_fallback;
-        (content, tool_calls, recovered_by_fallback) =
-            resolve_tool_calls(content, tool_calls, &known_tools);
         core.send_agent(session_id, AgentEvent::MessageDone { text: content.clone() });
 
         // Never persist a fully empty assistant message (e.g. a turn cancelled
@@ -2747,14 +2681,12 @@ async fn run_loop(
         // The provider stopped writing without ever finishing the answer, so
         // this is broken output, not a response: there is no way to know
         // whether more calls were coming or whether this one was still being
-        // revised. Nothing recovered from it is dispatched, native or
-        // markup-recovered (resolve_tool_calls ran above, so both are in
-        // `tool_calls` by now). The partial text stays in the transcript and
+        // revised. No calls are dispatched. The partial text stays in the transcript and
         // any unrun call ids are stubbed after the loop, so resume replays
         // cleanly; the turn ends here with an error before its single Done.
         if result.finish_reason == TRUNCATED {
             let mut message =
-                "provider stream ended without a completion signal; the reply above is incomplete"
+                "provider response was interrupted or exceeded client limits; the reply above is incomplete"
                     .to_string();
             if !tool_calls.is_empty() {
                 let n = tool_calls.len();
@@ -2998,10 +2930,6 @@ async fn run_loop(
                         }),
                     ));
                     continue;
-                }
-
-                if registry.is_mutating(name) {
-                    snapshot_file(core, session_id, project_root, &args).await;
                 }
 
                 // Read live so "[a]lways" during an approval prompt takes effect
@@ -3420,25 +3348,6 @@ async fn run_loop(
             }
         }
 
-        // The one path by which a call reaches the loop from anywhere but the
-        // API's own tool_calls: fallback.rs read this reply's calls out of its
-        // text because the completion carried none (or only broken ones).
-        // Say so once per session, in the transcript and on the wire, so a
-        // session running on the recovery path is visible as such to the
-        // model (whose contract is native calls), to a frontend, and to
-        // anyone measuring whether the path is still needed at all.
-        if recovered_by_fallback && !cancelled.is_cancelled() {
-            let first = {
-                let mut map = core.sessions.lock().await;
-                map.get_mut(session_id)
-                    .map(|data| !std::mem::replace(&mut data.fallback_recovery_reported, true))
-                    .unwrap_or(true)
-            };
-            if first {
-                append_and_emit_note(core, session_id, guard.messages(), FALLBACK_RECOVERY_NOTE);
-            }
-        }
-
         // The mid-turn half of the self-modification loop: an extension file
         // written by this iteration's mutating calls activates before the
         // next model request, so a tool the agent writes in iteration N is
@@ -3452,7 +3361,6 @@ async fn run_loop(
                 .await;
         if refrozen {
             schemas_wire = registry.schemas_wire_arc();
-            known_tools = registry.tools.iter().map(|s| s.name.clone()).collect();
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
             approval_seen = unapproved_tool_map(&registry, &core.data_dir, project_root);
@@ -3506,17 +3414,6 @@ async fn run_loop(
         );
     }
     core.send_agent(session_id, AgentEvent::Done { stop_reason });
-}
-
-/// Record a file's pre-edit content the first time this session touches it,
-/// enabling cumulative per-file diffs.
-async fn snapshot_file(core: &Arc<Core>, session_id: &str, project_root: &Path, args: &Value) {
-    let Some(rel) = args["path"].as_str() else { return };
-    let content = std::fs::read_to_string(project_root.join(rel)).unwrap_or_default();
-    let mut sessions_map = core.sessions.lock().await;
-    if let Some(data) = sessions_map.get_mut(session_id) {
-        data.snapshots.entry(rel.to_string()).or_insert(content);
-    }
 }
 
 /// Persist transcript to disk without cloning it back into SessionData.
@@ -4132,9 +4029,9 @@ fn prune_transcript(
         }
     }
     if reached {
-        // Addressless: `append_archive` has not run yet, and a note may never
+        // Addressless: `commit_compaction` has not run yet, and a note may never
         // advertise an address the archive does not honor. The upgrade is
-        // `apply_compaction_digest`'s.
+        // `prepare_compaction_digest`'s.
         if note_reserve > 0 && !digest.truncated.is_empty() {
             messages.insert(2, ChatMessage::user(digest.format_truncation_only(None)));
         }
@@ -4193,6 +4090,136 @@ fn prune_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_compaction_keeps_the_transcript_and_resume_boundaries() {
+        for failed_file in ["archive", "messages", "index"] {
+            check_failed_compaction(failed_file).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compaction_index_lock_failure_preserves_live_history() {
+        check_failed_compaction("index-lock").await;
+    }
+
+    async fn check_failed_compaction(failed_file: &str) {
+        let dir = std::env::temp_dir().join(format!("openmax-compact-failure-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = "http://127.0.0.1:0".into();
+            settings.model = "test".into();
+            settings.context_tokens = Some(12_288);
+            settings.max_tokens = 1_024;
+        }
+        let mut data = build_session_data(&core, &id, &project);
+        while data.messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_500 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        let original = serde_json::to_value(&data.messages).unwrap();
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        core.sessions.lock().await.insert(id.clone(), data);
+        sessions::record_resume_point(&core, &id, 10);
+        let path = match failed_file {
+            "archive" => PathBuf::from(sessions::archive_display(&core, &id)),
+            "messages" => core.data_dir.join("sessions").join(format!("{id}.messages.json")),
+            "index-lock" => core.data_dir.join("sessions/index.lock"),
+            _ => core.data_dir.join("sessions/index.json"),
+        };
+        let backup = path.with_extension("original");
+        let existed = path.exists();
+        if existed { std::fs::rename(&path, &backup).unwrap(); }
+        std::fs::create_dir(&path).unwrap();
+        let result = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await;
+        std::fs::remove_dir(&path).unwrap();
+        if existed { std::fs::rename(&backup, &path).unwrap(); }
+
+        assert!(result.is_err(), "{failed_file} failure must refuse compaction");
+        let messages = core.sessions.lock().await.get(&id).unwrap().messages.clone();
+        assert_eq!(serde_json::to_value(messages).unwrap(), original, "{failed_file}: live transcript");
+        assert_eq!(serde_json::to_value(sessions::load_messages(&core, &id).unwrap()).unwrap(), original,
+            "{failed_file}: saved transcript");
+        assert_eq!(sessions::meta(&core, &id).unwrap().resume_points, vec![10]);
+        assert!(sessions::load_archive(&core, &id).is_empty(), "a failed attempt must not leave archive records to duplicate on retry");
+        let retried = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
+        assert!(retried.compacted_messages > 0);
+        assert!(!sessions::load_archive(&core, &id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fresh_session_keeps_faded_memory_files() {
+        let dir = std::env::temp_dir().join(format!("openmax-memory-retain-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        let memory_dir = project.join(crate::memory::MEMORY_DIR);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let path = memory_dir.join("rarely-needed.md");
+        let body = "# Recovery procedure\nKeep the full procedure even when it leaves the index.\n";
+        std::fs::write(&path, body).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(90 * 24 * 60 * 60);
+        std::fs::File::open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        core.set_run_approval_mode(ApprovalMode::Readonly);
+
+        let data = build_session_data(&core, "fresh", &project);
+
+        assert!(!data.messages[0].content.as_deref().unwrap().contains("Recovery procedure"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        assert!(!memory_dir.join(".access.jsonl").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compaction_respects_a_zero_request_budget() {
+        check_compaction_budget(0, false).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_reports_its_usage_to_the_frontend() {
+        check_compaction_budget(20_000, true).await;
+    }
+
+    async fn check_compaction_budget(cap: usize, expect_request: bool) {
+        let dir = std::env::temp_dir().join(format!("openmax-summary-budget-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let (base_url, requests) = counting_endpoint(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Summary\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\n",
+            "data: [DONE]\n\n",
+        )).await;
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = base_url;
+            settings.model = "test".into();
+            settings.context_tokens = Some(12_288);
+            settings.max_tokens = 1_024;
+            settings.max_agent_tokens = Some(cap);
+        }
+        let mut data = build_session_data(&core, &id, &project);
+        while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 8_500 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        core.sessions.lock().await.insert(id.clone(), data);
+        let result = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
+        assert!(result.compacted_messages > 0, "a summary is optional for compaction");
+        assert_eq!(*requests.lock().unwrap(), usize::from(expect_request));
+        let mut usage = 0;
+        while let Ok(env) = rx.try_recv() {
+            if let AgentEvent::Usage { prompt_tokens: 100, completion_tokens: 10, .. } = env.event { usage += 1; }
+        }
+        assert_eq!(usage, usize::from(expect_request));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// Hooks are inert until a human approves their exact content - the file
     /// and the code it runs, exactly what `openmax --approve` blesses. Tests
@@ -4278,25 +4305,6 @@ mod tests {
             .unwrap();
         assert!(gated().is_none(), "approving the prompt clears it");
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The fallback note speaks to the model first: it restates the broken
-    /// rule as an imperative instead of asserting an endpoint cause the
-    /// harness cannot know. The old text ("means the endpoint's tool-call
-    /// parser lags") told a markup-emitting model the fault was elsewhere
-    /// while confirming the markup worked.
-    #[test]
-    fn the_fallback_note_restates_the_native_call_rule() {
-        assert!(FALLBACK_RECOVERY_NOTE.contains("Emit native tool_calls"));
-        assert!(FALLBACK_RECOVERY_NOTE.contains("never print call markup"));
-        assert!(
-            FALLBACK_RECOVERY_NOTE.contains("may lag"),
-            "the endpoint explanation stays a possibility"
-        );
-        assert!(
-            !FALLBACK_RECOVERY_NOTE.contains("means the endpoint"),
-            "no asserted cause the harness cannot verify"
-        );
     }
 
     /// A policy notice is reported once per session, and on resume that
@@ -4588,51 +4596,6 @@ mod tests {
         // A real user decline keeps its own wording.
         assert!(declined_message(None).contains("The user declined this action"));
         assert_eq!(short_sha(&source.sha256), "a".repeat(12));
-    }
-
-    #[test]
-    fn broken_native_calls_fall_back_to_markup() {
-        let known = ["read_file".to_string(), "bash".to_string()];
-        let content = "I'll read it.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>";
-        let broken = vec![ToolCall {
-            id: "call_0".into(),
-            kind: "function".into(),
-            function: ToolCallFunction {
-                name: String::new(),
-                arguments: "{not json".into(),
-            },
-        }];
-        let (clean, calls, recovered) = resolve_tool_calls(content.into(), broken, &known);
-        assert_eq!(clean, "I'll read it.");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "read_file");
-        assert!(recovered, "calls that came out of the text say so");
-    }
-
-    #[test]
-    fn partial_broken_native_calls_keep_native() {
-        let known = ["read_file".to_string(), "bash".to_string()];
-        let good = ToolCall {
-            id: "call_0".into(),
-            kind: "function".into(),
-            function: ToolCallFunction {
-                name: "bash".into(),
-                arguments: r#"{"command":"echo hi"}"#.into(),
-            },
-        };
-        let bad = ToolCall {
-            id: "call_1".into(),
-            kind: "function".into(),
-            function: ToolCallFunction {
-                name: String::new(),
-                arguments: "nope".into(),
-            },
-        };
-        let (clean, calls, recovered) = resolve_tool_calls("run".into(), vec![good, bad], &known);
-        assert_eq!(clean, "run");
-        assert_eq!(calls.len(), 2);
-        assert!(is_native_call_broken(&calls[1]));
-        assert!(!recovered, "native calls kept are not a recovery");
     }
 
     fn tool_call(name: &str, args: &str) -> ToolCall {
@@ -7064,126 +7027,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A reply whose only tool call is markup in its text: what a serving
-    /// layer produces when its parser does not know this model's format.
-    const MARKUP_CALL_SSE: &str = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>{\\\"name\\\":\\\"read_file\\\",\\\"arguments\\\":{\\\"path\\\":\\\"a.txt\\\"}}</tool_call>\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: [DONE]\n\n",
-    );
-
-    /// Calls recovered from reply text run, and the session says so once:
-    /// one harness note in the transcript and on the wire, on the first such
-    /// reply, none on the next. Nothing about the recovery was visible
-    /// before, so a session running on the fallback path looked identical to
-    /// one whose endpoint parses tool calls.
-    #[tokio::test]
-    async fn recovered_tool_calls_run_and_are_reported_once_per_session() {
-        use crate::state::Core;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let project = dir.join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
-        crate::trust::trust_project(&core.data_dir, &project).unwrap();
-
-        let (base_url, requests) = counting_endpoint(MARKUP_CALL_SSE).await;
-        {
-            let mut s = core.settings.lock().unwrap();
-            s.base_url = base_url;
-            s.model = "stub".into();
-            s.context_tokens = Some(16384);
-            s.max_agent_iterations = 2;
-        }
-
-        // Created in the store, so the transcript persists and a resume below
-        // reads it back from disk the way `-c` does.
-        let id = &sessions::create(&core, project.to_string_lossy().into()).unwrap().id;
-        start_turn(core.clone(), id.clone(), project, "read it".into()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut ran = 0usize;
-        let mut notes: Vec<String> = Vec::new();
-        let mut stop = None;
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(env)) =
-                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            {
-                match env.event {
-                    AgentEvent::ToolEnd { ok, output, .. } => {
-                        assert!(ok && output.contains("hello"), "{output}");
-                        ran += 1;
-                    }
-                    AgentEvent::HarnessNote { text, .. } => notes.push(text),
-                    AgentEvent::Done { stop_reason } => {
-                        stop = Some(stop_reason);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(stop.as_deref(), Some("max_iterations"));
-        assert_eq!(*requests.lock().unwrap(), 2);
-        assert_eq!(ran, 2, "every recovered call ran");
-        let recovery: Vec<&String> =
-            notes.iter().filter(|n| n.contains("tool calls as text")).collect();
-        assert_eq!(recovery.len(), 1, "one recovery note per session, got {notes:?}");
-        // The note rides a tool result, so the model reads it too.
-        let messages = transcript(&core, id).await;
-        let carried = messages
-            .iter()
-            .filter(|m| m.role == "tool" && m.content.as_deref().is_some_and(|c| c.contains("tool calls as text")))
-            .count();
-        assert_eq!(carried, 1, "the note is in the transcript exactly once");
-
-        // A restart after a compaction dropped the exchange that carried the
-        // note: the transcript on disk no longer has it, the archive does,
-        // and the resumed session still does not say it again (first the
-        // resume, then the resume after a prune). Simulated
-        // the way a prune lands on disk: the exchange appended to the archive,
-        // the transcript rewritten without it.
-        let mut on_disk = transcript(&core, id).await;
-        let at = on_disk
-            .iter()
-            .position(|m| m.role == "tool" && m.content.as_deref().is_some_and(|c| c.contains("tool calls as text")))
-            .expect("the note is on a tool result");
-        let dropped: Vec<ChatMessage> = on_disk.drain(at - 1..=at).collect();
-        assert!(sessions::append_archive(&core, id, &dropped), "the archive takes the exchange");
-        let mut persisted = 0usize;
-        assert!(sessions::save_messages(&core, id, &on_disk, &mut persisted, true), "the pruned transcript lands");
-        core.sessions.lock().await.remove(id.as_str());
-        let project = dir.join("project");
-        start_turn(core.clone(), id.clone(), project, "read it again".into()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut resumed_notes = 0usize;
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(env)) =
-                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            {
-                match env.event {
-                    AgentEvent::HarnessNote { text, .. } if text.contains("tool calls as text") => {
-                        resumed_notes += 1
-                    }
-                    AgentEvent::Done { .. } => break,
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(resumed_notes, 0, "a resumed session does not repeat the note");
-        let messages = transcript(&core, id).await;
-        assert!(
-            !carries_fallback_recovery_note(&messages),
-            "nothing re-added the note to the pruned transcript"
-        );
-        assert!(
-            carries_fallback_recovery_note(&sessions::load_archive(&core, id)),
-            "the one note lives in the archive"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// One tool call to `brokentool`, so the loop stops for its content card.
     const BROKEN_TOOL_SSE: &str = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"brokentool\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
@@ -8519,7 +8362,7 @@ mod tests {
         assert!(notes[0].contains("older tool output truncated"), "{}", notes[0]);
         assert!(
             !notes[0].contains("archive.jsonl"),
-            "the address waits for append_archive to honor it: {}",
+            "the address waits for commit_compaction to honor it: {}",
             notes[0]
         );
     }
@@ -8571,7 +8414,8 @@ mod tests {
             hooks: &hooks,
             cancelled: &cancelled,
         };
-        apply_compaction_digest(&ctx, &mut messages, digest).await;
+        let (archive, record) = prepare_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await;
+        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len()).unwrap();
 
         let note = messages[2].content.as_deref().unwrap();
         assert!(note.contains(&sessions::archive_display(&core, &id)), "{note}");
@@ -8654,7 +8498,8 @@ mod tests {
             hooks: &hooks,
             cancelled: &cancelled,
         };
-        apply_compaction_digest(&ctx, &mut messages, digest).await;
+        let (archive, record) = prepare_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await;
+        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len()).unwrap();
         assert_eq!(
             messages[2].content.as_deref(),
             Some(real_note.as_str()),

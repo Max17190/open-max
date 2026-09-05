@@ -61,11 +61,11 @@ only on demand. At session creation the live memories are ranked by ACT-R
 base-level activation (each past access at age `t` hours contributes
 `t^-0.5`; activation is the log of the sum, so one recall revives an old
 memory) and injected as one index line each under a 1500-byte budget. The
-harness appends reads and writes of memory paths to
-`.openmax/memory/.access.jsonl`; a memory that would score below one access
-21 days old leaves the index, and below one access 60 days old the file is
-deleted at the next session creation, leaving a tombstone line (name, sha256,
-description) in the log. No memories, no section, zero prompt cost. Full
+harness logs accesses through `read_file`, `write_file`, and `edit_file` to
+`.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
+over 21 days old leaves the index but stays searchable on disk. The harness
+never deletes memory files automatically; the user or agent decides when a
+fact is obsolete. No memories, no section, zero prompt cost. Full
 contract: `openmax --spec memory`.
 
 Everything the harness preserves is also searchable:

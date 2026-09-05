@@ -7,7 +7,6 @@ pub mod client;
 pub mod config;
 pub mod doctor;
 pub(crate) mod execution;
-pub mod fallback;
 pub mod hooks;
 pub mod ledger;
 pub mod memory;

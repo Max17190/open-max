@@ -592,10 +592,6 @@ const HELLO_SSE: &str = concat!(
 /// only the missing completion signal distinguishes it from a real request.
 const WRITE_CALL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"side-effect.txt\\\",\\\"content\\\":\\\"written\\\"}\"}}]}}]}\n\n";
 
-/// The same call as markup leaking into `content`, the shape the fallback
-/// parser recovers (it deliberately accepts an unclosed final tag).
-const WRITE_CALL_MARKUP_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>{\\\"name\\\":\\\"write_file\\\",\\\"arguments\\\":{\\\"path\\\":\\\"side-effect.txt\\\",\\\"content\\\":\\\"written\\\"}}</tool_call>\"}}]}\n\n";
-
 const TOOL_CALLS_TERMINATOR: &str = concat!(
     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
     "data: [DONE]\n\n",
@@ -997,68 +993,84 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
 /// call, so the arguments parse and nothing looks broken. A stream with no
 /// completion signal is not a response the model asked to act on (more calls
 /// may have been coming, or this one may still have been under revision), so
-/// the call must not run. Both routes into `tool_calls` are covered: native
-/// deltas, and markup recovered from content by the fallback parser.
+/// the call must not run.
 #[test]
 fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
-    for (tag, body) in [("native", WRITE_CALL_SSE), ("markup", WRITE_CALL_MARKUP_SSE)] {
-        let (project, home) = fresh_dirs(&format!("truncated-call-{tag}"));
-        let (base_url, _requests, _server) = spawn_scripted_server(vec![(body.to_string(), false)]);
-        // auto, so a refusal here is the truncation and not the approval gate.
-        write_settings_with_mode(&home, &base_url, "auto");
+    let (project, home) = fresh_dirs("truncated-native-call");
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![(WRITE_CALL_SSE.to_string(), false)]);
+    // auto, so a refusal here is the truncation and not the approval gate.
+    write_settings_with_mode(&home, &base_url, "auto");
 
-        let (code, lines, stdout) = json_turn(&project, &home, "write the file");
-        assert_truncated_turn(code, &lines, &stdout);
-        // The property that matters: no side effect.
-        assert!(
-            !project.join("side-effect.txt").exists(),
-            "{tag}: a call from an unterminated stream must not run: {stdout}"
-        );
-        assert!(
-            !lines.iter().any(|l| l["type"] == "tool_start"),
-            "{tag}: no tool may even be dispatched: {stdout}"
-        );
-        assert!(
-            lines.iter().any(|l| l["type"] == "error"
-                && l["message"].as_str().is_some_and(|m| m.contains("did not run"))),
-            "{tag}: the error must say the call was refused: {stdout}"
-        );
-        // The refused call was persisted before it was refused, so it needs a
-        // tool reply: an unanswered tool_call id breaks chat-template replay
-        // and would make the session unresumable.
-        let saved = session_dump(&home);
-        assert!(
-            saved.contains("\"role\":\"tool\"")
-                && saved.contains("The provider stream ended before this call could run"),
-            "{tag}: the refused call id must be answered on disk: {saved}"
-        );
-    }
+    let (code, lines, stdout) = json_turn(&project, &home, "write the file");
+    assert_truncated_turn(code, &lines, &stdout);
+    // The property that matters: no side effect.
+    assert!(
+        !project.join("side-effect.txt").exists(),
+        "a call from an unterminated stream must not run: {stdout}"
+    );
+    assert!(
+        !lines.iter().any(|l| l["type"] == "tool_start"),
+        "no tool may even be dispatched: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l["type"] == "error"
+            && l["message"].as_str().is_some_and(|m| m.contains("did not run"))),
+        "the error must say the call was refused: {stdout}"
+    );
+    // The refused call was persisted before it was refused, so it needs a
+    // tool reply: an unanswered tool_call id breaks chat-template replay
+    // and would make the session unresumable.
+    let saved = session_dump(&home);
+    assert!(
+        saved.contains("\"role\":\"tool\"")
+            && saved.contains("The provider stream ended before this call could run"),
+        "the refused call id must be answered on disk: {saved}"
+    );
 }
 
 /// Control for the refusals above: in the same unattended mode, that exact
 /// call does run once the stream finishes. Without this, the refusal test
-/// could pass for the wrong reason (a gate, or markup nothing recognized).
+/// could pass for the wrong reason, such as an approval gate.
 #[test]
 fn a_finished_stream_still_runs_the_same_write_call() {
-    for (tag, body) in [("native", WRITE_CALL_SSE), ("markup", WRITE_CALL_MARKUP_SSE)] {
-        let (project, home) = fresh_dirs(&format!("finished-call-{tag}"));
+    let (project, home) = fresh_dirs("finished-native-call");
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (format!("{WRITE_CALL_SSE}{TOOL_CALLS_TERMINATOR}"), true),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let (code, lines, stdout) = json_turn(&project, &home, "write the file");
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(
+        lines.iter().any(|l| l["type"] == "tool_start" && l["name"] == "write_file"),
+        "the finished call must be dispatched: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("side-effect.txt")).unwrap_or_default(),
+        "written",
+        "the finished call must run"
+    );
+}
+
+#[test]
+fn assistant_text_never_dispatches_a_tool() {
+    let call = r#"<tool_call>{"name":"write_file","arguments":{"path":"side-effect.txt","content":"written"}}</tool_call>"#;
+    for text in [call.to_string(), format!("Document `{call}`; do not run it."),
+        "```tool_call\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"side-effect.txt\",\"content\":\"written\"}}\n```".into()] {
+        let (project, home) = fresh_dirs("text-is-not-a-call");
+        let delta = serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]});
         let (base_url, _requests, _server) = spawn_scripted_server(vec![
-            (format!("{body}{TOOL_CALLS_TERMINATOR}"), true),
+            (format!("data: {delta}\n\ndata: [DONE]\n\n"), true),
             (HELLO_SSE.to_string(), true),
         ]);
         write_settings_with_mode(&home, &base_url, "auto");
-
-        let (code, lines, stdout) = json_turn(&project, &home, "write the file");
-        assert_eq!(code, Some(0), "{tag}: {stdout}");
-        assert!(
-            lines.iter().any(|l| l["type"] == "tool_start" && l["name"] == "write_file"),
-            "{tag}: the finished call must be dispatched: {stdout}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(project.join("side-effect.txt")).unwrap_or_default(),
-            "written",
-            "{tag}: the finished call must run"
-        );
+        let (code, lines, stdout) = json_turn(&project, &home, "explain the call syntax");
+        assert_eq!(code, Some(0), "{stdout}");
+        assert!(!project.join("side-effect.txt").exists(), "prose executed: {stdout}");
+        assert!(!lines.iter().any(|l| l["type"] == "tool_start"), "{stdout}");
+        assert!(lines.iter().any(|l| l["type"] == "message_done" && l["text"] == text), "{stdout}");
+        assert!(!session_dump(&home).contains("\"role\":\"tool\""));
     }
 }
 

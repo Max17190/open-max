@@ -14,6 +14,9 @@
 
 Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at the model server you choose: local, cloud, or a private proxy. No desktop shell, no heavyweight runtime, no telemetry.
 
+The endpoint must return structured API `tool_calls` to use tools. For local servers, configure the model's tool parser and chat template. Call markup in assistant text is displayed as text and never executed. Responses are limited to 16 MiB and 128 tool calls.
+
+
 You own the endpoints, the tools, the skills, and the context.
 
 ## Features
@@ -23,14 +26,12 @@ You own the endpoints, the tools, the skills, and the context.
 - **Trust before execution.** An exact canonical project root must be trusted before any agent turn or project behavior starts. Interactive use asks once; headless and stdio runs fail closed until explicitly started with `--trust-project`.
 - **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent writes them itself and the harness re-freezes as soon as a mutating call lands, so a tool the agent writes is a tool the agent uses on its very next step.
-- **Memory that forgets.** One durable fact per file in `.openmax/memory/`, written by the agent, surfaced as an index line in future sessions, ranked by ACT-R activation (recency and frequency of real use, one number). Facts never read fade from the index and are deleted after ~60 days with a tombstone in the access log. No database, no daemon, no embeddings; zero prompt cost when empty.
+- **File based memory.** One durable fact per file in `.openmax/memory/`, written by the agent, surfaced as an index line in future sessions, ranked by recency and frequency of observed use. Old entries fade from the index and remain searchable on disk until the user or agent deletes them. No database, no daemon, no embeddings; zero prompt cost when empty.
 - **Recall over everything kept.** `openmax --recall "<query>"` searches this project's past sessions, compaction archives, digests, and memories in one bounded streaming pass — BM25 relevance fused with the same recency law, ranked excerpts, each citing the file with the full record. No index to build or maintain: the stores on disk stay the single source of truth.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
 - **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure.
 
-## The intelligent harness
-
-Open Max's thesis is that it is the world's first intelligent harness: a living system that can construct the next capability it needs from ordinary files and native processes. A new tool, skill, hook, template, provider, tmux process, or frontend is a new neuron. The harness discovers it, gives the agent the minimum necessary description, and keeps the richer behavior outside the permanent loop.
+## Design
 
 The design starts with one question: **What is the smallest capability Open Max must provide so the agent can construct richer behavior itself?** The answer is one focused native loop, seven primitive tools, a fast event-driven TUI, context management, and stable file and process contracts.
 
@@ -205,7 +206,7 @@ Set `OPENMAX_PERF=1` while running the TUI to log frame, transcript-layout, and 
 
 ## Status
 
-Open Max is early software (v0.2.0). The agent loop, session persistence, extensibility, TUI, and GitHub Actions CI (test + release build + soft size gate) are in place, but there is no install script or published release channel yet. Expect rough edges. File an issue or send a PR if something breaks.
+Open Max is early software. File an issue or send a PR if something breaks.
 
 ## License
 
