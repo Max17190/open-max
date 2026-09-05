@@ -50,19 +50,6 @@ pub struct SessionMeta {
     /// distinguishable instead of collapsing into one stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resume_points: Vec<u64>,
-    /// The legacy system-insert migration touches two stores: this index
-    /// (boundary shift) and the transcript (the inserted line). One atomic
-    /// write cannot span both files, so the shift records itself here, in
-    /// the same index write that performs it, and hydration completes the
-    /// interrupted half exactly once instead of guessing from transcript
-    /// shape. Only sessions saved before the prompt lived at index zero
-    /// ever carry this.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub system_insert_shifted: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 pub const UNTITLED: &str = "New session";
@@ -447,25 +434,6 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
-/// True when an existing transcript file must not receive JSONL appends.
-/// Historical array-shaped blobs (first non-ws byte `[`) are not loaded as
-/// history, but the file may still sit on disk; append would create a mixed
-/// file. Force a full JSONL rewrite instead. Not a load dual-path.
-fn must_rewrite_non_jsonl(path: &PathBuf) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut head = [0u8; 64];
-    let Ok(n) = file.read(&mut head) else {
-        return false;
-    };
-    head[..n]
-        .iter()
-        .find(|b| !b.is_ascii_whitespace())
-        .is_some_and(|b| *b == b'[')
-}
-
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
 /// the same `*.tmp`.
@@ -594,7 +562,6 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
         created_at: now(),
         updated_at: now(),
         resume_points: Vec::new(),
-        system_insert_shifted: false,
     };
     let m = meta.clone();
     with_index(core, move |metas| metas.push(m))?;
@@ -630,48 +597,21 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
     });
 }
 
-/// A prune that only truncated inserts its note at index 2 without removing
-/// anything, so the transcript grows by exactly that message and every
-/// boundary at or after it moves up one. The mirror of
-/// `shift_resume_points_for_prune`, which only ever handles shrinkage.
-pub fn shift_resume_points_for_note_insert(core: &Core, id: &str) {
+/// One message was inserted at index `at`, so the transcript grows by exactly
+/// that message and every boundary at or after it moves up one. The mirror
+/// of `shift_resume_points_for_prune`, which only ever handles shrinkage. A
+/// truncation-only prune inserts its note at 2; hydration of a transcript
+/// saved without its system prompt inserts that prompt at 0.
+pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) {
     let _ = with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             for p in &mut m.resume_points {
-                if *p >= 2 {
+                if *p >= at {
                     *p = p.saturating_add(1);
                 }
             }
         }
     });
-}
-
-/// A system message is being inserted at the front of the transcript (legacy
-/// sessions saved before the prompt lived at index zero); every absolute
-/// boundary moves down by one, exactly once per session. The shift and its
-/// `system_insert_shifted` marker land in one atomic index write, so a crash
-/// between this and the transcript rewrite is recoverable: the next
-/// hydration sees the marker and skips the shift instead of drifting the
-/// boundaries a second time.
-///
-/// Returns whether the index write landed. The caller must treat false as
-/// "the insert is not yet persistable": a transcript that gains its system
-/// line on disk while the marker is missing is indistinguishable from a
-/// modern session, so the boundaries would stay unshifted forever.
-#[must_use]
-pub fn shift_resume_points_for_system_insert(core: &Core, id: &str) -> bool {
-    with_index(core, |metas| {
-        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            if m.system_insert_shifted {
-                return;
-            }
-            m.system_insert_shifted = true;
-            for p in &mut m.resume_points {
-                *p = p.saturating_add(1);
-            }
-        }
-    })
-    .is_ok()
 }
 
 /// Record that a new sitting resumed this session with `message_index`
@@ -828,9 +768,14 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         }
         return true;
     }
-    // Never append onto a non-JSONL blob left on disk after a failed load.
-    let needs_rewrite =
-        rewrite || messages.len() < *persisted || must_rewrite_non_jsonl(&path);
+    // `persisted` at zero means nothing of this session's is on disk yet. A
+    // non-empty file there is one `load_messages` could not read (it hands
+    // back None for a file it cannot parse), and appending to it would join
+    // this session's first line onto whatever its last line is, losing that
+    // message at the next load. Replace it instead.
+    let needs_rewrite = rewrite
+        || messages.len() < *persisted
+        || (*persisted == 0 && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0));
 
     let result = if needs_rewrite {
         write_jsonl(&path, messages)
@@ -885,10 +830,6 @@ mod tests {
         // The prune that fires this shift also inserted its digest note at
         // index 2; collapsed boundaries land after it, never on it.
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 7]);
-
-        // A legacy system-prompt insert moves every boundary down one.
-        assert!(shift_resume_points_for_system_insert(&core, id));
-        assert_eq!(meta(&core, id).unwrap().resume_points, vec![4, 8]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -905,8 +846,11 @@ mod tests {
         record_resume_point(&core, id, 3);
         record_resume_point(&core, id, 7);
 
-        shift_resume_points_for_note_insert(&core, id);
+        shift_resume_points_for_insert(&core, id, 2);
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![1, 4, 8]);
+        // An insert at the very front moves every boundary.
+        shift_resume_points_for_insert(&core, id, 0);
+        assert_eq!(meta(&core, id).unwrap().resume_points, vec![2, 5, 9]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1019,7 +963,6 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 resume_points: Vec::new(),
-                system_insert_shifted: false,
             })
         })
         .unwrap();
@@ -1145,7 +1088,6 @@ mod tests {
                         created_at: 1,
                         updated_at: 1,
                         resume_points: Vec::new(),
-                        system_insert_shifted: false,
                     });
                 })
                 .unwrap();
@@ -1377,8 +1319,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A file `load_messages` could not read is not history to append to:
+    /// its last line has no newline of ours, so the first appended record
+    /// would share that line and be skipped at the next load. The first
+    /// save of a session that persisted nothing yet replaces such a file.
     #[test]
-    fn save_over_array_blob_rewrites_jsonl_not_append() {
+    fn the_first_save_replaces_an_unreadable_transcript_instead_of_appending() {
         let dir = std::env::temp_dir().join(format!("openmax-sess-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = &create(&core, "/tmp/p".into()).unwrap().id;
@@ -1386,18 +1332,22 @@ mod tests {
         std::fs::write(&path, r#"[{"role":"user","content":"old"}]"#).unwrap();
         assert!(load_messages(&core, id).is_none());
 
-        // Fresh session after empty load: persisted_count starts at 0.
         let mut persisted = 0usize;
         let messages = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
-        save_messages(&core, id, &messages, &mut persisted, false);
+        assert!(save_messages(&core, id, &messages, &mut persisted, false));
         assert_eq!(persisted, 2);
-
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.trim_start().starts_with('['), "must not leave array prefix:\n{text}");
-        assert_eq!(text.matches('\n').count(), 2);
+        assert!(!text.trim_start().starts_with('['), "the unreadable file was appended to:\n{text}");
         let loaded = load_messages(&core, id).unwrap();
-        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.len(), 2, "every saved message loads back");
         assert_eq!(loaded[1].content.as_deref(), Some("hello"));
+
+        // From here on saves append, as they always did.
+        let mut longer = messages.clone();
+        longer.push(ChatMessage::assistant(Some("hi".into()), None));
+        assert!(save_messages(&core, id, &longer, &mut persisted, false));
+        assert_eq!(persisted, 3);
+        assert_eq!(load_messages(&core, id).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 

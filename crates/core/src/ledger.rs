@@ -59,8 +59,9 @@ pub enum Kind {
     Change,
     /// A human approved this exact content for unattended execution.
     Approval,
-    /// One-time import of a pre-chain `approved.json` (see the approvals
-    /// section): after this marker the legacy file is ignored forever.
+    /// Written by pre-release builds when approvals moved into the chain.
+    /// Nothing writes it now; the variant stays so a chain carrying one still
+    /// parses, and `approvals_from` reads it as no authority at all.
     ApprovalsImported,
     /// A human stopped expecting an approved capability at this path
     /// (`openmax --forget` after a deliberate deletion). The hashes stay
@@ -138,8 +139,8 @@ pub struct Change {
     pub kind: &'static str,
 }
 
-/// Bumped when approvals moved into the chain, so a line written before the
-/// move is legible as one (see `adopt_legacy_approvals`).
+/// Bumped when approvals moved into the chain. Older lines still parse; the
+/// number only says which build's shape a record carries.
 const RECORD_VERSION: u32 = 2;
 
 fn hex(bytes: &[u8]) -> String {
@@ -268,10 +269,6 @@ fn chain_head_path(dir: &Path) -> PathBuf {
 /// claim without also writing here.
 fn pending_head_path(dir: &Path) -> PathBuf {
     dir.join("chain-head.pending")
-}
-
-fn legacy_approved_path(dir: &Path) -> PathBuf {
-    dir.join("approved.json")
 }
 
 /// Every unverifiable-ledger error ends with this. The old message asserted
@@ -681,15 +678,6 @@ fn sync_locked(
 
     let mut changes = Vec::new();
     let mut lines = String::new();
-    // A turn is what gives an agent the chance to plant an `approved.json`,
-    // so a turn is where a ledger with nothing to inherit says so, once.
-    if let Some(mut marker) = seal_marker(dir, &verified.records, ts) {
-        marker.prev = prev.clone();
-        let line = serde_json::to_string(&marker).map_err(|e| e.to_string())?;
-        prev = sha256_hex(line.as_bytes());
-        lines.push_str(&line);
-        lines.push('\n');
-    }
     let mut seen: Vec<&PathBuf> = Vec::new();
     for (path, sha, bytes) in files {
         seen.push(path);
@@ -775,29 +763,6 @@ fn sync_locked(
 // the pin, and the audit trail: a forged approval has to forge the chain
 // (detectable, and the same ceiling trust already lives at), and every real
 // one shows up in `openmax --ledger` with its time, actor, and session.
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ApprovedFile {
-    #[serde(default)]
-    version: u32,
-    #[serde(default)]
-    hashes: Vec<String>,
-    /// Capability files a human has approved at least once, canonicalized.
-    /// What is enforced is still the hash set; this only remembers that a
-    /// path was live, so a later edit of an installed gate reads as a gate
-    /// that was modified rather than a file that was never installed.
-    #[serde(default)]
-    paths: Vec<String>,
-    /// What the approved bytes at a hook path actually declared. Reconciling
-    /// a modified hook has to judge it by this and never by the file on disk:
-    /// the modified content is the part the agent controls, so reading its
-    /// `event` would let an approved gate rewrite itself into an observer and
-    /// stop gating, and reading its `command` would let it hand itself a
-    /// repair exemption for a path nobody blessed.
-    #[serde(default)]
-    hooks: Vec<ApprovedHook>,
-}
 
 /// One hook as a human approved it: the shape reconciliation must remember,
 /// because the file itself can no longer be trusted to describe it.
@@ -942,11 +907,6 @@ fn approvals_from(records: &[Record]) -> Approvals {
 /// treat that as nothing approved (fail closed) while surfacing the reason.
 pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, String> {
     let dir = project_dir(data_dir, project_root);
-    if legacy_approved_path(&dir).exists() {
-        // Never an import: either the chain has already settled the question
-        // and the file is set aside, or it waits for a human to adopt it.
-        with_lock(&dir, || settle_legacy_store_locked(&dir))?;
-    }
     // The pin plus the log's CONTENT hash name one exact chain. The previous
     // key was (pin, byte length), and a same-length in-place rewrite of a
     // pinned record kept both while breaking the chain, so the cache served
@@ -960,17 +920,9 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
     // record breaks the chain the pin transitively names; an appended tail
     // is either unparseable, unpinned authority that refuses, or vouched by
     // a pending head, which bypasses the cache below), so a hit's bytes are
-    // the bytes its cached answer was verified from. A pending legacy store
-    // is part of the answer and is not covered by the key, so while one is
-    // on disk the cache steps aside.
-    let pending = read_legacy_store(&dir);
-    let key = pending
-        .is_none()
-        .then(|| {
-            read_trimmed(&chain_head_path(&dir))
-                .zip(std::fs::read(log_path(&dir)).ok().map(|bytes| sha256_hex(&bytes)))
-        })
-        .flatten();
+    // the bytes its cached answer was verified from.
+    let key = read_trimmed(&chain_head_path(&dir))
+        .zip(std::fs::read(log_path(&dir)).ok().map(|bytes| sha256_hex(&bytes)));
     if let Some((pin, log_sha)) = &key {
         if let Some(hit) = cached_approvals(&dir, pin, log_sha) {
             return Ok(hit);
@@ -979,20 +931,7 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
     let verified = read_verified(&dir)?;
     // Only the pinned prefix speaks for a human: an unpinned tail is bytes
     // nobody vouched for, so what it grants or retires stays inert.
-    let mut approved = approvals_from(&verified.records[..verified.pinned]);
-    if let Some((_, file)) = pending {
-        // An unadopted store contributes restriction and nothing else: the
-        // paths it claims were live, so a gate a human installed before the
-        // upgrade fails closed instead of quietly going inert. Its hashes and
-        // hook shapes wait for `openmax --adopt-approvals`, because those are
-        // the parts that would grant execution or relax a gate.
-        if inheritable(&verified.records) {
-            for path in file?.paths {
-                approved.paths.insert(PathBuf::from(path));
-            }
-        }
-        return Ok(approved);
-    }
+    let approved = approvals_from(&verified.records[..verified.pinned]);
     if let Some((pin, log_sha)) = key {
         remember_approvals(&dir, pin, log_sha, &approved);
     }
@@ -1030,247 +969,6 @@ fn remember_approvals(dir: &Path, pin: String, log_sha: String, approved: &Appro
     if let Ok(mut cache) = approval_cache().lock() {
         cache.insert(dir.to_path_buf(), (pin, log_sha, approved.clone()));
     }
-}
-
-/// A ledger whose chain has already answered the legacy question: some record
-/// carries the import marker, written either by an adoption or by first
-/// contact with a store-free ledger. After that, an `approved.json` is
-/// something that appeared next to a modern chain - which is the forgery this
-/// design exists to close - so it is set aside unread.
-fn sealed(records: &[Record]) -> bool {
-    records.iter().any(|r| r.kind == Kind::ApprovalsImported)
-}
-
-/// Whether an `approved.json` beside this ledger could be something this
-/// project actually inherited. It takes a record written before approvals
-/// joined the chain to make that plausible, and no marker settling the
-/// question since. A ledger this build wrote from scratch never had a store,
-/// so a file next to it is a plant and is set aside unread. The test asks for
-/// *some* older record rather than only older ones, so a human who approves
-/// something else first does not silently forfeit the store they were about
-/// to adopt.
-fn inheritable(records: &[Record]) -> bool {
-    records.iter().any(|r| r.v < RECORD_VERSION) && !sealed(records)
-}
-
-/// A legacy `approved.json` no chain vouches for.
-///
-/// Its hashes are what grant execution, and its hook shapes are what can
-/// *relax* a gate into an observer, so neither takes effect until a human
-/// adopts it: an unauthenticated file must never become authority on its own,
-/// which is the whole point of moving approvals into the chain. The paths it
-/// claims were live are read even while it waits, because a path can only make
-/// the harness stricter - content at a path a human approved is a modified
-/// capability, and a gate there fails closed. So the worst a planted file can
-/// do before a human looks at it is cost the project availability, which an
-/// agent holding `bash` has anyway; what it cannot do is make anything run.
-pub struct PendingLegacy {
-    pub path: PathBuf,
-    /// Digest of the exact bytes this preview describes. Adoption requires it
-    /// back, so what a human vouches for is what gets chained - a file
-    /// rewritten between the summary and the confirmation is a different
-    /// store, and importing it would launder bytes nobody saw.
-    pub sha256: String,
-    pub hashes: usize,
-    pub paths: Vec<PathBuf>,
-    pub shapes: usize,
-    /// The file exists but does not parse, so not even its paths can be read.
-    pub malformed: bool,
-}
-
-/// One read of the legacy store: the digest of the exact bytes read, and what
-/// they parse to. Everything downstream of a human decision keys on the
-/// digest, because "the file" is not a stable thing an approval can bind to -
-/// the bytes shown are.
-fn read_legacy_store(dir: &Path) -> Option<(String, Result<ApprovedFile, String>)> {
-    let legacy = legacy_approved_path(dir);
-    let bytes = std::fs::read(&legacy).ok()?;
-    let parsed = serde_json::from_slice(&bytes).map_err(|e| {
-        format!(
-            "{} is malformed ({e}); it can be adopted only after it is fixed, or removed",
-            legacy.display()
-        )
-    });
-    Some((sha256_hex(&bytes), parsed))
-}
-
-/// The legacy store waiting on a human, if there is one. `--check` names it
-/// and `--adopt-approvals` acts on it; both need the same read.
-pub fn pending_legacy(data_dir: &Path, project_root: &Path) -> Option<PendingLegacy> {
-    let dir = project_dir(data_dir, project_root);
-    let legacy = legacy_approved_path(&dir);
-    if !legacy.exists() || !inheritable(&read_verified(&dir).ok()?.records) {
-        return None;
-    }
-    let (sha256, parsed) = read_legacy_store(&dir)?;
-    Some(match parsed {
-        Ok(file) => PendingLegacy {
-            path: legacy,
-            sha256,
-            hashes: file.hashes.len(),
-            paths: file.paths.iter().map(PathBuf::from).collect(),
-            shapes: file.hooks.len(),
-            malformed: false,
-        },
-        Err(_) => PendingLegacy {
-            path: legacy,
-            sha256,
-            hashes: 0,
-            paths: Vec::new(),
-            shapes: 0,
-            malformed: true,
-        },
-    })
-}
-
-/// The marker that settles the legacy question for a pre-upgrade ledger with
-/// nothing to inherit, recording that nothing was. Written by the first sync
-/// after the upgrade - a write path, so reads stay reads - because otherwise
-/// the window stays open for as long as the project stays quiet and an
-/// `approved.json` planted later reads as an heirloom worth asking about. A
-/// turn is also the only thing that gives an agent the chance to plant one.
-fn seal_marker(dir: &Path, records: &[Record], ts: u64) -> Option<Record> {
-    if !inheritable(records) || legacy_approved_path(dir).exists() {
-        return None;
-    }
-    Some(Record {
-        v: RECORD_VERSION,
-        ts,
-        path: PathBuf::new(),
-        sha256: None,
-        actor: Actor::Initial,
-        session_id: None,
-        kind: Kind::ApprovalsImported,
-        also: Vec::new(),
-        event: None,
-        code: Vec::new(),
-        blocking: false,
-        prev: String::new(),
-    })
-}
-
-/// Decide what a legacy file beside this ledger is. Sealed chain: it appeared
-/// after the question was settled, so set it aside unread. Otherwise it stays
-/// exactly where it is, pending a human - this is the one path that must never
-/// quietly turn a file into authority.
-fn settle_legacy_store_locked(dir: &Path) -> Result<(), String> {
-    let legacy = legacy_approved_path(dir);
-    if !legacy.exists() {
-        return Ok(());
-    }
-    if !inheritable(&read_verified(dir)?.records) {
-        let aside = dir.join(format!("approved.json.ignored-{}", unix_now()));
-        let _ = std::fs::rename(&legacy, &aside);
-        let _ = std::fs::remove_file(&legacy);
-    }
-    Ok(())
-}
-
-/// What `openmax --adopt-approvals` folded into the chain.
-#[derive(Debug)]
-pub struct Adopted {
-    pub hashes: usize,
-    pub paths: usize,
-    pub shapes: usize,
-}
-
-/// Adopt a legacy `approved.json` into the chain, once, on a human's say-so.
-/// Imported entries are `Initial`: the file carried no time, no actor, and no
-/// integrity, so no stronger claim can be made about where they came from -
-/// and `--ledger` names them, so a human can audit exactly what was inherited.
-/// All three of its shapes are carried: the hash set, the approved paths that
-/// tell a modified gate from one nobody ever installed, and the per-hook shape
-/// (event plus the code it named) that says whether a modified hook used to
-/// gate. A store old enough to remember no shape adopts the path alone, which
-/// reconciliation already reads as a gate - the safe answer when the question
-/// can no longer be asked. The marker closes the window behind it.
-///
-/// `vouched_sha` is the digest from the `PendingLegacy` the human was shown.
-/// The confirmation prompt is an open interval any process can write across,
-/// so the say-so binds to bytes, not to a path: if the file on disk no longer
-/// hashes to what was previewed, nothing is adopted and the human is asked to
-/// look again.
-pub fn adopt_legacy_approvals(
-    data_dir: &Path,
-    project_root: &Path,
-    vouched_sha: &str,
-) -> Result<Adopted, String> {
-    let dir = project_dir(data_dir, project_root);
-    with_lock(&dir, || {
-        let legacy = legacy_approved_path(&dir);
-        let verified = read_verified(&dir)?;
-        if !inheritable(&verified.records) {
-            return Err(format!(
-                "{} is not an inherited store: this ledger has never kept approvals anywhere but its own chain, so that file appeared beside a chain already keeping the answer",
-                legacy.display()
-            ));
-        }
-        refuse_unpinned_authority(&verified)?;
-        let file = match read_legacy_store(&dir) {
-            Some((sha, _)) if sha != vouched_sha => {
-                return Err(format!(
-                    "{} changed after it was shown: the bytes on disk are not the bytes a human vouched for, so nothing was adopted; run `openmax --adopt-approvals` again to review what is there now",
-                    legacy.display()
-                ));
-            }
-            Some((_, file)) => file?,
-            None => return Err(format!("{} is gone; nothing to adopt", legacy.display())),
-        };
-        let ts = unix_now();
-        let imported = |path: PathBuf, hashes: &[String], shape: Option<&ApprovedHook>| Record {
-            v: RECORD_VERSION,
-            ts,
-            path,
-            sha256: hashes.first().cloned(),
-            actor: Actor::Initial,
-            session_id: None,
-            kind: Kind::Approval,
-            also: hashes.iter().skip(1).cloned().collect(),
-            event: shape.map(|h| h.event.clone()),
-            code: shape.map(|h| h.code.clone()).unwrap_or_default(),
-            blocking: shape.is_some_and(|h| h.blocking),
-            prev: String::new(),
-        };
-        let mut records = Vec::new();
-        if !file.hashes.is_empty() {
-            records.push(imported(PathBuf::new(), &file.hashes, None));
-        }
-        // One record per approved path: a record carries a single path, and
-        // dropping them would turn every installed gate into one nobody
-        // blessed. The remembered shape rides the path it describes, so an
-        // observe hook a human really installed does not come back as a
-        // demoted gate. A shape whose path is not in the path set has nothing
-        // to hang on; the released store never wrote one, and inventing a path
-        // memory from it would grant authority the old file never carried.
-        for path in &file.paths {
-            let shape = file.hooks.iter().find(|h| h.path == *path);
-            records.push(imported(PathBuf::from(path), &[], shape));
-        }
-        records.push(Record {
-            v: RECORD_VERSION,
-            ts,
-            path: legacy.clone(),
-            sha256: None,
-            actor: Actor::Initial,
-            session_id: None,
-            kind: Kind::ApprovalsImported,
-            also: Vec::new(),
-            event: None,
-            code: Vec::new(),
-            blocking: false,
-            prev: String::new(),
-        });
-        let (lines, head) = chain(records, &verified.head)?;
-        append_chained(&dir, &lines, &head)?;
-        // Only now: an unremovable legacy file must not cost the user their
-        // approvals, and the marker already makes it inert.
-        let _ = std::fs::remove_file(&legacy);
-        Ok(Adopted {
-            hashes: file.hashes.len(),
-            paths: file.paths.len(),
-            shapes: file.hooks.len(),
-        })
-    })
 }
 
 /// Link records onto `head`, returning the lines to append and the new head.
@@ -1334,7 +1032,6 @@ fn approve(
 ) -> Result<(), String> {
     let dir = project_dir(data_dir, project_root);
     with_lock(&dir, || {
-        settle_legacy_store_locked(&dir)?;
         let verified = read_verified(&dir)?;
         refuse_unpinned_authority(&verified)?;
         let known = approvals_from(&verified.records[..verified.pinned]);
@@ -1800,7 +1497,6 @@ pub fn forget_capability(
 ) -> Result<bool, String> {
     let dir = project_dir(data_dir, project_root);
     with_lock(&dir, || {
-        settle_legacy_store_locked(&dir)?;
         let verified = read_verified(&dir)?;
         refuse_unpinned_authority(&verified)?;
         let known = approvals_from(&verified.records[..verified.pinned]);
@@ -3205,9 +2901,9 @@ mod tests {
     }
 
     /// The proven exploit: one unattended session, no human, the agent writes
-    /// a hook and appends its sha to the approvals store through `bash`.
-    /// Approvals live in the chain now, so a file dropped beside it is not an
-    /// approval - it is set aside, and the hook stays inert.
+    /// a hook and appends its sha to an approvals file through `bash`.
+    /// Approvals live in the chain, so a file dropped beside it is not an
+    /// approval: nothing reads it, and the hook stays inert.
     #[test]
     fn a_forged_approvals_file_approves_nothing() {
         let data = temp("forge-data");
@@ -3218,10 +2914,10 @@ mod tests {
         let payload = sha256_hex(b"event = \"session_start\"\ncommand = \"/bin/sh\"\n");
         let hook = root.join(".openmax/hooks/payload.toml");
         let dir = project_dir(&data, &root);
-        // Both shapes of the old store, including the path set that decides
-        // whether a gate counts as installed.
+        // The shape a plain store would take, including a path set that
+        // claims a gate was installed.
         std::fs::write(
-            legacy_approved_path(&dir),
+            dir.join("approved.json"),
             serde_json::json!({
                 "version": 1,
                 "hashes": [payload],
@@ -3231,10 +2927,6 @@ mod tests {
         )
         .unwrap();
         assert!(!is_approved(&data, &root, &payload), "a forged store must approve nothing");
-        assert!(
-            !legacy_approved_path(&dir).exists(),
-            "the forgery is set aside, not left to be re-read"
-        );
         let approved = approvals(&data, &root).unwrap();
         assert!(approved.hashes.is_empty());
         assert!(!approved.was_live(&hook), "a forged path claim is not an installed gate");
@@ -3614,204 +3306,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A legacy store is a file with no evidence of its own, so nothing in it
-    /// runs until a human says so. Until then it may only *restrict*: the
-    /// paths it claims were live keep a pre-upgrade gate failing closed, while
-    /// its hashes and hook shapes - the parts that would grant execution or
-    /// relax a gate - stay inert.
-    #[test]
-    fn a_legacy_store_grants_nothing_until_a_human_adopts_it() {
-        let data = temp("adopt-data");
-        let root = temp("adopt-proj");
-        let dir = project_dir(&data, &root);
-        let sha = sha256_hex(b"old hook");
-
-        // A ledger written before approvals joined the chain: v1 records.
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = Record {
-            v: 1,
-            ts: 1,
-            path: root.join(".openmax/tools/a.toml"),
-            sha256: Some(sha256_hex(b"v1")),
-            actor: Actor::Initial,
-            session_id: None,
-            kind: Kind::Change,
-            also: Vec::new(),
-            event: None,
-            code: Vec::new(),
-            blocking: false,
-            prev: String::new(),
-        };
-        let line = serde_json::to_string(&old).unwrap();
-        std::fs::write(log_path(&dir), format!("{line}\n")).unwrap();
-        std::fs::write(chain_head_path(&dir), sha256_hex(line.as_bytes())).unwrap();
-        let gate = root.join("gate.toml");
-        std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
-        let observer = root.join("watch.toml");
-        std::fs::write(&observer, "event = \"post_tool_use\"\ncommand = \"/bin/true\"\n").unwrap();
-        let store = serde_json::json!({
-            "version": 1,
-            "hashes": [sha],
-            // A store old enough to remember no shape (the released one)
-            // alongside one written after shapes existed.
-            "paths": [
-                canonical_or(&gate).display().to_string(),
-                canonical_or(&observer).display().to_string(),
-            ],
-            "hooks": [{
-                "path": canonical_or(&observer).display().to_string(),
-                "event": "post_tool_use",
-                "code": [],
-            }],
-        })
-        .to_string();
-        std::fs::write(legacy_approved_path(&dir), &store).unwrap();
-
-        // Unadopted: no hash it lists is approved, and no shape it remembers
-        // can turn a would-be gate into an observer.
-        let waiting = approvals(&data, &root).unwrap();
-        assert!(!waiting.contains(&sha), "an unauthenticated file approves nothing");
-        assert!(waiting.approved_hook(&observer).is_none(), "and relaxes nothing");
-        // But a path it claims was live still fails closed, which is the only
-        // direction an unvouched-for file is allowed to move the answer.
-        assert!(waiting.was_live(&gate));
-        assert!(legacy_approved_path(&dir).exists(), "it waits rather than being consumed");
-        assert!(history(&data, &root).unwrap().len() == 1, "and nothing was written for it");
-
-        let pending = pending_legacy(&data, &root).expect("a human is told what is waiting");
-        assert_eq!((pending.hashes, pending.paths.len(), pending.shapes), (1, 2, 1));
-        assert!(!pending.malformed);
-
-        // The human acts, vouching for the bytes they were shown. Now every
-        // shape is inherited, as `initial`.
-        let adopted = adopt_legacy_approvals(&data, &root, &pending.sha256).unwrap();
-        assert_eq!((adopted.hashes, adopted.paths, adopted.shapes), (1, 2, 1));
-        let inherited = approvals(&data, &root).unwrap();
-        assert!(inherited.contains(&sha), "adoption keeps the approvals it inherited");
-        assert!(inherited.was_live(&gate), "and the paths that say a gate was installed");
-        // A remembered shape is inherited exactly: an observer a human really
-        // installed must not come back as a gate that was demoted.
-        let watched = inherited.approved_hook(&observer).expect("the shape is inherited");
-        assert_eq!(watched.event(), "post_tool_use");
-        assert!(!watched.is_gate());
-        // A path whose shape was never recorded stays unremembered, which
-        // reconciliation reads as a gate: the safe answer to a question the
-        // old store cannot answer.
-        assert!(inherited.approved_hook(&gate).is_none());
-        assert!(!legacy_approved_path(&dir).exists(), "the adopted file is removed");
-        let records = history(&data, &root).unwrap();
-        assert_eq!(records[1].kind, Kind::Approval);
-        assert_eq!(records[1].actor, Actor::Initial, "inherited provenance is unknowable");
-        assert_eq!(records.last().unwrap().kind, Kind::ApprovalsImported);
-
-        // Recreating it afterwards is not an inheritance: the chain settled
-        // the question, so the file is set aside unread and cannot be adopted.
-        let forged = sha256_hex(b"forged hook");
-        std::fs::write(
-            legacy_approved_path(&dir),
-            serde_json::json!({ "version": 1, "hashes": [forged] }).to_string(),
-        )
-        .unwrap();
-        assert!(!is_approved(&data, &root, &forged));
-        assert!(is_approved(&data, &root, &sha), "the real inheritance survives");
-        assert!(pending_legacy(&data, &root).is_none());
-        assert!(adopt_legacy_approvals(&data, &root, &pending.sha256).is_err());
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The confirmation prompt is an open interval any process with `bash`
-    /// can write across. A store rewritten inside it is a different store:
-    /// the human's say-so binds to the bytes they were shown, so the
-    /// substitution imports nothing and the window stays open for a fresh
-    /// look at what is actually on disk.
-    #[test]
-    fn adoption_refuses_a_store_rewritten_after_the_preview() {
-        let data = temp("swap-data");
-        let root = temp("swap-proj");
-        let dir = project_dir(&data, &root);
-        let honest = sha256_hex(b"the tool the human remembers");
-        let smuggled = sha256_hex(b"event = \"session_start\"\ncommand = \"/bin/sh\"\n");
-
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = Record {
-            v: 1,
-            ts: 1,
-            path: root.join(".openmax/tools/a.toml"),
-            sha256: Some(sha256_hex(b"v1")),
-            actor: Actor::Initial,
-            session_id: None,
-            kind: Kind::Change,
-            also: Vec::new(),
-            event: None,
-            code: Vec::new(),
-            blocking: false,
-            prev: String::new(),
-        };
-        let line = serde_json::to_string(&old).unwrap();
-        std::fs::write(log_path(&dir), format!("{line}\n")).unwrap();
-        std::fs::write(chain_head_path(&dir), sha256_hex(line.as_bytes())).unwrap();
-        std::fs::write(
-            legacy_approved_path(&dir),
-            serde_json::json!({ "version": 1, "hashes": [honest] }).to_string(),
-        )
-        .unwrap();
-
-        // The human previews the honest store...
-        let pending = pending_legacy(&data, &root).unwrap();
-        assert_eq!(pending.hashes, 1);
-        // ...and while they read the prompt, the file is swapped.
-        std::fs::write(
-            legacy_approved_path(&dir),
-            serde_json::json!({ "version": 1, "hashes": [smuggled] }).to_string(),
-        )
-        .unwrap();
-
-        let err = adopt_legacy_approvals(&data, &root, &pending.sha256).unwrap_err();
-        assert!(err.contains("changed after it was shown"), "the refusal names the swap: {err}");
-        assert!(!is_approved(&data, &root, &smuggled), "the substituted hash gained nothing");
-        assert!(!is_approved(&data, &root, &honest));
-        assert_eq!(history(&data, &root).unwrap().len(), 1, "nothing was chained");
-        assert!(legacy_approved_path(&dir).exists(), "the file stays for a fresh preview");
-
-        // A fresh preview of what is actually there can still be adopted: the
-        // gate is the pairing of eyes and bytes, not a lockout.
-        let second = pending_legacy(&data, &root).expect("the window is still open");
-        assert_ne!(second.sha256, pending.sha256);
-        let adopted = adopt_legacy_approvals(&data, &root, &second.sha256).unwrap();
-        assert_eq!(adopted.hashes, 1);
-        assert!(is_approved(&data, &root, &smuggled), "adopted only once a human saw it");
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The window closes on first contact when there is nothing to inherit, so
-    /// a store planted afterwards is not even offered to a human.
-    #[test]
-    fn a_store_planted_after_the_chain_settles_is_never_offered() {
-        let data = temp("seal-data");
-        let root = temp("seal-proj");
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
-            .unwrap();
-        assert!(approvals(&data, &root).unwrap().hashes.is_empty());
-        let dir = project_dir(&data, &root);
-        // Nothing to settle: this chain was never anything but a chain, so a
-        // file beside it is a plant however early it arrives.
-        assert!(!inheritable(&history(&data, &root).unwrap()));
-
-        let payload = sha256_hex(b"event = \"session_start\"\ncommand = \"/bin/sh\"\n");
-        let planted = serde_json::json!({ "version": 1, "hashes": [payload] }).to_string();
-        std::fs::write(legacy_approved_path(&dir), &planted).unwrap();
-        assert!(pending_legacy(&data, &root).is_none(), "nothing to ask a human about");
-        assert!(!is_approved(&data, &root, &payload));
-        // Even vouching for the planted bytes themselves cannot force it in:
-        // the chain settled the question before the file existed.
-        assert!(adopt_legacy_approvals(&data, &root, &sha256_hex(planted.as_bytes())).is_err());
-        assert!(!legacy_approved_path(&dir).exists(), "set aside, not read");
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     #[test]
     fn objects_are_verified_on_read_and_timestamps_are_readable() {
         let data = temp("objstate-data");
@@ -3986,62 +3480,6 @@ mod tests {
 
         let err = approvals(&data, &root).unwrap_err();
         assert!(err.contains("rewritten"), "{err}");
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// An upgraded project with no legacy file seals the import window at
-    /// first contact: an `approved.json` planted afterwards is set aside
-    /// unread, not imported as an heirloom.
-    #[test]
-    fn first_contact_seals_the_legacy_import_window() {
-        let data = temp("seal-data");
-        let root = temp("seal-proj");
-        let dir = project_dir(&data, &root);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // A ledger written before approvals moved into the chain: v1 records,
-        // no import marker.
-        let record = Record {
-            v: 1,
-            ts: 1,
-            path: root.join(".openmax/tools/a.toml"),
-            sha256: Some(sha256_hex(b"v1")),
-            actor: Actor::External,
-            session_id: None,
-            kind: Kind::Change,
-            also: Vec::new(),
-            event: None,
-            code: Vec::new(),
-            blocking: false,
-            prev: String::new(),
-        };
-        let line = serde_json::to_string(&record).unwrap();
-        std::fs::write(log_path(&dir), format!("{line}\n")).unwrap();
-        std::fs::write(chain_head_path(&dir), sha256_hex(line.as_bytes())).unwrap();
-
-        // Reading changes nothing - a read must stay a read - but the first
-        // turn after the upgrade settles it, because a turn is the only thing
-        // that could have planted a store in the first place.
-        let _ = approvals(&data, &root).unwrap();
-        assert!(!sealed(&history(&data, &root).unwrap()), "a read must not write");
-        sync(&data, &root, &[], Actor::External, None).unwrap();
-        assert!(
-            sealed(&history(&data, &root).unwrap()),
-            "the first sync after the upgrade must settle the question"
-        );
-
-        let planted = format!(
-            r#"{{"version":1,"hashes":["{}"],"paths":[]}}"#,
-            sha256_hex(b"planted")
-        );
-        std::fs::write(legacy_approved_path(&dir), planted).unwrap();
-        let approved = approvals(&data, &root).unwrap();
-        assert!(
-            !approved.contains(&sha256_hex(b"planted")),
-            "a planted legacy file walked into the chain"
-        );
-        assert!(!legacy_approved_path(&dir).exists(), "the planted file must be set aside");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
