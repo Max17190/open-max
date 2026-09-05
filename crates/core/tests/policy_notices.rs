@@ -134,11 +134,7 @@ async fn drive_turn(
             _ => {}
         }
     }
-    // Done precedes the running flag clearing; wait for idle before the
-    // caller starts another turn (a fast runner races that window).
-    while core.is_running(session) {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    assert!(!core.is_running(session), "Done follows turn settlement");
 }
 
 const ALLOW_RULE: &str = "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\narg_regex = \"^git status\"\n";
@@ -317,8 +313,16 @@ async fn a_resumed_session_does_not_repeat_a_persisted_notice() {
         open_max_core::sessions::load_messages(&core, &session).unwrap().is_some(),
         "the transcript must be on disk for this to be a real resume"
     );
-    drop(rx);
+    // Dropping the frontend Arc is not process exit: the finishing task may
+    // still own the core. Channel closure confirms all owners have released.
     drop(core);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the first process shuts down")
+            .is_none(),
+        "the completed turn closes its event channel"
+    );
 
     // Process two: same session id, hydrated from disk.
     let (core, mut rx) = Core::new(data).unwrap();
