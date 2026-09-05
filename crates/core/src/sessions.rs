@@ -140,7 +140,7 @@ fn messages_path(core: &Core, id: &str) -> PathBuf {
     sessions_dir(core).join(format!("{id}.messages.json"))
 }
 
-fn manifest_path(core: &Core, id: &str) -> PathBuf {
+pub(crate) fn manifest_path(core: &Core, id: &str) -> PathBuf {
     sessions_dir(core).join(format!("{id}.manifest.json"))
 }
 
@@ -1347,6 +1347,7 @@ mod tests {
         assert!(load_messages(&core, &id).unwrap().is_none(), "a deleted transcript stays deleted");
         save_manifest(&core, &id, &crate::registry::RegistryManifest {
             version: 1,
+            profile: crate::registry::Profile::Full,
             external_tools: Vec::new(),
             skills: Vec::new(),
             ext_fingerprint: 0,

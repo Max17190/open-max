@@ -196,6 +196,12 @@ pub struct Hooks {
     /// Hooks that exist but are not live, reported once per turn instead of
     /// vanishing: content no human approved, or a revoked observe hook.
     notices: Vec<HookFailure>,
+    /// A set that runs nothing and stays that way: the minimal profile runs a
+    /// session without project hooks (they rewrite input, gate calls, and
+    /// inject guidance, which is project-specific harness behavior a
+    /// measurement must not carry), and every mid-turn re-discovery asks
+    /// this flag before it asks the disk.
+    suppressed: bool,
 }
 
 /// First stem wins: project dirs are listed before global, and that
@@ -261,6 +267,21 @@ fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
 }
 
 impl Hooks {
+    /// No hooks now and none on re-discovery; see the `suppressed` field.
+    pub fn suppressed() -> Self {
+        Self { suppressed: true, ..Self::default() }
+    }
+
+    /// Discover again for a changed mode, unless this set is suppressed, in
+    /// which case the replacement is suppressed too.
+    pub fn rediscover_for_mode(&self, project_root: &Path, data_dir: &Path, mode: crate::config::ApprovalMode) -> Self {
+        if self.suppressed {
+            Self::suppressed()
+        } else {
+            Self::discover_for_mode(project_root, data_dir, mode)
+        }
+    }
+
     /// Discover hooks under project `.openmax/hooks/` then global
     /// `~/.openmax/hooks/`. Project entries with the same file stem win.
     ///

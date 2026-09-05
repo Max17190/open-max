@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use open_max_core::agent;
+use open_max_core::registry::Profile;
 use open_max_core::text::one_line;
 use open_max_core::sessions;
 use open_max_core::state::Core;
@@ -19,6 +20,9 @@ pub struct HeadlessArgs {
     pub prompts: Vec<String>,
     pub continue_session: bool,
     pub json: bool,
+    /// The shape a session this run creates freezes under; a continued
+    /// session keeps its own.
+    pub profile: Profile,
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
@@ -42,7 +46,14 @@ pub async fn run(
         }
     } else {
         match sessions::create(&core, project_key) {
-            Ok(meta) => meta.id,
+            Ok(meta) => {
+                if let Err(e) = agent::freeze_new_session(&core, &meta.id, &project, args.profile) {
+                    eprintln!("openmax: {e}");
+                    let _ = sessions::discard_if_empty(&core, &meta.id);
+                    return 1;
+                }
+                meta.id
+            }
             Err(e) => {
                 eprintln!("openmax: failed to create session: {e}");
                 return 1;

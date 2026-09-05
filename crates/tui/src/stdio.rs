@@ -69,6 +69,9 @@ enum Command {
 
 pub struct StdioArgs {
     pub continue_session: bool,
+    /// The shape a session this run creates freezes under; a continued
+    /// session keeps its own.
+    pub profile: open_max_core::registry::Profile,
 }
 
 pub async fn run(
@@ -89,7 +92,14 @@ pub async fn run(
         }
     } else {
         match sessions::create(&core, project_key.clone()) {
-            Ok(meta) => (meta.id, false),
+            Ok(meta) => {
+                if let Err(e) = agent::freeze_new_session(&core, &meta.id, &project, args.profile) {
+                    eprintln!("openmax: {e}");
+                    let _ = sessions::discard_if_empty(&core, &meta.id);
+                    return 1;
+                }
+                (meta.id, false)
+            }
             Err(e) => {
                 eprintln!("openmax: failed to create session: {e}");
                 return 1;
