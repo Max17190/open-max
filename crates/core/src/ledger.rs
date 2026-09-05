@@ -59,10 +59,6 @@ pub enum Kind {
     Change,
     /// A human approved this exact content for unattended execution.
     Approval,
-    /// Written by pre-release builds when approvals moved into the chain.
-    /// Nothing writes it now; the variant stays so a chain carrying one still
-    /// parses, and `approvals_from` reads it as no authority at all.
-    ApprovalsImported,
     /// A human stopped expecting an approved capability at this path
     /// (`openmax --forget` after a deliberate deletion). The hashes stay
     /// blessed - approval binds bytes - only the path memory ends.
@@ -74,7 +70,6 @@ impl Kind {
         match self {
             Kind::Change => "change",
             Kind::Approval => "approval",
-            Kind::ApprovalsImported => "approvals-imported",
             Kind::PathRetired => "path-retired",
         }
     }
@@ -809,7 +804,7 @@ fn approvals_from(records: &[Record]) -> Approvals {
                 let key = r.path.display().to_string();
                 approvals.hooks.retain(|h| h.path != key);
             }
-            Kind::Change | Kind::ApprovalsImported => {}
+            Kind::Change => {}
         }
     }
     approvals
@@ -899,8 +894,11 @@ fn chain(records: Vec<Record>, head: &str) -> Result<(String, String), String> {
     Ok((lines, prev))
 }
 
-/// Record a human approval of exact content. Serialized under the ledger lock.
-pub fn approve_hash(data_dir: &Path, project_root: &Path, sha: &str) -> Result<(), String> {
+/// Approve a bare hash at no path: the one approval shape no production path
+/// writes (both live paths name the manifest they bless), kept as a fixture
+/// for the tests that exercise path-less records.
+#[cfg(test)]
+pub(crate) fn approve_hash(data_dir: &Path, project_root: &Path, sha: &str) -> Result<(), String> {
     approve(data_dir, project_root, &[sha.to_string()], None, None)
 }
 
@@ -1266,8 +1264,8 @@ pub fn object_state(data_dir: &Path, project_root: &Path, sha: &str) -> ObjectSt
 }
 
 /// True when an approval's PRIMARY manifest bytes cannot be restored: the
-/// record approved a manifest sha but its object is missing or corrupt (a
-/// legacy or hash-only approval never stored one). `--ledger` surfaces this so
+/// record approved a manifest sha but its object is missing or corrupt (never
+/// stored, removed, or rewritten since). `--ledger` surfaces this so
 /// a row with intact bound objects but an unrestorable manifest does not read
 /// as fully restorable. False for non-approvals and path-only
 /// approvals, which have no manifest object to restore.
@@ -1643,7 +1641,9 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
 
 /// The project-local code the capability manifest at `path` will execute,
 /// whichever surface it belongs to. Both manifest surfaces name a `command`
-/// plus fixed `args`; skills name none.
+/// plus fixed `args`; skills name none. Production reads go through
+/// `manifest_code_source` with bytes already in hand; this path-taking form
+/// is what the integration tests bind their fixtures with.
 pub fn manifest_code(path: &Path, project_root: &Path) -> Vec<BoundCode> {
     match std::fs::read_to_string(path) {
         Ok(text) => manifest_code_source(path, &text, project_root),
