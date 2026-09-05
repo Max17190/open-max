@@ -1,9 +1,8 @@
 //! `openmax --spec <surface>`: the complete authoring contract for each
 //! extension surface, printed by the binary that enforces it.
 //!
-//! The self-extension guide in the frozen prompt is an index: it names the
-//! surfaces and their file paths in ~360 tokens. This module is the body the
-//! agent reads on demand (via bash), the same progressive disclosure skills
+//! The frozen prompt lists extension paths. This module supplies the contracts
+//! the agent reads on demand (via bash), the same progressive disclosure skills
 //! use, so knowing the exact grammar of a hook payload or a permissions rule
 //! costs zero prompt tokens until the moment it is needed. Every fenced
 //! example below is written to disk and run through the real extension
