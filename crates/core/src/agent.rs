@@ -44,7 +44,6 @@ use tokio::sync::oneshot;
 
 use crate::client::{ChatClient, StreamDelta, TRUNCATED};
 use crate::config::{ApprovalMode, Settings};
-use crate::fallback;
 use crate::hooks::{Hooks, PreToolResult};
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
@@ -59,24 +58,6 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// with no perceptible latency.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DIGEST_PREFIX: &str = "[context note:";
-/// Once per session, on the first tool result of the first reply whose calls
-/// were recovered from its text (fallback.rs) rather than sent as API
-/// `tool_calls`. States what happened, restates the rule the reply broke as
-/// an imperative (the established failure shape is a model absorbing the
-/// vocabulary while still emitting markup), and offers the endpoint-lag
-/// explanation as a possibility, not a verdict - the harness cannot see
-/// whether the model or the endpoint's parser leaked the markup. Advisory,
-/// so it is a note the model reads and a frontend renders, not an error.
-const FALLBACK_RECOVERY_NOTE: &str = "[harness note: this reply carried its tool calls as text rather than as API tool_calls; the harness recognized the markup and ran them. Emit native tool_calls and never print call markup as reply text (the frozen rules require it). If native calls keep arriving as text, the endpoint's tool-call parsing may lag this model; tell the user. Reported once per session.]";
-
-/// Whether these messages (a transcript, or the archive of what compaction
-/// dropped from it) already carry the recovery note on a tool result.
-fn carries_fallback_recovery_note(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|m| {
-        m.role == "tool" && m.content.as_deref().is_some_and(|c| c.contains(FALLBACK_RECOVERY_NOTE))
-    })
-}
-
 /// Outcome of a mutating-tool approval prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalOutcome {
@@ -84,36 +65,6 @@ enum ApprovalOutcome {
     Declined,
     Cancelled,
     TimedOut,
-}
-
-/// True when a native server tool call cannot be executed as-is.
-fn is_native_call_broken(call: &ToolCall) -> bool {
-    call.function.name.is_empty()
-        || serde_json::from_str::<Value>(&call.function.arguments).is_err()
-}
-
-/// When every native call is broken, try to recover calls from content markup.
-/// Broken natives are only discarded if the markup actually yields calls;
-/// otherwise they are kept so each one gets its per-call error (which tells
-/// the model to retry) instead of vanishing silently. The flag says whether
-/// the calls returned came out of the text: the one path by which a call
-/// reaches the loop from anywhere but the API's own `tool_calls`.
-fn resolve_tool_calls(
-    mut content: String,
-    mut tool_calls: Vec<ToolCall>,
-    known_tools: &[String],
-) -> (String, Vec<ToolCall>, bool) {
-    let all_broken = !tool_calls.is_empty() && tool_calls.iter().all(is_native_call_broken);
-    let mut recovered = false;
-    if tool_calls.is_empty() || all_broken {
-        let names: Vec<&str> = known_tools.iter().map(String::as_str).collect();
-        if let Some((clean, calls)) = fallback::extract_tool_calls(&content, &names) {
-            content = clean;
-            tool_calls = calls;
-            recovered = true;
-        }
-    }
-    (content, tool_calls, recovered)
 }
 
 /// One consecutive run of tool calls: `[start, end)`; `concurrent` when length >= 2
@@ -493,12 +444,6 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             )
         };
         let reported_policy_notices = rehydrate_policy_notices(&messages);
-        // Once per session means once per session's record: the note rides a
-        // tool result, so a resumed session finds it in the transcript, or in
-        // the compaction archive if a prune has since dropped that exchange,
-        // and does not repeat it.
-        let fallback_recovery_reported = carries_fallback_recovery_note(&messages)
-            || carries_fallback_recovery_note(&sessions::load_archive(core, session_id));
         SessionData {
             messages,
             registry,
@@ -507,7 +452,6 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
-            fallback_recovery_reported,
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices,
@@ -545,7 +489,6 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             snapshots: Default::default(),
             take_seq: 0,
             schemas_over_budget_reported: false,
-            fallback_recovery_reported: false,
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices: Default::default(),
@@ -1125,11 +1068,7 @@ async fn summarize_compaction(
             cached_tokens: u.cached_tokens,
         });
     }
-    let mut summary = result.content;
-    if let Some(clean) = fallback::strip_leading_think(&summary) {
-        summary = clean;
-    }
-    let summary = summary.trim().replace(['\n', '\r'], " ");
+    let summary = result.content.trim().replace(['\n', '\r'], " ");
     if summary.is_empty() {
         return None;
     }
@@ -2558,7 +2497,6 @@ async fn run_loop(
     // tool schema bytes without re-serializing the Value array. `mut` because
     // a mid-turn refreeze swaps in the next generation between iterations.
     let mut schemas_wire = registry.schemas_wire_arc();
-    let mut known_tools: Vec<String> = registry.tools.iter().map(|s| s.name.clone()).collect();
     let caps = tools::OutputCaps::from_settings(&settings);
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
@@ -2712,18 +2650,8 @@ async fn run_loop(
             )),
         });
 
-        // Prefer structured calls from the server; when there are none (or all
-        // are broken), recover calls from raw markup in the content (see fallback.rs).
-        let mut content = result.content.clone();
-        let mut tool_calls = result.tool_calls.clone();
-        // Reasoning leaked into content is display-only: persisting it would
-        // re-prefill dead tokens on every later turn.
-        if let Some(clean) = fallback::strip_leading_think(&content) {
-            content = clean;
-        }
-        let recovered_by_fallback;
-        (content, tool_calls, recovered_by_fallback) =
-            resolve_tool_calls(content, tool_calls, &known_tools);
+        let content = result.content.clone();
+        let tool_calls = result.tool_calls.clone();
         core.send_agent(session_id, AgentEvent::MessageDone { text: content.clone() });
 
         // Never persist a fully empty assistant message (e.g. a turn cancelled
@@ -2747,11 +2675,10 @@ async fn run_loop(
         // The provider stopped writing without ever finishing the answer, so
         // this is broken output, not a response: there is no way to know
         // whether more calls were coming or whether this one was still being
-        // revised. Nothing recovered from it is dispatched, native or
-        // markup-recovered (resolve_tool_calls ran above, so both are in
-        // `tool_calls` by now). The partial text stays in the transcript and
-        // any unrun call ids are stubbed after the loop, so resume replays
-        // cleanly; the turn ends here with an error before its single Done.
+        // revised. No call it carried is dispatched. The partial text stays
+        // in the transcript and any unrun call ids are stubbed after the
+        // loop, so resume replays cleanly; the turn ends here with an error
+        // before its single Done.
         if result.finish_reason == TRUNCATED {
             let mut message =
                 "provider stream ended without a completion signal; the reply above is incomplete"
@@ -3420,25 +3347,6 @@ async fn run_loop(
             }
         }
 
-        // The one path by which a call reaches the loop from anywhere but the
-        // API's own tool_calls: fallback.rs read this reply's calls out of its
-        // text because the completion carried none (or only broken ones).
-        // Say so once per session, in the transcript and on the wire, so a
-        // session running on the recovery path is visible as such to the
-        // model (whose contract is native calls), to a frontend, and to
-        // anyone measuring whether the path is still needed at all.
-        if recovered_by_fallback && !cancelled.is_cancelled() {
-            let first = {
-                let mut map = core.sessions.lock().await;
-                map.get_mut(session_id)
-                    .map(|data| !std::mem::replace(&mut data.fallback_recovery_reported, true))
-                    .unwrap_or(true)
-            };
-            if first {
-                append_and_emit_note(core, session_id, guard.messages(), FALLBACK_RECOVERY_NOTE);
-            }
-        }
-
         // The mid-turn half of the self-modification loop: an extension file
         // written by this iteration's mutating calls activates before the
         // next model request, so a tool the agent writes in iteration N is
@@ -3452,7 +3360,6 @@ async fn run_loop(
                 .await;
         if refrozen {
             schemas_wire = registry.schemas_wire_arc();
-            known_tools = registry.tools.iter().map(|s| s.name.clone()).collect();
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
             approval_seen = unapproved_tool_map(&registry, &core.data_dir, project_root);
@@ -4280,25 +4187,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The fallback note speaks to the model first: it restates the broken
-    /// rule as an imperative instead of asserting an endpoint cause the
-    /// harness cannot know. The old text ("means the endpoint's tool-call
-    /// parser lags") told a markup-emitting model the fault was elsewhere
-    /// while confirming the markup worked.
-    #[test]
-    fn the_fallback_note_restates_the_native_call_rule() {
-        assert!(FALLBACK_RECOVERY_NOTE.contains("Emit native tool_calls"));
-        assert!(FALLBACK_RECOVERY_NOTE.contains("never print call markup"));
-        assert!(
-            FALLBACK_RECOVERY_NOTE.contains("may lag"),
-            "the endpoint explanation stays a possibility"
-        );
-        assert!(
-            !FALLBACK_RECOVERY_NOTE.contains("means the endpoint"),
-            "no asserted cause the harness cannot verify"
-        );
-    }
-
     /// A policy notice is reported once per session, and on resume that
     /// "already said it" set is rebuilt by parsing the notices back out of the
     /// transcript, which stores them one-lined. So the reporter must take
@@ -4588,51 +4476,6 @@ mod tests {
         // A real user decline keeps its own wording.
         assert!(declined_message(None).contains("The user declined this action"));
         assert_eq!(short_sha(&source.sha256), "a".repeat(12));
-    }
-
-    #[test]
-    fn broken_native_calls_fall_back_to_markup() {
-        let known = ["read_file".to_string(), "bash".to_string()];
-        let content = "I'll read it.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>";
-        let broken = vec![ToolCall {
-            id: "call_0".into(),
-            kind: "function".into(),
-            function: ToolCallFunction {
-                name: String::new(),
-                arguments: "{not json".into(),
-            },
-        }];
-        let (clean, calls, recovered) = resolve_tool_calls(content.into(), broken, &known);
-        assert_eq!(clean, "I'll read it.");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "read_file");
-        assert!(recovered, "calls that came out of the text say so");
-    }
-
-    #[test]
-    fn partial_broken_native_calls_keep_native() {
-        let known = ["read_file".to_string(), "bash".to_string()];
-        let good = ToolCall {
-            id: "call_0".into(),
-            kind: "function".into(),
-            function: ToolCallFunction {
-                name: "bash".into(),
-                arguments: r#"{"command":"echo hi"}"#.into(),
-            },
-        };
-        let bad = ToolCall {
-            id: "call_1".into(),
-            kind: "function".into(),
-            function: ToolCallFunction {
-                name: String::new(),
-                arguments: "nope".into(),
-            },
-        };
-        let (clean, calls, recovered) = resolve_tool_calls("run".into(), vec![good, bad], &known);
-        assert_eq!(clean, "run");
-        assert_eq!(calls.len(), 2);
-        assert!(is_native_call_broken(&calls[1]));
-        assert!(!recovered, "native calls kept are not a recovery");
     }
 
     fn tool_call(name: &str, args: &str) -> ToolCall {
@@ -7059,126 +6902,6 @@ mod tests {
         assert!(
             ends.iter().all(|(ok, output)| *ok && output.contains("poll")),
             "a repeated call must execute, not be vetoed: {ends:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A reply whose only tool call is markup in its text: what a serving
-    /// layer produces when its parser does not know this model's format.
-    const MARKUP_CALL_SSE: &str = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>{\\\"name\\\":\\\"read_file\\\",\\\"arguments\\\":{\\\"path\\\":\\\"a.txt\\\"}}</tool_call>\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: [DONE]\n\n",
-    );
-
-    /// Calls recovered from reply text run, and the session says so once:
-    /// one harness note in the transcript and on the wire, on the first such
-    /// reply, none on the next. Nothing about the recovery was visible
-    /// before, so a session running on the fallback path looked identical to
-    /// one whose endpoint parses tool calls.
-    #[tokio::test]
-    async fn recovered_tool_calls_run_and_are_reported_once_per_session() {
-        use crate::state::Core;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let project = dir.join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
-        crate::trust::trust_project(&core.data_dir, &project).unwrap();
-
-        let (base_url, requests) = counting_endpoint(MARKUP_CALL_SSE).await;
-        {
-            let mut s = core.settings.lock().unwrap();
-            s.base_url = base_url;
-            s.model = "stub".into();
-            s.context_tokens = Some(16384);
-            s.max_agent_iterations = 2;
-        }
-
-        // Created in the store, so the transcript persists and a resume below
-        // reads it back from disk the way `-c` does.
-        let id = &sessions::create(&core, project.to_string_lossy().into()).unwrap().id;
-        start_turn(core.clone(), id.clone(), project, "read it".into()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut ran = 0usize;
-        let mut notes: Vec<String> = Vec::new();
-        let mut stop = None;
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(env)) =
-                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            {
-                match env.event {
-                    AgentEvent::ToolEnd { ok, output, .. } => {
-                        assert!(ok && output.contains("hello"), "{output}");
-                        ran += 1;
-                    }
-                    AgentEvent::HarnessNote { text, .. } => notes.push(text),
-                    AgentEvent::Done { stop_reason } => {
-                        stop = Some(stop_reason);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(stop.as_deref(), Some("max_iterations"));
-        assert_eq!(*requests.lock().unwrap(), 2);
-        assert_eq!(ran, 2, "every recovered call ran");
-        let recovery: Vec<&String> =
-            notes.iter().filter(|n| n.contains("tool calls as text")).collect();
-        assert_eq!(recovery.len(), 1, "one recovery note per session, got {notes:?}");
-        // The note rides a tool result, so the model reads it too.
-        let messages = transcript(&core, id).await;
-        let carried = messages
-            .iter()
-            .filter(|m| m.role == "tool" && m.content.as_deref().is_some_and(|c| c.contains("tool calls as text")))
-            .count();
-        assert_eq!(carried, 1, "the note is in the transcript exactly once");
-
-        // A restart after a compaction dropped the exchange that carried the
-        // note: the transcript on disk no longer has it, the archive does,
-        // and the resumed session still does not say it again (first the
-        // resume, then the resume after a prune). Simulated
-        // the way a prune lands on disk: the exchange appended to the archive,
-        // the transcript rewritten without it.
-        let mut on_disk = transcript(&core, id).await;
-        let at = on_disk
-            .iter()
-            .position(|m| m.role == "tool" && m.content.as_deref().is_some_and(|c| c.contains("tool calls as text")))
-            .expect("the note is on a tool result");
-        let dropped: Vec<ChatMessage> = on_disk.drain(at - 1..=at).collect();
-        assert!(sessions::append_archive(&core, id, &dropped), "the archive takes the exchange");
-        let mut persisted = 0usize;
-        assert!(sessions::save_messages(&core, id, &on_disk, &mut persisted, true), "the pruned transcript lands");
-        core.sessions.lock().await.remove(id.as_str());
-        let project = dir.join("project");
-        start_turn(core.clone(), id.clone(), project, "read it again".into()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut resumed_notes = 0usize;
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(env)) =
-                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-            {
-                match env.event {
-                    AgentEvent::HarnessNote { text, .. } if text.contains("tool calls as text") => {
-                        resumed_notes += 1
-                    }
-                    AgentEvent::Done { .. } => break,
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(resumed_notes, 0, "a resumed session does not repeat the note");
-        let messages = transcript(&core, id).await;
-        assert!(
-            !carries_fallback_recovery_note(&messages),
-            "nothing re-added the note to the pruned transcript"
-        );
-        assert!(
-            carries_fallback_recovery_note(&sessions::load_archive(&core, id)),
-            "the one note lives in the archive"
         );
 
         let _ = std::fs::remove_dir_all(dir);
