@@ -444,6 +444,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             )
         };
         let reported_policy_notices = rehydrate_policy_notices(&messages);
+        let reported_approval_mode = rehydrate_approval_mode(&messages);
         // Once per session means once per session's record: the note rides a
         // tool result, so a resumed session finds it in the transcript, or in
         // the compaction archive if a prune has since dropped that exchange,
@@ -458,7 +459,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             ledger_synced: false,
             unrecorded_external: None,
             reported_policy_notices,
-            reported_approval_mode: None,
+            reported_approval_mode,
             seen_ledger_events: crate::ledger::approval_events(&core.data_dir, project_root)
                 .unwrap_or_default()
                 .into_iter()
@@ -526,8 +527,9 @@ struct ReadonlyBatchCtx<'a> {
     project_root: &'a Path,
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
-    hooks: &'a Hooks,
-    permissions: &'a TurnPermissions,
+    hooks: &'a mut Hooks,
+    permissions: &'a mut TurnPermissions,
+    policy_mode: &'a mut ApprovalMode,
     parallelism: usize,
     /// Turn-local usage accumulator, flushed once at turn end.
     usage: &'a std::sync::Mutex<TurnUsage>,
@@ -603,84 +605,95 @@ where
 /// Returns true when the user cancelled mid-gate so the turn should stop
 /// before more tools run (matches the serial tool path).
 async fn execute_readonly_batch(
-    ctx: &ReadonlyBatchCtx<'_>,
+    ctx: &mut ReadonlyBatchCtx<'_>,
     calls: &[ToolCall],
     messages: &mut Vec<ChatMessage>,
 ) -> bool {
     let mut parsed: Vec<Value> = Vec::with_capacity(calls.len());
     let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
-    for call in calls {
-        let name = call.function.name.as_str();
-        // batchable_call already validated the JSON; Null (impossible) would
-        // just surface as a missing-argument tool error.
-        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-        parsed.push(args.clone());
-        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
-            call_id: call.id.clone(),
-            name: name.into(),
-            args: args.clone(),
-        });
-        // hooks pre → permissions → content gate. approval_mode is skipped
-        // because batchable_call excludes mutating tools.
-        let block = match ctx
-            .hooks
-            .pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled)
-            .await
-        {
-            PreToolResult::Block { reason } => Some(tools::ToolOutcome {
-                ok: false,
-                output: reason,
-                diff: None, ..Default::default()
-            }),
-            PreToolResult::Cancelled => {
-                // Close every ToolStart already emitted in this batch so the
-                // transcript stays well-formed, then stop the turn.
-                for prior in calls.iter().take(parsed.len()) {
-                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                        call_id: prior.id.clone(),
-                        ok: false,
-                        output: "cancelled".to_string(),
-                    });
-                    messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
-                }
-                return true;
+    'admit: loop {
+        blocked.clear();
+        for (index, call) in calls.iter().enumerate() {
+            let name = call.function.name.as_str();
+            // batchable_call already validated the JSON; Null (impossible) would
+            // just surface as a missing-argument tool error.
+            let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+            if index == parsed.len() {
+                parsed.push(args.clone());
+                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
+                    call_id: call.id.clone(),
+                    name: name.into(),
+                    args: args.clone(),
+                });
             }
-            PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
-                PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
+            // hooks pre → permissions → content gate. approval_mode is skipped
+            // because batchable_call excludes mutating tools.
+            let mode = *ctx.policy_mode;
+            let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
+            refresh_approval_policy(ctx.core, ctx.session_id, ctx.project_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
+            if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
+                // No call has run yet. Re-admit the whole batch so a selection
+                // during a later hook also invalidates earlier admissions.
+                continue 'admit;
+            }
+            let block = match pre {
+                PreToolResult::Block { reason } => Some(tools::ToolOutcome {
                     ok: false,
                     output: reason,
                     diff: None, ..Default::default()
                 }),
-                // Ask is excluded from batching (see batchable_call); if it
-                // still lands here outside auto, refuse the batch call.
-                PermissionDecision::Ask if ctx.core.approval_mode(ctx.project_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
-                    ok: false,
-                    output: "permission rule requires approval; re-run outside a concurrent batch"
-                        .into(),
-                    diff: None, ..Default::default()
-                }),
-                // Allow/Default: readonly batch tools are non-mutating.
-                PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
-            },
-        };
-        // Unapproved content is excluded from batching (see batchable_call) so
-        // the serial path can prompt; if one still lands here, block rather
-        // than run unapproved host code outside auto. The sites share one
-        // predicate, so the batch path cannot drift away from the gate again.
-        let block = block.or_else(|| {
-            if ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto { return None; }
-            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
-                |source| tools::ToolOutcome {
-                    ok: false,
-                    output: declined_message(Some(&source)),
-                    diff: None,
-                    ..Default::default()
+                PreToolResult::Cancelled => {
+                    // Close every ToolStart already emitted in this batch so the
+                    // transcript stays well-formed, then stop the turn.
+                    for prior in calls.iter().take(parsed.len()) {
+                        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
+                            call_id: prior.id.clone(),
+                            ok: false,
+                            output: "cancelled".to_string(),
+                        });
+                        messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
+                    }
+                    return true;
+                }
+                PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
+                    PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
+                        ok: false,
+                        output: reason,
+                        diff: None, ..Default::default()
+                    }),
+                    // Ask is excluded from batching (see batchable_call); if it
+                    // still lands here outside auto, refuse the batch call.
+                    PermissionDecision::Ask if ctx.core.approval_mode(ctx.project_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
+                        ok: false,
+                        output: "permission rule requires approval; re-run outside a concurrent batch"
+                            .into(),
+                        diff: None, ..Default::default()
+                    }),
+                    // Allow/Default: readonly batch tools are non-mutating.
+                    PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
                 },
-            )
-        });
-        blocked.push(block);
+            };
+            // Unapproved content is excluded from batching (see batchable_call) so
+            // the serial path can prompt; if one still lands here, block rather
+            // than run unapproved host code outside auto. The sites share one
+            // predicate, so the batch path cannot drift away from the gate again.
+            let block = block.or_else(|| {
+                if ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto { return None; }
+                unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
+                    |source| tools::ToolOutcome {
+                        ok: false,
+                        output: declined_message(Some(&source)),
+                        diff: None,
+                        ..Default::default()
+                    },
+                )
+            });
+            blocked.push(block);
+        }
+        break;
     }
 
+    let data_dir = &ctx.core.data_dir;
     let futures: Vec<_> = calls
         .iter()
         .zip(parsed.iter())
@@ -697,7 +710,7 @@ async fn execute_readonly_batch(
                 if let Some(outcome) = blocked_outcome {
                     return outcome;
                 }
-                registry.execute(&name, &args, &ctx.core.data_dir, &root, caps, cancel).await
+                registry.execute(&name, &args, data_dir, &root, caps, cancel).await
             }
         })
         .collect();
@@ -2354,6 +2367,27 @@ fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::Jo
     })
 }
 
+fn execution_policy_note(mode: ApprovalMode) -> String {
+    let detail = match mode {
+        ApprovalMode::Auto => "carry out authorized work, including extension creation and repair, without asking for confirmation. Valid tools, hooks, and permission allows need no content approval. Deny rules and validation still apply",
+        ApprovalMode::Ask => "mutating calls and unapproved tool content require confirmation unless the applicable gate permits them. Hooks and project permission allows require content approval",
+        ApprovalMode::Readonly => "mutating calls and calls requiring approval are disabled",
+    };
+    format!("[execution policy: {} for this trusted project; {detail}.]", mode.as_str())
+}
+
+fn rehydrate_approval_mode(messages: &[ChatMessage]) -> Option<ApprovalMode> {
+    let notes = [ApprovalMode::Auto, ApprovalMode::Ask, ApprovalMode::Readonly]
+        .map(|mode| (mode, execution_policy_note(mode)));
+    // Recover only the last visible notice. If wording changes or compaction
+    // removed it, emit the current policy again. This never grants authority.
+    messages.iter().rev()
+        .filter(|m| m.role == "user" || m.role == "tool")
+        .filter_map(|m| m.content.as_deref())
+        .flat_map(|content| content.lines().rev())
+        .find_map(|line| notes.iter().find(|(_, text)| line == text).map(|(mode, _)| *mode))
+}
+
 async fn refresh_approval_policy(
     core: &Arc<Core>,
     session_id: &str,
@@ -2384,12 +2418,7 @@ async fn refresh_approval_policy(
         })
     };
     if changed {
-        let detail = match current {
-            ApprovalMode::Auto => "carry out authorized work, including extension creation and repair, without asking for confirmation. Valid tools, hooks, and permission allows need no content approval. Deny rules and validation still apply",
-            ApprovalMode::Ask => "mutating calls and unapproved tool content require confirmation unless the applicable gate permits them. Hooks and project permission allows require content approval",
-            ApprovalMode::Readonly => "mutating calls and calls requiring approval are disabled",
-        };
-        let text = format!("[execution policy: {} for this trusted project; {detail}.]", current.as_str());
+        let text = execution_policy_note(current);
         if on_tool {
             append_and_emit_note(core, session_id, messages, &text);
         } else {
@@ -2875,20 +2904,21 @@ async fn run_loop(
             }
 
             if segment.concurrent {
-                let batch_ctx = ReadonlyBatchCtx {
+                let mut batch_ctx = ReadonlyBatchCtx {
                     core,
                     session_id,
                     registry: &registry,
                     project_root,
                     caps,
                     cancelled: cancelled.clone(),
-                    hooks: &hooks,
-                    permissions: &permissions,
+                    hooks: &mut hooks,
+                    permissions: &mut permissions,
+                    policy_mode: &mut policy_mode,
                     parallelism: parallel_tool_limit(settings.max_parallel_tools),
                     usage: &turn_usage,
                 };
                 if execute_readonly_batch(
-                    &batch_ctx,
+                    &mut batch_ctx,
                     &tool_calls[segment.start..segment.end],
                     guard.messages(),
                 )
@@ -2933,10 +2963,18 @@ async fn run_loop(
 
                 // Order: hooks pre → permissions → approval_mode → execute.
                 // Denies never prompt the user.
-                match hooks
-                    .pre_tool_use(session_id, name, &args, project_root, &cancelled)
-                    .await
-                {
+                // A mode selection can land while a hook is awaiting its
+                // process. Re-admit under the new policy before dispatch,
+                // including its allow filtering and content-bound hook gates.
+                let pre = loop {
+                    let mode = policy_mode;
+                    let pre = hooks.pre_tool_use(session_id, name, &args, project_root, &cancelled).await;
+                    refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+                    if mode == policy_mode || matches!(pre, PreToolResult::Cancelled) {
+                        break pre;
+                    }
+                };
+                match pre {
                     PreToolResult::Block { reason } => {
                         core.send_agent(session_id, AgentEvent::ToolEnd {
                             call_id: call.id.clone(),
@@ -7110,6 +7148,104 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n",
     );
+
+    #[tokio::test]
+    async fn a_mode_change_during_a_serial_pre_hook_refreshes_permission_allows() {
+        mode_change_during_pre_hook(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_during_a_batch_pre_hook_refreshes_permission_allows() {
+        mode_change_during_pre_hook(true).await;
+    }
+
+    async fn mode_change_during_pre_hook(batch: bool) {
+        let dir = std::env::temp_dir().join(format!("omx-mode-hook-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join(".openmax/hooks")).unwrap();
+        std::fs::write(root.join("a.txt"), "read succeeded").unwrap();
+        std::fs::write(root.join(".openmax/hooks/wait.toml"),
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"hook.sh\"]\n").unwrap();
+        std::fs::write(root.join("hook.sh"), "touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
+        if batch {
+            std::fs::write(root.join("hook.sh"), "if [ ! -e first ]; then touch first; exit 0; fi; touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
+        }
+        let tool = if batch { "read_file" } else { "bash" };
+        std::fs::write(root.join(".openmax/permissions.toml"), format!(
+            "[[rules]]\neffect = \"allow\"\ntool = \"{tool}\"\n[[rules]]\neffect = \"ask\"\ntool = \"{tool}\"\n"
+        )).unwrap();
+        let count = if batch { 2 } else { 1 };
+        let args = if batch { serde_json::json!({"path":"a.txt"}) } else { serde_json::json!({"command":"echo ran"}) };
+        let calls: Vec<_> = (0..count).map(|i| serde_json::json!({
+            "index":i,"id":format!("call-{i}"),"function":{"name":tool,"arguments":args.to_string()}
+        })).collect();
+        let response = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        let (base_url, _) = counting_endpoint(&format!("data: {response}\n\ndata: [DONE]\n\n")).await;
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &root).unwrap();
+        core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = base_url;
+            settings.model = "stub".into();
+            settings.context_tokens = Some(16384);
+            settings.max_agent_iterations = 1;
+        }
+        start_turn(core.clone(), "s".into(), root.clone(), "go".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("ready").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.expect("the pre hook must start");
+        core.set_project_approval_mode(&root, ApprovalMode::Ask).unwrap();
+        std::fs::write(root.join("release"), "").unwrap();
+        let mut results = Vec::new();
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            match env.event {
+                AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(&approval_id, false); }
+                AgentEvent::ToolEnd { ok, .. } => results.push(ok),
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(results, vec![false; count], "auto-loaded allows must not survive a switch to ask during a hook");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_only_reports_a_changed_execution_policy() {
+        let dir = std::env::temp_dir().join(format!("omx-policy-resume-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let (core, _) = Core::new(dir.join("data")).unwrap();
+        crate::trust::trust_project(&core.data_dir, &root).unwrap();
+        for on_tool in [false, true] {
+            let id = sessions::create(&core, root.display().to_string()).unwrap().id;
+            core.sessions.lock().await.insert(id.clone(), build_session_data(&core, &id, &root));
+            core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
+            let mut mode = ApprovalMode::Auto;
+            let mut hooks = Hooks::discover_for_mode(&root, &core.data_dir, mode);
+            let mut permissions = TurnPermissions::new(Permissions::discover_for_mode(&root, &core.data_dir, mode));
+            let mut messages = vec![ChatMessage::system("test"), ChatMessage::user("go")];
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+            if on_tool { messages.push(ChatMessage::tool("call", "result")); }
+            core.set_project_approval_mode(&root, ApprovalMode::Ask).unwrap();
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut messages).await;
+            let mut persisted = 0;
+            assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+            core.sessions.lock().await.remove(&id);
+            ensure_session_hydrated(&core, &id, &root).await;
+            let mut resumed = core.sessions.lock().await.get(&id).unwrap().messages.clone();
+            resumed.push(ChatMessage::user("continue"));
+            let before = serde_json::to_value(&resumed).unwrap();
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut resumed).await;
+            assert_eq!(serde_json::to_value(&resumed).unwrap(), before, "resume must not repeat the last visible policy");
+            core.set_project_approval_mode(&root, ApprovalMode::Readonly).unwrap();
+            refresh_approval_policy(&core, &id, &root, &mut mode, &mut hooks, &mut permissions, &mut resumed).await;
+            assert_eq!(resumed.len(), messages.len() + 2, "a changed mode still needs a notice");
+            assert!(resumed[resumed.len() - 2].content.as_deref().unwrap().contains("execution policy: readonly"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn a_mode_change_refreshes_hooks_permissions_and_the_model_notice() {
