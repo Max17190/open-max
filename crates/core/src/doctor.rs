@@ -3928,7 +3928,7 @@ mod tests {
     }
 
     #[test]
-    fn hygiene_flags_unused_tools() {
+    fn hygiene_flags_unused_tools_and_skills() {
         let root = temp_project();
         let data = temp_project();
         let tools_dir = root.join(".openmax").join("tools");
@@ -3936,6 +3936,13 @@ mod tests {
         std::fs::write(
             tools_dir.join("ghost.toml"),
             "name = \"ghost\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n",
+        )
+        .unwrap();
+        let skill_dir = root.join(".agents").join("skills").join("deploy-app");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: deploy-app\ndescription: Deploy the application\n---\nbody\n",
         )
         .unwrap();
         // Enough recorded signal to judge non-use.
@@ -3950,6 +3957,11 @@ mod tests {
             findings.iter().any(|f| f.path.ends_with("ghost.toml")
                 && f.status.summary().contains("never called")),
             "unused tool must be flagged"
+        );
+        assert!(
+            findings.iter().any(|f| f.kind == "skill"
+                && f.status.summary().contains("'deploy-app' was never read")),
+            "unread skill must be flagged"
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
