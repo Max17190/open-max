@@ -64,7 +64,22 @@ cargo update -w --quiet
 git add Cargo.toml Cargo.lock
 git commit -qm "release: ${version}"
 git tag -a "${tag}" -m "${version}"
-git push --quiet origin main "${tag}"
+# --atomic or neither ref moves. A plain multi-ref push is not atomic: if the
+# branch is rejected (someone pushed to main in the window since the check
+# above) the tag still lands, and a tag is what starts a release, so the
+# published binaries would come from a commit that never reached main.
+if ! git push --quiet --atomic origin main "${tag}"; then
+  # Undo the local commit and tag so a retry starts clean and does not skip a
+  # number. Safe because both were created moments ago by this script, on a
+  # tree it verified was clean.
+  if [ "$(git log -1 --format=%s)" = "release: ${version}" ]; then
+    git tag -d "${tag}" >/dev/null
+    git reset --quiet --hard HEAD~1
+  fi
+  echo "push rejected; nothing was published and the local bump was undone." >&2
+  echo "run 'git pull --rebase' and try again." >&2
+  exit 1
+fi
 
 echo "pushed ${tag}. The release workflow builds and publishes it:"
 echo "  https://github.com/Max17190/open-max/actions"
