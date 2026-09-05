@@ -386,8 +386,7 @@ which of its own creations are pure tax and delete them. Nothing is pruned
 automatically: the core measures, the agent judges.
 
 With enough recorded signal (50 calls), `openmax --check` warns about
-extensions that were never used, and it always warns when two skills describe
-nearly the same thing - look-alike skills degrade the model's selection.
+extensions that were never used.
 
 ## Validation
 

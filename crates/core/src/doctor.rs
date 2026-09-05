@@ -1319,9 +1319,8 @@ fn watch_cancel_signals(cancel: std::sync::Arc<crate::state::CancelToken>) {
 fn watch_cancel_signals(_: std::sync::Arc<crate::state::CancelToken>) {}
 
 /// Skill-library hygiene: extensions the usage record says are pure prompt
-/// tax, and near-duplicate skill descriptions that shadow each other in the
-/// index. Warnings only - the agent (or human) judges and deletes; nothing
-/// is pruned automatically.
+/// tax. Warnings only - the agent (or human) judges and deletes; nothing is
+/// pruned automatically.
 fn hygiene_findings(
     project_root: &Path,
     data_dir: &Path,
@@ -1359,43 +1358,7 @@ fn hygiene_findings(
             }
         }
     }
-    // Near-duplicate descriptions make the model pick between look-alikes
-    // (skill shadowing); flag the later name of each pair.
-    for (i, (name_a, desc_a, _)) in skills.iter().enumerate() {
-        for (name_b, desc_b, path_b) in skills.iter().skip(i + 1) {
-            if name_a == name_b {
-                continue; // cross-tier shadowing is reported elsewhere
-            }
-            if description_similarity(desc_a, desc_b) > 0.6 {
-                findings.push(Finding {
-                    kind: "skill",
-                    path: path_b.clone(),
-                    status: Status::Warn(format!(
-                        "'{name_b}' describes nearly the same thing as '{name_a}'; look-alike skills degrade selection - consider merging"
-                    )),
-                });
-            }
-        }
-    }
     findings
-}
-
-/// Word-set Jaccard similarity, lowercase: cheap, deterministic, no model.
-fn description_similarity(a: &str, b: &str) -> f64 {
-    let words = |s: &str| -> std::collections::HashSet<String> {
-        s.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() > 2)
-            .map(str::to_string)
-            .collect()
-    };
-    let (a, b) = (words(a), words(b));
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let intersection = a.intersection(&b).count() as f64;
-    let union = a.union(&b).count() as f64;
-    intersection / union
 }
 
 /// Every tool name this project can actually call: the built-ins plus every
@@ -3965,7 +3928,7 @@ mod tests {
     }
 
     #[test]
-    fn hygiene_flags_unused_tools_and_lookalike_skills() {
+    fn hygiene_flags_unused_tools() {
         let root = temp_project();
         let data = temp_project();
         let tools_dir = root.join(".openmax").join("tools");
@@ -3975,18 +3938,6 @@ mod tests {
             "name = \"ghost\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n",
         )
         .unwrap();
-        for (name, desc) in [
-            ("deploy-app", "Deploy the application to the production cluster safely"),
-            ("ship-app", "Deploy the application to the production cluster with checks"),
-        ] {
-            let dir = root.join(".agents").join("skills").join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"),
-            )
-            .unwrap();
-        }
         // Enough recorded signal to judge non-use.
         let mut delta = crate::ledger::UsageDelta::default();
         for _ in 0..50 {
@@ -3999,11 +3950,6 @@ mod tests {
             findings.iter().any(|f| f.path.ends_with("ghost.toml")
                 && f.status.summary().contains("never called")),
             "unused tool must be flagged"
-        );
-        assert!(
-            findings.iter().any(|f| matches!(f.status, Status::Warn(_))
-                && f.status.summary().contains("nearly the same thing")),
-            "look-alike skills must be flagged"
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
