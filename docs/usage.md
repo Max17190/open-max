@@ -17,6 +17,7 @@ openmax -c
 openmax --provider ollama --model qwen2.5-coder:7b
 openmax -p "summarize the top level layout of this repo"
 openmax -p --json "list public modules in crates/core"
+openmax --profile minimal -p "fix the failing test"   # measurement shape: four tools, bare prompt
 openmax --check                       # validate extension files
 openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
@@ -39,6 +40,17 @@ In print mode, text goes to stdout and tool progress to stderr. With `--json`,
 each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
 `approval_mode`; select `/approvals auto` once in the trusted project for
 unattended runs.
+
+`--profile minimal` starts a session with only `read_file`, `write_file`,
+`edit_file`, and `bash`, a one-line system prompt that names no path, and
+nothing from the project: no `AGENTS.md`, layout map, skills, memory, hooks,
+or extension tools (permission rules still apply). It is the shape to measure
+a model under: the prefix is byte-identical across checkouts and carries no
+help beyond the tools themselves. The profile is fixed when the session is
+created; a session that cannot record it refuses to start rather than running
+as a full one. `--continue` and `/resume` keep whatever profile a session has,
+`/status` shows it, and extension files written during a minimal session are
+recorded in the ledger but never loaded into it.
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in

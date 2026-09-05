@@ -5,6 +5,10 @@
 //! index, and the tools trailer. `system_prompt_with_breakdown` reports the
 //! size of each, which is what `/context` and `--spec usage` show.
 //!
+//! Under the minimal profile (`registry::Profile::Minimal`) the prompt is the
+//! persona line alone: every grounding section and the extension pointer are
+//! skipped, so the prefix is byte-identical across projects.
+//!
 //! Every variable-length component is capped in bytes (`AGENTS.md` 2,000, the
 //! layout map 1,200 at depth 2, skills 3,000) and says so when it truncates.
 //! Without caps the prompt would grow with the repository, and this text is
@@ -42,6 +46,13 @@ const MAX_SKILL_NAME_SHOWN: usize = 64;
 /// parser so a resumed session recognizes exactly the section it carries.
 const MEMORY_SECTION_HEADER: &str =
     "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n";
+
+/// The whole system prompt of a minimal-profile session. No path: the shell
+/// runs in the project root and every tool path is project-relative, so the
+/// bytes are identical in every checkout of every project, which is what
+/// makes a measurement under this profile comparable across machines.
+pub const MINIMAL_PROMPT: &str =
+    "You are Open Max, a coding agent working in the current project. Tool paths are project-relative.";
 
 /// The prompt text alone, for tests that only assert on its content.
 #[cfg(test)]
@@ -113,6 +124,16 @@ impl PromptBreakdown {
 pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
+    if registry.profile == crate::registry::Profile::Minimal {
+        // The measurement prompt: the persona line and the one rule the
+        // tools need. No path, project instructions, layout map, skills,
+        // memory, or extension pointer, so the prefix is identical across
+        // checkouts and carries nothing the model could take as task help.
+        let prompt = MINIMAL_PROMPT.to_string();
+        breakdown.components.push(("base rules".into(), prompt.len()));
+        breakdown.add_registry(registry, project_root);
+        return (prompt, breakdown);
+    }
     // Tool-specific guidance lives in each tool's schema description (which
     // rides in every request anyway); rules here are only the cross-cutting
     // ones. Both sides count against the frozen prompt budget in
@@ -396,6 +417,69 @@ mod tests {
         let discovered = system_prompt(&dir, &Registry::build(&dir.join("data"), &dir));
         assert_eq!(discovered, builtin_prompt(&dir));
         assert!(!discovered.contains("\n\nSkills (before using one"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The minimal profile is a measurement instrument: the persona line and
+    /// the shell-plus-editor schemas, nothing else, however much grounding
+    /// the project offers. Instructions, memory, skills, and extension tools
+    /// on disk are all ignored, or the prefix would vary by project and the
+    /// measurement would include harness help.
+    #[test]
+    fn a_minimal_prompt_ignores_every_grounding_source() {
+        use crate::registry::Profile;
+        let dir = temp_project();
+        std::fs::write(dir.join("AGENTS.md"), "# Rules\nAlways run the tests.").unwrap();
+        std::fs::create_dir_all(dir.join(".openmax/memory")).unwrap();
+        std::fs::write(dir.join(".openmax/memory/port.md"), "# The port is 7443\nSet in nginx.conf.").unwrap();
+        std::fs::create_dir_all(dir.join(".agents/skills/review")).unwrap();
+        std::fs::write(
+            dir.join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: reviews a diff\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            dir.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
+        )
+        .unwrap();
+
+        let registry = Registry::build_for(Profile::Minimal, &dir.join("data"), &dir);
+        assert_eq!(registry.tool_names(), crate::tools::MINIMAL_TOOL_NAMES);
+        assert!(registry.skills.is_empty());
+        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        assert_eq!(prompt, MINIMAL_PROMPT);
+        assert!(!prompt.contains(&*dir.to_string_lossy()), "no checkout path in the measurement prefix");
+        assert_eq!(breakdown.components.len(), 1, "one component, the persona line: {:?}", breakdown.components);
+        assert!(breakdown.memory.is_empty());
+        assert!(breakdown.skills.is_empty());
+        assert_eq!(breakdown.tools.len(), crate::tools::MINIMAL_TOOL_NAMES.len());
+        // Same bytes from a manifest round trip, which is how a resumed
+        // session rebuilds its prefix.
+        let resumed = Registry::from_manifest(registry.to_manifest());
+        assert_eq!(system_prompt(&dir, &resumed), prompt);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The minimal prefix has its own budget: the persona line plus the four
+    /// schemas, measured the same way as the full budget (no path to strip:
+    /// the minimal prompt carries none).
+    #[test]
+    fn the_minimal_prefix_fits_its_budget() {
+        use crate::registry::Profile;
+        let dir = temp_project();
+        let registry = Registry::build_for(Profile::Minimal, &dir.join("data"), &dir);
+        let (prompt, _) = system_prompt_with_breakdown(&dir, &registry);
+        let schemas = registry.tool_schemas_wire().len();
+        let total = prompt.len() + schemas;
+        const CAP: usize = 1_600;
+        assert!(
+            total <= CAP,
+            "minimal prefix budget exceeded by {} bytes: prompt {} + schemas {schemas} = {total}, cap {CAP}",
+            total - CAP,
+            prompt.len(),
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
