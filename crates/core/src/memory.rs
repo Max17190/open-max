@@ -425,7 +425,7 @@ fn trailer_line(omitted: usize) -> String {
     format!("… {omitted} more (ls {MEMORY_DIR})\n")
 }
 
-pub fn index_line(entry: &MemoryEntry) -> String {
+fn index_line(entry: &MemoryEntry) -> String {
     format!("- {}: {} — {}\n", entry.name, entry.description, entry.path)
 }
 

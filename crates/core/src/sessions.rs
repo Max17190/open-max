@@ -199,7 +199,8 @@ pub fn last_compaction(core: &Core, id: &str) -> Option<CompactionRecord> {
 }
 
 /// Load compaction history for a session (corrupt lines skipped).
-pub fn load_compaction(core: &Core, id: &str) -> Vec<CompactionRecord> {
+#[cfg(test)]
+fn load_compaction(core: &Core, id: &str) -> Vec<CompactionRecord> {
     let Ok(text) = std::fs::read_to_string(compaction_path(core, id)) else {
         return Vec::new();
     };

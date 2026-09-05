@@ -666,11 +666,13 @@ impl Hooks {
                 .any(|p| resolve_for_repair(p).is_some_and(|p| p == candidate))
     }
 
-    pub fn pre_count(&self) -> usize {
+    #[cfg(test)]
+    fn pre_count(&self) -> usize {
         self.pre.len()
     }
 
-    pub fn post_count(&self) -> usize {
+    #[cfg(test)]
+    fn post_count(&self) -> usize {
         self.post.len()
     }
 

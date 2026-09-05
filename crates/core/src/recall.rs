@@ -309,7 +309,7 @@ fn camel_parts(run: &[char]) -> Vec<String> {
 /// The upper cap keeps a base64 blob or a minified bundle from becoming one
 /// giant unmatchable token that bloats the term maps; content inside such a
 /// run is not lexically findable either way (the cited address is).
-pub(crate) fn tokenize(text: &str) -> Vec<String> {
+fn tokenize(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     tokenize_runs(text, |_, _, token| out.push(token));
     out
