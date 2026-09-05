@@ -1132,23 +1132,16 @@ struct CompactionCtx<'a> {
 
 /// Preserve the originals and prepare the candidate's digest. The record and
 /// hook are emitted only after the candidate transcript has been persisted.
-async fn apply_compaction_digest(
+async fn prepare_compaction_digest(
     ctx: &CompactionCtx<'_>,
     messages: &mut [ChatMessage],
     mut digest: CompactionDigest,
     spend: &mut RequestSpend,
-) -> Result<Option<sessions::CompactionRecord>, String> {
+) -> (Vec<ChatMessage>, Option<sessions::CompactionRecord>) {
     let CompactionCtx { core, session_id, client, cancelled, .. } = *ctx;
-    // Preserve both truncated and dropped messages before installing the
-    // candidate. A failed archive leaves the original transcript in place.
-    if !sessions::append_archive(core, session_id, &digest.truncated)
-        || !sessions::append_archive(core, session_id, &digest.dropped)
-    {
-        return Err("compaction refused: could not archive the original messages".into());
-    }
     if digest.message_count == 0 {
         // Truncation-only: upgrade the note the prune just inserted with the
-        // address, now that the archive has honored it. Matched by content,
+        // address. This candidate stays private until commit. Matched by content,
         // not by position: index 2 may instead hold an earlier prune's real
         // digest note, which carries a summary and Files touched this note
         // does not. No summarizer request (dropped_text is empty so
@@ -1161,10 +1154,12 @@ async fn apply_compaction_digest(
             && is_digest_message(&messages[2])
             && messages[2].content.as_deref() == Some(inserted.as_str())
         {
-            let archive = sessions::archive_display(core, session_id);
-            messages[2] = ChatMessage::user(digest.format_truncation_only(Some(&archive)));
+            let path = sessions::archive_display(core, session_id);
+            messages[2] = ChatMessage::user(digest.format_truncation_only(Some(&path)));
         }
-        return Ok(None);
+        let mut archive = digest.truncated;
+        archive.extend(digest.dropped);
+        return (archive, None);
     }
     // Structured fields from the previous record carry forward by
     // code: the prune may have dropped the old digest note, whose
@@ -1172,19 +1167,22 @@ async fn apply_compaction_digest(
     if let Some(prior) = sessions::last_compaction(core, session_id) {
         digest.absorb_prior(&prior);
     }
-    let archive = sessions::archive_display(core, session_id);
+    let path = sessions::archive_display(core, session_id);
     // Upgrade the heuristic note to a model-written summary when
     // the endpoint cooperates; the note at index 2 was just
     // inserted by the prune, so replacing it here keeps one
     // digest message.
     let note = match summarize_compaction(core, session_id, client, &digest, cancelled, spend).await {
-        Some(summary) => digest.format_with_summary(&summary, Some(&archive)),
-        None => digest.format(Some(&archive)),
+        Some(summary) => digest.format_with_summary(&summary, Some(&path)),
+        None => digest.format(Some(&path)),
     };
     if messages.len() > 2 && is_digest_message(&messages[2]) {
         messages[2] = ChatMessage::user(note.clone());
     }
-    Ok(Some(digest.to_record(note)))
+    let record = digest.to_record(note);
+    let mut archive = digest.truncated;
+    archive.extend(digest.dropped);
+    (archive, Some(record))
 }
 
 /// A failed archive or transcript write must not discard the live history.
@@ -1212,25 +1210,16 @@ async fn compact_messages(
     };
     if !changed { return Ok(0); }
     let dropped = digest.as_ref().map(|d| d.message_count).unwrap_or(0);
-    let record = match digest {
-        Some(digest) => apply_compaction_digest(ctx, &mut candidate, digest, spend).await?,
-        None => None,
+    let (archive, record) = match digest {
+        Some(digest) => prepare_compaction_digest(ctx, &mut candidate, digest, spend).await,
+        None => (Vec::new(), None),
     };
-    if !save_messages(ctx.core, ctx.session_id, &candidate, true).await {
-        return Err("compaction refused: could not persist the compacted transcript".into());
+    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, record.as_ref(), messages.len())?;
+    if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
+        data.persisted_count = candidate.len();
     }
-    let before_len = messages.len() as u64;
     *messages = candidate;
-    let after_len = messages.len() as u64;
-    // The transcript is committed now. A metadata error is reported, but
-    // must not put an older conversation back into the live session.
-    if after_len < before_len {
-        sessions::shift_resume_points_for_prune(ctx.core, ctx.session_id, before_len - after_len)?;
-    } else if after_len > before_len {
-        sessions::shift_resume_points_for_insert(ctx.core, ctx.session_id, 2)?;
-    }
     if let Some(record) = record {
-        sessions::append_compaction(ctx.core, ctx.session_id, &record);
         if let Ok(value) = serde_json::to_value(&record) {
             let failures = ctx.hooks.compaction(ctx.session_id, ctx.project_root, &value, ctx.cancelled).await;
             report_hook_failures(ctx.core, ctx.session_id, failures);
@@ -1252,6 +1241,7 @@ pub fn start_turn(
             project_root.display()
         ));
     }
+    sessions::recover_compaction(&core)?;
     let cancelled = Arc::new(CancelToken::default());
     {
         // `running` is the outer lock for both pieces of turn state. Claiming
@@ -4039,9 +4029,9 @@ fn prune_transcript(
         }
     }
     if reached {
-        // Addressless: `append_archive` has not run yet, and a note may never
+        // Addressless: `commit_compaction` has not run yet, and a note may never
         // advertise an address the archive does not honor. The upgrade is
-        // `apply_compaction_digest`'s.
+        // `prepare_compaction_digest`'s.
         if note_reserve > 0 && !digest.truncated.is_empty() {
             messages.insert(2, ChatMessage::user(digest.format_truncation_only(None)));
         }
@@ -4104,48 +4094,62 @@ mod tests {
     #[tokio::test]
     async fn failed_compaction_keeps_the_transcript_and_resume_boundaries() {
         for failed_file in ["archive", "messages", "index"] {
-            let dir = std::env::temp_dir().join(format!("openmax-compact-failure-{}", uuid::Uuid::new_v4()));
-            let project = dir.join("project");
-            std::fs::create_dir_all(&project).unwrap();
-            let (core, _rx) = Core::new(dir.join("data")).unwrap();
-            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
-            {
-                let mut settings = core.settings.lock().unwrap();
-                settings.base_url = "http://127.0.0.1:0".into();
-                settings.model = "test".into();
-                settings.context_tokens = Some(12_288);
-                settings.max_tokens = 1_024;
-            }
-            let mut data = build_session_data(&core, &id, &project);
-            while data.messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_500 {
-                data.messages.push(ChatMessage::user("q ".repeat(400)));
-                data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
-            }
-            let original = serde_json::to_value(&data.messages).unwrap();
-            assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
-            core.sessions.lock().await.insert(id.clone(), data);
-            sessions::record_resume_point(&core, &id, 10);
-            let path = match failed_file {
-                "archive" => PathBuf::from(sessions::archive_display(&core, &id)),
-                "messages" => core.data_dir.join("sessions").join(format!("{id}.messages.json")),
-                _ => core.data_dir.join("sessions/index.json"),
-            };
-            let backup = path.with_extension("original");
-            let existed = path.exists();
-            if existed { std::fs::rename(&path, &backup).unwrap(); }
-            std::fs::create_dir(&path).unwrap();
-            let result = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await;
-            std::fs::remove_dir(&path).unwrap();
-            if existed { std::fs::rename(&backup, &path).unwrap(); }
-
-            assert!(result.is_err(), "{failed_file} failure must refuse compaction");
-            let messages = core.sessions.lock().await.get(&id).unwrap().messages.clone();
-            assert_eq!(serde_json::to_value(messages).unwrap(), original, "{failed_file}: live transcript");
-            assert_eq!(serde_json::to_value(sessions::load_messages(&core, &id).unwrap()).unwrap(), original,
-                "{failed_file}: saved transcript");
-            assert_eq!(sessions::meta(&core, &id).unwrap().resume_points, vec![10]);
-            let _ = std::fs::remove_dir_all(dir);
+            check_failed_compaction(failed_file).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_compaction_index_lock_failure_preserves_live_history() {
+        check_failed_compaction("index-lock").await;
+    }
+
+    async fn check_failed_compaction(failed_file: &str) {
+        let dir = std::env::temp_dir().join(format!("openmax-compact-failure-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = "http://127.0.0.1:0".into();
+            settings.model = "test".into();
+            settings.context_tokens = Some(12_288);
+            settings.max_tokens = 1_024;
+        }
+        let mut data = build_session_data(&core, &id, &project);
+        while data.messages.iter().map(|m| m.estimated_tokens()).sum::<usize>() <= 8_500 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        let original = serde_json::to_value(&data.messages).unwrap();
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        core.sessions.lock().await.insert(id.clone(), data);
+        sessions::record_resume_point(&core, &id, 10);
+        let path = match failed_file {
+            "archive" => PathBuf::from(sessions::archive_display(&core, &id)),
+            "messages" => core.data_dir.join("sessions").join(format!("{id}.messages.json")),
+            "index-lock" => core.data_dir.join("sessions/index.lock"),
+            _ => core.data_dir.join("sessions/index.json"),
+        };
+        let backup = path.with_extension("original");
+        let existed = path.exists();
+        if existed { std::fs::rename(&path, &backup).unwrap(); }
+        std::fs::create_dir(&path).unwrap();
+        let result = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await;
+        std::fs::remove_dir(&path).unwrap();
+        if existed { std::fs::rename(&backup, &path).unwrap(); }
+
+        assert!(result.is_err(), "{failed_file} failure must refuse compaction");
+        let messages = core.sessions.lock().await.get(&id).unwrap().messages.clone();
+        assert_eq!(serde_json::to_value(messages).unwrap(), original, "{failed_file}: live transcript");
+        assert_eq!(serde_json::to_value(sessions::load_messages(&core, &id).unwrap()).unwrap(), original,
+            "{failed_file}: saved transcript");
+        assert_eq!(sessions::meta(&core, &id).unwrap().resume_points, vec![10]);
+        assert!(sessions::load_archive(&core, &id).is_empty(), "a failed attempt must not leave archive records to duplicate on retry");
+        let retried = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
+        assert!(retried.compacted_messages > 0);
+        assert!(!sessions::load_archive(&core, &id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -8358,7 +8362,7 @@ mod tests {
         assert!(notes[0].contains("older tool output truncated"), "{}", notes[0]);
         assert!(
             !notes[0].contains("archive.jsonl"),
-            "the address waits for append_archive to honor it: {}",
+            "the address waits for commit_compaction to honor it: {}",
             notes[0]
         );
     }
@@ -8410,7 +8414,8 @@ mod tests {
             hooks: &hooks,
             cancelled: &cancelled,
         };
-        apply_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await.unwrap();
+        let (archive, record) = prepare_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await;
+        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len()).unwrap();
 
         let note = messages[2].content.as_deref().unwrap();
         assert!(note.contains(&sessions::archive_display(&core, &id)), "{note}");
@@ -8493,7 +8498,8 @@ mod tests {
             hooks: &hooks,
             cancelled: &cancelled,
         };
-        apply_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await.unwrap();
+        let (archive, record) = prepare_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await;
+        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len()).unwrap();
         assert_eq!(
             messages[2].content.as_deref(),
             Some(real_note.as_str()),
