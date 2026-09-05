@@ -205,7 +205,7 @@ const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user
 - Memory: .openmax/memory/<name>.md, one durable fact per file.\n\
 Before creating or changing these files, use bash: openmax --spec <surface> to read the format, approval, and activation rules.\n\
 Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
-Verify with openmax --check. Tools and skills refresh after every executed mutating call and at turn start (/reload forces it). Permissions and templates apply on next use; hooks from the next turn.\n\
+Verify with openmax --check. Tools and skills refresh after every executed mutating call and at turn start (/reload forces it). Templates apply on next use; hooks from the next turn.\n\
 Use openmax --ledger for tool/skill history and restorable objects, and openmax --recall \"<query>\" for past sessions, archives, and memory.\n\
 Compose workflows with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.";
 
