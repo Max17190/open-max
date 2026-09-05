@@ -329,13 +329,13 @@ pub async fn execute(
     }
     // The file tools are synchronous fs/walk work; run them off the async
     // workers so a big grep or read never stalls streaming and the UI.
-    // Esc stops waiting immediately; the blocking task may finish in the pool.
+    // Cancellation may stop waiting for reads. Started mutations must settle
+    // before the turn releases ownership of the files they can still change.
+    let mutating = is_mutating(name);
     let name = name.to_string();
     let args = args.clone();
     let root = root.to_path_buf();
-    tokio::select! {
-        _ = cancel.cancelled() => ToolOutcome::err("tool cancelled by user"),
-        result = tokio::task::spawn_blocking(move || match name.as_str() {
+    let task = tokio::task::spawn_blocking(move || match name.as_str() {
             "list_dir" => list_dir(&root, &args),
             "read_file" => read_file(&root, &args),
             "write_file" => write_file(&root, &args),
@@ -346,7 +346,21 @@ pub async fn execute(
                 "unknown tool: {other}; the available tools are {}",
                 TOOL_NAMES.join(", ")
             )),
-        }) => result.unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}"))),
+        });
+    finish_file_task(task, mutating, cancel).await
+}
+
+async fn finish_file_task(
+    task: tokio::task::JoinHandle<ToolOutcome>,
+    mutating: bool,
+    cancel: Arc<CancelToken>,
+) -> ToolOutcome {
+    if mutating {
+        return task.await.unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}")));
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => ToolOutcome::err("tool cancelled by user"),
+        result = task => result.unwrap_or_else(|e| ToolOutcome::err(format!("tool execution failed: {e}"))),
     }
 }
 
@@ -510,18 +524,6 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
-fn leading_whitespace(s: &str) -> &str {
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        if matches!(c, ' ' | '\t') {
-            end = i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    &s[..end]
-}
-
 fn line_similarity(a: &str, b: &str) -> f64 {
     let a = a.trim();
     let b = b.trim();
@@ -562,54 +564,6 @@ fn closest_line_hint(content: &str, old_string: &str) -> String {
     )
 }
 
-fn find_trimmed_runs(file_lines: &[&str], old_lines: &[&str]) -> Vec<(usize, usize)> {
-    if old_lines.is_empty() {
-        return Vec::new();
-    }
-    let n = old_lines.len();
-    if file_lines.len() < n {
-        return Vec::new();
-    }
-    let mut runs = Vec::new();
-    for start in 0..=file_lines.len() - n {
-        if (0..n).all(|i| file_lines[start + i].trim() == old_lines[i].trim()) {
-            runs.push((start, start + n));
-        }
-    }
-    runs
-}
-
-fn reindent_new_string(new_string: &str, old_string: &str, file_first_matched_line: &str) -> String {
-    let old_base = leading_whitespace(old_string.lines().next().unwrap_or(""));
-    let file_base = leading_whitespace(file_first_matched_line);
-    new_string
-        .lines()
-        .map(|line| {
-            let content = line.trim_start();
-            if content.is_empty() && line.is_empty() {
-                return String::new();
-            }
-            let new_ws = leading_whitespace(line);
-            let rel = if new_ws.len() >= old_base.len() { &new_ws[old_base.len()..] } else { "" };
-            format!("{file_base}{rel}{content}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn replace_line_range(content: &str, start: usize, count: usize, replacement: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let had_trailing_nl = content.ends_with('\n');
-    let mut out: Vec<&str> = lines[..start].to_vec();
-    out.extend(replacement.lines());
-    out.extend_from_slice(&lines[start + count..]);
-    let mut result = out.join("\n");
-    if had_trailing_nl && !result.is_empty() {
-        result.push('\n');
-    }
-    result
-}
-
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let rel = args["path"].as_str().unwrap_or_default();
     let (Some(old_string), Some(new_string)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
@@ -628,7 +582,6 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         Err(e) => return ToolOutcome::err(format!("cannot read {rel}: {e}")),
     };
 
-    let mut fuzzy_match = false;
     let new = if old.contains(old_string) {
         let count = old.matches(old_string).count();
         if count > 1 && !replace_all {
@@ -642,33 +595,14 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
             old.replacen(old_string, new_string, 1)
         }
     } else {
-        let old_lines: Vec<&str> = old_string.lines().collect();
-        let file_lines: Vec<&str> = old.lines().collect();
-        let runs = find_trimmed_runs(&file_lines, &old_lines);
-        if runs.is_empty() {
-            return ToolOutcome::err(closest_line_hint(&old, old_string));
-        }
-        if runs.len() > 1 && !replace_all {
-            return ToolOutcome::err(format!(
-                "old_string matches {} locations with whitespace normalization; provide a longer unique string or set replace_all to true",
-                runs.len()
-            ));
-        }
-        fuzzy_match = true;
-        let mut updated = old.clone();
-        for (start, end) in runs.iter().rev() {
-            let reindented = reindent_new_string(new_string, old_string, file_lines[*start]);
-            updated = replace_line_range(&updated, *start, end - start, &reindented);
-        }
-        updated
+        return ToolOutcome::err(closest_line_hint(&old, old_string));
     };
 
     if let Err(e) = std::fs::write(&path, &new) {
         return ToolOutcome::err(format!("cannot write {rel}: {e}"));
     }
     let diff = make_diff(root, &path, &old, &new);
-    let suffix = if fuzzy_match { " [matched with whitespace normalization]" } else { "" };
-    let summary = format!("edited {} (+{} −{}){}", diff.path, diff.added, diff.removed, suffix);
+    let summary = format!("edited {} (+{} −{})", diff.path, diff.added, diff.removed);
     ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
@@ -1112,6 +1046,56 @@ pub(crate) fn describe_exit(status: &std::process::ExitStatus) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_started_file_mutation_settles_before_cancellation_returns() {
+        let root = temp_project();
+        let path = root.join("finished.txt");
+        let written = path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            std::fs::write(written, "settled").unwrap();
+            ToolOutcome::ok("written".into())
+        });
+        let cancel = Arc::new(CancelToken::default());
+        let mut settled = tokio::spawn(finish_file_task(task, true, cancel.clone()));
+        started_rx.await.unwrap();
+        cancel.cancel();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(50), &mut settled).await;
+        let waited = early.is_err();
+        release_tx.send(()).unwrap();
+        let outcome = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => settled.await.unwrap(),
+        };
+        assert!(waited, "cancellation must not detach a started mutation");
+        assert!(outcome.ok, "{}", outcome.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "settled");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edits_require_exact_whitespace_without_overlapping_fallbacks() {
+        let root = temp_project();
+        for (content, needle) in [
+            ("if ready:\n    run()\n", "if ready:\nrun()"),
+            ("items:\n  - first\n", "items:\n- first"),
+            ("\tfirst\n\tsecond\n", "first\nsecond"),
+            ("first\r\nsecond\r\n", "first\nsecond"),
+            (" a\n a\n a\n a\n", "a\na\na"),
+        ] {
+            std::fs::write(root.join("exact.txt"), content).unwrap();
+            let out = edit_file(&root, &json!({
+                "path": "exact.txt", "old_string": needle, "new_string": "changed", "replace_all": true
+            }));
+            assert!(!out.ok, "non-exact edit unexpectedly succeeded: {content:?}");
+            assert_eq!(std::fs::read_to_string(root.join("exact.txt")).unwrap(), content);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn temp_project() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("openmax-tools-{}", uuid::Uuid::new_v4()));
@@ -1697,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_tier2_whitespace_match_preserves_indent() {
+    fn an_exact_edit_preserves_surrounding_indentation() {
         let root = std::env::temp_dir().join(format!("openmax-edit-fuzzy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
@@ -1706,12 +1690,11 @@ mod tests {
             &root,
             &json!({
                 "path": "src.rs",
-                "old_string": "fn inner() {\n    old_value\n}",
-                "new_string": "fn inner() {\n    new_value\n}"
+                "old_string": "    fn inner() {\n        old_value\n    }",
+                "new_string": "    fn inner() {\n        new_value\n    }"
             }),
         );
         assert!(out.ok, "{}", out.output);
-        assert!(out.output.contains("[matched with whitespace normalization]"), "{}", out.output);
         let content = std::fs::read_to_string(root.join("src.rs")).unwrap();
         assert!(content.contains("        new_value\n"), "indent must be preserved: {content:?}");
         assert!(!content.contains("old_value"), "{}", content);
@@ -1719,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_tier2_ambiguity_error() {
+    fn an_exact_edit_rejects_ambiguous_matches() {
         let root = std::env::temp_dir().join(format!("openmax-edit-ambig-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
@@ -1732,13 +1715,12 @@ mod tests {
             &root,
             &json!({
                 "path": "dup.rs",
-                "old_string": "fn foo() {\n    a\n}",
-                "new_string": "fn foo() {\n    b\n}"
+                "old_string": "    fn foo() {\n        a\n    }",
+                "new_string": "    fn foo() {\n        b\n    }"
             }),
         );
         assert!(!out.ok, "{}", out.output);
-        assert!(out.output.contains("whitespace normalization"), "{}", out.output);
-        assert!(out.output.contains("2 locations"), "{}", out.output);
+        assert!(out.output.contains("matches 2 times"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 

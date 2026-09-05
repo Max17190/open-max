@@ -678,7 +678,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   providers.json overrides.
 - `max_output_bytes`: tool-output byte cap before tail-truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
-- `max_agent_tokens`: per-turn spend ceiling, admission-enforced.
+- `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
+  compaction summaries. An unaffordable summary uses the deterministic digest.
 - `max_agent_iterations`: tool/model iteration cap per turn (default 50).
 - `max_parallel_tools`: concurrent read-only tool cap, clamped 1..=32.
 

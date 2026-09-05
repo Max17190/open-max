@@ -100,13 +100,11 @@ pub struct Settings {
     /// admission: a request goes out only when what the turn has spent plus
     /// the request's own estimated size still fits, so the ceiling refuses
     /// the request it cannot afford instead of the one after it. The reply
-    /// side is not reserved, so the last admitted request may run past the
-    /// cap by at most `max_tokens`; a cap the first request cannot fit ends
-    /// the turn before it spends anything.
-    /// A compaction summary is not charged here: it is housekeeping that makes
-    /// the next request smaller, and refusing a turn for it would spend the
-    /// ceiling on the thing that was saving it. None means no ceiling (the
-    /// behavior every existing settings.json has today).
+    /// side is not reserved. Output tokens and input-estimation error can
+    /// exceed the cap; a request whose estimate cannot fit is withheld.
+    /// Compaction summaries share this ceiling. When a summary cannot fit,
+    /// compaction keeps its deterministic digest and makes no summary request.
+    /// None means no ceiling.
     pub max_agent_tokens: Option<usize>,
     /// Cap on agent tool/model iterations per turn (main loop).
     #[serde(default = "default_max_agent_iterations")]

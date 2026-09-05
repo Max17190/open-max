@@ -120,6 +120,10 @@ pub enum StreamDelta {
 /// instead of `stop` so a cut-off reply cannot pass for a finished one.
 pub const TRUNCATED: &str = "truncated";
 
+// Bound wire input, including reasoning, unterminated lines, and tool arguments.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 128;
+
 pub struct CompletionResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
@@ -379,7 +383,10 @@ impl ChatClient {
                 break resp;
             }
             let code = status.as_u16();
-            let text = resp.text().await.unwrap_or_default();
+            let body = read_body(resp, &cancelled).await
+                .map_err(|e| format!("backend returned {status}: {e}"))?;
+            let Some(body) = body else { return Ok(cancelled_response()); };
+            let text = String::from_utf8_lossy(&body);
             let err = format!("backend returned {status}: {}", describe_backend(&text));
             if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
                 backoff_sleep(attempt).await;
@@ -403,7 +410,8 @@ impl ChatClient {
 
         // Some servers ignore `stream` and return a complete JSON body.
         if is_json {
-            let v: Value = resp.json().await.map_err(|e| format!("bad JSON response: {e}"))?;
+            let Some(body) = read_body(resp, &cancelled).await? else { return Ok(cancelled_response()); };
+            let v: Value = serde_json::from_slice(&body).map_err(|e| format!("bad JSON response: {e}"))?;
             return parse_complete_response(&v, &mut on_delta);
         }
 
@@ -420,6 +428,8 @@ impl ChatClient {
         // multi-byte sequence).
         let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
+        let mut received = 0usize;
+        let mut scanned = 0usize;
 
         'outer: loop {
             let next = tokio::select! {
@@ -430,10 +440,20 @@ impl ChatClient {
                 }
             };
             let Some(chunk) = next else { break };
-            let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
+            let chunk = match chunk {
+                Ok(chunk) if chunk.len() <= MAX_RESPONSE_BYTES - received => chunk,
+                _ => {
+                    saw_terminator = false;
+                    finish_reason = TRUNCATED.into();
+                    break;
+                }
+            };
+            received += chunk.len();
             buf.extend_from_slice(&chunk);
 
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            while let Some(rel) = buf[scanned..].iter().position(|&b| b == b'\n') {
+                let pos = scanned + rel;
+                scanned = 0;
                 let rest = buf.split_off(pos + 1);
                 let consumed = std::mem::replace(&mut buf, rest);
                 let line = trim_bytes(&consumed[..pos]);
@@ -478,6 +498,11 @@ impl ChatClient {
                 if let Some(calls) = delta.tool_calls {
                     for tc in calls {
                         let idx = tc.index.unwrap_or(0) as usize;
+                        if idx >= MAX_TOOL_CALLS {
+                            saw_terminator = false;
+                            finish_reason = TRUNCATED.into();
+                            break 'outer;
+                        }
                         while partials.len() <= idx {
                             partials.push(PartialToolCall::default());
                         }
@@ -495,6 +520,7 @@ impl ChatClient {
                     }
                 }
             }
+            scanned = buf.len();
         }
 
         // The stream ran out without the server ever finishing it: report the
@@ -510,6 +536,51 @@ impl ChatClient {
         }
         Ok(CompletionResult { content, tool_calls, finish_reason, usage })
     }
+}
+
+fn cancelled_response() -> CompletionResult {
+    CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into(), usage: None }
+}
+
+async fn read_body(
+    resp: reqwest::Response,
+    cancelled: &crate::state::CancelToken,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            _ = cancelled.cancelled() => return Ok(None),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else { return Ok(Some(body)); };
+        let chunk = chunk.map_err(|e| format!("response body failed: {e}"))?;
+        if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+            return Err(format!("response exceeded {MAX_RESPONSE_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+/// Strip a leaked leading reasoning block from assistant content. Serving
+/// layers normally split reasoning into `reasoning_content`, but when template
+/// coverage lags a model the raw `<think>…</think>` block arrives in
+/// `content`. Persisting it would re-prefill dead reasoning tokens on every
+/// subsequent turn. Handles an unterminated block (stream cut mid-thought) by
+/// treating the rest of the message as reasoning. Returns None when there is
+/// nothing to strip.
+pub(crate) fn strip_leading_think(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        if let Some(body) = trimmed.strip_prefix(open) {
+            let rest = match body.find(close) {
+                Some(i) => &body[i + close.len()..],
+                None => "",
+            };
+            return Some(rest.trim_start().to_string());
+        }
+    }
+    None
 }
 
 fn trim_bytes(mut s: &[u8]) -> &[u8] {
@@ -545,6 +616,9 @@ fn parse_complete_response(
     }
     let mut partials = Vec::new();
     if let Some(calls) = msg["tool_calls"].as_array() {
+        if calls.len() > MAX_TOOL_CALLS {
+            return Err(format!("response exceeded {MAX_TOOL_CALLS} tool calls"));
+        }
         for tc in calls {
             partials.push(PartialToolCall {
                 id: tc["id"].as_str().unwrap_or("").to_string(),
@@ -646,6 +720,29 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn leading_think_block_is_stripped() {
+        assert_eq!(
+            strip_leading_think("<think>hmm, let me see</think>\nThe answer is 4.").as_deref(),
+            Some("The answer is 4.")
+        );
+        assert_eq!(
+            strip_leading_think("  <thinking>pondering</thinking>done").as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn unterminated_think_block_consumes_the_rest() {
+        assert_eq!(strip_leading_think("<think>cut off mid-").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn think_tag_mid_message_is_left_alone() {
+        assert!(strip_leading_think("The `<think>` tag is used by Qwen3.").is_none());
+        assert!(strip_leading_think("plain answer").is_none());
+    }
+
+    #[test]
     fn trim_bytes_strips_whitespace() {
         assert_eq!(trim_bytes(b"  hello \r"), b"hello");
     }
@@ -688,7 +785,11 @@ mod tests {
     /// Content-Length, so the body ends at EOF) and then drops the connection.
     /// That is exactly what a provider dying mid-stream looks like on the wire:
     /// the transfer is well-formed, only the completion signal is missing.
-    fn spawn_sse_once(sse: &'static str) -> String {
+    fn spawn_sse_once(sse: &str) -> String {
+        spawn_response_once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"), None)
+    }
+
+    fn spawn_response_once(response: String, hold: Option<std::sync::mpsc::Receiver<()>>) -> String {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -716,18 +817,14 @@ mod tests {
             if content_length > 0 && stream.read_exact(&mut body).is_err() {
                 return;
             }
-            let _ = stream.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
-                )
-                .as_bytes(),
-            );
+            let _ = stream.write_all(response.as_bytes());
+            if let Some(hold) = hold { let _ = hold.recv(); }
             // Dropping the socket ends the body: the client sees a plain EOF.
         });
         format!("http://{addr}/v1")
     }
 
-    async fn stream_once(sse: &'static str) -> CompletionResult {
+    async fn stream_once(sse: &str) -> CompletionResult {
         let client = ChatClient::new(spawn_sse_once(sse), None, "m".into(), 0.0, 64);
         client
             .stream_chat(
@@ -738,6 +835,47 @@ mod tests {
             )
             .await
             .expect("a close-delimited body is not a transport error")
+    }
+
+    #[tokio::test]
+    async fn response_bodies_observe_cancellation() {
+        for status in ["200 OK", "400 Bad Request"] {
+            let (release, hold) = std::sync::mpsc::channel();
+            let url = spawn_response_once(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 10000\r\n\r\n{{"), Some(hold));
+            let cancelled = Arc::new(crate::state::CancelToken::default());
+            let task_cancel = cancelled.clone();
+            let mut task = tokio::spawn(async move {
+                ChatClient::new(url, None, "m".into(), 0.0, 64)
+                    .stream_chat(&[ChatMessage::user("hi")], "[]", task_cancel, |_| {}).await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancelled.cancel();
+            let result = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task).await;
+            let _ = release.send(());
+            assert_eq!(result.expect("body cancellation must finish promptly").unwrap().unwrap().finish_reason, "cancelled");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_keeps_partial_text() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"keep this\"}}]}\n\n";
+        let url = spawn_response_once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\n{body}"), None);
+        let result = ChatClient::new(url, None, "m".into(), 0.0, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+        assert_eq!(result.content, "keep this");
+        assert_eq!(result.finish_reason, TRUNCATED);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_stream_is_refused() {
+        let body = format!("{}\ndata: [DONE]\n\n", "x".repeat(17 * 1024 * 1024));
+        assert_eq!(stream_once(&body).await.finish_reason, TRUNCATED);
+    }
+
+    #[tokio::test]
+    async fn an_out_of_bounds_tool_index_is_refused() {
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":128,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(stream_once(body).await.finish_reason, TRUNCATED);
     }
 
     /// The bug this guards: a server that dies mid-answer sends neither

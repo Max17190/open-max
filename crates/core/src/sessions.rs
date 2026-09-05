@@ -233,10 +233,8 @@ pub fn compaction_display(core: &Core, id: &str) -> String {
 /// Append the messages a prune dropped (or truncated in place), oldest
 /// first, one JSON line each. The transcript rewrite that follows the prune
 /// is destructive; this file is the lossless record behind the digest note's
-/// address. Best-effort like `append_compaction`: a failure warns and the
-/// prune proceeds, because fitting the window beats archiving what no longer
-/// fits in it - but the caller gets `false` so the note never advertises an
-/// address the archive does not honor.
+/// address. A failure warns and returns false; compaction must retain the
+/// original transcript until this preservation step succeeds.
 pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
         return true;
@@ -541,11 +539,11 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 /// its digest note at index 2, and that digest summarizes the dropped
 /// earlier sittings, so a boundary that collapses lands AFTER the digest
 /// (index 3), never on or before it; duplicates that result are dropped.
-pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
+pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) -> Result<(), String> {
     if removed == 0 {
-        return;
+        return Ok(());
     }
-    let _ = with_index(core, |metas| {
+    with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             let mut shifted: Vec<u64> = m
                 .resume_points
@@ -556,7 +554,7 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
             shifted.dedup();
             m.resume_points = shifted;
         }
-    });
+    })
 }
 
 /// One message was inserted at index `at`, so the transcript grows by exactly
@@ -564,8 +562,8 @@ pub fn shift_resume_points_for_prune(core: &Core, id: &str, removed: u64) {
 /// of `shift_resume_points_for_prune`, which only ever handles shrinkage. A
 /// truncation-only prune inserts its note at 2; hydration of a transcript
 /// saved without its system prompt inserts that prompt at 0.
-pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) {
-    let _ = with_index(core, |metas| {
+pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
+    with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
             for p in &mut m.resume_points {
                 if *p >= at {
@@ -573,7 +571,7 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) {
                 }
             }
         }
-    });
+    })
 }
 
 /// Record that a new sitting resumed this session with `message_index`
@@ -809,7 +807,7 @@ mod tests {
         // A prune removed a net 3 messages above the pinned prefix: the
         // deep boundary shifts, the shallow one collapses onto the floor,
         // and the pinned-prefix boundary is untouched.
-        shift_resume_points_for_prune(&core, id, 3);
+        shift_resume_points_for_prune(&core, id, 3).unwrap();
         // The prune that fires this shift also inserted its digest note at
         // index 2; collapsed boundaries land after it, never on it.
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 7]);
@@ -829,10 +827,10 @@ mod tests {
         record_resume_point(&core, id, 3);
         record_resume_point(&core, id, 7);
 
-        shift_resume_points_for_insert(&core, id, 2);
+        shift_resume_points_for_insert(&core, id, 2).unwrap();
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![1, 4, 8]);
         // An insert at the very front moves every boundary.
-        shift_resume_points_for_insert(&core, id, 0);
+        shift_resume_points_for_insert(&core, id, 0).unwrap();
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![2, 5, 9]);
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -14,6 +14,9 @@
 
 Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at the model server you choose: local, cloud, or a private proxy. No desktop shell, no heavyweight runtime, no telemetry.
 
+The endpoint must return structured API `tool_calls` to use tools. For local servers, configure the model's tool parser and chat template. Call markup in assistant text is displayed as text and never executed. Responses are limited to 16 MiB and 128 tool calls.
+
+
 You own the endpoints, the tools, the skills, and the context.
 
 ## Features
