@@ -1266,7 +1266,6 @@ pub fn start_turn(
             project_root.display()
         ));
     }
-    sessions::recover_compaction(&core)?;
     let cancelled = Arc::new(CancelToken::default());
     {
         // `running` is the outer lock for both pieces of turn state. Claiming

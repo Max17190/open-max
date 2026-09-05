@@ -14,8 +14,9 @@
 //! when the transcript is rewritten: whatever a prune removed was already
 //! appended to the archive, which is append-only.
 //!
-//! Compaction commits are recoverable as a unit through an undo record.
-//! Other writes are best-effort and loud: a failed append surfaces as an agent
+//! A compaction commits its writes in the one order that keeps history whole
+//! at every cut (`commit_compaction`). Other writes are best-effort and loud:
+//! a failed append surfaces as an agent
 //! warning rather than aborting a turn, since losing accounting must not cost
 //! the user their work. The one thing that is not best-effort is ordering
 //! against deletion. Every writer re-checks under `sessions_lock` that the
@@ -511,94 +512,9 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
-/// One undo record under the index lock. Its presence means no compaction
-/// receipt has been committed. Recovery restores every file before allowing
-/// another transcript or index operation, including in a new process.
-#[derive(Serialize, Deserialize)]
-struct CompactionUndo {
-    id: String,
-    messages: Option<Vec<u8>>,
-    archive_len: Option<u64>,
-    record_len: Option<u64>,
-    resume_points: Vec<u64>,
-}
-
-fn pending_compaction_path(core: &Core) -> PathBuf {
-    sessions_dir(core).join("compaction.pending.json")
-}
-
-fn optional_bytes(path: &PathBuf) -> Result<Option<Vec<u8>>, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-    }
-}
-
-fn optional_len(path: &PathBuf) -> Result<Option<u64>, String> {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
-        Ok(_) => Err(format!("{} is not a regular file", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-fn remove_if_present(path: &PathBuf) -> Result<(), String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-fn restore_tail(path: &PathBuf, len: Option<u64>) -> Result<(), String> {
-    let Some(len) = len else { return remove_if_present(path); };
-    let actual = optional_len(path)?.ok_or("compaction recovery file is missing")?;
-    if actual == len { return Ok(()); }
-    if actual < len {
-        return Err(format!("{} lost its original prefix", path.display()));
-    }
-    std::fs::OpenOptions::new().write(true).open(path)
-        .and_then(|file| file.set_len(len)).map_err(|e| e.to_string())
-}
-
-fn recover_compaction_locked(core: &Core) -> Result<(), String> {
-    let Some(bytes) = optional_bytes(&pending_compaction_path(core))? else { return Ok(()); };
-    let undo: CompactionUndo = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("invalid compaction recovery record: {e}"))?;
-    let mut metas = match read_index(core) {
-        IndexRead::Loaded(metas) => metas,
-        _ => return Err("compaction recovery requires a readable session index".into()),
-    };
-    let meta = metas.iter_mut().find(|m| m.id == undo.id)
-        .ok_or("compaction recovery session is missing from the index")?;
-    let index_changed = meta.resume_points != undo.resume_points;
-    meta.resume_points = undo.resume_points;
-    // Free incomplete appends first. An unchanged file needs no replacement,
-    // which lets a failed append recover even when disk space is exhausted.
-    restore_tail(&archive_path(core, &undo.id), undo.archive_len)?;
-    restore_tail(&compaction_path(core, &undo.id), undo.record_len)?;
-    if optional_bytes(&messages_path(core, &undo.id))? != undo.messages {
-        match undo.messages {
-            Some(bytes) => write_atomic(&messages_path(core, &undo.id), bytes)?,
-            None => remove_if_present(&messages_path(core, &undo.id))?,
-        }
-    }
-    if index_changed { save_index(core, &metas)?; }
-    remove_if_present(&pending_compaction_path(core))
-}
-
-/// Resolve an interrupted compaction before a turn reads its conversation.
-pub(crate) fn recover_compaction(core: &Core) -> Result<(), String> {
-    let _store = lock_store(core)?;
-    Ok(())
-}
-
 fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, ()>, std::fs::File), String> {
     let guard = core.sessions_lock.lock().unwrap();
     let flock = lock_index(core)?;
-    recover_compaction_locked(core)?;
     Ok((guard, flock))
 }
 
@@ -618,11 +534,21 @@ fn shifted_resume_points(points: &[u64], before: usize, after: usize) -> Vec<u64
 #[cfg(test)]
 thread_local! {
     static FAIL_COMPACTION_INDEX_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_COMPACTION_TRANSCRIPT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Commit archive, digest, transcript, and boundaries under one store lock.
-/// On failure the undo record restores the prior generation. If restoration
-/// also fails, the record remains and later store access retries recovery.
+/// Commit archive, digest record, replay boundaries, and transcript under one
+/// store lock, in the order that keeps history whole at every cut. The archive
+/// gains its lines before the transcript loses them, and the transcript is
+/// replaced atomically, so neither a failure nor a crash can drop a message
+/// that is not already on disk. Every failure leaves the live transcript and
+/// its boundaries as they were: an append or the index write fails before the
+/// transcript is touched, and a transcript rewrite that fails after the index
+/// moved puts the boundaries back. What a failed attempt can leave behind is
+/// an archive line and a digest record for a prune that then did not happen,
+/// duplicates of what the transcript still holds, which the readers tolerate
+/// (`--recall` deduplicates, `last_compaction` takes the newest), and a torn
+/// line the next append steps over (`append_text`).
 pub(crate) fn commit_compaction(
     core: &Core,
     id: &str,
@@ -637,40 +563,42 @@ pub(crate) fn commit_compaction(
         IndexRead::Loaded(metas) => metas,
         _ => return Err("compaction requires a readable session index".into()),
     };
-    let meta = metas.iter_mut().find(|m| m.id == id).ok_or("compaction session was deleted")?;
+    let pos = metas.iter().position(|m| m.id == id).ok_or("compaction session was deleted")?;
     load_messages_locked(core, id)?;
-    let undo = CompactionUndo {
-        id: id.to_string(),
-        messages: optional_bytes(&messages_path(core, id))?,
-        archive_len: optional_len(&archive_path(core, id))?,
-        record_len: optional_len(&compaction_path(core, id))?,
-        resume_points: meta.resume_points.clone(),
-    };
-    meta.resume_points = shifted_resume_points(&meta.resume_points, before_len, messages.len());
-    write_atomic(&pending_compaction_path(core), serde_json::to_vec(&undo).map_err(|e| e.to_string())?)?;
-    let result = (|| {
-        if !archive.is_empty() { append_jsonl(&archive_path(core, id), archive)?; }
-        if let Some(record) = record {
-            let line = serde_json::to_string(record).map_err(|e| e.to_string())?;
-            let mut file = std::fs::OpenOptions::new().create(true).append(true)
-                .open(compaction_path(core, id)).map_err(|e| e.to_string())?;
-            writeln!(file, "{line}").map_err(|e| e.to_string())?;
-        }
-        write_jsonl(&messages_path(core, id), messages)?;
-        #[cfg(test)]
-        if FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.replace(false)) {
-            return Err("injected compaction index failure".into());
-        }
-        save_index(core, &metas)?;
-        remove_if_present(&pending_compaction_path(core))
-    })();
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => match recover_compaction_locked(core) {
-            Ok(()) => Err(error),
-            Err(recovery) => Err(format!("{error}; compaction recovery is pending: {recovery}")),
-        },
+    if !archive.is_empty() {
+        append_jsonl(&archive_path(core, id), archive)?;
     }
+    if let Some(record) = record {
+        let mut line = serde_json::to_string(record).map_err(|e| e.to_string())?;
+        line.push('\n');
+        append_text(&compaction_path(core, id), &line)?;
+    }
+    let before = metas[pos].resume_points.clone();
+    metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len());
+    #[cfg(test)]
+    if FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.replace(false)) {
+        return Err("injected compaction index failure".into());
+    }
+    save_index(core, &metas)?;
+    #[cfg(test)]
+    let transcript_written = if FAIL_COMPACTION_TRANSCRIPT_WRITE.with(|fail| fail.replace(false)) {
+        Err("injected compaction transcript failure".to_string())
+    } else {
+        write_jsonl(&messages_path(core, id), messages)
+    };
+    #[cfg(not(test))]
+    let transcript_written = write_jsonl(&messages_path(core, id), messages);
+    if let Err(error) = transcript_written {
+        // The boundaries moved for a prune that did not land: put them back,
+        // and say so if even that write fails, since a boundary that stays
+        // shifted renders a replay divider early until the next prune.
+        metas[pos].resume_points = before;
+        return Err(match save_index(core, &metas) {
+            Ok(()) => error,
+            Err(restore) => format!("{error}; the replay boundaries could not be restored either: {restore}"),
+        });
+    }
+    Ok(())
 }
 
 /// Write `bytes` via a unique same-directory temp file + rename so readers
@@ -716,7 +644,6 @@ fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
 }
 
 fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
-    use std::io::{Read, Seek, SeekFrom};
     // Serialize the whole tail first, then one write. Callers must heal on
     // failure (rewrite the full file) so a partial write cannot be re-appended
     // and duplicate complete lines when `persisted` is left unchanged.
@@ -725,20 +652,34 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> 
         buf.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
         buf.push('\n');
     }
+    append_text(path, &buf)
+}
+
+/// Append whole lines to a JSONL file, starting on a fresh line. A complete
+/// record need not end in a newline (a crash or a full disk can cut the
+/// terminator), and appending straight after it would glue the next record
+/// onto that line: every reader skips a line that does not parse, so a
+/// record that was just written, and just dropped from the transcript, would
+/// be lost with the fragment. One newline first keeps the loss to the
+/// fragment, which was never a complete record.
+fn append_text(path: &PathBuf, text: &str) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .read(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    // A complete JSON record need not end in a newline. Separate the next
-    // record rather than turning two valid messages into one damaged line.
+    let mut buf = String::with_capacity(text.len() + 1);
     if file.metadata().map_err(|e| e.to_string())?.len() > 0 {
         file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
         let mut last = [0u8];
         file.read_exact(&mut last).map_err(|e| e.to_string())?;
-        if last[0] != b'\n' { buf.insert(0, '\n'); }
+        if last[0] != b'\n' {
+            buf.push('\n');
+        }
     }
+    buf.push_str(text);
     file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
     file.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -1061,112 +1002,76 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
 mod tests {
     use super::*;
 
+    /// Every write that can fail before the transcript rewrite leaves the
+    /// live transcript and its replay boundaries exactly as they were. What a
+    /// failed attempt may leave behind is an archive line and a digest record
+    /// for a prune that did not happen: duplicates the retry repeats and the
+    /// readers tolerate, never a loss.
     #[test]
-    fn interrupted_compaction_restores_each_write_stage_before_retry() {
-        for stage in 0..=4 {
-            let dir = std::env::temp_dir().join(format!("openmax-compaction-recover-{}", uuid::Uuid::new_v4()));
-            let (core, _rx) = Core::new(dir.clone()).unwrap();
-            let id = create(&core, "project".into()).unwrap().id;
-            let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"),
-                ChatMessage::assistant(Some("reply".into()), None), ChatMessage::user("second"),
-                ChatMessage::assistant(Some("last reply".into()), None)];
-            assert!(save_messages(&core, &id, &original, &mut 0, true));
-            record_resume_point(&core, &id, 4);
-            append_archive(&core, &id, &[ChatMessage::user("prior archive")]);
-            let record = CompactionRecord { ts: 1, message_count: 3, tools: vec![], paths: vec![], user_snippets: vec![], digest: "digest".into() };
-            append_compaction(&core, &id, &record);
-            let original_archive = std::fs::read(archive_path(&core, &id)).unwrap();
-            let original_records = std::fs::read(compaction_path(&core, &id)).unwrap();
-            let candidate = vec![original[0].clone(), original[1].clone(), ChatMessage::user("digest")];
-            let undo = CompactionUndo {
-                id: id.clone(), messages: optional_bytes(&messages_path(&core, &id)).unwrap(),
-                archive_len: optional_len(&archive_path(&core, &id)).unwrap(),
-                record_len: optional_len(&compaction_path(&core, &id)).unwrap(), resume_points: vec![4],
-            };
-            write_atomic(&pending_compaction_path(&core), serde_json::to_vec(&undo).unwrap()).unwrap();
-            // These are the on-disk states left by a process exiting between
-            // commit writes. Include torn appends to exercise exact truncation.
-            if stage >= 1 {
-                append_jsonl(&archive_path(&core, &id), &original[2..]).unwrap();
-                std::fs::OpenOptions::new().append(true).open(archive_path(&core, &id)).unwrap()
-                    .write_all(b"{torn archive").unwrap();
-            }
-            if stage >= 2 {
-                std::fs::OpenOptions::new().append(true).open(compaction_path(&core, &id)).unwrap()
-                    .write_all(b"{torn record").unwrap();
-            }
-            if stage >= 3 { write_jsonl(&messages_path(&core, &id), &candidate).unwrap(); }
-            if stage >= 4 {
-                let mut metas = match read_index(&core) { IndexRead::Loaded(metas) => metas, _ => panic!("index") };
-                metas[0].resume_points = vec![3];
-                save_index(&core, &metas).unwrap();
-            }
-            drop(core);
-            let (core, _rx) = Core::new(dir.clone()).unwrap();
-            assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap(), "stage {stage}");
-            assert_eq!(std::fs::read(archive_path(&core, &id)).unwrap(), original_archive, "stage {stage}");
-            assert_eq!(std::fs::read(compaction_path(&core, &id)).unwrap(), original_records, "stage {stage}");
-            assert_eq!(meta(&core, &id).unwrap().resume_points, vec![4]);
-            assert!(!pending_compaction_path(&core).exists());
-            commit_compaction(&core, &id, &candidate, &original[2..], Some(&record), original.len()).unwrap();
-            assert_eq!(load_archive(&core, &id).len(), 4, "retry appends each archived message once");
-            assert_eq!(load_compaction(&core, &id).len(), 2);
-            assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3]);
-            assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&candidate).unwrap());
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn a_failed_compaction_index_commit_rolls_back_all_files() {
-        let dir = std::env::temp_dir().join(format!("openmax-compaction-rollback-{}", uuid::Uuid::new_v4()));
+    fn an_index_write_failure_leaves_the_transcript_untouched() {
+        let dir = std::env::temp_dir().join(format!("openmax-compaction-index-failure-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = create(&core, "project".into()).unwrap().id;
-        let original = vec![ChatMessage::user("original")];
+        let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
         assert!(save_messages(&core, &id, &original, &mut 0, true));
-        let record = CompactionRecord { ts: 1, message_count: 1, tools: vec![], paths: vec![], user_snippets: vec![], digest: "digest".into() };
-        let candidate = vec![ChatMessage::user("candidate")];
+        record_resume_point(&core, &id, 3);
+        let record = CompactionRecord { ts: 1, message_count: 2, tools: vec![], paths: vec![], user_snippets: vec![], digest: "digest".into() };
+        let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
         FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.set(true));
-        assert!(commit_compaction(&core, &id, &candidate, &original, Some(&record), original.len()).is_err());
-        // Read raw files so this assertion cannot trigger recovery itself.
+        assert!(commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len()).is_err());
         let bytes = std::fs::read_to_string(messages_path(&core, &id)).unwrap();
-        assert!(bytes.contains("original") && !bytes.contains("candidate"), "{bytes}");
-        assert!(!archive_path(&core, &id).exists());
-        assert!(!compaction_path(&core, &id).exists());
-        assert!(!pending_compaction_path(&core).exists());
-        commit_compaction(&core, &id, &candidate, &original, Some(&record), original.len()).unwrap();
-        assert_eq!(load_archive(&core, &id).len(), 1);
-        assert_eq!(load_compaction(&core, &id).len(), 1);
+        assert!(bytes.contains("first") && !bytes.contains("digest"), "{bytes}");
+        assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3]);
+        commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len()).unwrap();
+        let archived: Vec<String> = load_archive(&core, &id).into_iter().filter_map(|m| m.content).collect();
+        assert!(archived.ends_with(&["first".to_string(), "second".to_string()]), "the retry archives what it drops: {archived:?}");
+        assert_eq!(last_compaction(&core, &id).unwrap().digest, "digest");
+        assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&candidate).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The index moves before the transcript does, so a transcript rewrite
+    /// that fails has to put the boundaries back, or a replay renders a
+    /// divider early for a prune that never landed.
     #[test]
-    fn failed_compaction_recovery_blocks_further_writes() {
-        let dir = std::env::temp_dir().join(format!("openmax-recovery-blocked-{}", uuid::Uuid::new_v4()));
+    fn a_transcript_write_failure_restores_the_replay_boundaries() {
+        let dir = std::env::temp_dir().join(format!("openmax-compaction-transcript-failure-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         let id = create(&core, "project".into()).unwrap().id;
-        let original = vec![ChatMessage::user("original")];
+        let mut original = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
+        for i in 0..6 {
+            original.push(ChatMessage::user(format!("message {i}")));
+        }
+        assert!(save_messages(&core, &id, &original, &mut 0, true));
+        record_resume_point(&core, &id, 6);
+        let candidate = vec![original[0].clone(), original[1].clone(), ChatMessage::user("digest"), original[7].clone()];
+        FAIL_COMPACTION_TRANSCRIPT_WRITE.with(|fail| fail.set(true));
+        assert!(commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len()).is_err());
+        assert_eq!(meta(&core, &id).unwrap().resume_points, vec![6], "boundaries restored");
+        assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
+        commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len()).unwrap();
+        assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3], "boundaries shift with the prune that landed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A crash or a full disk can leave the archive ending in a torn record
+    /// with no newline. The next commit must start on a fresh line, or its
+    /// first record is glued to the fragment and both are unreadable, and
+    /// that record was just dropped from the transcript: history lost.
+    #[test]
+    fn a_torn_archive_tail_never_swallows_the_next_record() {
+        let dir = std::env::temp_dir().join(format!("openmax-torn-archive-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "project".into()).unwrap().id;
+        let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
         assert!(save_messages(&core, &id, &original, &mut 0, true));
         append_archive(&core, &id, &[ChatMessage::user("prior")]);
-        let undo = CompactionUndo {
-            id: id.clone(), messages: optional_bytes(&messages_path(&core, &id)).unwrap(),
-            archive_len: optional_len(&archive_path(&core, &id)).unwrap(), record_len: None,
-            resume_points: vec![],
-        };
-        write_atomic(&pending_compaction_path(&core), serde_json::to_vec(&undo).unwrap()).unwrap();
-        append_jsonl(&archive_path(&core, &id), &[ChatMessage::user("uncommitted")]).unwrap();
-        write_jsonl(&messages_path(&core, &id), &[ChatMessage::user("candidate")]).unwrap();
-        let path = archive_path(&core, &id);
-        let backup = path.with_extension("backup");
-        std::fs::rename(&path, &backup).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        assert!(!save_messages(&core, &id, &[ChatMessage::user("must not persist")], &mut 1, true));
-        assert!(pending_compaction_path(&core).exists());
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::rename(&backup, &path).unwrap();
-        assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
-        assert_eq!(load_archive(&core, &id).len(), 1);
-        assert!(!pending_compaction_path(&core).exists());
+        std::fs::OpenOptions::new().append(true).open(archive_path(&core, &id)).unwrap()
+            .write_all(b"{\"role\":\"user\",\"content\":\"torn").unwrap();
+        let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
+        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len()).unwrap();
+        let archived: Vec<String> = load_archive(&core, &id).into_iter().filter_map(|m| m.content).collect();
+        assert_eq!(archived, ["prior", "first", "second"], "every dropped message reads back");
         let _ = std::fs::remove_dir_all(dir);
     }
 
