@@ -54,6 +54,7 @@ use crate::tools;
 use crate::types::{estimate_tokens, AgentEvent, ChatMessage, ToolCall};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
+const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
 /// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
 /// with no perceptible latency.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
@@ -611,86 +612,93 @@ async fn execute_readonly_batch(
 ) -> bool {
     let mut parsed: Vec<Value> = Vec::with_capacity(calls.len());
     let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
-    'admit: loop {
-        blocked.clear();
-        for (index, call) in calls.iter().enumerate() {
-            let name = call.function.name.as_str();
-            // batchable_call already validated the JSON; Null (impossible) would
-            // just surface as a missing-argument tool error.
-            let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-            if index == parsed.len() {
-                parsed.push(args.clone());
-                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
-                    call_id: call.id.clone(),
-                    name: name.into(),
-                    args: args.clone(),
+    for call in calls {
+        let name = call.function.name.as_str();
+        // batchable_call already validated the JSON; Null (impossible) would
+        // just surface as a missing-argument tool error.
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        parsed.push(args.clone());
+        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
+            call_id: call.id.clone(),
+            name: name.into(),
+            args: args.clone(),
+        });
+        // hooks pre → permissions → content gate. approval_mode is skipped
+        // because batchable_call excludes mutating tools.
+        let mode = *ctx.policy_mode;
+        let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
+        refresh_approval_policy(ctx.core, ctx.session_id, ctx.project_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
+        if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
+            // Nothing has executed. Refuse the batch without replaying hooks,
+            // which may have side effects even for a non-mutating tool.
+            for (index, pending) in calls.iter().enumerate() {
+                if index >= parsed.len() {
+                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
+                        call_id: pending.id.clone(),
+                        name: pending.function.name.clone(),
+                        args: serde_json::from_str(&pending.function.arguments).unwrap_or(Value::Null),
+                    });
+                }
+                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
+                    call_id: pending.id.clone(), ok: false, output: POLICY_CHANGED_DURING_HOOK.into(),
                 });
+                messages.push(ChatMessage::tool(pending.id.clone(), format!("Error: {POLICY_CHANGED_DURING_HOOK}")));
             }
-            // hooks pre → permissions → content gate. approval_mode is skipped
-            // because batchable_call excludes mutating tools.
-            let mode = *ctx.policy_mode;
-            let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
-            refresh_approval_policy(ctx.core, ctx.session_id, ctx.project_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
-            if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
-                // No call has run yet. Re-admit the whole batch so a selection
-                // during a later hook also invalidates earlier admissions.
-                continue 'admit;
+            return false;
+        }
+        let block = match pre {
+            PreToolResult::Block { reason } => Some(tools::ToolOutcome {
+                ok: false,
+                output: reason,
+                diff: None, ..Default::default()
+            }),
+            PreToolResult::Cancelled => {
+                // Close every ToolStart already emitted in this batch so the
+                // transcript stays well-formed, then stop the turn.
+                for prior in calls.iter().take(parsed.len()) {
+                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
+                        call_id: prior.id.clone(),
+                        ok: false,
+                        output: "cancelled".to_string(),
+                    });
+                    messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
+                }
+                return true;
             }
-            let block = match pre {
-                PreToolResult::Block { reason } => Some(tools::ToolOutcome {
+            PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
+                PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
                     ok: false,
                     output: reason,
                     diff: None, ..Default::default()
                 }),
-                PreToolResult::Cancelled => {
-                    // Close every ToolStart already emitted in this batch so the
-                    // transcript stays well-formed, then stop the turn.
-                    for prior in calls.iter().take(parsed.len()) {
-                        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                            call_id: prior.id.clone(),
-                            ok: false,
-                            output: "cancelled".to_string(),
-                        });
-                        messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
-                    }
-                    return true;
-                }
-                PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
-                    PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
-                        ok: false,
-                        output: reason,
-                        diff: None, ..Default::default()
-                    }),
-                    // Ask is excluded from batching (see batchable_call); if it
-                    // still lands here outside auto, refuse the batch call.
-                    PermissionDecision::Ask if ctx.core.approval_mode(ctx.project_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
-                        ok: false,
-                        output: "permission rule requires approval; re-run outside a concurrent batch"
-                            .into(),
-                        diff: None, ..Default::default()
-                    }),
-                    // Allow/Default: readonly batch tools are non-mutating.
-                    PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
+                // Ask is excluded from batching (see batchable_call); if it
+                // still lands here outside auto, refuse the batch call.
+                PermissionDecision::Ask if ctx.core.approval_mode(ctx.project_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
+                    ok: false,
+                    output: "permission rule requires approval; re-run outside a concurrent batch"
+                        .into(),
+                    diff: None, ..Default::default()
+                }),
+                // Allow/Default: readonly batch tools are non-mutating.
+                PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
+            },
+        };
+        // Unapproved content is excluded from batching (see batchable_call) so
+        // the serial path can prompt; if one still lands here, block rather
+        // than run unapproved host code outside auto. The sites share one
+        // predicate, so the batch path cannot drift away from the gate again.
+        let block = block.or_else(|| {
+            if ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto { return None; }
+            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
+                |source| tools::ToolOutcome {
+                    ok: false,
+                    output: declined_message(Some(&source)),
+                    diff: None,
+                    ..Default::default()
                 },
-            };
-            // Unapproved content is excluded from batching (see batchable_call) so
-            // the serial path can prompt; if one still lands here, block rather
-            // than run unapproved host code outside auto. The sites share one
-            // predicate, so the batch path cannot drift away from the gate again.
-            let block = block.or_else(|| {
-                if ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto { return None; }
-                unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
-                    |source| tools::ToolOutcome {
-                        ok: false,
-                        output: declined_message(Some(&source)),
-                        diff: None,
-                        ..Default::default()
-                    },
-                )
-            });
-            blocked.push(block);
-        }
-        break;
+            )
+        });
+        blocked.push(block);
     }
 
     let data_dir = &ctx.core.data_dir;
@@ -2963,17 +2971,14 @@ async fn run_loop(
 
                 // Order: hooks pre → permissions → approval_mode → execute.
                 // Denies never prompt the user.
-                // A mode selection can land while a hook is awaiting its
-                // process. Re-admit under the new policy before dispatch,
-                // including its allow filtering and content-bound hook gates.
-                let pre = loop {
-                    let mode = policy_mode;
-                    let pre = hooks.pre_tool_use(session_id, name, &args, project_root, &cancelled).await;
-                    refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
-                    if mode == policy_mode || matches!(pre, PreToolResult::Cancelled) {
-                        break pre;
-                    }
-                };
+                // Refuse an admission interrupted by a mode selection. Never
+                // replay completed hooks, which can have side effects.
+                let mode = policy_mode;
+                let mut pre = hooks.pre_tool_use(session_id, name, &args, project_root, &cancelled).await;
+                refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+                if mode != policy_mode && !matches!(pre, PreToolResult::Cancelled) {
+                    pre = PreToolResult::Block { reason: POLICY_CHANGED_DURING_HOOK.into() };
+                }
                 match pre {
                     PreToolResult::Block { reason } => {
                         core.send_agent(session_id, AgentEvent::ToolEnd {
@@ -7151,30 +7156,40 @@ mod tests {
 
     #[tokio::test]
     async fn a_mode_change_during_a_serial_pre_hook_refreshes_permission_allows() {
-        mode_change_during_pre_hook(false).await;
+        mode_change_during_pre_hook(false, false).await;
     }
 
     #[tokio::test]
     async fn a_mode_change_during_a_batch_pre_hook_refreshes_permission_allows() {
-        mode_change_during_pre_hook(true).await;
+        mode_change_during_pre_hook(true, false).await;
     }
 
-    async fn mode_change_during_pre_hook(batch: bool) {
+    #[tokio::test]
+    async fn a_mode_change_never_replays_serial_pre_hook_side_effects() {
+        mode_change_during_pre_hook(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_never_replays_batch_pre_hook_side_effects() {
+        mode_change_during_pre_hook(true, true).await;
+    }
+
+    async fn mode_change_during_pre_hook(batch: bool, approved_hook: bool) {
         let dir = std::env::temp_dir().join(format!("omx-mode-hook-{}", uuid::Uuid::new_v4()));
         let root = dir.join("project");
         std::fs::create_dir_all(root.join(".openmax/hooks")).unwrap();
         std::fs::write(root.join("a.txt"), "read succeeded").unwrap();
         std::fs::write(root.join(".openmax/hooks/wait.toml"),
             "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"hook.sh\"]\n").unwrap();
-        std::fs::write(root.join("hook.sh"), "touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
+        std::fs::write(root.join("hook.sh"), "echo ran >> hook-effects; touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
         if batch {
-            std::fs::write(root.join("hook.sh"), "if [ ! -e first ]; then touch first; exit 0; fi; touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
+            std::fs::write(root.join("hook.sh"), "echo ran >> hook-effects; if [ ! -e first ]; then touch first; exit 0; fi; touch ready; while [ ! -e release ]; do sleep 0.01; done").unwrap();
         }
         let tool = if batch { "read_file" } else { "bash" };
         std::fs::write(root.join(".openmax/permissions.toml"), format!(
             "[[rules]]\neffect = \"allow\"\ntool = \"{tool}\"\n[[rules]]\neffect = \"ask\"\ntool = \"{tool}\"\n"
         )).unwrap();
-        let count = if batch { 2 } else { 1 };
+        let count = if batch { 3 } else { 1 };
         let args = if batch { serde_json::json!({"path":"a.txt"}) } else { serde_json::json!({"command":"echo ran"}) };
         let calls: Vec<_> = (0..count).map(|i| serde_json::json!({
             "index":i,"id":format!("call-{i}"),"function":{"name":tool,"arguments":args.to_string()}
@@ -7183,6 +7198,11 @@ mod tests {
         let (base_url, _) = counting_endpoint(&format!("data: {response}\n\ndata: [DONE]\n\n")).await;
         let (core, mut rx) = Core::new(dir.join("data")).unwrap();
         crate::trust::trust_project(&core.data_dir, &root).unwrap();
+        if approved_hook {
+            let manifest = root.join(".openmax/hooks/wait.toml");
+            let shas = [manifest.clone(), root.join("hook.sh")].map(|path| crate::ledger::sha256_hex(&std::fs::read(path).unwrap()));
+            crate::ledger::approve_capability(&core.data_dir, &root, &manifest, &shas).unwrap();
+        }
         core.set_project_approval_mode(&root, ApprovalMode::Auto).unwrap();
         {
             let mut settings = core.settings.lock().unwrap();
@@ -7208,6 +7228,8 @@ mod tests {
             }
         }
         assert_eq!(results, vec![false; count], "auto-loaded allows must not survive a switch to ask during a hook");
+        assert_eq!(std::fs::read_to_string(root.join("hook-effects")).unwrap().lines().count(), if batch { 2 } else { 1 },
+            "an explicit mode change must not replay completed pre hooks");
         let _ = std::fs::remove_dir_all(dir);
     }
 

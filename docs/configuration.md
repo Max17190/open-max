@@ -83,6 +83,8 @@ Deny rules, hook gates, parsing, output limits, and execution reports remain
 active in every mode. Rules are still first-match and cannot relax during a
 turn. Hook file edits apply at the next turn; explicit mode changes refresh
 policy before subsequent calls. A failed save leaves the active mode unchanged.
+If the mode changes during pre-tool checks, those calls are refused without
+replaying hooks. The agent can request them again under the new mode.
 Returning to `ask` restores content requirements for anything created in `auto`.
 
 Only a human-controlled frontend can select a saved mode. Agent-spawned
