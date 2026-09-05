@@ -107,7 +107,7 @@ pub async fn run(
         emit(&mut stdout, &transcript_value(&session_id, &messages));
     }
     let stdin_rx = spawn_stdin_reader();
-    drive(core, core_rx, session_id, project, stdin_rx, &mut stdout).await
+    drive(core, core_rx, session_id, project, stdin_rx, &mut stdout, !continued).await
 }
 
 /// The blocking stdin reader on its own thread; malformed input travels as
@@ -157,8 +157,33 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Result<Command, String>> {
 
 /// The protocol loop, separated from real stdin/stdout so tests can drive a
 /// session in-process: commands arrive on a channel, every emitted line goes
-/// to `out`.
+/// to `out`. `fresh` says this process created the session: a client that
+/// quits before any turn persisted anything (or whose only prompt a gate
+/// refused) would otherwise leave an index entry with nothing behind it.
 async fn drive<W: Write>(
+    core: Arc<Core>,
+    core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    session_id: String,
+    project: PathBuf,
+    stdin_rx: mpsc::Receiver<Result<Command, String>>,
+    out: &mut W,
+    fresh: bool,
+) -> i32 {
+    let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, out).await;
+    if fresh {
+        if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            // One line, like every other harness line on stderr: the reason
+            // quotes the index path, an authored byte string.
+            eprintln!(
+                "openmax: warning: the empty session {session_id} stays indexed: {}",
+                open_max_core::text::one_line(&e)
+            );
+        }
+    }
+    code
+}
+
+async fn drive_loop<W: Write>(
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: String,
@@ -841,29 +866,37 @@ mod tests {
 
     /// Drive the protocol loop in-process: commands in, emitted lines out.
     async fn drive_commands(commands: Vec<Command>) -> (Vec<serde_json::Value>, i32, Arc<Core>) {
-        let (lines, code, core, dir) = drive_in_project(|_| {}, commands).await;
+        let (lines, code, core, dir) = drive_in_project(|_| {}, false, commands).await;
         let _ = std::fs::remove_dir_all(dir);
         (lines, code, core)
     }
 
     /// Same loop, with `prepare` run against the project root (which is also
     /// the data dir) before the session starts, so a test can plant trust or
-    /// extension files. The caller owns the directory's cleanup.
+    /// extension files, and `seeded` giving the session a persisted transcript
+    /// first, as one that has run a turn would have. The caller owns the
+    /// directory's cleanup.
     async fn drive_in_project(
         prepare: impl FnOnce(&std::path::Path),
+        seeded: bool,
         commands: Vec<Command>,
     ) -> (Vec<serde_json::Value>, i32, Arc<Core>, PathBuf) {
         let dir = crate::test_temp_dir("openmax-stdio");
         let (core, core_rx) = Core::new(dir.clone()).unwrap();
         prepare(&dir);
         let meta = sessions::create(&core, dir.display().to_string()).unwrap();
+        if seeded {
+            let mut persisted = 0usize;
+            let seed = [open_max_core::types::ChatMessage::system("sys")];
+            assert!(sessions::save_messages(&core, &meta.id, &seed, &mut persisted, false));
+        }
         let (tx, rx) = mpsc::channel(64);
         for cmd in commands {
             tx.send(Ok(cmd)).await.unwrap();
         }
         drop(tx);
         let mut out = Vec::new();
-        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &mut out).await;
+        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &mut out, true).await;
         let lines = String::from_utf8(out)
             .unwrap()
             .lines()
@@ -877,7 +910,8 @@ mod tests {
     /// delegate or custom UI drives gets the project's templates too. The
     /// turn dies at endpoint resolution (nothing is configured), but the
     /// title is written from the submitted text before that, so it is the
-    /// proof of what was submitted.
+    /// proof of what was submitted. Seeded, so the session is history that
+    /// survives the exit and keeps the title.
     #[tokio::test]
     async fn a_template_invocation_expands_before_the_turn_starts() {
         let (lines, _code, core, dir) = drive_in_project(
@@ -891,6 +925,7 @@ mod tests {
                 )
                 .unwrap();
             },
+            true,
             vec![Command::User { text: "/omx-stdio-greet world".into() }],
         )
         .await;
@@ -907,6 +942,25 @@ mod tests {
             errors.iter().all(|m| m.contains("no model endpoint configured")),
             "{errors:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The session exists from the handshake on (its id is in `hello`), so a
+    /// client that quits first has left an index entry with no file behind
+    /// it: `--recall` would report it as unreadable history on every run and
+    /// `--continue` would attach to it. It is discarded at exit; a session
+    /// with a transcript is history and stays.
+    #[tokio::test]
+    async fn a_client_that_quits_before_any_turn_leaves_no_session_behind() {
+        let (_lines, code, core, dir) = drive_in_project(|_| {}, false, vec![Command::Quit]).await;
+        assert_eq!(code, 0);
+        let key = dir.display().to_string();
+        assert!(sessions::list(&core, &key).is_empty(), "nothing to resume was left indexed");
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (_lines, _code, core, dir) = drive_in_project(|_| {}, true, vec![Command::Quit]).await;
+        let key = dir.display().to_string();
+        assert_eq!(sessions::list(&core, &key).len(), 1, "a transcript is history");
         let _ = std::fs::remove_dir_all(dir);
     }
 
