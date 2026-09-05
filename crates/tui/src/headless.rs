@@ -50,6 +50,27 @@ pub async fn run(
         }
     };
 
+    let code = run_prompts(&core, &mut core_rx, &session_id, &args).await;
+    // A run whose every turn ended before anything was persisted (an endpoint
+    // that never resolved, a prompt a gate refused) leaves an index entry with
+    // nothing behind it.
+    if !args.continue_session {
+        if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            // The reason quotes the index path, an authored byte string, so it
+            // is flattened like every other harness line on this stream.
+            eprintln!("openmax: warning: the empty session {session_id} stays indexed: {}", one_line(&e));
+        }
+    }
+    code
+}
+
+async fn run_prompts(
+    core: &Arc<Core>,
+    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    session_id: &str,
+    args: &HeadlessArgs,
+) -> i32 {
+    let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut exit_code = 0i32;
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
@@ -57,7 +78,7 @@ pub async fn run(
     for prompt in &args.prompts {
         // Wait until the previous turn's spawn has cleared `running`. Done is
         // emitted before that cleanup, so starting immediately races.
-        if !wait_until_idle(&core, &session_id).await {
+        if !wait_until_idle(core, session_id).await {
             eprintln!("openmax: timed out waiting for the previous turn to finish");
             return 1;
         }
@@ -67,7 +88,7 @@ pub async fn run(
         // would, so hooks and the transcript see the expanded text.
         if let Err(e) = agent::start_turn(
             core.clone(),
-            session_id.clone(),
+            session_id.to_string(),
             project.clone(),
             templates::expand_user_input(&core.data_dir, &project, prompt),
         ) {
@@ -77,9 +98,9 @@ pub async fn run(
 
         let mut saw_tokens = false;
         let turn_exit = run_turn_events(
-            &core,
-            &mut core_rx,
-            &session_id,
+            core,
+            core_rx,
+            session_id,
             args.json,
             &mut saw_tokens,
             &mut stdout,

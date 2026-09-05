@@ -665,6 +665,27 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove a session that no store backs: no transcript, archive, or
+/// compaction file exists, so nothing could ever be read back from it. A
+/// front end creates its session before the first turn, and a client that
+/// quits first, or a first prompt a gate refuses, leaves an index entry with
+/// nothing behind it; every later `--recall` then reports it as listed but
+/// unreadable, and `--continue` attaches to it. The manifest alone does not
+/// count: a turn that started writes one before anything else, and a turn
+/// that then failed still left no history. Ok(whether it was removed); a
+/// removal the index refused (damaged, unwritable) is the caller's to
+/// report, because the entry it leaves behind is exactly the one this
+/// exists to prevent.
+pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
+    let backed = [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
+        .iter()
+        .any(|p| p.exists());
+    if backed {
+        return Ok(false);
+    }
+    delete(core, id).map(|()| true)
+}
+
 /// Set the title from the first user message, once.
 pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
     let title = title.trim().chars().take(48).collect::<String>();
@@ -891,6 +912,42 @@ mod tests {
         assert_eq!(latest(&core, "/tmp/tie").unwrap().id, a);
         let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
         assert_eq!(listed, vec![a, c, b]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session that persisted nothing is not history: at its front end's
+    /// exit it leaves the index, so recall never reports it as unreadable and
+    /// `--continue` never attaches to it. One with a transcript stays, and a
+    /// manifest alone (a turn that started and failed before its first save)
+    /// does not keep it.
+    #[test]
+    fn a_session_with_no_store_behind_it_is_discarded() {
+        let dir = std::env::temp_dir().join(format!("openmax-discard-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let empty = create(&core, "/tmp/p".into()).unwrap().id;
+        let manifest_only = create(&core, "/tmp/p".into()).unwrap().id;
+        save_manifest(&core, &manifest_only, &crate::registry::Registry::builtin_only().to_manifest());
+        let kept = create(&core, "/tmp/p".into()).unwrap().id;
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &kept, &[ChatMessage::system("sys")], &mut persisted, false));
+
+        assert_eq!(discard_if_empty(&core, &empty), Ok(true));
+        assert_eq!(discard_if_empty(&core, &manifest_only), Ok(true));
+        assert!(!manifest_path(&core, &manifest_only).exists(), "its files go with it");
+        assert_eq!(discard_if_empty(&core, &kept), Ok(false), "a transcript is history");
+        let ids: Vec<String> = list(&core, "/tmp/p").into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![kept.clone()]);
+
+        // An index that cannot be rewritten leaves the entry, and says so
+        // rather than reporting a removal that did not happen.
+        let ghost = create(&core, "/tmp/p".into()).unwrap().id;
+        let index_path = core.data_dir.join("sessions").join("index.json");
+        let good_index = std::fs::read_to_string(&index_path).unwrap();
+        std::fs::write(&index_path, "[{\"id\": \"trunc").unwrap();
+        let err = discard_if_empty(&core, &ghost).unwrap_err();
+        assert!(err.contains("does not parse"), "{err}");
+        std::fs::write(&index_path, good_index).unwrap();
+        assert_eq!(discard_if_empty(&core, &ghost), Ok(true), "once the index heals it goes");
         let _ = std::fs::remove_dir_all(dir);
     }
 
