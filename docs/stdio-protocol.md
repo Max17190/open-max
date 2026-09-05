@@ -53,7 +53,9 @@ ignored; blank lines are skipped; EOF behaves like `quit`.
 
 Every event line carries the flattened `session_id`, then a `type`
 discriminator, then its fields. openmax emits keys in that order, but object
-key order is not significant: parse every line by field name.
+key order is not significant: parse every line by field name. The two lines
+that are not events, `protocol_error` and the `approval_mode` acknowledgement,
+carry no `session_id`.
 
 | `type` | Fields |
 | --- | --- |
