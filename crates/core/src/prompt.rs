@@ -192,27 +192,22 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     (prompt, breakdown)
 }
 
-/// The agent is responsible for its own extensibility: when the user asks for
-/// a recurring capability, workflow, or policy, the right move is usually to
-/// write one of these files rather than to improvise each time. Static text,
-/// so the zero-cost invariant (byte-identical prompt with nothing installed)
-/// still holds; roughly 360 tokens is the price of an agent that can grow and
-/// compose itself without permanent orchestration features.
+/// Discoverable file and process contracts, paid in every frozen prompt.
+/// Formats and approval details live in --spec and load only when needed.
+/// Workflow choices belong to the task and project instructions.
 const SELF_EXTENSION: &str = "\n\nExtend yourself by writing files when the user asks for a reusable capability:\n\
-- New tool: .openmax/tools/<name>.toml with name, description, params (JSON schema), command, args, mutating.\n\
-- New skill: .agents/skills/<name>/SKILL.md with frontmatter name + description; body loads on demand.\n\
-- Prompt template: .agents/prompts/<name>.md ($ARGUMENTS and $1..$9 expand); the user runs it as /<name>.\n\
-- Hook: .openmax/hooks/<name>.toml with event pre_tool_use or user_prompt_submit (exit nonzero blocks), post_tool_use, session_start, compaction, or turn_end. In auto, valid hooks need no approval. In ask/readonly, unapproved hooks are inert; approval covers the .toml and its code, and a revoked live gate blocks tools.\n\
-- Permission rules: .openmax/permissions.toml, one [[rules]] table per rule with effect = allow|deny|ask, tool = \"<tool name>\", optional arg_regex (unanchored). Any error in this file denies every tool, so write it exactly and check it.\n\
-- Provider: use bash to edit ~/.openmax/providers.json for named model endpoints (native file tools are project-confined).\n\
-A tool or skill you write goes live before your next step: the harness re-freezes after every executed mutating call and at turn start (/reload also forces it). The harness records tool/skill file changes (actor + hash); bash: openmax --ledger lists history and restorable objects. Permissions and templates apply on next use; hooks from the next turn. Verify what you wrote with bash: openmax --check. Before writing a surface, read its full contract (fields, stdin payloads, activation) with bash: openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
-Compose beyond the loop with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.\n\
-\n\
-Working files (there is no built-in plan mode or todo list):\n\
-- PLAN.md: for multi-step work, write the plan there first and keep it current.\n\
-- TODO.md: the running task list; check items off as you finish.\n\
-- AGENTS.md: standing project instructions; keep it short (loads at session create and on /reload).\n\
-- Memory: one durable fact per file in .openmax/memory/<name>.md; its first line is indexed at the next freeze (a write triggers one). Update or delete stale facts; unused files fade from the index but stay searchable on disk. Contract: openmax --spec memory. Search everything past sessions kept: bash: openmax --recall \"<query>\".";
+- Tools: .openmax/tools/<name>.toml\n\
+- Skills: .agents/skills/<name>/SKILL.md\n\
+- Prompt templates: .agents/prompts/<name>.md\n\
+- Hooks: .openmax/hooks/<name>.toml\n\
+- Permissions: .openmax/permissions.toml\n\
+- Providers: ~/.openmax/providers.json (edit with bash).\n\
+- Memory: .openmax/memory/<name>.md, one durable fact per file.\n\
+Before creating or changing these files, use bash: openmax --spec <surface> to read the format, approval, and activation rules.\n\
+Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
+Verify with openmax --check. Tools and skills refresh after every executed mutating call and at turn start (/reload forces it). Templates apply on next use; hooks from the next turn.\n\
+Use openmax --ledger for tool/skill history and restorable objects, and openmax --recall \"<query>\" for past sessions, archives, and memory.\n\
+Compose workflows with CLI-backed tools + skills. Use a child openmax -p or openmax --stdio process for isolated work, tmux for durable or parallel processes, and the stdio protocol for custom frontends.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -407,13 +402,12 @@ mod tests {
         let dir = temp_project();
         let discovered = system_prompt(&dir, &Registry::build(&dir.join("data"), &dir));
         assert_eq!(discovered, builtin_prompt(&dir));
-        assert!(!discovered.contains("Skills"));
+        assert!(!discovered.contains("\n\nSkills (before using one"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The self-extension guide is part of every frozen prompt: the agent
-    /// must know the file surfaces it can grow through and that /reload or
-    /// /new activates frozen ones.
+    /// must be able to find extension files, their contracts, and activation.
     #[test]
     fn prompt_carries_self_extension_guide() {
         let dir = temp_project();
@@ -431,27 +425,15 @@ mod tests {
         // prints "openmax --spec settings"; the guide's memory line names
         // --recall). the_guide_pointer_names_only_real_surfaces enforces
         // that every named surface exists and the omission list is exact.
-        assert!(prompt.contains(
-            "openmax --spec tools|skills|prompts|hooks|permissions|providers|memory|stdio"
-        ));
-        assert!(prompt.contains("user_prompt_submit"));
+        assert!(prompt.contains("openmax --spec <surface>"));
         assert!(prompt.contains("providers.json"));
-        assert!(prompt.contains("Provider: use bash"));
+        assert!(prompt.contains("edit with bash"));
         assert!(prompt.contains("CLI-backed tools + skills"));
         assert!(prompt.contains("openmax -p or openmax --stdio"));
         assert!(prompt.contains("tmux for durable or parallel processes"));
         assert!(prompt.contains("stdio protocol for custom frontends"));
-        // The design's "use instead" contract: PLAN.md over plan mode,
-        // TODO.md over a todo product, AGENTS.md for standing instructions,
-        // and the memory surface for facts that must survive sessions.
-        assert!(prompt.contains("PLAN.md"));
-        assert!(prompt.contains("TODO.md"));
-        assert!(prompt.contains("AGENTS.md: standing project instructions"));
         assert!(prompt.contains(".openmax/memory/<name>.md"));
-        assert!(prompt.contains("fade from the index"));
-        assert!(prompt.contains("openmax --spec memory"));
         assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
-        assert!(prompt.contains("on /reload"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -721,9 +703,7 @@ mod tests {
     fn missing_agents_md_adds_nothing() {
         let dir = temp_project();
         let prompt = builtin_prompt(&dir);
-        // The self-extension guide names AGENTS.md as a working file; the
-        // injected project-instructions section must stay absent when no
-        // AGENTS.md exists on disk.
+        // The grounding section is absent when there is no instruction file.
         assert!(!prompt.contains("Project instructions (AGENTS.md):"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -751,9 +731,15 @@ mod tests {
         // pointer (--check settings rows print "openmax --spec settings"; the
         // guide's memory line names --recall). A new --spec surface must
         // either join the pointer or this list, consciously.
-        let pointer = ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory", "stdio"];
-        for s in pointer {
-            assert!(crate::spec::SURFACES.contains(&s), "the pointer names a surface --spec lacks: {s}");
+        let pointer: Vec<&str> = SELF_EXTENSION.lines()
+            .find_map(|line| line.strip_prefix("Surfaces: "))
+            .expect("the guide lists its authoring contracts")
+            .trim_end_matches('.')
+            .split('|')
+            .collect();
+        for s in &pointer {
+            assert!(crate::spec::SURFACES.contains(s), "the pointer names a surface --spec lacks: {s}");
+            assert!(crate::spec::render(s).is_some(), "the named contract must render: {s}");
         }
         let mut omitted: Vec<&str> = crate::spec::SURFACES
             .iter()
@@ -770,38 +756,10 @@ mod tests {
         );
     }
 
-    /// Budget gate for the frozen prompt prefix: base system prompt, the
-    /// self-extension guide (now including the working-files contract), and
-    /// the serialized builtin tool array must stay within ~1180 tokens. The
-    /// cap is in chars (the core stays tokenizer-free): the pre-guide 3452
-    /// chars including a 52-char project root measured 794 tokens on
-    /// o200k_base and 775 on cl100k_base (2026-07-16); the guide adds ~360
-    /// tokens. The interpolated root varies per machine, so it is excluded
-    /// here and the cap leaves room for a typical checkout path. If this
-    /// fails, re-measure with a real tokenizer before raising anything.
-    /// Only builtins count: external tools are the user's own budget, and
-    /// grounding sections (AGENTS.md, layout map, skills) have their own caps.
-    ///
-    /// Raised from 4900 to 5020 (2026-07-30): what a hook approval covers is
-    /// now stated in the guide (+119 chars, ~30 tokens). The old line said
-    /// unapproved hooks are inert and stopped there, which taught the agent
-    /// that rewriting a hook's script was harmless - the exact belief the
-    /// approval binding exists to correct.
-    ///
-    /// Raised from 5020 to 5280 (2026-07-31): the working-files contract now
-    /// names the memory surface (+220 chars). Re-measured per the rule above
-    /// with `dump_frozen_prompt_payload_for_tokenizer`: 1196 tokens on
-    /// o200k_base, 1174 on cl100k_base at 5240 path-free chars, so the cap
-    /// tracks ~1200 tokens. The old guide taught "there is no memory", which
-    /// held the agent to AGENTS.md hand-editing; ~20 real tokens is the price
-    /// of the index being discoverable at all.
-    ///
-    /// Raised from 5280 to 5360 (2026-07-31): the memory line now points at
-    /// `openmax --recall` (+79 chars). Re-measured: 1214 tokens on
-    /// o200k_base, 1191 on cl100k_base at 5312 path-free chars. Preserved
-    /// history the agent cannot find is a promise, not a capability; 18 real
-    /// tokens buys the pointer that makes archives and past sessions
-    /// searchable instead of merely stored.
+    /// The path-free base rules, extension guide, and builtin schemas must
+    /// fit in 4,000 bytes. Grounding sections have separate caps. Measure the
+    /// payload with dump_frozen_prompt_payload_for_tokenizer and a real
+    /// tokenizer before changing this budget; provider framing is not included.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
@@ -827,25 +785,13 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 5_360;
+        const CAP: usize = 4_000;
         assert!(
             total <= CAP,
-            "frozen prompt budget exceeded by {} chars: base rules + guide (path-free) \
-             {path_free} + builtin tools {tool_chars} = {total}, cap {CAP} (~1215 real \
-             tokens with a typical checkout path).\n\
-             \n\
-             This cap is a budget, not a ceiling someone forgot to raise, and it is nearly \
-             spent: every new extension surface has to be announced in the self-extension \
-             guide, and the guide is what most of these bytes are. Raising it is allowed and \
-             has been done before (see this test's doc comment for each raise and what it \
-             bought), but it is a deliberate decision that carries the measurement, never a \
-             bumped number: run\n\
-             \n\
-             cargo test -p open-max-core --lib -- dump_frozen_prompt_payload_for_tokenizer \
-             --ignored --nocapture\n\
-             \n\
-             count the dumped payload with a real tokenizer (the char estimate here runs \
-             ~9% high), and put that token number and what it buys in the PR.",
+            "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
+             {path_free} + builtin tools {tool_chars} = {total}, cap {CAP}. \
+             Re-measure with dump_frozen_prompt_payload_for_tokenizer and a real tokenizer \
+             before changing the budget.",
             total - CAP,
         );
         let _ = std::fs::remove_dir_all(dir);
