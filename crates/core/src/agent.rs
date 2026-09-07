@@ -47,7 +47,7 @@ use crate::config::{ApprovalMode, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
-use crate::registry::{Profile, Registry};
+use crate::registry::Registry;
 use crate::sessions;
 use crate::state::{CancelToken, Core, SessionData};
 use crate::tools;
@@ -408,65 +408,6 @@ async fn report_schemas_over_budget(
         // are all appended, so the sequence is complete and the note lands
         // after it.
         msgs.push(ChatMessage::user(note));
-    }
-}
-
-/// Record the profile a session that has no transcript yet will freeze
-/// under, before its first turn hydrates it. The manifest is the record:
-/// hydration honors a manifest saved ahead of the first message, so a
-/// frontend calls this right after `sessions::create`. `Full` is what
-/// hydration freezes on its own and is left to it, so the memory scan that
-/// grounds a full prompt stays the single scan its freeze already makes.
-/// A session that already has a manifest keeps it: a profile is fixed for
-/// the session's life.
-///
-/// Fails closed. `save_manifest` reports a failed write on the event
-/// channel and returns, and the manifest is the only record of the profile,
-/// so the write is verified by reading it back: a session that cannot
-/// record `minimal` must not start, because hydration would freeze the full
-/// profile and a measurement run would silently measure the wrong harness.
-pub fn freeze_new_session(core: &Core, session_id: &str, project_root: &Path, profile: Profile) -> Result<(), String> {
-    if profile == Profile::Full {
-        return Ok(());
-    }
-    if let Some(existing) = sessions::load_manifest(core, session_id) {
-        return if existing.profile == profile {
-            Ok(())
-        } else {
-            Err(format!(
-                "session {session_id} already froze the {} profile; a profile is fixed for a session's life",
-                existing.profile.as_str()
-            ))
-        };
-    }
-    let registry = Registry::build_for(profile, &core.data_dir, project_root);
-    sessions::save_manifest(core, session_id, &registry.to_manifest());
-    match sessions::load_manifest(core, session_id) {
-        Some(manifest) if manifest.profile == profile => Ok(()),
-        _ => Err(format!(
-            "could not record the {} profile for session {session_id}; the session was not started",
-            profile.as_str()
-        )),
-    }
-}
-
-/// The profile a session runs under: its in-memory registry once hydrated,
-/// its manifest before that. A session with neither is a full one, which is
-/// what hydration will freeze.
-async fn session_profile(core: &Core, session_id: &str) -> Profile {
-    if let Some(data) = core.sessions.lock().await.get(session_id) {
-        return data.registry.profile;
-    }
-    sessions::load_manifest(core, session_id).map(|m| m.profile).unwrap_or_default()
-}
-
-/// The hooks one turn of `session_id` runs. A minimal session runs none:
-/// hooks are project-specific harness behavior, and the profile's promise is
-/// that the same run behaves the same in every checkout.
-async fn hooks_for_session(core: &Core, session_id: &str, project_root: &Path, mode: ApprovalMode) -> Hooks {
-    match session_profile(core, session_id).await {
-        Profile::Minimal => Hooks::suppressed(),
-        Profile::Full => Hooks::discover_for_mode(project_root, &core.data_dir, mode),
     }
 }
 
@@ -1443,16 +1384,6 @@ pub async fn reload_session(
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
 
     ensure_session_hydrated(core, session_id, project_root).await?;
-    {
-        let sessions_map = core.sessions.lock().await;
-        if sessions_map.get(session_id).is_some_and(|d| d.registry.profile == Profile::Minimal) {
-            return Err(
-                "this session runs the minimal profile, which freezes no extension files; \
-                 start a session without --profile minimal to use them"
-                    .into(),
-            );
-        }
-    }
 
     let counts = (registry.tools.len(), registry.skills.len());
     {
@@ -1630,7 +1561,7 @@ async fn run_compact(
         });
     }
     let client = ChatClient::from_endpoint(&endpoint);
-    let hooks = hooks_for_session(core, session_id, project_root, core.approval_mode(project_root)).await;
+    let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
     let ctx = CompactionCtx { core, session_id, project_root, client: &client, hooks: &hooks, cancelled };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, schema_tokens, true, &mut spend).await {
@@ -2088,37 +2019,16 @@ async fn refreeze_if_extensions_changed(
     };
     let files = std::mem::take(&mut snapshot.files);
     let disk_fp = snapshot.fingerprint();
-    let (stale, unsynced, minimal) = {
+    let (stale, unsynced) = {
         let sessions_map = core.sessions.lock().await;
         match sessions_map.get(session_id) {
             Some(d) => (
                 !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp,
                 !d.ledger_synced,
-                d.registry.profile == Profile::Minimal,
             ),
-            None => (false, false, false),
+            None => (false, false),
         }
     };
-    if minimal && stale {
-        // The minimal profile freezes no extension surface, so a changed
-        // generation is never activated or narrated to the model. It is
-        // still recorded: the files changed while no turn ran, which makes
-        // the change external, and the fingerprint moves with it so the
-        // same generation is not recorded twice. The fingerprint moves
-        // before the record lands, the order the full profile keeps: a
-        // failed record is retried by the next turn-start sync, which files
-        // it as external, the one direction the ledger tolerates
-        // (settle_ledger).
-        record_generation_unactivated(core, session_id, &Arc::new(Registry::minimal_at(disk_fp))).await;
-        let (receipt, landed) =
-            settle_ledger(core, session_id, project_root, files, crate::ledger::Actor::External).await;
-        if !landed {
-            for message in receipt {
-                core.send_agent(session_id, AgentEvent::Error { message });
-            }
-        }
-        return None;
-    }
     if !stale {
         if unsynced {
             // Nothing to activate, but the freeze read these files straight
@@ -2189,18 +2099,6 @@ async fn refreeze_if_extensions_changed(
         return Some(receipt);
     }
     None
-}
-
-/// Pin a minimal session's registry to a new extension generation without
-/// changing its tools or prompt: the profile has no surface to activate, but
-/// the refreeze checks compare the fingerprint against disk, and the manifest
-/// must carry the generation the ledger has now recorded.
-async fn record_generation_unactivated(core: &Arc<Core>, session_id: &str, fresh: &Arc<Registry>) {
-    let mut sessions_map = core.sessions.lock().await;
-    if let Some(data) = sessions_map.get_mut(session_id) {
-        data.registry = fresh.clone();
-        sessions::save_manifest(core, session_id, &data.registry.to_manifest());
-    }
 }
 
 /// Sync the ledger and describe the outcome for the refreeze receipt. A
@@ -2324,25 +2222,6 @@ async fn refreeze_between_iterations(
     };
     let files = std::mem::take(&mut snapshot.files);
     if snapshot.fingerprint() == registry.ext_fingerprint {
-        return false;
-    }
-    if registry.profile == Profile::Minimal {
-        // Recorded as this session's work, since its own mutating call
-        // produced the change, and never activated: the minimal profile has
-        // no extension surface (see refreeze_if_extensions_changed). Same
-        // order as the full profile: the fingerprint moves first, and a
-        // record that fails here is retried at the next turn start as
-        // external, which understates the agent and never the human.
-        let fresh = Arc::new(Registry::minimal_at(snapshot.fingerprint()));
-        record_generation_unactivated(core, session_id, &fresh).await;
-        *registry = fresh;
-        let (receipt, landed) =
-            settle_ledger(core, session_id, project_root, files, crate::ledger::Actor::Session).await;
-        if !landed {
-            for message in receipt {
-                core.send_agent(session_id, AgentEvent::Error { message });
-            }
-        }
         return false;
     }
     let Ok(new_registry) =
@@ -2502,7 +2381,7 @@ async fn refresh_approval_policy(
     let current = core.approval_mode(project_root);
     if current != *mode {
         *mode = current;
-        *hooks = hooks.rediscover_for_mode(project_root, &core.data_dir, current);
+        *hooks = Hooks::discover_for_mode(project_root, &core.data_dir, current);
         permissions.reload(Permissions::discover_for_mode(project_root, &core.data_dir, current));
         report_hook_failures(core, session_id, hooks.notices());
     }
@@ -2541,7 +2420,7 @@ async fn run_loop(
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
     let mut policy_mode = core.approval_mode(project_root);
-    let mut hooks = hooks_for_session(core, session_id, project_root, policy_mode).await;
+    let mut hooks = Hooks::discover_for_mode(project_root, &core.data_dir, policy_mode);
     // A hook that exists but did not load says so every turn. Inert is a
     // policy the user wrote down and is not getting, so it must not be
     // something they only discover by running `openmax --check`.
@@ -3486,7 +3365,7 @@ async fn run_loop(
                     let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
                     if hooks_now != hooks_seen {
                         hooks_seen = hooks_now;
-                        let discovered = hooks.rediscover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
+                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
                         let inert: Vec<String> = discovered
                             .notices()
                             .into_iter()
@@ -5414,145 +5293,6 @@ mod tests {
         drop(map);
         let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
         assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The minimal profile is frozen ahead of hydration and fixed for the
-    /// session's life: the shell-plus-editor subset, the persona prompt, and
-    /// nothing from the project, however much sits on disk. An extension file
-    /// that appears between turns is recorded for the ledger and never
-    /// activated, so prompt and schemas stay byte-identical for the whole
-    /// session, a resume rebuilds the same shape from the manifest, and
-    /// /reload has nothing to offer.
-    #[tokio::test]
-    async fn a_minimal_session_freezes_the_subset_and_never_activates_extensions() {
-        use crate::state::Core;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let project = dir.join("project");
-        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
-        std::fs::write(project.join("AGENTS.md"), "# Rules\nAlways run the tests.").unwrap();
-        std::fs::write(
-            project.join(".openmax/tools/deploy.toml"),
-            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
-        )
-        .unwrap();
-        crate::trust::trust_project(&core.data_dir, &project).unwrap();
-        let id = &sessions::create(&core, project.display().to_string()).unwrap().id;
-
-        freeze_new_session(&core, id, &project, Profile::Minimal).unwrap();
-        let prompt = {
-            let data = build_session_data(&core, id, &project).unwrap();
-            assert_eq!(data.registry.profile, Profile::Minimal);
-            assert_eq!(data.registry.tool_names(), tools::MINIMAL_TOOL_NAMES);
-            assert!(data.registry.get("deploy").is_none(), "a tool on disk is not loaded");
-            let prompt = data.messages[0].content.clone().unwrap();
-            assert!(!prompt.contains("AGENTS.md") && !prompt.contains("openmax --spec"), "{prompt}");
-            core.sessions.lock().await.insert(id.to_string(), data);
-            prompt
-        };
-        // A transcript, so the turn-start check sees a live session.
-        core.sessions.lock().await.get_mut(id).unwrap().messages.push(ChatMessage::user("hi"));
-
-        // Another tool file lands between turns.
-        std::fs::write(
-            project.join(".openmax/tools/lint.toml"),
-            "name = \"lint\"\ndescription = \"lints\"\ncommand = \"/bin/echo\"\nmutating = false\n",
-        )
-        .unwrap();
-        assert!(
-            refreeze_if_extensions_changed(&core, id, &project).await.is_none(),
-            "nothing is narrated to the model"
-        );
-        {
-            let map = core.sessions.lock().await;
-            let data = map.get(id).unwrap();
-            assert_eq!(data.registry.tool_names(), tools::MINIMAL_TOOL_NAMES);
-            assert_eq!(data.messages[0].content.as_deref(), Some(prompt.as_str()), "the prefix did not move");
-            let disk = crate::registry::capture_extensions(&core.data_dir, &project).fingerprint();
-            assert_eq!(data.registry.ext_fingerprint, disk, "the generation is remembered, not re-recorded");
-        }
-        let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
-        assert_eq!(manifest.profile, Profile::Minimal);
-        assert!(manifest.external_tools.is_empty());
-        let resumed = Registry::from_manifest(manifest);
-        assert_eq!(resumed.tool_names(), tools::MINIMAL_TOOL_NAMES);
-        assert!(reload_session(&core, id, &project).await.is_err(), "no extension surface to reload");
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The minimal profile runs no project hooks: a gate that blocks every
-    /// prompt in a full session is inert in a minimal one, so the same run
-    /// behaves the same in every checkout, whatever policy the project
-    /// carries. Permission rules are not hooks and still apply.
-    #[tokio::test]
-    async fn a_minimal_session_runs_no_project_hooks() {
-        use crate::state::Core;
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, mut rx) = Core::new(dir.clone()).unwrap();
-        let project = dir.join("project");
-        let hooks_dir = project.join(".openmax/hooks");
-        std::fs::create_dir_all(&hooks_dir).unwrap();
-        let script = project.join("gate.sh");
-        {
-            let mut f = std::fs::File::create(&script).unwrap();
-            f.write_all(b"#!/bin/sh\necho 'blocked by policy'; exit 1\n").unwrap();
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-        std::fs::write(
-            hooks_dir.join("gate.toml"),
-            format!("event = \"user_prompt_submit\"\ncommand = \"{}\"\n", script.display()),
-        )
-        .unwrap();
-        approve_hook(&core, &project, &hooks_dir.join("gate.toml"));
-        crate::trust::trust_project(&core.data_dir, &project).unwrap();
-
-        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
-        {
-            let mut s = core.settings.lock().unwrap();
-            s.base_url = base_url;
-            s.model = "stub".into();
-            s.context_tokens = Some(16384);
-        }
-        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
-        freeze_new_session(&core, &id, &project, Profile::Minimal).unwrap();
-
-        start_turn(core.clone(), id.clone(), project.clone(), "should reach the model".into()).unwrap();
-        let (stop, _) = drive_turn(&mut rx).await;
-        assert_ne!(stop, "blocked", "the project gate must not run under the minimal profile");
-        assert_eq!(*requests.lock().unwrap(), 1, "the prompt reached the model");
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// The manifest is the only record of a session's profile. A session
-    /// that cannot record `minimal` must not start: hydration would freeze
-    /// the full profile, and a measurement run would silently measure the
-    /// wrong harness.
-    #[test]
-    fn a_minimal_session_that_cannot_record_its_profile_is_refused() {
-        use crate::state::Core;
-
-        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
-        let project = dir.join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
-        // A directory where the manifest file must land: the atomic write
-        // cannot replace it, so the profile cannot be recorded.
-        std::fs::create_dir_all(sessions::manifest_path(&core, &id)).unwrap();
-
-        let err = freeze_new_session(&core, &id, &project, Profile::Minimal).unwrap_err();
-        assert!(err.contains("could not record the minimal profile"), "{err}");
-        assert!(sessions::load_manifest(&core, &id).is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
