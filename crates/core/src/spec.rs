@@ -849,14 +849,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/5)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/6)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/5","protocol_version":5,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -898,7 +898,10 @@ the frozen tool schemas sent on every request, context_tokens),
 refreeze receipt, or a policy/providers/settings/approval notice - surfaced
 here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
-like a turn-start receipt), `diff` (call_id,
+like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
+model request is being resent after a transport failure, a 429, or a stream
+that died before any reply text; thinking already streamed for that attempt
+is void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
@@ -946,9 +949,10 @@ only guaranteed terminator. A command that starts no turn (empty text, an
 untrusted project) still gets one, with stop_reason `refused`, after the
 `protocol_error` that says why. A turn that dies unexpectedly reports
 `error` and then `done` with stop_reason `error`; a provider stream that ends
-mid-answer with no completion signal reports its partial `message_done`, then
-`error`, then `done` with stop_reason `truncated`, and no tool call it carried
-is run. The single exception is a
+mid-answer with no completion signal is resent (each resend announced by a
+`retry`) while no reply text has streamed, and otherwise reports its partial
+`message_done`, then `error`, then `done` with stop_reason `truncated`, and
+no tool call it carried is run. The single exception is a
 `user` sent while a turn is in flight: that is refused with a
 `protocol_error` and no `done`, because the running turn owns the next one.
 
@@ -1338,6 +1342,7 @@ mod tests {
             },
             AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new() },
             AgentEvent::HarnessNote { call_id: String::new(), text: String::new() },
+            AgentEvent::Retry { attempt: 0, max_attempts: 0, reason: String::new() },
             AgentEvent::Diff {
                 call_id: String::new(),
                 path: String::new(),

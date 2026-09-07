@@ -2747,6 +2747,10 @@ impl App {
                     ));
                 }
             }
+            AgentEvent::Retry { attempt, max_attempts, reason } => {
+                // The reason can carry a backend body; the note is one line.
+                self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Says what it costs and what to do, not how compaction reacts:
                 // that depends on whether any room is left at all.

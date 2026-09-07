@@ -264,6 +264,11 @@ async fn run_turn_events(
                     );
                 }
             }
+            AgentEvent::Retry { attempt, max_attempts, reason } => {
+                if !json {
+                    let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
+                }
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Advisory: the turn still runs, so the exit code is untouched.
                 if !json {

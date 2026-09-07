@@ -5,10 +5,18 @@
 //! `stream_options`, and provider-specific headers. The request body is
 //! serialized once before the retry loop so a retry resends identical bytes.
 //!
-//! Retries are deliberately narrow: connect failures, timeouts, and 429 only,
-//! and only BEFORE the first token arrives. Once a stream has produced output,
-//! retrying would duplicate text the caller already saw, so a mid-stream
-//! failure is reported instead.
+//! Retries cover what a network can do to one request before the reply
+//! exists: a transport failure on send, a 429, and a stream that died before
+//! any reply text arrived. Each attempt resends the same bytes after an
+//! exponential backoff and tells the caller through [`StreamDelta::Retry`].
+//! Once reply text has streamed, a retry would duplicate what the caller
+//! already showed, so a failure after that point is reported as a
+//! truncation instead; reasoning deltas are display-only and do not count.
+//! A stream this client ends on purpose (the size cap, an out-of-range tool
+//! index, cancellation) is never retried: the next attempt would end the
+//! same way. A reply carrying only tool calls has no reply text, so a server
+//! that never sends a completion signal costs the whole budget on such a
+//! reply before its truncation is reported.
 //!
 //! There is no overall request timeout, only a connect timeout. A local or
 //! slow endpoint can legitimately take minutes to generate, and a deadline
@@ -113,6 +121,12 @@ fn serialize_chat_request_body(
 pub enum StreamDelta {
     Content(String),
     Reasoning(String),
+    /// The request is being resent: `attempt` is the one about to go out of
+    /// the `max_attempts` budget, after `reason` ended the previous one. Any
+    /// reasoning streamed for the failed attempt is void; no content was. A
+    /// request gives up before the budget when [`UNREACHED_ATTEMPTS`] in a
+    /// row never reached the endpoint.
+    Retry { attempt: u32, max_attempts: u32, reason: String },
 }
 
 /// `finish_reason` for a stream the server never terminated: no `[DONE]` line
@@ -323,14 +337,11 @@ impl ChatClient {
             tools_wire,
         )?;
 
-        // Retry only pre-stream transport failures (connect/timeout) and 429
-        // (request rejected before work starts). Do not retry 502/503/504: a
-        // proxy may already have forwarded the POST and started a completion,
-        // so a second attempt can duplicate backend work with no idempotency key.
-        // Once SSE bytes start, failures fail cleanly without a second prefill.
-        const MAX_ATTEMPTS: u32 = 3;
         let mut attempt = 0u32;
-        let resp = loop {
+        // Attempts in a row that never reached the endpoint; any other
+        // outcome, including a later transport fault, resets it.
+        let mut unreached = 0u32;
+        loop {
             attempt += 1;
             let mut req = self
                 .http
@@ -350,192 +361,212 @@ impl ChatClient {
             // it runs; keep cancellation responsive throughout.
             let send_result = tokio::select! {
                 r = req.send() => r,
-                _ = cancelled.cancelled() => {
-                    return Ok(CompletionResult {
-                        content: String::new(),
-                        tool_calls: Vec::new(),
-                        finish_reason: "cancelled".into(),
-                        usage: None,
-                    });
-                }
+                _ = cancelled.cancelled() => return Ok(cancelled_response()),
             };
             let resp = match send_result {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("request failed: {}", describe_transport(&e));
-                    if attempt < MAX_ATTEMPTS && is_transient_transport(&e) {
-                        backoff_sleep(attempt).await;
-                        if cancelled.is_cancelled() {
-                            return Ok(CompletionResult {
-                                content: String::new(),
-                                tool_calls: Vec::new(),
-                                finish_reason: "cancelled".into(),
-                                usage: None,
-                            });
+                    unreached = if e.is_connect() || e.is_timeout() { unreached + 1 } else { 0 };
+                    if attempt < MAX_ATTEMPTS && unreached < UNREACHED_ATTEMPTS && is_transient_transport(&e) {
+                        if !retry_after(attempt, &msg, &cancelled, &mut on_delta).await {
+                            return Ok(cancelled_response());
                         }
                         continue;
                     }
                     return Err(msg);
                 }
             };
+            unreached = 0;
             let status = resp.status();
-            if status.is_success() {
-                break resp;
-            }
-            let code = status.as_u16();
-            let body = read_body(resp, &cancelled).await
-                .map_err(|e| format!("backend returned {status}: {e}"))?;
-            let Some(body) = body else { return Ok(cancelled_response()); };
-            let text = String::from_utf8_lossy(&body);
-            let err = format!("backend returned {status}: {}", describe_backend(&text));
-            if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
-                backoff_sleep(attempt).await;
-                if cancelled.is_cancelled() {
-                    return Ok(CompletionResult {
-                        content: String::new(),
-                        tool_calls: Vec::new(),
-                        finish_reason: "cancelled".into(),
-                        usage: None,
-                    });
-                }
-                continue;
-            }
-            return Err(err);
-        };
-        let is_json = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("application/json"));
-
-        // Some servers ignore `stream` and return a complete JSON body.
-        if is_json {
-            let Some(body) = read_body(resp, &cancelled).await? else { return Ok(cancelled_response()); };
-            let v: Value = serde_json::from_slice(&body).map_err(|e| format!("bad JSON response: {e}"))?;
-            return parse_complete_response(&v, &mut on_delta);
-        }
-
-        let mut content = String::new();
-        let mut partials: Vec<PartialToolCall> = Vec::new();
-        let mut finish_reason = String::from("stop");
-        // Did the server ever say it was done (a `[DONE]` line or a
-        // finish_reason chunk)? Without one, the stream ending means the
-        // connection dropped mid-answer, not that the model finished.
-        let mut saw_terminator = false;
-        let mut usage: Option<Usage> = None;
-        // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
-        // conversion only happens on complete lines ('\n' is never part of a
-        // multi-byte sequence).
-        let mut buf: Vec<u8> = Vec::new();
-        let mut stream = resp.bytes_stream();
-        let mut received = 0usize;
-        let mut scanned = 0usize;
-
-        'outer: loop {
-            let next = tokio::select! {
-                c = stream.next() => c,
-                _ = cancelled.cancelled() => {
-                    finish_reason = "cancelled".into();
-                    break;
-                }
-            };
-            let Some(chunk) = next else { break };
-            let chunk = match chunk {
-                Ok(chunk) if chunk.len() <= MAX_RESPONSE_BYTES - received => chunk,
-                _ => {
-                    saw_terminator = false;
-                    finish_reason = TRUNCATED.into();
-                    break;
-                }
-            };
-            received += chunk.len();
-            buf.extend_from_slice(&chunk);
-
-            while let Some(rel) = buf[scanned..].iter().position(|&b| b == b'\n') {
-                let pos = scanned + rel;
-                scanned = 0;
-                let rest = buf.split_off(pos + 1);
-                let consumed = std::mem::replace(&mut buf, rest);
-                let line = trim_bytes(&consumed[..pos]);
-                if line.is_empty() || line.first() == Some(&b':') {
+            if !status.is_success() {
+                let code = status.as_u16();
+                let body = read_body(resp, &cancelled).await
+                    .map_err(|e| format!("backend returned {status}: {e}"))?;
+                let Some(body) = body else { return Ok(cancelled_response()); };
+                let text = String::from_utf8_lossy(&body);
+                let err = format!("backend returned {status}: {}", describe_backend(&text));
+                if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
+                    if !retry_after(attempt, &err, &cancelled, &mut on_delta).await {
+                        return Ok(cancelled_response());
+                    }
                     continue;
                 }
-                let data = strip_data_prefix(line);
-                if data == b"[DONE]" {
-                    saw_terminator = true;
-                    break 'outer;
-                }
-                let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
-                if let Some(u) = chunk.usage {
-                    usage = Some(u.into_usage());
-                }
-                // The usage-bearing final chunk has an empty choices array.
-                let Some(choice) = chunk.choices.into_iter().next() else { continue };
+                return Err(err);
+            }
+            let is_json = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.contains("application/json"));
 
-                if let Some(reason) = choice.finish_reason {
-                    // Servers that end a stream here and never send `[DONE]`
-                    // are still finished: this is a terminator too.
-                    saw_terminator = true;
-                    finish_reason = reason;
-                }
-                let delta = choice.delta;
-                if let Some(text) = delta.content {
-                    if !text.is_empty() {
-                        content.push_str(&text);
-                        on_delta(StreamDelta::Content(text));
+            // Some servers ignore `stream` and return a complete JSON body.
+            if is_json {
+                let Some(body) = read_body(resp, &cancelled).await? else { return Ok(cancelled_response()); };
+                let v: Value = serde_json::from_slice(&body).map_err(|e| format!("bad JSON response: {e}"))?;
+                return parse_complete_response(&v, &mut on_delta);
+            }
+
+            let (reply, interrupted) = read_sse(resp, &cancelled, &mut on_delta).await;
+            match interrupted {
+                Some(reason) if reply.content.is_empty() && attempt < MAX_ATTEMPTS => {
+                    if !retry_after(attempt, &reason, &cancelled, &mut on_delta).await {
+                        return Ok(cancelled_response());
                     }
                 }
-                // Reasoning models surface thinking under different keys.
-                if let Some(text) = delta.reasoning_content {
-                    if !text.is_empty() {
-                        on_delta(StreamDelta::Reasoning(text));
-                    }
-                } else if let Some(text) = delta.reasoning {
-                    if !text.is_empty() {
-                        on_delta(StreamDelta::Reasoning(text));
-                    }
+                _ => return Ok(reply),
+            }
+        }
+    }
+}
+
+/// Parse one SSE stream to its end. The second value names the interruption
+/// when the network ended the stream before the server did: EOF with no
+/// terminator, or a read error. It is `None` for a finished reply and for a
+/// stream this client cut itself, which a fresh attempt would cut the same way.
+async fn read_sse(
+    resp: reqwest::Response,
+    cancelled: &crate::state::CancelToken,
+    on_delta: &mut impl FnMut(StreamDelta),
+) -> (CompletionResult, Option<String>) {
+    let mut content = String::new();
+    let mut partials: Vec<PartialToolCall> = Vec::new();
+    let mut finish_reason = String::from("stop");
+    // Did the server ever say it was done (a `[DONE]` line or a
+    // finish_reason chunk)? Without one, the stream ending means the
+    // connection dropped mid-answer, not that the model finished.
+    let mut saw_terminator = false;
+    let mut usage: Option<Usage> = None;
+    // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
+    // conversion only happens on complete lines ('\n' is never part of a
+    // multi-byte sequence).
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    let mut received = 0usize;
+    let mut scanned = 0usize;
+    // Set when the network, not the server or this client, ended the
+    // stream: the one truncation a fresh attempt can undo.
+    let mut interrupted: Option<String> = None;
+
+    'outer: loop {
+        let next = tokio::select! {
+            c = stream.next() => c,
+            _ = cancelled.cancelled() => {
+                finish_reason = "cancelled".into();
+                break;
+            }
+        };
+        let Some(chunk) = next else {
+            if !saw_terminator {
+                interrupted = Some("the stream ended before the reply finished".into());
+            }
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) if chunk.len() <= MAX_RESPONSE_BYTES - received => chunk,
+            Ok(_) => {
+                saw_terminator = false;
+                finish_reason = TRUNCATED.into();
+                break;
+            }
+            Err(e) => {
+                saw_terminator = false;
+                finish_reason = TRUNCATED.into();
+                // A body that fails to decode will fail the same way again;
+                // only the connection is worth a fresh attempt.
+                if !e.is_decode() {
+                    interrupted = Some(describe_transport(&e));
                 }
-                if let Some(calls) = delta.tool_calls {
-                    for tc in calls {
-                        let idx = tc.index.unwrap_or(0) as usize;
-                        if idx >= MAX_TOOL_CALLS {
-                            saw_terminator = false;
-                            finish_reason = TRUNCATED.into();
-                            break 'outer;
+                break;
+            }
+        };
+        received += chunk.len();
+        buf.extend_from_slice(&chunk);
+
+        while let Some(rel) = buf[scanned..].iter().position(|&b| b == b'\n') {
+            let pos = scanned + rel;
+            scanned = 0;
+            let rest = buf.split_off(pos + 1);
+            let consumed = std::mem::replace(&mut buf, rest);
+            let line = trim_bytes(&consumed[..pos]);
+            if line.is_empty() || line.first() == Some(&b':') {
+                continue;
+            }
+            let data = strip_data_prefix(line);
+            if data == b"[DONE]" {
+                saw_terminator = true;
+                break 'outer;
+            }
+            let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
+            if let Some(u) = chunk.usage {
+                usage = Some(u.into_usage());
+            }
+            // The usage-bearing final chunk has an empty choices array.
+            let Some(choice) = chunk.choices.into_iter().next() else { continue };
+
+            if let Some(reason) = choice.finish_reason {
+                // Servers that end a stream here and never send `[DONE]`
+                // are still finished: this is a terminator too.
+                saw_terminator = true;
+                finish_reason = reason;
+            }
+            let delta = choice.delta;
+            if let Some(text) = delta.content {
+                if !text.is_empty() {
+                    content.push_str(&text);
+                    on_delta(StreamDelta::Content(text));
+                }
+            }
+            // Reasoning models surface thinking under different keys.
+            if let Some(text) = delta.reasoning_content {
+                if !text.is_empty() {
+                    on_delta(StreamDelta::Reasoning(text));
+                }
+            } else if let Some(text) = delta.reasoning {
+                if !text.is_empty() {
+                    on_delta(StreamDelta::Reasoning(text));
+                }
+            }
+            if let Some(calls) = delta.tool_calls {
+                for tc in calls {
+                    let idx = tc.index.unwrap_or(0) as usize;
+                    if idx >= MAX_TOOL_CALLS {
+                        saw_terminator = false;
+                        finish_reason = TRUNCATED.into();
+                        break 'outer;
+                    }
+                    while partials.len() <= idx {
+                        partials.push(PartialToolCall::default());
+                    }
+                    if let Some(id) = tc.id {
+                        partials[idx].id.push_str(&id);
+                    }
+                    if let Some(function) = tc.function {
+                        if let Some(name) = function.name {
+                            partials[idx].name.push_str(&name);
                         }
-                        while partials.len() <= idx {
-                            partials.push(PartialToolCall::default());
-                        }
-                        if let Some(id) = tc.id {
-                            partials[idx].id.push_str(&id);
-                        }
-                        if let Some(function) = tc.function {
-                            if let Some(name) = function.name {
-                                partials[idx].name.push_str(&name);
-                            }
-                            if let Some(args) = function.arguments {
-                                partials[idx].arguments.push_str(&args);
-                            }
+                        if let Some(args) = function.arguments {
+                            partials[idx].arguments.push_str(&args);
                         }
                     }
                 }
             }
-            scanned = buf.len();
         }
-
-        // The stream ran out without the server ever finishing it: report the
-        // truncation rather than the default "stop", which would make a
-        // cut-off answer indistinguishable from a complete one. Cancellation
-        // ends the stream from this side, so it keeps its own reason.
-        if !saw_terminator && finish_reason != "cancelled" {
-            finish_reason = TRUNCATED.into();
-        }
-        let tool_calls = finalize_tool_calls(partials);
-        if !tool_calls.is_empty() && finish_reason == "stop" {
-            finish_reason = "tool_calls".into();
-        }
-        Ok(CompletionResult { content, tool_calls, finish_reason, usage })
+        scanned = buf.len();
     }
+
+    // The stream ran out without the server ever finishing it: report the
+    // truncation rather than the default "stop", which would make a
+    // cut-off answer indistinguishable from a complete one. Cancellation
+    // ends the stream from this side, so it keeps its own reason.
+    if !saw_terminator && finish_reason != "cancelled" {
+        finish_reason = TRUNCATED.into();
+    }
+    let tool_calls = finalize_tool_calls(partials);
+    if !tool_calls.is_empty() && finish_reason == "stop" {
+        finish_reason = "tool_calls".into();
+    }
+    (CompletionResult { content, tool_calls, finish_reason, usage }, interrupted)
 }
 
 fn cancelled_response() -> CompletionResult {
@@ -698,6 +729,31 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Attempts per request. With [`BACKOFF_UNIT`] doubling up to
+/// [`BACKOFF_CAP`], the last attempt goes out about a minute after the
+/// first. A transient fault on the path to an endpoint (a reset or a TLS
+/// alert on send, a stream cut mid-reply) can recur for minutes and clears
+/// within seconds most times and within a minute at worst, so attempts
+/// packed into one second only ever observe the fault and end a turn the
+/// next connection would have completed. Every wait is announced and
+/// cancellable.
+const MAX_ATTEMPTS: u32 = 8;
+/// Attempts in a row that may fail before any connection exists (refused,
+/// unresolvable, a connect timeout, a failed TLS handshake) before the
+/// request gives up early. That is an address with nothing listening far
+/// more often than a blip, and a user who forgot to start a local server
+/// should hear so after the two short waits, not a minute. A refused
+/// address fails in about three seconds; one that drops packets pays the
+/// connect timeout on each attempt as well.
+const UNREACHED_ATTEMPTS: u32 = 3;
+
+#[cfg(not(test))]
+const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Tests exercise the attempt count, never the wall clock.
+#[cfg(test)]
+const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_millis(1);
+const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(16);
+
 /// Only statuses that mean the server rejected the request before doing work.
 /// 5xx from a proxy is not safe to retry without an idempotency key.
 fn is_retryable_status(code: u16) -> bool {
@@ -708,10 +764,22 @@ fn is_transient_transport(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request()
 }
 
-async fn backoff_sleep(attempt: u32) {
-    // ~100ms, ~200ms (capped); keep total retry budget small for local UX.
-    let ms = 100u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(2)));
-    tokio::time::sleep(std::time::Duration::from_millis(ms.min(400))).await;
+/// Announce the retry, then wait out the backoff for `attempt` (1-based, the
+/// one that just failed). Returns false when cancelled during the wait: a
+/// backoff can reach [`BACKOFF_CAP`], and a user who cancels must not sit
+/// through it.
+async fn retry_after(
+    attempt: u32,
+    reason: &str,
+    cancelled: &crate::state::CancelToken,
+    on_delta: &mut impl FnMut(StreamDelta),
+) -> bool {
+    on_delta(StreamDelta::Retry { attempt: attempt + 1, max_attempts: MAX_ATTEMPTS, reason: reason.to_string() });
+    let wait = BACKOFF_UNIT.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => true,
+        _ = cancelled.cancelled() => false,
+    }
 }
 
 #[cfg(test)]
@@ -917,19 +985,170 @@ mod tests {
         assert_eq!(result.finish_reason, "stop");
     }
 
-    /// The client reports what arrived without hiding it: the calls come back
-    /// alongside the truncation, and refusing to dispatch them is the agent
-    /// loop's decision (a call from a stream the model never finished may not
-    /// be the call it meant to make).
+    /// An endpoint that answers successive connections with successive
+    /// bodies, each close-delimited, then stops listening. An empty body
+    /// closes the connection after reading the request without answering:
+    /// the shape of a transport fault on send. Returns the URL and the
+    /// number of connections it served.
+    fn spawn_sse_sequence(bodies: Vec<String>) -> (String, Arc<std::sync::Mutex<usize>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::new(std::sync::Mutex::new(0usize));
+        let count = served.clone();
+        std::thread::spawn(move || {
+            for sse in bodies {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 && stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                *count.lock().unwrap() += 1;
+                if sse.is_empty() {
+                    continue;
+                }
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}").as_bytes(),
+                );
+            }
+        });
+        (format!("http://{addr}/v1"), served)
+    }
+
+    async fn stream_sequence(bodies: Vec<String>) -> (CompletionResult, Vec<String>, usize) {
+        let (url, served) = spawn_sse_sequence(bodies);
+        let mut deltas: Vec<String> = Vec::new();
+        let result = ChatClient::new(url, None, "m".into(), 0.0, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+                deltas.push(match d {
+                    StreamDelta::Content(t) => format!("content:{t}"),
+                    StreamDelta::Reasoning(t) => format!("reasoning:{t}"),
+                    StreamDelta::Retry { attempt, max_attempts, reason } => format!("retry:{attempt}/{max_attempts}:{reason}"),
+                })
+            })
+            .await
+            .unwrap();
+        let served = *served.lock().unwrap();
+        (result, deltas, served)
+    }
+
+    /// The bug this guards: a connection that died while the model was still
+    /// reasoning ended the whole turn with the task half done, on a fault the
+    /// next connection did not see. Nothing the caller keeps had arrived, so
+    /// the client starts the reply over, announces the retry after the
+    /// reasoning it voids, and the result is the finished reply alone.
+    #[tokio::test]
+    async fn a_stream_interrupted_before_any_reply_text_is_started_over() {
+        let (result, deltas, served) = stream_sequence(vec![
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me\"},\"finish_reason\":null}]}\n\n".into(),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .into(),
+        ])
+        .await;
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(
+            deltas,
+            vec![
+                "reasoning:let me".to_string(),
+                format!("retry:2/{MAX_ATTEMPTS}:the stream ended before the reply finished"),
+                "content:all of it".to_string(),
+            ]
+        );
+    }
+
+    /// A connection the far side drops before answering is a transport fault
+    /// after the connection existed: each one is resent after a backoff,
+    /// announced, and the turn goes on with the reply that arrives.
+    #[tokio::test]
+    async fn a_request_dropped_on_send_is_resent_until_a_reply_arrives() {
+        let good = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (result, deltas, served) =
+            stream_sequence(vec![String::new(), String::new(), String::new(), good.into()]).await;
+        assert_eq!(served, 4);
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(deltas.len(), 4);
+        for (i, delta) in deltas.iter().take(3).enumerate() {
+            assert!(
+                delta.starts_with(&format!("retry:{}/{MAX_ATTEMPTS}:request failed: ", i + 2)),
+                "resend {} is announced with its cause: {delta}",
+                i + 2
+            );
+        }
+        assert_eq!(deltas[3], "content:all of it");
+    }
+
+    /// Nothing listening is not a fault worth a minute of backoff: after
+    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early. Port 9 is
+    /// the discard service, which nothing on a developer host listens on.
+    #[tokio::test]
+    async fn an_address_that_never_answers_gives_up_before_the_budget() {
+        let mut deltas: Vec<String> = Vec::new();
+        let result = ChatClient::new("http://127.0.0.1:9/v1".into(), None, "m".into(), 0.0, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+                if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
+                    deltas.push(format!("{attempt}/{max_attempts}"));
+                }
+            })
+            .await;
+        let Err(err) = result else { panic!("no listener is a failed request") };
+        assert!(err.starts_with("request failed: "), "{err}");
+        assert_eq!(deltas, vec![format!("2/{MAX_ATTEMPTS}"), format!("3/{MAX_ATTEMPTS}")]);
+    }
+
+    /// The client reports what arrived without hiding it: once the retry
+    /// budget is spent, the calls come back alongside the truncation, and
+    /// refusing to dispatch them is the agent loop's decision (a call from a
+    /// stream the model never finished may not be the call it meant to make).
     #[tokio::test]
     async fn a_truncated_stream_still_returns_the_tool_calls_it_carried() {
-        let result = stream_once(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
-        )
-        .await;
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n";
+        let (result, deltas, served) = stream_sequence(vec![body.to_string(); MAX_ATTEMPTS as usize]).await;
+        assert_eq!(served, MAX_ATTEMPTS as usize, "every attempt in the budget was spent first");
+        assert_eq!(deltas.len(), MAX_ATTEMPTS as usize - 1, "each resend was announced");
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].function.name, "read_file");
         assert_eq!(result.finish_reason, TRUNCATED, "an unfinished stream is not a clean tool_calls stop");
+    }
+
+    /// Reply text the caller has already shown is never duplicated: a stream
+    /// that dies after content streamed is a truncation, not a retry.
+    #[tokio::test]
+    async fn a_stream_interrupted_after_reply_text_is_not_retried() {
+        let (result, deltas, served) = stream_sequence(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n".into(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"unreached\"},\"finish_reason\":\"stop\"}]}\n\n".into(),
+        ])
+        .await;
+        assert_eq!(served, 1);
+        assert_eq!(result.finish_reason, TRUNCATED);
+        assert_eq!(result.content, "half an ans");
+        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
     }
 
     #[test]
