@@ -7,9 +7,11 @@
 //! so only the process that runs turns can honestly say *when* a capability
 //! file changed relative to the session lifecycle. The ledger lives outside
 //! the project (like `trust.json`), where the confined file tools never
-//! write. Each record embeds the sha256 of the previous record line, so
-//! tampering through bash is at least detectable - the honest ceiling
-//! without an OS sandbox, and the same ceiling trust already lives at.
+//! write. Each record embeds the sha256 of the previous record line, so a
+//! torn write or an edit that does not recompute the chain is detected. A
+//! deliberate rewrite of log and pin together is not: there is no key, and
+//! bash can reach the data dir. That is the honest ceiling without an OS
+//! sandbox, and the same ceiling trust already lives at.
 //!
 //! Rollback is deliberately a file operation, not a product: `openmax
 //! --ledger` prints history with object paths, and restoring is `cp`. The
@@ -146,14 +148,28 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-/// Per-project ledger directory under the harness data dir, keyed by the
-/// canonical root so symlinked spellings share one history.
-pub fn project_dir(data_dir: &Path, project_root: &Path) -> PathBuf {
+/// The per-project key every per-project store under the data dir uses:
+/// the canonical root's hash, so symlinked spellings share one history.
+pub fn project_key(project_root: &Path) -> String {
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let key = sha256_hex(canonical.to_string_lossy().as_bytes());
-    data_dir.join("ledger").join(&key[..16])
+    // The path's bytes, not a lossy rendering: two roots that differ only
+    // in invalid UTF-8 would otherwise share a key, and with it a ledger and
+    // a prompt history. Valid UTF-8 paths hash to the same key either way.
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        canonical.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = canonical.to_string_lossy().into_owned().into_bytes();
+    sha256_hex(&bytes)[..16].to_string()
+}
+
+/// Per-project ledger directory under the harness data dir.
+pub fn project_dir(data_dir: &Path, project_root: &Path) -> PathBuf {
+    data_dir.join("ledger").join(project_key(project_root))
 }
 
 fn log_path(dir: &Path) -> PathBuf {
@@ -1882,6 +1898,20 @@ pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key hashes the path's bytes, not a lossy rendering: two roots that
+    /// differ only in invalid UTF-8 bytes spell the same lossy string, and a
+    /// shared key would let one project's ledger and prompt history answer
+    /// for the other's.
+    #[cfg(unix)]
+    #[test]
+    fn project_key_distinguishes_byte_distinct_roots() {
+        use std::os::unix::ffi::OsStrExt;
+        let a = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/open-max-\xff"));
+        let b = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/open-max-\xfe"));
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy(), "the lossy spellings collide");
+        assert_ne!(project_key(&a), project_key(&b));
+    }
 
     /// Verify the hash chain; returns the number of intact records or the
     /// index where the chain breaks. A test oracle: production verification

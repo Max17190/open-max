@@ -130,8 +130,13 @@ pub struct Composer {
 }
 
 impl Composer {
-    pub fn new(data_dir: &std::path::Path) -> Self {
-        let history_path = data_dir.join("history.json");
+    pub fn new(data_dir: &std::path::Path, project_root: &std::path::Path) -> Self {
+        // Prompt history is per project, keyed by the canonical root like
+        // every other per-project store: one project's drafts must not
+        // surface in another project's composer.
+        let history_path = data_dir
+            .join("history")
+            .join(format!("{}.json", open_max_core::ledger::project_key(project_root)));
         let history: Vec<String> = std::fs::read_to_string(&history_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -627,6 +632,9 @@ impl Composer {
             self.history.drain(..overflow);
         }
         if let Ok(json) = serde_json::to_string(&self.history) {
+            if let Some(dir) = self.history_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
             let _ = std::fs::write(&self.history_path, json);
         }
     }
@@ -1132,7 +1140,7 @@ mod tests {
 
     #[test]
     fn large_paste_collapses_to_a_marker_and_reads_back_expanded() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         let blob = blob.trim_end().to_string();
         composer.insert_str("before ");
@@ -1155,7 +1163,7 @@ mod tests {
     /// later path, never a second delivery.
     #[test]
     fn ctrl_o_expands_the_marker_under_the_cursor_not_the_first() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         let blob = blob.trim_end().to_string();
         composer.insert_paste(&blob);
@@ -1191,7 +1199,7 @@ mod tests {
     /// marker as literal text.
     #[test]
     fn an_embedded_marker_spelling_never_captures_a_later_paste() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let mut first: Vec<String> = (1..=11).map(|i| format!("alpha {i}")).collect();
         first.push("[pasted #2: 12 lines]".to_string());
         composer.insert_paste(&first.join("\n"));
@@ -1215,7 +1223,7 @@ mod tests {
     /// instead of injecting the paste twice.
     #[test]
     fn a_typed_marker_duplicate_stays_literal() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         let blob = blob.trim_end().to_string();
         composer.insert_paste(&blob);
@@ -1238,7 +1246,7 @@ mod tests {
     /// "hello\nquoted world", silently merging the suffix into the quote.
     #[test]
     fn append_block_lands_at_the_end_never_mid_line() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("hello world");
         composer.row = 0;
         composer.col = 5; // cursor between "hello" and " world"
@@ -1251,7 +1259,7 @@ mod tests {
     /// would silently blow a collapsed paste back into the draft.
     #[test]
     fn append_block_never_expands_a_collapsed_paste() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         composer.insert_paste(blob.trim_end());
         composer.append_block("quoted");
@@ -1264,7 +1272,7 @@ mod tests {
 
     #[test]
     fn small_pastes_splice_literally() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_paste("just\nthree\nlines");
         assert_eq!(composer.lines.len(), 3);
         assert_eq!(composer.text(), "just\nthree\nlines");
@@ -1273,7 +1281,7 @@ mod tests {
 
     #[test]
     fn a_single_line_blob_collapses_on_the_char_bound() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob = "x".repeat(2000);
         composer.insert_paste(&blob);
         assert_eq!(composer.lines[0], "[pasted #1: 2000 chars]");
@@ -1282,7 +1290,7 @@ mod tests {
 
     #[test]
     fn expand_paste_at_cursor_splices_the_bytes_back_for_editing() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob: String = (1..=12)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1308,7 +1316,7 @@ mod tests {
 
     #[test]
     fn an_edited_marker_never_expands() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob: String = (1..=12).map(|i| format!("l{i}\n")).collect();
         composer.insert_paste(blob.trim_end());
         // Damage the marker itself; a char merely appended after the closing
@@ -1321,7 +1329,7 @@ mod tests {
 
     #[test]
     fn empty_composer_uses_single_purposeful_placeholder() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let (lines, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!(lines.len(), 1);
         assert_eq!(plain(&lines[0]), "❯ Describe a task");
@@ -1334,7 +1342,7 @@ mod tests {
     /// way, so a draft and its echo line up column for column.
     #[test]
     fn multiline_composer_indents_continuation_rows_with_blank_cells() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("first\nsecond");
         let (lines, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!(plain(&lines[0]), "❯ first");
@@ -1347,7 +1355,7 @@ mod tests {
     /// and there is text above. Rows under it stay blank.
     #[test]
     fn only_a_scrolled_top_row_marks_the_gutter() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         for i in 0..10 {
             composer.insert_str(&format!("line {i:02}\n"));
         }
@@ -1362,7 +1370,7 @@ mod tests {
 
     #[test]
     fn composer_edits_complete_graphemes() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("e\u{301}👩‍💻");
 
         composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
@@ -1381,7 +1389,7 @@ mod tests {
     /// 100 KB minified blob.
     #[test]
     fn a_paste_splices_segments_instead_of_inserting_per_char() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         let blob = "x".repeat(10_000);
         composer.insert_str(&blob);
         assert_eq!(
@@ -1396,7 +1404,7 @@ mod tests {
 
     #[test]
     fn a_crlf_paste_drops_carriage_returns_and_splits_lines() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("first\r\nsecond\rhalf\r\n");
         assert_eq!(composer.text(), "first\nsecondhalf\n");
         assert_eq!((composer.row, composer.col), (2, 0));
@@ -1404,7 +1412,7 @@ mod tests {
 
     #[test]
     fn a_mid_line_paste_lands_at_the_cursor() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("head tail");
         for _ in 0..4 {
             composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
@@ -1443,7 +1451,7 @@ mod tests {
 
     #[test]
     fn composer_cursor_uses_terminal_cell_width() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("漢e\u{301}👩‍💻");
         let (_, cursor_x, cursor_y) = composer.render(40, 3);
         assert_eq!((cursor_x, cursor_y), (7, 0));
@@ -1454,7 +1462,7 @@ mod tests {
     /// most of the draft was neither visible nor reachable.
     #[test]
     fn a_long_line_wraps_into_rows_instead_of_running_past_the_box() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str(&"word ".repeat(20)); // 100 cells on one line
         let width = 20;
 
@@ -1479,8 +1487,9 @@ mod tests {
     #[test]
     fn moving_the_cursor_does_not_re_wrap_the_draft() {
         // A unique directory that is never created: the composer only reads
-        // history.json, so this test is isolated from every other one's history.
-        let mut composer = Composer::new(&crate::test_temp_dir("openmax-composer-wraps"));
+        // its history file, so this test is isolated from every other one's.
+        let dir = crate::test_temp_dir("openmax-composer-wraps");
+        let mut composer = Composer::new(&dir, &dir);
         composer.insert_str(&"word ".repeat(200));
         composer.render(40, 6);
         let base = composer.wraps;
@@ -1526,7 +1535,7 @@ mod tests {
     /// press snaps back so typing never happens off screen.
     #[test]
     fn the_wheel_reaches_rows_above_the_window_and_typing_snaps_back() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         for i in 0..20 {
             composer.insert_str(&format!("line {i:02}\n"));
         }
@@ -1557,7 +1566,7 @@ mod tests {
     /// row pointed at, not on whatever logical line happens to be last.
     #[test]
     fn a_click_lands_the_cursor_on_the_row_and_column_pointed_at() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("hello world foo");
         let (width, height) = (12, 6);
         // Rows are "hello " and "world foo"; the gutter costs two cells.
@@ -1575,7 +1584,7 @@ mod tests {
 
     #[test]
     fn a_click_respects_double_width_cells() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("漢字ab");
         // Cell 2 is the second half of 漢: the cursor goes before it.
         composer.click_at(40, 6, GUTTER as u16 + 1, 0);
@@ -1588,7 +1597,7 @@ mod tests {
     /// across wrapped rows and across logical lines.
     #[test]
     fn dragging_selects_the_source_text_under_the_pointer() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("hello world foo");
         let (width, height) = (12, 6);
 
@@ -1598,7 +1607,7 @@ mod tests {
         assert_eq!(composer.selected_text().as_deref(), Some("hello world"));
 
         // Across logical lines the newline comes with it.
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("alpha\nbeta");
         composer.click_at(40, height, GUTTER as u16 + 2, 0);
         composer.drag_to(40, height, GUTTER as u16 + 2, 1);
@@ -1610,7 +1619,7 @@ mod tests {
     /// one-character case that an inclusive endpoint alone cannot express.
     #[test]
     fn double_click_selects_the_word_under_the_pointer() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("see crates/tui/src/app.rs:42 now");
         let (width, height) = (60, 6);
 
@@ -1626,20 +1635,20 @@ mod tests {
         );
 
         // A one-character word is a real selection, not an empty one.
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("let x = 1");
         assert_eq!(at(&mut composer, 4).as_deref(), Some("x"));
     }
 
     #[test]
     fn triple_click_selects_the_logical_line_even_where_it_wraps() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("alpha\nhello world foo bar\nomega");
         // Width 12 wraps the middle line across rows; a triple-click on any of
         // them still means the whole logical line.
         let (width, height) = (12, 6);
         for row in [0u16, 1] {
-            let mut c = Composer::new(&std::env::temp_dir());
+            let mut c = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
             c.insert_str("hello world foo bar");
             c.select_line_at(width, height, GUTTER as u16, row);
             c.finish_selection();
@@ -1660,7 +1669,7 @@ mod tests {
     /// carries, which is the one thing this surface promises.
     #[test]
     fn a_gesture_on_an_empty_line_clears_the_previous_selection() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("alpha\n\nbeta");
         let (width, height) = (40, 6);
 
@@ -1686,7 +1695,7 @@ mod tests {
     /// clamps the same way.
     #[test]
     fn a_composer_gesture_drag_never_shrinks_below_the_word() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("alpha beta gamma");
         let (width, height) = (40, 6);
         let cell = |col: usize| (GUTTER + col) as u16;
@@ -1713,7 +1722,7 @@ mod tests {
     /// The guarantee #132 established for the transcript, now true here too.
     #[test]
     fn the_release_cell_is_carried_not_dropped() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("fn main() {}");
         composer.click_at(40, 6, GUTTER as u16, 0);
         composer.drag_to(40, 6, GUTTER as u16 + 11, 0);
@@ -1725,7 +1734,7 @@ mod tests {
     /// never swallow the Ctrl+C that follows it.
     #[test]
     fn a_click_without_a_drag_leaves_no_selection() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("hello");
         composer.click_at(40, 6, GUTTER as u16 + 2, 0);
         assert!(composer.is_dragging());
@@ -1737,7 +1746,7 @@ mod tests {
 
     #[test]
     fn only_the_selected_cells_are_highlighted() {
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("alpha\nbeta");
         composer.click_at(40, 6, GUTTER as u16 + 2, 0);
         composer.drag_to(40, 6, GUTTER as u16 + 2, 1);
@@ -1771,7 +1780,7 @@ mod tests {
         let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
 
         // From the last row: presses walk the draft upward to empty.
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("first\nsecond\nthird");
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "first\nsecond");
@@ -1784,7 +1793,7 @@ mod tests {
         assert_eq!(composer.text(), "");
 
         // From the top row: presses consume downward, no stuck state.
-        let mut composer = Composer::new(&std::env::temp_dir());
+        let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
         composer.insert_str("first\nsecond\nthird");
         composer.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         composer.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -1811,7 +1820,7 @@ mod tests {
             ("multi-line-100k", "let value = compute(input);\n".repeat(3_600)),
         ] {
             let t0 = Instant::now();
-            let mut composer = Composer::new(&std::env::temp_dir());
+            let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
             composer.insert_str(&text);
             let paste_ms = t0.elapsed().as_secs_f64() * 1e3;
             std::hint::black_box(composer.text());
@@ -1832,7 +1841,7 @@ mod tests {
             ("paste-10k", "let value = compute(input, &config).unwrap_or_default();\n".repeat(180)),
             ("paste-100k", "let value = compute(input, &config).unwrap_or_default();\n".repeat(1800)),
         ] {
-            let mut composer = Composer::new(&std::env::temp_dir());
+            let mut composer = Composer::new(&std::env::temp_dir(), &std::env::temp_dir());
             composer.insert_str(&text);
             // A frame asks twice: once to size the box, once to fill it.
             let frame = |c: &mut Composer| {

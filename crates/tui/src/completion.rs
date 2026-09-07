@@ -102,12 +102,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         "endpoint, cache, performance, privacy, and network details",
         true,
     ),
-    command(
-        "theme",
-        "dark|light|mono|catppuccin",
-        "switch appearance",
-        false,
-    ),
     command("quit", "", "exit", true),
 ];
 

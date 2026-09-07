@@ -50,10 +50,15 @@ options:
                          deliberately deleting one; a missing approved hook
                          fails closed). Tools never fail closed: a deleted
                          approved tool needs nothing forgotten
-      --run-examples     with --check, execute each tool's [example] once.
-                         Unsandboxed: needs a trusted project and a tool file
-                         approved with --approve, and honors permissions and
-                         approval_mode exactly as a session does
+      --run-examples     with --check, execute each tool's [example] once, in
+                         a trusted project, under the same permission rules
+                         and pre_tool_use hooks as a turn. In auto, a valid
+                         tool then runs on the host without content
+                         approval. In ask or readonly, an approved tool runs
+                         on the host under approval_mode, and an unapproved
+                         one is probed in a sandbox (no network, writes
+                         confined to a scratch dir); a passing probe
+                         approves nothing
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers, memory) and exit;
                          nonzero if any is broken.
@@ -962,8 +967,6 @@ async fn main() -> std::io::Result<()> {
         eprintln!("openmax: unexpected arguments (use --print for headless)\n\n{HELP}");
         std::process::exit(2);
     }
-
-    theme::init();
 
     // Fullscreen session on the alternate screen: openmax owns the whole
     // terminal while it runs, and your shell (prompt, history, scrollback)

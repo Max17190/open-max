@@ -163,13 +163,11 @@ pub fn load(data_dir: &Path) -> Result<Settings, String> {
         .map_err(|e| format!("invalid settings file {}: {e}", path.display()))
 }
 
-pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
-    save_bytes(data_dir, settings).map(|_| ())
-}
-
-/// `save`, also returning the exact bytes written so a caller can fingerprint
-/// what IT wrote rather than re-reading a path something else may have
-/// replaced in the meantime.
+/// Write settings.json and return the exact bytes written. The one caller
+/// is `Core::save_settings`, which fingerprints what it wrote rather than
+/// re-reading a path something else may have replaced in the meantime, so a
+/// session's own save is never mistaken for external drift. Nothing outside
+/// the core writes settings.json.
 pub(crate) fn save_bytes(data_dir: &Path, settings: &Settings) -> Result<Vec<u8>, String> {
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     let destination = settings_path(data_dir);
@@ -340,10 +338,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let first = Settings { model: "one".into(), ..Settings::default() };
-        save(&dir, &first).unwrap();
+        save_bytes(&dir, &first).unwrap();
         let mut second = first.clone();
         second.model = "vendor/family/two".into();
-        save(&dir, &second).unwrap();
+        save_bytes(&dir, &second).unwrap();
         assert_eq!(load(&dir).unwrap().model, "vendor/family/two");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()

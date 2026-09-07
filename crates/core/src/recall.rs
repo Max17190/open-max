@@ -1,6 +1,7 @@
 //! `openmax --recall "<query>"`: deliberate recall over this project's own
 //! history - session transcripts, compaction archives, compaction digests,
-//! session titles, and memory files - ranked, budgeted, and cited.
+//! and memory files - ranked, budgeted, and cited. Session titles ride on
+//! every hit but are not searched (see `collect_chunks`).
 //!
 //! The archive PR made every prune reversible ("Full dropped messages:
 //! <path>"); the memory PR made facts durable. Recall is the searchable form
