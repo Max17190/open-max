@@ -31,7 +31,7 @@ use crate::ui::tool_card::{self, DiffText};
 use crate::ui::transcript::{
     wrap_lines, Term, Transcript,
 };
-use crate::ui::{context, extensions, markdown, model_picker, ready};
+use crate::ui::{context, extensions, markdown, model_picker};
 
 /// Where keyboard focus lives in chat mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -523,7 +523,7 @@ impl App {
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
         Self {
-            composer: Composer::new(&core.data_dir),
+            composer: Composer::new(&core.data_dir, &project),
             core,
             project,
             session_id: None,
@@ -1537,15 +1537,12 @@ impl App {
     }
 
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
-        let current = self.core.settings.lock().unwrap().clone();
-        match save_model_selection(
-            &self.core.data_dir,
-            &current,
-            provider.clone(),
-            model.clone(),
-        ) {
-            Ok(next) => {
-                self.core.adopt_saved_settings(&next);
+        let next = model_selection(&self.core.settings.lock().unwrap(), provider.clone(), model.clone());
+        // The core's own save: it fingerprints the exact bytes it writes,
+        // under its lock, so a TUI-authored save never reads as drift and a
+        // racing external edit still does. Adopted in memory only on success.
+        match self.core.save_settings(&next) {
+            Ok(()) => {
                 *self.core.settings.lock().unwrap() = next;
                 let source = provider
                     .map(|name| format!(" from {name}"))
@@ -2120,32 +2117,6 @@ impl App {
                 }
                 self.transcript.push(block);
                 self.dirty.mark_chat();
-            }
-            "theme" => {
-                match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some("light" | "day") => {
-                        theme::apply(theme::ThemeId::Light);
-                        self.note("theme: light");
-                    }
-                    Some("dark" | "night") => {
-                        theme::apply(theme::ThemeId::Dark);
-                        self.note("theme: dark");
-                    }
-                    Some("catppuccin" | "mocha" | "cat") => {
-                        theme::apply(theme::ThemeId::Catppuccin);
-                        self.note("theme: catppuccin");
-                    }
-                    Some("mono" | "bw") => {
-                        theme::set_tokens(theme::Tokens::mono());
-                        self.note("theme: mono");
-                    }
-                    _ => self.note("usage: /theme dark|light|mono|catppuccin"),
-                }
-                self.transcript.invalidate_styles();
-                self.hist_reuse_key = None;
-                self.tail_width = 0;
-                self.thinking_source.clear();
-                self.dirty = Dirty::all();
             }
             "model" if raw_rest.is_empty() => {
                 let settings = self.core.settings.lock().unwrap().clone();
@@ -3352,13 +3323,7 @@ impl App {
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
             if self.composer.is_empty() {
-                ready::render(
-                    Rect {
-                        width: content_w,
-                        ..area
-                    },
-                    frame.buffer_mut(),
-                );
+                render_ready(Rect { width: content_w, ..area }, frame.buffer_mut());
             }
             return;
         }
@@ -3705,17 +3670,24 @@ fn command_parts(command: &str) -> (&str, &str) {
     (head, rest)
 }
 
-fn save_model_selection(
-    data_dir: &std::path::Path,
-    current: &config::Settings,
-    provider: Option<String>,
-    model: String,
-) -> Result<config::Settings, String> {
+/// Restrained orientation for an empty chat session: one dim word. Transient
+/// chrome, never transcript content, so it never reaches saved sessions or
+/// the model; hidden when the area cannot hold it.
+fn render_ready(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    if area.width < 5 || area.height == 0 {
+        return;
+    }
+    Paragraph::new(Line::from(Span::styled("READY", Style::default().fg(theme::DIM()))))
+        .render(Rect { height: 1, ..area }, buf);
+}
+
+/// The settings a model selection produces; pure, so the caller decides how
+/// and whether to persist them.
+fn model_selection(current: &config::Settings, provider: Option<String>, model: String) -> config::Settings {
     let mut next = current.clone();
     next.provider = provider;
     next.model = model;
-    config::save(data_dir, &next)?;
-    Ok(next)
+    next
 }
 
 /// Single source of truth for `/help` and onboarding copy.
@@ -4360,7 +4332,7 @@ mod tests {
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
         wide_status_right,
-        presence_title, rect_contains, save_model_selection, turn_end_rings,
+        model_selection, presence_title, rect_contains, turn_end_rings,
         App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
@@ -4624,18 +4596,13 @@ mod tests {
     fn model_selection_persists_provider_and_complete_id() {
         let dir = crate::test_temp_dir("openmax-model-save");
         fs::create_dir_all(&dir).unwrap();
-        let current = config::Settings::default();
+        let (core, _rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
         let exact = "openrouter/vendor/family/model".to_string();
-        let saved = save_model_selection(
-            &dir,
-            &current,
-            Some("openrouter".into()),
-            exact.clone(),
-        )
-        .unwrap();
-        assert_eq!(saved.provider.as_deref(), Some("openrouter"));
-        assert_eq!(saved.model, exact);
-        let disk = config::load(&dir).unwrap();
+        let next = model_selection(&config::Settings::default(), Some("openrouter".into()), exact.clone());
+        assert_eq!(next.provider.as_deref(), Some("openrouter"));
+        assert_eq!(next.model, exact);
+        core.save_settings(&next).unwrap();
+        let disk = config::load(&core.data_dir).unwrap();
         assert_eq!(disk.provider.as_deref(), Some("openrouter"));
         assert_eq!(disk.model, exact);
         fs::remove_dir_all(dir).unwrap();
@@ -4648,21 +4615,6 @@ mod tests {
             ("model", "openrouter/vendor/family/model")
         );
         assert_eq!(command_parts("model"), ("model", ""));
-    }
-
-    #[test]
-    fn model_selection_failure_leaves_current_settings_unchanged() {
-        let current = config::Settings::default();
-        let missing = crate::test_temp_dir("openmax-model-save-missing").join("nested");
-        let result = save_model_selection(
-            &missing,
-            &current,
-            Some("other".into()),
-            "other/model".into(),
-        );
-        assert!(result.is_err());
-        assert!(current.provider.is_none());
-        assert_eq!(current.model, config::Settings::default().model);
     }
 
     #[test]
@@ -4877,7 +4829,7 @@ mod tests {
         let (mut app, dir) = app_fixture();
         let on_disk = {
             let settings = app.core.settings.lock().unwrap().clone();
-            config::save(&dir, &settings).unwrap();
+            app.core.save_settings(&settings).unwrap();
             config::load(&dir).unwrap().approval_mode
         };
         assert_eq!(on_disk, config::ApprovalMode::Ask);
@@ -4985,7 +4937,7 @@ mod tests {
         let (mut app, dir) = app_fixture();
         {
             let settings = app.core.settings.lock().unwrap().clone();
-            config::save(&dir, &settings).unwrap();
+            app.core.save_settings(&settings).unwrap();
         }
 
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
@@ -5015,7 +4967,7 @@ mod tests {
         let (mut app, dir) = app_fixture();
         {
             let settings = app.core.settings.lock().unwrap().clone();
-            config::save(&dir, &settings).unwrap();
+            app.core.save_settings(&settings).unwrap();
         }
         app.pending_approval =
             Some(("id".into(), "bash".into(), "sum".into(), "detail".into(), vec![]));

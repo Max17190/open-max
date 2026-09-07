@@ -426,15 +426,6 @@ impl Transcript {
         self.offset = lines_from_bottom;
     }
 
-    /// Theme changes affect cached line surfaces even when content and width
-    /// stay constant.
-    pub fn invalidate_styles(&mut self) {
-        for block in &mut self.blocks {
-            block.invalidate();
-        }
-        self.dirty = true;
-    }
-
     fn rebuild_index(&mut self) {
         self.block_starts.clear();
         self.total = 0;

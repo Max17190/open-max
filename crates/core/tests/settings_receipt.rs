@@ -291,27 +291,23 @@ async fn a_missing_settings_file_replaced_by_a_directory_is_drift() {
     let _ = std::fs::remove_dir_all(&env.dir);
 }
 
-/// The fingerprint after a harness save is of the bytes the harness WROTE,
-/// never a re-read of the path. Modeled deterministically: the external
-/// replacement lands BEFORE the harness adopts its own save (the interval-
-/// race outcome). A re-read-based adoption would swallow the foreign bytes
-/// as this process's own; fingerprinting the intended bytes keeps them
-/// visible as drift.
+/// A harness save fingerprints the bytes it writes, under its lock, so
+/// there is no interval in which a foreign write could be adopted as this
+/// process's own. What the test can observe from outside is the consequence:
+/// an external replacement landing after the save still reads as drift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_racing_external_replacement_is_not_adopted_by_save() {
+async fn an_external_replacement_after_a_save_still_reads_as_drift() {
     let env = build_env(vec![completion_with_text("only")]).await;
     let settings_path = env.data.join("settings.json");
     let mut s = env.core.settings.lock().unwrap().clone();
     s.model = "scripted-2".into();
-    // The harness's write (through the direct helper, as /model does)...
-    open_max_core::config::save(&env.data, &s).unwrap();
-    // ...an external replacement lands in the interval...
-    let mut external = s.clone();
+    // The harness's write, the one path every in-app save takes...
+    env.core.save_settings(&s).unwrap();
+    *env.core.settings.lock().unwrap() = s.clone();
+    // ...then an external replacement lands.
+    let mut external = s;
     external.model = "external-edit".into();
     std::fs::write(&settings_path, serde_json::to_string_pretty(&external).unwrap()).unwrap();
-    // ...and only now does the harness adopt what IT saved.
-    env.core.adopt_saved_settings(&s);
-    *env.core.settings.lock().unwrap() = s;
     assert!(
         env.core.settings_disk_changed().is_some(),
         "the foreign bytes must read as drift, not be adopted as this process's own"

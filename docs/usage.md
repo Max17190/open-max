@@ -84,6 +84,8 @@ before resuming. A session that has never saved messages can still start fresh.
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/reload` | Force a re-freeze now (it also happens automatically when extension files change) |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
+| `/compact` | Compact the context now instead of waiting for the budget to force it |
+| `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, performance, privacy, and network details |
 | `/quit` | Exit |

@@ -285,20 +285,6 @@ impl Core {
         Ok(())
     }
 
-    /// Adopt these exact settings as this process's own after a save that
-    /// went through `config::save` directly (an existing helper with its own
-    /// tests). Fingerprints the serialization of what was saved, never a
-    /// re-read of the path.
-    pub fn adopt_saved_settings(&self, settings: &Settings) {
-        if let Ok(json) = serde_json::to_string_pretty(settings) {
-            *self
-                .settings_disk_fingerprint
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) =
-                SettingsFingerprint::Bytes(hash_bytes(json.as_bytes()));
-        }
-    }
-
     /// Whether settings.json on disk moved since this process last read or
     /// wrote it. On drift, records the new content (so each distinct change
     /// is reported once) and returns whether the new bytes would parse -

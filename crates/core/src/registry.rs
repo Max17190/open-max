@@ -464,8 +464,9 @@ impl Registry {
         registry
     }
 
-    /// A registry with built-ins only: used for sessions that predate the
-    /// extensibility layer, so their behavior never changes retroactively.
+    /// A registry with built-ins only: the shape a session without a
+    /// manifest resolves to until its first turn re-freezes from disk, and
+    /// the baseline tests build on.
     pub fn builtin_only() -> Self {
         Self::assemble(Vec::new(), Vec::new())
     }
