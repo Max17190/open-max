@@ -661,42 +661,36 @@ async fn join_streams(
     mut stderr: tokio::task::JoinHandle<io::Result<FinishedStream>>,
     stop: Arc<CancelToken>,
 ) -> Result<(FinishedStream, FinishedStream), ProcessError> {
-    let wait_for_both = async {
-        let (stdout_result, stderr_result) = tokio::join!(&mut stdout, &mut stderr);
-        (stdout_result, stderr_result)
-    };
-    let joined = match tokio::time::timeout(OUTPUT_DRAIN_GRACE, wait_for_both).await {
-        Ok(joined) => joined,
-        Err(_) => {
-            // A descendant can escape the invocation's process group while
-            // retaining an inherited pipe. Stop reading so that it cannot
-            // strand the agent after the supervised process has terminated.
-            stop.cancel();
-            match tokio::time::timeout(TERMINATION_GRACE, async {
-                tokio::join!(&mut stdout, &mut stderr)
-            })
-            .await
-            {
-                Ok(joined) => joined,
-                Err(_) => {
-                    stdout.abort();
-                    stderr.abort();
-                    return Err(ProcessError::Wait(io::Error::other(
-                        "output drains did not stop after process termination",
-                    )));
-                }
+    // One join future carries both drains through both grace windows. A
+    // `JoinHandle` yields its output once and panics when polled again, so a
+    // drain that finished inside the first window must not be joined afresh
+    // in the second: the pinned join remembers which side is already done.
+    let joined = {
+        let mut both = std::pin::pin!(async { tokio::join!(&mut stdout, &mut stderr) });
+        match tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut both).await {
+            Ok(joined) => Some(joined),
+            Err(_) => {
+                // A descendant can escape the invocation's process group while
+                // retaining an inherited pipe. Stop reading so that it cannot
+                // strand the agent after the supervised process has terminated.
+                stop.cancel();
+                tokio::time::timeout(TERMINATION_GRACE, &mut both).await.ok()
             }
         }
     };
-    let stdout = joined
-        .0
-        .map_err(|error| ProcessError::Wait(io::Error::other(error)))?
-        .map_err(ProcessError::Wait)?;
-    let stderr = joined
-        .1
-        .map_err(|error| ProcessError::Wait(io::Error::other(error)))?
-        .map_err(ProcessError::Wait)?;
-    Ok((stdout, stderr))
+    let Some((stdout_result, stderr_result)) = joined else {
+        stdout.abort();
+        stderr.abort();
+        return Err(ProcessError::Wait(io::Error::other(
+            "output drains did not stop after process termination",
+        )));
+    };
+    let finished = |result: Result<io::Result<FinishedStream>, tokio::task::JoinError>| {
+        result
+            .map_err(|error| ProcessError::Wait(io::Error::other(error)))?
+            .map_err(ProcessError::Wait)
+    };
+    Ok((finished(stdout_result)?, finished(stderr_result)?))
 }
 
 async fn combine_logs(
@@ -949,6 +943,29 @@ mod tests {
             sandbox: None,
             env_allowlist: None,
         }
+    }
+
+    /// One drain finished, the other outlived the grace: the shape of a
+    /// detached descendant that kept an inherited pipe open. The second wait
+    /// must not poll the finished drain again: a `JoinHandle` polled after
+    /// completion panics, taking the whole turn down with it.
+    #[tokio::test]
+    async fn a_finished_drain_is_not_polled_again_when_the_other_hangs() {
+        let finished = |bytes: &'static [u8]| FinishedStream {
+            stream: CapturedStream { total_bytes: bytes.len() as u64, head: bytes.to_vec(), tail: Vec::new() },
+            spill_path: None,
+            omitted: false,
+        };
+        let stdout = tokio::spawn(async move { Ok(finished(b"out")) });
+        let stop = Arc::new(CancelToken::default());
+        let stop_for_stderr = stop.clone();
+        let stderr = tokio::spawn(async move {
+            stop_for_stderr.cancelled().await;
+            Ok(finished(b"err"))
+        });
+        let (out, err) = join_streams(stdout, stderr, stop).await.expect("both drains settle");
+        assert_eq!(out.stream.head, b"out");
+        assert_eq!(err.stream.head, b"err");
     }
 
     #[tokio::test]
