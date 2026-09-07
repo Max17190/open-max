@@ -5220,6 +5220,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A manifest written by the build that briefly had a second session
+    /// shape (v4, with a shape field) must not resume into a hybrid: the
+    /// persisted one-line prompt beside the full tool set. The version gate
+    /// retires that shape wholesale. The manifest reads as absent, the
+    /// session falls back to built-ins, and the first turn-start check
+    /// refreezes prompt and manifest from disk into one consistent shape.
+    #[tokio::test]
+    async fn a_manifest_from_the_retired_shape_refreezes_into_one_shape() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        // The retired build's records: a version-4 manifest whose fingerprint
+        // matches disk (so nothing but the version gate can trigger a
+        // refreeze), and a transcript whose system line is the bare prompt.
+        let mut legacy = Registry::build(&core.data_dir, &project).to_manifest();
+        legacy.version = 4;
+        sessions::save_manifest(&core, &id, &legacy);
+        let bare = "You are Open Max, a coding agent working in the current project. Tool paths are project-relative.";
+        let messages = vec![
+            ChatMessage::system(bare),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant(Some("hello".into()), None),
+        ];
+        let mut persisted = 0usize;
+        assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+
+        assert!(sessions::load_manifest(&core, &id).is_none(), "the retired shape reads as absent");
+        let data = build_session_data(&core, &id, &project).unwrap();
+        core.sessions.lock().await.insert(id.clone(), data);
+        assert!(
+            refreeze_if_extensions_changed(&core, &id, &project).await.is_some(),
+            "the first turn-start check refreezes from disk"
+        );
+        {
+            let map = core.sessions.lock().await;
+            let data = map.get(&id).unwrap();
+            let prompt = data.messages[0].content.as_deref().unwrap();
+            assert_ne!(prompt, bare, "the bare prompt must not survive beside seven tools");
+            assert!(prompt.contains("Rules:"), "{prompt}");
+            assert_eq!(data.registry.tool_names().len(), tools::TOOL_NAMES.len());
+        }
+        assert_eq!(
+            sessions::load_manifest(&core, &id).map(|m| m.version),
+            Some(crate::registry::MANIFEST_VERSION),
+            "the refreeze writes the current manifest shape"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn build_session_data_honors_manifest_without_messages() {
         use crate::state::Core;

@@ -699,7 +699,14 @@ pub struct RegistryManifest {
 // parsing it back out of the prompt was forgeable by newline-bearing
 // filenames rendered into later sections). Old manifests read as absent
 // and refreeze, so every live manifest carries exact rows.
-pub const MANIFEST_VERSION: u32 = 4;
+// 5: for one day the manifest carried a session-shape field for a second,
+// bare shape (four tools under a one-line prompt) that was then removed. A
+// v4 manifest from that build parsed as a full one while its transcript
+// kept the bare prompt: seven tools under a one-line prompt, neither shape,
+// and no fingerprint change to repair it. Reading v4 as absent retires
+// those records the way this constant always has: built-ins until the next
+// turn start, which refreezes prompt and manifest from disk together.
+pub const MANIFEST_VERSION: u32 = 5;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
