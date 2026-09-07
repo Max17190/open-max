@@ -43,40 +43,6 @@ pub(crate) const MAX_TIMEOUT_SECS: u64 = 300;
 /// unreviewably long grant list past the human reading the approval.
 pub(crate) const MAX_ENV_NAMES: usize = 16;
 
-/// Which shape a session freezes. `Full` is the harness: every built-in,
-/// the extension surface, and the grounding sections. `Minimal` is the
-/// measurement instrument: the shell-plus-editor subset of the built-ins
-/// (`tools::MINIMAL_TOOL_NAMES`) behind a one-line prompt, with no
-/// extension tools, skills, memory, project instructions, or layout map. It
-/// exists so a model can be measured with the least harness help the tools
-/// allow, under a prefix that is byte-stable across projects. A profile is
-/// fixed for a session's life: the prompt and schemas it froze are the cache
-/// prefix every later request extends, and a resumed session keeps them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Profile {
-    #[default]
-    Full,
-    Minimal,
-}
-
-impl Profile {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Profile::Full => "full",
-            Profile::Minimal => "minimal",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim() {
-            "full" => Some(Profile::Full),
-            "minimal" => Some(Profile::Minimal),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum ToolKind {
     Builtin,
@@ -120,9 +86,6 @@ pub struct ToolSpec {
 /// or the user forces /reload. Between freezes it is immutable, keeping the
 /// serialized schema bytes prompt-cache-stable.
 pub struct Registry {
-    /// The shape this registry froze; see `Profile`. Persisted in the
-    /// manifest so a resumed session cannot change shape.
-    pub profile: Profile,
     /// Built-ins first in their fixed order, then external tools sorted by
     /// name — deterministic so two builds serialize identically.
     pub tools: Vec<ToolSpec>,
@@ -507,66 +470,17 @@ impl Registry {
         Self::assemble(Vec::new(), Vec::new())
     }
 
-    /// Freeze a registry for `profile`. `Full` discovers the extension
-    /// surface exactly as `build` does. `Minimal` freezes the shell-plus-editor
-    /// subset and nothing from disk, but still fingerprints the extension
-    /// files, so the ledger can attribute changes the session makes to them
-    /// (a minimal session can write a tool file it cannot itself load, and
-    /// the next full session must not record that write as a human's).
-    pub fn build_for(profile: Profile, data_dir: &Path, project_root: &Path) -> Self {
-        match profile {
-            Profile::Full => Self::build(data_dir, project_root),
-            Profile::Minimal => {
-                Self::minimal_at(capture_extensions(data_dir, project_root).fingerprint())
-            }
-        }
-    }
-
-    /// The minimal registry pinned to one extension generation: same tools
-    /// and prompt as every other minimal registry, differing only in the
-    /// fingerprint the refreeze checks compare against disk.
-    pub(crate) fn minimal_at(ext_fingerprint: u64) -> Self {
-        let mut registry = Self::assemble_for(Profile::Minimal, Vec::new(), Vec::new());
-        registry.ext_fingerprint = ext_fingerprint;
-        registry
-    }
-
-    pub(crate) fn assemble(external: Vec<ToolSpec>, skills: Vec<SkillSpec>) -> Self {
-        Self::assemble_for(Profile::Full, external, skills)
-    }
-
-    pub(crate) fn assemble_for(profile: Profile, mut external: Vec<ToolSpec>, mut skills: Vec<SkillSpec>) -> Self {
+    pub(crate) fn assemble(mut external: Vec<ToolSpec>, skills: Vec<SkillSpec>) -> Self {
         // Built-ins come straight from the canonical schema literals so the
-        // registry can never drift from what tools.rs implements. The minimal
-        // profile keeps the subset in the same order: the full array with
-        // entries removed, never a reordering.
-        let keep = |name: &str| profile == Profile::Full || tools::MINIMAL_TOOL_NAMES.contains(&name);
-        let mut tools_list: Vec<ToolSpec> =
-            builtin_specs().into_iter().filter(|s| keep(&s.name)).collect();
-        if profile == Profile::Minimal {
-            // No extension surface: nothing discovered on disk is loaded, so a
-            // manifest or caller handing some over cannot smuggle it in.
-            external.clear();
-            skills.clear();
-        }
+        // registry can never drift from what tools.rs implements.
+        let mut tools_list = builtin_specs();
         // Built-in names win over external ones: shadowing a built-in would
         // silently change core behavior mid-workflow.
         external.retain(|t| !tools::TOOL_NAMES.contains(&t.name.as_str()));
         external.sort_by(|a, b| a.name.cmp(&b.name));
         tools_list.extend(external);
 
-        let mut schemas = match profile {
-            Profile::Full => tools::tool_schemas().clone(),
-            Profile::Minimal => Value::Array(
-                tools::tool_schemas()
-                    .as_array()
-                    .expect("builtin schemas are an array")
-                    .iter()
-                    .filter(|entry| keep(entry["function"]["name"].as_str().unwrap_or("")))
-                    .cloned()
-                    .collect(),
-            ),
-        };
+        let mut schemas = tools::tool_schemas().clone();
         if let Some(arr) = schemas.as_array_mut() {
             for spec in tools_list.iter().filter(|s| !matches!(s.kind, ToolKind::Builtin)) {
                 arr.push(serde_json::json!({
@@ -586,12 +500,7 @@ impl Registry {
             .map(|(i, s)| (s.name.clone(), i))
             .collect();
         let schemas_wire: Arc<str> = schemas.to_string().into();
-        // The minimal profile indexes no memory: it reports itself as scanned
-        // with an empty section so prompt assembly never scans for it, and
-        // prices zero rows on every path (live or persisted).
-        let minimal = profile == Profile::Minimal;
         Self {
-            profile,
             tools: tools_list,
             skills,
             skills_omitted: 0,
@@ -602,9 +511,9 @@ impl Registry {
             broken_tools: Vec::new(),
             shadowed_skills: Vec::new(),
             memory_files: None,
-            frozen_memory_rows: if minimal { Some(Vec::new()) } else { None },
+            frozen_memory_rows: None,
             memory_section: None,
-            memory_scanned: minimal,
+            memory_scanned: false,
             schemas,
             schemas_wire,
             by_name,
@@ -754,10 +663,6 @@ impl Default for Registry {
 pub struct RegistryManifest {
     pub version: u32,
 
-    /// The shape the session froze. Additive: manifests written before the
-    /// field read as `full`, which is what every one of them was.
-    #[serde(default)]
-    pub profile: Profile,
     pub external_tools: Vec<ExternalToolManifest>,
     pub skills: Vec<SkillSpec>,
     /// Fingerprint of the extension files at freeze time. Manifests written
@@ -794,7 +699,14 @@ pub struct RegistryManifest {
 // parsing it back out of the prompt was forgeable by newline-bearing
 // filenames rendered into later sections). Old manifests read as absent
 // and refreeze, so every live manifest carries exact rows.
-pub const MANIFEST_VERSION: u32 = 4;
+// 5: for one day the manifest carried a session-shape field for a second,
+// bare shape (four tools under a one-line prompt) that was then removed. A
+// v4 manifest from that build parsed as a full one while its transcript
+// kept the bare prompt: seven tools under a one-line prompt, neither shape,
+// and no fingerprint change to repair it. Reading v4 as absent retires
+// those records the way this constant always has: built-ins until the next
+// turn start, which refreezes prompt and manifest from disk together.
+pub const MANIFEST_VERSION: u32 = 5;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
@@ -840,7 +752,6 @@ impl Registry {
             })
             .collect();
         RegistryManifest {
-            profile: self.profile,
             memory_files: self.memory_files.clone(),
             // The frozen channel, not a re-parse: a restored registry
             // re-suspending must keep the accounting its persisted prompt
@@ -875,7 +786,7 @@ impl Registry {
                 }),
             })
             .collect();
-        let mut registry = Self::assemble_for(manifest.profile, external, manifest.skills);
+        let mut registry = Self::assemble(external, manifest.skills);
         registry.ext_fingerprint = manifest.ext_fingerprint;
         // The manifest's memory identities are the baseline for the first
         // refreeze's memory receipt. A resumed session's prompt is the

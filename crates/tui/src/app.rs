@@ -218,9 +218,6 @@ fn conversation_layout(
 
 pub struct Args {
     pub continue_session: bool,
-    /// The shape a session this process creates freezes under; a resumed
-    /// session keeps its own.
-    pub profile: registry::Profile,
 }
 
 #[derive(PartialEq)]
@@ -239,8 +236,6 @@ struct ToolMeta {
 pub struct App {
     core: Arc<Core>,
     project: PathBuf,
-    /// Profile for sessions this process creates (`--profile`).
-    profile: registry::Profile,
     session_id: Option<String>,
     /// A /resume (or --continue) picked this session and no turn has
     /// hydrated it yet: /context's numbers are still today's-config
@@ -531,7 +526,6 @@ impl App {
             composer: Composer::new(&core.data_dir),
             core,
             project,
-            profile: registry::Profile::Full,
             session_id: None,
             resumed_awaiting_hydration: false,
             pending_submit: None,
@@ -607,18 +601,7 @@ impl App {
         }
     }
 
-    /// The profile the current session froze (its manifest is the record),
-    /// or the one this process will give the next new session.
-    fn session_profile(&self) -> registry::Profile {
-        self.session_id
-            .as_deref()
-            .and_then(|id| sessions::load_manifest(&self.core, id))
-            .map(|m| m.profile)
-            .unwrap_or(self.profile)
-    }
-
     async fn startup(&mut self, args: &Args) {
-        self.profile = args.profile;
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
@@ -2050,14 +2033,6 @@ impl App {
             None => {
                 let meta = sessions::create(&self.core, self.project.display().to_string())
                     .map_err(std::io::Error::other)?;
-                if let Err(e) = agent::freeze_new_session(&self.core, &meta.id, &self.project, self.profile) {
-                    // Refused, not degraded: the draft goes back to the
-                    // composer and no session is left behind.
-                    let _ = sessions::discard_if_empty(&self.core, &meta.id);
-                    self.note(&e);
-                    self.composer.load(&text);
-                    return Ok(());
-                }
                 self.session_id = Some(meta.id.clone());
                 self.resumed_awaiting_hydration = false;
                 meta.id
@@ -2485,7 +2460,6 @@ impl App {
                     kv("endpoint", &endpoint),
                     kv("host", &host),
                     kv("approvals", self.core.approval_mode(&self.project).as_str()),
-                    kv("profile", self.session_profile().as_str()),
                     kv(
                         "context",
                         &if context_tokens == 0 {

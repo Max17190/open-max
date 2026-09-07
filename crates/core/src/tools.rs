@@ -140,15 +140,6 @@ pub fn tool_names() -> Vec<String> {
     TOOL_NAMES.iter().map(|s| s.to_string()).collect()
 }
 
-/// The built-ins the minimal profile freezes, in `TOOL_NAMES` order: a shell
-/// plus a file editor split into its read, create, and replace verbs. That is
-/// the capability set of the two-tool scaffold most published coding
-/// benchmarks run a model under, at a fraction of its schema bytes, so a
-/// model measured under this profile is measured with the least harness help
-/// these tools allow. Discovery stays out: `bash` covers `ls`, `find`, and
-/// `grep`, and every extra schema is a hint the measurement should not give.
-pub const MINIMAL_TOOL_NAMES: &[&str] = &["read_file", "write_file", "edit_file", "bash"];
-
 /// One-line human summary of a call, shown in approval prompts and tool cards.
 pub fn summarize_call(name: &str, args: &Value) -> String {
     match name {
@@ -1055,23 +1046,6 @@ pub(crate) fn describe_exit(status: &std::process::ExitStatus) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    /// The minimal set is a subset of the built-ins in their frozen order, so
-    /// a minimal registry's schema array is the full array with entries
-    /// removed and nothing reordered: deterministic bytes, like every other
-    /// prompt-cache prefix. A shell and an editor are the floor; a profile
-    /// without either would measure a model that cannot act.
-    #[test]
-    fn minimal_tool_names_are_an_ordered_subset_of_the_builtins() {
-        let positions: Vec<usize> = MINIMAL_TOOL_NAMES
-            .iter()
-            .map(|n| TOOL_NAMES.iter().position(|t| t == n).expect("every minimal tool is a built-in"))
-            .collect();
-        assert!(positions.windows(2).all(|w| w[0] < w[1]), "minimal tools keep the built-in order");
-        assert!(MINIMAL_TOOL_NAMES.contains(&"bash"));
-        assert!(MINIMAL_TOOL_NAMES.contains(&"edit_file"));
-        assert!(MINIMAL_TOOL_NAMES.len() < TOOL_NAMES.len());
-    }
 
     #[tokio::test]
     async fn a_started_file_mutation_settles_before_cancellation_returns() {

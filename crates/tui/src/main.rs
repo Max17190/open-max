@@ -25,12 +25,6 @@ options:
   -c, --continue         resume the latest session in this directory
   -m, --model <id>       use this model id for the run
       --provider <name>  use a named provider from ~/.openmax/providers.json
-      --profile <name>   full (default) or minimal. minimal freezes only
-                         read_file, write_file, edit_file, and bash behind a
-                         one-line prompt: no project instructions, layout map,
-                         skills, memory, hooks, or extension tools. For
-                         measuring a model with the least harness help; new
-                         sessions only
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
       --json             with --print, emit AgentEvent envelopes as JSONL;
@@ -87,8 +81,6 @@ struct CliArgs {
     continue_session: bool,
     model: Option<String>,
     provider: Option<String>,
-    /// Session shape for a new session (`--profile`), validated in main.
-    profile: Option<String>,
     print: bool,
     json: bool,
     stdio: bool,
@@ -124,7 +116,6 @@ where
         continue_session: false,
         model: None,
         provider: None,
-        profile: None,
         print: false,
         json: false,
         stdio: false,
@@ -147,7 +138,6 @@ where
             Short('c') | Long("continue") => out.continue_session = true,
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
             Long("provider") => out.provider = Some(parser.value()?.string()?),
-            Long("profile") => out.profile = Some(parser.value()?.string()?),
             Short('p') | Long("print") => {
                 if out.print {
                     // Subsequent -p closes the previous prompt; empty is an error.
@@ -265,28 +255,6 @@ async fn main() -> std::io::Result<()> {
         eprintln!("openmax: --json requires --print, --check, or --recall\n\n{HELP}");
         std::process::exit(2);
     }
-    // Validated before anything runs: an unknown profile must not fall back
-    // to the full one, or a measurement run would silently measure the
-    // wrong harness.
-    let profile = match cli.profile.as_deref() {
-        None => open_max_core::registry::Profile::Full,
-        Some(name) => match open_max_core::registry::Profile::parse(name) {
-            Some(profile) => profile,
-            None => {
-                eprintln!("openmax: unknown profile {name:?}; use full or minimal\n\n{HELP}");
-                std::process::exit(2);
-            }
-        },
-    };
-    // A session's profile is fixed at creation (its prompt and schemas are
-    // the cache prefix every later request extends), so the flag on a
-    // resume is an error rather than a silent no-op.
-    if cli.profile.is_some() && cli.continue_session {
-        eprintln!(
-            "openmax: --profile applies to a new session; a resumed session keeps the profile it was created with\n\n{HELP}"
-        );
-        std::process::exit(2);
-    }
     // --recall prints one report and exits, like --spec: swallowing another
     // requested operation would look like success for work that never ran.
     if cli.recall.is_some()
@@ -300,7 +268,6 @@ async fn main() -> std::io::Result<()> {
             || cli.spec.is_some()
             || cli.model.is_some()
             || cli.provider.is_some()
-            || cli.profile.is_some()
             || !cli.prompts.is_empty())
     {
         eprintln!("openmax: --recall is a standalone operation; run other options separately\n\n{HELP}");
@@ -326,7 +293,6 @@ async fn main() -> std::io::Result<()> {
             || cli.continue_session
             || cli.model.is_some()
             || cli.provider.is_some()
-            || cli.profile.is_some()
             || !cli.prompts.is_empty())
     {
         eprintln!("openmax: --spec is a standalone operation; run other options separately\n\n{HELP}");
@@ -336,16 +302,6 @@ async fn main() -> std::io::Result<()> {
     // that executed no example must never exit 0 as if it had.
     if cli.run_examples && !cli.check {
         eprintln!("openmax: --run-examples requires --check\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // --profile shapes a session. The maintenance operations run none, so
-    // accepting the flag there would look like it took effect.
-    if cli.profile.is_some()
-        && (cli.check || cli.ledger || cli.ledger_repair || cli.approve.is_some() || cli.forget.is_some())
-    {
-        eprintln!(
-            "openmax: --profile applies to a session run (interactive, --print, or --stdio), not to --check, --ledger, --ledger-repair, --approve, or --forget\n\n{HELP}"
-        );
         std::process::exit(2);
     }
 
@@ -978,7 +934,7 @@ async fn main() -> std::io::Result<()> {
         let code = stdio::run(
             core,
             core_rx,
-            stdio::StdioArgs { continue_session: cli.continue_session, profile },
+            stdio::StdioArgs { continue_session: cli.continue_session },
         )
         .await;
         std::process::exit(code);
@@ -996,7 +952,6 @@ async fn main() -> std::io::Result<()> {
                 prompts: cli.prompts,
                 continue_session: cli.continue_session,
                 json: cli.json,
-                profile,
             },
         )
         .await;
@@ -1043,7 +998,7 @@ async fn main() -> std::io::Result<()> {
         terminal,
         core,
         core_rx,
-        app::Args { continue_session: cli.continue_session, profile },
+        app::Args { continue_session: cli.continue_session },
     )
     .await;
 
@@ -1874,14 +1829,6 @@ mod tests {
         // interactive stdio session and takes no prompt.
         let cli = parse_args_from(["--check", "--stdio"]).unwrap();
         assert!(cli.check && cli.stdio && !cli.print && cli.prompts.is_empty());
-    }
-
-    #[test]
-    fn profile_flag_takes_a_name() {
-        let cli = parse_args_from(["--profile", "minimal", "-p", "inspect"]).unwrap();
-        assert_eq!(cli.profile.as_deref(), Some("minimal"));
-        assert!(cli.print);
-        assert!(parse_args_from(["--profile"]).is_err());
     }
 
     #[test]
