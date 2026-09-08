@@ -108,6 +108,13 @@ pub enum AgentEvent {
     /// links it to the tool result it rides when it rode one, else empty (a
     /// note inserted before the next prompt, e.g. a turn-start receipt).
     HarnessNote { call_id: String, text: String },
+    /// The model request is being resent: `attempt` of `max_attempts` goes
+    /// out after a backoff, `reason` having ended the previous one (a
+    /// transport failure, a 429, or a stream that died before any reply
+    /// text). Emitted before the wait; a cancel during it ends the turn and
+    /// the attempt never goes out. Thinking streamed for the failed attempt
+    /// is void; no Token preceded it.
+    Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
     /// (paths, command head) for the TUI card; may be empty.
@@ -138,7 +145,7 @@ pub enum AgentEvent {
         /// as structured data, not folded into `detail`, so the frontend
         /// controls its own un-clippable placement. Additive and defaulted:
         /// a stream without the key deserializes unchanged, and the key is
-        /// omitted from the wire whenever it is empty, so `openmax-stdio/5`
+        /// omitted from the wire whenever it is empty, so `openmax-stdio/6`
         /// bytes are byte-identical for every call that grants no env.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<String>,
@@ -220,7 +227,7 @@ mod tests {
 
     /// Golden wire format for every `AgentEvent`, wrapped in its envelope
     /// exactly as `--stdio` and `--print --json` emit it. These strings are
-    /// the `openmax-stdio/5` contract: session_id first, then the `type`
+    /// the `openmax-stdio/6` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
@@ -345,6 +352,10 @@ mod tests {
             env(AgentEvent::SchemasOverBudget { schema_tokens: 6800, budget_tokens: 2150 }),
             r#"{"session_id":"s1","type":"schemas_over_budget","schema_tokens":6800,"budget_tokens":2150}"#
         );
+        assert_eq!(
+            env(AgentEvent::Retry { attempt: 2, max_attempts: 8, reason: "request failed: connection reset".into() }),
+            r#"{"session_id":"s1","type":"retry","attempt":2,"max_attempts":8,"reason":"request failed: connection reset"}"#
+        );
 
         assert_eq!(
             env(AgentEvent::HookFailed {
@@ -428,6 +439,7 @@ mod tests {
                 AgentEvent::ToolStart { .. } => {}
                 AgentEvent::ToolEnd { .. } => {}
                 AgentEvent::HarnessNote { .. } => {}
+                AgentEvent::Retry { .. } => {}
                 AgentEvent::Diff { .. } => {}
                 AgentEvent::ApprovalRequest { .. } => {}
                 AgentEvent::ApprovalSettled { .. } => {}

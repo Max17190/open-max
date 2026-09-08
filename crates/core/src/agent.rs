@@ -2352,6 +2352,13 @@ impl TokenBatcher {
         match delta {
             StreamDelta::Content(t) => self.content.push_str(&t),
             StreamDelta::Reasoning(t) => self.thinking.push_str(&t),
+            // Flush first so the wire keeps the order the client saw: the
+            // reasoning already streamed, then the notice that it is void.
+            StreamDelta::Retry { attempt, max_attempts, reason } => {
+                self.flush();
+                self.core.send_agent(&self.session_id, AgentEvent::Retry { attempt, max_attempts, reason });
+                return;
+            }
         }
         if self.last_flush.elapsed() >= FLUSH_INTERVAL {
             self.flush();

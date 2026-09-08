@@ -2747,6 +2747,17 @@ impl App {
                     ));
                 }
             }
+            AgentEvent::Retry { attempt, max_attempts, reason } => {
+                // The reasoning shown so far belongs to the attempt that
+                // failed; the fresh attempt starts its own. The reason can
+                // carry a backend body; the note is one line.
+                self.thinking_tail.clear();
+                self.thinking_source.clear();
+                self.thinking_wrapped.clear();
+                self.thinking_chars = 0;
+                self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
+                self.dirty.mark_tail();
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Says what it costs and what to do, not how compaction reacts:
                 // that depends on whether any room is left at all.
@@ -5497,6 +5508,29 @@ mod tests {
         assert_eq!(home_shortened("/srv/data", home), "/srv/data");
         assert_eq!(home_shortened("/srv/data", None), "/srv/data");
         assert_eq!(home_shortened("/srv/data", Some("/")), "/srv/data");
+    }
+
+    /// The reasoning tail shown during a turn belongs to one attempt. A
+    /// retry starts the reply over, so what the failed attempt streamed is
+    /// dropped before the fresh attempt's reasoning arrives; otherwise the
+    /// two would read as one thought.
+    #[test]
+    fn a_retry_drops_the_failed_attempts_reasoning_tail() {
+        let (mut app, dir) = app_fixture();
+        app.running = true;
+        app.turn_started = Some(std::time::Instant::now());
+        app.on_agent_event(AgentEvent::Thinking { text: "abandoned line".into() });
+        assert_eq!(app.thinking_tail, "abandoned line");
+        app.on_agent_event(AgentEvent::Retry {
+            attempt: 2,
+            max_attempts: 8,
+            reason: "the stream ended before the reply finished".into(),
+        });
+        assert!(app.thinking_tail.is_empty());
+        assert_eq!(app.thinking_chars, 0);
+        app.on_agent_event(AgentEvent::Thinking { text: "fresh line".into() });
+        assert_eq!(app.thinking_tail, "fresh line");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

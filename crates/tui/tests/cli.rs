@@ -602,8 +602,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/5");
-    assert_eq!(hello["protocol_version"], 5);
+    assert_eq!(hello["proto"], "openmax-stdio/6");
+    assert_eq!(hello["protocol_version"], 6);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -1084,11 +1084,14 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
 /// call, so the arguments parse and nothing looks broken. A stream with no
 /// completion signal is not a response the model asked to act on (more calls
 /// may have been coming, or this one may still have been under revision), so
-/// the call must not run.
+/// the call must not run. Reply text streams first, so this is the
+/// interruption the client does not start over.
 #[test]
 fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
     let (project, home) = fresh_dirs("truncated-native-call");
-    let (base_url, _requests, _server) = spawn_scripted_server(vec![(WRITE_CALL_SSE.to_string(), false)]);
+    let prose = "data: {\"choices\":[{\"delta\":{\"content\":\"writing it\"},\"finish_reason\":null}]}\n\n";
+    let (base_url, _requests, _server) =
+        spawn_scripted_server(vec![(format!("{prose}{WRITE_CALL_SSE}"), false)]);
     // auto, so a refusal here is the truncation and not the approval gate.
     write_settings_with_mode(&home, &base_url, "auto");
 

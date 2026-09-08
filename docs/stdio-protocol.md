@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/5`)
+# stdio protocol (`openmax-stdio/6`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/5","protocol_version":5,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -72,6 +72,7 @@ one).
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
 | `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt, or a policy, providers, settings, or approval notice. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |
+| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out of the `max_attempts` budget after a backoff wait, `reason` having ended the previous one with a transport failure, a 429, or a stream that died before any reply text arrived. Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` lines already emitted for that attempt are void and the reply starts over; no `token` line precedes a retried stream. A request gives up before the budget when three attempts in a row never reached the endpoint) |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha`, and optional `env` (see below) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
@@ -137,7 +138,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `stop_reason` | Meaning |
 | --- | --- |
 | provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
-| `truncated` | The provider stream ended with no completion signal; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
+| `truncated` | The provider stream ended with no completion signal (after reply text had streamed, or on the last retry) or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
 | `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), or its refusal could not be persisted; the reply stands unverified |
