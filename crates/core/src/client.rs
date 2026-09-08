@@ -122,10 +122,13 @@ pub enum StreamDelta {
     Content(String),
     Reasoning(String),
     /// The request is being resent: `attempt` is the one about to go out of
-    /// the `max_attempts` budget, after `reason` ended the previous one. Any
-    /// reasoning streamed for the failed attempt is void; no content was. A
-    /// request gives up before the budget when [`UNREACHED_ATTEMPTS`] in a
-    /// row never reached the endpoint.
+    /// the `max_attempts` budget, after `reason` ended the previous one. It
+    /// is announced before the backoff wait, which is what the caller is
+    /// waiting through; a cancellation during the wait ends the request
+    /// instead, and the attempt never goes out. Any reasoning streamed for
+    /// the failed attempt is void; no content was. A request gives up before
+    /// the budget when [`UNREACHED_ATTEMPTS`] in a row never reached the
+    /// endpoint.
     Retry { attempt: u32, max_attempts: u32, reason: String },
 }
 
@@ -1104,18 +1107,26 @@ mod tests {
     }
 
     /// Nothing listening is not a fault worth a minute of backoff: after
-    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early. Port 9 is
-    /// the discard service, which nothing on a developer host listens on.
+    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early. The port
+    /// was bound and released by this test, so nothing answers on it; the
+    /// deadline keeps a stray listener from turning that into a hang.
     #[tokio::test]
     async fn an_address_that_never_answers_gives_up_before_the_budget() {
+        let url = {
+            let released = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/v1", released.local_addr().unwrap())
+        };
         let mut deltas: Vec<String> = Vec::new();
-        let result = ChatClient::new("http://127.0.0.1:9/v1".into(), None, "m".into(), 0.0, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
-                if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
-                    deltas.push(format!("{attempt}/{max_attempts}"));
-                }
-            })
-            .await;
+        let client = ChatClient::new(url, None, "m".into(), 0.0, 64);
+        let messages = [ChatMessage::user("hi")];
+        let request = client.stream_chat(&messages, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+            if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
+                deltas.push(format!("{attempt}/{max_attempts}"));
+            }
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .expect("a released port answers with a refusal, not silence");
         let Err(err) = result else { panic!("no listener is a failed request") };
         assert!(err.starts_with("request failed: "), "{err}");
         assert_eq!(deltas, vec![format!("2/{MAX_ATTEMPTS}"), format!("3/{MAX_ATTEMPTS}")]);
