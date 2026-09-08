@@ -1625,6 +1625,65 @@ async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_roo
     Ok(())
 }
 
+/// Consecutive iterations whose tool calls AND results are byte-identical.
+///
+/// Identical arguments alone say nothing (#225: a `wait`, a `git status`, a
+/// log tail repeat verbatim while their output moves), so nothing here vetoes
+/// a call; every call executes. What this tracks is the pair: the model asked
+/// the same thing and the world answered the same way. That pair is how a
+/// model that has finished fails to stop: its reasoning says the task is
+/// complete, its reply is the same verification call again, with the same
+/// output, until the iteration cap ends the turn. The shape is common enough
+/// to end turns at the cap. From the third identical pair on, the tool
+/// message carries [`repeated_result_note`]: advisory, counted, and it names
+/// the two ways out.
+#[derive(Default)]
+struct RepeatTracker {
+    last: Option<u64>,
+    streak: usize,
+}
+
+/// The identical-pair count at which the note first appears.
+const REPEAT_NOTE_AT: usize = 3;
+
+/// The note's opening, so tests and readers can find it in a tool message.
+const REPEAT_NOTE_MARK: &str = "[harness: identical call, identical output";
+
+impl RepeatTracker {
+    /// Record one finished iteration: its calls and the tool replies they
+    /// drew (the trailing run of tool messages, one per call). Returns the
+    /// length of the current run of identical iterations, this one included:
+    /// 1 when it differs from the previous one.
+    fn observe(&mut self, calls: &[ToolCall], messages: &[ChatMessage]) -> usize {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for call in calls {
+            call.function.name.hash(&mut h);
+            call.function.arguments.hash(&mut h);
+        }
+        let replies = messages.iter().rev().take(calls.len()).take_while(|m| m.role == "tool");
+        for reply in replies {
+            reply.content.hash(&mut h);
+        }
+        let key = h.finish();
+        self.streak = if self.last == Some(key) { self.streak + 1 } else { 1 };
+        self.last = Some(key);
+        self.streak
+    }
+}
+
+/// The advisory for the n-th identical call-and-result pair in a row. It
+/// never claims the result cannot change (a poll can legitimately sit still
+/// for longer than one call may run), so it offers the polling exit and the
+/// finished exit and lets the model pick.
+fn repeated_result_note(n: usize) -> String {
+    format!(
+        "{REPEAT_NOTE_MARK}, {n} times in a row. If you are waiting on something, \
+         keep waiting. If the task is complete, stop calling tools and reply with \
+         a short plain-text summary now.]"
+    )
+}
+
 /// Append a harness note to the last tool message (where the MODEL reads it)
 /// and emit it on the wire as a HarnessNote (where a custom FRONTEND reads
 /// it): the receipts the model sees were invisible to any non-TUI client,
@@ -2630,6 +2689,7 @@ async fn run_loop(
     let context_tokens = endpoint.context_tokens;
     let max_tokens = endpoint.max_tokens;
     let max_iterations = settings.max_agent_iterations.max(1);
+    let mut repeats = RepeatTracker::default();
 
     'turns: for _ in 0..max_iterations {
         refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
@@ -2748,6 +2808,9 @@ async fn run_loop(
             break 'turns;
         }
         if tool_calls.is_empty() {
+            // A reply with no calls ends the run of identical iterations, even
+            // when a turn_end refusal below sends the loop round again.
+            repeats = RepeatTracker::default();
             // The one exit a hook may refuse. The model says it is done, so an
             // approved blocking turn_end gets to check the world before that
             // becomes the turn's answer; the hook verifies what is on disk,
@@ -3419,6 +3482,13 @@ async fn run_loop(
                     }
                 }
             }
+        }
+
+        // Every call above executed; this only annotates the reply the model
+        // reads next when the iteration repeated the previous one exactly.
+        let streak = repeats.observe(&tool_calls, guard.messages());
+        if streak >= REPEAT_NOTE_AT {
+            append_and_emit_note(core, session_id, guard.messages(), &repeated_result_note(streak));
         }
 
         // The mid-turn half of the self-modification loop: an extension file
@@ -7271,6 +7341,112 @@ mod tests {
         assert!(
             ends.iter().all(|(ok, output)| *ok && output.contains("poll")),
             "a repeated call must execute, not be vetoed: {ends:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A read-only call repeated with byte-identical results is the shape of
+    /// a model that has finished but keeps "verifying" instead of answering:
+    /// its reasoning says the task is complete, its reply is the same tool
+    /// call again. Every call still executes; from the third identical
+    /// call-and-result pair on, the tool message carries an advisory note
+    /// that names the count and says how to end the turn.
+    #[tokio::test]
+    async fn identical_calls_with_identical_results_draw_a_note_from_the_third() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_agent_iterations = 5;
+        }
+
+        let id = "sess-repeat-note";
+        start_turn(core.clone(), id.into(), project, "keep reading".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "max_iterations");
+        assert_eq!(*requests.lock().unwrap(), 5, "every iteration still executes its call");
+
+        let messages = transcript(&core, id).await;
+        let tool_replies: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(tool_replies.len(), 5);
+        for (i, reply) in tool_replies.iter().enumerate() {
+            assert!(reply.contains("hello"), "call {} executed and returned the file: {reply}", i + 1);
+        }
+        assert!(!tool_replies[0].contains(REPEAT_NOTE_MARK), "first call: {}", tool_replies[0]);
+        assert!(!tool_replies[1].contains(REPEAT_NOTE_MARK), "first repeat: {}", tool_replies[1]);
+        for (n, reply) in tool_replies.iter().enumerate().skip(2) {
+            let expected = repeated_result_note(n + 1);
+            assert!(
+                reply.ends_with(&format!("\n{expected}")),
+                "identical pair {} carries the note for its count: {reply}",
+                n + 1
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One `bash` call whose arguments never change while its output does:
+    /// the shape of polling. Identical arguments alone are not a repeat. The
+    /// command draws from the kernel, so it moves under any shell.
+    const CHANGING_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"head -c 16 /dev/urandom | od -An -tx1\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[tokio::test]
+    async fn identical_calls_with_changing_results_draw_no_note() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, requests) = counting_endpoint(CHANGING_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+            s.max_agent_iterations = 5;
+        }
+
+        let id = "sess-repeat-changing";
+        start_turn(core.clone(), id.into(), project, "poll".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "max_iterations");
+        assert_eq!(*requests.lock().unwrap(), 5);
+
+        let messages = transcript(&core, id).await;
+        let tool_replies: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(tool_replies.len(), 5);
+        assert!(
+            tool_replies.iter().all(|r| !r.contains(REPEAT_NOTE_MARK)),
+            "moving results are polling, not a stuck loop: {tool_replies:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
