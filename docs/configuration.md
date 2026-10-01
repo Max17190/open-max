@@ -45,7 +45,10 @@ provider's per-model entries override the first two.
   serves for the model. `openmax --check` warns while it is missing.
 - `max_tokens` (default 4096): the completion reserve, clamped so it never
   eats the window (at most `context_tokens - 2048`).
-- `temperature` (default 0.2).
+- `temperature` (default unset): sent only when set, so otherwise the
+  server's own default applies. Leave it unset for OpenAI reasoning models,
+  which reject any value but 1. Server defaults differ: Ollama's
+  OpenAI-compatible endpoint uses 1.0, not the Modelfile's value.
 - `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
   keeps the tail and spills the full log to `~/.openmax/cmd-logs`.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
