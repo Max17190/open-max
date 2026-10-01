@@ -45,7 +45,10 @@ use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
 struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
-    temperature: f32,
+    // Omitted unless configured: some models reject any value but their own
+    // default, and a server fills in its default when the field is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,7 +77,7 @@ struct StreamOptions {
 fn serialize_chat_request_body(
     model: &str,
     messages: &[ChatMessage],
-    temperature: f32,
+    temperature: Option<f32>,
     max_tokens: usize,
     use_max_completion_tokens: bool,
     send_stream_options: bool,
@@ -168,7 +171,7 @@ pub struct ChatClient {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
-    pub temperature: f32,
+    pub temperature: Option<f32>,
     pub max_tokens: usize,
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
@@ -242,7 +245,7 @@ struct ToolCallFnDelta {
 }
 
 impl ChatClient {
-    pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: f32, max_tokens: usize) -> Self {
+    pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: Option<f32>, max_tokens: usize) -> Self {
         Self::with_options(
             base_url,
             api_key,
@@ -276,7 +279,7 @@ impl ChatClient {
         base_url: String,
         api_key: Option<String>,
         model: String,
-        temperature: f32,
+        temperature: Option<f32>,
         max_tokens: usize,
         headers: Vec<(String, String)>,
         use_max_completion_tokens: bool,
@@ -388,7 +391,11 @@ impl ChatClient {
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
                 let text = String::from_utf8_lossy(&body);
-                let err = format!("backend returned {status}: {}", describe_backend(&text));
+                let message = describe_backend(&text);
+                let mut err = format!("backend returned {status}: {message}");
+                if let Some(hint) = temperature_hint(self.temperature, &message) {
+                    err.push_str(&hint);
+                }
                 if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
                     if !retry_after(attempt, &err, &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
@@ -721,6 +728,24 @@ fn describe_backend(body: &str) -> String {
         .unwrap_or_else(|| truncate(body, 600))
 }
 
+/// What to do when a server refuses the temperature it was sent. Versions
+/// before temperature became optional wrote `"temperature": 0.2` into
+/// settings.json on every save, so a user who never chose a value can still
+/// be sending one, and reasoning models refuse every request that carries
+/// it. Dropping a saved 0.2 on load would also discard a value someone did
+/// choose, so the refusal names the setting and the fix instead. Only the
+/// server's own error message is read, never the raw body: a backend that
+/// echoes the request beside an unrelated error would otherwise blame a
+/// valid setting for, say, an exhausted quota.
+fn temperature_hint(sent: Option<f32>, message: &str) -> Option<String> {
+    let sent = sent?;
+    message.to_ascii_lowercase().contains("temperature").then(|| {
+        format!(
+            " (settings.json sets temperature {sent}; older versions wrote 0.2 there on every save, so if you did not choose it, delete the key and the server's default applies)"
+        )
+    })
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -828,6 +853,44 @@ mod tests {
         assert_eq!(describe_backend(""), "");
     }
 
+    /// A settings.json saved before temperature became optional still holds
+    /// the old 0.2 default, which reasoning models refuse. The refusal must
+    /// name the setting and the fix; nothing is said when no temperature was
+    /// sent or the refusal is about something else.
+    #[tokio::test]
+    async fn a_refused_temperature_names_the_setting_to_remove() {
+        let refusal = r#"{"error":{"message":"Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported."}}"#;
+        let refuse = || spawn_response_once(
+            format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{refusal}", refusal.len()),
+            None,
+        );
+        let err = ChatClient::new(refuse(), None, "m".into(), Some(0.2), 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .err()
+            .expect("a 400 is an error");
+        assert!(err.contains("does not support 0.2"), "{err}");
+        assert!(err.contains("settings.json sets temperature 0.2") && err.contains("delete the key"), "{err}");
+
+        assert!(temperature_hint(None, refusal).is_none(), "nothing was sent, so nothing to remove");
+        assert!(temperature_hint(Some(0.2), "model not found").is_none());
+
+        // A backend that echoes the request beside an unrelated error says
+        // nothing about temperature in its message: no advice to delete it.
+        let echoed = r#"{"error":{"message":"You exceeded your current quota"},"request":{"model":"m","temperature":0.2}}"#;
+        let refuse = || spawn_response_once(
+            format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{echoed}", echoed.len()),
+            None,
+        );
+        let err = ChatClient::new(refuse(), None, "m".into(), Some(0.2), 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .err()
+            .expect("a 422 is an error");
+        assert!(err.contains("exceeded your current quota"), "{err}");
+        assert!(!err.contains("settings.json"), "{err}");
+    }
+
     #[test]
     fn backend_error_without_a_message_falls_back_to_the_error_value() {
         assert_eq!(
@@ -897,7 +960,7 @@ mod tests {
     }
 
     async fn stream_once(sse: &str) -> CompletionResult {
-        let client = ChatClient::new(spawn_sse_once(sse), None, "m".into(), 0.0, 64);
+        let client = ChatClient::new(spawn_sse_once(sse), None, "m".into(), None, 64);
         client
             .stream_chat(
                 &[ChatMessage::user("hi")],
@@ -917,7 +980,7 @@ mod tests {
             let cancelled = Arc::new(crate::state::CancelToken::default());
             let task_cancel = cancelled.clone();
             let mut task = tokio::spawn(async move {
-                ChatClient::new(url, None, "m".into(), 0.0, 64)
+                ChatClient::new(url, None, "m".into(), None, 64)
                     .stream_chat(&[ChatMessage::user("hi")], "[]", task_cancel, |_| {}).await
             });
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -932,7 +995,7 @@ mod tests {
     async fn a_transport_error_keeps_partial_text() {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"keep this\"}}]}\n\n";
         let url = spawn_response_once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\n{body}"), None);
-        let result = ChatClient::new(url, None, "m".into(), 0.0, 64)
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
             .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
         assert_eq!(result.content, "keep this");
         assert_eq!(result.finish_reason, TRUNCATED);
@@ -1052,7 +1115,7 @@ mod tests {
     async fn stream_sequence(bodies: Vec<String>) -> (CompletionResult, Vec<String>, usize) {
         let (url, served) = spawn_sse_sequence(bodies);
         let mut deltas: Vec<String> = Vec::new();
-        let result = ChatClient::new(url, None, "m".into(), 0.0, 64)
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
             .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
                 deltas.push(match d {
                     StreamDelta::Content(t) => format!("content:{t}"),
@@ -1157,7 +1220,7 @@ mod tests {
             format!("http://{}/v1", released.local_addr().unwrap())
         };
         let mut deltas: Vec<String> = Vec::new();
-        let client = ChatClient::new(url, None, "m".into(), 0.0, 64);
+        let client = ChatClient::new(url, None, "m".into(), None, 64);
         let messages = [ChatMessage::user("hi")];
         let request = client.stream_chat(&messages, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
             if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
@@ -1238,7 +1301,7 @@ mod tests {
         let bytes = serialize_chat_request_body(
             "test-model",
             &messages,
-            0.2,
+            Some(0.2),
             1024,
             false,
             true,
@@ -1278,7 +1341,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body("m", &messages, 0.0, 64, false, true, tools_wire)
+                serialize_chat_request_body("m", &messages, None, 64, false, true, tools_wire)
                     .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(
@@ -1303,11 +1366,24 @@ mod tests {
             "function": { "name": "bash", "parameters": { "type": "object" } }
         }])
         .to_string();
-        let a = serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools_wire)
+        let a = serialize_chat_request_body("m", &messages, Some(0.5), 256, false, true, &tools_wire)
             .unwrap();
-        let b = serialize_chat_request_body("m", &messages, 0.5, 256, false, true, &tools_wire)
+        let b = serialize_chat_request_body("m", &messages, Some(0.5), 256, false, true, &tools_wire)
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Unset means absent, not a placeholder: a model that accepts only its
+    /// own default refuses the request when the field is present at all.
+    #[test]
+    fn serialize_omits_temperature_unless_configured() {
+        let messages = vec![ChatMessage::user("hi")];
+        let unset = serialize_chat_request_body("m", &messages, None, 64, false, true, "").unwrap();
+        let v: Value = serde_json::from_slice(&unset).unwrap();
+        assert!(v.get("temperature").is_none(), "{v}");
+        let set = serialize_chat_request_body("m", &messages, Some(0.7), 64, false, true, "").unwrap();
+        let v: Value = serde_json::from_slice(&set).unwrap();
+        assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-5, "{v}");
     }
 
     #[test]
@@ -1316,7 +1392,7 @@ mod tests {
         let bytes = serialize_chat_request_body(
             "gpt-style",
             &messages,
-            0.1,
+            Some(0.1),
             512,
             true,  // use_max_completion_tokens
             false, // send_stream_options
@@ -1341,7 +1417,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let wire = registry.tool_schemas_wire();
         let bytes =
-            serialize_chat_request_body("m", &messages, 0.0, 64, false, true, wire).unwrap();
+            serialize_chat_request_body("m", &messages, None, 64, false, true, wire).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(
             body.contains(wire),

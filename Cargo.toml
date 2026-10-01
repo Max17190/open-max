@@ -73,6 +73,12 @@ targets = [
 install-path = "~/.openmax/bin"
 install-updater = false
 
+# dist 0.32 builds aarch64-apple-darwin on macos-14, which GitHub fails during
+# October 2026 brownouts and retires on November 2, 2026; one failed build
+# job stops the whole release, because `host` needs every build to pass.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # Lean, fast binaries: thin LTO and symbol stripping keep the harness tiny so
 # the model gets the machine.
 [profile.release]

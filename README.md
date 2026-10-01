@@ -83,7 +83,7 @@ there. It adds that directory to your `PATH` through your shell profile, so
 open a new shell (or `source ~/.openmax/bin/env`) and run `openmax`.
 
 macOS and Linux, x86_64 and arm64. Linux gets a glibc build, or a static musl
-build automatically when glibc is older than 2.31, so it also runs on Alpine and
+build automatically when glibc is older than 2.35, so it also runs on Alpine and
 inside slim containers. Windows is not supported.
 
 Pass `--no-modify-path` to leave your `PATH` alone, or set

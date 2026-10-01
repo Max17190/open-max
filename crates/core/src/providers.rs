@@ -106,7 +106,7 @@ pub struct ActiveEndpoint {
     pub model: String,
     pub context_tokens: usize,
     pub max_tokens: usize,
-    pub temperature: f32,
+    pub temperature: Option<f32>,
     pub compat: CompatFlags,
 }
 

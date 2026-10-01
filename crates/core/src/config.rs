@@ -83,7 +83,12 @@ pub struct Settings {
     /// unless the named provider's model entry supplies it.
     pub context_tokens: Option<usize>,
     pub max_tokens: usize,
-    pub temperature: f32,
+    /// Sent only when set; unset leaves sampling to the server's default.
+    /// Some models accept nothing else: OpenAI's reasoning models reject any
+    /// temperature but 1. Skipped when unset so a settings save never pins a
+    /// value the user did not choose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
     /// Byte cap for bash/external tool output before tail-truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
@@ -133,7 +138,7 @@ impl Default for Settings {
             approval_mode: ApprovalMode::Ask,
             context_tokens: None,
             max_tokens: 4096,
-            temperature: 0.2,
+            temperature: None,
             max_output_bytes: None,
             compaction_tokens: None,
             max_agent_tokens: None,
@@ -231,6 +236,34 @@ mod tests {
         let json = serde_json::to_string(&configured).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.max_agent_tokens, Some(120_000));
+    }
+
+    /// The TUI saves the whole struct, so an unset temperature has to stay
+    /// out of the file: a written default would be indistinguishable from
+    /// the user's choice and would go out on every request after.
+    #[test]
+    fn unset_temperature_is_not_written_by_a_settings_save() {
+        assert_eq!(Settings::default().temperature, None);
+        let defaulted: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.temperature, None);
+        let dir = temp_dir("temperature-unset");
+        let bytes = save_bytes(&dir, &Settings { model: "m".into(), ..Settings::default() }).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(written.get("temperature").is_none(), "{written}");
+        assert_eq!(load(&dir).unwrap().temperature, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file written before temperature became optional carries the old
+    /// default explicitly; it still parses and keeps sending that value.
+    #[test]
+    fn explicit_temperature_parses_and_round_trips() {
+        let s: Settings = serde_json::from_str(r#"{"temperature": 0.2}"#).unwrap();
+        assert_eq!(s.temperature, Some(0.2));
+        let json: serde_json::Value = serde_json::to_value(&s).unwrap();
+        assert!((json["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6, "{json}");
+        let back: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.temperature, Some(0.2));
     }
 
     #[test]
