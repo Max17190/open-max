@@ -391,8 +391,9 @@ impl ChatClient {
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
                 let text = String::from_utf8_lossy(&body);
-                let mut err = format!("backend returned {status}: {}", describe_backend(&text));
-                if let Some(hint) = temperature_hint(self.temperature, &text) {
+                let message = describe_backend(&text);
+                let mut err = format!("backend returned {status}: {message}");
+                if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
                 }
                 if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
@@ -732,10 +733,13 @@ fn describe_backend(body: &str) -> String {
 /// settings.json on every save, so a user who never chose a value can still
 /// be sending one, and reasoning models refuse every request that carries
 /// it. Dropping a saved 0.2 on load would also discard a value someone did
-/// choose, so the refusal names the setting and the fix instead.
-fn temperature_hint(sent: Option<f32>, body: &str) -> Option<String> {
+/// choose, so the refusal names the setting and the fix instead. Only the
+/// server's own error message is read, never the raw body: a backend that
+/// echoes the request beside an unrelated error would otherwise blame a
+/// valid setting for, say, an exhausted quota.
+fn temperature_hint(sent: Option<f32>, message: &str) -> Option<String> {
     let sent = sent?;
-    body.to_ascii_lowercase().contains("temperature").then(|| {
+    message.to_ascii_lowercase().contains("temperature").then(|| {
         format!(
             " (settings.json sets temperature {sent}; older versions wrote 0.2 there on every save, so if you did not choose it, delete the key and the server's default applies)"
         )
@@ -869,7 +873,22 @@ mod tests {
         assert!(err.contains("settings.json sets temperature 0.2") && err.contains("delete the key"), "{err}");
 
         assert!(temperature_hint(None, refusal).is_none(), "nothing was sent, so nothing to remove");
-        assert!(temperature_hint(Some(0.2), r#"{"error":{"message":"model not found"}}"#).is_none());
+        assert!(temperature_hint(Some(0.2), "model not found").is_none());
+
+        // A backend that echoes the request beside an unrelated error says
+        // nothing about temperature in its message: no advice to delete it.
+        let echoed = r#"{"error":{"message":"You exceeded your current quota"},"request":{"model":"m","temperature":0.2}}"#;
+        let refuse = || spawn_response_once(
+            format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{echoed}", echoed.len()),
+            None,
+        );
+        let err = ChatClient::new(refuse(), None, "m".into(), Some(0.2), 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .err()
+            .expect("a 422 is an error");
+        assert!(err.contains("exceeded your current quota"), "{err}");
+        assert!(!err.contains("settings.json"), "{err}");
     }
 
     #[test]
