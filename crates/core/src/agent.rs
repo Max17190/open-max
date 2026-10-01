@@ -1511,6 +1511,7 @@ async fn run_compact(
     let settings = core.settings.lock().unwrap().clone();
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
+    let client = ChatClient::from_endpoint(&endpoint);
     let (messages, registry, take_seq, factor) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
@@ -1522,7 +1523,7 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
-        let factor = token_factor(data.prompt_ratio);
+        let factor = token_factor(route_ratio(data.prompt_ratio.as_ref(), &client.origin()));
         let (messages, seq) = take_messages(data);
         (messages, registry, seq, factor)
     };
@@ -1543,7 +1544,7 @@ async fn run_compact(
     // schema futility guard below still applies to both paths.
     let trigger = settings
         .compaction_tokens
-        .map(|requested| to_estimate(requested, factor).max(COMPACTION_TOKENS_FLOOR).min(budget))
+        .map(|requested| requested_trigger(requested, factor, budget))
         .unwrap_or(budget);
     let tokens_before =
         schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
@@ -1567,7 +1568,6 @@ async fn run_compact(
             context_tokens: endpoint.context_tokens,
         });
     }
-    let client = ChatClient::from_endpoint(&endpoint);
     let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
     let ctx = CompactionCtx { core, session_id, project_root, client: &client, hooks: &hooks, cancelled };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
@@ -2704,8 +2704,12 @@ async fn run_loop(
     let max_tokens = endpoint.max_tokens;
     // Seeded from the session, not reset per turn: a turn whose request the
     // provider refused for length learned nothing, and the next one must
-    // still budget with what the earlier requests taught.
-    let mut prompt_ratio = core.sessions.lock().await.get(session_id).and_then(|d| d.prompt_ratio);
+    // still budget with what the earlier requests on this route taught.
+    let origin = client.origin();
+    let mut prompt_ratio = route_ratio(
+        core.sessions.lock().await.get(session_id).and_then(|d| d.prompt_ratio.as_ref()),
+        &origin,
+    );
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
 
@@ -2718,9 +2722,9 @@ async fn run_loop(
         let schema_tokens = estimate_tokens(schemas_wire.len());
         // The window is counted in the server's tokens and everything
         // compaction compares is an estimate, so the window side converts
-        // here, once. `compaction_tokens` converts with it: the user reads it
-        // against the same context number the UI shows, and the trigger caps
-        // it by the budget, so it must be in the budget's units.
+        // here, once. `compaction_tokens` converts with it (inside the
+        // trigger, after its floor): the user reads it against the same
+        // context number the UI shows, and the trigger caps it by the budget.
         let factor = token_factor(prompt_ratio);
         let window_budget = context_tokens.saturating_sub(max_tokens + 1024);
         let budget = to_estimate(window_budget, factor);
@@ -2729,8 +2733,9 @@ async fn run_loop(
             report_schemas_over_budget(core, session_id, guard.messages(), schema_real, window_budget)
                 .await;
         }
-        let setting = settings.compaction_tokens.map(|tokens| to_estimate(tokens, factor));
-        let trigger = compaction_trigger(budget, schema_tokens, setting, guard.messages());
+        let trigger = compaction_trigger(
+            budget, schema_tokens, settings.compaction_tokens, factor, guard.messages(),
+        );
         let ctx = CompactionCtx {
             core, session_id, project_root, client: &client, hooks: &hooks, cancelled: &cancelled,
         };
@@ -2790,12 +2795,14 @@ async fn run_loop(
         if let Some(ratio) = observed_prompt_ratio(&result, used) {
             prompt_ratio = Some(ratio);
             if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                data.prompt_ratio = Some(ratio);
+                data.prompt_ratio = Some((origin.clone(), ratio));
             }
         }
 
         refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
-        spend.record(core, session_id, used, &result);
+        // Charged in the units admission used, so a reply without usage pays
+        // the calibrated estimate rather than a raw one that undercounts it.
+        spend.record(core, session_id, used_real, &result);
 
         // Only the API tool_calls field carries executable calls.
         let mut content = result.content.clone();
@@ -4057,8 +4064,17 @@ fn schemas_outgrow_budget(budget: usize, schema_tokens: usize) -> bool {
 /// Floor for the `compaction_tokens` setting. The prune target is 70% of the
 /// trigger, so the hysteresis gap is 30% of it; below this floor the gap is
 /// too small to buy append-only turns, and the session would re-prune (and
-/// re-pay a summary request) every few iterations.
+/// re-pay a summary request) every few iterations. In the setting's own real
+/// tokens, like the conversation the gap has to hold; see `requested_trigger`.
 const COMPACTION_TOKENS_FLOOR: usize = 20_000;
+
+/// The trigger a `compaction_tokens` setting asks for, in estimator units:
+/// floored in the setting's real tokens, then converted, then capped by the
+/// budget. Flooring after the conversion would floor the estimate instead,
+/// and under a 4x factor a 30k setting would compact at 80k real tokens.
+fn requested_trigger(requested: usize, factor: f64, budget: usize) -> usize {
+    to_estimate(requested.max(COMPACTION_TOKENS_FLOOR), factor).min(budget)
+}
 
 /// What the digest note itself may cost after a prune, in tokens. An upper
 /// bound, not a guess: the prefix and count, sixteen tool names of at most
@@ -4095,14 +4111,18 @@ const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
 /// the newest three messages, so those (plus the note's own allowance) are
 /// what the target must contain. Counting more would fall back while a
 /// configured prune could in fact succeed, silently disabling the setting.
+///
+/// `setting` is in the user's real tokens; `budget`, `schema_tokens`, and the
+/// result are estimator units under `factor`.
 fn compaction_trigger(
     budget: usize,
     schema_tokens: usize,
     setting: Option<usize>,
+    factor: f64,
     messages: &[ChatMessage],
 ) -> usize {
     let Some(requested) = setting else { return budget };
-    let trigger = requested.max(COMPACTION_TOKENS_FLOOR).min(budget);
+    let trigger = requested_trigger(requested, factor, budget);
     if schemas_outgrow_budget(trigger, schema_tokens) {
         return budget;
     }
@@ -4146,6 +4166,12 @@ fn over_budget_error_context(
 fn observed_prompt_ratio(result: &CompletionResult, estimated: usize) -> Option<f64> {
     let prompt_tokens = result.usage?.prompt_tokens;
     (prompt_tokens > 0 && estimated > 0).then(|| prompt_tokens as f64 / estimated as f64)
+}
+
+/// The session's last observed ratio, if `origin` is the route that taught
+/// it. A ratio measured on another route says nothing about this one.
+fn route_ratio(stored: Option<&(String, f64)>, origin: &str) -> Option<f64> {
+    stored.filter(|(taught_by, _)| taught_by == origin).map(|&(_, ratio)| ratio)
 }
 
 /// How many real tokens one estimated token is worth on this endpoint: the
@@ -7380,13 +7406,19 @@ mod tests {
     /// counts what it was asked for. What ends these turns is the loop's own
     /// accounting, which is the thing under test.
     async fn counting_endpoint(sse: &str) -> (String, Arc<StdMutex<usize>>) {
+        scripted_endpoint(&[sse]).await
+    }
+
+    /// `counting_endpoint` for a provider whose replies change mid-session:
+    /// the nth request gets the nth stream, and the last one repeats.
+    async fn scripted_endpoint(streams: &[&str]) -> (String, Arc<StdMutex<usize>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(StdMutex::new(0usize));
         let seen = requests.clone();
-        let body = sse.to_string();
+        let bodies: Vec<String> = streams.iter().map(|s| s.to_string()).collect();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = Vec::new();
@@ -7410,7 +7442,11 @@ mod tests {
                 if content_length > 0 && sock.read_exact(&mut payload).await.is_err() {
                     continue;
                 }
-                *seen.lock().unwrap() += 1;
+                let body = {
+                    let mut seen = seen.lock().unwrap();
+                    *seen += 1;
+                    &bodies[(*seen - 1).min(bodies.len() - 1)]
+                };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
                 );
@@ -8157,6 +8193,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Drive one turn to its Done, collecting the `used_tokens` of every
+    /// budget event, one per request the loop considered sending.
+    async fn budgets_until_done(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
+    ) -> (String, Vec<usize>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut budgets = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                match env.event {
+                    AgentEvent::Budget { used_tokens, .. } => budgets.push(used_tokens),
+                    AgentEvent::Done { stop_reason } => return (stop_reason, budgets),
+                    _ => {}
+                }
+            }
+        }
+        panic!("the turn never emitted Done");
+    }
+
+    /// What the last request of a turn carried, in estimator units: the
+    /// frozen schemas plus everything but the reply it got.
+    async fn last_request_estimate(core: &Arc<Core>, id: &str) -> usize {
+        let map = core.sessions.lock().await;
+        let data = &map[id];
+        let sent = &data.messages[..data.messages.len() - 1];
+        estimate_tokens(data.registry.schemas_wire_arc().len())
+            + sent.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
+    }
+
     /// The bytes/4 estimate under-counts BPE tokenizers on code by more than
     /// the budget's headroom, so a transcript it calls comfortable can be
     /// refused for length. Once the server reports a prompt larger than the
@@ -8166,25 +8233,6 @@ mod tests {
     #[tokio::test]
     async fn the_servers_prompt_tokens_calibrate_the_next_requests_budget() {
         use crate::state::Core;
-
-        async fn budgets_until_done(
-            rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
-        ) -> (String, Vec<usize>) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            let mut budgets = Vec::new();
-            while tokio::time::Instant::now() < deadline {
-                if let Ok(Some(env)) =
-                    tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-                {
-                    match env.event {
-                        AgentEvent::Budget { used_tokens, .. } => budgets.push(used_tokens),
-                        AgentEvent::Done { stop_reason } => return (stop_reason, budgets),
-                        _ => {}
-                    }
-                }
-            }
-            panic!("the turn never emitted Done");
-        }
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
@@ -8230,7 +8278,7 @@ mod tests {
             "the plain estimate fits this transcript under the budget"
         );
         let ratio = 70_000.0 / first as f64;
-        assert_eq!(core.sessions.lock().await[&id].prompt_ratio, Some(ratio));
+        assert_eq!(core.sessions.lock().await[&id].prompt_ratio.as_ref().map(|r| r.1), Some(ratio));
 
         start_turn(core.clone(), id.clone(), project.clone(), "second".into()).unwrap();
         let (stop, budgets) = budgets_until_done(&mut rx).await;
@@ -8240,20 +8288,125 @@ mod tests {
             "the calibrated budget must compact what the plain one let through"
         );
         let [second] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
-        // What the request carried: everything but the reply it got.
-        let estimate = {
-            let map = core.sessions.lock().await;
-            let data = &map[&id];
-            let sent = &data.messages[..data.messages.len() - 1];
-            estimate_tokens(data.registry.schemas_wire_arc().len())
-                + sent.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
-        };
+        let estimate = last_request_estimate(&core, &id).await;
         assert_eq!(
             second,
             (estimate as f64 * ratio).round() as usize,
             "the budget event reports the request in the window's units"
         );
         assert!(second <= 63_488, "and the pruned request fits the window: {second}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A ratio describes the route that reported it: another model, URL, or
+    /// credential tokenizes and templates differently. After a switch, the
+    /// new route's first request budgets on the plain estimate, in the turn
+    /// (its budget event and its admission under a cap) and in `/compact`,
+    /// instead of a stale ratio that can refuse a request the new route takes.
+    #[tokio::test]
+    async fn a_route_switch_drops_the_old_routes_calibration() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        // Route A reports a prompt far past any tokenizer, so what it teaches
+        // is the 4x ceiling; route B is the same stub on another URL.
+        let (route_a, a_requests) = counting_endpoint(&STOP_SSE.replace(
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000000,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+        ))
+        .await;
+        let (route_b, b_requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = route_a.clone();
+            s.model = "stub".into();
+            s.context_tokens = Some(131_072);
+            s.max_tokens = 1_024;
+        }
+
+        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop");
+        let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let cancel = Arc::new(CancelToken::default());
+        let on_a = run_compact(&core, &id, &project, &cancel).await.unwrap();
+
+        core.settings.lock().unwrap().base_url = route_b;
+        let on_b = run_compact(&core, &id, &project, &cancel).await.unwrap();
+        assert_eq!(on_b.compacted_messages, 0, "a fresh session has nothing to prune");
+        assert_eq!(
+            on_a.tokens_before,
+            4 * on_b.tokens_before,
+            "/compact on route B reports the plain estimate, not route A's 4x"
+        );
+
+        // Twice the first request: room for the next one on the plain
+        // estimate, and well short of it at route A's 4x.
+        core.settings.lock().unwrap().max_agent_tokens = Some(2 * first);
+        start_turn(core.clone(), id.clone(), project.clone(), "second".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop", "the stale 4x must not refuse route B's first request");
+        assert_eq!((*a_requests.lock().unwrap(), *b_requests.lock().unwrap()), (1, 1));
+        let [second] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        assert_eq!(second, last_request_estimate(&core, &id).await, "route B budgets on factor 1.0");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Admission prices a request in calibrated tokens, so the charge for a
+    /// reply that reports no usage must be the same number. Charging the raw
+    /// estimate instead under-bills every such request by the learned factor,
+    /// and a capped turn keeps admitting requests its own arithmetic refuses.
+    #[tokio::test]
+    async fn a_reply_without_usage_is_charged_in_calibrated_tokens() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        // The first reply teaches the 4x ceiling; every later one is a read
+        // with no usage at all, so the loop's fallback charge is what counts.
+        let teach = STOP_SSE.replace(
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000000,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+        );
+        let (base_url, requests) = scripted_endpoint(&[&teach, TOOL_SSE]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(131_072);
+            s.max_agent_iterations = 10;
+        }
+
+        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop");
+        let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+
+        // Each read request costs about 4 x `first` calibrated. Charged that
+        // way, one request plus the next one's admission is ~8x, past this
+        // cap, so the turn stops after one. Charged at the raw ~1x, the
+        // second and third requests would still fit under it.
+        core.settings.lock().unwrap().max_agent_tokens = Some(first * 13 / 2);
+        start_turn(core.clone(), id.clone(), project.clone(), "keep reading".into()).unwrap();
+        let (stop, _) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "budget_exhausted");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            2,
+            "one teaching request, then one read before the calibrated charge refuses the next"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9956,7 +10109,7 @@ mod tests {
             messages.push(msg("assistant", 2_000));
             messages.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(budget, schema_tokens, Some(30_000), &messages);
+        let trigger = compaction_trigger(budget, schema_tokens, Some(30_000), 1.0, &messages);
         assert_eq!(trigger, 30_000);
         let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens);
         assert!(changed, "over the setting must prune with the window budget still far away");
@@ -9977,8 +10130,8 @@ mod tests {
     /// endpoint, and unset means the budget exactly.
     #[test]
     fn the_compaction_setting_never_raises_the_trigger() {
-        assert_eq!(compaction_trigger(50_000, 500, Some(400_000), &[]), 50_000);
-        assert_eq!(compaction_trigger(50_000, 500, None, &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, Some(400_000), 1.0, &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, None, 1.0, &[]), 50_000);
     }
 
     /// A setting whose prune target the frozen schemas outgrow can never be
@@ -9990,7 +10143,7 @@ mod tests {
         let budget = 150_000;
         let schema_tokens = 18_000;
         assert!(schemas_outgrow_budget(20_000, schema_tokens));
-        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &[]), budget);
+        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &[]), budget);
     }
 
     /// The other unachievable shape: a protected tail the setting's target
@@ -10010,13 +10163,13 @@ mod tests {
             messages.push(msg("tool", 30_000));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, Some(20_000), &messages),
+            compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &messages),
             budget,
             "an unreachable target must not arm per-iteration compaction"
         );
         // The same setting over a lean transcript stays in force.
         let lean = vec![msg("system", 400), msg("user", 400)];
-        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), &lean), 20_000);
+        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &lean), 20_000);
 
         // And the floor counts only what a maximal prune actually leaves:
         // the pinned head, the note, and the newest three. Six mid-sized
@@ -10027,7 +10180,7 @@ mod tests {
             boundary.push(msg("assistant", 9_600));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, Some(20_000), &boundary),
+            compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &boundary),
             20_000,
             "a reachable target must keep the setting in force"
         );
@@ -10121,8 +10274,32 @@ mod tests {
     #[test]
     fn a_tiny_compaction_setting_is_floored() {
         assert_eq!(
-            compaction_trigger(100_000, 500, Some(1_000), &[]),
+            compaction_trigger(100_000, 500, Some(1_000), 1.0, &[]),
             COMPACTION_TOKENS_FLOOR
+        );
+    }
+
+    /// The floor bounds the user's setting, which counts real tokens, so it
+    /// applies before the conversion. Under a learned 4x factor a 30k setting
+    /// compacts at 30k real tokens (7,500 estimated), not at the floor taken
+    /// in estimator units (20,000 estimated, 80k real), and a tiny setting
+    /// rides the floor in real tokens too. `/compact` aims at the same mark.
+    #[test]
+    fn a_calibrated_setting_is_floored_in_real_tokens() {
+        let factor = token_factor(Some(4.0));
+        let mut transcript = vec![msg("system", 200), msg("user", 200)];
+        // ~12k estimated, ~48k real: past the 30k the setting asks for.
+        while transcript.iter().map(ChatMessage::estimated_tokens).sum::<usize>() < 12_000 {
+            transcript.push(msg("assistant", 2_000));
+            transcript.push(msg("user", 2_000));
+        }
+        let trigger = compaction_trigger(100_000, 500, Some(30_000), factor, &transcript);
+        assert_eq!(trigger, 7_500);
+        assert_eq!(requested_trigger(30_000, factor, 100_000), trigger);
+        assert!(enforce_budget(&mut transcript, trigger, 500).0, "compaction fires at 30k real");
+        assert_eq!(
+            compaction_trigger(100_000, 500, Some(1_000), factor, &[]),
+            to_estimate(COMPACTION_TOKENS_FLOOR, factor)
         );
     }
 
@@ -10218,7 +10395,7 @@ mod tests {
             let schema_tokens = estimate_tokens(data.registry.schemas_wire_arc().len());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, Some(20_000), &data.messages),
+                compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &data.messages),
                 budget,
                 "fixture must sit in the fallback band"
             );
