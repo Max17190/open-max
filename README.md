@@ -71,9 +71,10 @@ bun install -g openmax-cli    # or: npm install -g openmax-cli
 
 The command is `openmax` either way; only the package name carries the `-cli`,
 because `openmax` on npm belongs to an unrelated 2015 package. This path fetches
-the same native binary, so it is the one install that needs Node or Bun present.
-Bun blocks install scripts by default, which is fine here: the binary is fetched
-on first run instead, once, and cached.
+the same native binary through a small launcher script that runs under `node`,
+so it is the one install that needs Node.js on your `PATH`, even when bun did the
+installing. Bun blocks install scripts by default, which is fine here: the binary
+is fetched on first run instead, once, and cached.
 
 Either way there is no Rust toolchain and no build. The script picks the right
 prebuilt binary for your machine, checks it against the published SHA-256
@@ -86,11 +87,11 @@ macOS and Linux, x86_64 and arm64. Linux gets a glibc build, or a static musl
 build automatically when glibc is older than 2.35, so it also runs on Alpine and
 inside slim containers. Windows is not supported.
 
-Pass `--no-modify-path` to leave your `PATH` alone, or set
+Set `OPENMAX_NO_MODIFY_PATH=1` to leave your `PATH` alone, or
 `OPENMAX_INSTALL_DIR` to install somewhere else:
 
 ```sh
-curl -fsSL https://useopenmax.dev/install.sh | sh -s -- --no-modify-path
+curl -fsSL https://useopenmax.dev/install.sh | OPENMAX_NO_MODIFY_PATH=1 sh
 ```
 
 `useopenmax.dev/install.sh` redirects to the current release's installer, so it
