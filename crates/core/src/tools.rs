@@ -922,14 +922,26 @@ async fn bash_tool(
         return ToolOutcome::err("missing required argument: command");
     };
     let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60).clamp(1, 300);
-    // Prefer zsh (macOS default), then bash, then sh for portable Linux CI/hosts.
-    let shell = ["/bin/zsh", "/bin/bash", "/bin/sh"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .unwrap_or("/bin/sh");
+    // The tool is named bash and models write bash, so run bash wherever it
+    // is installed: zsh's defaults break common bash (an unmatched glob is an
+    // error, `$var` is not word-split, arrays start at 1). Fixed paths, not a
+    // PATH lookup, so a PATH entry inside the project cannot swap in an
+    // agent-written shell under every approved command. Not a login shell:
+    // the child already inherits the launching terminal's environment, and
+    // re-sourcing profiles costs time per call and can reorder PATH (an
+    // activated virtualenv stops coming first).
+    let shell = [
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/usr/local/bin/bash",
+        "/run/current-system/sw/bin/bash",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).exists())
+    .unwrap_or("/bin/sh");
     let request = ProcessRequest {
         program: shell.into(),
-        args: vec!["-lc".into(), command.into()],
+        args: vec!["-c".into(), command.into()],
         cwd: root.to_path_buf(),
         stdin: StdinMode::Null,
         timeout: std::time::Duration::from_secs(timeout_secs),
@@ -1508,6 +1520,26 @@ mod tests {
             "no background children, no note: {}",
             plain.output
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Commands ran under zsh wherever it was installed, so on every Mac a
+    /// model's bash met 1-indexed arrays and unmatched globs as errors, and as
+    /// a login shell that re-sourced profiles on every call. `${arr[1]}` naming
+    /// the second element with `login_shell` off holds for non-login bash only.
+    #[tokio::test]
+    async fn the_bash_tool_runs_bash_as_a_non_login_shell() {
+        let root = temp_project();
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "arr=(zero one); echo \"${arr[1]}\"; if shopt -q login_shell; then echo login; fi"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.trim(), "one", "bash, not a login shell: {}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
