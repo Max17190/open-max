@@ -11,7 +11,8 @@
 //! exponential backoff and tells the caller through [`StreamDelta::Retry`].
 //! Once reply text has streamed, a retry would duplicate what the caller
 //! already showed, so a failure after that point is reported as a
-//! truncation instead; reasoning deltas are display-only and do not count.
+//! truncation instead. Reasoning deltas do not count: a retried attempt's
+//! reasoning is void, and the result carries only the final attempt's.
 //! A stream this client ends on purpose (the size cap, an out-of-range tool
 //! index, cancellation) is never retried: the next attempt would end the
 //! same way. A reply carrying only tool calls has no reply text, so a server
@@ -44,7 +45,7 @@ use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: WireMessages<'a>,
     // Omitted unless configured: some models reject any value but their own
     // default, and a server fills in its default when the field is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,16 +68,63 @@ struct StreamOptions {
     include_usage: bool,
 }
 
+/// The transcript as one endpoint receives it, borrowed so a request never
+/// copies it. Each message goes out as it serializes on disk, except that
+/// reasoning goes only to the endpoint that produced it (`origin` matches
+/// the message's `reasoning_origin`), and the stamp itself never goes.
+struct WireMessages<'a> {
+    messages: &'a [ChatMessage],
+    origin: &'a str,
+}
+
+impl Serialize for WireMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.messages.iter().map(|m| {
+            let replay = m.reasoning_origin.as_deref() == Some(self.origin);
+            WireMessage {
+                role: &m.role,
+                content: m.content.as_deref(),
+                tool_calls: m.tool_calls.as_deref(),
+                tool_call_id: m.tool_call_id.as_deref(),
+                reasoning_content: m.reasoning_content.as_deref().filter(|_| replay),
+                reasoning: m.reasoning.as_deref().filter(|_| replay),
+            }
+        }))
+    }
+}
+
+/// One message on the wire. Fields, order, and skip rules follow
+/// `ChatMessage`, so a message without reasoning keeps its exact bytes.
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<&'a [ToolCall]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a str>,
+}
+
 /// Serialize the chat-completion request body once. Honors multi-provider
 /// compat: `max_completion_tokens` vs `max_tokens`, optional `stream_options`,
 /// and tools/`tool_choice` only when `tools_wire` is a non-empty JSON array.
 ///
 /// `tools_wire` is the frozen registry schema string (exact bytes). It is
 /// injected via `RawValue` so multi-iteration turns keep schema identity for
-/// the server's KV cache without re-walking a `Value` tree.
+/// the server's KV cache without re-walking a `Value` tree. `origin` is the
+/// receiving endpoint's `ChatClient::origin`, which decides whose reasoning
+/// goes out.
+// One argument per request field, as in `with_options`.
+#[allow(clippy::too_many_arguments)]
 fn serialize_chat_request_body(
     model: &str,
     messages: &[ChatMessage],
+    origin: &str,
     temperature: Option<f32>,
     max_tokens: usize,
     use_max_completion_tokens: bool,
@@ -96,7 +144,7 @@ fn serialize_chat_request_body(
     };
     let req = ChatCompletionRequest {
         model,
-        messages,
+        messages: WireMessages { messages, origin },
         temperature,
         max_tokens: if use_max_completion_tokens {
             None
@@ -147,6 +195,12 @@ const MAX_TOOL_CALLS: usize = 128;
 pub struct CompletionResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// The reply's reasoning under the key the server sent it in, for the
+    /// caller to put on the assistant message stamped with this client's
+    /// `origin` (see `ChatMessage`). At most one is set, possibly to an empty
+    /// string (`reasoning_fields` says which).
+    pub reasoning_content: Option<String>,
+    pub reasoning: Option<String>,
     /// The server's reason, or `cancelled` (we stopped reading) or
     /// [`TRUNCATED`] (the server stopped writing without ever finishing).
     pub finish_reason: String,
@@ -315,6 +369,19 @@ impl ChatClient {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 
+    /// The stamp for reasoning this endpoint produces: the first 16 hex chars
+    /// of sha256 over base_url and model. The model is part of it because a
+    /// server can reject reasoning for one model it accepts for another, and
+    /// trailing slashes are dropped as `endpoint` drops them, since the
+    /// request goes to the same URL. A hash rather than the URL, so a session
+    /// file never holds a base_url that embeds a credential.
+    pub fn origin(&self) -> String {
+        let key = format!("{}\n{}", self.base_url.trim_end_matches('/'), self.model);
+        let mut origin = crate::ledger::sha256_hex(key.as_bytes());
+        origin.truncate(16);
+        origin
+    }
+
     /// Stream a chat completion, invoking `on_delta` for each token. Returns the
     /// fully accumulated message. If the server replies with plain JSON instead
     /// of an SSE stream, the response is parsed in one shot.
@@ -336,6 +403,7 @@ impl ChatClient {
         let body = serialize_chat_request_body(
             &self.model,
             messages,
+            &self.origin(),
             self.temperature,
             self.max_tokens,
             self.use_max_completion_tokens,
@@ -440,6 +508,10 @@ async fn read_sse(
     on_delta: &mut impl FnMut(StreamDelta),
 ) -> (CompletionResult, Option<String>) {
     let mut content = String::new();
+    // One buffer per key, so the reply goes back under the key that carried
+    // it. `None` until the server sends that key as a string, even an empty one.
+    let mut reasoning_content: Option<String> = None;
+    let mut reasoning: Option<String> = None;
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
     // Did the server ever say it was done (a `[DONE]` line or a
@@ -529,6 +601,12 @@ async fn read_sse(
                 }
             }
             // Reasoning models surface thinking under different keys.
+            if let Some(text) = &delta.reasoning_content {
+                reasoning_content.get_or_insert_with(String::new).push_str(text);
+            }
+            if let Some(text) = &delta.reasoning {
+                reasoning.get_or_insert_with(String::new).push_str(text);
+            }
             if let Some(text) = delta.reasoning_content {
                 if !text.is_empty() {
                     on_delta(StreamDelta::Reasoning(text));
@@ -577,11 +655,40 @@ async fn read_sse(
     if !tool_calls.is_empty() && finish_reason == "stop" {
         finish_reason = "tool_calls".into();
     }
-    (CompletionResult { content, tool_calls, finish_reason, usage }, interrupted)
+    let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage }, interrupted)
+}
+
+/// Which key one reply's reasoning goes back under: the one the server sent
+/// it in. Presence decides, not text: DeepSeek wants the key back on every
+/// later assistant message, and an empty string satisfies it, so a key sent
+/// as a string is kept even when empty; a null or absent key is not. A reply
+/// that used both keys keeps the one carrying text, and `reasoning_content`
+/// (the key the display path also prefers) when both or neither do. The
+/// other key is dropped rather than merged, so the server gets its thinking
+/// back once, under a key it emits. Neither key present sets neither, so the
+/// message keeps its old shape.
+fn reasoning_fields(
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let has_text = |key: &Option<String>| key.as_deref().is_some_and(|t| !t.is_empty());
+    if has_text(&reasoning_content) || (reasoning_content.is_some() && !has_text(&reasoning)) {
+        (reasoning_content, None)
+    } else {
+        (None, reasoning)
+    }
 }
 
 fn cancelled_response() -> CompletionResult {
-    CompletionResult { content: String::new(), tool_calls: Vec::new(), finish_reason: "cancelled".into(), usage: None }
+    CompletionResult {
+        content: String::new(),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+        reasoning: None,
+        finish_reason: "cancelled".into(),
+        usage: None,
+    }
 }
 
 async fn read_body(
@@ -677,7 +784,9 @@ fn parse_complete_response(
     let usage = serde_json::from_value::<UsageJson>(v["usage"].clone())
         .ok()
         .map(UsageJson::into_usage);
-    Ok(CompletionResult { content, tool_calls, finish_reason, usage })
+    let text = |key: &str| msg[key].as_str().map(str::to_string);
+    let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
+    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage })
 }
 
 fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
@@ -1052,6 +1161,88 @@ mod tests {
         assert_eq!(result.finish_reason, "stop");
     }
 
+    /// DeepSeek's thinking mode streams its reasoning as `reasoning_content`
+    /// and answers the next request carrying tools with a 400 unless it comes
+    /// back, so the result keeps the whole of it, under that key.
+    #[tokio::test]
+    async fn streamed_reasoning_content_is_kept_for_the_next_request() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"check\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!(result.reasoning_content.as_deref(), Some("let me check"));
+        assert_eq!(result.reasoning, None);
+        assert_eq!(result.content, "done");
+    }
+
+    /// Reasoning goes back under the key the server sent it in and no other:
+    /// a strict server rejects a message property it never emits.
+    #[tokio::test]
+    async fn reasoning_goes_back_under_the_key_the_server_used() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(result.reasoning.as_deref(), Some("hmm"));
+        assert_eq!(result.reasoning_content, None);
+        let origin = ChatClient::new("http://a/v1".into(), None, "m".into(), None, 64).origin();
+        let mut reply = ChatMessage::assistant(Some(result.content), None);
+        reply.reasoning_content = result.reasoning_content;
+        reply.reasoning = result.reasoning;
+        reply.reasoning_origin = Some(origin.clone());
+        assert_eq!(
+            wire(std::slice::from_ref(&reply), &origin),
+            r#"[{"role":"assistant","content":"ok","reasoning":"hmm"}]"#
+        );
+        // It rides every later request, so the context budget counts it.
+        assert!(reply.estimated_tokens() > ChatMessage::assistant(Some("ok".into()), None).estimated_tokens());
+
+        // A server that uses both keys gets one back, the display's choice.
+        let both = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"same\",\"reasoning\":\"same\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(both.reasoning_content.as_deref(), Some("same"));
+        assert_eq!(both.reasoning, None);
+        // Unless only the other one carries text: the thinking is not lost.
+        let both = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\",\"reasoning\":\"real\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(both.reasoning_content, None);
+        assert_eq!(both.reasoning.as_deref(), Some("real"));
+    }
+
+    /// A server that ignores `stream` and answers in one JSON body keeps its
+    /// reasoning too: the next request owes it back all the same.
+    #[tokio::test]
+    async fn a_one_shot_json_reply_keeps_its_reasoning() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok","reasoning_content":"thought"},"finish_reason":"stop"}]}"#;
+        let url = spawn_response_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()),
+            None,
+        );
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+        assert_eq!(result.content, "ok");
+        assert_eq!(result.reasoning_content.as_deref(), Some("thought"));
+        assert_eq!(result.reasoning, None);
+
+        let reply = json!({"choices":[{"message":{"content":"ok","reasoning":"aside"}}]});
+        let result = parse_complete_response(&reply, &mut |_| {}).unwrap();
+        assert_eq!(result.reasoning.as_deref(), Some("aside"));
+        assert_eq!(result.reasoning_content, None);
+        let reply = json!({"choices":[{"message":{"content":"ok"}}]});
+        let result = parse_complete_response(&reply, &mut |_| {}).unwrap();
+        assert!(result.reasoning_content.is_none() && result.reasoning.is_none());
+    }
+
     /// An endpoint that answers successive connections with successive
     /// bodies, each close-delimited, then stops listening. An empty body
     /// closes the connection after reading the request without answering:
@@ -1265,6 +1456,26 @@ mod tests {
         assert_eq!(deltas, vec!["content:half an ans".to_string()]);
     }
 
+    /// The reasoning an interrupted attempt streamed is void once the reply
+    /// starts over: the result carries the attempt that finished, never the
+    /// two run together.
+    #[tokio::test]
+    async fn a_retried_reply_keeps_only_the_final_attempts_reasoning() {
+        let (result, _, served) = stream_sequence(vec![
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"abandoned\"},\"finish_reason\":null}]}\n\n".into(),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"fresh\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .into(),
+        ])
+        .await;
+        assert_eq!(served, 2);
+        assert_eq!(result.content, "all of it");
+        assert_eq!(result.reasoning_content.as_deref(), Some("fresh"));
+    }
+
     #[test]
     fn retryable_status_codes() {
         assert!(is_retryable_status(429));
@@ -1301,6 +1512,7 @@ mod tests {
         let bytes = serialize_chat_request_body(
             "test-model",
             &messages,
+            "o",
             Some(0.2),
             1024,
             false,
@@ -1336,12 +1548,136 @@ mod tests {
         assert_eq!(msgs[2]["content"], "calling a tool");
     }
 
+    /// A message with no reasoning keeps the exact bytes it had before the
+    /// reasoning fields existed, on the wire and on disk, so a server that
+    /// never sends reasoning sees no change, and a session file from before
+    /// them still loads. Reasoning withheld from another endpoint leaves the
+    /// same bytes behind.
+    #[test]
+    fn a_message_without_reasoning_serializes_as_before() {
+        let messages = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant(Some("calling".into()), Some(vec![bash_call()])),
+            ChatMessage::tool("c1", "out"),
+        ];
+        let old_shape = concat!(
+            r#"[{"role":"user","content":"hi"},"#,
+            r#"{"role":"assistant","content":"calling","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"#,
+            r#"{"role":"tool","content":"out","tool_call_id":"c1"}]"#,
+        );
+        assert_eq!(wire(&messages, "o"), old_shape);
+        assert_eq!(serde_json::to_string(&messages).unwrap(), old_shape);
+        let bytes = serialize_chat_request_body("m", &messages, "o", None, 64, false, false, "").unwrap();
+        let body = String::from_utf8(bytes).unwrap();
+        assert!(body.contains(&format!(r#""messages":{old_shape}"#)), "{body}");
+
+        let mut foreign = messages.clone();
+        foreign[1].reasoning_content = Some("thought".into());
+        foreign[1].reasoning_origin = Some("elsewhere".into());
+        assert_eq!(wire(&foreign, "o"), old_shape);
+
+        let old: ChatMessage = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert!(old.reasoning_content.is_none() && old.reasoning.is_none() && old.reasoning_origin.is_none());
+    }
+
+    /// The bug this guards: a session that ran on DeepSeek and then moved to
+    /// OpenAI or Groq with `/model` sent DeepSeek's reasoning along, and both
+    /// answer a message property their model never emits with a 400. The
+    /// reasoning goes back to the endpoint that produced it and nowhere else,
+    /// and the stamp that decides it never leaves the session file.
+    #[test]
+    fn reasoning_goes_only_to_the_endpoint_that_produced_it() {
+        let client = |base: &str, model: &str| ChatClient::new(base.into(), None, model.into(), None, 64);
+        let deepseek = client("https://api.deepseek.com", "deepseek-reasoner");
+        let mut reply = ChatMessage::assistant(None, Some(vec![bash_call()]));
+        reply.reasoning_content = Some("thought".into());
+        reply.reasoning_origin = Some(deepseek.origin());
+        let messages = vec![ChatMessage::user("hi"), reply, ChatMessage::tool("c1", "out")];
+
+        // The same endpoint, however its base_url ends, gets it back.
+        let same = client("https://api.deepseek.com/", "deepseek-reasoner");
+        assert_eq!(same.origin(), deepseek.origin());
+        assert_eq!(deepseek.origin().len(), 16);
+        let body = request_body(&same, &messages);
+        assert!(body.contains(r#""tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}],"reasoning_content":"thought"}"#), "{body}");
+
+        // A `/model` switch to another base_url, or to another model on the
+        // same one, sends the transcript without it.
+        for other in [client("https://api.openai.com/v1", "gpt-5"), client("https://api.deepseek.com", "deepseek-chat")] {
+            assert_ne!(other.origin(), deepseek.origin());
+            let body = request_body(&other, &messages);
+            assert!(!body.contains("reasoning_content") && !body.contains(r#""reasoning""#), "{body}");
+        }
+
+        // Reasoning no endpoint stamped goes back to none.
+        let mut unstamped = messages.clone();
+        unstamped[1].reasoning_origin = None;
+        assert!(!request_body(&deepseek, &unstamped).contains("reasoning_content"));
+
+        // The stamp itself is never on the wire, though the session file keeps it.
+        let body = request_body(&deepseek, &messages);
+        assert!(!body.contains("reasoning_origin") && !body.contains(&deepseek.origin()), "{body}");
+        assert!(serde_json::to_string(&messages[1]).unwrap().contains(&deepseek.origin()));
+    }
+
+    /// DeepSeek wants the key back on every later assistant message, and an
+    /// empty string satisfies it: a key the server sent as a string is kept
+    /// and echoed even when it carried no text. A null key is no key.
+    #[tokio::test]
+    async fn an_empty_reasoning_key_is_echoed_as_an_empty_string() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\",\"reasoning\":null},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(result.reasoning_content.as_deref(), Some(""));
+        assert_eq!(result.reasoning, None);
+        let origin = ChatClient::new("http://a/v1".into(), None, "m".into(), None, 64).origin();
+        let mut reply = ChatMessage::assistant(Some(result.content), None);
+        reply.reasoning_content = result.reasoning_content;
+        reply.reasoning_origin = Some(origin.clone());
+        assert_eq!(wire(&[reply], &origin), r#"[{"role":"assistant","content":"ok","reasoning_content":""}]"#);
+
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":null},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert!(result.reasoning_content.is_none() && result.reasoning.is_none());
+
+        let reply = json!({"choices":[{"message":{"content":"ok","reasoning_content":""}}]});
+        let result = parse_complete_response(&reply, &mut |_| {}).unwrap();
+        assert_eq!(result.reasoning_content.as_deref(), Some(""));
+        let reply = json!({"choices":[{"message":{"content":"ok","reasoning_content":null}}]});
+        let result = parse_complete_response(&reply, &mut |_| {}).unwrap();
+        assert!(result.reasoning_content.is_none() && result.reasoning.is_none());
+    }
+
+    fn bash_call() -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "bash".into(), arguments: "{}".into() },
+        }
+    }
+
+    /// The messages array exactly as `origin` would receive it.
+    fn wire(messages: &[ChatMessage], origin: &str) -> String {
+        serde_json::to_string(&WireMessages { messages, origin }).unwrap()
+    }
+
+    /// The whole request body `client` would send for `messages`.
+    fn request_body(client: &ChatClient, messages: &[ChatMessage]) -> String {
+        let bytes = serialize_chat_request_body(&client.model, messages, &client.origin(), None, 64, false, false, "").unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
     #[test]
     fn serialize_chat_request_body_omits_tools_when_empty() {
         let messages = vec![ChatMessage::user("hi")];
         for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body("m", &messages, None, 64, false, true, tools_wire)
+                serialize_chat_request_body("m", &messages, "o", None, 64, false, true, tools_wire)
                     .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(
@@ -1366,9 +1702,9 @@ mod tests {
             "function": { "name": "bash", "parameters": { "type": "object" } }
         }])
         .to_string();
-        let a = serialize_chat_request_body("m", &messages, Some(0.5), 256, false, true, &tools_wire)
+        let a = serialize_chat_request_body("m", &messages, "o", Some(0.5), 256, false, true, &tools_wire)
             .unwrap();
-        let b = serialize_chat_request_body("m", &messages, Some(0.5), 256, false, true, &tools_wire)
+        let b = serialize_chat_request_body("m", &messages, "o", Some(0.5), 256, false, true, &tools_wire)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -1378,10 +1714,10 @@ mod tests {
     #[test]
     fn serialize_omits_temperature_unless_configured() {
         let messages = vec![ChatMessage::user("hi")];
-        let unset = serialize_chat_request_body("m", &messages, None, 64, false, true, "").unwrap();
+        let unset = serialize_chat_request_body("m", &messages, "o", None, 64, false, true, "").unwrap();
         let v: Value = serde_json::from_slice(&unset).unwrap();
         assert!(v.get("temperature").is_none(), "{v}");
-        let set = serialize_chat_request_body("m", &messages, Some(0.7), 64, false, true, "").unwrap();
+        let set = serialize_chat_request_body("m", &messages, "o", Some(0.7), 64, false, true, "").unwrap();
         let v: Value = serde_json::from_slice(&set).unwrap();
         assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-5, "{v}");
     }
@@ -1392,6 +1728,7 @@ mod tests {
         let bytes = serialize_chat_request_body(
             "gpt-style",
             &messages,
+            "o",
             Some(0.1),
             512,
             true,  // use_max_completion_tokens
@@ -1417,7 +1754,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let wire = registry.tool_schemas_wire();
         let bytes =
-            serialize_chat_request_body("m", &messages, None, 64, false, true, wire).unwrap();
+            serialize_chat_request_body("m", &messages, "o", None, 64, false, true, wire).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(
             body.contains(wire),
