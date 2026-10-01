@@ -56,8 +56,10 @@ provider's per-model entries override the first two.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
 Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
-plus the frozen tool schemas (estimated at ~4 chars per token). Over budget,
-compaction prunes hard to 70% of the budget in one pass and then leaves
+plus the frozen tool schemas (estimated at ~4 chars per token, scaled up when
+the server reported more `prompt_tokens` than estimated for the session's last
+request, as BPE tokenizers do on code). Over budget, compaction prunes hard to
+70% of the budget in one pass and then leaves
 history untouched until it is crossed again, so the prompt prefix stays
 byte-stable between prunes and the server-side prompt cache stays warm. A
 prune truncates old tool outputs first, then drops the oldest exchanges;
