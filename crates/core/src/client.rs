@@ -391,7 +391,10 @@ impl ChatClient {
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
                 let text = String::from_utf8_lossy(&body);
-                let err = format!("backend returned {status}: {}", describe_backend(&text));
+                let mut err = format!("backend returned {status}: {}", describe_backend(&text));
+                if let Some(hint) = temperature_hint(self.temperature, &text) {
+                    err.push_str(&hint);
+                }
                 if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
                     if !retry_after(attempt, &err, &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
@@ -724,6 +727,21 @@ fn describe_backend(body: &str) -> String {
         .unwrap_or_else(|| truncate(body, 600))
 }
 
+/// What to do when a server refuses the temperature it was sent. Versions
+/// before temperature became optional wrote `"temperature": 0.2` into
+/// settings.json on every save, so a user who never chose a value can still
+/// be sending one, and reasoning models refuse every request that carries
+/// it. Dropping a saved 0.2 on load would also discard a value someone did
+/// choose, so the refusal names the setting and the fix instead.
+fn temperature_hint(sent: Option<f32>, body: &str) -> Option<String> {
+    let sent = sent?;
+    body.to_ascii_lowercase().contains("temperature").then(|| {
+        format!(
+            " (settings.json sets temperature {sent}; older versions wrote 0.2 there on every save, so if you did not choose it, delete the key and the server's default applies)"
+        )
+    })
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -829,6 +847,29 @@ mod tests {
         // Servers that answer with plain text or HTML still show something.
         assert_eq!(describe_backend("upstream timeout"), "upstream timeout");
         assert_eq!(describe_backend(""), "");
+    }
+
+    /// A settings.json saved before temperature became optional still holds
+    /// the old 0.2 default, which reasoning models refuse. The refusal must
+    /// name the setting and the fix; nothing is said when no temperature was
+    /// sent or the refusal is about something else.
+    #[tokio::test]
+    async fn a_refused_temperature_names_the_setting_to_remove() {
+        let refusal = r#"{"error":{"message":"Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported."}}"#;
+        let refuse = || spawn_response_once(
+            format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{refusal}", refusal.len()),
+            None,
+        );
+        let err = ChatClient::new(refuse(), None, "m".into(), Some(0.2), 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .err()
+            .expect("a 400 is an error");
+        assert!(err.contains("does not support 0.2"), "{err}");
+        assert!(err.contains("settings.json sets temperature 0.2") && err.contains("delete the key"), "{err}");
+
+        assert!(temperature_hint(None, refusal).is_none(), "nothing was sent, so nothing to remove");
+        assert!(temperature_hint(Some(0.2), r#"{"error":{"message":"model not found"}}"#).is_none());
     }
 
     #[test]

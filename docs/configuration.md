@@ -48,7 +48,9 @@ provider's per-model entries override the first two.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's
-  OpenAI-compatible endpoint uses 1.0, not the Modelfile's value.
+  OpenAI-compatible endpoint uses 1.0, not the Modelfile's value. Earlier
+  versions wrote `"temperature": 0.2` on every settings save; if you never
+  chose it, delete the key.
 - `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
   keeps the tail and spills the full log to `~/.openmax/cmd-logs`.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
