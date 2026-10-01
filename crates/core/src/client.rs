@@ -370,13 +370,20 @@ impl ChatClient {
     }
 
     /// The stamp for reasoning this endpoint produces: the first 16 hex chars
-    /// of sha256 over base_url and model. The model is part of it because a
-    /// server can reject reasoning for one model it accepts for another, and
-    /// trailing slashes are dropped as `endpoint` drops them, since the
-    /// request goes to the same URL. A hash rather than the URL, so a session
-    /// file never holds a base_url that embeds a credential.
+    /// of sha256 over the whole route, base_url, model, credential, and
+    /// headers. The model is part of it because a server can reject reasoning
+    /// for one model it accepts for another; the credential and headers
+    /// because two providers sharing a URL and model can still route to
+    /// different backends or accounts, and reasoning one produced must not
+    /// reach the other (encrypted reasoning only decrypts for the account
+    /// that made it). Trailing slashes are dropped as `endpoint` drops them,
+    /// since the request goes to the same URL. A hash, so a session file never
+    /// holds the URL, the key, or a header value.
     pub fn origin(&self) -> String {
-        let key = format!("{}\n{}", self.base_url.trim_end_matches('/'), self.model);
+        let mut key = format!("{}\n{}\n{}", self.base_url.trim_end_matches('/'), self.model, self.api_key.as_deref().unwrap_or(""));
+        for (name, value) in &self.headers {
+            key.push_str(&format!("\n{}:{value}", name.to_ascii_lowercase()));
+        }
         let mut origin = crate::ledger::sha256_hex(key.as_bytes());
         origin.truncate(16);
         origin
@@ -1609,6 +1616,17 @@ mod tests {
             assert!(!body.contains("reasoning_content") && !body.contains(r#""reasoning""#), "{body}");
         }
 
+        // Two providers on one URL and model are still two routes when the
+        // credential or a routing header differs: neither gets the other's.
+        let mut keyed = client("https://api.deepseek.com", "deepseek-reasoner");
+        keyed.api_key = Some("sk-other-account".into());
+        let mut routed = client("https://api.deepseek.com", "deepseek-reasoner");
+        routed.headers = vec![("X-Route".into(), "backend-b".into())];
+        for other in [keyed, routed] {
+            assert_ne!(other.origin(), deepseek.origin());
+            assert!(!request_body(&other, &messages).contains("reasoning_content"));
+        }
+
         // Reasoning no endpoint stamped goes back to none.
         let mut unstamped = messages.clone();
         unstamped[1].reasoning_origin = None;
@@ -1617,6 +1635,9 @@ mod tests {
         // The stamp itself is never on the wire, though the session file keeps it.
         let body = request_body(&deepseek, &messages);
         assert!(!body.contains("reasoning_origin") && !body.contains(&deepseek.origin()), "{body}");
+        let mut secret = client("https://api.deepseek.com", "deepseek-reasoner");
+        secret.api_key = Some("sk-live-secret".into());
+        assert!(!secret.origin().contains("sk-"), "the stamp is a hash, never the key");
         assert!(serde_json::to_string(&messages[1]).unwrap().contains(&deepseek.origin()));
     }
 
