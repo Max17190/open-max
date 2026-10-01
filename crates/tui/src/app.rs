@@ -5689,6 +5689,9 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
             // File content that happens to look like an edit summary.
             open_max_core::types::ChatMessage {
@@ -5696,6 +5699,9 @@ mod tests {
                 content: Some("1 release notes (+3 −0) overall".into()),
                 tool_calls: None,
                 tool_call_id: Some("c1".into()),
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
         ];
         let mut persisted = 0usize;
@@ -5743,12 +5749,18 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_origin: None,
                 });
                 messages.push(open_max_core::types::ChatMessage {
                     role: "tool".into(),
                     content: Some(output.clone()),
                     tool_calls: None,
                     tool_call_id: Some(format!("c{i}")),
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_origin: None,
                 });
             }
             let mut persisted = 0usize;
@@ -5819,12 +5831,18 @@ mod tests {
                     },
                 ]),
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
                 content: Some(timeout.clone()),
                 tool_calls: None,
                 tool_call_id: Some("c1".into()),
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
             // A SUCCESSFUL command whose output merely opens with the same
             // sentence: equality, not a prefix, decides, so this replays ok
@@ -5834,6 +5852,9 @@ mod tests {
                 content: Some(format!("{timeout}\nprobe output continues")),
                 tool_calls: None,
                 tool_call_id: Some("c2".into()),
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
         ];
         let mut persisted = 0usize;
@@ -5884,18 +5905,27 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
                 content: Some("wrote notes.md (+3 −0)".into()),
                 tool_calls: None,
                 tool_call_id: Some("c1".into()),
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
                 role: "assistant".into(),
                 content: Some("done".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_origin: None,
             },
         ];
         let mut persisted = 0usize;
