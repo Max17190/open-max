@@ -846,6 +846,9 @@ mod tests {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_origin: None,
         };
         let messages = vec![
             mk("system", "hidden"),

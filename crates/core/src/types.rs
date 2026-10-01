@@ -3,7 +3,8 @@
 //! Two unrelated vocabularies live here because both are contracts. The first
 //! is the OpenAI chat wire format (`ChatMessage`, `ToolCall`), serialized
 //! exactly as a provider expects; `content` is optional because an assistant
-//! message carrying only tool calls has none.
+//! message carrying only tool calls has none. The one exception is reasoning,
+//! which the client sends only to the endpoint that produced it.
 //!
 //! The second is `AgentEvent`, the single channel `core` speaks to any
 //! frontend over. It is the whole public surface of a running turn, which is
@@ -44,26 +45,55 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// An assistant reply's reasoning, kept so later requests can send it
+    /// back. DeepSeek's thinking mode answers a request carrying `tools` with
+    /// a 400 unless each earlier reply's `reasoning_content` returns;
+    /// OpenRouter reads the same text as `reasoning`. At most one of the two
+    /// is set, and only under the key the server itself sent. Absent
+    /// otherwise, so such messages serialize exactly as before, and session
+    /// files written before these fields existed still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Which endpoint produced the reasoning above (`ChatClient::origin`).
+    /// The client sends reasoning back only to that endpoint and never sends
+    /// this stamp at all: after a `/model` switch, OpenAI and Groq reject a
+    /// message property their model never emits. Reasoning without a stamp
+    /// goes back nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_origin: Option<String>,
 }
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: Some(content.into()), tool_calls: None, tool_call_id: None }
+        Self::plain("system", Some(content.into()), None, None)
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(content.into()), tool_calls: None, tool_call_id: None }
+        Self::plain("user", Some(content.into()), None, None)
     }
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Self { role: "assistant".into(), content, tool_calls, tool_call_id: None }
+        Self::plain("assistant", content, tool_calls, None)
     }
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: Some(content.into()), tool_calls: None, tool_call_id: Some(tool_call_id.into()) }
+        Self::plain("tool", Some(content.into()), None, Some(tool_call_id.into()))
+    }
+
+    /// Every constructor starts without reasoning: only the agent loop
+    /// attaches it, from a reply, together with its origin.
+    fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_origin: None }
     }
 
     /// Rough size estimate used for context budgeting, plus a small constant
-    /// for the role/envelope bytes every message pays.
+    /// for the role/envelope bytes every message pays. Reasoning counts: it
+    /// rides every later request, and a server that leaves it out of the
+    /// prompt only makes this an overestimate, which compacts a little early.
     pub fn estimated_tokens(&self) -> usize {
         let mut chars = self.content.as_deref().map(str::len).unwrap_or(0);
+        for reasoning in [&self.reasoning_content, &self.reasoning].into_iter().flatten() {
+            chars += reasoning.len();
+        }
         if let Some(calls) = &self.tool_calls {
             for c in calls {
                 chars += c.function.name.len() + c.function.arguments.len() + 16;

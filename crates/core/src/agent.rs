@@ -2771,7 +2771,9 @@ async fn run_loop(
         let mut content = result.content.clone();
         let tool_calls = result.tool_calls.clone();
         // Reasoning leaked into content is display-only: persisting it would
-        // re-prefill dead tokens on every later turn.
+        // re-prefill dead tokens on every later turn. It is not moved into
+        // the reasoning fields either; only what the server sent under its
+        // own reasoning key goes back.
         if let Some(clean) = crate::client::strip_leading_think(&content) {
             content = clean;
         }
@@ -2780,10 +2782,20 @@ async fn run_loop(
         // Never persist a fully empty assistant message (e.g. a turn cancelled
         // before the first token): chat templates can reject it on replay.
         if !content.is_empty() || !tool_calls.is_empty() {
-            guard.messages().push(ChatMessage::assistant(
+            let mut reply = ChatMessage::assistant(
                 if content.is_empty() { None } else { Some(content.clone()) },
                 if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
-            ));
+            );
+            // The server's reasoning rides this message on later requests to
+            // the same endpoint, under the key it came in: DeepSeek refuses a
+            // request carrying tools whose earlier replies lack theirs. The
+            // stamp keeps it from an endpoint a `/model` switch moves to.
+            reply.reasoning_content = result.reasoning_content.clone();
+            reply.reasoning = result.reasoning.clone();
+            if reply.reasoning_content.is_some() || reply.reasoning.is_some() {
+                reply.reasoning_origin = Some(client.origin());
+            }
+            guard.messages().push(reply);
             // Any prune was rewritten to disk before the request went out, so
             // this save only appends the new assistant message. A failed
             // eager rewrite still heals here: save_messages rewrites whenever
@@ -4782,7 +4794,7 @@ mod tests {
     }
 
     fn msg(role: &str, len: usize) -> ChatMessage {
-        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None }
+        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_origin: None }
     }
 
     fn assistant_with_tools(name: &str, args: &str) -> ChatMessage {
@@ -6073,6 +6085,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A thinking-mode reply: reasoning streamed as `reasoning_content`, then
+    /// one read.
+    const THINKING_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"read a.txt \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// A provider that answers its first request with `first` and every later
+    /// one with `STOP_SSE`, keeping each request body it was sent.
+    async fn capturing_endpoint(first: &'static str) -> (String, Arc<StdMutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0u8; content_length];
+                if content_length > 0 && sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
+                n += 1;
+                let sse = if n == 1 { first } else { STOP_SSE };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), bodies)
+    }
+
+    /// The assistant messages of one captured request body.
+    fn sent_replies(body: &str) -> Vec<Value> {
+        let body: Value = serde_json::from_str(body).unwrap();
+        body["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").cloned().collect()
+    }
+
+    /// The bug this guards: DeepSeek's thinking mode answered the second
+    /// request of every tool loop with a 400, because the reasoning its first
+    /// reply streamed was shown and thrown away. The assistant message that
+    /// goes back must carry it, under the key the server used and no other.
+    #[tokio::test]
+    async fn a_tool_loop_sends_the_servers_reasoning_back() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, bodies) = capturing_endpoint(THINKING_TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+
+        let id = "sess-reasoning";
+        start_turn(core.clone(), id.into(), project.clone(), "what is in a.txt".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one tool step, then the answer");
+        let replies = sent_replies(&bodies[1]);
+        assert_eq!(replies.len(), 1, "{}", bodies[1]);
+        assert_eq!(replies[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(replies[0]["reasoning_content"], "read a.txt first", "{}", bodies[1]);
+        assert!(replies[0].get("reasoning").is_none(), "only the key the server used goes back");
+        assert!(!bodies[1].contains("reasoning_origin"), "the stamp stays in the session file");
+
+        // The final reply streamed no reasoning, so it carries none.
+        let messages = transcript(&core, id).await;
+        let last = messages.last().unwrap();
+        assert_eq!(last.content.as_deref(), Some("done"));
+        assert!(last.reasoning_content.is_none() && last.reasoning.is_none() && last.reasoning_origin.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `/model` switch moves the session to an endpoint that never produced
+    /// the reasoning in its transcript, and OpenAI and Groq answer a message
+    /// property their model never emits with a 400. The reasoning stays on
+    /// disk, is withheld from the new endpoint, and goes back again once the
+    /// session returns to the one that produced it.
+    #[tokio::test]
+    async fn a_model_switch_withholds_another_endpoints_reasoning() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (thinking, thinking_bodies) = capturing_endpoint(THINKING_TOOL_SSE).await;
+        let (other, other_bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        let id = "sess-switch";
+        for (base_url, prompt) in [(&thinking, "what is in a.txt"), (&other, "and now?"), (&thinking, "and back?")] {
+            core.settings.lock().unwrap().base_url = base_url.clone();
+            start_turn(core.clone(), id.into(), project.clone(), prompt.into()).unwrap();
+            let (stop, _) = drive_turn(&mut rx).await;
+            assert_eq!(stop, "stop");
+        }
+
+        let origin = transcript(&core, id)
+            .await
+            .iter()
+            .find_map(|m| m.reasoning_origin.clone())
+            .expect("the reasoning reply is stamped with its endpoint");
+        let other_bodies = other_bodies.lock().unwrap().clone();
+        assert_eq!(other_bodies.len(), 1);
+        assert!(
+            !other_bodies[0].contains("reasoning") && !other_bodies[0].contains(&origin),
+            "the switched-to endpoint got another endpoint's reasoning: {}",
+            other_bodies[0]
+        );
+        let thinking_bodies = thinking_bodies.lock().unwrap().clone();
+        assert_eq!(thinking_bodies.len(), 3, "the tool step, its answer, and the turn after the switch back");
+        let replies = sent_replies(&thinking_bodies[2]);
+        assert_eq!(replies[0]["reasoning_content"], "read a.txt first", "{}", thinking_bodies[2]);
+        assert!(!thinking_bodies[2].contains("reasoning_origin"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The unapproved-source card carries the probe evidence when a
     /// sandboxed example of exactly these bytes passed - prepended to the
     /// detail so clipping cannot hide it - and stays evidence-free for a
@@ -6206,6 +6380,9 @@ mod tests {
             content: Some("wrote .openmax/tools/deploy.toml".into()),
             tool_calls: None,
             tool_call_id: Some("call-1".into()),
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_origin: None,
         });
 
         // Missing required field `command`: parses as TOML, fails the spec.
