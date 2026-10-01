@@ -76,6 +76,17 @@ pub struct SessionData {
     /// refreeze receipt names file changes, not approvals - so the turn
     /// start names any it has not seen.
     pub seen_ledger_events: HashSet<u64>,
+    /// Server-reported `prompt_tokens` over the local estimate of the same
+    /// request, as last observed on a turn's completion. The bytes/4
+    /// estimator under-counts BPE tokenizers on code, by far more than the
+    /// budget's headroom, so the send budget is scaled by this ratio and
+    /// compaction fires before the provider refuses the request for length.
+    /// Keyed by the route that taught it (`ChatClient::origin`): another
+    /// model, URL, key, or header set tokenizes and templates differently,
+    /// so after a switch the plain estimate applies until the new route
+    /// reports. In memory only: a resumed session runs on the plain estimate
+    /// until its first response. See `agent::token_factor`.
+    pub prompt_ratio: Option<(String, f64)>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous
