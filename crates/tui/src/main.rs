@@ -1422,10 +1422,15 @@ fn ensure_project_trust(
             ));
         }
         // Same second wall as --approve: a human at a terminal, or an
-        // explicit attestation for automation a human runs.
+        // explicit attestation for automation a human runs. The repair is
+        // printed as one command to paste, so it carries the directory as a
+        // quoted `cd`: a parenthesized note is a shell syntax error.
         require_human(
             "a trust grant",
-            &format!("openmax --trust-project (in {})", project.display()),
+            &format!(
+                "cd {} && openmax --trust-project",
+                open_max_core::doctor::shell_quote(project)
+            ),
         );
         let trusted = open_max_core::trust::trust_project(data_dir, project)?;
         eprintln!("openmax: trusted project {}", trusted.display());

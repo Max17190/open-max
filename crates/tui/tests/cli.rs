@@ -405,10 +405,14 @@ fn documented_trust_commands_work_as_written() {
 
 /// A frontend's stdin is its protocol pipe, never a terminal, so it cannot
 /// grant trust, and the refusal it gets on an untrusted project must name a
-/// grant that works for it rather than the flag that cannot.
+/// grant that works for it rather than the flag that cannot. The grant the
+/// no-terminal refusal prints must paste into a shell as written, from a
+/// project whose path a shell would split.
 #[test]
 fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
-    let (project, home) = fresh_dirs("frontend-trust");
+    let (base, home) = fresh_dirs("frontend-trust");
+    let project = base.join("my proj");
+    std::fs::create_dir_all(&project).unwrap();
     write_settings(&home, "http://127.0.0.1:9/v1");
     let spawn = |args: &[&str]| {
         finish_with_deadline(
@@ -425,6 +429,11 @@ fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{stderr}");
     assert!(stderr.contains("no terminal"), "{stderr}");
+    let repair = format!(
+        "`cd {} && openmax --trust-project`",
+        open_max_core::doctor::shell_quote(&std::fs::canonicalize(&project).unwrap())
+    );
+    assert!(stderr.contains(&repair), "the printed grant must paste as written: {stderr}");
     assert!(out.stdout.is_empty(), "a refused grant must not start a session");
     assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &project), Ok(false));
 
@@ -432,7 +441,7 @@ fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{stderr}");
     assert!(stderr.contains("not trusted") && stderr.contains("from a terminal"), "{stderr}");
-    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
 
 #[test]
