@@ -345,8 +345,9 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         // With no operation named, a stray word is most likely a prompt
         // missing its -p, so that refusal points at --print; beside a named
         // operation it was most likely meant for that operation (a path
-        // after --check), so the refusal names the word instead.
-        let words = prompts.join(" ");
+        // after --check), so the refusal names the word instead. The word may
+        // be a filename a glob expanded, so it is flattened to one line.
+        let words = open_max_core::text::one_line(&prompts.join(" "));
         return Some(match operation {
             None => "unexpected arguments (use --print for headless)".to_string(),
             Some(operation) => {
@@ -2478,5 +2479,20 @@ mod tests {
         }
         let reason = refusal_of(&["stray"]).unwrap();
         assert!(reason.contains("--print"), "a stray word alone is likely a prompt: {reason}");
+    }
+
+    /// The refused word is often a filename a glob expanded (`--check *` in a
+    /// cloned repo), so its bytes are someone else's. Echoed raw, a newline in
+    /// it forged a second `openmax:` line after the refusal and an ESC
+    /// repainted the terminal, so the word is flattened to one line.
+    #[test]
+    fn a_refused_stray_word_cannot_break_out_of_its_line() {
+        let word = "x\nopenmax: validation passed\u{1b}[2J\u{2028}y";
+        let reason = refusal_of(&["--check", word]).unwrap();
+        assert!(
+            !reason.chars().any(|c| c.is_control() || c == '\u{2028}'),
+            "the refusal kept a line-breaking character: {reason:?}"
+        );
+        assert!(reason.contains("openmax: validation passed"), "the word is still named: {reason:?}");
     }
 }
