@@ -1233,6 +1233,8 @@ async fn compact_messages(
     if let Some(reason) = sessions::index_diagnostic(ctx.core) {
         return Err(format!("compaction refused: {reason}"));
     }
+    // The head the prune pins, and so the index its digest note takes.
+    let head = pinned_head(messages);
     let mut candidate = messages.clone();
     let (changed, digest) = if force {
         prune_transcript(&mut candidate, trigger, schema_tokens, total)
@@ -1245,7 +1247,7 @@ async fn compact_messages(
         Some(digest) => prepare_compaction_digest(ctx, &mut candidate, digest, spend).await,
         None => (Vec::new(), None),
     };
-    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, record.as_ref(), messages.len())?;
+    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, record.as_ref(), messages.len(), head)?;
     if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
         data.persisted_count = candidate.len();
     }
@@ -9460,6 +9462,9 @@ mod tests {
                 messages.push(msg("assistant", 2000));
                 messages.push(msg("user", 2000));
             }
+            // Truncation keeps the slice of old output that speaks to what
+            // stays, so the relevance signal must read the request too.
+            assert!(live_context(&messages, pinned_head(&messages), messages.len() - 6).contains("the task"));
             let (changed, digest) = enforce_budget(&mut messages, 2000, 0);
             assert!(changed && digest.is_some_and(|d| d.message_count > 0));
             assert_eq!(messages[1].content.as_deref(), Some(note.as_str()));
@@ -9625,7 +9630,7 @@ mod tests {
             cancelled: &cancelled,
         };
         let (archive, record) = prepare_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await;
-        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len()).unwrap();
+        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len(), pinned_head(&messages)).unwrap();
 
         let note = messages[2].content.as_deref().unwrap();
         assert!(note.contains(&sessions::archive_display(&core, &id)), "{note}");
@@ -9709,7 +9714,7 @@ mod tests {
             cancelled: &cancelled,
         };
         let (archive, record) = prepare_compaction_digest(&ctx, &mut messages, digest, &mut RequestSpend::new(None)).await;
-        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len()).unwrap();
+        sessions::commit_compaction(&core, &id, &messages, &archive, record.as_ref(), messages.len(), pinned_head(&messages)).unwrap();
         assert_eq!(
             messages[2].content.as_deref(),
             Some(real_note.as_str()),
@@ -10234,6 +10239,20 @@ mod tests {
             20_000,
             "a reachable target must keep the setting in force"
         );
+
+        // A note-first opening pins the request behind the note as well, so
+        // a request the target cannot contain makes the setting unreachable
+        // however much prunable history follows it.
+        let note = ChatMessage::user(execution_policy_note(ApprovalMode::Ask));
+        let mut note_first = vec![msg("system", 400), note, msg("user", prune_target(20_000) * 4)];
+        for _ in 0..6 {
+            note_first.push(msg("assistant", 400));
+        }
+        assert_eq!(
+            compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &note_first),
+            budget,
+            "the floor must count the whole pinned head"
+        );
     }
 
     /// The feasibility check reserves DIGEST_NOTE_ALLOWANCE_TOKENS for the
@@ -10686,16 +10705,32 @@ mod tests {
             assert!(sessions::save_messages(&core, &id, &data.messages, &mut persisted, true));
             sessions::save_manifest(&core, &id, &data.registry.to_manifest());
         }
+        // An earlier sitting resumed after the first exchange.
+        sessions::record_resume_point(&core, &id, 4);
 
         ensure_session_hydrated(&core, &id, &project).await.unwrap();
         size_window_to_transcript(&core, &id).await;
         let cancel = Arc::new(CancelToken::default());
         let receipt = run_compact(&core, &id, &project, &cancel).await.unwrap();
-        assert!(receipt.compacted_messages > 0, "the forced prune must drop exchanges");
+        assert!(receipt.compacted_messages > 1, "the forced prune must drop the first exchange and more");
         let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
         assert!(keeps_verbatim(&on_disk, &request), "the original request must survive: {on_disk:?}");
         assert_eq!(on_disk[1].content.as_deref(), Some(note.as_str()), "the note keeps its place");
         assert_eq!(on_disk[2].content.as_deref(), Some(request.as_str()), "the request follows it");
+        // The digest follows the request and carries the archive address. A
+        // slot left at index 2 would find the request there, skip the
+        // upgrade, and leave the addressless note in the transcript.
+        assert!(is_digest_message(&on_disk[3]), "the digest follows the request: {on_disk:?}");
+        let address = sessions::archive_display(&core, &id);
+        assert!(
+            on_disk[3].content.as_deref().is_some_and(|c| c.contains(&address)),
+            "the digest names the archive: {:?}",
+            on_disk[3]
+        );
+        // The first exchange is gone, so its boundary collapses to just after
+        // the digest. Landing on the digest would draw the replay divider
+        // above the context note instead of below it.
+        assert_eq!(sessions::meta(&core, &id).unwrap().resume_points, vec![4]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
