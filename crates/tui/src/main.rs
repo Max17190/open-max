@@ -31,8 +31,9 @@ options:
       --json             with --print, emit AgentEvent envelopes as JSONL;
                          with --check, emit findings as one JSON array
       --stdio            bidirectional JSONL session: commands on stdin
-                         ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
-                         envelopes on stdout; the custom-frontend protocol
+                         ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
+                         \"reload\"|\"cancel\"|\"quit\"}), AgentEvent envelopes
+                         on stdout; the custom-frontend protocol
       --recall <query>   search this project's past sessions, archives,
                          compaction digests, and memories; prints ranked
                          excerpts, each cited as file:line so the full record
@@ -247,6 +248,72 @@ fn approve_command(path: &std::path::Path) -> String {
     format!("openmax --approve {}", open_max_core::doctor::shell_quote(path))
 }
 
+/// Why a command line is refused before anything runs, or None.
+///
+/// `main` performs one operation, and every operation but a session exits
+/// when it is done, before the next one is considered. A second operation,
+/// or an option only another operation reads, was dropped without a word and
+/// the run exited as if that work had happened: `--check --ledger` printed
+/// history and exited 0 having validated nothing. Every combination is
+/// decided here, so a new flag cannot reach dispatch without being placed,
+/// and each refusal names both sides of the conflict.
+fn refusal(cli: &CliArgs) -> Option<String> {
+    // Each operation, named by its flag. `--check --stdio` is one operation
+    // of its own: validating a protocol stream on stdin.
+    let operations: Vec<&str> = [
+        (cli.spec.is_some(), "--spec"),
+        (cli.recall.is_some(), "--recall"),
+        (cli.ledger, "--ledger"),
+        (cli.ledger_repair, "--ledger-repair"),
+        (cli.approve.is_some(), "--approve"),
+        (cli.forget.is_some(), "--forget"),
+        (cli.check, if cli.stdio { "--check --stdio" } else { "--check" }),
+        (cli.stdio && !cli.check, "--stdio"),
+        (cli.print, "--print"),
+    ]
+    .into_iter()
+    .filter_map(|(on, flag)| on.then_some(flag))
+    .collect();
+    if let [first, second, ..] = operations.as_slice() {
+        return Some(format!("{first} and {second} are separate operations; run them one at a time"));
+    }
+    // None is the interactive session.
+    let operation = operations.first().copied();
+    // Each option and the operations that read it.
+    const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
+    let options: [(bool, &str, &[Option<&str>]); 6] = [
+        (cli.trust_project, "--trust-project", SESSIONS),
+        (cli.continue_session, "--continue", SESSIONS),
+        (cli.model.is_some(), "--model", SESSIONS),
+        (cli.provider.is_some(), "--provider", SESSIONS),
+        (cli.json, "--json", &[Some("--print"), Some("--check"), Some("--recall")]),
+        (cli.run_examples, "--run-examples", &[Some("--check")]),
+    ];
+    for (on, flag, readers) in options {
+        if !on || readers.contains(&operation) {
+            continue;
+        }
+        return Some(match operation {
+            Some(operation) => format!("{operation} does not use {flag}; run them separately"),
+            None => {
+                let readers: Vec<&str> = readers.iter().flatten().copied().collect();
+                let readers = match readers.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => format!("{}, or {last}", rest.join(", ")),
+                    _ => readers.concat(),
+                };
+                format!("{flag} requires {readers}")
+            }
+        });
+    }
+    if !cli.prompts.is_empty() && operation != Some("--print") {
+        return Some(match operation {
+            Some(operation) => format!("{operation} does not take a prompt (use --print for headless)"),
+            None => "unexpected arguments (use --print for headless)".to_string(),
+        });
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = match parse_args() {
@@ -257,57 +324,8 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    if cli.json && !cli.print && !cli.check && cli.recall.is_none() {
-        eprintln!("openmax: --json requires --print, --check, or --recall\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // --recall prints one report and exits, like --spec: swallowing another
-    // requested operation would look like success for work that never ran.
-    if cli.recall.is_some()
-        && (cli.check
-            || cli.stdio
-            || cli.print
-            || cli.run_examples
-            || cli.trust_project
-            || cli.continue_session
-            || cli.ledger
-            || cli.spec.is_some()
-            || cli.model.is_some()
-            || cli.provider.is_some()
-            || !cli.prompts.is_empty())
-    {
-        eprintln!("openmax: --recall is a standalone operation; run other options separately\n\n{HELP}");
-        std::process::exit(2);
-    }
-    if cli.stdio && (cli.print || !cli.prompts.is_empty()) {
-        eprintln!("openmax: --stdio takes commands on stdin, not flags or prompts\n\n{HELP}");
-        std::process::exit(2);
-    }
-    if cli.check && cli.trust_project {
-        eprintln!("openmax: --check and --trust-project are separate operations\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // --spec prints one contract and exits; silently swallowing any other
-    // requested option (e.g. --spec hooks --check, or --spec tools -m qwen)
-    // would look like success for work that never ran.
-    if cli.spec.is_some()
-        && (cli.check
-            || cli.stdio
-            || cli.print
-            || cli.run_examples
-            || cli.trust_project
-            || cli.continue_session
-            || cli.model.is_some()
-            || cli.provider.is_some()
-            || !cli.prompts.is_empty())
-    {
-        eprintln!("openmax: --spec is a standalone operation; run other options separately\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // Same reason: --run-examples only does anything under --check, and a run
-    // that executed no example must never exit 0 as if it had.
-    if cli.run_examples && !cli.check {
-        eprintln!("openmax: --run-examples requires --check\n\n{HELP}");
+    if let Some(reason) = refusal(&cli) {
+        eprintln!("openmax: {reason}\n\n{HELP}");
         std::process::exit(2);
     }
 
@@ -962,11 +980,6 @@ async fn main() -> std::io::Result<()> {
         )
         .await;
         std::process::exit(code);
-    }
-
-    if !cli.prompts.is_empty() {
-        eprintln!("openmax: unexpected arguments (use --print for headless)\n\n{HELP}");
-        std::process::exit(2);
     }
 
     // Signals are routed before the terminal changes, so none of them can
@@ -2268,5 +2281,109 @@ mod tests {
     fn empty_print_group_is_rejected() {
         assert!(parse_args_from(["-p", "-p", "second"]).is_err());
         assert!(parse_args_from(["-p"]).is_err());
+    }
+
+    /// Every operation a command line can select, as its args and the name a
+    /// refusal gives it. `-p` comes last in any line built from these: the
+    /// tokens after it are its prompt. An empty name is the interactive
+    /// session.
+    const OPERATIONS: [(&[&str], &str); 11] = [
+        (&[], ""),
+        (&["--spec", "tools"], "--spec"),
+        (&["--recall", "q"], "--recall"),
+        (&["--ledger"], "--ledger"),
+        (&["--ledger-repair"], "--ledger-repair"),
+        (&["--approve", "f"], "--approve"),
+        (&["--forget", "f"], "--forget"),
+        (&["--check"], "--check"),
+        (&["--check", "--stdio"], "--check --stdio"),
+        (&["--stdio"], "--stdio"),
+        (&["-p", "x"], "--print"),
+    ];
+
+    /// Whether a refusal names `flag` as a whole flag, so `--ledger` is not
+    /// satisfied by `--ledger-repair`.
+    fn names(reason: &str, flag: &str) -> bool {
+        reason.match_indices(flag).any(|(at, _)| {
+            reason[at + flag.len()..].chars().next().is_none_or(|c| matches!(c, ' ' | ';' | ','))
+        })
+    }
+
+    fn refusal_of(args: &[&str]) -> Option<String> {
+        refusal(&parse_args_from(args.iter().copied()).unwrap())
+    }
+
+    /// Every pair of operations is refused before either runs, naming both:
+    /// each one exits when it is done, so the second was dropped and the run
+    /// exited as if it had happened (`--check --ledger` validated nothing and
+    /// exited 0).
+    #[test]
+    fn every_pair_of_operations_is_refused_naming_both() {
+        // The interactive session is what runs when no operation is named,
+        // so it cannot be paired, and `--check --stdio` is already one.
+        let operations: Vec<_> = OPERATIONS
+            .iter()
+            .filter(|(_, name)| !name.is_empty() && *name != "--check --stdio")
+            .collect();
+        for (i, (a, a_name)) in operations.iter().enumerate() {
+            assert_eq!(refusal_of(a), None, "{a:?} alone is a valid command line");
+            for (b, b_name) in &operations[i + 1..] {
+                let args: Vec<&str> = a.iter().chain(b.iter()).copied().collect();
+                let reason = refusal_of(&args);
+                if (*a_name, *b_name) == ("--check", "--stdio") {
+                    assert_eq!(reason, None, "--check --stdio validates a protocol stream");
+                    continue;
+                }
+                let reason = reason.unwrap_or_else(|| panic!("{args:?} must be refused"));
+                assert!(names(&reason, a_name) && names(&reason, b_name), "{args:?}: {reason}");
+            }
+        }
+        // A third operation is refused even beside the one valid pair.
+        let reason = refusal_of(&["--check", "--stdio", "--ledger"]).unwrap();
+        assert!(names(&reason, "--check --stdio") && names(&reason, "--ledger"), "{reason}");
+    }
+
+    /// An option only another operation reads was dropped as silently as a
+    /// second operation was (`--ledger -m x` exited 0 having used no model).
+    /// Each option is placed against every operation: refused, naming both,
+    /// wherever it would be ignored, and accepted wherever it is read.
+    #[test]
+    fn an_option_the_operation_does_not_read_is_refused_naming_both() {
+        let sessions: &[&str] = &["", "--stdio", "--print"];
+        let options: [(&[&str], &str, &[&str]); 7] = [
+            (&["--trust-project"], "--trust-project", sessions),
+            (&["--continue"], "--continue", sessions),
+            (&["-m", "m"], "--model", sessions),
+            (&["--provider", "p"], "--provider", sessions),
+            (&["--json"], "--json", &["--print", "--check", "--recall"]),
+            (&["--run-examples"], "--run-examples", &["--check"]),
+            // A bare word is a prompt, which only --print reads.
+            (&["extra"], "", &["--print"]),
+        ];
+        for (option, flag, readers) in options {
+            for (operation, name) in OPERATIONS {
+                let args: Vec<&str> = option.iter().chain(operation.iter()).copied().collect();
+                let reason = refusal_of(&args);
+                if readers.contains(&name) {
+                    assert_eq!(reason, None, "{args:?} is a valid command line");
+                    continue;
+                }
+                let reason = reason.unwrap_or_else(|| panic!("{args:?} must be refused"));
+                assert!(
+                    (flag.is_empty() || names(&reason, flag))
+                        && (name.is_empty() || names(&reason, name)),
+                    "{args:?}: {reason}"
+                );
+            }
+        }
+        // The combinations the docs show still run.
+        for args in [
+            &["--check", "--json", "--run-examples"][..],
+            &["--trust-project", "--continue", "-m", "m", "--provider", "p", "-p", "--json", "x"],
+            &["--trust-project", "--continue", "--stdio"],
+            &["--recall", "q", "--json"],
+        ] {
+            assert_eq!(refusal_of(args), None, "{args:?} is a valid command line");
+        }
     }
 }
