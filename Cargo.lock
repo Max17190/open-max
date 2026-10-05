@@ -1131,7 +1131,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open-max-core"
-version = "0.2.0"
+version = "2026.10.0"
 dependencies = [
  "fs2",
  "futures-util",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "openmax"
-version = "0.2.0"
+version = "2026.10.0"
 dependencies = [
  "crossterm",
  "futures-util",
