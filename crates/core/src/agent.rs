@@ -16,7 +16,8 @@
 //!    the original request survive.
 //! 4. Per tool call: permissions, then `approval_mode`, then the human, then
 //!    execution. Assistant messages carrying `tool_calls` are persisted BEFORE
-//!    the tools run, so a cancel or crash cannot leave a call with no record.
+//!    the tools run, so a cancel or crash cannot leave a call with no record,
+//!    and a call whose result never landed is answered on resume.
 //! 5. `turn_end` hooks fire on every exit path of a STARTED turn, including
 //!    cancel and provider failure, because a session left marked running is a
 //!    spinner that never stops. A `user_prompt_submit` gate that denies or is
@@ -138,36 +139,55 @@ fn batchable_call(
     unapproved_capability(registry, data_dir, project_root, name).is_none()
 }
 
-/// Append cancel/error tool messages for any tool_call_ids on the last assistant
-/// message that still lack a following tool reply. Returns true if messages grew.
+/// The reply for a tool call whose result was never recorded: the process
+/// died, or the turn unwound, after the call was persisted and before its
+/// result was. Nothing that runs later knows whether the call ran.
+const INTERRUPTED_TOOL_CALL: &str = "This call was interrupted before its result was recorded, so whether it ran and what it changed are unknown. Check before repeating it.";
+
+/// Answer every tool call in the transcript that has no reply with a tool
+/// message carrying `note`. Returns the index of each reply inserted, in
+/// ascending order, for a caller that has to move replay boundaries with it.
 ///
-/// Assistant messages with `tool_calls` are persisted before tools run; a cancel
-/// mid-turn can leave orphan call ids that break chat-template replay on resume.
-fn complete_pending_tool_replies(messages: &mut Vec<ChatMessage>, note: &str) -> bool {
-    let Some(asst_idx) = messages.iter().rposition(|m| {
-        m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
-    }) else {
-        return false;
-    };
-    let ids: Vec<String> = messages[asst_idx]
-        .tool_calls
-        .as_ref()
-        .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
-        .unwrap_or_default();
-    // Own the answered set so we can push stubs without fighting the borrow checker.
-    let answered: BTreeSet<String> = messages[asst_idx + 1..]
-        .iter()
-        .filter(|m| m.role == "tool")
-        .filter_map(|m| m.tool_call_id.clone())
-        .collect();
-    let missing: Vec<String> = ids.into_iter().filter(|id| !answered.contains(id)).collect();
-    if missing.is_empty() {
-        return false;
+/// A provider accepts an assistant message with `tool_calls` only when a reply
+/// for each id follows it before any other message, and refuses every later
+/// request that carries one unanswered id. The call is persisted before its
+/// tool runs and the result only at iteration end, so a cancel, a truncated
+/// reply whose calls were refused, a panic, or a killed process can each
+/// leave one. A reply counts only inside the run of tool messages directly
+/// after its call, and a missing one goes at the end of that run rather than
+/// the end of the transcript: a history that kept growing past the gap is
+/// answered where the gap is.
+fn complete_pending_tool_replies(messages: &mut Vec<ChatMessage>, note: &str) -> Vec<usize> {
+    let mut inserted = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let ids: Vec<String> = match &messages[i] {
+            m if m.role == "assistant" => {
+                m.tool_calls.iter().flatten().map(|c| c.id.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        i += 1;
+        if ids.is_empty() {
+            continue;
+        }
+        let mut end = i;
+        while messages.get(end).is_some_and(|m| m.role == "tool") {
+            end += 1;
+        }
+        let missing: Vec<String> = {
+            let answered: BTreeSet<&str> =
+                messages[i..end].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+            ids.into_iter().filter(|id| !answered.contains(id.as_str())).collect()
+        };
+        for id in missing {
+            messages.insert(end, ChatMessage::tool(id, note));
+            inserted.push(end);
+            end += 1;
+        }
+        i = end;
     }
-    for id in missing {
-        messages.push(ChatMessage::tool(id, note));
-    }
-    true
+    inserted
 }
 
 /// Forward observe-only hook failures to the frontend. The turn proceeds
@@ -423,27 +443,39 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         let count = messages.len();
         // The prompt lives at index 0. A transcript without it there is from
         // a build that predates the rule (none was ever released): give the
-        // model its prompt and rewrite the file into the current shape, so
-        // every later save is a plain append. Every replay boundary moves
-        // down one with it, after the rewrite lands: a crash between the two
-        // leaves the boundaries where they were, which is where an unshifted
-        // transcript would have put them anyway, never one message too far.
+        // model its prompt, and the file is rewritten into that shape below.
         let needs_system = messages.first().map(|m| m.role.as_str()) != Some("system");
-        let (prompt_breakdown, persisted_count) = if needs_system {
+        let prompt_breakdown = if needs_system {
             let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
             messages.insert(0, ChatMessage::system(prompt));
-            let mut persisted = 0usize;
-            if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
-                let _ = sessions::shift_resume_points_for_insert(core, session_id, 0);
-            }
-            (Arc::new(breakdown), persisted)
+            Arc::new(breakdown)
         } else {
             let persisted_prompt =
                 messages.first().and_then(|m| m.content.as_deref()).unwrap_or("");
-            (
-                Arc::new(PromptBreakdown::from_persisted(persisted_prompt, &registry, project_root)),
-                count,
-            )
+            Arc::new(PromptBreakdown::from_persisted(persisted_prompt, &registry, project_root))
+        };
+        // A process that died mid-tool left a call on record with no reply,
+        // and a provider refuses every request that carries one. Answer it
+        // where it stands, including in a transcript that went on growing
+        // past it.
+        let stubs = complete_pending_tool_replies(&mut messages, INTERRUPTED_TOOL_CALL);
+        // Either insert rewrites the file into the current shape at once, so
+        // every later save is a plain append. Every replay boundary at or
+        // past an insert moves down one with it, after the rewrite lands: a
+        // crash before or between the shifts leaves a boundary short of the
+        // message it marked, which is where an unshifted transcript would
+        // have put it anyway, never one message too far.
+        let inserted: Vec<usize> = needs_system.then_some(0).into_iter().chain(stubs).collect();
+        let persisted_count = if inserted.is_empty() {
+            count
+        } else {
+            let mut persisted = 0usize;
+            if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
+                for at in inserted {
+                    let _ = sessions::shift_resume_points_for_insert(core, session_id, at as u64);
+                }
+            }
+            persisted
         };
         let reported_policy_notices = rehydrate_policy_notices(&messages);
         let reported_approval_mode = rehydrate_approval_mode(&messages);
@@ -3571,17 +3603,16 @@ async fn run_loop(
     // A turn can end with the last assistant's tool_calls persisted but never
     // answered: cancel mid-turn (siblings after an approval cancel, or cancel
     // before tools ran), or a truncated response whose calls were refused.
-    // Stub the orphans so resume templates stay well-formed.
+    // Answer them so the next request is well-formed. No other exit leaves
+    // one today; one that ever does gets the reply that claims nothing.
     let unanswered_note = if stop_reason == "cancelled" || cancelled.is_cancelled() {
-        Some("The user cancelled this turn.")
+        "The user cancelled this turn."
     } else if stop_reason == TRUNCATED {
-        Some("The provider stream ended before this call could run; it was not executed.")
+        "The provider stream ended before this call could run; it was not executed."
     } else {
-        None
+        INTERRUPTED_TOOL_CALL
     };
-    if let Some(note) = unanswered_note {
-        let _ = complete_pending_tool_replies(guard.messages(), note);
-    }
+    complete_pending_tool_replies(guard.messages(), unanswered_note);
 
     save_messages(core, session_id, guard.messages(), false).await;
     // Restore in-memory transcript under the async lock (Drop is try_lock only).
@@ -3694,9 +3725,15 @@ impl MessageGuard {
 
 impl Drop for MessageGuard {
     fn drop(&mut self) {
-        let Some(messages) = self.messages.take() else {
+        let Some(mut messages) = self.messages.take() else {
             return;
         };
+        // No commit means an unwind (a panic, or the turn's task dropped),
+        // possibly mid-tool: the call is on record and its reply is not. The
+        // session stays live in this process, so hydration never sees this
+        // transcript again; what goes back here is what the next request
+        // sends, and an unanswered call would make the provider refuse it.
+        complete_pending_tool_replies(&mut messages, INTERRUPTED_TOOL_CALL);
         match self.core.sessions.try_lock() {
             Ok(mut map) => {
                 restore_if_current(&mut map, &self.session_id, self.take_seq, messages);
@@ -5015,14 +5052,14 @@ mod tests {
             ChatMessage::tool("c1", "ok"),
         ];
         let note = "The user cancelled this turn.";
-        assert!(complete_pending_tool_replies(&mut messages, note));
+        assert_eq!(complete_pending_tool_replies(&mut messages, note), vec![4, 5]);
         assert_eq!(messages.len(), 6);
         assert_eq!(messages[4].tool_call_id.as_deref(), Some("c2"));
         assert_eq!(messages[4].content.as_deref(), Some(note));
         assert_eq!(messages[5].tool_call_id.as_deref(), Some("c3"));
         assert_eq!(messages[5].content.as_deref(), Some(note));
         // Idempotent once every id has a reply.
-        assert!(!complete_pending_tool_replies(&mut messages, note));
+        assert!(complete_pending_tool_replies(&mut messages, note).is_empty());
     }
 
     #[test]
@@ -5032,7 +5069,7 @@ mod tests {
             ChatMessage::system("sys"),
             ChatMessage::assistant(Some("hi".into()), None),
         ];
-        assert!(!complete_pending_tool_replies(&mut plain, note));
+        assert!(complete_pending_tool_replies(&mut plain, note).is_empty());
 
         let mut done = vec![
             ChatMessage::assistant(
@@ -5048,7 +5085,7 @@ mod tests {
             ),
             ChatMessage::tool("only", "files"),
         ];
-        assert!(!complete_pending_tool_replies(&mut done, note));
+        assert!(complete_pending_tool_replies(&mut done, note).is_empty());
     }
 
     /// Built-in tools never reach the ledger inside `batchable_call`, so
@@ -5352,6 +5389,52 @@ mod tests {
         guard_b.commit().await;
         let map = core.sessions.lock().await;
         assert_eq!(map.get(id).unwrap().messages.len(), 1);
+        drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A panic mid-tool unwinds through the guard with the call on record and
+    /// its reply never written. The session stays live in this process, so
+    /// hydration never runs again to repair it: the transcript the guard puts
+    /// back is the one the next request sends, and it must already answer
+    /// every call it carries.
+    #[tokio::test]
+    async fn message_guard_answers_calls_a_panic_left_unanswered() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = "guard-unanswered";
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        {
+            let data = build_session_data(&core, id, &project).unwrap();
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+        let (taken, seq) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            data.messages.push(ChatMessage::user("read both"));
+            take_messages(data)
+        };
+        let mut guard = MessageGuard::new(core.clone(), id, taken, seq);
+        let calls = vec![
+            ToolCall { id: "c1".into(), ..tool_call("read_file", r#"{"path":"a"}"#) },
+            ToolCall { id: "c2".into(), ..tool_call("read_file", r#"{"path":"b"}"#) },
+        ];
+        guard.messages().push(ChatMessage::assistant(None, Some(calls)));
+        guard.messages().push(ChatMessage::tool("c1", "alpha"));
+        // Unwind without a commit, as a panic in the second call would.
+        drop(guard);
+
+        let map = core.sessions.lock().await;
+        let restored = &map.get(id).unwrap().messages;
+        let tail: Vec<(&str, Option<&str>)> = restored[restored.len() - 2..]
+            .iter()
+            .map(|m| (m.role.as_str(), m.tool_call_id.as_deref()))
+            .collect();
+        assert_eq!(tail, vec![("tool", Some("c1")), ("tool", Some("c2"))], "{restored:?}");
         drop(map);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -9398,6 +9481,150 @@ mod tests {
             vec![3],
             "and shifts nothing"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The assistant message carrying tool calls is on disk before its tools
+    /// run, and their results land at the end of the iteration, so a process
+    /// killed in between leaves `[.., assistant(tool_calls)]`. Resumed as is,
+    /// the next request is `[.., assistant(tool_calls), user]`, which a strict
+    /// server refuses with a 400 on that turn and every turn after it. The
+    /// resumed turn must send the call answered before the new prompt.
+    #[tokio::test]
+    async fn a_resumed_turn_answers_a_tool_call_the_last_process_never_did() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let data = build_session_data(&core, &id, &project).unwrap();
+            let mut messages = data.messages;
+            messages.push(ChatMessage::user("what is in a.txt"));
+            messages.push(ChatMessage::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "c1".into(),
+                    ..tool_call("read_file", r#"{"path":"a.txt"}"#)
+                }]),
+            ));
+            let mut persisted = 0usize;
+            assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+        }
+
+        let (base_url, bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+        start_turn(core.clone(), id.clone(), project.clone(), "go on".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1);
+        let body: Value = serde_json::from_str(&bodies[0]).unwrap();
+        let sent = body["messages"].as_array().unwrap();
+        let call = sent
+            .iter()
+            .position(|m| m["role"] == "assistant" && m["tool_calls"][0]["id"] == "c1")
+            .expect("the interrupted call is still in the history");
+        let prompt = sent
+            .iter()
+            .position(|m| m["role"] == "user" && m["content"] == "go on")
+            .expect("the new prompt went out");
+        assert_eq!(
+            (sent[call + 1]["role"].as_str(), sent[call + 1]["tool_call_id"].as_str()),
+            (Some("tool"), Some("c1")),
+            "the call must be answered right after it: {}",
+            bodies[0]
+        );
+        assert!(call + 1 < prompt, "and before the new prompt: {}", bodies[0]);
+        let reply = sent[call + 1]["content"].as_str().unwrap_or("");
+        assert!(reply.contains("interrupted"), "the reply says what happened: {reply}");
+
+        // The answer is a session record, not a per-request patch.
+        let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
+        let replies: Vec<usize> = on_disk
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "tool" && m.tool_call_id.as_deref() == Some("c1"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(replies, vec![3], "exactly one reply, right after the call");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A transcript the unanswered call already broke went on growing: every
+    /// later prompt was saved behind it, and every request was refused. On
+    /// hydration the reply goes right after the call, not at the end, the
+    /// file is rewritten in that shape at once, and the replay boundaries
+    /// behind the insert move down with the messages they marked.
+    #[test]
+    fn hydration_answers_an_unanswered_call_in_place() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let call = |id: &str, path: &str| ToolCall {
+            id: id.into(),
+            ..tool_call("read_file", &format!(r#"{{"path":"{path}"}}"#))
+        };
+        let mut persisted = 0usize;
+        assert!(sessions::save_messages(
+            &core,
+            id,
+            &[
+                ChatMessage::system("sys"),
+                ChatMessage::user("read both"),
+                ChatMessage::assistant(None, Some(vec![call("c1", "a"), call("c2", "b")])),
+                ChatMessage::tool("c1", "alpha"),
+                ChatMessage::user("are you there?"),
+                ChatMessage::user("hello?"),
+            ],
+            &mut persisted,
+            false,
+        ));
+        sessions::record_resume_point(&core, id, 2);
+        sessions::record_resume_point(&core, id, 4);
+
+        let data = build_session_data(&core, id, Path::new(".")).unwrap();
+        let shape: Vec<(&str, Option<&str>)> = data
+            .messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.tool_call_id.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("system", None),
+                ("user", None),
+                ("assistant", None),
+                ("tool", Some("c1")),
+                ("tool", Some("c2")),
+                ("user", None),
+                ("user", None),
+            ]
+        );
+        assert_eq!(data.messages[3].content.as_deref(), Some("alpha"), "the real result is kept");
+        assert_eq!(data.persisted_count, 7, "the rewrite lands during hydration");
+        assert_eq!(sessions::load_messages(&core, id).unwrap().unwrap().len(), 7);
+        assert_eq!(
+            sessions::meta(&core, id).unwrap().resume_points,
+            vec![2, 5],
+            "a boundary before the insert stays, one at or after it follows its message"
+        );
+        let again = build_session_data(&core, id, Path::new(".")).unwrap();
+        assert_eq!(again.messages.len(), 7, "a second hydration inserts nothing");
+        assert_eq!(sessions::meta(&core, id).unwrap().resume_points, vec![2, 5]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
