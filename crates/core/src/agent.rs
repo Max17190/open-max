@@ -1382,7 +1382,11 @@ pub async fn reload_session(
             .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
     let files = std::mem::take(&mut snapshot.files);
-    let registry = Registry::from_snapshot(snapshot);
+    // Activation reads the memory store, so it stays off the runtime thread
+    // like the capture above.
+    let registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot))
+        .await
+        .map_err(|e| format!("reload discovery failed: {e}"))?;
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
 
     ensure_session_hydrated(core, session_id, project_root).await?;
@@ -5528,6 +5532,74 @@ mod tests {
         drop(map);
         let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
         assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Activating a generation reads every memory file and the access log,
+    /// which grows with the memory store. /reload must do that read on a
+    /// blocking thread: on the runtime thread it stalls every other task
+    /// there, frontend work included, until the scan finishes. A FIFO in the
+    /// memory directory holds the scan open; while it is held, a task on this
+    /// single-threaded runtime must still answer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_reads_memory_off_the_runtime_thread() {
+        use crate::state::Core;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert(id.clone(), data);
+        }
+        let fifo = project.join(crate::memory::MEMORY_DIR).join("held.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        let (ping_tx, ping_rx) = oneshot::channel::<()>();
+        let (pong_tx, pong_rx) = std::sync::mpsc::channel::<()>();
+        // None: the scan never opened the FIFO. Some(answered): whether the
+        // runtime ran another task while the scan was held open.
+        let holder = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let held = loop {
+                // A non-blocking writer open succeeds only once a reader has it.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                {
+                    Ok(f) => break f,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(_) => return None,
+                }
+            };
+            let _ = ping_tx.send(());
+            let answered = pong_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            // Closing without a write is EOF for the reader and leaves the
+            // FIFO's mtime alone, so the scan finishes in one read.
+            drop(held);
+            Some(answered)
+        });
+
+        let (reloaded, ()) = tokio::join!(reload_session(&core, &id, &project), async {
+            if ping_rx.await.is_ok() {
+                let _ = pong_tx.send(());
+            }
+        });
+        reloaded.unwrap();
+        let answered = holder.join().unwrap().expect("the reload scanned the memory directory");
+        assert!(answered, "the memory scan behind /reload stalled the runtime thread");
 
         let _ = std::fs::remove_dir_all(dir);
     }
