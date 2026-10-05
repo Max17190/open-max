@@ -259,11 +259,12 @@ name collision.
 `SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
 keys are read, and only at the block's top level (no leading indentation), so
 an indented key inside a nested map like `metadata:` never overrides them:
-- `name:` (required): the skill's index name, a bare or double-quoted value on
-  one line.
+- `name:` (required): the skill's index name, a bare, single-quoted, or
+  double-quoted value on one line.
 - `description:` (required in practice): one line saying what the skill does
-  and when to use it; capped at 200 chars. Bare or double-quoted, or a `>`/`|`
-  block scalar folded to one line (the spelling many packaged skills ship).
+  and when to use it; capped at 200 chars. Bare, single-quoted, or
+  double-quoted, or a `>`/`|` block scalar folded to one line (the spelling
+  many packaged skills ship).
   This is the only text that enters the prompt (~15 tokens per skill), so it
   must carry the "when".
 
