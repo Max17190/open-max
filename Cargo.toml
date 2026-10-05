@@ -37,16 +37,18 @@ libc = "0.2"
 # no Windows implementation, so no Windows target or PowerShell installer.
 #
 # `.github/workflows/release.yml` is generated from this config by
-# `dist generate`, with ONE hand-edit: the "Install dist" step fetches the
-# upstream installer, checks it against a pinned sha256, and only then runs it,
-# because that job holds `contents: write` and its `dist` binary is what
-# publishes the release.
+# `dist generate`, with hand-edited steps marked `LOCAL EDIT`. The "Install
+# dist" steps fetch the upstream installer, check it against a pinned sha256,
+# and only then run it, because those jobs hold `contents: write` and build or
+# publish the release. The "Run the npm launcher under node or bun" step in
+# `publish-npm` rewrites the npm package's launcher so it runs without Node.js
+# when bun is on PATH.
 #
-# `allow-dirty = ["ci"]` is what lets that edit survive: without it `dist plan`
+# `allow-dirty = ["ci"]` is what lets those edits survive: without it `dist plan`
 # fails the job because the checked-in workflow no longer matches what it would
 # generate. The cost is that dist will no longer update the workflow for us, so
-# bumping cargo-dist-version below means regenerating by hand, re-applying the
-# verification step, and re-pinning its hash in the same commit.
+# bumping cargo-dist-version below means regenerating by hand, re-applying every
+# `LOCAL EDIT` step, and re-pinning the installer hash in the same commit.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
