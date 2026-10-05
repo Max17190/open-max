@@ -544,6 +544,8 @@ thread_local! {
     static FAIL_COMPACTION_TRANSCRIPT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Every path this thread synced to the device, in order.
     static SYNCED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The OS error every directory sync on this thread fails with, if any.
+    static FAIL_DIR_SYNC: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Commit archive, digest record, replay boundaries, and transcript under one
@@ -676,8 +678,15 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
 /// a barrier sync gives the ordering without that wait. A file system that
 /// does not take one gets a plain sync instead.
 fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    sync_device(file, path).map_err(|e| cannot_sync(e, path))
+}
+
+/// `sync` with the OS error as it came, so `sync_dir` can read its code.
+fn sync_device(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
+    #[cfg(not(test))]
+    let _ = path;
     #[cfg(target_vendor = "apple")]
     let result = {
         use std::os::fd::AsRawFd;
@@ -689,19 +698,43 @@ fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     };
     #[cfg(not(target_vendor = "apple"))]
     let result = file.sync_all();
-    result.map_err(|e| std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", path.display())))
+    result
+}
+
+fn cannot_sync(e: std::io::Error, path: &Path) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", path.display()))
 }
 
 /// `sync` a directory, which holds the names of its files: a new name or a
 /// rename reaches the disk through it, not through the file's own sync. Unix
-/// only, since elsewhere a directory cannot be opened as a file to sync.
+/// only, since elsewhere a directory cannot be opened as a file to sync. A
+/// file system that cannot sync a directory at all (`dir_sync_unsupported`)
+/// counts as synced: there the sync never succeeds, so failing on it would
+/// fail every ordered append, and so every compaction, for good.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     if !cfg!(unix) {
         return Ok(());
     }
-    let file = std::fs::File::open(dir)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", dir.display())))?;
-    sync(&file, dir)
+    let file = std::fs::File::open(dir).map_err(|e| cannot_sync(e, dir))?;
+    let synced = sync_device(&file, dir);
+    #[cfg(test)]
+    let synced = FAIL_DIR_SYNC.with(|fail| fail.get()).map_or(synced, |code| Err(std::io::Error::from_raw_os_error(code)));
+    match synced {
+        Err(e) if !dir_sync_unsupported(&e) => Err(cannot_sync(e, dir)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a directory sync failed only because the file system does not
+/// sync directories: some reject it with EINVAL or EBADF (no sync operation
+/// for a directory), others with ENOTSUP. Any other error, such as EIO, is a
+/// real failure to write.
+fn dir_sync_unsupported(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let unsupported = [libc::EINVAL, libc::EBADF, libc::ENOTSUP, libc::EOPNOTSUPP];
+    #[cfg(not(unix))]
+    let unsupported: [i32; 0] = [];
+    e.raw_os_error().is_some_and(|code| unsupported.contains(&code))
 }
 
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
@@ -740,7 +773,8 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage], ordered: bool) -> Resu
 /// `ordered` syncs the bytes and then the directory (`sync`), so they and the
 /// file's name, which the file's own sync does not cover when this append
 /// created it, reach the disk ahead of any later write. A failed sync fails
-/// the append, before anything that relies on it is written. A compaction
+/// the append, before anything that relies on it is written, except a
+/// directory sync the file system does not support (`sync_dir`). A compaction
 /// needs that for what it archives, because the transcript rewrite after it
 /// deletes the same messages. A transcript append does not: a power cut
 /// that loses its tail costs the newest messages, not the session, since the
@@ -1929,6 +1963,38 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(archive.map(|a| &synced[a + 1]), Some(&sessions_dir(&core)), "{synced:?}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Some file systems cannot sync a directory at all: every directory sync
+    /// fails with EINVAL, EBADF or ENOTSUP. Failing a compaction on that can
+    /// never succeed later, so every turn past the compaction trigger would
+    /// end in an error and the session could not go on. Those errors count
+    /// as done; a real I/O error still fails the compaction before the
+    /// transcript is touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_system_that_cannot_sync_directories_still_compacts() {
+        let dir = std::env::temp_dir().join(format!("openmax-dir-sync-unsupported-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "project".into()).unwrap().id;
+        let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
+        let transcript = |core: &Core| serde_json::to_value(load_messages(core, &id).unwrap().unwrap()).unwrap();
+        let commit_with = |code: i32| {
+            assert!(save_messages(&core, &id, &original, &mut 0, true));
+            FAIL_DIR_SYNC.with(|fail| fail.set(Some(code)));
+            let committed = commit_compaction(&core, &id, &candidate, &original[1..], None, original.len(), 2);
+            FAIL_DIR_SYNC.with(|fail| fail.set(None));
+            committed
+        };
+        for code in [libc::EINVAL, libc::EBADF, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert_eq!(commit_with(code), Ok(()), "errno {code}");
+            assert_eq!(transcript(&core), serde_json::to_value(&candidate).unwrap());
+        }
+        let error = commit_with(libc::EIO).unwrap_err();
+        assert!(error.contains("cannot sync"), "{error}");
+        assert_eq!(transcript(&core), serde_json::to_value(&original).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
