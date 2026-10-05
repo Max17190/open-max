@@ -2923,7 +2923,15 @@ mod tests {
         data
     }
 
+    /// Every example run publishes the process-wide RUN_EXAMPLES_STACK and
+    /// restores the value it read on entry. Two concurrent runs interleave
+    /// those writes: the later one restores the earlier one's root after it
+    /// already finished, and that test's next run refuses as recursive. One
+    /// run at a time keeps the variable exact.
+    static EXAMPLE_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn examples(root: &Path, data: &Path) -> Result<Vec<ExampleVerdict>, String> {
+        let _serial = EXAMPLE_RUNS.lock().await;
         run_examples_at(root, data, |_| {}).await
     }
 
@@ -2950,7 +2958,7 @@ mod tests {
         for name in ["create.toml", "observe.toml", "permissions.toml"] {
             assert!(matches!(find(&findings, name).status, Status::Ok(_)), "{findings:?}");
         }
-        let result = run_examples_at(&root, &data, |_| {}).await.unwrap();
+        let result = examples(&root, &data).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].result.is_ok(), "{:?}", result[0]);
         assert!(!result[0].sandboxed);
@@ -3430,6 +3438,7 @@ mod tests {
         let data = approved_data_dir(&root, &[&tool]);
         let stack = std::fs::canonicalize(&root).unwrap().display().to_string();
 
+        let _serial = EXAMPLE_RUNS.lock().await;
         let refusal = run_examples_within(&root, &data, &stack, |_| {})
             .await
             .unwrap_err();
