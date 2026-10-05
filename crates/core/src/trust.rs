@@ -108,13 +108,25 @@ pub(crate) fn approval_modes(data_dir: &Path) -> Result<BTreeMap<PathBuf, Approv
     }).collect())
 }
 
+/// The choice governing `canonical`: its own saved entry, else the nearest
+/// enclosing root's. Trust already covers a root's subtree, so a child started
+/// in a worktree or subdirectory (the delegation case) must run under the
+/// same mode, not fall back to the default where a headless child declines
+/// every approval. A nested root's explicit choice still wins. Ancestors are
+/// component-wise, so /a/bc never takes the choice saved for /a/b. `modes`
+/// must come from [`approval_modes`], which keeps trusted roots only.
+pub(crate) fn nearest_approval_mode(modes: &BTreeMap<PathBuf, ApprovalMode>, canonical: &Path) -> Option<ApprovalMode> {
+    canonical.ancestors().find_map(|root| modes.get(root).copied())
+}
+
 /// Resolve a fresh process's mode, also used by the diagnostic CLI.
 pub(crate) fn approval_mode(data_dir: &Path, project_root: &Path, default: ApprovalMode) -> Result<ApprovalMode, String> {
     let canonical = canonical_project(project_root)?;
-    Ok(approval_modes(data_dir)?.get(&canonical).copied().unwrap_or(default))
+    Ok(nearest_approval_mode(&approval_modes(data_dir)?, &canonical).unwrap_or(default))
 }
 
-/// Save an explicit choice for one canonical project, without changing the
+/// Save an explicit choice for one canonical project, which its
+/// subdirectories without a choice of their own follow, without changing the
 /// default for other projects or granting any content approvals.
 pub(crate) fn set_approval_mode(
     data_dir: &Path,
@@ -223,6 +235,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(project);
     }
 
+    /// A child started in a subdirectory or worktree of a trusted project
+    /// (the delegation case) must run under that project's saved mode: in
+    /// ask, a headless child declines every approval and delegated work
+    /// fails on its first write. A nested root's own choice still wins, and
+    /// a mode saved on a root that is not trusted never reaches its subtree.
+    #[test]
+    fn approval_mode_comes_from_the_nearest_trusted_ancestor() {
+        let data = temp_dir("inherit-data");
+        let root = temp_dir("inherit-root");
+        let sub = root.join("sub");
+        let deep = sub.join("dir");
+        std::fs::create_dir_all(&deep).unwrap();
+        let sibling = root
+            .parent()
+            .unwrap()
+            .join(format!("{}-evil", root.file_name().unwrap().to_str().unwrap()));
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        trust_project(&data, &root).unwrap();
+        set_approval_mode(&data, &root, ApprovalMode::Auto).unwrap();
+        assert_eq!(approval_mode(&data, &deep, ApprovalMode::Ask).unwrap(), ApprovalMode::Auto, "inherits the project's choice");
+        assert_eq!(approval_mode(&data, &sibling, ApprovalMode::Ask).unwrap(), ApprovalMode::Ask, "path-prefix sibling must not ride along");
+
+        set_approval_mode(&data, &sub, ApprovalMode::Ask).unwrap();
+        assert_eq!(approval_mode(&data, &deep, ApprovalMode::Readonly).unwrap(), ApprovalMode::Ask, "the nearest saved choice wins");
+        assert_eq!(approval_mode(&data, &root, ApprovalMode::Readonly).unwrap(), ApprovalMode::Auto, "a nested choice never flows up");
+
+        // Trust only the inner root; the outer root's saved mode is stale.
+        let untrusted = temp_dir("inherit-untrusted-data");
+        let outer = std::fs::canonicalize(&root).unwrap();
+        let inner = std::fs::canonicalize(&sub).unwrap();
+        update(&untrusted, |file| {
+            file.projects.push(inner);
+            file.approval_modes.insert(outer, ApprovalMode::Auto);
+            Ok(())
+        }).unwrap();
+        assert_eq!(approval_mode(&untrusted, &deep, ApprovalMode::Ask).unwrap(), ApprovalMode::Ask, "an untrusted root's mode is ignored");
+
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(untrusted);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(sibling);
+    }
+
     #[test]
     fn concurrent_mode_selections_preserve_both_projects() {
         let data = temp_dir("modes-data");
@@ -240,7 +296,7 @@ mod tests {
         assert_eq!(approval_mode(&data, &b, ApprovalMode::Ask).unwrap(), ApprovalMode::Readonly);
         let child = a.join("nested");
         std::fs::create_dir(&child).unwrap();
-        assert_eq!(approval_mode(&data, &child, ApprovalMode::Ask).unwrap(), ApprovalMode::Ask);
+        assert_eq!(approval_mode(&data, &child, ApprovalMode::Ask).unwrap(), ApprovalMode::Auto, "a subdirectory runs under its project's choice");
         #[cfg(unix)] {
             let alias = data.join("alias");
             std::os::unix::fs::symlink(&a, &alias).unwrap();

@@ -76,7 +76,13 @@ approval card's **Auto for project** choice. Every selector saves the same
 choice in `~/.openmax/trust.json` for this exact canonical project path.
 It survives new sessions and restarts, including headless and stdio runs.
 Other projects keep their own choice or the `settings.json` default, which
-is `ask`. Symlink aliases share the choice; nested projects have their own.
+is `ask`. Symlink aliases share the choice. A subdirectory of the project,
+including a worktree placed under it (such as `.worktrees/`) where a
+delegated `openmax -p` child starts, follows the nearest enclosing project's
+choice unless it has a saved choice of its own. Inheritance follows the path,
+not the Git repository: a worktree outside the root, such as one made with
+`git worktree add ../feature`, gets neither the project's trust nor its
+choice and needs its own.
 
 - `auto` runs authorized work without confirmation, including newly created
   or repaired tools, hooks, and project permission `allow` rules. It ignores
