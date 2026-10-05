@@ -608,6 +608,13 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     } else {
         (old_string.to_string(), new_string.to_string())
     };
+    // Strings that differ only in line endings are the same edit once read
+    // as CRLF; writing it would report a change that never reached the file.
+    if old_string == new_string {
+        return ToolOutcome::err(format!(
+            "old_string and new_string differ only in line endings; {rel} uses CRLF throughout and edit_file keeps it, so use write_file to change line endings"
+        ));
+    }
 
     let new = if old.contains(&old_string) {
         let count = old.matches(&old_string).count();
@@ -1217,6 +1224,19 @@ mod tests {
         }));
         assert!(out.ok, "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("dup.txt")).unwrap(), "z\r\nw\r\nz\r\nw\r\n");
+
+        // Strings that differ only in line endings become the same edit once
+        // read as CRLF, so they are refused like identical strings instead of
+        // reporting a line-ending change that was never written.
+        std::fs::write(root.join("ends.txt"), "a\r\nb\r\n").unwrap();
+        for (old_string, new_string) in [("a\r\nb", "a\nb"), ("a\nb", "a\r\nb")] {
+            let out = edit_file(&root, &json!({
+                "path": "ends.txt", "old_string": old_string, "new_string": new_string
+            }));
+            assert!(!out.ok, "a line-ending-only edit must not report success: {}", out.output);
+            assert!(out.output.contains("differ only in line endings"), "{}", out.output);
+            assert_eq!(std::fs::read(root.join("ends.txt")).unwrap(), b"a\r\nb\r\n");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
