@@ -741,9 +741,55 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<
     ensure_owned(core, id)?;
     with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            for p in &mut m.resume_points {
-                if *p >= at {
-                    *p = p.saturating_add(1);
+            shift_points_for_insert(&mut m.resume_points, at);
+        }
+    })
+}
+
+fn shift_points_for_insert(points: &mut [u64], at: u64) {
+    for p in points {
+        if *p >= at {
+            *p = p.saturating_add(1);
+        }
+    }
+}
+
+/// One message was removed from index `at`, so the transcript shrinks by
+/// exactly that message and every boundary after it moves down one: the
+/// mirror of [`shift_resume_points_for_insert`]. A boundary on the removed
+/// message stays put and now marks the message that followed it, so two
+/// boundaries can meet there and become one. Hydration removes a tool reply
+/// that was saved after prompts instead of after its call.
+fn shift_points_for_remove(points: &mut Vec<u64>, at: u64) {
+    for p in points.iter_mut() {
+        if *p > at {
+            *p -= 1;
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+}
+
+/// One message inserted into or removed from a transcript, at an index
+/// counted after the edits before it: what a replay boundary has to follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeEdit {
+    Insert(u64),
+    Remove(u64),
+}
+
+/// Move every replay boundary through `edits`, in the order they were made,
+/// in one index write: either every edit lands or none does, so a caller
+/// whose write failed keeps the edits and retries them whole, and no
+/// boundary moves twice.
+pub fn apply_resume_edits(core: &Core, id: &str, edits: &[ResumeEdit]) -> Result<(), String> {
+    ensure_owned(core, id)?;
+    with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            for edit in edits {
+                match *edit {
+                    ResumeEdit::Insert(at) => shift_points_for_insert(&mut m.resume_points, at),
+                    ResumeEdit::Remove(at) => shift_points_for_remove(&mut m.resume_points, at),
                 }
             }
         }
@@ -910,6 +956,12 @@ fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>
     }
     Ok(Some(parsed))
 }
+
+/// A `persisted` count past the end of any transcript, for a file known to
+/// differ from memory: [`save_messages`] rewrites whenever `persisted`
+/// exceeds what it is given, so the next save replaces the file whole
+/// instead of appending to it or refusing to.
+pub const PERSISTED_STALE: usize = usize::MAX;
 
 /// Persist messages. Appends only new tail lines when possible; rewrites the
 /// whole file after budget trimming or message drops.
