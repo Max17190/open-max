@@ -415,11 +415,26 @@ pub fn index_diagnostic(core: &Core) -> Option<String> {
     load_index_checked(core).err()
 }
 
+/// A frontend's refusal to start, continue, or list sessions, pointing at
+/// `--check` when the refusal is the index's damage. Only frontends add the
+/// pointer, never the shared reason: `--check` gives the repair with the
+/// step that makes it safe (close every openmax), while a bare path acted
+/// on under a running session turns that session's later saves into silent
+/// no-ops. Any other refusal (a lock or write failure) passes through as is.
+pub fn refusal_with_repair(core: &Core, reason: String) -> String {
+    match read_index(core) {
+        IndexRead::Damaged(damage) if damage == reason => {
+            format!("{reason}; run openmax --check for the repair")
+        }
+        _ => reason,
+    }
+}
+
 /// The index under `data_dir` and the reason, when it exists but cannot be
 /// read. For `--check`, which validates without a Core, so this takes no
 /// lock and creates no directory; the index is only ever replaced by an
 /// atomic rename, so an unlocked read sees one whole version or the other.
-pub fn index_damage(data_dir: &Path) -> Option<(PathBuf, String)> {
+pub(crate) fn index_damage(data_dir: &Path) -> Option<(PathBuf, String)> {
     let path = data_dir.join("sessions").join("index.json");
     match read_index_at(&path) {
         IndexRead::Damaged(reason) => Some((path, reason)),
@@ -1797,7 +1812,9 @@ mod tests {
     /// previous session over a file full of them. Every refusal names the
     /// file, and `--check` sees the same damage without a Core. The shared
     /// reason carries no repair: it also reaches live sessions, where moving
-    /// the index aside turns every later save into a silent no-op.
+    /// the index aside turns every later save into a silent no-op. A
+    /// frontend's refusal points at `--check`, and only for the damage: a
+    /// lock or write failure is not something `--check` repairs.
     #[test]
     fn a_damaged_index_is_named_to_readers_not_reported_as_empty() {
         let dir = std::env::temp_dir().join(format!("openmax-damaged-read-{}", uuid::Uuid::new_v4()));
@@ -1813,8 +1830,13 @@ mod tests {
             index_diagnostic(&core).unwrap(),
         ];
         for reason in refusals {
-            assert!(reason.contains(&path) && !reason.contains("move it aside"), "{reason}");
+            assert!(reason.contains(&path), "{reason}");
+            assert!(!reason.contains("move it aside") && !reason.contains("--check"), "{reason}");
+            let refusal = refusal_with_repair(&core, reason.clone());
+            assert_eq!(refusal, format!("{reason}; run openmax --check for the repair"));
         }
+        let unrelated = format!("cannot lock {path}: busy");
+        assert_eq!(refusal_with_repair(&core, unrelated.clone()), unrelated);
         assert_eq!(index_damage(&dir).map(|(at, _)| at), Some(index_path(&core)));
         assert_eq!(std::fs::read_to_string(index_path(&core)).unwrap(), "[{");
 

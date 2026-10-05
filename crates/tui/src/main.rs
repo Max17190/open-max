@@ -61,8 +61,8 @@ options:
                          confined to a scratch dir); a passing probe
                          approves nothing
       --check            validate extension files (tools, skills, templates,
-                         hooks, permissions, providers, memory) and exit;
-                         nonzero if any is broken.
+                         hooks, permissions, providers, memory) and the
+                         session index, then exit; nonzero if any is broken.
                          with --stdio, validate a JSONL protocol stream on
                          stdin against the openmax-stdio contract instead
       --spec <surface>   print the authoring contract for one surface and

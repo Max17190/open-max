@@ -40,7 +40,7 @@ pub async fn run(
                 return 2;
             }
             Err(e) => {
-                eprintln!("openmax: {}", one_line(&e));
+                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(&core, e)));
                 return 1;
             }
         }
@@ -48,7 +48,7 @@ pub async fn run(
         match sessions::create(&core, project_key) {
             Ok(meta) => meta.id,
             Err(e) => {
-                eprintln!("openmax: failed to create session: {e}");
+                eprintln!("openmax: failed to create session: {}", sessions::refusal_with_repair(&core, e));
                 return 1;
             }
         }

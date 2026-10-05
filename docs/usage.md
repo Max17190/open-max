@@ -17,7 +17,7 @@ openmax -c
 openmax --provider ollama --model qwen2.5-coder:7b
 openmax -p "summarize the top level layout of this repo"
 openmax -p --json "list public modules in crates/core"
-openmax --check                       # validate extension files
+openmax --check                       # validate extension files and the session index
 openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
 openmax --stdio                       # full session over JSONL pipes
@@ -58,6 +58,11 @@ record it cut off never became a message, so the session resumes from the
 last complete record and the next save removes the fragment. A session whose
 first save it interrupted has no transcript yet, and like any session that
 has never saved messages, starts fresh.
+
+A damaged or unreadable session index (`~/.openmax/sessions/index.json`)
+refuses new sessions and continuation with its path, and the app keeps
+running. Open Max never replaces it with an empty index. Run `openmax --check`
+for the repair: close every openmax, then move the file aside.
 
 ## Keys
 

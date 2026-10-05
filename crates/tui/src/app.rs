@@ -754,7 +754,7 @@ impl App {
                     self.replay(&meta.id);
                 }
                 Ok(None) => self.note("no previous session here; starting fresh"),
-                Err(e) => self.error(&e),
+                Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
             }
         }
     }
@@ -2253,7 +2253,7 @@ impl App {
                 let meta = match sessions::create(&self.core, self.project.display().to_string()) {
                     Ok(meta) => meta,
                     Err(e) => {
-                        self.error(&e);
+                        self.error(&sessions::refusal_with_repair(&self.core, e));
                         return Ok(());
                     }
                 };
@@ -2478,7 +2478,7 @@ impl App {
                     self.completion = None;
                     self.mode = Mode::Sessions;
                 }
-                Err(e) => self.error(&e),
+                Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
             },
             "reload" => match &self.session_id {
                 None => self.note("no session yet; a new session always freezes the current config"),
@@ -5533,11 +5533,16 @@ mod tests {
         index
     }
 
+    /// Where a refusal over a damaged index sends the user: `--check` gives
+    /// the repair with the step that makes it safe.
+    const REPAIR_POINTER: &str = "run openmax --check for the repair";
+
     /// A damaged session index refuses the session a first prompt creates.
     /// Returned as an I/O error, that refusal unwound the event loop and
     /// closed the app on the first prompt in every project. It belongs in
-    /// the transcript, naming the file, with the app still running and the
-    /// damaged bytes left for the user to recover.
+    /// the transcript, naming the file and pointing at `--check` for the
+    /// repair, with the app still running and the damaged bytes left for
+    /// the user to recover.
     #[tokio::test]
     async fn a_damaged_session_index_is_reported_and_the_app_keeps_running() {
         let (mut app, dir) = app_fixture();
@@ -5553,6 +5558,7 @@ mod tests {
             shown.contains(&index.display().to_string()),
             "the error must name the damaged index: {shown}"
         );
+        assert!(shown.contains(REPAIR_POINTER), "the error must point at the repair: {shown}");
         assert!(!app.should_quit && !app.running && app.session_id.is_none());
         assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
         fs::remove_dir_all(dir).unwrap();
@@ -5560,7 +5566,8 @@ mod tests {
 
     /// `--continue` and `/resume` read the same index. A damaged one is
     /// history the app cannot read, not an empty past: each must name the
-    /// file rather than report that there is nothing to resume.
+    /// file, and point at `--check` for the repair, rather than report that
+    /// there is nothing to resume.
     #[tokio::test]
     async fn continue_and_resume_name_a_damaged_session_index() {
         let (mut app, dir) = app_fixture();
@@ -5570,14 +5577,16 @@ mod tests {
         app.startup(&super::Args { continue_session: true }).await;
         let continued = app.transcript.export_text();
         assert!(
-            continued.contains(&path) && !continued.contains("no previous session"),
+            continued.contains(&path)
+                && continued.contains(REPAIR_POINTER)
+                && !continued.contains("no previous session"),
             "--continue must name the damaged index: {continued}"
         );
 
         app.handle_submit("/resume".into()).await.unwrap();
         let resumed = app.transcript.export_text()[continued.len()..].to_string();
         assert!(
-            resumed.contains(&path) && !resumed.contains("no sessions"),
+            resumed.contains(&path) && resumed.contains(REPAIR_POINTER) && !resumed.contains("no sessions"),
             "/resume must name the damaged index: {resumed}"
         );
         assert!(app.sessions_panel.is_none());
