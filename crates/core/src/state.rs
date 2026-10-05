@@ -43,6 +43,12 @@ pub struct SessionData {
     pub prompt_breakdown: Arc<crate::prompt::PromptBreakdown>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,
+    /// Replay-boundary edits for a hydration repair that is in `messages`
+    /// but not yet on disk, because the rewrite that should have landed it
+    /// failed. Applied by whichever save lands it: applied before, the
+    /// boundaries would mark messages the file does not hold yet, and never
+    /// applied, a replay draws each later divider early. In memory only.
+    pub deferred_resume_edits: Vec<crate::sessions::ResumeEdit>,
     /// Process-unique id of the turn that last took `messages`; a restore is
     /// only valid while this still matches the taker (guards against a newer
     /// turn or a recreated session reusing the id).

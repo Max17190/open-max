@@ -763,6 +763,24 @@ pub fn shift_resume_points_for_remove(core: &Core, id: &str, at: u64) -> Result<
     })
 }
 
+/// One message inserted into or removed from a transcript, at an index
+/// counted after the edits before it: what a replay boundary has to follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeEdit {
+    Insert(u64),
+    Remove(u64),
+}
+
+/// Move every replay boundary through `edits`, in the order they were made.
+pub fn apply_resume_edits(core: &Core, id: &str, edits: &[ResumeEdit]) {
+    for edit in edits {
+        let _ = match *edit {
+            ResumeEdit::Insert(at) => shift_resume_points_for_insert(core, id, at),
+            ResumeEdit::Remove(at) => shift_resume_points_for_remove(core, id, at),
+        };
+    }
+}
+
 /// Record that a new sitting resumed this session with `message_index`
 /// messages already on disk. Index zero is an empty session, not a
 /// boundary; repeats (resuming again before any new turn) are deduplicated.

@@ -501,26 +501,28 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         // made. A crash between the rewrite and the shifts leaves a divider
         // a message off, which changes where a replay draws it and nothing
         // the model is sent.
-        let inserted: Vec<usize> = needs_system.then_some(0).into_iter().chain(stubs).collect();
-        let persisted_count = if inserted.is_empty() && strays.is_empty() {
+        let edits: Vec<sessions::ResumeEdit> = needs_system
+            .then_some(0)
+            .into_iter()
+            .chain(stubs)
+            .map(|at| sessions::ResumeEdit::Insert(at as u64))
+            .chain(strays.into_iter().map(|at| sessions::ResumeEdit::Remove(at as u64)))
+            .collect();
+        let mut deferred_resume_edits = Vec::new();
+        let persisted_count = if edits.is_empty() {
             count
         } else {
             let mut persisted = 0usize;
             if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
-                for at in inserted {
-                    let _ = sessions::shift_resume_points_for_insert(core, session_id, at as u64);
-                }
-                for at in strays {
-                    let _ = sessions::shift_resume_points_for_remove(core, session_id, at as u64);
-                }
+                sessions::apply_resume_edits(core, session_id, &edits);
                 persisted
             } else {
                 // The file still holds the transcript as it was. A count of
                 // zero would make every later save refuse to append to it,
                 // so no turn of this sitting would reach disk; a stale count
                 // makes the next save rewrite the file whole, which lands the
-                // repair too. The dividers stay where they were, off by the
-                // messages the repair moved, as after a crash above.
+                // repair too, and the boundaries move with it then.
+                deferred_resume_edits = edits;
                 sessions::PERSISTED_STALE
             }
         };
@@ -535,6 +537,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             registry,
             prompt_breakdown,
             persisted_count,
+            deferred_resume_edits,
             take_seq: 0,
             schemas_over_budget_reported: false,
             ledger_synced: false,
@@ -568,6 +571,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             registry,
             prompt_breakdown: Arc::new(breakdown),
             persisted_count: 0,
+            deferred_resume_edits: Vec::new(),
             take_seq: 0,
             schemas_over_budget_reported: false,
             ledger_synced: false,
@@ -1315,6 +1319,15 @@ async fn compact_messages(
         enforce_budget(&mut candidate, trigger, schema_tokens)
     };
     if !changed { return Ok(0); }
+    // A hydration repair still waiting for a save lands first, with its
+    // boundary edits: the commit moves the boundaries as if they already
+    // measured this transcript, and once it lands the edits no longer fit.
+    let deferred = ctx.core.sessions.lock().await
+        .get(ctx.session_id)
+        .is_some_and(|data| !data.deferred_resume_edits.is_empty());
+    if deferred && !save_messages(ctx.core, ctx.session_id, messages, true).await {
+        return Err("compaction refused: the session transcript could not be saved".into());
+    }
     let dropped = digest.as_ref().map(|d| d.message_count).unwrap_or(0);
     let (archive, record) = match digest {
         Some(digest) => prepare_compaction_digest(ctx, &mut candidate, digest, spend).await,
@@ -1691,7 +1704,8 @@ fn apply_freeze(
     data.prompt_breakdown = Arc::new(breakdown);
     sessions::save_manifest(core, session_id, &data.registry.to_manifest());
     data.persisted_count = 0;
-    sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
+    let saved = sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
+    land_deferred_resume_edits(core, session_id, data, saved);
 }
 
 /// Load a session into the in-memory map if this process has not seen it yet.
@@ -3707,9 +3721,21 @@ async fn run_loop(
 async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) -> bool {
     let mut sessions_map = core.sessions.lock().await;
     if let Some(data) = sessions_map.get_mut(session_id) {
-        sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite)
+        let saved = sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite);
+        land_deferred_resume_edits(core, session_id, data, saved);
+        saved
     } else {
         false
+    }
+}
+
+/// Move the replay boundaries a failed hydration rewrite left for later,
+/// once `saved` says a save landed the transcript that holds its repair.
+/// Such a save is always a whole rewrite (`sessions::PERSISTED_STALE`).
+fn land_deferred_resume_edits(core: &Core, session_id: &str, data: &mut SessionData, saved: bool) {
+    if saved && !data.deferred_resume_edits.is_empty() {
+        let edits = std::mem::take(&mut data.deferred_resume_edits);
+        sessions::apply_resume_edits(core, session_id, &edits);
     }
 }
 
@@ -9699,6 +9725,138 @@ mod tests {
             Some(("assistant", Some("done"))),
             "and so does its reply"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// When a failed hydration rewrite leaves its repair for a later save to
+    /// land, the replay boundaries must move when it lands. Left where they
+    /// were, they mark the old indices in a file the inserted reply has
+    /// shifted, so a replay draws each sitting's divider a message early.
+    #[tokio::test]
+    async fn a_deferred_hydration_repair_moves_replay_boundaries_when_it_lands() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let data = build_session_data(&core, &id, &project).unwrap();
+            let mut messages = data.messages;
+            messages.push(ChatMessage::user("what is in a.txt"));
+            messages.push(ChatMessage::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "c1".into(),
+                    ..tool_call("read_file", r#"{"path":"a.txt"}"#)
+                }]),
+            ));
+            messages.push(ChatMessage::user("later"));
+            let mut persisted = 0usize;
+            assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+        }
+        // A later sitting began at "later", and this one begins after it.
+        sessions::record_resume_point(&core, &id, 3);
+        sessions::record_resume_point(&core, &id, 4);
+
+        let index = core.data_dir.join("sessions").join("index.json");
+        let intact = std::fs::read(&index).unwrap();
+        std::fs::write(&index, "{ not json").unwrap();
+        ensure_session_hydrated(&core, &id, &project).await.unwrap();
+        std::fs::write(&index, intact).unwrap();
+        assert_eq!(
+            sessions::load_messages(&core, &id).unwrap().unwrap().len(),
+            4,
+            "the repair did not land, so the file is as it was"
+        );
+        assert_eq!(
+            sessions::meta(&core, &id).unwrap().resume_points,
+            vec![3, 4],
+            "and the boundaries still mark that file"
+        );
+
+        let (base_url, _bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+        start_turn(core.clone(), id.clone(), project.clone(), "go on".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
+        assert_eq!(on_disk[3].tool_call_id.as_deref(), Some("c1"), "the repair reached the file");
+        assert_eq!(on_disk[4].content.as_deref(), Some("later"));
+        assert_eq!(
+            sessions::meta(&core, &id).unwrap().resume_points,
+            vec![4, 5],
+            "each boundary follows the message it marked"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same deferred repair, landed by a prune instead of a save. The
+    /// prune moves the boundaries from the length of the transcript in
+    /// memory, so the repair's edits have to land before it: after, they no
+    /// longer fit the file, and skipped, this sitting's divider ends up a
+    /// message before the end of the compacted transcript.
+    #[tokio::test]
+    async fn a_prune_lands_a_deferred_hydration_repair_with_its_boundaries() {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.base_url = base_url;
+            settings.model = "test".into();
+            settings.context_tokens = Some(12_288);
+            settings.max_tokens = 1_024;
+            settings.max_agent_tokens = Some(0);
+        }
+        let mut messages = build_session_data(&core, &id, &project).unwrap().messages;
+        messages.push(ChatMessage::user("what is in a.txt"));
+        messages.push(ChatMessage::assistant(
+            None,
+            Some(vec![ToolCall { id: "c1".into(), ..tool_call("read_file", r#"{"path":"a.txt"}"#) }]),
+        ));
+        while messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 8_500 {
+            messages.push(ChatMessage::user("q ".repeat(400)));
+            messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        assert!(sessions::save_messages(&core, &id, &messages, &mut 0, true));
+        // This sitting begins after everything on file.
+        sessions::record_resume_point(&core, &id, messages.len() as u64);
+
+        let index = core.data_dir.join("sessions").join("index.json");
+        let intact = std::fs::read(&index).unwrap();
+        std::fs::write(&index, "{ not json").unwrap();
+        ensure_session_hydrated(&core, &id, &project).await.unwrap();
+        std::fs::write(&index, intact).unwrap();
+        assert_eq!(
+            sessions::load_messages(&core, &id).unwrap().unwrap().len(),
+            messages.len(),
+            "the repair did not land"
+        );
+
+        let result = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
+        assert!(result.compacted_messages > 0);
+        assert_eq!(*requests.lock().unwrap(), 0);
+        let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
+        assert_eq!(
+            sessions::meta(&core, &id).unwrap().resume_points.last().copied(),
+            Some(on_disk.len() as u64),
+            "this sitting's divider still marks the end of the transcript"
+        );
+        assert!(core.sessions.lock().await.get(&id).unwrap().deferred_resume_edits.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }
