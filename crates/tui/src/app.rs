@@ -331,6 +331,15 @@ pub struct App {
     /// `refresh_project_root`).
     project_root: PathBuf,
     session_id: Option<String>,
+    /// `session_id` was created by this app on a first submit, so leaving it
+    /// with nothing saved (a prompt a gate refused, a turn that failed
+    /// before its first save) discards it instead of leaving an empty entry
+    /// for `--continue` to reattach. A resumed session is never discarded.
+    created_session: bool,
+    /// Created sessions left while their work still ran. Whether they are
+    /// empty is known only once it settles: a cancelled turn still saves the
+    /// prompt it was given.
+    left_running: Vec<String>,
     /// A /resume (or --continue) picked this session and no turn has
     /// hydrated it yet: /context's numbers are still today's-config
     /// preview, not the session's own. A freshly created id never sets
@@ -468,20 +477,38 @@ pub struct App {
     status_width: u16,
 }
 
+/// Returns the warnings that must wait for the restored terminal: anything
+/// written before then lands on the alternate screen and vanishes with it.
 pub async fn run(
     mut terminal: Term,
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: Args,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<String>> {
     let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut app = App::new(core.clone(), project, files_tx);
 
     app.startup(&args).await;
-    let quit = args.quit.notified();
-    tokio::pin!(quit);
+    let result =
+        event_loop(&mut terminal, &mut app, &mut core_rx, &mut files_rx, &args.quit).await;
+    // The quit's last strong handle goes with the loop, so a signal during
+    // the discard below exits at once instead of waiting on it.
+    drop(args);
+    // Every way out of the loop, a failed terminal included, leaves here.
+    let warnings = app.discard_created_sessions_on_exit();
+    result.map(|()| warnings)
+}
 
+async fn event_loop(
+    terminal: &mut Term,
+    app: &mut App,
+    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    files_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
+    quit: &tokio::sync::Notify,
+) -> std::io::Result<()> {
+    let quit = quit.notified();
+    tokio::pin!(quit);
     // Terminal events are forwarded through a channel so the core-event arm
     // can be gated on `input_rx.is_empty()` — a token firehose must never
     // starve a keypress (crossterm's EventStream itself is not peekable).
@@ -513,7 +540,7 @@ pub async fn run(
     let mut draw_deadline: Option<Instant> = None;
     let mut resize_hold: Option<Instant> = None;
     let (mut input_unpainted, mut last_drew_input) = (false, false);
-    draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL)?;
+    draw_frame(terminal, app, MIN_DRAW_INTERVAL)?;
     app.dirty.clear();
     // State the initial presence in the title; transitions are edge-driven.
     app.emit_presence_title();
@@ -584,7 +611,7 @@ pub async fn run(
             let now = Instant::now();
             match paint_pacing(now, last_draw, last_drew_input, resize_hold, wake) {
                 Paint::Now => {
-                    draw_frame(&mut terminal, &mut app, now.duration_since(last_draw))?;
+                    draw_frame(terminal, app, now.duration_since(last_draw))?;
                     last_draw = now;
                     last_drew_input = std::mem::take(&mut input_unpainted);
                     draw_deadline = None;
@@ -640,6 +667,8 @@ impl App {
             project_root: open_max_core::state::canonical_root(&project),
             project,
             session_id: None,
+            created_session: false,
+            left_running: Vec::new(),
             resumed_awaiting_hydration: false,
             pending_submit: None,
             mode: Mode::Chat,
@@ -866,7 +895,8 @@ impl App {
                 return false;
             }
         }
-        self.session_id = None;
+        let left = self.session_id.take().filter(|_| self.created_session);
+        self.created_session = false;
         self.resumed_awaiting_hydration = false;
         self.transcript = Transcript::new();
         self.running = false;
@@ -921,7 +951,39 @@ impl App {
         self.transcript.follow();
         self.dirty.mark_chat();
         self.dirty.mark_chrome();
+        // Last, so a failure lands in the fresh transcript, not the old one.
+        if let Some(id) = left {
+            if self.core.is_running(&id) {
+                self.left_running.push(id);
+            } else {
+                self.discard_if_empty(&id);
+            }
+        }
         true
+    }
+
+    /// Discard a session this app created, if nothing was saved to it. A
+    /// failure is reported: the entry it leaves is the one this prevents.
+    fn discard_if_empty(&mut self, id: &str) {
+        if let Err(e) = sessions::discard_if_empty(&self.core, id) {
+            self.error(&format!("the empty session {id} stays indexed: {e}"));
+        }
+    }
+
+    /// Quitting leaves the current session too, and nothing will settle the
+    /// ones still running: their turns end with the process. The discard
+    /// decides under the store lock, so a turn that saved in time still
+    /// keeps its session. Returns the failures, for the shell to print once
+    /// the terminal is restored.
+    fn discard_created_sessions_on_exit(&mut self) -> Vec<String> {
+        let mut ids = std::mem::take(&mut self.left_running);
+        ids.extend(self.session_id.clone().filter(|_| self.created_session));
+        ids.into_iter()
+            .filter_map(|id| {
+                let e = sessions::discard_if_empty(&self.core, &id).err()?;
+                Some(format!("the empty session {id} stays indexed: {e}"))
+            })
+            .collect()
     }
 
     // ---------- terminal events ----------
@@ -2080,6 +2142,7 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            self.created_session = false;
                             self.resumed_awaiting_hydration = false;
                         }
                         if panel.items.is_empty() {
@@ -2128,6 +2191,9 @@ impl App {
                         let _ = sessions::detach(&self.core, &id);
                         return;
                     }
+                    // Resumed now, so no longer this app's to discard when
+                    // the turn it was left with settles.
+                    self.left_running.retain(|left| *left != id);
                     self.session_id = Some(id.clone());
                     self.replay(&id);
                 }
@@ -2181,6 +2247,7 @@ impl App {
                 let meta = sessions::create(&self.core, self.project.display().to_string())
                     .map_err(std::io::Error::other)?;
                 self.session_id = Some(meta.id.clone());
+                self.created_session = true;
                 self.resumed_awaiting_hydration = false;
                 meta.id
             }
@@ -2619,6 +2686,13 @@ impl App {
     async fn on_core_event(&mut self, env: AgentEventEnvelope) {
         if self.session_id.as_deref() == Some(env.session_id.as_str()) {
             self.on_agent_event(env.event);
+        } else if let Some(i) = self.left_running.iter().position(|id| *id == env.session_id) {
+            // Its last event goes out only after it leaves `running`, so
+            // this is reached once the work has settled.
+            if !self.core.is_running(&env.session_id) {
+                let id = self.left_running.swap_remove(i);
+                self.discard_if_empty(&id);
+            }
         }
         // Send the next queued message once the turn has fully settled.
         if self.flush_queue {
@@ -4570,6 +4644,82 @@ mod tests {
         app.reset_for_new_session();
         assert!(!app.running);
         assert!(!app.compacting, "compaction state is session-scoped, like running");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Feed the app core events until `id`'s work settles.
+    async fn settle(
+        app: &mut App,
+        core_rx: &mut mpsc::UnboundedReceiver<open_max_core::types::AgentEventEnvelope>,
+        id: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(env) = core_rx.recv().await {
+                let done = env.session_id == id && matches!(env.event, AgentEvent::Done { .. });
+                app.on_core_event(env).await;
+                if done {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the turn never settled");
+    }
+
+    /// The app creates its session on the first submit, so a first prompt
+    /// that fails before anything is saved (here at endpoint resolution:
+    /// nothing is configured) leaves an index entry with nothing behind it,
+    /// which `--continue` then reattaches to. Leaving such a session, by
+    /// /new or by quitting, discards it, whether its turn is still running
+    /// or already settled; a session the app resumed stays.
+    #[tokio::test]
+    async fn a_created_session_left_before_anything_was_saved_leaves_no_entry() {
+        let dir = crate::test_temp_dir("openmax-app-ghost");
+        let (core, mut core_rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core.clone(), dir.clone(), files_tx);
+        let key = dir.display().to_string();
+        let ids = |core: &std::sync::Arc<Core>| -> Vec<String> {
+            open_max_core::sessions::list(core, &key).into_iter().map(|m| m.id).collect()
+        };
+
+        // Settled before the user moves on.
+        app.handle_submit("hello".into()).await.unwrap();
+        let settled = app.session_id.clone().unwrap();
+        settle(&mut app, &mut core_rx, &settled).await;
+        assert_eq!(ids(&core), vec![settled.clone()], "the failed prompt's session is indexed");
+        app.handle_submit("/new".into()).await.unwrap();
+        assert!(ids(&core).is_empty(), "/new left an empty session behind");
+
+        // Left while its turn is still running (it has not yet been polled):
+        // discarded once it settles, since a cancelled turn may still save.
+        app.handle_submit("hello".into()).await.unwrap();
+        let running = app.session_id.clone().unwrap();
+        app.handle_submit("/new".into()).await.unwrap();
+        settle(&mut app, &mut core_rx, &running).await;
+        assert!(ids(&core).is_empty(), "a session left mid-turn stayed behind empty");
+        let sessions_dir = core.data_dir.join("sessions");
+        for id in [&settled, &running] {
+            assert!(!sessions_dir.join(format!("{id}.lock")).exists(), "{id} left its lock file");
+        }
+
+        // A resumed session was not this app's to create, so it stays even
+        // though nothing was ever saved to it.
+        let resumed = open_max_core::sessions::create(&core, key.clone()).unwrap().id;
+        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        assert_eq!(app.session_id.as_deref(), Some(resumed.as_str()));
+        app.handle_submit("/new".into()).await.unwrap();
+        assert_eq!(ids(&core), vec![resumed.clone()], "a resumed session was discarded");
+
+        // Quitting leaves the current session and the ones left running,
+        // and no turn of theirs will settle after it.
+        app.handle_submit("hello".into()).await.unwrap();
+        app.handle_submit("/new".into()).await.unwrap();
+        app.handle_submit("hello".into()).await.unwrap();
+        assert_eq!(app.left_running.len(), 1);
+        assert!(app.discard_created_sessions_on_exit().is_empty());
+        assert_eq!(ids(&core), vec![resumed], "quitting left an empty session behind");
         let _ = fs::remove_dir_all(dir);
     }
 

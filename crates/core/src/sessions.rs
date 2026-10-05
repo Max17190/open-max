@@ -54,8 +54,20 @@ pub struct SessionMeta {
     pub resume_points: Vec<u64>,
 }
 
-/// The lock file is never removed: unlinking it would let a second inode
-/// acquire the same session name while the first owner still holds its lock.
+/// The lock file lives as long as its session: removing the session unlinks
+/// it, while still holding it, under the store lock. Every claim opens and
+/// locks the file under that same lock. A claim that could open the file
+/// before the unlink and lock it after the remover let go would own an inode
+/// no other claim can reach, while the next claim created and locked a fresh
+/// file under the same name: two owners of one session.
+///
+/// An older release takes the same flock(2) (see `lock_index`) but claims
+/// without the store lock and never unlinks. The unlink comes only after the
+/// session has left the index, under the index lock, so for as long as a
+/// session is indexed every binary locks the one file its name holds. An
+/// older binary that races a removal can still lock the unlinked file, but
+/// the session it then owns is no longer indexed, and every release drops
+/// writes to such a session.
 pub(crate) struct SessionOwner {
     _file: std::fs::File,
     detach: bool,
@@ -82,7 +94,9 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
         }
         return Ok(());
     }
-    let path = sessions_dir(core).join(format!("{id}.lock"));
+    // See `SessionOwner`: the open and the lock go under the store lock.
+    let _store = lock_store(core)?;
+    let path = lock_path(core, id);
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
     file.try_lock().map_err(|e| match e {
@@ -90,7 +104,7 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
             format!("session {id} is already open in another process; close it there or start a new session"),
         std::fs::TryLockError::Error(e) => format!("cannot lock session {id}: {e}"),
     })?;
-    if validate { load_messages(core, id)?; }
+    if validate { load_messages_locked(core, id)?; }
     owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
     Ok(())
 }
@@ -133,6 +147,10 @@ fn sessions_dir(core: &Core) -> PathBuf {
     let dir = core.data_dir.join("sessions");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+fn lock_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.lock"))
 }
 
 fn messages_path(core: &Core, id: &str) -> PathBuf {
@@ -997,40 +1015,7 @@ pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
 }
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
-    // Explicit deletion may remove damaged data, but never a foreign writer.
-    claim_session(core, id, false, false)?;
-    // Stop the session's work before removing its files. A frontend may
-    // delete the session it is currently running, and a turn that keeps going
-    // keeps writing: every sidecar here is opened with `create`, so an
-    // in-flight append recreates the file that was just deleted. Cancelling
-    // first is also the behaviour a user asking to delete a session expects.
-    //
-    // A request already on the wire can still land after this returns and
-    // append one record. That window is inherent to cooperative cancellation
-    // and predates the usage sidecar - the compaction and archive logs have
-    // always shared it - so it is narrowed here, not claimed closed.
-    core.cancel(id);
-    // The index entry and the files go under one lock. Dropping the entry
-    // first and the files second would let an append pass its check against
-    // the stale index and recreate what this call is removing.
-    let _store = lock_store(core)?;
-    let mut metas = match read_index(core) {
-        IndexRead::Loaded(metas) => metas,
-        IndexRead::Missing => Vec::new(),
-        // Deleting one session must not cost every other session its
-        // metadata; repair the index first.
-        IndexRead::Damaged(reason) => return Err(reason),
-    };
-    metas.retain(|m| m.id != id);
-    save_index(core, &metas)?;
-    let _ = std::fs::remove_file(messages_path(core, id));
-    let _ = std::fs::remove_file(manifest_path(core, id));
-    let _ = std::fs::remove_file(compaction_path(core, id));
-    let _ = std::fs::remove_file(archive_path(core, id));
-    let _ = std::fs::remove_file(usage_path(core, id));
-    drop(_store);
-    let _ = detach(core, id);
-    Ok(())
+    remove(core, id, false).map(|_| ())
 }
 
 /// Remove a session that no store backs: no transcript, archive, or
@@ -1045,13 +1030,72 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
 /// report, because the entry it leaves behind is exactly the one this
 /// exists to prevent.
 pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
-    let backed = [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
-        .iter()
-        .any(|p| p.exists());
-    if backed {
+    // Settled without claiming: a session with history stays, whoever holds it.
+    if backed(core, id) {
         return Ok(false);
     }
-    delete(core, id).map(|()| true)
+    remove(core, id, true)
+}
+
+fn backed(core: &Core, id: &str) -> bool {
+    [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
+        .iter()
+        .any(|p| p.exists())
+}
+
+/// `delete`, or with `only_if_empty` the removal half of `discard_if_empty`.
+/// Ok(whether the session was removed).
+fn remove(core: &Core, id: &str, only_if_empty: bool) -> Result<bool, String> {
+    // Explicit deletion may remove damaged data, but never a foreign writer.
+    claim_session(core, id, false, false)?;
+    // Stop the session's work before removing its files. A frontend may
+    // delete the session it is currently running, and a turn that keeps going
+    // keeps writing: every sidecar here is opened with `create`, so an
+    // in-flight append recreates the file that was just deleted. Cancelling
+    // first is also the behaviour a user asking to delete a session expects.
+    //
+    // A request already on the wire can still land after this returns and
+    // append one record. That window is inherent to cooperative cancellation
+    // and predates the usage sidecar - the compaction and archive logs have
+    // always shared it - so it is narrowed here, not claimed closed.
+    //
+    // A discard has not decided yet, and a session it keeps must keep its turn.
+    if !only_if_empty {
+        core.cancel(id);
+    }
+    // The index entry and the files go under one lock. Dropping the entry
+    // first and the files second would let an append pass its check against
+    // the stale index and recreate what this call is removing.
+    let _store = lock_store(core)?;
+    // A turn of this process can save between the caller's look and this
+    // lock. Every transcript write holds the lock, so the answer here is
+    // final: a session that gained history in that window stays.
+    if only_if_empty && backed(core, id) {
+        return Ok(false);
+    }
+    let mut metas = match read_index(core) {
+        IndexRead::Loaded(metas) => metas,
+        IndexRead::Missing => Vec::new(),
+        // Deleting one session must not cost every other session its
+        // metadata; repair the index first.
+        IndexRead::Damaged(reason) => return Err(reason),
+    };
+    metas.retain(|m| m.id != id);
+    save_index(core, &metas)?;
+    let _ = std::fs::remove_file(messages_path(core, id));
+    let _ = std::fs::remove_file(manifest_path(core, id));
+    let _ = std::fs::remove_file(compaction_path(core, id));
+    let _ = std::fs::remove_file(archive_path(core, id));
+    let _ = std::fs::remove_file(usage_path(core, id));
+    // Still held by the claim above, and unlinked under the store lock every
+    // claim opens it under (see `SessionOwner`).
+    let _ = std::fs::remove_file(lock_path(core, id));
+    drop(_store);
+    if only_if_empty {
+        core.cancel(id);
+    }
+    let _ = detach(core, id);
+    Ok(true)
 }
 
 /// Set the title from the first user message, once.
@@ -2162,6 +2206,173 @@ mod tests {
         );
         drop(older);
         creator.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Removing a session unlinks its lock file, which an older binary never
+    /// does. That binary must still exclude the removal: unlinking a file it
+    /// holds would delete the session it is writing and hand its name to the
+    /// next claim. A raw flock stands in for it, as above.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_is_refused_while_an_older_binary_holds_the_session() {
+        let dir = std::env::temp_dir().join(format!("openmax-flock-remove-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let session_lock = lock_path(&core, &id);
+
+        let older = raw_flock(&session_lock).expect("nothing holds the session yet");
+        assert!(delete(&core, &id).unwrap_err().contains("another process"));
+        assert!(discard_if_empty(&core, &id).unwrap_err().contains("another process"));
+        assert!(session_lock.exists(), "a lock file an older binary holds was unlinked");
+        assert!(list(&core, "/tmp/p").iter().any(|m| m.id == id), "a held session was removed");
+        drop(older);
+        assert_eq!(discard_if_empty(&core, &id), Ok(true));
+        assert!(!session_lock.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every claim creates `<id>.lock`. A deleted or discarded session is
+    /// never claimed again, so a lock file it leaves behind is never reused
+    /// or removed: one stray file for every such session, forever. A session
+    /// that stays keeps its file, which its next claim reuses.
+    #[test]
+    fn deleting_or_discarding_a_session_leaves_no_lock_file() {
+        let dir = std::env::temp_dir().join(format!("openmax-lockfile-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let lock = |id: &str| dir.join("sessions").join(format!("{id}.lock"));
+
+        let deleted = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &deleted).unwrap();
+        assert!(lock(&deleted).exists());
+        delete(&core, &deleted).unwrap();
+        assert!(!lock(&deleted).exists(), "delete left the session's lock file behind");
+
+        let discarded = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &discarded).unwrap();
+        assert_eq!(discard_if_empty(&core, &discarded), Ok(true));
+        assert!(!lock(&discarded).exists(), "discard left the session's lock file behind");
+
+        // Never claimed before: the claim delete makes for itself goes too.
+        let unclaimed = create(&core, "/tmp/p".into()).unwrap().id;
+        delete(&core, &unclaimed).unwrap();
+        assert!(!lock(&unclaimed).exists(), "delete left the lock file its own claim made");
+
+        let kept = create(&core, "/tmp/p".into()).unwrap().id;
+        assert!(save_messages(&core, &kept, &[ChatMessage::system("sys")], &mut 0, false));
+        assert_eq!(discard_if_empty(&core, &kept), Ok(false));
+        assert!(lock(&kept).exists(), "a session that stays keeps its lock file");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The unlink is safe only because no claim can open the file before it
+    /// and lock it after (see `SessionOwner`). Parked rather than raced, since
+    /// a race that misses the bad interleaving proves nothing: while a
+    /// deleter holds the store, a claim from another process must wait
+    /// instead of opening the file.
+    #[test]
+    fn a_claim_cannot_interleave_with_the_unlink_of_its_lock_file() {
+        let dir = std::env::temp_dir().join(format!("openmax-claim-{}", uuid::Uuid::new_v4()));
+        let (deleter, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&deleter, "/tmp/p".into()).unwrap().id;
+        attach(&deleter, &id).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = {
+            let deleter = deleter.clone();
+            std::thread::spawn(move || {
+                let _store = lock_store(&deleter).unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let claimer = {
+            let (dir, id) = (dir.clone(), id.clone());
+            std::thread::spawn(move || {
+                let (other, _rx) = Core::new(dir).unwrap();
+                let claimed = attach(&other, &id);
+                done_tx.send(()).unwrap();
+                claimed
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "a claim must wait while another process holds the store, or it can open \
+             the lock file a delete is about to unlink"
+        );
+        release_tx.send(()).unwrap();
+        parked.join().unwrap();
+        let refused = claimer.join().unwrap().unwrap_err();
+        assert!(refused.contains("another process"), "the deleter still owns it: {refused}");
+
+        // With the file unlinked, claims that race for the name still end
+        // with exactly one owner. Each core outlives the race, so no lock is
+        // released early and handed to a later claim.
+        delete(&deleter, &id).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let (dir, id, start) = (dir.clone(), id.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let (core, _rx) = Core::new(dir).unwrap();
+                    start.wait();
+                    let owned = attach(&core, &id).is_ok();
+                    (owned, core)
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(owned, _)| *owned).count(), 1, "one owner per session");
+        drop(results);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A front end discards at exit, and a turn of its own can still be
+    /// running then. Whether the session is empty is decided under the store
+    /// lock every transcript write holds, so a save that lands while the
+    /// discard waits for that lock keeps the session instead of being
+    /// deleted with it.
+    #[test]
+    fn a_discard_keeps_a_session_that_gained_history_while_it_waited() {
+        let dir = std::env::temp_dir().join(format!("openmax-discard-race-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                let _store = lock_store(&core).unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let discard = {
+            let (core, id) = (core.clone(), id.clone());
+            std::thread::spawn(move || {
+                let discarded = discard_if_empty(&core, &id);
+                done_tx.send(()).unwrap();
+                discarded
+            })
+        };
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err());
+        // The parked holder's save, landing while the discard waits.
+        let line = serde_json::to_string(&ChatMessage::user("hello")).unwrap();
+        std::fs::write(messages_path(&core, &id), format!("{line}\n")).unwrap();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(discard.join().unwrap(), Ok(false), "a session with a transcript is history");
+        assert_eq!(load_messages(&core, &id).unwrap().map(|m| m.len()), Some(1));
+        assert!(list(&core, "/tmp/p").iter().any(|m| m.id == id), "and it stays indexed");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1069,7 +1069,11 @@ async fn main() -> std::io::Result<()> {
     .await;
 
     restore_terminal();
-    result
+    result.map(|warnings| {
+        for warning in warnings {
+            eprintln!("openmax: warning: {}", open_max_core::text::one_line(&warning));
+        }
+    })
 }
 
 /// Terminal modes the fullscreen session has switched on, one bit each.
