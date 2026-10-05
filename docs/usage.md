@@ -53,7 +53,10 @@ history and recall remain available.
 A damaged or unreadable transcript stops continuation with its path and the
 failure reason. Open Max preserves the original bytes and does not silently
 skip records or replace the transcript. Repair or recover a copy explicitly
-before resuming. A session that has never saved messages can still start fresh.
+before resuming. A final record that a crash or power loss cut off mid-write
+is not damage: it never became a message, so the session resumes from the
+last complete record and the next save removes the fragment. A session that
+has never saved messages can still start fresh.
 
 ## Keys
 

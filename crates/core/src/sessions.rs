@@ -31,7 +31,7 @@
 //! then converts into silently dropping their transcripts.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -542,6 +542,8 @@ fn shifted_resume_points(points: &[u64], before: usize, after: usize, head: usiz
 thread_local! {
     static FAIL_COMPACTION_INDEX_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_COMPACTION_TRANSCRIPT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Every path this thread synced to the device, in order.
+    static SYNCED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Commit archive, digest record, replay boundaries, and transcript under one
@@ -555,8 +557,11 @@ thread_local! {
 /// an archive line and a digest record for a prune that then did not happen,
 /// duplicates of what the transcript still holds, which the readers tolerate
 /// (`--recall` deduplicates, `last_compaction` takes the newest), and a torn
-/// line the next append steps over (`append_text`). `head` is how many
-/// leading messages the prune kept, which is also where its digest note sits.
+/// line the next append cuts (`append_text`). Both appends are synced before
+/// the rewrite, which is durable once it lands: otherwise a power cut could
+/// keep the rewrite and lose the archive lines it relies on. `head` is how
+/// many leading messages the prune kept, which is also where its digest note
+/// sits.
 pub(crate) fn commit_compaction(
     core: &Core,
     id: &str,
@@ -575,12 +580,12 @@ pub(crate) fn commit_compaction(
     let pos = metas.iter().position(|m| m.id == id).ok_or("compaction session was deleted")?;
     load_messages_locked(core, id)?;
     if !archive.is_empty() {
-        append_jsonl(&archive_path(core, id), archive)?;
+        append_jsonl(&archive_path(core, id), archive, true)?;
     }
     if let Some(record) = record {
         let mut line = serde_json::to_string(record).map_err(|e| e.to_string())?;
         line.push('\n');
-        append_text(&compaction_path(core, id), &line)?;
+        append_text(&compaction_path(core, id), &line, true)?;
     }
     let before = metas[pos].resume_points.clone();
     metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len(), head);
@@ -612,7 +617,10 @@ pub(crate) fn commit_compaction(
 
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
-/// the same `*.tmp`.
+/// the same `*.tmp`. The temp file is synced before the rename: a rename can
+/// reach the disk before the bytes it points at, and a power cut between the
+/// two leaves an empty or partial file under the final name with the old
+/// contents already gone.
 pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     let parent = path
         .parent()
@@ -625,7 +633,11 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         .to_string_lossy();
     let id = uuid::Uuid::new_v4().simple();
     let tmp = parent.join(format!("{base}.{id}.tmp"));
-    if let Err(e) = std::fs::write(&tmp, bytes.as_ref()) {
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(bytes.as_ref())?;
+        sync(&file, &tmp)
+    });
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
@@ -635,12 +647,32 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         return Err(format!("{} is a directory", path.display()));
     }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // The rename lives in the directory, so it survives a power cut
+            // once the directory is synced. Best effort, and after the fact:
+            // the file is already replaced, and an error here must not report
+            // a write that landed as one that did not.
+            #[cfg(unix)]
+            if let Ok(dir) = std::fs::File::open(&parent) {
+                let _ = sync(&dir, &parent);
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e.to_string())
         }
     }
+}
+
+/// Wait until `file` is on the device. Every barrier in this module goes
+/// through here, so a test can see which ones a write issued and in what
+/// order.
+fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
+    file.sync_all()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", path.display())))
 }
 
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
@@ -652,7 +684,7 @@ fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
     write_atomic(path, out)
 }
 
-fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+fn append_jsonl(path: &PathBuf, messages: &[ChatMessage], durable: bool) -> Result<(), String> {
     // Serialize the whole tail first, then one write. Callers must heal on
     // failure (rewrite the full file) so a partial write cannot be re-appended
     // and duplicate complete lines when `persisted` is left unchanged.
@@ -661,17 +693,26 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> 
         buf.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
         buf.push('\n');
     }
-    append_text(path, &buf)
+    append_text(path, &buf, durable)
 }
 
-/// Append whole lines to a JSONL file, starting on a fresh line. A complete
-/// record need not end in a newline (a crash or a full disk can cut the
-/// terminator), and appending straight after it would glue the next record
-/// onto that line: every reader skips a line that does not parse, so a
-/// record that was just written, and just dropped from the transcript, would
-/// be lost with the fragment. One newline first keeps the loss to the
-/// fragment, which was never a complete record.
-fn append_text(path: &PathBuf, text: &str) -> Result<(), String> {
+/// Append whole lines to a JSONL file, starting on a fresh line after its
+/// last complete record. A crash or a full disk can leave the file ending
+/// without a newline in two ways. A complete record that lost only its
+/// newline gets one, or the next record would be glued onto it and both
+/// would be unreadable. A torn record (`is_torn`) is cut: no reader can use
+/// it, and left in place it would sit mid-file after this append, where the
+/// transcript loader refuses the whole session. No record moves either way.
+/// A write that fails part way is cut back off too, since the caller will
+/// append the same records again.
+///
+/// `durable` waits for the bytes to reach the device. A compaction needs that
+/// for what it archives, because the transcript rewrite after it deletes the
+/// same messages and is itself durable. A transcript append does not: a
+/// power cut that loses its tail costs the newest messages, not the session,
+/// since what remains ends in a complete record or a torn one the loader
+/// drops, and a drive barrier per save would cost every model request one.
+fn append_text(path: &PathBuf, text: &str, durable: bool) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -679,19 +720,69 @@ fn append_text(path: &PathBuf, text: &str) -> Result<(), String> {
         .read(true)
         .open(path)
         .map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let start = final_line_start(&mut file, len).map_err(|e| e.to_string())?;
+    let mut keep = len;
     let mut buf = String::with_capacity(text.len() + 1);
-    if file.metadata().map_err(|e| e.to_string())?.len() > 0 {
-        file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
-        let mut last = [0u8];
-        file.read_exact(&mut last).map_err(|e| e.to_string())?;
-        if last[0] != b'\n' {
+    if start < len {
+        let mut line = Vec::new();
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.read_to_end(&mut line))
+            .map_err(|e| e.to_string())?;
+        if is_torn(&line) {
+            file.set_len(start).map_err(|e| e.to_string())?;
+            keep = start;
+        } else {
             buf.push('\n');
         }
     }
     buf.push_str(text);
-    file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
+    if let Err(e) = file.write_all(buf.as_bytes()) {
+        let _ = file.set_len(keep);
+        return Err(e.to_string());
+    }
     file.flush().map_err(|e| e.to_string())?;
+    if durable {
+        sync(&file, path).map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Where the final line of a file `len` bytes long starts: `len` itself when
+/// the file is empty or ends in a newline. Reads backwards a block at a time,
+/// so an append never reads the history it extends.
+fn final_line_start(file: &mut std::fs::File, len: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut block = [0u8; 4096];
+    let mut end = len;
+    while end > 0 {
+        let begin = end.saturating_sub(block.len() as u64);
+        let part = &mut block[..(end - begin) as usize];
+        file.seek(SeekFrom::Start(begin))?;
+        file.read_exact(part)?;
+        if let Some(i) = part.iter().rposition(|&b| b == b'\n') {
+            return Ok(begin + i as u64 + 1);
+        }
+        end = begin;
+    }
+    Ok(0)
+}
+
+/// Whether an unterminated final line reads as a record a crash or a full
+/// disk cut off mid-write: it is not JSON. Every record is one JSON object,
+/// and no proper prefix of a JSON object is JSON, so every torn record reads
+/// this way (a cut inside a multi-byte character included) and no whole one
+/// does: a record that only lost its newline, or one that is whole but
+/// damaged some other way, is never taken for a tear.
+fn is_torn(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err()
+}
+
+/// How many leading bytes of a JSONL file hold its records: all of them,
+/// unless the final line is unterminated and torn.
+fn records_end(bytes: &[u8]) -> usize {
+    let start = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    if start < bytes.len() && is_torn(&bytes[start..]) { start } else { bytes.len() }
 }
 
 /// Sessions for one project, most recently updated first.
@@ -929,7 +1020,11 @@ pub(crate) fn touch_at(core: &Core, id: &str, ts: u64) {
 }
 
 /// Load the authoritative transcript. Only a missing file is a fresh session.
-/// A damaged or unreadable record must survive for explicit recovery.
+/// A damaged or unreadable record must survive for explicit recovery. A torn
+/// final record (`is_torn`) is not one: it is what a crash mid-append leaves,
+/// it never became a message, and refusing it would strand any session a
+/// crash interrupted mid-save. It is skipped here and cut by the next append,
+/// or replaced by the next rewrite.
 pub fn load_messages(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, String> {
     let _store = lock_store(core)?;
     load_messages_locked(core, id)
@@ -937,11 +1032,13 @@ pub fn load_messages(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, 
 
 fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, String> {
     let path = messages_path(core, id);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("transcript {} is unreadable: {e}; original file preserved", path.display())),
     };
+    let text = std::str::from_utf8(&bytes[..records_end(&bytes)])
+        .map_err(|e| format!("transcript {} is unreadable: {e}; original file preserved", path.display()))?;
     let mut parsed = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() { continue; }
@@ -952,7 +1049,7 @@ fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>
         parsed.push(message);
     }
     if parsed.is_empty() {
-        return Err(format!("transcript {} is empty; original file preserved", path.display()));
+        return Err(format!("transcript {} holds no complete record; original file preserved", path.display()));
     }
     Ok(Some(parsed))
 }
@@ -1031,7 +1128,7 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         // Append is best-effort for the common path. On any failure (including
         // partial write_all), rewrite the full transcript atomically so a
         // later append cannot duplicate complete lines that already landed.
-        match append_jsonl(&path, &messages[*persisted..]) {
+        match append_jsonl(&path, &messages[*persisted..], false) {
             Ok(()) => Ok(()),
             Err(append_err) => write_jsonl(&path, messages).map_err(|rewrite_err| {
                 format!("append failed ({append_err}); rewrite also failed: {rewrite_err}")
@@ -1641,7 +1738,7 @@ mod tests {
         let cases = [
             Vec::new(), b"{torn".to_vec(), vec![0xff],
             [good.as_slice(), b"{broken middle}\n", good.as_slice()].concat(),
-            [good.as_slice(), b"{torn tail"].concat(),
+            [good.as_slice(), b"{broken tail}\n"].concat(),
         ];
         for bytes in cases {
             std::fs::write(&path, &bytes).unwrap();
@@ -1680,6 +1777,97 @@ mod tests {
         assert!(!save_messages(&core, &id, &messages, &mut persisted, true));
         assert!(commit_compaction(&core, &id, &messages, &[], None, 2, 2).is_err());
         assert_eq!(std::fs::read(messages_path(&core, &id)).unwrap(), b"{damage after loading");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A crash or a power cut mid-append leaves the transcript ending in part
+    /// of a record: no newline, and not JSON, sometimes not even whole UTF-8.
+    /// That fragment was never a message, so a resume drops it instead of
+    /// refusing the session, and the next save cuts it instead of stranding
+    /// it mid-file, where it would be damage. Only the final line gets this:
+    /// the same bytes anywhere else, or a whole record that does not parse,
+    /// are still refused.
+    #[test]
+    fn a_torn_final_record_is_dropped_on_load_and_cut_by_the_next_save() {
+        let dir = std::env::temp_dir().join(format!("openmax-torn-tail-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let path = messages_path(&core, &id);
+        let line = |m: &ChatMessage| serde_json::to_string(m).unwrap() + "\n";
+        let good = line(&ChatMessage::system("rules")) + &line(&ChatMessage::user("keep"));
+        let torn: [&[u8]; 2] = [b"{\"role\":\"assistant\",\"content\":\"half", b"{\"role\":\"assistant\",\"content\":\"caf\xc3"];
+        for fragment in torn {
+            std::fs::write(&path, [good.as_bytes(), fragment].concat()).unwrap();
+            let mut messages = load_messages(&core, &id).unwrap().expect("the complete records resume");
+            assert_eq!(messages.len(), 2);
+            let mut persisted = messages.len();
+            messages.push(ChatMessage::user("next"));
+            assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), good.clone() + &line(&messages[2]), "the fragment is cut, not stranded");
+            assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), 3);
+        }
+        // A rewrite or a compaction replaces the file whole, fragment and all.
+        let messages = vec![ChatMessage::system("rules"), ChatMessage::user("keep")];
+        std::fs::write(&path, [good.as_bytes(), torn[0]].concat()).unwrap();
+        assert!(save_messages(&core, &id, &messages, &mut 2, true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+        std::fs::write(&path, [good.as_bytes(), torn[0]].concat()).unwrap();
+        commit_compaction(&core, &id, &messages, &[], None, 2, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+
+        for damaged in [
+            [good.as_bytes(), torn[0], b"\n", good.as_bytes()].concat(),
+            [good.as_bytes(), b"{\"role\":5}"].concat(),
+        ] {
+            std::fs::write(&path, &damaged).unwrap();
+            assert!(load_messages(&core, &id).unwrap_err().contains("line 3"));
+            assert!(!save_messages(&core, &id, &messages, &mut 2, true));
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rename can reach the disk before the bytes it points at, so a power
+    /// cut after an unsynced atomic write can leave an empty or partial file
+    /// under the final name with the old contents already gone. The temp file
+    /// is synced before the rename, and the directory after it, so the
+    /// rename itself survives too.
+    #[test]
+    fn an_atomic_write_syncs_its_bytes_before_the_rename_and_the_directory_after() {
+        let dir = std::env::temp_dir().join(format!("openmax-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.json");
+        SYNCED.with(|synced| synced.take());
+        write_atomic(&path, "[]").unwrap();
+        let synced = SYNCED.with(|synced| synced.take());
+        assert_eq!(synced.len(), if cfg!(unix) { 2 } else { 1 }, "{synced:?}");
+        let name = synced[0].file_name().unwrap().to_string_lossy();
+        assert!(synced[0].parent() == Some(dir.as_path()) && name.starts_with("index.json.") && name.ends_with(".tmp"), "{synced:?}");
+        if cfg!(unix) {
+            assert_eq!(synced[1], dir);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The transcript rewrite deletes what the archive just gained, and the
+    /// rewrite is durable once it lands, so the archive has to reach the disk
+    /// first or a power cut between the two loses those messages from both.
+    #[test]
+    fn a_compaction_syncs_its_archive_before_the_transcript_rewrite() {
+        let dir = std::env::temp_dir().join(format!("openmax-archive-sync-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        assert!(save_messages(&core, &id, &original, &mut 0, true));
+        let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
+        SYNCED.with(|synced| synced.take());
+        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len(), 2).unwrap();
+        let synced = SYNCED.with(|synced| synced.take());
+        let archive = synced.iter().position(|p| *p == archive_path(&core, &id));
+        let transcript = format!("{id}.messages.json.");
+        let rewrite = synced.iter().position(|p| p.file_name().unwrap().to_string_lossy().starts_with(&transcript));
+        assert!(matches!((archive, rewrite), (Some(a), Some(r)) if a < r), "{synced:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
