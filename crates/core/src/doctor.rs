@@ -799,6 +799,15 @@ pub fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+/// The printed trust grant for `project`. `--trust-project` trusts the
+/// current directory and a grant covers its subtree, so a bare command pasted
+/// into a terminal opened elsewhere (often $HOME) would trust that directory
+/// and everything under it while the refused project stays untrusted. The
+/// quoted `cd` makes the paste grant exactly the project that was refused.
+pub fn trust_command(project: &std::path::Path) -> String {
+    format!("cd {} && openmax --trust-project", shell_quote(project))
+}
+
 fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut warn = |kind: &'static str, path: PathBuf, command: &str, args: &[String]| {
@@ -1157,8 +1166,9 @@ async fn run_examples_within(
     // --check refuses --trust-project, so adding the flag to this run fails.
     if !crate::trust::is_trusted(data_dir, project_root)? {
         return Err(format!(
-            "project {} is not trusted; inspect it, then trust it once from a terminal with `openmax --trust-project`",
-            project_root.display()
+            "project {} is not trusted; inspect it, then trust it once from a terminal with `{}`",
+            project_root.display(),
+            trust_command(project_root)
         ));
     }
     // Fail closed like a session start: a malformed settings file is a
@@ -3188,6 +3198,11 @@ mod tests {
         // is a grant on its own, not a flag added to this run.
         assert!(refusal.contains("from a terminal"), "{refusal}");
         assert!(!refusal.contains("rerun with"), "{refusal}");
+        // A trust grant covers its subtree, so a bare `openmax --trust-project`
+        // pasted into a terminal opened elsewhere (often $HOME) trusts that
+        // directory and everything under it. The repair carries the project.
+        let grant = format!("`cd {} && openmax --trust-project`", shell_quote(&root));
+        assert!(refusal.contains(&grant), "{refusal}");
         assert!(!touched.exists(), "nothing may run in an untrusted project");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);

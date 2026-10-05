@@ -446,10 +446,14 @@ fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
     assert!(out.stdout.is_empty(), "a refused grant must not start a session");
     assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &project), Ok(false));
 
+    // The frontend's user pastes this into a terminal that is usually not in
+    // the project, and a grant covers its subtree, so the repair must carry
+    // the project rather than trust wherever that terminal happens to be.
     let out = spawn(&["--stdio"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{stderr}");
     assert!(stderr.contains("not trusted") && stderr.contains("from a terminal"), "{stderr}");
+    assert!(stderr.contains(&repair), "the grant must name the refused project: {stderr}");
     let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
 
