@@ -1190,8 +1190,7 @@ fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     // Hook first: any panic past raw mode must restore the shell. This thread
     // runs the event loop and draws every frame.
     install_panic_restore(std::thread::current().id(), restore_terminal);
-    enable_raw_mode()?;
-    TERM_MODES.fetch_or(MODE_RAW, Ordering::SeqCst);
+    enter_raw_mode(&TERM_MODES, enable_raw_mode)?;
     // The session states its presence in the tab title while it runs (see
     // app::Presence); save the shell's title and hand it back on every exit
     // path. Pushed only after raw mode succeeds, so an early error cannot
@@ -1205,6 +1204,24 @@ fn init_terminal() -> std::io::Result<ui::transcript::Term> {
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
     };
     init().inspect_err(|_| restore_terminal())
+}
+
+/// Switch to raw mode and record it as one step under the stdout lock, which
+/// `restore_terminal` holds from claiming the modes until raw mode is off.
+/// Raw mode is termios state, not bytes on stdout, so nothing else orders it
+/// against a concurrent restore: switched outside the lock, a forced exit
+/// landing between the switch and the record would find nothing to undo and
+/// exit with the shell raw. Under the lock, that exit either runs first and
+/// keeps stdout until the process ends, so raw mode is never entered, or
+/// finds raw mode recorded and leaves it.
+fn enter_raw_mode(
+    modes: &AtomicU8,
+    enable: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let _out = std::io::stdout().lock();
+    enable()?;
+    modes.fetch_or(MODE_RAW, Ordering::SeqCst);
+    Ok(())
 }
 
 /// A frame-sized `BufWriter` that discards, rather than writes, its bytes
@@ -2048,6 +2065,33 @@ mod tests {
         assert_eq!(TERM_MODES.load(Ordering::SeqCst), 0);
     }
 
+    /// The forced exit on a second signal can restore while startup is
+    /// entering raw mode. Raw mode is termios state, so the restore leaves it
+    /// only when its bit is recorded; a restore landing after the switch but
+    /// before the bit would find nothing to undo and exit with the shell raw.
+    /// The restore here stands in for `restore_terminal`, which claims the
+    /// modes only while holding stdout (see
+    /// `restore_claims_the_modes_only_while_holding_stdout`).
+    #[test]
+    fn raw_mode_is_recorded_before_a_racing_restore_can_claim_it() {
+        let modes = &AtomicU8::new(0);
+        let claimed = std::thread::scope(|s| {
+            let mut restore = None;
+            enter_raw_mode(modes, || {
+                restore = Some(s.spawn(move || {
+                    let _out = std::io::stdout().lock();
+                    write_restore(&mut std::io::sink(), modes)
+                }));
+                // Holds the window between the switch and the record open.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(())
+            })
+            .unwrap();
+            restore.unwrap().join().unwrap()
+        });
+        assert_eq!(claimed, MODE_RAW, "a restore found raw mode entered but not recorded");
+    }
+
     /// SIGTERM's default action ends the process on the spot with every
     /// terminal mode still on; the watcher hands it to the event loop as a
     /// quit, so the normal exit path restores the terminal. The watcher must
@@ -2055,22 +2099,42 @@ mod tests {
     /// drops its tasks and then waits on blocking work still running (a
     /// grep, a scan), and the handlers it installed stay in place, so a
     /// watcher on it would leave every signal through that wait swallowed.
+    /// Handlers stay installed for the life of the process and the watcher
+    /// keeps waiting for a second signal, so the probe runs in a child: the
+    /// test process keeps the default action for every later signal.
     #[cfg(unix)]
     #[test]
     fn sigterm_reaches_the_quit_after_the_starting_runtime_is_gone() {
-        let runtime =
-            || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let quit = runtime().block_on(async { watch_quit_signals() });
-        let status = std::process::Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_REACHES_QUIT";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime =
+                || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let quit = runtime().block_on(async { watch_quit_signals() });
+            let status = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            runtime().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
+                    .await
+                    .expect("SIGTERM must reach the event loop as a quit")
+            });
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::sigterm_reaches_the_quit_after_the_starting_runtime_is_gone"])
+            .env(CHILD, "1")
+            .output()
             .unwrap();
-        assert!(status.success());
-        runtime().block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
-                .await
-                .expect("SIGTERM must reach the event loop as a quit")
-        });
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        // "1 passed" rules out a filter that matched nothing and exited 0.
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "SIGTERM did not reach the quit ({:?}): {stdout}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     /// Once the event loop has ended it drops the quit, and nothing reads it
