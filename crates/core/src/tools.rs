@@ -982,38 +982,49 @@ async fn bash_tool(
                     truncated,
                 )
             }
-            Termination::Exited(status) => {
-                // The note is the harness speaking, not captured output, but it
-                // still has to fit the caller's cap, which `max_output_bytes`
-                // can set as low as 1000 bytes. Reserve its length instead of
-                // letting a fixed annotation push the result past the limit.
-                let reserved = match output.background_terminated {
-                    true => BACKGROUND_TERMINATED_NOTE.len() + 1,
-                    false => 0,
-                };
-                let budget = caps.command_bytes.saturating_sub(reserved).max(1);
-                let (text, truncated) = render_process_output(&output, budget);
-                let (ok, text) = match status.success() {
-                    true => (true, text),
-                    false => (false, format!("{}\n{text}", describe_exit(status))),
-                };
-                // A backgrounded server dies with the call and the exit status
-                // is still 0, so without this the next step is a request to a
-                // port nothing is listening on.
-                let text = match output.background_terminated {
-                    true => format!("{text}\n{BACKGROUND_TERMINATED_NOTE}"),
-                    false => text,
-                };
-                ToolOutcome::from_process(ok, text, &output, truncated)
-            }
+            Termination::Exited(status) => exited_outcome(&output, status, caps.command_bytes),
         },
     }
 }
 
-/// Each bash call runs in its own process group, and the group is terminated
-/// when the call returns, so a backgrounded process does not outlive it. The
-/// exit status is still the shell's, which means a caller that started a server
-/// sees success and an absent server, with nothing connecting the two.
+/// The result of a bash or external tool process that exited on its own.
+/// Both run in their own process group with the same cleanup on exit, so
+/// they share this rendering: a copy that drops the note below hands the
+/// caller a clean exit and a helper that is already gone.
+pub(crate) fn exited_outcome(
+    output: &ProcessOutput,
+    status: &std::process::ExitStatus,
+    cap: usize,
+) -> ToolOutcome {
+    // The note is the harness speaking, not captured output, but it
+    // still has to fit the caller's cap, which `max_output_bytes`
+    // can set as low as 1000 bytes. Reserve its length instead of
+    // letting a fixed annotation push the result past the limit.
+    let reserved = match output.background_terminated {
+        true => BACKGROUND_TERMINATED_NOTE.len() + 1,
+        false => 0,
+    };
+    let budget = cap.saturating_sub(reserved).max(1);
+    let (text, truncated) = render_process_output(output, budget);
+    let (ok, text) = match status.success() {
+        true => (true, text),
+        false => (false, format!("{}\n{text}", describe_exit(status))),
+    };
+    // A backgrounded server dies with the call and the exit status
+    // is still 0, so without this the next step is a request to a
+    // port nothing is listening on.
+    let text = match output.background_terminated {
+        true => format!("{text}\n{BACKGROUND_TERMINATED_NOTE}"),
+        false => text,
+    };
+    ToolOutcome::from_process(ok, text, output, truncated)
+}
+
+/// Each bash call and each external tool call runs in its own process group,
+/// and the group is terminated when the call returns, so a backgrounded
+/// process does not outlive it. The exit status is still the command's, which
+/// means a caller that started a server sees success and an absent server,
+/// with nothing connecting the two.
 ///
 /// `setsid` is named as a conditional, not a recipe: it is util-linux and does
 /// not exist on macOS, where the harness also runs. A named tmux session is the
@@ -1021,11 +1032,11 @@ async fn bash_tool(
 /// durable background work.
 pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
     "[openmax: this command left running background processes, and they were ",
-    "terminated when it returned. Every bash call runs in its own process group ",
-    "and that group is cleaned up on exit, so `&`, `nohup` and `disown` do not ",
-    "survive the call. To keep something running, start it in a named tmux ",
-    "session you can inspect and reattach, or, on Linux only, detach it from the ",
-    "group with `setsid`.]"
+    "terminated when it returned. Every bash or external tool call runs in its ",
+    "own process group and that group is cleaned up on exit, so `&`, `nohup` ",
+    "and `disown` do not survive the call. To keep something running, start it ",
+    "in a named tmux session you can inspect and reattach, or, on Linux only, ",
+    "detach it from the group with `setsid`.]"
 );
 
 /// Describe a non-success exit honestly. A signal kill has no exit code, and
