@@ -130,9 +130,11 @@ writes the call's JSON arguments to stdin as one newline-terminated line, and
 returns stdout as the result.
 Nonzero exit makes the result an error carrying `exit code N` plus output.
 Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
-7 days. The tool runs in its own process group, and that group is cleaned up
-when the tool exits: anything it started in the background (`&`, `nohup`,
-`disown`) is terminated then, and the result carries a note saying so. A
+7 days. The tool runs in its own process group. When the tool exits, any
+process still in that group is terminated (`&`, `nohup` and `disown` leave a
+process there), and the result carries a note saying so. Cleanup reaches only
+that group: a process that moved itself to a new session or group is neither
+stopped nor reported. A
 helper that must outlive the call, such as a long-lived server, belongs in a
 named tmux session. The process is a
 native host process with the network and filesystem authority of Open Max;
