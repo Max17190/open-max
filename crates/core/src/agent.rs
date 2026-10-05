@@ -12,8 +12,9 @@
 //!    capability the agent wrote in the previous turn is usable in this one
 //!    without `/reload`.
 //! 3. Budget enforcement, which truncates old tool output and then drops whole
-//!    exchanges, always keeping `[system, first user]` so the cache prefix and
-//!    the original request survive.
+//!    exchanges, always keeping the system prompt and the conversation's
+//!    opening through the user's first request (see `pinned_head`) so the
+//!    cache prefix and the original request survive.
 //! 4. Per tool call: permissions, then `approval_mode`, then the human, then
 //!    execution. Assistant messages carrying `tool_calls` are persisted BEFORE
 //!    the tools run, so a cancel or crash cannot leave a call with no record.
@@ -1166,10 +1167,13 @@ async fn prepare_compaction_digest(
     spend: &mut RequestSpend,
 ) -> (Vec<ChatMessage>, Option<sessions::CompactionRecord>) {
     let CompactionCtx { core, session_id, client, cancelled, .. } = *ctx;
+    // The prune's note sits right after the pinned head, and a digest note
+    // ends the opening run, so the head of the pruned candidate is its slot.
+    let slot = pinned_head(messages);
     if digest.message_count == 0 {
         // Truncation-only: upgrade the note the prune just inserted with the
         // address. This candidate stays private until commit. Matched by content,
-        // not by position: index 2 may instead hold an earlier prune's real
+        // not by position: the slot may instead hold an earlier prune's real
         // digest note, which carries a summary and Files touched this note
         // does not. No summarizer request (dropped_text is empty so
         // summarize_compaction returns None anyway), no compaction record (an
@@ -1177,12 +1181,12 @@ async fn prepare_compaction_digest(
         // the structured carry-forward absorb_prior depends on), and no
         // compaction hook, which today fires only for real compactions.
         let inserted = digest.format_truncation_only(None);
-        if messages.len() > 2
-            && is_digest_message(&messages[2])
-            && messages[2].content.as_deref() == Some(inserted.as_str())
+        if messages.len() > slot
+            && is_digest_message(&messages[slot])
+            && messages[slot].content.as_deref() == Some(inserted.as_str())
         {
             let path = sessions::archive_display(core, session_id);
-            messages[2] = ChatMessage::user(digest.format_truncation_only(Some(&path)));
+            messages[slot] = ChatMessage::user(digest.format_truncation_only(Some(&path)));
         }
         let mut archive = digest.truncated;
         archive.extend(digest.dropped);
@@ -1196,15 +1200,15 @@ async fn prepare_compaction_digest(
     }
     let path = sessions::archive_display(core, session_id);
     // Upgrade the heuristic note to a model-written summary when
-    // the endpoint cooperates; the note at index 2 was just
+    // the endpoint cooperates; the note in the slot was just
     // inserted by the prune, so replacing it here keeps one
     // digest message.
     let note = match summarize_compaction(core, session_id, client, &digest, cancelled, spend).await {
         Some(summary) => digest.format_with_summary(&summary, Some(&path)),
         None => digest.format(Some(&path)),
     };
-    if messages.len() > 2 && is_digest_message(&messages[2]) {
-        messages[2] = ChatMessage::user(note.clone());
+    if messages.len() > slot && is_digest_message(&messages[slot]) {
+        messages[slot] = ChatMessage::user(note.clone());
     }
     let record = digest.to_record(note);
     let mut archive = digest.truncated;
@@ -4005,15 +4009,35 @@ const PRUNE_TARGET_PCT: usize = 70;
 /// separate decision from choosing which bytes it holds.
 const TRUNCATED_WIDTH: usize = 160;
 
-/// The text a prune is keeping: the first user message (the standing request)
-/// and the tail that survives untouched. Used as the relevance signal for
-/// which slice of an old tool output to keep, so it must describe what the
-/// transcript will still contain, not what is being removed. Bounded: only
-/// the tail's own bytes, which the budget already caps.
-fn live_context(messages: &[ChatMessage], keep_tail: usize) -> String {
+/// How many leading messages a prune keeps: the system prompt and the
+/// conversation's opening, through the user's original request. Turn-start
+/// notes (the execution policy, a refreeze receipt, a policy notice) are
+/// inserted ahead of the prompt they accompany, so a first turn opens
+/// `[system, note, request]` and the request ends the opening run of user
+/// messages rather than sitting at index 1. Pinning index 1 alone kept the
+/// note forever and dropped the request first. The run ends at the first
+/// model reply or at a previous prune's digest note, which sits right after
+/// the head. Never below 2, the floor every transcript was already pruned
+/// with, so one that opens `[system, request]` prunes exactly as before.
+fn pinned_head(messages: &[ChatMessage]) -> usize {
+    let opening = messages
+        .iter()
+        .skip(1)
+        .take_while(|m| m.role == "user" && !is_digest_message(m))
+        .count();
+    (1 + opening).max(2)
+}
+
+/// The text a prune is keeping: the pinned head (through the standing
+/// request) and the tail that survives untouched. Used as the relevance
+/// signal for which slice of an old tool output to keep, so it must describe
+/// what the transcript will still contain, not what is being removed.
+/// Bounded: only the head's and the tail's own bytes, which the budget
+/// already caps.
+fn live_context(messages: &[ChatMessage], head: usize, keep_tail: usize) -> String {
     let mut out = String::new();
     for (i, msg) in messages.iter().enumerate() {
-        let keeps = i == 1 || i >= keep_tail;
+        let keeps = i < head || i >= keep_tail;
         if !keeps || msg.role == "system" {
             continue;
         }
@@ -4107,8 +4131,8 @@ const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
 /// summary request each time.
 ///
 /// Irreducible means exactly what a maximal prune leaves: the drop loop's
-/// six-message length floor ends at the pinned head, the digest note, and
-/// the newest three messages, so those (plus the note's own allowance) are
+/// length floor ends at the pinned head, the digest note, and the newest
+/// three messages, so those (plus the note's own allowance) are
 /// what the target must contain. Counting more would fall back while a
 /// configured prune could in fact succeed, silently disabling the setting.
 ///
@@ -4126,12 +4150,13 @@ fn compaction_trigger(
     if schemas_outgrow_budget(trigger, schema_tokens) {
         return budget;
     }
+    let head = pinned_head(messages);
     let irreducible: usize = schema_tokens
         + DIGEST_NOTE_ALLOWANCE_TOKENS
         + messages
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i < 2 || i + 3 >= messages.len())
+            .filter(|(i, _)| *i < head || i + 3 >= messages.len())
             .map(|(_, m)| m.estimated_tokens())
             .sum::<usize>();
     if prune_target(trigger) < irreducible {
@@ -4238,20 +4263,23 @@ fn prune_transcript(
     mut total: usize,
 ) -> (bool, Option<CompactionDigest>) {
     let target = achievable_target(budget, schema_tokens);
+    // Fixed for the whole prune: once an exchange is dropped, later user
+    // messages would join the opening run and pin themselves.
+    let head = pinned_head(messages);
     let keep_tail = messages.len().saturating_sub(6);
     // What the transcript will still be about once this prune is done: the
     // original request plus the surviving tail. Truncation keeps the slice of
     // each old tool output that speaks to *this*, so the bytes that stay are
     // the ones the live conversation refers to.
-    let live_context = live_context(messages, keep_tail);
+    let live_context = live_context(messages, head, keep_tail);
     let mut digest = CompactionDigest::new(dropped_text_cap(budget));
     let mut truncated = false;
     // Room for the note a truncation-only prune leaves below, so meeting the
-    // target and then gaining the note cannot end above it. Zero when index 2
-    // already holds a real digest note: that note carries the archive address
-    // and fields (Files touched, the model summary) this one does not, so it
-    // is left alone and nothing new is inserted.
-    let note_reserve = if messages.len() > 2 && is_digest_message(&messages[2]) {
+    // target and then gaining the note cannot end above it. Zero when the
+    // slot after the head already holds a real digest note: that note carries
+    // the archive address and fields (Files touched, the model summary) this
+    // one does not, so it is left alone and nothing new is inserted.
+    let note_reserve = if messages.len() > head && is_digest_message(&messages[head]) {
         0
     } else {
         TRUNCATION_NOTE_ALLOWANCE_TOKENS
@@ -4284,19 +4312,19 @@ fn prune_transcript(
         // advertise an address the archive does not honor. The upgrade is
         // `prepare_compaction_digest`'s.
         if note_reserve > 0 && !digest.truncated.is_empty() {
-            messages.insert(2, ChatMessage::user(digest.format_truncation_only(None)));
+            messages.insert(head, ChatMessage::user(digest.format_truncation_only(None)));
         }
         return (true, Some(digest).filter(CompactionDigest::has_archive_material));
     }
-    // Drop whole exchanges starting after [system, first user]. Keep tool
+    // Drop whole exchanges starting after the pinned head. Keep tool
     // replies consistent with the assistant message that requested them.
-    while total > target && messages.len() > 6 {
-        let removed = messages.remove(2);
+    while total > target && messages.len() > head + 4 {
+        let removed = messages.remove(head);
         digest.record_message(&removed);
         total = total.saturating_sub(removed.estimated_tokens());
         if removed.role == "assistant" && removed.tool_calls.is_some() {
-            while messages.len() > 2 && messages[2].role == "tool" {
-                let tool = messages.remove(2);
+            while messages.len() > head && messages[head].role == "tool" {
+                let tool = messages.remove(head);
                 digest.record_message(&tool);
                 total = total.saturating_sub(tool.estimated_tokens());
             }
@@ -4304,24 +4332,24 @@ fn prune_transcript(
     }
     if digest.message_count > 0 {
         let note = ChatMessage::user(digest.format(None));
-        if messages.len() > 2 && is_digest_message(&messages[2]) {
-            messages[2] = note;
+        if messages.len() > head && is_digest_message(&messages[head]) {
+            messages[head] = note;
         } else {
-            messages.insert(2, note);
+            messages.insert(head, note);
         }
         // Digest insert can push total slightly over target; keep dropping
-        // exchanges after the digest (index 3) so the next turn stays
+        // exchanges after the digest (head + 1) so the next turn stays
         // append-only and does not re-mutate history for another prune.
         // Record dropped messages into the same digest so the note stays a
         // faithful summary of everything removed (not only the first pass).
         total = schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
-        while total > target && messages.len() > 6 {
-            let removed = messages.remove(3);
+        while total > target && messages.len() > head + 4 {
+            let removed = messages.remove(head + 1);
             digest.record_message(&removed);
             total = total.saturating_sub(removed.estimated_tokens());
             if removed.role == "assistant" && removed.tool_calls.is_some() {
-                while messages.len() > 3 && messages[3].role == "tool" {
-                    let tool = messages.remove(3);
+                while messages.len() > head + 1 && messages[head + 1].role == "tool" {
+                    let tool = messages.remove(head + 1);
                     digest.record_message(&tool);
                     total = total.saturating_sub(tool.estimated_tokens());
                 }
@@ -4329,8 +4357,8 @@ fn prune_transcript(
         }
         // Always refresh the note after the drop loop so extra removals are
         // reflected even when the first-pass note was already inserted above.
-        if messages.len() > 2 && is_digest_message(&messages[2]) {
-            messages[2] = ChatMessage::user(digest.format(None));
+        if messages.len() > head && is_digest_message(&messages[head]) {
+            messages[head] = ChatMessage::user(digest.format(None));
         }
         (true, Some(digest))
     } else {
@@ -9419,6 +9447,28 @@ mod tests {
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
     }
 
+    /// Behind a note-first opening, every prune keeps `[system, note,
+    /// request]` and replaces the one digest right after it. A head that ran
+    /// past the digest would pin the previous digest and stack a new one per
+    /// prune.
+    #[test]
+    fn reprunes_keep_a_note_first_opening_and_one_digest() {
+        let note = execution_policy_note(ApprovalMode::Ask);
+        let mut messages = vec![msg("system", 400), ChatMessage::user(note.clone()), ChatMessage::user("the task")];
+        for _ in 0..2 {
+            for _ in 0..20 {
+                messages.push(msg("assistant", 2000));
+                messages.push(msg("user", 2000));
+            }
+            let (changed, digest) = enforce_budget(&mut messages, 2000, 0);
+            assert!(changed && digest.is_some_and(|d| d.message_count > 0));
+            assert_eq!(messages[1].content.as_deref(), Some(note.as_str()));
+            assert_eq!(messages[2].content.as_deref(), Some("the task"));
+            assert!(is_digest_message(&messages[3]), "{messages:?}");
+            assert_eq!(messages.iter().filter(|m| is_digest_message(m)).count(), 1);
+        }
+    }
+
     #[test]
     fn budget_truncates_old_tool_output_first() {
         let mut messages = vec![msg("system", 100), msg("user", 100)];
@@ -10508,6 +10558,144 @@ mod tests {
                     .is_some_and(|c| c.starts_with(DIGEST_PREFIX)),
             "the digest note is at index 2 on disk"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A request longer than any digest snippet, so only the message itself
+    /// can satisfy a verbatim match after a prune.
+    fn original_request() -> String {
+        let request = format!(
+            "rename the parser's public types and update every caller: {}",
+            "keep the wire format byte-identical; ".repeat(6)
+        );
+        assert!(request.len() > MAX_DIGEST_SNIPPET_BYTES);
+        request
+    }
+
+    fn keeps_verbatim(messages: &[ChatMessage], request: &str) -> bool {
+        messages.iter().any(|m| m.role == "user" && m.content.as_deref() == Some(request))
+    }
+
+    /// The window a forced prune must cut into: the transcript as it stands
+    /// is the whole budget, so the 70% target sits below it.
+    async fn size_window_to_transcript(core: &Arc<Core>, id: &str) {
+        let used = {
+            let map = core.sessions.lock().await;
+            let data = &map[id];
+            estimate_tokens(data.registry.schemas_wire_arc().len())
+                + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
+        };
+        let mut s = core.settings.lock().unwrap();
+        s.context_tokens = Some(used + s.max_tokens + 1024);
+    }
+
+    /// The first turn of a fresh session inserts the execution-policy note
+    /// ahead of the prompt, so the user's request is not the message right
+    /// after the system prompt. A prune that pinned by position kept that
+    /// note forever and dropped the request first, leaving a long session
+    /// with at most a clipped snippet of its own task.
+    #[tokio::test]
+    async fn a_prune_keeps_the_original_request_behind_a_first_turn_note() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let (base_url, _) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(400_000);
+            s.max_tokens = 1_024;
+        }
+
+        let request = original_request();
+        start_turn(core.clone(), id.clone(), project.clone(), request.clone()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let opened = transcript(&core, &id).await;
+        let at = opened
+            .iter()
+            .position(|m| m.content.as_deref() == Some(request.as_str()))
+            .expect("the first turn records the request");
+        assert!(
+            opened[1..at]
+                .iter()
+                .any(|m| m.content.as_deref().is_some_and(|c| c.starts_with("[execution policy:"))),
+            "the fixture must open with the policy note ahead of the request: {opened:?}"
+        );
+        for step in 0..6 {
+            let prompt = format!("step {step}: {}", "more detail ".repeat(200));
+            start_turn(core.clone(), id.clone(), project.clone(), prompt).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        }
+
+        size_window_to_transcript(&core, &id).await;
+        let cancel = Arc::new(CancelToken::default());
+        let receipt = run_compact(&core, &id, &project, &cancel).await.unwrap();
+        assert!(receipt.compacted_messages > 0, "the forced prune must drop exchanges");
+        assert!(
+            keeps_verbatim(&transcript(&core, &id).await, &request),
+            "the original request must survive the prune in memory"
+        );
+        assert!(
+            keeps_verbatim(&sessions::load_messages(&core, &id).unwrap().unwrap(), &request),
+            "the original request must survive the prune on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Session files already on disk open with `[system, note, request]`, the
+    /// shape every first turn wrote. Hydrating one and pruning it must keep
+    /// the request too, and keep the note ahead of it where the model read it.
+    #[tokio::test]
+    async fn a_persisted_note_first_transcript_keeps_its_request_through_a_prune() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            // A refused connection: the summary upgrade fails fast and the
+            // heuristic note lands.
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.max_tokens = 1_024;
+        }
+        let note = execution_policy_note(ApprovalMode::Auto);
+        let request = original_request();
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            data.messages.push(ChatMessage::user(note.clone()));
+            data.messages.push(ChatMessage::user(request.clone()));
+            data.messages.push(ChatMessage::assistant(Some("on it".into()), None));
+            for step in 0..6 {
+                data.messages.push(ChatMessage::user(format!("step {step}: {}", "more detail ".repeat(200))));
+                data.messages.push(ChatMessage::assistant(Some("done".into()), None));
+            }
+            let mut persisted = 0usize;
+            assert!(sessions::save_messages(&core, &id, &data.messages, &mut persisted, true));
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+
+        ensure_session_hydrated(&core, &id, &project).await.unwrap();
+        size_window_to_transcript(&core, &id).await;
+        let cancel = Arc::new(CancelToken::default());
+        let receipt = run_compact(&core, &id, &project, &cancel).await.unwrap();
+        assert!(receipt.compacted_messages > 0, "the forced prune must drop exchanges");
+        let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
+        assert!(keeps_verbatim(&on_disk, &request), "the original request must survive: {on_disk:?}");
+        assert_eq!(on_disk[1].content.as_deref(), Some(note.as_str()), "the note keeps its place");
+        assert_eq!(on_disk[2].content.as_deref(), Some(request.as_str()), "the request follows it");
 
         let _ = std::fs::remove_dir_all(dir);
     }
