@@ -254,8 +254,10 @@ struct UsageJson {
     completion_tokens: Option<u64>,
     prompt_tokens_details: Option<PromptTokensDetails>,
     // Some servers report cache hits here instead of (or beside)
-    // `prompt_tokens_details.cached_tokens`.
-    prompt_cache_hit_tokens: Option<u64>,
+    // `prompt_tokens_details.cached_tokens`. Kept untyped so a value of the
+    // wrong type in this fallback cannot fail the whole usage object, or a
+    // streamed chunk's content with it.
+    prompt_cache_hit_tokens: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -271,7 +273,7 @@ impl UsageJson {
             cached_tokens: self
                 .prompt_tokens_details
                 .and_then(|d| d.cached_tokens)
-                .or(self.prompt_cache_hit_tokens),
+                .or(self.prompt_cache_hit_tokens.and_then(|v| v.as_u64())),
         }
     }
 }
@@ -1284,6 +1286,36 @@ mod tests {
         assert_eq!(usage_of(json!({"prompt_tokens_details":{"cached_tokens":70}})).cached_tokens, Some(70));
         // A server that reports neither still reads as not reported, not zero.
         assert_eq!(usage_of(json!({"prompt_tokens":100})).cached_tokens, None);
+    }
+
+    /// `prompt_cache_hit_tokens` is only a fallback. A value of the wrong
+    /// type there must not fail the whole usage object (or, when streamed,
+    /// the whole chunk with its content): that would lose token counts and
+    /// text that parsed fine before the field was read at all.
+    #[tokio::test]
+    async fn an_unusable_prompt_cache_hit_tokens_keeps_the_rest_of_usage() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":70},\"prompt_cache_hit_tokens\":\"80\"}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("ok", "stop"));
+        let usage = result.usage.expect("usage beside an unusable fallback still parses");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens), (100, 5, Some(70)));
+
+        let usage_of = |usage: Value| {
+            let reply = json!({"choices":[{"message":{"content":"ok"}}],"usage":usage});
+            parse_complete_response(&reply, &mut |_| {}).unwrap().usage.expect("usage is parsed")
+        };
+        let with_details = json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":70},"prompt_cache_hit_tokens":"80"});
+        assert_eq!(usage_of(with_details).cached_tokens, Some(70));
+        // With nothing usable to fall back on, cached tokens read as not reported.
+        for bad in [json!("80"), json!(-1), json!(1.5), json!({})] {
+            let usage = usage_of(json!({"prompt_tokens":100,"prompt_cache_hit_tokens":bad}));
+            assert_eq!((usage.prompt_tokens, usage.cached_tokens), (100, None));
+        }
     }
 
     /// An endpoint that answers successive connections with successive
