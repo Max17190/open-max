@@ -7,8 +7,8 @@
 //! project's `.agents/skills/<name>/SKILL.md` — the emerging cross-harness
 //! convention — with the project winning on name collision. A SKILL.md
 //! carries `---`-delimited frontmatter with `name:` and `description:`;
-//! only those two keys are read (bare, double-quoted, or a `>`/`|` block
-//! scalar for the description), so no YAML dependency is needed.
+//! only those two keys are read (bare, single- or double-quoted, or a `>`/`|`
+//! block scalar for the description), so no YAML dependency is needed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,7 +65,8 @@ pub(crate) fn discover_in(dirs: &[PathBuf]) -> Vec<SkillSpec> {
 }
 
 /// Pull `name:` and `description:` out of the frontmatter block. Values may
-/// be bare or double-quoted; anything more exotic belongs in the body.
+/// be bare, single-quoted, or double-quoted; anything more exotic belongs in
+/// the body.
 /// Errors are ignored by discovery and surfaced verbatim by `openmax --check`.
 pub(crate) fn parse_skill_md(path: &Path) -> Result<SkillSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
@@ -97,7 +98,7 @@ pub(crate) fn parse_skill_source(path: &Path, text: &str) -> Result<SkillSpec, S
             // a second line, clause, or row, so it is flattened to one line
             // here; length and every printable character survive, so the
             // Agent Skills portability warning still sees the real name.
-            name = Some(crate::text::one_line(v.trim().trim_matches('"')));
+            name = Some(crate::text::one_line(&unquote(v.trim())));
         }
     }
     let name = name
@@ -122,17 +123,17 @@ pub(crate) fn raw_description(text: &str) -> Option<String> {
 }
 
 /// Every top-level `description:` value of one frontmatter block, in order,
-/// each folded to a single line. Three spellings are read: a bare value, a
-/// double-quoted value, and a YAML block scalar (`>` folded or `|` literal,
-/// with an optional `-`/`+` chomping indicator and an optional explicit
-/// indentation digit), whose value is the indented lines that follow.
-/// Multi-line values fold to one line because the index line is one line;
-/// the frontmatter's `>` says the author meant that too. Anything more
-/// exotic (single quotes, flow mappings, anchors) reads as its literal
-/// spelling. An INDENTED `description:` is someone else's data (a nested
-/// map's field, like the standard `metadata:` block) and never one of these
-/// values. Callers pick first or last; each surface keeps the choice it
-/// always made.
+/// each folded to a single line. Four spellings are read: a bare value, a
+/// single-quoted value (`''` is an escaped quote), a double-quoted value,
+/// and a YAML block scalar (`>` folded or `|` literal, with an optional
+/// `-`/`+` chomping indicator and an optional explicit indentation digit),
+/// whose value is the indented lines that follow. Multi-line values fold to
+/// one line because the index line is one line; the frontmatter's `>` says
+/// the author meant that too. Anything more exotic (flow mappings, anchors)
+/// reads as its literal spelling. An INDENTED `description:` is someone
+/// else's data (a nested map's field, like the standard `metadata:` block)
+/// and never one of these values. Callers pick first or last; each surface
+/// keeps the choice it always made.
 pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
     let lines: Vec<&str> = block.lines().collect();
     let mut descriptions = Vec::new();
@@ -183,7 +184,7 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
             // non-blank line no deeper than the key, so a sibling key never
             // joins the value. A quoted value is a single token by
             // definition and takes no continuation.
-            let raw = value.trim_matches('"');
+            let raw = unquote(value);
             // A quoted value is one token by definition. A value that OPENS
             // like a block-scalar header but is not a legal one (`>0`, a zero
             // indent digit) stays literal and takes no continuation either:
@@ -193,7 +194,7 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
                 || value.starts_with('\'')
                 || value.starts_with('>')
                 || value.starts_with('|');
-            let mut parts: Vec<&str> = vec![raw];
+            let mut parts: Vec<&str> = vec![&raw];
             if !literal {
                 while i < lines.len() {
                     let next = lines[i];
@@ -220,6 +221,18 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
         }
     }
     descriptions
+}
+
+/// A one-line frontmatter value with its quotes removed. A single-quoted
+/// scalar reads the way YAML reads it (`''` is one literal quote, and a
+/// double quote inside is literal); read verbatim, `name: 'pdf'` indexed as
+/// `'pdf'`, quotes and all, and never collided with a bare `pdf`. Any other
+/// value has its surrounding double quotes trimmed, as it always has.
+fn unquote(value: &str) -> String {
+    match value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => value.trim_matches('"').to_string(),
+    }
 }
 
 /// Whether a value is a YAML block scalar header (`>` or `|`, optionally
@@ -341,6 +354,39 @@ mod tests {
             "Audits config files. name: fields inside YAML are checked too."
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A single-quoted scalar is ordinary YAML (`''` is its escaped quote),
+    /// and every standard consumer reads it unquoted. Reading it literally
+    /// indexed `name: 'pdf'` as `'pdf'`, quotes included, so the prompt
+    /// index advertised a name the file does not state and a same-named
+    /// bare skill elsewhere never collided with it.
+    #[test]
+    fn a_single_quoted_name_and_description_are_unquoted() {
+        let spec = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: 'pdf'\ndescription: 'It''s a test'\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(spec.name, "pdf");
+        assert_eq!(spec.description, "It's a test");
+
+        // The same reader serves prompt templates.
+        assert_eq!(frontmatter_descriptions("description: 'It''s a test'"), vec!["It's a test"]);
+
+        // Each quote style is literal inside the other.
+        let nested = parse_skill_source(
+            Path::new("SKILL.md"),
+            "---\nname: \"it's\"\ndescription: '\"quoted\"'\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(nested.name, "it's");
+        assert_eq!(nested.description, "\"quoted\"");
+
+        // An unterminated single quote is not a quoted scalar; it stays
+        // literal, as any malformed spelling does.
+        let open = parse_skill_source(Path::new("SKILL.md"), "---\nname: 'pdf\n---\nbody\n").unwrap();
+        assert_eq!(open.name, "'pdf");
     }
 
     #[test]

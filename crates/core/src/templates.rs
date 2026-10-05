@@ -184,8 +184,8 @@ pub(crate) fn raw_description(text: &str) -> Option<String> {
 }
 
 /// Same reader as SKILL.md (`skills::frontmatter_descriptions`): bare,
-/// double-quoted, or a `>`/`|` block scalar folded to one line. Templates
-/// keep the first `description:` key, as they always have.
+/// single- or double-quoted, or a `>`/`|` block scalar folded to one line.
+/// Templates keep the first `description:` key, as they always have.
 fn frontmatter_description(text: &str) -> Option<String> {
     let rest = text.strip_prefix("---")?;
     let end = frontmatter_end(text)?;
