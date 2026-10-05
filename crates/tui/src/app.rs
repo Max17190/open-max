@@ -313,9 +313,11 @@ struct ToolMeta {
 pub struct App {
     core: Arc<Core>,
     project: PathBuf,
-    /// `project` resolved once at launch, the key its approval mode is read
-    /// by. The status line shows that mode on every chrome frame; resolving
-    /// the path there cost filesystem syscalls on every keystroke.
+    /// `project` resolved, the key its approval mode is read by. The status
+    /// line shows that mode on every chrome frame; resolving the path there
+    /// cost filesystem syscalls on every keystroke. So it is resolved at
+    /// launch and again only where the mode is read to act on it (see
+    /// `refresh_project_root`).
     project_root: PathBuf,
     session_id: Option<String>,
     /// A /resume (or --continue) picked this session and no turn has
@@ -1546,6 +1548,8 @@ impl App {
     fn select_approval_mode(&mut self, mode: config::ApprovalMode) -> bool {
         match self.core.set_project_approval_mode(&self.project, mode) {
             Ok(()) => {
+                // The save resolved the path itself; show the project it saved for.
+                self.refresh_project_root();
                 self.note(&format!("approvals: {} for this project (saved)", mode.as_str()));
                 self.dirty.mark_chrome();
                 true
@@ -1558,12 +1562,27 @@ impl App {
     }
 
     fn cycle_approval_mode(&mut self) {
+        self.refresh_project_root();
         self.select_approval_mode(self.approval_mode().next());
     }
 
     /// The mode the status line shows. Reads no filesystem.
     fn approval_mode(&self) -> config::ApprovalMode {
         self.core.approval_mode_canonical(&self.project_root)
+    }
+
+    /// Re-resolve `project_root`. Turns and saves resolve the project path
+    /// when they run, so once the path leads to another project (the
+    /// directory moved and a symlink took its place) a stale root would show
+    /// one project's mode while turns enforce the other's. Called where the
+    /// mode is read to act on it: a submit, a tool call, a selection. Never
+    /// per frame.
+    fn refresh_project_root(&mut self) {
+        let root = open_max_core::state::canonical_root(&self.project);
+        if root != self.project_root {
+            self.project_root = root;
+            self.dirty.mark_chrome();
+        }
     }
 
     /// Approval hit regions use the fixed order allow once, auto for project,
@@ -2090,6 +2109,8 @@ impl App {
     // ---------- submission and slash commands ----------
 
     async fn handle_submit(&mut self, text: String) -> std::io::Result<()> {
+        // A turn, /status, and /approvals all read the mode.
+        self.refresh_project_root();
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
             let builtin = head == "exit"
@@ -2690,6 +2711,8 @@ impl App {
                 self.dirty.mark_chrome();
             }
             AgentEvent::ToolStart { call_id, name, args } => {
+                // The turn reads the approval mode for this call.
+                self.refresh_project_root();
                 let summary = registry::summarize_call(&name, &args);
                 self.tool_meta.insert(
                     call_id,
@@ -4598,6 +4621,63 @@ mod tests {
         render_app(&mut app, 100, 12);
         let after = line_text(&app.status_line);
         assert!(after.ends_with("  auto "), "a draw re-resolved the project path: {after:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Turns and saves resolve the project path when they run. When the
+    /// launch path comes to lead to another trusted project (the directory
+    /// moved and a symlink to another project took its place), Shift+Tab and
+    /// the status line must follow it too, or the line shows one project's
+    /// mode while turns enforce the other's, and Shift+Tab steps from the
+    /// shown mode but saves the result for the other project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_mode_follows_the_project_turns_resolve() {
+        let dir = crate::test_temp_dir("openmax-app-retargeted-root");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let link = dir.join("link");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &first).unwrap();
+        open_max_core::trust::trust_project(&dir, &second).unwrap();
+        core.set_project_approval_mode(&first, config::ApprovalMode::Auto).unwrap();
+        core.set_project_approval_mode(&second, config::ApprovalMode::Readonly).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core, link.clone(), files_tx);
+        render_app(&mut app, 100, 12);
+        let launch = line_text(&app.status_line);
+        assert!(launch.ends_with("  auto "), "{launch:?}");
+
+        let retarget = |to: &std::path::Path| {
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(to, &link).unwrap();
+        };
+        retarget(&second);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(
+            app.core.approval_mode(&link),
+            config::ApprovalMode::Ask,
+            "Shift+Tab must step from the mode turns enforce (readonly), not the one last shown",
+        );
+        assert_eq!(app.core.approval_mode(&first), config::ApprovalMode::Auto);
+        render_app(&mut app, 100, 12);
+        let stepped = line_text(&app.status_line);
+        assert!(stepped.ends_with("  ask "), "{stepped:?}");
+
+        // A tool call is where a turn reads the mode, so it re-syncs the line.
+        retarget(&first);
+        app.dirty.clear();
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            args: json!({"command": "ls"}),
+        });
+        render_app(&mut app, 100, 12);
+        let during_turn = line_text(&app.status_line);
+        assert!(during_turn.ends_with("  auto "), "{during_turn:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 
