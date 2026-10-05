@@ -906,9 +906,9 @@ here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
 model request is being resent after a transport failure, a 429 or transient
-5xx, or, before any reply text, a stream that died or that the provider
-failed with a rate limit or a server fault; thinking already streamed for
-that attempt is void), `diff` (call_id,
+5xx, or, before any reply text, a stream that died or a stream or reply the
+provider failed with a rate limit, an overload, or a server fault; thinking
+already streamed for that attempt is void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming

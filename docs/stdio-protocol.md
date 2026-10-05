@@ -72,7 +72,7 @@ one).
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
 | `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt, or a policy, providers, settings, or approval notice. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |
-| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out of the `max_attempts` budget after a backoff wait, `reason` having ended the previous one with a transport failure, a 429 or transient server error (500, 502, 503, 504, 529), or, before any reply text arrived, a stream that died or that the provider failed with a rate limit or a server fault. The wait is the backoff, or the response's `Retry-After` in seconds when that is longer. A `Retry-After` of more than a minute is not retried: the request fails at once and the error names the server's wait. Neither is a 429 reporting an exhausted quota (`insufficient_quota`). Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` lines already emitted for that attempt are void and the reply starts over; no `token` line precedes a retried stream. A request gives up before the budget when three attempts in a row never reached the endpoint) |
+| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out of the `max_attempts` budget after a backoff wait, `reason` having ended the previous one with a transport failure, a 429 or transient server error (500, 502, 503, 504, 529), or, before any reply text arrived, a stream that died or a stream or reply the provider failed with a rate limit, an overload, or a server fault. The wait is the backoff, or the response's `Retry-After` in seconds when that is longer. A `Retry-After` of more than a minute is not retried: the request fails at once and the error names the server's wait. Neither is a 429 reporting an exhausted quota (`insufficient_quota`). Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` lines already emitted for that attempt are void and the reply starts over; no `token` line precedes a retried stream. A request gives up before the budget when three attempts in a row never reached the endpoint) |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha`, and optional `env` (see below) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
@@ -120,12 +120,14 @@ state and cancellation token. A client may submit the next turn immediately.
 Every `user` command is answered by exactly one `done`, and `done` is the only
 guaranteed terminator: never block waiting for another event. On a normal turn
 a run of `token` deltas is terminated by one `message_done`, but a turn that
-hits a provider-stream error emits an `error` line and then `done` with no
-`message_done`. A turn that dies unexpectedly reports `error` and then `done`
-with `stop_reason` `error`, so a crash is an event rather than a silent stall.
-A stream the provider abandons mid-answer still emits `message_done` (with the
-partial text, which is kept in the session), then an `error` line, then `done`
-with `stop_reason` `truncated`: an incomplete answer is never reported as a
+hits a provider-stream error, including a failure the provider reports inside
+the stream after some `token` lines, emits an `error` line and then `done`
+with no `message_done`; that partial text is not kept. A turn that dies
+unexpectedly reports `error` and then `done` with `stop_reason` `error`, so a
+crash is an event rather than a silent stall. A stream that ends mid-answer
+with no completion signal still emits `message_done` (with the partial text,
+which is kept in the session), then an `error` line, then `done` with
+`stop_reason` `truncated`: an incomplete answer is never reported as a
 finished one. No tool call carried by such a stream is dispatched, even one
 whose arguments parse, because a stream with no completion signal never said
 which calls the model meant to make.
