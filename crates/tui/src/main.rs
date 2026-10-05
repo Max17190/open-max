@@ -9,12 +9,13 @@ mod ui;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::execute;
+use crossterm::{execute, queue};
 use open_max_core::state::{default_data_dir, Core};
 
 const HELP: &str = "openmax: a barebones high-performance agent harness
@@ -968,6 +969,10 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(2);
     }
 
+    // Signals are routed before the terminal changes, so none of them can
+    // fall back to its default action and exit with every mode left on.
+    let quit = watch_quit_signals();
+
     // Fullscreen session on the alternate screen: openmax owns the whole
     // terminal while it runs, and your shell (prompt, history, scrollback)
     // reappears untouched on exit.
@@ -981,69 +986,211 @@ async fn main() -> std::io::Result<()> {
 
     // Kitty keyboard protocol makes Shift+Enter distinct; Alt+Enter stays as
     // the fallback everywhere else. Bracketed paste for sane multiline paste.
-    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        let _ = execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            )
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        enable_mode(
+            MODE_KEYBOARD,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         );
     }
-    let _ = execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    enable_mode(MODE_PASTE, crossterm::event::EnableBracketedPaste);
     // Mouse capture for wheel scrolling of the transcript. Terminals still
     // allow text selection with the usual modifier (Option on macOS).
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    enable_mode(MODE_MOUSE, EnableMouseCapture);
     // Focus reports gate the turn-done ring on the user being away.
-    let _ = execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
+    enable_mode(MODE_FOCUS, crossterm::event::EnableFocusChange);
 
     let result = app::run(
         terminal,
         core,
         core_rx,
-        app::Args { continue_session: cli.continue_session },
+        app::Args { continue_session: cli.continue_session, quit },
     )
     .await;
 
-    let _ = execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-    if enhanced {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    ratatui::restore();
-    pop_title();
+    restore_terminal();
     result
+}
+
+/// Terminal modes the fullscreen session has switched on, one bit each.
+/// Every exit path (quit, a signal, a failed init, a UI panic) ends in
+/// `restore_terminal`, which undoes exactly these. A mode left on outlives
+/// the process: mouse reporting alone turns every later mouse move into
+/// escape bytes typed at the shell prompt.
+static TERM_MODES: AtomicU8 = AtomicU8::new(0);
+const MODE_RAW: u8 = 1;
+const MODE_TITLE: u8 = 1 << 1;
+const MODE_ALT_SCREEN: u8 = 1 << 2;
+const MODE_KEYBOARD: u8 = 1 << 3;
+const MODE_PASTE: u8 = 1 << 4;
+const MODE_MOUSE: u8 = 1 << 5;
+const MODE_FOCUS: u8 = 1 << 6;
+
+/// XTWINOPS title stack pop; see `push_title`.
+const POP_TITLE: &[u8] = b"\x1b[23;0t";
+
+/// Switch one mode on and record it for `restore_terminal`. The bit is set
+/// first: a write that fails partway may still have reached the terminal,
+/// and undoing a mode that never took is harmless.
+fn enable_mode(mode: u8, command: impl crossterm::Command) {
+    TERM_MODES.fetch_or(mode, Ordering::SeqCst);
+    let _ = execute!(std::io::stdout(), command);
+}
+
+/// Hand the terminal back to the shell. Every exit path calls it, and only
+/// the first call after a mode was enabled does anything.
+fn restore_terminal() {
+    // Held until raw mode is off too: a concurrent caller (the forced exit
+    // on a second signal) blocks here instead of finding the modes claimed
+    // but not yet undone, exiting, and leaving the shell raw.
+    let mut out = std::io::stdout().lock();
+    let restored = write_restore(&mut out, &TERM_MODES);
+    // Last, so whatever prints next (an error, a panic report) lands on a
+    // cooked terminal.
+    if restored & MODE_RAW != 0 {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Write the sequences that undo each mode recorded in `modes`, and return
+/// the modes it claimed. The swap claims them all at once, so a second call
+/// writes nothing and two exit paths can never both restore.
+fn write_restore<W: Write>(out: &mut W, modes: &AtomicU8) -> u8 {
+    use crossterm::cursor::Show;
+    use crossterm::event::{DisableBracketedPaste, DisableFocusChange};
+    use crossterm::terminal::{EndSynchronizedUpdate, LeaveAlternateScreen};
+    let on = modes.swap(0, Ordering::SeqCst);
+    // One write per mode: a failed write must not keep the next mode on.
+    if on & MODE_ALT_SCREEN != 0 {
+        // A frame cut short by a panic can leave a synchronized update open
+        // (the terminal then holds every later byte) and the cursor hidden.
+        let _ = queue!(out, EndSynchronizedUpdate);
+        let _ = queue!(out, Show);
+    }
+    if on & MODE_FOCUS != 0 {
+        let _ = queue!(out, DisableFocusChange);
+    }
+    if on & MODE_MOUSE != 0 {
+        let _ = queue!(out, DisableMouseCapture);
+    }
+    if on & MODE_PASTE != 0 {
+        let _ = queue!(out, DisableBracketedPaste);
+    }
+    // Terminals keep one keyboard flag stack per screen, so the pop has to
+    // land while the alternate screen is still current.
+    if on & MODE_KEYBOARD != 0 {
+        let _ = queue!(out, PopKeyboardEnhancementFlags);
+    }
+    if on & MODE_ALT_SCREEN != 0 {
+        let _ = queue!(out, LeaveAlternateScreen);
+    }
+    if on & MODE_TITLE != 0 {
+        let _ = out.write_all(POP_TITLE);
+    }
+    let _ = out.flush();
+    on
+}
+
+/// Restore the terminal ahead of the panic report, but only for a panic on
+/// `ui`, the thread that draws. The hook is process-global, and the core
+/// survives panics on its own worker threads (a turn task, a tool) by
+/// reporting them as errors while the TUI keeps drawing; restoring there
+/// would drop the live session out of the alternate screen and leave it
+/// painting over the shell.
+fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + Sync + 'static) {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == ui {
+            restore();
+        }
+        hook(info);
+    }));
+}
+
+/// SIGTERM, SIGHUP (the terminal went away), and SIGINT sent from outside
+/// (raw mode makes Ctrl+C a key) each end the process on the spot by
+/// default, with every terminal mode still on. While the event loop runs,
+/// the first one reaches it as a quit, so the session ends through the
+/// normal exit path; a second means that path is stuck, so the terminal is
+/// restored here and the process exits. Once the loop has ended, nothing
+/// reads a quit again, so the first signal takes that exit itself.
+///
+/// The watcher runs on its own thread and runtime. When main returns, the
+/// main runtime drops its tasks and then waits on blocking work still
+/// running (a grep, a scan), while the handlers stay installed; a watcher
+/// on that runtime would leave every signal through that wait swallowed.
+#[cfg(unix)]
+fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
+    use futures_util::future::select_all;
+    use tokio::signal::unix::{signal, SignalKind};
+    let quit = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Weak: main and then the event loop own the quit, so it is gone once
+    // the loop has ended, and a signal from then on exits at once instead
+    // of waiting on a loop that will never read it.
+    let event_loop = std::sync::Arc::downgrade(&quit);
+    let (registered, ready) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_io().build() else {
+            return;
+        };
+        runtime.block_on(async move {
+            let mut signals: Vec<_> =
+                [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()]
+                    .into_iter()
+                    .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
+                    .collect();
+            let _ = registered.send(());
+            if signals.is_empty() {
+                return;
+            }
+            let (_, first, _) =
+                select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
+            let last = match event_loop.upgrade() {
+                Some(quit) => {
+                    quit.notify_one();
+                    drop(quit);
+                    select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await.1
+                }
+                None => first,
+            };
+            // Held until exit (the lock is reentrant, so the restore still
+            // writes): the event loop must not paint over the restored shell.
+            let _stdout = std::io::stdout().lock();
+            restore_terminal();
+            std::process::exit(128 + signals[last].0);
+        });
+    });
+    // Return only once the handlers are registered, so a signal that lands
+    // during startup still ends the session cleanly. A watcher that never
+    // started drops its sender, which ends this wait too.
+    let _ = ready.recv();
+    quit
+}
+
+#[cfg(not(unix))]
+fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
+    std::sync::Arc::new(tokio::sync::Notify::new())
 }
 
 /// XTWINOPS title stack: save the shell's tab title on entry, restore it on
 /// every exit path. Terminals without the stack ignore both writes and are
 /// left with the last presence title, which at exit reads "project · openmax".
 fn push_title() {
+    TERM_MODES.fetch_or(MODE_TITLE, Ordering::SeqCst);
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x1b[22;0t").and_then(|_| out.flush());
-}
-
-fn pop_title() {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[23;0t").and_then(|_| out.flush());
 }
 
 /// `ratatui::init` with one change: frame output goes through a 256 KiB
 /// buffer so each flush is one write(2) instead of the dozens that `Stdout`'s
 /// built-in 1 KiB line buffer produces on token-streaming frames.
-/// `ratatui::restore` stays the counterpart on exit and panic; it operates on
-/// the shared stdout fd, and every completed frame ends fully flushed.
+/// `restore_terminal` is the counterpart on every exit path; it writes to the
+/// shared stdout fd, and every completed frame ends fully flushed.
 fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
-    // Hook first: any panic or error past raw mode must restore the shell.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
-        pop_title();
-        hook(info);
-    }));
-    enable_raw_mode()?;
+    // Hook first: any panic past raw mode must restore the shell. This thread
+    // runs the event loop and draws every frame.
+    install_panic_restore(std::thread::current().id(), restore_terminal);
+    enter_raw_mode(&TERM_MODES, enable_raw_mode)?;
     // The session states its presence in the tab title while it runs (see
     // app::Presence); save the shell's title and hand it back on every exit
     // path. Pushed only after raw mode succeeds, so an early error cannot
@@ -1051,20 +1198,38 @@ fn init_terminal() -> std::io::Result<ui::transcript::Term> {
     push_title();
     let init = || -> std::io::Result<ui::transcript::Term> {
         let mut out = FrameWriter::new(std::io::stdout(), 256 * 1024);
+        TERM_MODES.fetch_or(MODE_ALT_SCREEN, Ordering::SeqCst);
         execute!(out, EnterAlternateScreen)?;
         out.flush()?;
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
     };
-    init().inspect_err(|_| {
-        ratatui::restore();
-        pop_title();
-    })
+    init().inspect_err(|_| restore_terminal())
 }
 
-/// A frame-sized `BufWriter` that discards, rather than flushes, its buffered
-/// bytes when dropped mid-panic. The panic hook has already restored the
-/// normal screen by the time unwinding drops the terminal, so flushing a
-/// partial frame there would spray escape bytes over the user's shell.
+/// Switch to raw mode and record it as one step under the stdout lock, which
+/// `restore_terminal` holds from claiming the modes until raw mode is off.
+/// Raw mode is termios state, not bytes on stdout, so nothing else orders it
+/// against a concurrent restore: switched outside the lock, a forced exit
+/// landing between the switch and the record would find nothing to undo and
+/// exit with the shell raw. Under the lock, that exit either runs first and
+/// keeps stdout until the process ends, so raw mode is never entered, or
+/// finds raw mode recorded and leaves it.
+fn enter_raw_mode(
+    modes: &AtomicU8,
+    enable: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let _out = std::io::stdout().lock();
+    enable()?;
+    modes.fetch_or(MODE_RAW, Ordering::SeqCst);
+    Ok(())
+}
+
+/// A frame-sized `BufWriter` that discards, rather than writes, its bytes
+/// while the thread is panicking. The panic hook has already restored the
+/// normal screen by the time unwinding drops the terminal, and that drop
+/// still flushes (ratatui shows the cursor on the way out), so writing then
+/// would land a partial frame, with its synchronized update still open, on
+/// the user's shell.
 pub struct FrameWriter<W: Write>(Option<std::io::BufWriter<W>>);
 
 impl<W: Write> FrameWriter<W> {
@@ -1079,10 +1244,22 @@ impl<W: Write> FrameWriter<W> {
 
 impl<W: Write> Write for FrameWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if std::thread::panicking() {
+            return Ok(buf.len());
+        }
         self.buf().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if std::thread::panicking() {
+            if let Some(w) = self.0.take() {
+                // into_parts hands the buffer back without writing it.
+                let capacity = w.capacity();
+                let (inner, _) = w.into_parts();
+                self.0 = Some(std::io::BufWriter::with_capacity(capacity, inner));
+            }
+            return Ok(());
+        }
         self.buf().flush()
     }
 }
@@ -1751,6 +1928,252 @@ mod tests {
         assert!(result.is_err());
         // The restored shell must never receive the abandoned frame.
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    /// ratatui's Terminal shows the cursor when it drops, which flushes the
+    /// backend. Unwinding from a UI panic drops it after the hook restored
+    /// the shell, so that flush must not land the half-drawn frame (with its
+    /// open synchronized update, which makes the terminal hold all output).
+    #[test]
+    fn frame_writer_flushed_while_panicking_writes_nothing() {
+        struct ShowCursorOnDrop(FrameWriter<Sink>);
+        impl Drop for ShowCursorOnDrop {
+            fn drop(&mut self) {
+                let _ = execute!(self.0, crossterm::cursor::Show);
+            }
+        }
+        let sink = Sink::default();
+        let inner = sink.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut term = ShowCursorOnDrop(FrameWriter::new(inner, 1024));
+            crossterm::queue!(term.0, crossterm::terminal::BeginSynchronizedUpdate).unwrap();
+            term.0.write_all(b"half a frame").unwrap();
+            panic!("draw failed");
+        }));
+        assert!(result.is_err());
+        let written = sink.0.lock().unwrap();
+        assert!(written.is_empty(), "flushed mid-panic: {:?}", String::from_utf8_lossy(&written));
+    }
+
+    fn ansi(command: impl crossterm::Command) -> String {
+        let mut out = String::new();
+        command.write_ansi(&mut out).unwrap();
+        out
+    }
+
+    /// Every mode the fullscreen session switched on is switched off by the
+    /// one restore, and only once: the panic hook and the exit path can both
+    /// run it. A mode left on outlives the process, and mouse reporting above
+    /// all turns every later mouse move into escape bytes at the shell prompt.
+    #[test]
+    fn restore_disables_every_enabled_mode_exactly_once() {
+        let all = MODE_RAW
+            | MODE_TITLE
+            | MODE_ALT_SCREEN
+            | MODE_KEYBOARD
+            | MODE_PASTE
+            | MODE_MOUSE
+            | MODE_FOCUS;
+        let modes = AtomicU8::new(all);
+        let mut out = Vec::new();
+        let claimed = write_restore(&mut out, &modes);
+        let out = String::from_utf8(out).unwrap();
+        for (what, seq) in [
+            ("synchronized update", ansi(crossterm::terminal::EndSynchronizedUpdate)),
+            ("hidden cursor", ansi(crossterm::cursor::Show)),
+            ("focus reports", ansi(crossterm::event::DisableFocusChange)),
+            ("mouse capture", ansi(DisableMouseCapture)),
+            ("bracketed paste", ansi(crossterm::event::DisableBracketedPaste)),
+            ("keyboard flags", ansi(PopKeyboardEnhancementFlags)),
+            ("alternate screen", ansi(crossterm::terminal::LeaveAlternateScreen)),
+            ("title stack", "\x1b[23;0t".to_string()),
+        ] {
+            assert!(out.contains(&seq), "{what} is left on: {out:?}");
+        }
+        // Terminals keep one keyboard flag stack per screen, so the pop has
+        // to land while the alternate screen is still current.
+        let pop = out.find(&ansi(PopKeyboardEnhancementFlags));
+        let leave = out.find(&ansi(crossterm::terminal::LeaveAlternateScreen));
+        assert!(pop < leave, "{out:?}");
+        // Raw mode is termios state, not bytes: the caller leaves it.
+        assert_eq!(claimed, all);
+
+        let mut again = Vec::new();
+        assert_eq!(write_restore(&mut again, &modes), 0);
+        assert!(again.is_empty(), "a second restore wrote {:?}", String::from_utf8_lossy(&again));
+    }
+
+    /// Restore undoes only what was switched on: init can fail before the
+    /// alternate screen, and a terminal without the keyboard protocol never
+    /// had flags pushed.
+    #[test]
+    fn restore_leaves_alone_modes_never_enabled() {
+        let mut out = Vec::new();
+        write_restore(&mut out, &AtomicU8::new(MODE_RAW | MODE_TITLE));
+        assert_eq!(String::from_utf8_lossy(&out), "\x1b[23;0t");
+
+        let mut out = Vec::new();
+        let no_keyboard = MODE_TITLE | MODE_ALT_SCREEN | MODE_PASTE | MODE_MOUSE | MODE_FOCUS;
+        write_restore(&mut out, &AtomicU8::new(no_keyboard));
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(&ansi(PopKeyboardEnhancementFlags)), "{out:?}");
+    }
+
+    /// The panic hook is process-global, and the core survives panics on its
+    /// own worker threads (a turn task, a tool) by reporting them as errors
+    /// while the TUI keeps drawing. Restoring there would drop the live
+    /// session out of the alternate screen and leave it painting over the
+    /// shell, so only a panic on the thread that drives the UI restores.
+    #[test]
+    fn panic_hook_restores_only_for_the_ui_thread() {
+        use std::sync::atomic::AtomicUsize;
+        static RESTORES: AtomicUsize = AtomicUsize::new(0);
+        install_panic_restore(std::thread::current().id(), || {
+            RESTORES.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let worker = std::thread::spawn(|| panic!("a worker panic the core survives"));
+        assert!(worker.join().is_err());
+        assert_eq!(RESTORES.load(Ordering::SeqCst), 0, "a worker panic restored the terminal");
+
+        let ui = std::panic::catch_unwind(|| panic!("a UI panic"));
+        assert!(ui.is_err());
+        assert_eq!(RESTORES.load(Ordering::SeqCst), 1, "a UI panic must restore the terminal");
+    }
+
+    /// Two exit paths can restore at once: the normal exit after a first
+    /// signal, and the forced exit on a second one. A restore claims the
+    /// modes only while it holds stdout, so a caller that finds nothing left
+    /// to undo knows the other restore has finished, raw mode included.
+    /// Claiming them outside the lock let the forced exit find them claimed
+    /// but not yet undone, and leave the shell in raw mode.
+    #[test]
+    fn restore_claims_the_modes_only_while_holding_stdout() {
+        let held = std::io::stdout().lock();
+        // Raw mode alone writes no bytes, and leaving it is a no-op in a
+        // process that never entered it.
+        TERM_MODES.fetch_or(MODE_RAW, Ordering::SeqCst);
+        let restore = std::thread::spawn(restore_terminal);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let unclaimed = TERM_MODES.load(Ordering::SeqCst);
+        drop(held);
+        restore.join().unwrap();
+        assert_eq!(
+            unclaimed, MODE_RAW,
+            "a restore claimed the modes while another caller held stdout"
+        );
+        assert_eq!(TERM_MODES.load(Ordering::SeqCst), 0);
+    }
+
+    /// The forced exit on a second signal can restore while startup is
+    /// entering raw mode. Raw mode is termios state, so the restore leaves it
+    /// only when its bit is recorded; a restore landing after the switch but
+    /// before the bit would find nothing to undo and exit with the shell raw.
+    /// The restore here stands in for `restore_terminal`, which claims the
+    /// modes only while holding stdout (see
+    /// `restore_claims_the_modes_only_while_holding_stdout`).
+    #[test]
+    fn raw_mode_is_recorded_before_a_racing_restore_can_claim_it() {
+        let modes = &AtomicU8::new(0);
+        let claimed = std::thread::scope(|s| {
+            let mut restore = None;
+            enter_raw_mode(modes, || {
+                restore = Some(s.spawn(move || {
+                    let _out = std::io::stdout().lock();
+                    write_restore(&mut std::io::sink(), modes)
+                }));
+                // Holds the window between the switch and the record open.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(())
+            })
+            .unwrap();
+            restore.unwrap().join().unwrap()
+        });
+        assert_eq!(claimed, MODE_RAW, "a restore found raw mode entered but not recorded");
+    }
+
+    /// SIGTERM's default action ends the process on the spot with every
+    /// terminal mode still on; the watcher hands it to the event loop as a
+    /// quit, so the normal exit path restores the terminal. The watcher must
+    /// outlive the runtime that started it: when main returns, that runtime
+    /// drops its tasks and then waits on blocking work still running (a
+    /// grep, a scan), and the handlers it installed stay in place, so a
+    /// watcher on it would leave every signal through that wait swallowed.
+    /// Handlers stay installed for the life of the process and the watcher
+    /// keeps waiting for a second signal, so the probe runs in a child: the
+    /// test process keeps the default action for every later signal.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_reaches_the_quit_after_the_starting_runtime_is_gone() {
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_REACHES_QUIT";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime =
+                || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let quit = runtime().block_on(async { watch_quit_signals() });
+            let status = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            runtime().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
+                    .await
+                    .expect("SIGTERM must reach the event loop as a quit")
+            });
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::sigterm_reaches_the_quit_after_the_starting_runtime_is_gone"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        // "1 passed" rules out a filter that matched nothing and exited 0.
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "SIGTERM did not reach the quit ({:?}): {stdout}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    /// Once the event loop has ended it drops the quit, and nothing reads it
+    /// again, while the runtime still waits on blocking work (a grep, a scan)
+    /// before the process can exit. A signal then has no loop to reach, so it
+    /// must end the process at once; handing it to the gone loop would leave
+    /// the first Ctrl+C or SIGTERM doing nothing until that work finished.
+    /// The exit is the behavior under test, so the probe runs in a child.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_exits_at_once_after_the_event_loop_is_gone() {
+        use tokio::signal::unix::SignalKind;
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_AFTER_LOOP";
+        let sleep = std::time::Duration::from_secs(10);
+        if std::env::var_os(CHILD).is_some() {
+            drop(watch_quit_signals());
+            let status = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            // Stands in for the blocking work the runtime waits on.
+            std::thread::sleep(sleep);
+            return;
+        }
+        let start = std::time::Instant::now();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::sigterm_exits_at_once_after_the_event_loop_is_gone"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(128 + SignalKind::terminate().as_raw_value()),
+            "SIGTERM after the event loop ended did not exit at once ({:?}): {}",
+            start.elapsed(),
+            String::from_utf8_lossy(&child.stdout)
+        );
+        assert!(start.elapsed() < sleep);
     }
 
     #[test]
