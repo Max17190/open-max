@@ -1108,10 +1108,11 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
 
 /// SIGTERM, SIGHUP (the terminal went away), and SIGINT sent from outside
 /// (raw mode makes Ctrl+C a key) each end the process on the spot by
-/// default, with every terminal mode still on. The first one reaches the
-/// event loop as a quit, so the session ends through the normal exit path;
-/// a second means that path is stuck, so the terminal is restored here and
-/// the process exits.
+/// default, with every terminal mode still on. While the event loop runs,
+/// the first one reaches it as a quit, so the session ends through the
+/// normal exit path; a second means that path is stuck, so the terminal is
+/// restored here and the process exits. Once the loop has ended, nothing
+/// reads a quit again, so the first signal takes that exit itself.
 ///
 /// The watcher runs on its own thread and runtime. When main returns, the
 /// main runtime drops its tasks and then waits on blocking work still
@@ -1122,7 +1123,10 @@ fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
     use futures_util::future::select_all;
     use tokio::signal::unix::{signal, SignalKind};
     let quit = std::sync::Arc::new(tokio::sync::Notify::new());
-    let event_loop = quit.clone();
+    // Weak: main and then the event loop own the quit, so it is gone once
+    // the loop has ended, and a signal from then on exits at once instead
+    // of waiting on a loop that will never read it.
+    let event_loop = std::sync::Arc::downgrade(&quit);
     let (registered, ready) = std::sync::mpsc::channel();
     let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_io().build() else {
@@ -1138,15 +1142,21 @@ fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
             if signals.is_empty() {
                 return;
             }
-            select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
-            event_loop.notify_one();
-            let (_, second, _) =
+            let (_, first, _) =
                 select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
+            let last = match event_loop.upgrade() {
+                Some(quit) => {
+                    quit.notify_one();
+                    drop(quit);
+                    select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await.1
+                }
+                None => first,
+            };
             // Held until exit (the lock is reentrant, so the restore still
             // writes): the event loop must not paint over the restored shell.
             let _stdout = std::io::stdout().lock();
             restore_terminal();
-            std::process::exit(128 + signals[second].0);
+            std::process::exit(128 + signals[last].0);
         });
     });
     // Return only once the handlers are registered, so a signal that lands
@@ -2061,6 +2071,45 @@ mod tests {
                 .await
                 .expect("SIGTERM must reach the event loop as a quit")
         });
+    }
+
+    /// Once the event loop has ended it drops the quit, and nothing reads it
+    /// again, while the runtime still waits on blocking work (a grep, a scan)
+    /// before the process can exit. A signal then has no loop to reach, so it
+    /// must end the process at once; handing it to the gone loop would leave
+    /// the first Ctrl+C or SIGTERM doing nothing until that work finished.
+    /// The exit is the behavior under test, so the probe runs in a child.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_exits_at_once_after_the_event_loop_is_gone() {
+        use tokio::signal::unix::SignalKind;
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_AFTER_LOOP";
+        let sleep = std::time::Duration::from_secs(10);
+        if std::env::var_os(CHILD).is_some() {
+            drop(watch_quit_signals());
+            let status = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            // Stands in for the blocking work the runtime waits on.
+            std::thread::sleep(sleep);
+            return;
+        }
+        let start = std::time::Instant::now();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::sigterm_exits_at_once_after_the_event_loop_is_gone"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(128 + SignalKind::terminate().as_raw_value()),
+            "SIGTERM after the event loop ended did not exit at once ({:?}): {}",
+            start.elapsed(),
+            String::from_utf8_lossy(&child.stdout)
+        );
+        assert!(start.elapsed() < sleep);
     }
 
     #[test]

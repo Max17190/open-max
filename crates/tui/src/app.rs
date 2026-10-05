@@ -219,7 +219,9 @@ fn conversation_layout(
 pub struct Args {
     pub continue_session: bool,
     /// Notified when a signal asks the session to end. The loop treats it
-    /// as /quit, so the normal exit path restores the terminal.
+    /// as /quit, so the normal exit path restores the terminal. The signal
+    /// watcher holds it weakly: once the loop drops it, a signal exits at
+    /// once, so keep no other strong handle past the loop.
     pub quit: Arc<tokio::sync::Notify>,
 }
 
