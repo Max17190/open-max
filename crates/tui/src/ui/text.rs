@@ -30,11 +30,13 @@ pub fn cell_width(grapheme: &str) -> usize {
 }
 
 /// One line of captured program output without its complete CSI (`ESC [`,
-/// colors and cursor moves) and OSC (`ESC ]`, titles and hyperlinks, ended by
-/// BEL or `ESC \`) escape sequences. The renderer drops the ESC byte and
-/// paints the rest, so a red `error` would read `[31merror[0m`. An incomplete
-/// sequence is left as it is, and none spans a newline: removing text the
-/// program did not clearly mark as a sequence would hide output.
+/// colors and cursor moves), OSC (`ESC ]`, titles and hyperlinks, ended by
+/// BEL or `ESC \`), and charset designation (`ESC (` and kin, as in the
+/// `ESC ( B ESC [ m` a terminfo color reset emits) escape sequences. The
+/// renderer drops the ESC byte and paints the rest, so a red `error` would
+/// read `[31merror[0m`. An incomplete sequence is left as it is, and none
+/// spans a newline: removing text the program did not clearly mark as a
+/// sequence would hide output.
 pub fn strip_escapes(text: &str) -> Cow<'_, str> {
     if !text.contains('\u{1b}') {
         return Cow::Borrowed(text);
@@ -57,11 +59,15 @@ pub fn strip_escapes(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Byte length of the complete CSI or OSC sequence `seq` starts with (its
-/// first byte is ESC). Every byte that can end one is ASCII, so the length
-/// always lands on a char boundary.
+/// Byte length of the complete CSI, OSC, or charset designation sequence
+/// `seq` starts with (its first byte is ESC). Every byte that can end one is
+/// ASCII, so the length always lands on a char boundary.
 fn escape_len(seq: &[u8]) -> Option<usize> {
     match seq.get(1)? {
+        // Designates a character set: exactly one final byte follows. Kept
+        // this narrow because a wider escape rule would also eat an ESC
+        // followed by a space and a letter.
+        b'(' | b')' | b'*' | b'+' => (0x30..=0x7e).contains(seq.get(2)?).then_some(3),
         b'[' => {
             // Parameter and intermediate bytes, then one final byte.
             let end = 2 + seq[2..].iter().position(|b| !(0x20..=0x3f).contains(b))?;
@@ -266,13 +272,19 @@ mod tests {
             strip_escapes("\u{1b}]8;;https://e.x/é\u{7}café\u{1b}]8;;\u{1b}\\!"),
             "café!"
         );
+        // The terminfo color reset designates the ASCII charset first.
+        assert_eq!(
+            strip_escapes("\u{1b}[31merror\u{1b}(B\u{1b}[m: failed"),
+            "error: failed"
+        );
         // Incomplete and other sequences stay: they are not clearly markup.
         for kept in [
             "cut \u{1b}[31",
             "cut \u{1b}",
+            "cut \u{1b}(",
+            "\u{1b} B",
             "title \u{1b}]0;never ended",
             "title \u{1b}]0;ended\non the next line\u{7}",
-            "\u{1b}(B",
         ] {
             assert_eq!(strip_escapes(kept), kept);
         }
