@@ -441,24 +441,28 @@ fn read_index(core: &Core) -> IndexRead {
     read_index_at(&index_path(core))
 }
 
-/// The reason names the file and the repair, because a damaged index
-/// refuses every new session in every project until it is dealt with, and
-/// the reason is all a user sees. Moving it aside is the whole repair: a
-/// missing index is an empty store, so the next session starts a new one,
-/// and the moved file keeps every entry for recovery by hand.
+/// The reason names the file and the problem, never a repair. It also
+/// reaches live sessions (the save warning, the compaction refusal, recall),
+/// and moving the index aside under one makes the still-indexed gate read
+/// its session as deleted, so every later save is dropped without a word.
+/// The repair is `--check`'s to give (see `doctor::check_at`).
 fn read_index_at(path: &Path) -> IndexRead {
-    let damaged = |problem: String| IndexRead::Damaged(format!(
-        "session index {} {problem}; move it aside to start a new index",
-        path.display()
-    ));
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexRead::Missing,
-        Err(e) => return damaged(format!("is unreadable ({e})")),
+        Err(e) => {
+            return IndexRead::Damaged(format!(
+                "session index {} is unreadable ({e})",
+                path.display()
+            ))
+        }
     };
     match serde_json::from_str(&text) {
         Ok(metas) => IndexRead::Loaded(metas),
-        Err(e) => damaged(format!("does not parse ({e})")),
+        Err(e) => IndexRead::Damaged(format!(
+            "session index {} does not parse ({e})",
+            path.display()
+        )),
     }
 }
 
@@ -1791,8 +1795,9 @@ mod tests {
     /// Readers that answer "what history is there" name a damaged index
     /// instead of answering "none": `--continue` would otherwise report no
     /// previous session over a file full of them. Every refusal names the
-    /// file and the repair, and `--check` sees the same damage without a
-    /// Core.
+    /// file, and `--check` sees the same damage without a Core. The shared
+    /// reason carries no repair: it also reaches live sessions, where moving
+    /// the index aside turns every later save into a silent no-op.
     #[test]
     fn a_damaged_index_is_named_to_readers_not_reported_as_empty() {
         let dir = std::env::temp_dir().join(format!("openmax-damaged-read-{}", uuid::Uuid::new_v4()));
@@ -1808,7 +1813,7 @@ mod tests {
             index_diagnostic(&core).unwrap(),
         ];
         for reason in refusals {
-            assert!(reason.contains(&path) && reason.contains("move it aside"), "{reason}");
+            assert!(reason.contains(&path) && !reason.contains("move it aside"), "{reason}");
         }
         assert_eq!(index_damage(&dir).map(|(at, _)| at), Some(index_path(&core)));
         assert_eq!(std::fs::read_to_string(index_path(&core)).unwrap(), "[{");

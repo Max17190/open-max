@@ -777,12 +777,26 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 
     // A damaged session index refuses every new session and every
     // `--continue`, in every project, until it is moved aside. Only damage
-    // is a finding: a healthy index is state, not configuration.
+    // is a finding: a healthy index is state, not configuration. Moving it
+    // is the whole repair (a missing index is an empty store), but only
+    // with openmax closed: a running session whose entry leaves with the
+    // file reads as deleted, and its later saves are dropped silently. The
+    // target is a name not yet taken, so a second incident never overwrites
+    // the copy an earlier one moved aside.
     if let Some((path, reason)) = crate::sessions::index_damage(data_dir) {
-        let aside = path.with_extension("json.damaged");
+        let mut aside = path.with_extension("json.damaged");
+        let mut n = 1;
+        while std::fs::symlink_metadata(&aside).is_ok() {
+            n += 1;
+            aside = path.with_extension(format!("json.damaged-{n}"));
+        }
         findings.push(Finding {
             kind: "sessions",
-            status: Status::Err(format!("{reason}: mv {} {}", shell_quote(&path), shell_quote(&aside))),
+            status: Status::Err(format!(
+                "{reason}; close every openmax, then move it aside to start a new index: mv {} {}",
+                shell_quote(&path),
+                shell_quote(&aside)
+            )),
             path,
         });
     }
@@ -4369,6 +4383,9 @@ mod tests {
     /// A damaged session index refuses every new session and every
     /// `--continue`, in every project, so the command whose job is naming
     /// what is broken names it, with the repair. A healthy index is silent.
+    /// The copyable `mv` targets a name that does not exist yet: a fixed
+    /// name would overwrite the copy an earlier incident moved aside, and
+    /// with it the only record of that index's sessions.
     #[test]
     fn a_damaged_session_index_is_an_error_with_its_repair() {
         let root = temp_project();
@@ -4377,18 +4394,24 @@ mod tests {
         write(index.clone(), "[]\n");
         assert!(!check_at(&root, &data).iter().any(|f| f.path == index), "a healthy index is not a finding");
 
+        let earlier = data.join("sessions/index.json.damaged");
+        write(earlier.clone(), "[{\"id\":\"earlier\"");
         write(index.clone(), "[{");
         let findings = check_at(&root, &data);
         let finding = findings
             .iter()
             .find(|f| f.path == index)
             .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
-        assert!(
-            matches!(&finding.status, Status::Err(reason) if reason.contains("mv ")),
-            "a damaged index is an error that carries its repair: {finding:?}"
-        );
+        let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
+        let (_, target) = reason
+            .rsplit_once(&format!("mv {} ", shell_quote(&index)))
+            .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
+        let target = PathBuf::from(target.trim_matches('\''));
+        assert!(target.starts_with(data.join("sessions")) && target != index, "{reason}");
+        assert!(!target.exists(), "the repair must not overwrite {}: {reason}", target.display());
         assert!(has_errors(&findings));
         assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{", "--check never rewrites the index");
+        assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "[{\"id\":\"earlier\"");
         let _ = std::fs::remove_dir_all(root);
     }
 
