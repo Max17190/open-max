@@ -143,7 +143,9 @@ Readonly refuses mutating calls and calls requiring confirmation.
 
 Select /approvals auto|ask|readonly or Shift+Tab in a human-controlled frontend.
 The choice persists for this exact trusted project across launches, including
-headless/stdio. Other projects retain their own choice or settings default.
+headless/stdio. A subdirectory or worktree without its own choice follows the
+nearest enclosing project's. Other projects retain their own choice or settings
+default.
 Running in auto does not grant hashes: switching back to ask restores content
 requirements. Approve specific bytes with openmax --approve <manifest> or the
 content card in ask. Approving a file write approves only that write.
@@ -690,11 +692,12 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `api_key`: literal, or `$ENV_VAR` indirection; `OPENMAX_API_KEY` also works.
 - `model`: model id sent with every request.
 - `approval_mode`: `auto` | `ask` | `readonly`; default ask. Used only when
-  this project has no saved choice. /approvals, Shift+Tab, and the card's
-  Auto for project choice persist in trust.json under the canonical root,
-  not in settings.json. They do not change other projects. Auto includes
-  extension execution without content approvals; deny rules and validation
-  still apply. Agent-spawned clients cannot change the saved mode.
+  neither this project nor an enclosing one has a saved choice. /approvals,
+  Shift+Tab, and the card's Auto for project choice persist in trust.json
+  under the canonical root, not in settings.json. They do not change other
+  projects. Auto includes extension execution without content approvals;
+  deny rules and validation still apply. Agent-spawned clients cannot change
+  the saved mode.
 - `context_tokens`: the model's context window in tokens. REQUIRED here or
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or

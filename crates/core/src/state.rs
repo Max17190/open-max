@@ -187,16 +187,16 @@ fn settings_file_fingerprint(data_dir: &std::path::Path) -> SettingsFingerprint 
 }
 
 impl Core {
-    /// The choice for this exact canonical project, or the settings default.
+    /// The choice for this canonical project or its nearest enclosing one
+    /// (see `trust::nearest_approval_mode`), or the settings default.
     /// Never call while holding the settings lock.
     pub fn approval_mode(&self, project_root: &std::path::Path) -> crate::config::ApprovalMode {
         let canonical = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-        self.project_approval_modes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&canonical)
-            .copied()
-            .unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
+        let saved = crate::trust::nearest_approval_mode(
+            &self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner()),
+            &canonical,
+        );
+        saved.unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
     }
 
     /// Persist before changing the live gate. A failed save leaves both the
@@ -376,6 +376,25 @@ mod tests {
         assert!(core.set_project_approval_mode(&project, ApprovalMode::Ask).is_err());
         assert_eq!(core.approval_mode(&project), ApprovalMode::Auto, "a failed save must leave the live policy unchanged");
         assert!(Core::new(data).is_err(), "unreadable authority state fails closed at launch");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A process started in a worktree of a project gates its tools with the
+    /// project's choice, from the launch snapshot and after a live selection;
+    /// otherwise a delegated headless child under auto declines every write.
+    #[test]
+    fn project_mode_covers_sessions_in_its_subdirectories() {
+        use crate::config::ApprovalMode;
+        let dir = std::env::temp_dir().join(format!("omx-mode-sub-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        let worktree = project.join(".worktrees").join("task-a");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let data = dir.join("data");
+        crate::trust::trust_project(&data, &project).unwrap();
+        let (core, _) = Core::new(data.clone()).unwrap();
+        core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
+        assert_eq!(core.approval_mode(&worktree), ApprovalMode::Auto, "live selection");
+        assert_eq!(Core::new(data).unwrap().0.approval_mode(&worktree), ApprovalMode::Auto, "launch snapshot");
         let _ = std::fs::remove_dir_all(dir);
     }
 

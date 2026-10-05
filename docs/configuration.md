@@ -76,7 +76,9 @@ approval card's **Auto for project** choice. Every selector saves the same
 choice in `~/.openmax/trust.json` for this exact canonical project path.
 It survives new sessions and restarts, including headless and stdio runs.
 Other projects keep their own choice or the `settings.json` default, which
-is `ask`. Symlink aliases share the choice; nested projects have their own.
+is `ask`. Symlink aliases share the choice. A subdirectory or worktree of the
+project, such as one a delegated `openmax -p` child starts in, follows the
+nearest enclosing project's choice unless it has a saved choice of its own.
 
 - `auto` runs authorized work without confirmation, including newly created
   or repaired tools, hooks, and project permission `allow` rules. It ignores
