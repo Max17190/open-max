@@ -26,7 +26,7 @@ use crate::execution::{
 use crate::state::CancelToken;
 
 use serde_json::{json, Value};
-use similar::{ChangeTag, TextDiff};
+use similar::{ChangeTag, DiffTag, TextDiff};
 
 use crate::client::truncate;
 
@@ -483,12 +483,19 @@ fn floor_char(s: &str, mut idx: usize) -> usize {
 /// a call that cancellation waits for, so each reports what it has by then.
 const DIFF_BUDGET: Duration = Duration::from_millis(200);
 
-fn make_diff(root: &Path, path: &Path, old: &str, new: &str) -> DiffInfo {
-    diff_strings(&rel_display(root, path), old, new)
+/// A finished write or edit: the diff for the UI and the summary the model
+/// reads. Counts from a diff cut off at its deadline can include unchanged
+/// lines, so the summary gives them as an upper bound, or the model takes an
+/// estimate for the size of its edit.
+fn changed_file(verb: &str, root: &Path, path: &Path, old: &str, new: &str) -> ToolOutcome {
+    let (diff, complete) = diff_strings(&rel_display(root, path), old, new);
+    let bound = if complete { "" } else { "at most " };
+    let summary = format!("{verb} {} ({bound}+{} −{})", diff.path, diff.added, diff.removed);
+    ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
-/// Unified diff between two versions of a file.
-fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
+/// Unified diff between two versions of a file, and whether it finished.
+fn diff_strings(rel: &str, old: &str, new: &str) -> (DiffInfo, bool) {
     let deadline = Instant::now() + DIFF_BUDGET;
     let text_diff = TextDiff::configure().deadline(deadline).diff_lines(old, new);
     // Past its deadline the diff stops searching and writes each region left
@@ -496,13 +503,15 @@ fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
     // so it would list unchanged lines as rewritten and its counts can run
     // high.
     let gave_up = Instant::now() > deadline;
+    // Counted per op, not per line, so a cut-off diff of a huge rewrite is
+    // not walked line by line after its deadline. A deletion has an empty
+    // new range and an insertion an empty old range.
     let mut added = 0;
     let mut removed = 0;
-    for change in text_diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => added += 1,
-            ChangeTag::Delete => removed += 1,
-            ChangeTag::Equal => {}
+    for op in text_diff.ops() {
+        if op.tag() != DiffTag::Equal {
+            removed += op.old_range().len();
+            added += op.new_range().len();
         }
     }
     let diff = if gave_up {
@@ -516,7 +525,7 @@ fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
             .header(&format!("a/{rel}"), &format!("b/{rel}"))
             .to_string()
     };
-    DiffInfo { path: rel.to_string(), diff: truncate(&diff, 40_000), added, removed }
+    (DiffInfo { path: rel.to_string(), diff: truncate(&diff, 40_000), added, removed }, !gave_up)
 }
 
 fn write_file(root: &Path, args: &Value) -> ToolOutcome {
@@ -537,9 +546,7 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
     if let Err(e) = std::fs::write(&path, content) {
         return ToolOutcome::err(format!("cannot write {rel}: {e}"));
     }
-    let diff = make_diff(root, &path, &old, content);
-    let summary = format!("wrote {} (+{} −{})", diff.path, diff.added, diff.removed);
-    ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
+    changed_file("wrote", root, &path, &old, content)
 }
 
 /// The part of a line the closest-match hint compares: trimmed, and no more
@@ -610,10 +617,13 @@ fn closest_line_hint_until(content: &str, old_string: &str, deadline: Instant) -
     let key_bytes = byte_counts(key);
     let mut best_idx = 0usize;
     let mut best_score = 0.0f64;
-    let mut scored = false;
     let mut cut_at = None;
     for (i, line) in content.lines().enumerate() {
-        if scored && Instant::now() > deadline {
+        // Every line before `i` has been compared, by its diff or by a ceiling
+        // that ruled it out, so the hint always names the best of at least
+        // one. Waiting for a diff instead never stops a scan in which no
+        // line shares a byte with the copied text.
+        if i > 0 && Instant::now() > deadline {
             cut_at = Some(i);
             break;
         }
@@ -622,7 +632,6 @@ fn closest_line_hint_until(content: &str, old_string: &str, deadline: Instant) -
         if similarity_ceiling(hint_text(line), key, &key_bytes) <= best_score {
             continue;
         }
-        scored = true;
         let score = line_similarity(line, needle);
         if score > best_score {
             best_score = score;
@@ -677,9 +686,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     if let Err(e) = std::fs::write(&path, &new) {
         return ToolOutcome::err(format!("cannot write {rel}: {e}"));
     }
-    let diff = make_diff(root, &path, &old, &new);
-    let summary = format!("edited {} (+{} −{})", diff.path, diff.added, diff.removed);
-    ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
+    changed_file("edited", root, &path, &old, &new)
 }
 
 /// Hidden files are searchable: the agent's own extension surface lives in
@@ -1900,7 +1907,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Past its deadline the scan stops at the next line once it has scored
+    /// Past its deadline the scan stops at the next line once it has compared
     /// one, and the hint names the lines it compared so a partial best is not
     /// read as the file's best.
     #[test]
@@ -1913,6 +1920,20 @@ mod tests {
         let hint = closest_line_hint_until(content, needle, expired);
         assert!(hint.contains("Closest match in lines 1-1 is at line 1"), "{hint}");
         assert!(hint.contains("Read the file around that line"), "{hint}");
+    }
+
+    /// A line that shares no byte with the copied text is ruled out by its
+    /// ceiling without a diff, so the deadline cannot wait for a diff: a scan
+    /// in which no line shares a byte (a copied blank first line, non-ASCII
+    /// text against an ASCII file) would walk the whole file past it.
+    #[test]
+    fn a_closest_match_scan_stops_at_its_deadline_when_no_line_shares_a_byte() {
+        let content: String = (0..1_000).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        let expired = Instant::now() - Duration::from_millis(1);
+        for needle in ["   \nfn missing() {}", "日本語"] {
+            let hint = closest_line_hint_until(&content, needle, expired);
+            assert!(hint.contains("Closest match in lines 1-1 is at line 1"), "{needle:?}: {hint}");
+        }
     }
 
     /// The scan skips a line's diff when its ceiling cannot beat the best
@@ -1938,12 +1959,15 @@ mod tests {
 
     /// A full rewrite shares no lines with the file it replaces, so the line
     /// diff for the UI is quadratic in the file's length and a mutating
-    /// call cannot be cancelled while it runs.
+    /// call cannot be cancelled while it runs. A diff cut off at its deadline
+    /// can count unchanged lines as rewritten, so the model is told its
+    /// counts are an upper bound rather than the size of the edit.
     #[test]
     fn a_full_rewrite_of_a_large_file_reports_a_bounded_diff() {
         let root = temp_project();
         std::fs::write(root.join("small.txt"), "one\ntwo\nthree\n").unwrap();
         let out = write_file(&root, &json!({"path": "small.txt", "content": "one\nTWO\nthree\n"}));
+        assert_eq!(out.output, "wrote small.txt (+1 −1)", "a finished diff reports exact counts");
         let diff = out.diff.expect("a write reports its diff");
         assert_eq!((diff.added, diff.removed), (1, 1), "{}", diff.diff);
         assert!(diff.diff.starts_with("--- a/small.txt\n+++ b/small.txt\n"), "{}", diff.diff);
@@ -1964,6 +1988,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the diff for a full rewrite must stop at its deadline");
         assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            out.output,
+            format!("wrote big.txt (at most +{lines} −{lines})"),
+            "a diff cut off at its deadline reports its counts as an upper bound"
+        );
         let diff = out.diff.expect("a write reports its diff");
         assert_eq!((diff.added, diff.removed), (lines, lines), "{}", out.output);
         assert!(diff.diff.contains("diff not shown"), "{}", diff.diff);
