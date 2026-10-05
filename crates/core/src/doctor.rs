@@ -782,7 +782,10 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // with openmax closed: a running session whose entry leaves with the
     // file reads as deleted, and its later saves are dropped silently. The
     // target is a name not yet taken, so a second incident never overwrites
-    // the copy an earlier one moved aside.
+    // the copy an earlier one moved aside. That name is only free when this
+    // prints; `-n` keeps it so when the command runs later (rerun from shell
+    // history, or copied from an older `--check`), and a skipped move leaves
+    // the index damaged, so the next `--check` names a free target again.
     if let Some((path, reason)) = crate::sessions::index_damage(data_dir) {
         let mut aside = path.with_extension("json.damaged");
         let mut n = 1;
@@ -793,7 +796,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         findings.push(Finding {
             kind: "sessions",
             status: Status::Err(format!(
-                "{reason}; close every openmax, then move it aside to start a new index: mv {} {}",
+                "{reason}; close every openmax, then move it aside to start a new index: mv -n {} {}",
                 shell_quote(&path),
                 shell_quote(&aside)
             )),
@@ -4404,7 +4407,7 @@ mod tests {
             .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
         let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
         let (_, target) = reason
-            .rsplit_once(&format!("mv {} ", shell_quote(&index)))
+            .rsplit_once(&format!("mv -n {} ", shell_quote(&index)))
             .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
         let target = PathBuf::from(target.trim_matches('\''));
         assert!(target.starts_with(data.join("sessions")) && target != index, "{reason}");
@@ -4412,6 +4415,53 @@ mod tests {
         assert!(has_errors(&findings));
         assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{", "--check never rewrites the index");
         assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "[{\"id\":\"earlier\"");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The free target is chosen when `--check` prints, but the user runs
+    /// the command later: rerun from shell history after a second incident,
+    /// or copied from an older `--check` whose name another move has since
+    /// taken. A plain `mv` then replaces that copy, and with it the only
+    /// record of its index's sessions. The printed command must leave a copy
+    /// that appeared in between alone, and still do the repair once `--check`
+    /// names a free target again.
+    #[test]
+    fn a_damaged_index_repair_never_overwrites_a_copy_made_after_check() {
+        let root = temp_project();
+        let data = root.join("data");
+        let index = data.join("sessions/index.json");
+        write(index.clone(), "[{");
+        let repair = |data: &Path| {
+            let findings = check_at(&root, data);
+            let finding = findings
+                .iter()
+                .find(|f| f.path == index)
+                .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
+            let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
+            let (_, command) = reason
+                .split_once("move it aside to start a new index: ")
+                .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
+            command.to_string()
+        };
+
+        let stale = repair(&data);
+        let taken = data.join("sessions/index.json.damaged");
+        assert!(stale.ends_with(&shell_quote(&taken)), "{stale}");
+        write(taken.clone(), "[{\"id\":\"earlier\"");
+        let _ = std::process::Command::new("/bin/sh").arg("-c").arg(&stale).output().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "[{\"id\":\"earlier\"",
+            "the repair must not overwrite a copy made after --check: {stale}"
+        );
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{");
+
+        let fresh = repair(&data);
+        let run = std::process::Command::new("/bin/sh").arg("-c").arg(&fresh).output().unwrap();
+        assert!(run.status.success(), "{fresh}: {}", String::from_utf8_lossy(&run.stderr));
+        assert!(!index.exists(), "the repair moves the damaged index aside: {fresh}");
+        assert_eq!(std::fs::read_to_string(data.join("sessions/index.json.damaged-2")).unwrap(), "[{");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "[{\"id\":\"earlier\"");
         let _ = std::fs::remove_dir_all(root);
     }
 
