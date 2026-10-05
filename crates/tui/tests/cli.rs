@@ -1438,6 +1438,43 @@ fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
     );
 }
 
+/// A provider that fails after its 200 has gone out says so inside the
+/// stream. That used to read as a clean end: the turn stopped with nothing
+/// reported, and a tool call that streamed before the failure ran. The turn
+/// fails with the provider's own message and runs nothing.
+#[test]
+fn a_provider_error_inside_the_stream_is_reported_and_runs_no_tool_call() {
+    let (project, home) = fresh_dirs("stream-error");
+    let failure = concat!(
+        "data: {\"error\":{\"code\":400,\"message\":\"upstream rejected the request\"},",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (format!("{WRITE_CALL_SSE}{failure}"), true),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    // auto, so a call that is not run was refused for this reason and not by
+    // the approval gate.
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let (code, lines, stdout) = json_turn(&project, &home, "write the file");
+    assert_eq!(code, Some(1), "a failed reply must not exit 0: {stdout}");
+    assert!(
+        !project.join("side-effect.txt").exists(),
+        "a call from a stream the provider failed must not run: {stdout}"
+    );
+    assert!(!lines.iter().any(|l| l["type"] == "tool_start"), "{stdout}");
+    assert!(
+        lines.iter().any(|l| l["type"] == "error"
+            && l["message"].as_str().is_some_and(|m| m.contains("upstream rejected the request"))),
+        "the provider's message must be reported: {stdout}"
+    );
+    let last = lines.last().expect("at least one line");
+    assert_eq!(last["type"], "done", "{stdout}");
+    assert_eq!(last["stop_reason"], "error", "{stdout}");
+}
+
 /// Control for the refusals above: in the same unattended mode, that exact
 /// call does run once the stream finishes. Without this, the refusal test
 /// could pass for the wrong reason, such as an approval gate.

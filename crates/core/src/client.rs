@@ -7,21 +7,25 @@
 //!
 //! Retries cover what can end one request before the reply exists: a
 //! transport failure on send, a rate limit or transient server error (429,
-//! 500, 502, 503, 504, 529), and a stream that died before any reply text
-//! arrived. Each attempt resends the same bytes after an exponential backoff,
-//! stretched to a server's Retry-After, and tells the caller through
-//! [`StreamDelta::Retry`]. A 429 for an exhausted quota, and a Retry-After
-//! longer than a minute, are reported at once: no wait the turn would take
-//! lets the request succeed.
+//! 500, 502, 503, 504, 529), and a stream that died, or that the server
+//! failed with a rate limit or a server fault, before any reply text
+//! arrived. Each attempt resends the same bytes after an exponential
+//! backoff, stretched to a server's Retry-After, and tells the caller
+//! through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and a
+//! Retry-After longer than a minute, are reported at once: no wait the turn
+//! would take lets the request succeed.
 //! Once reply text has streamed, a retry would duplicate what the caller
-//! already showed, so a failure after that point is reported as a
-//! truncation instead. Reasoning deltas do not count: a retried attempt's
-//! reasoning is void, and the result carries only the final attempt's.
-//! A stream this client ends on purpose (the size cap, an out-of-range tool
-//! index, cancellation) is never retried: the next attempt would end the
-//! same way. A reply carrying only tool calls has no reply text, so a server
-//! that never sends a completion signal costs the whole budget on such a
-//! reply before its truncation is reported.
+//! already showed, so a cut after that point is reported as a truncation
+//! instead. A failure the server reports inside a 200 response (an `error`
+//! object, or finish_reason `error`) is never a reply: unless it is retried,
+//! it is an error carrying the server's own message. A cut after the server
+//! finished its reply leaves the reply finished. Reasoning deltas do not
+//! count: a retried attempt's reasoning is void, and the result carries only
+//! the final attempt's. A stream this client ends on purpose (the size cap,
+//! an out-of-range tool index, cancellation) is never retried: the next
+//! attempt would end the same way. A reply carrying only tool calls has no
+//! reply text, so a server that never sends a completion signal costs the
+//! whole budget on such a reply before its truncation is reported.
 //!
 //! There is no overall request timeout, only a connect timeout. A local or
 //! slow endpoint can legitimately take minutes to generate, and a deadline
@@ -247,9 +251,14 @@ struct PartialToolCall {
 
 #[derive(Deserialize)]
 struct StreamChunk {
+    // A failure line may carry no choices at all.
+    #[serde(default)]
     choices: Vec<StreamChoice>,
     // Sent on the final chunk when the request asks for it via stream_options.
     usage: Option<UsageJson>,
+    // A failure the server reports after its 200 has gone out: alone on its
+    // line, or beside a choice that ends with finish_reason `error`.
+    error: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -509,31 +518,89 @@ impl ChatClient {
             if is_json {
                 let Some(body) = read_body(resp, &cancelled).await? else { return Ok(cancelled_response()); };
                 let v: Value = serde_json::from_slice(&body).map_err(|e| format!("bad JSON response: {e}"))?;
+                // A 200 can still carry a failure in place of the reply.
+                if let Some(error) = v.get("error").filter(|e| !e.is_null()) {
+                    let failure = server_failure(error, &String::from_utf8_lossy(&body));
+                    if failure.retryable && attempt < MAX_ATTEMPTS {
+                        if !retry_after(attempt, &failure.message, &cancelled, &mut on_delta).await {
+                            return Ok(cancelled_response());
+                        }
+                        continue;
+                    }
+                    return Err(failure.message);
+                }
                 return parse_complete_response(&v, &mut on_delta);
             }
 
-            let (reply, interrupted) = read_sse(resp, &cancelled, &mut on_delta).await;
-            match interrupted {
-                Some(reason) if reply.content.is_empty() && attempt < MAX_ATTEMPTS => {
-                    if !retry_after(attempt, &reason, &cancelled, &mut on_delta).await {
-                        return Ok(cancelled_response());
-                    }
-                }
+            let (reply, unfinished) = read_sse(resp, &cancelled, &mut on_delta).await;
+            // The restart rules: nothing the caller keeps has streamed yet,
+            // and the budget has an attempt left.
+            let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
+            let reason = match unfinished {
+                Some(Unfinished::Interrupted(reason)) if restartable => reason,
+                Some(Unfinished::Failed(failure)) if failure.retryable && restartable => failure.message,
+                // Never a truncated reply: the server said this one failed,
+                // and a tool call it carried must not run.
+                Some(Unfinished::Failed(failure)) => return Err(failure.message),
                 _ => return Ok(reply),
+            };
+            if !retry_after(attempt, &reason, &cancelled, &mut on_delta).await {
+                return Ok(cancelled_response());
             }
         }
     }
 }
 
-/// Parse one SSE stream to its end. The second value names the interruption
-/// when the network ended the stream before the server did: EOF with no
-/// terminator, or a read error. It is `None` for a finished reply and for a
-/// stream this client cut itself, which a fresh attempt would cut the same way.
+/// Why a stream ended without the reply it promised.
+enum Unfinished {
+    /// The network ended the stream before the server did: EOF with no
+    /// terminator, or a read error before one.
+    Interrupted(String),
+    /// The server reported a failure inside the stream.
+    Failed(ServerFailure),
+}
+
+/// A failure a server reported inside a 200 response rather than as its
+/// status, which is how a gateway fails once the stream has begun.
+struct ServerFailure {
+    /// The error to return, or the reason to give for a retry.
+    message: String,
+    /// A rate limit, an overloaded server, or a server fault: what a fresh
+    /// attempt can outlast. A refused request, an exhausted quota, or a
+    /// filtered reply would fail the same way again.
+    retryable: bool,
+}
+
+/// Read an `error` value (an object, or a bare message string) out of `raw`,
+/// the response text that carried it, so the message is the provider's own.
+fn server_failure(error: &Value, raw: &str) -> ServerFailure {
+    let code = &error["code"];
+    // A numeric code, sometimes sent as a string, is an HTTP status.
+    let status = code.as_u64().or_else(|| code.as_str()?.parse().ok());
+    let kinds = || [code, &error["type"]].into_iter().filter_map(Value::as_str);
+    let retryable = !kinds().any(|kind| kind.contains("quota"))
+        && match status {
+            Some(status) => status == 429 || (500..600).contains(&status),
+            None => kinds().any(|kind| ["rate_limit", "overloaded", "server_error"].iter().any(|k| kind.contains(k))),
+        };
+    let code = match code {
+        Value::Null => String::new(),
+        // Without the quotes a JSON string would print with.
+        Value::String(code) => format!(" ({code})"),
+        code => format!(" ({code})"),
+    };
+    ServerFailure { message: format!("backend reported an error{code}: {}", describe_backend(raw)), retryable }
+}
+
+/// Parse one SSE stream to its end. The second value says why the stream
+/// ended unfinished: the network cut it, or the server reported a failure
+/// inside it. It is `None` for a finished reply and for a stream this client
+/// cut itself, which a fresh attempt would cut the same way.
 async fn read_sse(
     resp: reqwest::Response,
     cancelled: &crate::state::CancelToken,
     on_delta: &mut impl FnMut(StreamDelta),
-) -> (CompletionResult, Option<String>) {
+) -> (CompletionResult, Option<Unfinished>) {
     let mut content = String::new();
     // One buffer per key, so the reply goes back under the key that carried
     // it. `None` until the server sends that key as a string, even an empty one.
@@ -553,9 +620,9 @@ async fn read_sse(
     let mut stream = resp.bytes_stream();
     let mut received = 0usize;
     let mut scanned = 0usize;
-    // Set when the network, not the server or this client, ended the
-    // stream: the one truncation a fresh attempt can undo.
-    let mut interrupted: Option<String> = None;
+    // Set when something outside this client ended the stream unfinished:
+    // the network cut it, or the server reported a failure in it.
+    let mut unfinished: Option<Unfinished> = None;
 
     'outer: loop {
         let next = tokio::select! {
@@ -567,7 +634,7 @@ async fn read_sse(
         };
         let Some(chunk) = next else {
             if !saw_terminator {
-                interrupted = Some("the stream ended before the reply finished".into());
+                unfinished = Some(Unfinished::Interrupted("the stream ended before the reply finished".into()));
             }
             break;
         };
@@ -578,15 +645,19 @@ async fn read_sse(
                 finish_reason = TRUNCATED.into();
                 break;
             }
+            // A cut after the server finished (while the usage chunk or
+            // `[DONE]` was still due) costs nothing of the reply: it stands,
+            // rather than coming back truncated or being generated and
+            // billed a second time.
+            Err(_) if saw_terminator => break,
             Err(e) => {
-                saw_terminator = false;
                 finish_reason = TRUNCATED.into();
                 // Every error this stream yields is the connection failing
                 // under the body: a chunked or sized body cut short surfaces
                 // here, not as a clean end, and this client applies no content
                 // decoding that could fail on its own. So each one is worth a
                 // fresh attempt.
-                interrupted = Some(describe_transport(&e));
+                unfinished = Some(Unfinished::Interrupted(describe_transport(&e)));
                 break;
             }
         };
@@ -611,8 +682,16 @@ async fn read_sse(
             if let Some(u) = chunk.usage {
                 usage = Some(u.into_usage());
             }
+            let choice = chunk.choices.into_iter().next();
+            // finish_reason `error` ends the stream, but not as a reply: it
+            // is a failure even when the server sends no error to go with it.
+            if chunk.error.is_some() || choice.as_ref().is_some_and(|c| c.finish_reason.as_deref() == Some("error")) {
+                let error = chunk.error.unwrap_or(Value::Null);
+                unfinished = Some(Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data))));
+                break 'outer;
+            }
             // The usage-bearing final chunk has an empty choices array.
-            let Some(choice) = chunk.choices.into_iter().next() else { continue };
+            let Some(choice) = choice else { continue };
 
             if let Some(reason) = choice.finish_reason {
                 // Servers that end a stream here and never send `[DONE]`
@@ -683,7 +762,7 @@ async fn read_sse(
         finish_reason = "tool_calls".into();
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage }, interrupted)
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage }, unfinished)
 }
 
 /// Which key one reply's reasoning goes back under: the one the server sent
@@ -1446,6 +1525,18 @@ mod tests {
                     );
                     continue;
                 }
+                // A body prefixed with JSON: is a whole JSON reply, the
+                // shape of a server that ignores `stream`.
+                if let Some(json) = sse.strip_prefix("JSON:") {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+                            json.len()
+                        )
+                        .as_bytes(),
+                    );
+                    continue;
+                }
                 let _ = stream.write_all(
                     format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}").as_bytes(),
                 );
@@ -1455,6 +1546,11 @@ mod tests {
     }
 
     async fn stream_sequence(bodies: Vec<String>) -> (CompletionResult, Vec<String>, usize) {
+        let (result, deltas, served) = try_stream_sequence(bodies).await;
+        (result.unwrap(), deltas, served)
+    }
+
+    async fn try_stream_sequence(bodies: Vec<String>) -> (Result<CompletionResult, String>, Vec<String>, usize) {
         let (url, served) = spawn_sse_sequence(bodies);
         let mut deltas: Vec<String> = Vec::new();
         let result = ChatClient::new(url, None, "m".into(), None, 64)
@@ -1465,8 +1561,7 @@ mod tests {
                     StreamDelta::Retry { attempt, max_attempts, reason } => format!("retry:{attempt}/{max_attempts}:{reason}"),
                 })
             })
-            .await
-            .unwrap();
+            .await;
         let served = *served.lock().unwrap();
         (result, deltas, served)
     }
@@ -1636,6 +1731,18 @@ mod tests {
         )
     }
 
+    /// How a gateway reports a failure once its 200 has gone out: an `error`
+    /// object beside a choice that ends with finish_reason `error`.
+    fn gateway_error_chunk(code: Value, message: &str) -> String {
+        let chunk = json!({
+            "id": "gen-1",
+            "object": "chat.completion.chunk",
+            "error": {"code": code, "message": message},
+            "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+    }
+
     const FINISHED: &str = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
@@ -1657,6 +1764,65 @@ mod tests {
                 deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:backend returned {}", &status[..3]))
                     && deltas[0].ends_with("upstream overloaded"),
                 "the resend names the refusal: {}",
+                deltas[0]
+            );
+            assert_eq!(deltas[1], "content:all of it");
+        }
+    }
+
+    /// The bug this guards: finish_reason `error` read as a clean end, so a
+    /// failure the server reported inside its stream ended the turn with
+    /// nothing said. It is an error carrying the provider's own message, and
+    /// one that would fail the same way again is not resent.
+    #[tokio::test]
+    async fn an_error_inside_the_stream_is_reported_with_the_providers_message() {
+        let (result, deltas, served) = try_stream_sequence(vec![
+            gateway_error_chunk(json!(400), "the prompt is longer than this endpoint accepts"),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a failure the server reported is an error");
+        assert!(err.contains("the prompt is longer than this endpoint accepts"), "{err}");
+        assert_eq!(served, 1, "a refused request is not resent");
+        assert!(deltas.is_empty(), "{deltas:?}");
+
+        // A retryable failure after reply text streamed is reported, not
+        // resent: the caller has already shown that text.
+        let (result, deltas, served) = try_stream_sequence(vec![
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"half an ans\"}},\"finish_reason\":null}}]}}\n\n{}",
+                gateway_error_chunk(json!("server_error"), "upstream disconnected unexpectedly")
+            ),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a failure after reply text is still an error");
+        assert!(err.contains("upstream disconnected unexpectedly"), "{err}");
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+    }
+
+    /// A rate limit or an overloaded upstream reported before any reply text
+    /// is what a fresh attempt outlasts: the reply starts over under the same
+    /// rules as a dropped stream, and the retry names the provider's reason.
+    #[tokio::test]
+    async fn a_retryable_error_inside_the_stream_is_started_over_before_reply_text() {
+        for (failure, message) in [
+            (gateway_error_chunk(json!(429), "rate limit reached upstream"), "rate limit reached upstream"),
+            (
+                "data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n".to_string(),
+                "upstream overloaded",
+            ),
+        ] {
+            let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
+            let result = result.expect("the second attempt finished");
+            assert_eq!(served, 2);
+            assert_eq!(result.finish_reason, "stop");
+            assert_eq!(result.content, "all of it");
+            assert_eq!(deltas.len(), 2, "{deltas:?}");
+            assert!(
+                deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:")) && deltas[0].contains(message),
+                "{}",
                 deltas[0]
             );
             assert_eq!(deltas[1], "content:all of it");
@@ -1733,6 +1899,122 @@ mod tests {
             assert_eq!(retries, 0, "{status}");
             assert_eq!(served, 1, "{status}");
         }
+    }
+
+    /// Some servers send the failure alone on its line, with no choices. That
+    /// line failed to parse and was skipped, so the stream read as one that
+    /// died with nothing said, and was resent until the budget ran out.
+    #[tokio::test]
+    async fn a_bare_error_line_is_reported_with_the_providers_message() {
+        for line in [
+            r#"data: {"error":{"message":"insufficient credits for this request","code":402}}"#,
+            r#"data: {"error":"insufficient credits for this request"}"#,
+        ] {
+            let (result, _, served) = try_stream_sequence(vec![format!("{line}\n\n"), FINISHED.into()]).await;
+            let err = result.err().expect("a bare error line is an error");
+            assert!(err.contains("insufficient credits for this request"), "{err}");
+            assert_eq!(served, 1, "a refused request is not resent");
+        }
+
+        // finish_reason `error` with no error beside it still fails the
+        // reply, and says what the server sent.
+        let (result, _, served) = try_stream_sequence(vec![
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n".into(),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("finish_reason error is an error");
+        assert!(err.contains(r#""finish_reason":"error""#), "{err}");
+        assert_eq!(served, 1);
+    }
+
+    /// A server that ignores `stream` can put the same failure in its JSON
+    /// reply. It reads the same way: the provider's message, and a retry when
+    /// a fresh attempt can outlast it.
+    #[tokio::test]
+    async fn a_failure_in_a_json_reply_is_reported_like_one_in_a_stream() {
+        let (result, deltas, served) = try_stream_sequence(vec![
+            r#"JSON:{"error":{"code":503,"message":"upstream overloaded"}}"#.into(),
+            FINISHED.into(),
+        ])
+        .await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert!(deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:")) && deltas[0].contains("upstream overloaded"), "{deltas:?}");
+
+        let (result, _, served) = try_stream_sequence(vec![
+            r#"JSON:{"error":{"type":"invalid_request_error","message":"unknown parameter: tools"}}"#.into(),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a refused request is an error");
+        assert_eq!(err, "backend reported an error: unknown parameter: tools");
+        assert_eq!(served, 1);
+    }
+
+    #[test]
+    fn server_failures_a_retry_can_outlast() {
+        let retryable = |error: Value| server_failure(&error, "").retryable;
+        for code in [json!(429), json!(500), json!(502), json!(503), json!(529), json!("503")] {
+            assert!(retryable(json!({"code": code, "message": "m"})), "{code}");
+        }
+        for kind in ["rate_limit_exceeded", "server_error", "overloaded_error"] {
+            assert!(retryable(json!({"code": kind})), "{kind}");
+            assert!(retryable(json!({"type": kind})), "{kind}");
+        }
+        for error in [
+            json!({"code": 400}),
+            json!({"code": 401}),
+            json!({"code": 402}),
+            json!({"code": 404}),
+            json!({"code": "insufficient_quota", "type": "insufficient_quota"}),
+            // An exhausted quota fails the same way however it is coded.
+            json!({"code": 429, "type": "insufficient_quota"}),
+            json!({"type": "invalid_request_error"}),
+            json!({"message": "no code at all"}),
+            json!("a bare message"),
+            Value::Null,
+        ] {
+            assert!(!retryable(error.clone()), "{error}");
+        }
+
+        let raw = r#"{"error":{"code":429,"message":"slow down"}}"#;
+        let error: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(server_failure(&error["error"], raw).message, "backend reported an error (429): slow down");
+        let raw = r#"{"error":{"code":"server_error","message":"upstream reset"}}"#;
+        let error: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(server_failure(&error["error"], raw).message, "backend reported an error (server_error): upstream reset");
+    }
+
+    /// The bug this guards: a connection cut after the server finished its
+    /// reply threw that finish away. A reply with text came back truncated,
+    /// and one carrying only tool calls has no text, so it was generated and
+    /// billed a second time. The finish the server sent stands.
+    #[tokio::test]
+    async fn a_finished_reply_survives_a_connection_cut_after_it() {
+        let (result, deltas, served) = stream_sequence(vec![
+            concat!(
+                "CHUNKED:data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .into(),
+            FINISHED.into(),
+        ])
+        .await;
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:all of it".to_string()]);
+
+        let call = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+        let (result, deltas, served) = stream_sequence(vec![format!("CHUNKED:{call}"), call.into()]).await;
+        assert_eq!(served, 1, "the finished reply is generated once");
+        assert!(deltas.is_empty(), "{deltas:?}");
+        assert_eq!(result.finish_reason, "tool_calls");
+        assert_eq!(result.tool_calls.len(), 1);
     }
 
     #[test]
