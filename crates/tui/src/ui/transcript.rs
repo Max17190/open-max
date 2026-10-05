@@ -137,11 +137,15 @@ impl Block {
         let selectable_chars = selectable.chars().count();
         // Search covers the compact header plus the whole output, matching
         // what `search_text_line` reads back out; the folded view is not
-        // part of it.
+        // part of it. The output is searched as the screen shows it, or a
+        // color code inside a phrase would hide it from find while a query
+        // for the hidden code matched. Stripping never removes a newline, so
+        // line slots still agree with the raw output.
+        let visible = strip_escapes(&full_output);
         let search_lower = if selectable.is_empty() {
-            lower_for_search(&full_output)
+            lower_for_search(&visible)
         } else {
-            lower_for_search(&format!("{selectable}\n{full_output}"))
+            lower_for_search(&format!("{selectable}\n{visible}"))
         };
         let header = compact
             .first()
@@ -1222,7 +1226,9 @@ fn lines_to_plain(lines: &[Line<'static>]) -> String {
 /// rebuilding the whole text: the compact header is at most a couple of
 /// lines and the full output is read by reference. Composed exactly like
 /// the lowercase cache in `Block::new` / `Block::tool`, which is what
-/// keeps line indices between the two in agreement.
+/// keeps line indices between the two in agreement. An output line comes
+/// back with the escape sequences the cache left out; `preview_text`
+/// drops them.
 fn search_text_line(b: &Block, line_idx: usize) -> Option<String> {
     // `split('\n')`, not `.lines()`: indices come from counting `\n` bytes
     // in the cache, and `.lines()` would drop a trailing empty slot.
@@ -2110,6 +2116,36 @@ mod tests {
 
         // The bytes themselves are untouched: the block copy is exact.
         assert_eq!(t.selected_copy_text().as_deref(), Some(output));
+    }
+
+    /// Find matches tool output as the screen shows it. A color code inside
+    /// a phrase hid that phrase from find, a query for the hidden `[31m`
+    /// matched a block whose preview did not hold it, and an output opening
+    /// on a bare color reset previewed as a blank row.
+    #[test]
+    fn find_matches_colored_tool_output_as_shown() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        let output = "\u{1b}[0m\n\
+                      \u{1b}[1m\u{1b}[31merror\u{1b}[0m\u{1b}[1m: mismatched types\u{1b}[0m\n\
+                      a fat\u{1b}[33mal\u{1b}[0m warning";
+        t.push_tool(vec![Line::from("✗ bash cargo build")], output.into(), false);
+        assert_eq!(t.filter_matches("error: mismatched"), vec![0]);
+        assert_eq!(t.filter_matches("fatal"), vec![0]);
+        assert_eq!(t.filter_matches("[31m"), Vec::<usize>::new());
+        assert_eq!(t.filter_matches("[0m"), Vec::<usize>::new());
+        assert_eq!(
+            t.block_preview(0, "error: mismatched").as_deref(),
+            Some("error: mismatched types")
+        );
+        assert_eq!(t.block_preview(0, "fatal").as_deref(), Some("a fatal warning"));
+
+        // Without a header the output's first visible line is the preview.
+        let mut bare = Transcript::new();
+        bare.set_width(60);
+        bare.push_tool(Vec::new(), output.into(), false);
+        assert_eq!(bare.block_preview(0, "").as_deref(), Some("error: mismatched types"));
+        assert_eq!(bare.filter_matches("error: mismatched"), vec![0]);
     }
 
     #[test]
