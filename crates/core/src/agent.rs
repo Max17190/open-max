@@ -498,9 +498,10 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         // Any edit rewrites the file into the current shape at once, so
         // every later save is a plain append. Then every replay boundary
         // follows the message it marked, edit by edit in the order they were
-        // made. A crash between the rewrite and the shifts leaves a divider
-        // a message off, which changes where a replay draws it and nothing
-        // the model is sent.
+        // made; edits the file or the index cannot take yet wait on the
+        // session for a later save. A crash between the rewrite and the
+        // shifts leaves a divider a message off, which changes where a
+        // replay draws it and nothing the model is sent.
         let edits: Vec<sessions::ResumeEdit> = needs_system
             .then_some(0)
             .into_iter()
@@ -508,22 +509,19 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             .map(|at| sessions::ResumeEdit::Insert(at as u64))
             .chain(strays.into_iter().map(|at| sessions::ResumeEdit::Remove(at as u64)))
             .collect();
-        let mut deferred_resume_edits = Vec::new();
-        let persisted_count = if edits.is_empty() {
-            count
+        let (persisted_count, saved) = if edits.is_empty() {
+            (count, true)
         } else {
             let mut persisted = 0usize;
             if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
-                sessions::apply_resume_edits(core, session_id, &edits);
-                persisted
+                (persisted, true)
             } else {
                 // The file still holds the transcript as it was. A count of
                 // zero would make every later save refuse to append to it,
                 // so no turn of this sitting would reach disk; a stale count
                 // makes the next save rewrite the file whole, which lands the
                 // repair too, and the boundaries move with it then.
-                deferred_resume_edits = edits;
-                sessions::PERSISTED_STALE
+                (sessions::PERSISTED_STALE, false)
             }
         };
         let reported_policy_notices = rehydrate_policy_notices(&messages);
@@ -532,12 +530,12 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         // tool result, so a resumed session finds it in the transcript, or in
         // the compaction archive if a prune has since dropped that exchange,
         // and does not repeat it.
-        SessionData {
+        let mut data = SessionData {
             messages,
             registry,
             prompt_breakdown,
             persisted_count,
-            deferred_resume_edits,
+            deferred_resume_edits: edits,
             take_seq: 0,
             schemas_over_budget_reported: false,
             ledger_synced: false,
@@ -550,7 +548,9 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
                 .map(|e| e.id)
                 .collect(),
             prompt_ratio: None,
-        }
+        };
+        land_deferred_resume_edits(core, session_id, &mut data, saved);
+        data
     } else {
         // No transcript on disk: start fresh, honoring a manifest saved
         // before the session wrote its first message.
@@ -1322,11 +1322,16 @@ async fn compact_messages(
     // A hydration repair still waiting for a save lands first, with its
     // boundary edits: the commit moves the boundaries as if they already
     // measured this transcript, and once it lands the edits no longer fit.
-    let deferred = ctx.core.sessions.lock().await
-        .get(ctx.session_id)
-        .is_some_and(|data| !data.deferred_resume_edits.is_empty());
-    if deferred && !save_messages(ctx.core, ctx.session_id, messages, true).await {
-        return Err("compaction refused: the session transcript could not be saved".into());
+    // So the prune waits while either one fails to land.
+    let pending = || async {
+        ctx.core.sessions.lock().await
+            .get(ctx.session_id)
+            .is_some_and(|data| !data.deferred_resume_edits.is_empty())
+    };
+    if pending().await
+        && (!save_messages(ctx.core, ctx.session_id, messages, true).await || pending().await)
+    {
+        return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
     let dropped = digest.as_ref().map(|d| d.message_count).unwrap_or(0);
     let (archive, record) = match digest {
@@ -3729,13 +3734,18 @@ async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessa
     }
 }
 
-/// Move the replay boundaries a failed hydration rewrite left for later,
-/// once `saved` says a save landed the transcript that holds its repair.
-/// Such a save is always a whole rewrite (`sessions::PERSISTED_STALE`).
+/// Move the replay boundaries of a hydration repair once `saved` says the
+/// file holds it: the first save after a failed hydration rewrite rewrites
+/// the file whole (`sessions::PERSISTED_STALE`), and every save after that
+/// keeps it. The edits stay pending until the index write that applies them
+/// lands, so an index that refuses the write leaves them for the next save
+/// to retry, instead of leaving each later divider a message early for good.
 fn land_deferred_resume_edits(core: &Core, session_id: &str, data: &mut SessionData, saved: bool) {
-    if saved && !data.deferred_resume_edits.is_empty() {
-        let edits = std::mem::take(&mut data.deferred_resume_edits);
-        sessions::apply_resume_edits(core, session_id, &edits);
+    if saved
+        && !data.deferred_resume_edits.is_empty()
+        && sessions::apply_resume_edits(core, session_id, &data.deferred_resume_edits).is_ok()
+    {
+        data.deferred_resume_edits.clear();
     }
 }
 
@@ -9855,6 +9865,87 @@ mod tests {
             sessions::meta(&core, &id).unwrap().resume_points.last().copied(),
             Some(on_disk.len() as u64),
             "this sitting's divider still marks the end of the transcript"
+        );
+        assert!(core.sessions.lock().await.get(&id).unwrap().deferred_resume_edits.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A save can land a resume repair and then fail to write the index that
+    /// holds the replay boundaries (a full disk, a store gone read-only).
+    /// The boundary edits must outlive that failure: dropped there, no later
+    /// save retries them, and each sitting's divider stays a message early
+    /// for good.
+    #[tokio::test]
+    async fn a_failed_index_write_leaves_the_repair_boundary_edits_for_the_next_save() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let data = build_session_data(&core, &id, &project).unwrap();
+            let mut messages = data.messages;
+            messages.push(ChatMessage::user("what is in a.txt"));
+            messages.push(ChatMessage::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "c1".into(),
+                    ..tool_call("read_file", r#"{"path":"a.txt"}"#)
+                }]),
+            ));
+            messages.push(ChatMessage::user("later"));
+            let mut persisted = 0usize;
+            assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+        }
+        sessions::record_resume_point(&core, &id, 3);
+        sessions::record_resume_point(&core, &id, 4);
+
+        let index = core.data_dir.join("sessions").join("index.json");
+        let intact = std::fs::read(&index).unwrap();
+        std::fs::write(&index, "{ not json").unwrap();
+        ensure_session_hydrated(&core, &id, &project).await.unwrap();
+        std::fs::write(&index, &intact).unwrap();
+
+        // A save lands the repaired transcript, then the index write that
+        // would move the boundaries fails.
+        {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(&id).unwrap();
+            assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, false));
+            std::fs::write(&index, "{ not json").unwrap();
+            land_deferred_resume_edits(&core, &id, data, true);
+            std::fs::write(&index, &intact).unwrap();
+        }
+        assert_eq!(
+            sessions::load_messages(&core, &id).unwrap().unwrap()[3].tool_call_id.as_deref(),
+            Some("c1"),
+            "the repair is on file"
+        );
+        assert_eq!(
+            sessions::meta(&core, &id).unwrap().resume_points,
+            vec![3, 4],
+            "but the boundaries have not moved"
+        );
+
+        let (base_url, _bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+        start_turn(core.clone(), id.clone(), project.clone(), "go on".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        assert_eq!(
+            sessions::meta(&core, &id).unwrap().resume_points,
+            vec![4, 5],
+            "the next save moves each boundary to the message it marked"
         );
         assert!(core.sessions.lock().await.get(&id).unwrap().deferred_resume_edits.is_empty());
 

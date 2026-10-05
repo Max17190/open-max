@@ -733,13 +733,17 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<
     ensure_owned(core, id)?;
     with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            for p in &mut m.resume_points {
-                if *p >= at {
-                    *p = p.saturating_add(1);
-                }
-            }
+            shift_points_for_insert(&mut m.resume_points, at);
         }
     })
+}
+
+fn shift_points_for_insert(points: &mut [u64], at: u64) {
+    for p in points {
+        if *p >= at {
+            *p = p.saturating_add(1);
+        }
+    }
 }
 
 /// One message was removed from index `at`, so the transcript shrinks by
@@ -748,19 +752,14 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<
 /// message stays put and now marks the message that followed it, so two
 /// boundaries can meet there and become one. Hydration removes a tool reply
 /// that was saved after prompts instead of after its call.
-pub fn shift_resume_points_for_remove(core: &Core, id: &str, at: u64) -> Result<(), String> {
-    ensure_owned(core, id)?;
-    with_index(core, |metas| {
-        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            for p in &mut m.resume_points {
-                if *p > at {
-                    *p -= 1;
-                }
-            }
-            m.resume_points.sort_unstable();
-            m.resume_points.dedup();
+fn shift_points_for_remove(points: &mut Vec<u64>, at: u64) {
+    for p in points.iter_mut() {
+        if *p > at {
+            *p -= 1;
         }
-    })
+    }
+    points.sort_unstable();
+    points.dedup();
 }
 
 /// One message inserted into or removed from a transcript, at an index
@@ -771,14 +770,22 @@ pub enum ResumeEdit {
     Remove(u64),
 }
 
-/// Move every replay boundary through `edits`, in the order they were made.
-pub fn apply_resume_edits(core: &Core, id: &str, edits: &[ResumeEdit]) {
-    for edit in edits {
-        let _ = match *edit {
-            ResumeEdit::Insert(at) => shift_resume_points_for_insert(core, id, at),
-            ResumeEdit::Remove(at) => shift_resume_points_for_remove(core, id, at),
-        };
-    }
+/// Move every replay boundary through `edits`, in the order they were made,
+/// in one index write: either every edit lands or none does, so a caller
+/// whose write failed keeps the edits and retries them whole, and no
+/// boundary moves twice.
+pub fn apply_resume_edits(core: &Core, id: &str, edits: &[ResumeEdit]) -> Result<(), String> {
+    ensure_owned(core, id)?;
+    with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            for edit in edits {
+                match *edit {
+                    ResumeEdit::Insert(at) => shift_points_for_insert(&mut m.resume_points, at),
+                    ResumeEdit::Remove(at) => shift_points_for_remove(&mut m.resume_points, at),
+                }
+            }
+        }
+    })
 }
 
 /// Record that a new sitting resumed this session with `message_index`
