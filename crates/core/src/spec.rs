@@ -143,9 +143,10 @@ Readonly refuses mutating calls and calls requiring confirmation.
 
 Select /approvals auto|ask|readonly or Shift+Tab in a human-controlled frontend.
 The choice persists for this exact trusted project across launches, including
-headless/stdio. A subdirectory or worktree without its own choice follows the
-nearest enclosing project's. Other projects retain their own choice or settings
-default.
+headless/stdio. A subdirectory, including a worktree placed under the project,
+without its own choice follows the nearest enclosing project's. A worktree
+outside the root (git worktree add ../x) needs its own trust and choice. Other
+projects retain their own choice or settings default.
 Running in auto does not grant hashes: switching back to ask restores content
 requirements. Approve specific bytes with openmax --approve <manifest> or the
 content card in ask. Approving a file write approves only that write.
