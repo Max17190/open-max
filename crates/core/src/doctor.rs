@@ -787,8 +787,9 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // history, or copied from an older `--check`), and a skipped move leaves
     // the index damaged, so the next `--check` names a free target again.
     // `-n` skips without a word and exits 0, so the command checks that the
-    // index left and says so when it did not: a silent skip reads as a done
-    // repair while every session still refuses.
+    // index left and, when it did not, says so and exits nonzero: a silent
+    // skip, or a zero status a script checks, reads as a done repair while
+    // every session still refuses.
     if let Some((path, reason)) = crate::sessions::index_damage(data_dir) {
         let mut aside = path.with_extension("json.damaged");
         let mut n = 1;
@@ -800,7 +801,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         findings.push(Finding {
             kind: "sessions",
             status: Status::Err(format!(
-                "{reason}; close every openmax, then move it aside to start a new index: mv -n {index} {} && test ! -e {index} || echo 'the index was not moved; run openmax --check again'",
+                "{reason}; close every openmax, then move it aside to start a new index: mv -n {index} {} && test ! -e {index} || {{ echo 'the index was not moved; run openmax --check again'; false; }}",
                 shell_quote(&aside)
             )),
             path,
@@ -4427,9 +4428,10 @@ mod tests {
     /// or copied from an older `--check` whose name another move has since
     /// taken. A plain `mv` then replaces that copy, and with it the only
     /// record of its index's sessions. The printed command must leave a copy
-    /// that appeared in between alone, say that it moved nothing (a silent
-    /// skip reads as a done repair while every session still refuses), and
-    /// still do the repair once `--check` names a free target again.
+    /// that appeared in between alone, say that it moved nothing and exit
+    /// nonzero (a silent skip, or a zero status a script checks, reads as a
+    /// done repair while every session still refuses), and still do the
+    /// repair once `--check` names a free target again.
     #[test]
     fn a_damaged_index_repair_never_overwrites_a_copy_made_after_check() {
         let root = temp_project();
@@ -4465,6 +4467,7 @@ mod tests {
             said.contains("not moved") && said.contains("openmax --check"),
             "a skipped repair must say so, not pass as done: {stale}: {said}"
         );
+        assert!(!skipped.status.success(), "a repair that moved nothing must exit nonzero: {stale}");
 
         let fresh = repair(&data);
         let run = std::process::Command::new("/bin/sh").arg("-c").arg(&fresh).output().unwrap();
