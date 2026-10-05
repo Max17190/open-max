@@ -1111,6 +1111,17 @@ fn is_digest_message(msg: &ChatMessage) -> bool {
         && msg.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX))
 }
 
+/// A note `format_truncation_only` wrote, told apart from a real digest by
+/// its fixed opening. Saved transcripts carry this wording, so it must keep
+/// matching them if the note is ever reworded.
+fn is_truncation_only_note(msg: &ChatMessage) -> bool {
+    is_digest_message(msg)
+        && msg.content.as_deref().and_then(|c| c.strip_prefix(DIGEST_PREFIX)).is_some_and(|rest| {
+            rest.trim_start_matches(|c: char| c == ' ' || c.is_ascii_digit())
+                .starts_with("older tool outputs were shortened in place")
+        })
+}
+
 /// One admission counter for every model request made during a turn.
 struct RequestSpend {
     tokens: usize,
@@ -1167,8 +1178,10 @@ async fn prepare_compaction_digest(
     spend: &mut RequestSpend,
 ) -> (Vec<ChatMessage>, Option<sessions::CompactionRecord>) {
     let CompactionCtx { core, session_id, client, cancelled, .. } = *ctx;
-    // The prune's note sits right after the pinned head, and a digest note
-    // ends the opening run, so the head of the pruned candidate is its slot.
+    // The prune's note sits right after the pinned head and ends the opening
+    // run (a real digest always does; a truncation-only note does because a
+    // model reply follows it), so the head of the pruned candidate is its
+    // slot.
     let slot = pinned_head(messages);
     if digest.message_count == 0 {
         // Truncation-only: upgrade the note the prune just inserted with the
@@ -4021,13 +4034,26 @@ const TRUNCATED_WIDTH: usize = 160;
 /// model reply or at a previous prune's digest note, which sits right after
 /// the head. Never below 2, the floor every transcript was already pruned
 /// with, so one that opens `[system, request]` prunes exactly as before.
+///
+/// One saved shape needs an exception. Release 2026.10.0 inserted a
+/// truncation-only prune's note at a fixed index 2, so a note-first session
+/// it shortened opens `[system, note, truncation note, request]`, the
+/// request still verbatim. Ending the run at that note dropped the request
+/// on the next prune, so the run continues past a truncation-only note when
+/// a plain user message follows it. A note written at the head instead
+/// always precedes a model reply, so it still ends the run.
 fn pinned_head(messages: &[ChatMessage]) -> usize {
-    let opening = messages
-        .iter()
-        .skip(1)
-        .take_while(|m| m.role == "user" && !is_digest_message(m))
-        .count();
-    (1 + opening).max(2)
+    let plain_user = |m: &ChatMessage| m.role == "user" && !is_digest_message(m);
+    let mut head = 1;
+    while let Some(m) = messages.get(head) {
+        let saved_ahead_of_request =
+            is_truncation_only_note(m) && messages.get(head + 1).is_some_and(plain_user);
+        if !plain_user(m) && !saved_ahead_of_request {
+            break;
+        }
+        head += 1;
+    }
+    head.max(2)
 }
 
 /// The text a prune is keeping: the pinned head (through the standing
@@ -9474,6 +9500,47 @@ mod tests {
         }
     }
 
+    /// Release 2026.10.0 inserted a truncation-only prune's note at a fixed
+    /// index 2, so a note-first session it shortened was saved as `[system,
+    /// note, truncation note, request, ...]` with the request still
+    /// verbatim. Ending the head at that note dropped the request on the
+    /// next prune, leaving only a clipped "Earlier goals" snippet.
+    #[test]
+    fn a_saved_truncation_note_ahead_of_the_request_stays_in_the_head() {
+        let note = execution_policy_note(ApprovalMode::Ask);
+        let mut shortened = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
+        shortened.truncated.push(msg("tool", 4000));
+        let saved = shortened.format_truncation_only(Some("sessions/s.archive.jsonl"));
+        let mut messages = vec![
+            msg("system", 400),
+            ChatMessage::user(note.clone()),
+            ChatMessage::user(saved.clone()),
+            ChatMessage::user("the task"),
+        ];
+        for _ in 0..2 {
+            for _ in 0..20 {
+                messages.push(msg("assistant", 2000));
+                messages.push(msg("user", 2000));
+            }
+            let (changed, digest) = enforce_budget(&mut messages, 2000, 0);
+            assert!(changed && digest.is_some_and(|d| d.message_count > 0));
+            assert_eq!(messages[1].content.as_deref(), Some(note.as_str()));
+            assert_eq!(messages[2].content.as_deref(), Some(saved.as_str()));
+            assert_eq!(messages[3].content.as_deref(), Some("the task"), "request lost: {messages:?}");
+            // One real digest, right after the request, replaced in place by
+            // the second prune rather than stacked.
+            let compacted = |m: &ChatMessage| {
+                is_digest_message(m) && m.content.as_deref().is_some_and(|c| c.contains("earlier messages were compacted"))
+            };
+            assert!(compacted(&messages[4]), "{messages:?}");
+            assert_eq!(messages.iter().filter(|m| compacted(m)).count(), 1);
+        }
+        // A real digest still ends the head when a user message follows it:
+        // only the legacy truncation note is looked past.
+        let real = [msg("system", 10), ChatMessage::user("task"), messages[4].clone(), ChatMessage::user("next")];
+        assert_eq!(pinned_head(&real), 2);
+    }
+
     #[test]
     fn budget_truncates_old_tool_output_first() {
         let mut messages = vec![msg("system", 100), msg("user", 100)];
@@ -10669,11 +10736,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Session files already on disk open with `[system, note, request]`, the
-    /// shape every first turn wrote. Hydrating one and pruning it must keep
-    /// the request too, and keep the note ahead of it where the model read it.
-    #[tokio::test]
-    async fn a_persisted_note_first_transcript_keeps_its_request_through_a_prune() {
+    /// Save a session that opens `[system, opening..]` (built from the
+    /// session's archive address), then a first reply and six more
+    /// exchanges, with a replay boundary after the first exchange. Hydrate
+    /// it and force a prune that drops the first exchange and more. Returns
+    /// the transcript on disk, its replay boundaries, and the address.
+    async fn compact_saved_opening(opening: impl FnOnce(&str) -> Vec<ChatMessage>) -> (Vec<ChatMessage>, Vec<u64>, String) {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -10690,12 +10758,12 @@ mod tests {
             s.model = "m".into();
             s.max_tokens = 1_024;
         }
-        let note = execution_policy_note(ApprovalMode::Auto);
-        let request = original_request();
+        let address = sessions::archive_display(&core, &id);
+        let opening = opening(&address);
+        let first_exchange_end = 2 + opening.len() as u64;
         {
             let mut data = build_session_data(&core, &id, &project).unwrap();
-            data.messages.push(ChatMessage::user(note.clone()));
-            data.messages.push(ChatMessage::user(request.clone()));
+            data.messages.extend(opening);
             data.messages.push(ChatMessage::assistant(Some("on it".into()), None));
             for step in 0..6 {
                 data.messages.push(ChatMessage::user(format!("step {step}: {}", "more detail ".repeat(200))));
@@ -10706,7 +10774,7 @@ mod tests {
             sessions::save_manifest(&core, &id, &data.registry.to_manifest());
         }
         // An earlier sitting resumed after the first exchange.
-        sessions::record_resume_point(&core, &id, 4);
+        sessions::record_resume_point(&core, &id, first_exchange_end);
 
         ensure_session_hydrated(&core, &id, &project).await.unwrap();
         size_window_to_transcript(&core, &id).await;
@@ -10714,6 +10782,20 @@ mod tests {
         let receipt = run_compact(&core, &id, &project, &cancel).await.unwrap();
         assert!(receipt.compacted_messages > 1, "the forced prune must drop the first exchange and more");
         let on_disk = sessions::load_messages(&core, &id).unwrap().unwrap();
+        let boundaries = sessions::meta(&core, &id).unwrap().resume_points;
+        let _ = std::fs::remove_dir_all(dir);
+        (on_disk, boundaries, address)
+    }
+
+    /// Session files already on disk open with `[system, note, request]`, the
+    /// shape every first turn wrote. Hydrating one and pruning it must keep
+    /// the request too, and keep the note ahead of it where the model read it.
+    #[tokio::test]
+    async fn a_persisted_note_first_transcript_keeps_its_request_through_a_prune() {
+        let note = execution_policy_note(ApprovalMode::Auto);
+        let request = original_request();
+        let (on_disk, boundaries, address) =
+            compact_saved_opening(|_| vec![ChatMessage::user(note.clone()), ChatMessage::user(request.clone())]).await;
         assert!(keeps_verbatim(&on_disk, &request), "the original request must survive: {on_disk:?}");
         assert_eq!(on_disk[1].content.as_deref(), Some(note.as_str()), "the note keeps its place");
         assert_eq!(on_disk[2].content.as_deref(), Some(request.as_str()), "the request follows it");
@@ -10721,7 +10803,6 @@ mod tests {
         // slot left at index 2 would find the request there, skip the
         // upgrade, and leave the addressless note in the transcript.
         assert!(is_digest_message(&on_disk[3]), "the digest follows the request: {on_disk:?}");
-        let address = sessions::archive_display(&core, &id);
         assert!(
             on_disk[3].content.as_deref().is_some_and(|c| c.contains(&address)),
             "the digest names the archive: {:?}",
@@ -10730,9 +10811,35 @@ mod tests {
         // The first exchange is gone, so its boundary collapses to just after
         // the digest. Landing on the digest would draw the replay divider
         // above the context note instead of below it.
-        assert_eq!(sessions::meta(&core, &id).unwrap().resume_points, vec![4]);
+        assert_eq!(boundaries, vec![4]);
+    }
 
-        let _ = std::fs::remove_dir_all(dir);
+    /// The other shape release 2026.10.0 saved for a note-first session: a
+    /// truncation-only prune put its note at index 2, ahead of the request.
+    /// The request must survive, the new digest must land after it with the
+    /// archive address, and the boundary must collapse to just after that
+    /// digest.
+    #[tokio::test]
+    async fn a_persisted_truncation_note_ahead_of_the_request_keeps_the_request() {
+        let note = execution_policy_note(ApprovalMode::Auto);
+        let request = original_request();
+        let mut saved = String::new();
+        let (on_disk, boundaries, address) = compact_saved_opening(|address| {
+            let mut shortened = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
+            shortened.truncated.push(msg("tool", 4000));
+            saved = shortened.format_truncation_only(Some(address));
+            vec![ChatMessage::user(note.clone()), ChatMessage::user(saved.clone()), ChatMessage::user(request.clone())]
+        })
+        .await;
+        assert_eq!(on_disk[1].content.as_deref(), Some(note.as_str()), "the note keeps its place");
+        assert_eq!(on_disk[2].content.as_deref(), Some(saved.as_str()), "the saved note keeps its place");
+        assert_eq!(on_disk[3].content.as_deref(), Some(request.as_str()), "the request survives verbatim: {on_disk:?}");
+        let digest = on_disk[4].content.as_deref().unwrap_or_default();
+        assert!(
+            is_digest_message(&on_disk[4]) && digest.contains("earlier messages were compacted") && digest.contains(&address),
+            "the digest follows the request and names the archive: {on_disk:?}"
+        );
+        assert_eq!(boundaries, vec![5]);
     }
 
     /// The condition holds on every turn once it holds at all, so the advisory
