@@ -557,11 +557,12 @@ thread_local! {
 /// an archive line and a digest record for a prune that then did not happen,
 /// duplicates of what the transcript still holds, which the readers tolerate
 /// (`--recall` deduplicates, `last_compaction` takes the newest), and a torn
-/// line the next append cuts (`append_text`). Both appends are synced before
-/// the rewrite, so they reach the disk ahead of it: otherwise a power cut
-/// could keep the rewrite and lose the archive lines it relies on. `head` is
-/// how many leading messages the prune kept, which is also where its digest
-/// note sits.
+/// line the next append cuts (`append_text`). Both appends are synced, with
+/// the directory that names their files, before the rewrite, so they reach
+/// the disk ahead of it: otherwise a power cut could keep the rewrite and
+/// lose the archive lines it relies on, or the archive itself when this
+/// compaction created it. `head` is how many leading messages the prune
+/// kept, which is also where its digest note sits.
 pub(crate) fn commit_compaction(
     core: &Core,
     id: &str,
@@ -654,10 +655,7 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
             // effort, and after the fact: the file is already replaced, and
             // an error here must not report a write that landed as one that
             // did not.
-            #[cfg(unix)]
-            if let Ok(dir) = std::fs::File::open(&parent) {
-                let _ = sync(&dir, &parent);
-            }
+            let _ = sync_dir(&parent);
             Ok(())
         }
         Err(e) => {
@@ -694,6 +692,18 @@ fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     result.map_err(|e| std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", path.display())))
 }
 
+/// `sync` a directory, which holds the names of its files: a new name or a
+/// rename reaches the disk through it, not through the file's own sync. Unix
+/// only, since elsewhere a directory cannot be opened as a file to sync.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    if !cfg!(unix) {
+        return Ok(());
+    }
+    let file = std::fs::File::open(dir)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", dir.display())))?;
+    sync(&file, dir)
+}
+
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
     let mut out = String::new();
     for msg in messages {
@@ -721,17 +731,22 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage], ordered: bool) -> Resu
 /// newline gets one, or the next record would be glued onto it and both
 /// would be unreadable. A torn record (`is_torn`) is cut: no reader can use
 /// it, and left in place it would sit mid-file after this append, where the
-/// transcript loader refuses the whole session. No record moves either way.
+/// transcript loader refuses the whole session. No record moves either way,
+/// and a final line that is neither (damage) is kept and gets a newline like
+/// a complete record, so the loader still refuses it with its bytes intact.
 /// A write that fails part way is cut back off too, since the caller will
 /// append the same records again.
 ///
-/// `ordered` syncs the bytes (`sync`), so they reach the disk ahead of any
-/// later write. A compaction needs that for what it archives, because the
-/// transcript rewrite after it deletes the same messages. A transcript append
-/// does not: a power cut that loses its tail costs the newest messages, not
-/// the session, since the first save wrote the file whole (`save_messages`)
-/// and what remains ends in a complete record or a torn one the loader
-/// drops, and a sync per save would cost every model request one.
+/// `ordered` syncs the bytes and then the directory (`sync`), so they and the
+/// file's name, which the file's own sync does not cover when this append
+/// created it, reach the disk ahead of any later write. A failed sync fails
+/// the append, before anything that relies on it is written. A compaction
+/// needs that for what it archives, because the transcript rewrite after it
+/// deletes the same messages. A transcript append does not: a power cut
+/// that loses its tail costs the newest messages, not the session, since the
+/// first save wrote the file whole (`save_messages`) and what remains ends
+/// in a complete record or a torn one the loader drops, and a sync per save
+/// would cost every model request one.
 fn append_text(path: &PathBuf, text: &str, ordered: bool) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new()
@@ -763,7 +778,8 @@ fn append_text(path: &PathBuf, text: &str, ordered: bool) -> Result<(), String> 
     }
     file.flush().map_err(|e| e.to_string())?;
     if ordered {
-        sync(&file, path).map_err(|e| e.to_string())?;
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        sync(&file, path).and_then(|()| sync_dir(dir)).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -789,15 +805,18 @@ fn final_line_start(file: &mut std::fs::File, len: u64) -> std::io::Result<u64> 
 }
 
 /// Whether an unterminated final line reads as a record a crash or a full
-/// disk cut off mid-write: it is not JSON. Every record is one JSON object,
-/// and no proper prefix of a JSON object is JSON, so every torn record reads
-/// this way (a cut inside a multi-byte character included). Other damage
-/// that breaks the JSON of that same line reads the same way and is dropped
-/// with it. A final line that is whole JSON is never taken for a tear: one
-/// that only lost its newline is kept, and one that is not a message is
-/// still refused.
+/// disk cut off mid-write: its JSON runs out before it closes. A tear keeps
+/// the start of a record and nothing else, so parsing it fails only at the
+/// end of input (a cut inside a multi-byte character included), never at a
+/// wrong byte. A power cut can also leave the end of an append reading as
+/// zeros, which no record contains (the serializer escapes control
+/// characters), so trailing zeros are set aside first. Any other final line
+/// is kept: one that only lost its newline is a record, and one that fails
+/// before its end (a closed record that does not parse) is damage the loader
+/// refuses with the bytes preserved.
 fn is_torn(line: &[u8]) -> bool {
-    serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err()
+    let end = line.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    serde_json::from_slice::<serde_json::Value>(&line[..end]).is_err_and(|e| e.is_eof())
 }
 
 /// How many leading bytes of a JSONL file hold its records: all of them,
@@ -1808,12 +1827,15 @@ mod tests {
     }
 
     /// A crash or a power cut mid-append leaves the transcript ending in part
-    /// of a record: no newline, and not JSON, sometimes not even whole UTF-8.
-    /// That fragment was never a message, so a resume drops it instead of
-    /// refusing the session, and the next save cuts it instead of stranding
-    /// it mid-file, where it would be damage. Only the final line gets this:
-    /// the same bytes anywhere else, or a whole record that does not parse,
-    /// are still refused.
+    /// of a record: no newline, the start of its JSON and nothing else,
+    /// sometimes cut inside a multi-byte character or followed by zeros where
+    /// a power cut left the end of the append unwritten. That fragment was
+    /// never a message, so a resume drops it instead of refusing the session,
+    /// and the next save cuts it instead of stranding it mid-file, where it
+    /// would be damage. Only such a final line gets this: the same bytes
+    /// anywhere else, a whole record that is not a message, or a final record
+    /// that is closed but does not parse, are damage, still refused, and no
+    /// save cuts them.
     #[test]
     fn a_torn_final_record_is_dropped_on_load_and_cut_by_the_next_save() {
         let dir = std::env::temp_dir().join(format!("openmax-torn-tail-{}", uuid::Uuid::new_v4()));
@@ -1822,7 +1844,10 @@ mod tests {
         let path = messages_path(&core, &id);
         let line = |m: &ChatMessage| serde_json::to_string(m).unwrap() + "\n";
         let good = line(&ChatMessage::system("rules")) + &line(&ChatMessage::user("keep"));
-        let torn: [&[u8]; 2] = [b"{\"role\":\"assistant\",\"content\":\"half", b"{\"role\":\"assistant\",\"content\":\"caf\xc3"];
+        let torn: [&[u8]; 4] = [
+            b"{\"role\":\"assistant\",\"content\":\"half", b"{\"role\":\"assistant\",\"content\":\"caf\xc3",
+            b"{\"role\":\"assistant\",\"content\":\"half\0\0\0\0", b"\0\0\0\0",
+        ];
         for fragment in torn {
             std::fs::write(&path, [good.as_bytes(), fragment].concat()).unwrap();
             let mut messages = load_messages(&core, &id).unwrap().expect("the complete records resume");
@@ -1842,14 +1867,18 @@ mod tests {
         commit_compaction(&core, &id, &messages, &[], None, 2, 2).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
 
+        let next = [messages.as_slice(), &[ChatMessage::user("next")]].concat();
         for damaged in [
             [good.as_bytes(), torn[0], b"\n", good.as_bytes()].concat(),
             [good.as_bytes(), b"{\"role\":5}"].concat(),
+            [good.as_bytes(), b"{\"role\":\"user\",\"content\":\"edited\"]"].concat(),
         ] {
             std::fs::write(&path, &damaged).unwrap();
             assert!(load_messages(&core, &id).unwrap_err().contains("line 3"));
             assert!(!save_messages(&core, &id, &messages, &mut 2, true));
             assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert!(save_messages(&core, &id, &next, &mut 2, false));
+            assert!(std::fs::read(&path).unwrap().starts_with(&damaged), "an append never cuts damage");
         }
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1879,7 +1908,9 @@ mod tests {
 
     /// The transcript rewrite deletes what the archive just gained, so the
     /// archive has to reach the disk first, or a power cut that keeps the
-    /// rewrite loses those messages from both.
+    /// rewrite loses those messages from both. That includes its name: the
+    /// first compaction creates the archive, and a file's own sync does not
+    /// cover its directory entry, so the directory is synced right after it.
     #[test]
     fn a_compaction_syncs_its_archive_before_the_transcript_rewrite() {
         let dir = std::env::temp_dir().join(format!("openmax-archive-sync-{}", uuid::Uuid::new_v4()));
@@ -1895,6 +1926,9 @@ mod tests {
         let transcript = format!("{id}.messages.json.");
         let rewrite = synced.iter().position(|p| p.file_name().unwrap().to_string_lossy().starts_with(&transcript));
         assert!(matches!((archive, rewrite), (Some(a), Some(r)) if a < r), "{synced:?}");
+        if cfg!(unix) {
+            assert_eq!(archive.map(|a| &synced[a + 1]), Some(&sessions_dir(&core)), "{synced:?}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
