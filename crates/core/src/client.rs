@@ -926,7 +926,12 @@ const RETRY_AFTER_CAP_SECS: u64 = 60;
 /// and the 529 an overloaded provider sends). Resending is safe: a chat
 /// completion changes nothing, tools run only once the agent loop holds a
 /// finished reply, and a refused status carries no reply text the caller
-/// could show twice. A 429 for an exhausted quota is excluded by
+/// could show twice. A gateway's 500 or 502 can follow work the upstream
+/// already did, so a resend may pay for that work twice. The chat
+/// completions API has no idempotency key to collapse the two, and failing
+/// the turn saves nothing: it ends with no reply, and the only way to one
+/// is the same request sent again. A stream cut before any reply text is
+/// resent on the same terms. A 429 for an exhausted quota is excluded by
 /// [`quota_exhausted`].
 fn is_retryable_status(code: u16) -> bool {
     matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
