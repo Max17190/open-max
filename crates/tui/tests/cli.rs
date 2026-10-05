@@ -284,16 +284,33 @@ fn shell_words(line: &str) -> (Vec<String>, String) {
 }
 
 /// Read the stdio handshake, then quit through `input`. The child's stdout
-/// closing first (a refusal) is reported with its exit and stderr.
+/// closing first (a refusal) is reported with its exit and stderr, and a
+/// child that stays alive without a handshake is killed at a deadline rather
+/// than hanging the test.
 fn stdio_handshake(
     mut child: std::process::Child,
     input: &mut dyn Write,
 ) -> Result<std::process::Output, String> {
-    // Held until the child exits, so nothing it writes after the handshake
-    // meets a closed pipe.
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut hello = String::new();
-    stdout.read_line(&mut hello).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut hello = String::new();
+        stdout.read_line(&mut hello).unwrap();
+        let _ = tx.send((hello, stdout));
+    });
+    // The reader comes back with the line and is held until the child exits,
+    // so nothing it writes after the handshake meets a closed pipe.
+    let (hello, _stdout) = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(read) => read,
+        Err(e) => {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            return Err(format!(
+                "no stdio handshake ({e}): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    };
     if !hello.contains("\"hello\"") {
         let out = finish_with_deadline(child);
         return Err(format!(
