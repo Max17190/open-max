@@ -1082,7 +1082,15 @@ impl ExampleGates {
         // the mode gates still guard every approved (host) run, unchanged.
         // The in-session content gate (unapproved_capability) is untouched:
         // a passing probe approves nothing.
-        if !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+        //
+        // "Approved" is the question that gate asks: the manifest and the
+        // project-local code it runs. A script rewritten after approval
+        // leaves the manifest hash unchanged, so asking about the manifest
+        // alone would run the new bytes on the host while a session asks
+        // for approval again.
+        let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
+        let code = crate::ledger::bound_code(&ext.command, &ext.args, project_root);
+        if !approvals.covers_capability(&ext.source_sha256, &code) {
             return Ok(Admission::Sandboxed);
         }
         // One exhaustive read of approval_mode, in the turn's precedence:
@@ -3024,6 +3032,57 @@ mod tests {
             Ok(()) => panic!("a write outside the scratch must fail the probe"),
         }
         assert!(!touched.exists(), "the probe must not touch the project");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// An approval covers the manifest and the project-local script it runs.
+    /// A script rewritten after approval leaves the manifest hash unchanged,
+    /// and a session asks for approval again before running it; an example
+    /// must not run those bytes with host authority either, in ask or in
+    /// readonly mode.
+    #[tokio::test]
+    async fn a_script_edited_after_approval_probes_sandboxed_and_cannot_touch_the_host() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let script = root.join("tool.sh");
+        write(script.clone(), "#!/bin/sh\nprintf ok\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let manifest = tool_file(
+            &root,
+            "scripted.toml",
+            "name = \"scripted\"\ndescription = \"d\"\ncommand = \"./tool.sh\"\n\n[example]\nexpect_regex = \"ok\"\n",
+        );
+        let data = approved_data_dir(&root, &[]);
+        let shas = vec![
+            crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap()),
+            crate::ledger::sha256_hex(&std::fs::read(&script).unwrap()),
+        ];
+        crate::ledger::approve_capability(&data, &root, &manifest, &shas).unwrap();
+
+        let approved = examples(&root, &data).await.unwrap();
+        let v = verdict(&approved, "scripted");
+        assert!(v.result.is_ok(), "{:?}", v.result);
+        assert!(!v.sandboxed, "the approved manifest and script keep their host run");
+
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nprintf ok\n", touched.display())).unwrap();
+        for mode in ["ask", "readonly"] {
+            std::fs::write(data.join("settings.json"), format!(r#"{{"approval_mode":"{mode}"}}"#))
+                .unwrap();
+            let results = examples(&root, &data).await.unwrap();
+            let v = verdict(&results, "scripted");
+            match &v.result {
+                Err(reason) if reason.contains("cannot sandbox a probe") => {
+                    assert!(reason.contains("--approve"), "{reason}");
+                }
+                other => assert!(v.sandboxed, "{mode}: an edited script runs only as a probe: {other:?}"),
+            }
+            assert!(!touched.exists(), "{mode}: the edited script must not touch the project");
+        }
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }

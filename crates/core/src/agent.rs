@@ -3774,7 +3774,7 @@ fn unapproved_capability(
     };
     let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
     let code = crate::ledger::bound_code(&ext.command, &ext.args, project_root);
-    if approvals.contains(&ext.source_sha256) && approvals.covers_code(&code) {
+    if approvals.covers_capability(&ext.source_sha256, &code) {
         return None;
     }
     let path = ext.source_path.strip_prefix(project_root).unwrap_or(&ext.source_path);

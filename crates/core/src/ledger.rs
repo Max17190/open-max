@@ -780,6 +780,15 @@ impl Approvals {
         code.iter()
             .all(|c| c.sha256.as_deref().is_some_and(|sha| self.contains(sha)))
     }
+
+    /// A capability's whole definition is approved: the manifest and every
+    /// project-local file it runs. Every gate that lets a tool's content run
+    /// with host authority asks this one question; one that asked about the
+    /// manifest alone would run a script rewritten after approval, since the
+    /// edit leaves the manifest hash unchanged.
+    pub fn covers_capability(&self, manifest_sha: &str, code: &[BoundCode]) -> bool {
+        self.contains(manifest_sha) && self.covers_code(code)
+    }
 }
 
 /// Everything the chain says a human approved. One act can bless several
