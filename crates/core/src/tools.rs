@@ -931,27 +931,34 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(out)
 }
 
-/// Truncate text for command rendering while keeping its tail. The process
-/// supervisor owns any bounded spill log; this helper never writes files.
-fn truncate_rendered_command_output(text: &str, max_bytes: usize, log_path: Option<&PathBuf>) -> String {
+/// The tail of `text` within `max_bytes`, starting at a line boundary when
+/// one is close by.
+fn kept_tail(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
     let mut start = text.len() - max_bytes;
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    // Start the kept tail at a line boundary when one is close by.
     if let Some(nl) = text[start..].find('\n') {
         if nl < 200 {
             start += nl + 1;
         }
     }
-    let note = match log_path {
+    &text[start..]
+}
+
+/// Heads the result when any part of the output was dropped. The process
+/// supervisor owns any bounded spill log; rendering never writes files.
+fn truncation_notice(log_path: Option<&PathBuf>) -> String {
+    match log_path {
         Some(path) => format!(
             "[start of output truncated; bounded output log saved to {}; tail or grep it with bash]",
             path.display()
         ),
         None => "[start of output truncated]".to_string(),
-    };
-    format!("{note}\n…{}", &text[start..])
+    }
 }
 
 fn captured_text(stream: &execution::CapturedStream) -> String {
@@ -964,32 +971,46 @@ fn stream_was_truncated(stream: &execution::CapturedStream) -> bool {
 
 /// Format native-process output identically for bash and external tools.
 /// The supervisor has already bounded each stream and owns any spill log.
+///
+/// Over the cap, each stream keeps its own tail, so a flood of warnings on
+/// stderr cannot evict all of stdout, which is usually the result the command
+/// ran for. A stream that needs less than half of the cap keeps all of it and
+/// leaves the rest to the other, and a `…` marks each stream whose start was
+/// dropped.
 pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) -> (String, bool) {
-    let mut text = captured_text(&output.stdout);
+    let stdout = captured_text(&output.stdout);
     let stderr = captured_text(&output.stderr);
-    if !stderr.trim().is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str("[stderr]\n");
-        text.push_str(&stderr);
-    }
-
+    let (label, stderr) = match (stderr.trim().is_empty(), stdout.is_empty()) {
+        (true, _) => ("", ""),
+        (false, true) => ("[stderr]\n", stderr.as_str()),
+        (false, false) => ("\n[stderr]\n", stderr.as_str()),
+    };
+    let over_cap = stdout.len() + label.len() + stderr.len() > max_bytes;
     let needs_notice = output.log_truncated
         || stream_was_truncated(&output.stdout)
         || stream_was_truncated(&output.stderr)
-        || text.len() > max_bytes;
-    if text.len() > max_bytes {
-        text = truncate_rendered_command_output(&text, max_bytes, output.log_path.as_ref());
-    } else if needs_notice {
-        if let Some(path) = &output.log_path {
-            text = format!(
-                "[start of output truncated; bounded output log saved to {}; tail or grep it with bash]\n…{text}",
-                path.display()
-            );
-        } else {
-            text = format!("[start of output truncated]\n…{text}");
+        || over_cap;
+
+    let budget = max_bytes.saturating_sub(label.len());
+    let stdout_share = stdout.len().min((budget / 2).max(budget.saturating_sub(stderr.len())));
+    let elide = |text: &str, share: usize, captured_whole: bool| {
+        let kept = kept_tail(text, share);
+        match captured_whole && kept.len() == text.len() {
+            true => kept.to_string(),
+            false => format!("…{kept}"),
         }
+    };
+    let mut text = elide(&stdout, stdout_share, !stream_was_truncated(&output.stdout));
+    if !label.is_empty() {
+        text.push_str(label);
+        text.push_str(&elide(
+            stderr,
+            budget - stdout_share,
+            !stream_was_truncated(&output.stderr),
+        ));
+    }
+    if needs_notice {
+        text = format!("{}\n{text}", truncation_notice(output.log_path.as_ref()));
     }
     if text.trim().is_empty() {
         ("(no output)".into(), needs_notice)
@@ -1365,7 +1386,13 @@ mod tests {
             text.push_str(&format!("line number {i} with some padding text\n"));
         }
         assert!(text.len() > MAX_OUTPUT_BYTES);
-        let kept = truncate_rendered_command_output(&text, MAX_OUTPUT_BYTES, None);
+        let output = rendered_output(
+            stream(text.len() as u64, b"", text.as_bytes()),
+            stream(0, b"", b""),
+            None,
+            false,
+        );
+        let (kept, _) = render_process_output(&output, MAX_OUTPUT_BYTES);
         assert!(kept.len() < text.len());
         assert!(kept.contains("line number 3999"), "the end of the output must survive");
         assert!(!kept.contains("line number 0 "), "the head is what gets dropped");
@@ -1442,6 +1469,35 @@ mod tests {
             text.contains("bounded output log saved to /tmp/openmax-command.log"),
             "{text}"
         );
+    }
+
+    /// When both streams overflow, neither is starved: each keeps its own
+    /// tail, and each cut is marked where it happened.
+    #[test]
+    fn process_renderer_splits_the_cap_when_both_streams_overflow() {
+        let lines = |tag: &str| (0..100).map(|i| format!("{tag}-{i:03}\n")).collect::<String>();
+        let (out, err) = (lines("out"), lines("err"));
+        let output = rendered_output(
+            stream(out.len() as u64, b"", out.as_bytes()),
+            stream(err.len() as u64, b"", err.as_bytes()),
+            None,
+            false,
+        );
+        let cap = 200;
+        let (text, truncated) = render_process_output(&output, cap);
+        assert!(truncated);
+        let (notice, body) = text.split_once('\n').unwrap();
+        assert_eq!(notice, "[start of output truncated]");
+        let (kept_out, kept_err) = body.split_once("\n[stderr]\n").expect(&text);
+        assert!(kept_out.starts_with('…') && kept_out.ends_with("out-099\n"), "{text}");
+        assert!(kept_err.starts_with('…') && kept_err.ends_with("err-099\n"), "{text}");
+        assert!(!body.contains("out-000") && !body.contains("err-000"), "{text}");
+        // An even split, give or take the line each cut snaps forward to.
+        let line = "out-000\n".len();
+        for kept in [kept_out, kept_err] {
+            assert!(kept.len() + line >= (cap - "\n[stderr]\n".len()) / 2, "{text}");
+        }
+        assert!(body.replace('…', "").len() <= cap, "{text}");
     }
 
     /// A command that succeeds reports its size just as a failing one does.
@@ -1659,6 +1715,41 @@ mod tests {
         assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
         assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");
         assert!(!out.output.contains("noise line 1 "), "head should be dropped");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Compiler and test warnings go to stderr by the thousand while the
+    /// result the command ran for is on stdout. Cutting the tail of the
+    /// joined text let stderr alone fill the cap and evict every byte of
+    /// stdout, so the caller saw warnings and never the result.
+    #[tokio::test]
+    async fn a_stderr_flood_does_not_evict_stdout() {
+        let root = temp_project();
+        let cap = 1_000;
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "echo RESULT; for i in $(seq 1 3000); do echo warn-$i >&2; done"}),
+            OutputCaps { command_bytes: cap },
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        let stderr_bytes = out.process_bytes.unwrap() - "RESULT\n".len() as u64;
+        assert!(stderr_bytes > cap as u64, "stderr alone must overflow the cap: {stderr_bytes}");
+        assert!(out.output.contains("RESULT"), "stdout must survive a stderr flood: {}", out.output);
+        assert!(out.output.contains("\n[stderr]\n"), "{}", out.output);
+        assert!(out.output.ends_with("warn-3000\n"), "stderr keeps its tail: {}", out.output);
+        assert!(!out.output.contains("warn-1\n"), "and drops its head: {}", out.output);
+        // The notice and the elision marks sit outside the cap, as they always
+        // have; the captured text they frame stays within it.
+        let (notice, body) = out.output.split_once('\n').unwrap();
+        assert!(notice.contains("bounded output log saved to"), "{notice}");
+        assert!(
+            body.replace('…', "").len() <= cap,
+            "both streams share one cap: {} bytes",
+            body.len()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
