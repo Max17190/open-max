@@ -924,6 +924,12 @@ fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>
     Ok(Some(parsed))
 }
 
+/// A `persisted` count past the end of any transcript, for a file known to
+/// differ from memory: [`save_messages`] rewrites whenever `persisted`
+/// exceeds what it is given, so the next save replaces the file whole
+/// instead of appending to it or refusing to.
+pub const PERSISTED_STALE: usize = usize::MAX;
+
 /// Persist messages. Appends only new tail lines when possible; rewrites the
 /// whole file after budget trimming or message drops.
 ///

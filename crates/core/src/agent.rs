@@ -513,8 +513,16 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
                 for at in strays {
                     let _ = sessions::shift_resume_points_for_remove(core, session_id, at as u64);
                 }
+                persisted
+            } else {
+                // The file still holds the transcript as it was. A count of
+                // zero would make every later save refuse to append to it,
+                // so no turn of this sitting would reach disk; a stale count
+                // makes the next save rewrite the file whole, which lands the
+                // repair too. The dividers stay where they were, off by the
+                // messages the repair moved, as after a crash above.
+                sessions::PERSISTED_STALE
             }
-            persisted
         };
         let reported_policy_notices = rehydrate_policy_notices(&messages);
         let reported_approval_mode = rehydrate_approval_mode(&messages);
@@ -9614,6 +9622,83 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(replies, vec![3], "exactly one reply, right after the call");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The rewrite that lands a hydration repair can fail (here a damaged
+    /// index refuses it) and leave the file as it was. Once writes work
+    /// again, the next turn must still be recorded: its prompt and reply, and
+    /// the repair with them. A turn that never reaches the file is one a
+    /// resume silently loses.
+    #[tokio::test]
+    async fn a_turn_after_a_failed_hydration_repair_is_still_recorded() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let data = build_session_data(&core, &id, &project).unwrap();
+            let mut messages = data.messages;
+            messages.push(ChatMessage::user("what is in a.txt"));
+            messages.push(ChatMessage::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "c1".into(),
+                    ..tool_call("read_file", r#"{"path":"a.txt"}"#)
+                }]),
+            ));
+            let mut persisted = 0usize;
+            assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
+        }
+
+        let index = core.data_dir.join("sessions").join("index.json");
+        let intact = std::fs::read(&index).unwrap();
+        std::fs::write(&index, "{ not json").unwrap();
+        ensure_session_hydrated(&core, &id, &project).await.unwrap();
+        std::fs::write(&index, intact).unwrap();
+        assert_eq!(
+            sessions::load_messages(&core, &id).unwrap().unwrap().len(),
+            3,
+            "the repair did not land, so the file is as it was"
+        );
+
+        let (base_url, _bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+        start_turn(core.clone(), id.clone(), project.clone(), "go on".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let shape = |messages: &[ChatMessage]| -> Vec<(String, Option<String>, Option<String>)> {
+            messages
+                .iter()
+                .map(|m| (m.role.clone(), m.tool_call_id.clone(), m.content.clone()))
+                .collect()
+        };
+        let on_disk = shape(&sessions::load_messages(&core, &id).unwrap().unwrap());
+        let in_memory = shape(&core.sessions.lock().await.get(&id).unwrap().messages);
+        assert_eq!(on_disk, in_memory, "disk matches memory");
+        assert_eq!(
+            on_disk[3],
+            ("tool".into(), Some("c1".into()), Some(INTERRUPTED_TOOL_CALL.into())),
+            "the repair reaches the file"
+        );
+        let prompt = on_disk.iter().position(|m| m.0 == "user" && m.2.as_deref() == Some("go on"));
+        assert!(prompt.is_some_and(|at| at > 3), "the turn's prompt reaches the file: {on_disk:?}");
+        assert_eq!(
+            on_disk.last().map(|m| (m.0.as_str(), m.2.as_deref())),
+            Some(("assistant", Some("done"))),
+            "and so does its reply"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
