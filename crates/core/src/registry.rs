@@ -180,11 +180,11 @@ pub(crate) struct ExtensionSnapshot {
     /// displaced paths, winning path, winner indexed). The receipt names
     /// these; cross-tier precedence is not here.
     pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
-    /// Project memory files (stem, content hash). Memory rides the frozen
-    /// prompt's index, so a memory write moves the fingerprint and refreezes:
-    /// the fact is live from the next step, deterministically, instead of
-    /// whenever some unrelated extension file happens to change. Not ledger
-    /// files (data, not capability), so not in `files`.
+    /// Project memory files (stem, content hash) this capture indexed.
+    /// Memory rides the frozen prompt's index but not the fingerprint, so a
+    /// memory write never refreezes on its own; the index catches up at the
+    /// next refreeze or /reload. Not ledger files (data, not capability), so
+    /// not in `files`.
     pub(crate) memory_files: Vec<(String, u64)>,
     /// The index section from the same scan as `memory_files`.
     pub(crate) memory_section: Option<(String, Vec<(String, usize)>)>,
@@ -359,23 +359,18 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
-    // Memory: ONE read produces both the fingerprint bytes and the index, so
-    // the fingerprint (which decides refreeze) and the frozen index cannot be
-    // captured from two different file generations - an atomic replace between
-    // two scans could otherwise freeze the replacement's index under the
-    // original's fingerprint, and a restore-to-original would then skip the
-    // refreeze that would fix it. The fingerprint hashes every
-    // VALID-named memory byte (a write to one refreezes); the index is the
-    // indexed subset of the SAME bytes. Never ledgered (data, not capability).
+    // Memory rides this capture's prompt index but stays OUT of the
+    // fingerprint. The fingerprint decides refreeze, and a refreeze replaces
+    // the system message and rewrites the transcript: hashing memory bytes
+    // turned every saved fact into a full prompt-cache miss and an
+    // O(transcript) rewrite, only to show the model a fact it had just
+    // written. The index is frozen with the prompt instead, so it changes
+    // only when a tool or skill change refreezes, or on /reload. The
+    // directory path is still hashed so a project without memories keeps the
+    // fingerprint its persisted sessions recorded and resumes without a
+    // refreeze. Never ledgered (data, not capability).
+    project_root.join(crate::memory::MEMORY_DIR).hash(&mut h);
     let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
-    {
-        let dir = project_root.join(crate::memory::MEMORY_DIR);
-        dir.hash(&mut h);
-        for (path, bytes) in &mem.fingerprint_files {
-            path.hash(&mut h);
-            bytes.hash(&mut h);
-        }
-    }
     let (memory_section, memory_files) = (mem.section, mem.identities);
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
