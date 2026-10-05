@@ -140,7 +140,7 @@ gateways (OpenRouter and similar), and private proxies.
 
 A canonical project root must be trusted before any agent turn or project
 behavior starts. Interactive use asks once; headless and stdio runs fail
-closed until explicitly started with `--trust-project`. A trusted root covers
+closed until a human grants trust with `--trust-project`. A trusted root covers
 its subtree, so worktrees under it (for example `.worktrees/`) need no extra
 grant; a sibling directory whose name merely extends the root never rides
 along.
@@ -148,11 +148,25 @@ along.
 Trust grants are human actions. Every process the agent loop spawns carries
 `OPENMAX_SESSION`, and under that marker both `--trust-project` and the
 interactive trust prompt refuse: a session cannot grant itself, or a child it
-starts, trust in a new directory.
+starts, trust in a new directory. Outside a session, `--trust-project` also
+needs a terminal on stdin, so grant it once from a shell:
 
 ```sh
-openmax --trust-project -p "summarize this repo"
-openmax --trust-project --stdio
+openmax --trust-project -p "summarize this repo"   # from a terminal
+```
+
+A frontend spawns `openmax --stdio` with stdin as its protocol pipe, which is
+not a terminal, so it cannot grant trust: `--trust-project` there exits 3.
+Trust the project once from a terminal (the command above, or the interactive
+prompt); from then on the frontend starts sessions with plain
+`openmax --stdio`.
+
+Automation a human runs with no terminal, such as CI, states the human act
+explicitly with `OPENMAX_HUMAN_ATTEST=1`. It is honored only outside an agent
+session, and the harness strips it from every process it spawns:
+
+```sh
+OPENMAX_HUMAN_ATTEST=1 openmax --trust-project -p "summarize this repo"
 ```
 
 Trust is persisted for the exact canonical path in `~/.openmax/trust.json`. It

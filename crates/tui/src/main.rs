@@ -1435,8 +1435,11 @@ fn ensure_project_trust(
         return Ok(());
     }
     if agent_spawned || cli.print || cli.stdio || !std::io::stdin().is_terminal() {
+        // Name a grant that works for every caller here: a frontend's stdin is
+        // its protocol pipe, and telling it to add --trust-project only leads
+        // to require_human's no-terminal refusal.
         return Err(format!(
-            "project {} is not trusted; inspect it, then rerun with --trust-project",
+            "project {} is not trusted; inspect it, then trust it once from a terminal with `openmax --trust-project`",
             project.display()
         ));
     }
