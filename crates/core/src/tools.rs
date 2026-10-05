@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::execution::{
     self, CaptureSpec, ProcessError, ProcessOutput, ProcessRequest, StdinMode, Termination,
@@ -477,13 +478,24 @@ fn floor_char(s: &str, mut idx: usize) -> usize {
     idx
 }
 
+/// Longest an edit spends on a closest-line hint or a display diff. Both are
+/// quadratic at worst (a minified line, a whole-file rewrite) and run inside
+/// a call that cancellation waits for, so each reports what it has by then.
+const DIFF_BUDGET: Duration = Duration::from_millis(200);
+
 fn make_diff(root: &Path, path: &Path, old: &str, new: &str) -> DiffInfo {
     diff_strings(&rel_display(root, path), old, new)
 }
 
 /// Unified diff between two versions of a file.
 fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
-    let text_diff = TextDiff::from_lines(old, new);
+    let deadline = Instant::now() + DIFF_BUDGET;
+    let text_diff = TextDiff::configure().deadline(deadline).diff_lines(old, new);
+    // Past its deadline the diff stops searching and writes each region left
+    // as one deletion and one insertion: a valid edit but not the smallest,
+    // so it would list unchanged lines as rewritten and its counts can run
+    // high.
+    let gave_up = Instant::now() > deadline;
     let mut added = 0;
     let mut removed = 0;
     for change in text_diff.iter_all_changes() {
@@ -493,11 +505,17 @@ fn diff_strings(rel: &str, old: &str, new: &str) -> DiffInfo {
             ChangeTag::Equal => {}
         }
     }
-    let diff = text_diff
-        .unified_diff()
-        .context_radius(3)
-        .header(&format!("a/{rel}"), &format!("b/{rel}"))
-        .to_string();
+    let diff = if gave_up {
+        format!(
+            "--- a/{rel}\n+++ b/{rel}\n(diff not shown: the change was too large to compare in time, so +{added} −{removed} may overcount)\n"
+        )
+    } else {
+        text_diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("a/{rel}"), &format!("b/{rel}"))
+            .to_string()
+    };
     DiffInfo { path: rel.to_string(), diff: truncate(&diff, 40_000), added, removed }
 }
 
@@ -524,9 +542,18 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
+/// The part of a line the closest-match hint compares: trimmed, and no more
+/// of it than read_file shows. A character diff is quadratic in line length,
+/// so scoring a whole minified line takes minutes, and the shown prefix is
+/// all of a clipped line the model can have copied.
+fn hint_text(line: &str) -> &str {
+    let line = line.trim();
+    &line[..floor_char(line, line.len().min(MAX_LINE_CHARS))]
+}
+
 fn line_similarity(a: &str, b: &str) -> f64 {
-    let a = a.trim();
-    let b = b.trim();
+    let a = hint_text(a);
+    let b = hint_text(b);
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
@@ -545,11 +572,57 @@ fn line_similarity(a: &str, b: &str) -> f64 {
     }
 }
 
+fn byte_counts(text: &str) -> [u32; 256] {
+    let mut counts = [0u32; 256];
+    for b in text.bytes() {
+        counts[usize::from(b)] += 1;
+    }
+    counts
+}
+
+/// An upper bound on `line_similarity` from one pass over the line: two texts
+/// cannot share more characters than they share bytes.
+fn similarity_ceiling(text: &str, key: &str, key_bytes: &[u32; 256]) -> f64 {
+    let mut left = *key_bytes;
+    let mut shared = 0usize;
+    for b in text.bytes() {
+        let count = &mut left[usize::from(b)];
+        if *count > 0 {
+            *count -= 1;
+            shared += 1;
+        }
+    }
+    let total = text.chars().count() + key.chars().count();
+    if total == 0 {
+        1.0
+    } else {
+        2.0 * shared as f64 / total as f64
+    }
+}
+
 fn closest_line_hint(content: &str, old_string: &str) -> String {
+    closest_line_hint_until(content, old_string, Instant::now() + DIFF_BUDGET)
+}
+
+fn closest_line_hint_until(content: &str, old_string: &str, deadline: Instant) -> String {
     let needle = old_string.lines().next().unwrap_or(old_string);
+    let key = hint_text(needle);
+    let key_bytes = byte_counts(key);
     let mut best_idx = 0usize;
     let mut best_score = 0.0f64;
+    let mut scored = false;
+    let mut cut_at = None;
     for (i, line) in content.lines().enumerate() {
+        if scored && Instant::now() > deadline {
+            cut_at = Some(i);
+            break;
+        }
+        // A line whose ceiling cannot beat the best score would not replace
+        // it, so skipping its diff leaves the result unchanged.
+        if similarity_ceiling(hint_text(line), key, &key_bytes) <= best_score {
+            continue;
+        }
+        scored = true;
         let score = line_similarity(line, needle);
         if score > best_score {
             best_score = score;
@@ -557,8 +630,11 @@ fn closest_line_hint(content: &str, old_string: &str) -> String {
         }
     }
     let closest = content.lines().nth(best_idx).unwrap_or("");
+    // A scan cut short must say so, or the model reads the best of the lines
+    // compared as the best of the file.
+    let scope = cut_at.map(|n| format!(" in lines 1-{n}")).unwrap_or_default();
     format!(
-        "old_string not found. Closest match is at line {}: '{}'. Read the file around that line and retry with the exact text.",
+        "old_string not found. Closest match{scope} is at line {}: '{}'. Read the file around that line and retry with the exact text.",
         best_idx + 1,
         truncate(closest, 120)
     )
@@ -1786,6 +1862,112 @@ mod tests {
         assert!(out.output.contains("Closest match is at line 1"), "{}", out.output);
         assert!(out.output.contains("almost_match"), "{}", out.output);
         assert!(out.output.contains("Read the file around that line"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A character diff is quadratic in line length, so scoring a whole
+    /// megabyte line on an edit miss runs for minutes inside a call that
+    /// cancellation waits for. Each line is scored on a bounded prefix,
+    /// which is also all of a clipped line the model could have copied.
+    #[test]
+    fn the_closest_match_hint_scores_a_bounded_prefix_of_long_lines() {
+        let root = temp_project();
+        let table = format!("pub const TABLE: &[u32] = &[{}];", "1234, ".repeat(200_000));
+        std::fs::write(root.join("table.rs"), format!("fn main() {{}}\n{table}\n")).unwrap();
+        // The start of the long line as read_file shows it, followed by a
+        // line the file does not have.
+        let copied = &table[..400];
+        let out = edit_file(&root, &json!({
+            "path": "table.rs", "old_string": format!("{copied}\n// missing"), "new_string": "x"
+        }));
+        assert!(!out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("Closest match is at line 2"),
+            "a line that starts with the copied text is its closest match however long it runs: {}",
+            out.output
+        );
+
+        // A miss against a file that is one megabyte line returns, and still
+        // names the line.
+        let blob = "var mixing=0;".repeat(80_000);
+        assert!(hint_text(&blob).len() <= MAX_LINE_CHARS, "the diff sees a bounded prefix");
+        std::fs::write(root.join("blob.js"), &blob).unwrap();
+        let out = edit_file(&root, &json!({
+            "path": "blob.js", "old_string": "function missing() {}", "new_string": "x"
+        }));
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("Closest match is at line 1"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Past its deadline the scan stops at the next line once it has scored
+    /// one, and the hint names the lines it compared so a partial best is not
+    /// read as the file's best.
+    #[test]
+    fn a_closest_match_scan_past_its_deadline_names_the_lines_it_compared() {
+        let content = "fn alpha() {}\nfn beta() {}\nfn almost_match() {}\n";
+        let needle = "fn almost_matched() {}";
+        let hint = closest_line_hint_until(content, needle, Instant::now() + Duration::from_secs(60));
+        assert!(hint.contains("Closest match is at line 3"), "{hint}");
+        let expired = Instant::now() - Duration::from_millis(1);
+        let hint = closest_line_hint_until(content, needle, expired);
+        assert!(hint.contains("Closest match in lines 1-1 is at line 1"), "{hint}");
+        assert!(hint.contains("Read the file around that line"), "{hint}");
+    }
+
+    /// The scan skips a line's diff when its ceiling cannot beat the best
+    /// score; that is only sound while the ceiling never undercuts the score.
+    #[test]
+    fn the_similarity_ceiling_never_undercuts_the_score() {
+        let long = format!("let table = [{}];", "7, ".repeat(400));
+        for (line, needle) in [
+            ("fn alpha() {}", "fn almost_matched() {}"),
+            ("", ""),
+            ("   ", "x"),
+            ("é è ë", "è é"),
+            ("naïve café", "naive cafe"),
+            ("    let x = 1;", "let x = 2;"),
+            (long.as_str(), "let table = [7, 7, 8];"),
+        ] {
+            let key = hint_text(needle);
+            let ceiling = similarity_ceiling(hint_text(line), key, &byte_counts(key));
+            let score = line_similarity(line, needle);
+            assert!(ceiling >= score, "{line:?} vs {needle:?}: ceiling {ceiling} under score {score}");
+        }
+    }
+
+    /// A full rewrite shares no lines with the file it replaces, so the line
+    /// diff for the UI is quadratic in the file's length and a mutating
+    /// call cannot be cancelled while it runs.
+    #[test]
+    fn a_full_rewrite_of_a_large_file_reports_a_bounded_diff() {
+        let root = temp_project();
+        std::fs::write(root.join("small.txt"), "one\ntwo\nthree\n").unwrap();
+        let out = write_file(&root, &json!({"path": "small.txt", "content": "one\nTWO\nthree\n"}));
+        let diff = out.diff.expect("a write reports its diff");
+        assert_eq!((diff.added, diff.removed), (1, 1), "{}", diff.diff);
+        assert!(diff.diff.starts_with("--- a/small.txt\n+++ b/small.txt\n"), "{}", diff.diff);
+        assert!(diff.diff.contains("-two\n+TWO\n"), "an ordinary edit keeps its full diff: {}", diff.diff);
+
+        let lines = 40_000;
+        let old: String = (0..lines).map(|i| format!("old line {i}\n")).collect();
+        let new: String = (0..lines).map(|i| format!("new line {i}\n")).collect();
+        std::fs::write(root.join("big.txt"), old).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_file(&dir, &json!({"path": "big.txt", "content": new})));
+        });
+        // A guard far above the bounded diff's cost, so a regression fails
+        // here instead of hanging the suite.
+        let out = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the diff for a full rewrite must stop at its deadline");
+        assert!(out.ok, "{}", out.output);
+        let diff = out.diff.expect("a write reports its diff");
+        assert_eq!((diff.added, diff.removed), (lines, lines), "{}", out.output);
+        assert!(diff.diff.contains("diff not shown"), "{}", diff.diff);
+        assert!(diff.diff.len() < 300, "the fallback is a summary, not a listing: {}", diff.diff);
         let _ = std::fs::remove_dir_all(root);
     }
 
