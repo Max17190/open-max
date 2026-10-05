@@ -518,11 +518,18 @@ fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, ()>, std::fs::Fi
     Ok((guard, flock))
 }
 
-fn shifted_resume_points(points: &[u64], before: usize, after: usize) -> Vec<u64> {
+/// Move replay boundaries with a prune that kept the first `head` messages
+/// and wrote its digest note at index `head`. Boundaries inside the pinned
+/// head are untouched, since nothing before them changed. A shrink collapses
+/// the rest onto `head + 1`, after the note, never on it, or the divider
+/// would render above the context note instead of below it; a note insert
+/// moves them up by what it added.
+fn shifted_resume_points(points: &[u64], before: usize, after: usize, head: usize) -> Vec<u64> {
+    let head = head as u64;
     let mut shifted: Vec<u64> = points.iter().map(|&p| {
-        if after < before && p >= 2 {
-            p.saturating_sub((before - after) as u64).max(3)
-        } else if after > before && p >= 2 {
+        if after < before && p >= head {
+            p.saturating_sub((before - after) as u64).max(head + 1)
+        } else if after > before && p >= head {
             p.saturating_add((after - before) as u64)
         } else { p }
     }).collect();
@@ -548,7 +555,8 @@ thread_local! {
 /// an archive line and a digest record for a prune that then did not happen,
 /// duplicates of what the transcript still holds, which the readers tolerate
 /// (`--recall` deduplicates, `last_compaction` takes the newest), and a torn
-/// line the next append steps over (`append_text`).
+/// line the next append steps over (`append_text`). `head` is how many
+/// leading messages the prune kept, which is also where its digest note sits.
 pub(crate) fn commit_compaction(
     core: &Core,
     id: &str,
@@ -556,6 +564,7 @@ pub(crate) fn commit_compaction(
     archive: &[ChatMessage],
     record: Option<&CompactionRecord>,
     before_len: usize,
+    head: usize,
 ) -> Result<(), String> {
     ensure_owned(core, id)?;
     let _store = lock_store(core)?;
@@ -574,7 +583,7 @@ pub(crate) fn commit_compaction(
         append_text(&compaction_path(core, id), &line)?;
     }
     let before = metas[pos].resume_points.clone();
-    metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len());
+    metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len(), head);
     #[cfg(test)]
     if FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.replace(false)) {
         return Err("injected compaction index failure".into());
@@ -726,9 +735,8 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 
 /// One message was inserted at index `at`, so the transcript grows by exactly
 /// that message and every boundary at or after it moves up one. The mirror
-/// of the boundary shift for a prune, which handles shrinkage. A
-/// truncation-only prune inserts its note at 2; hydration of a transcript
-/// saved without its system prompt inserts that prompt at 0.
+/// of the boundary shift for a prune, which handles shrinkage. Hydration of
+/// a transcript saved without its system prompt inserts that prompt at 0.
 pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
     ensure_owned(core, id)?;
     with_index(core, |metas| {
@@ -1018,11 +1026,11 @@ mod tests {
         let record = CompactionRecord { ts: 1, message_count: 2, tools: vec![], paths: vec![], user_snippets: vec![], digest: "digest".into() };
         let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
         FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.set(true));
-        assert!(commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len()).is_err());
+        assert!(commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len(), 2).is_err());
         let bytes = std::fs::read_to_string(messages_path(&core, &id)).unwrap();
         assert!(bytes.contains("first") && !bytes.contains("digest"), "{bytes}");
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3]);
-        commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len()).unwrap();
+        commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len(), 2).unwrap();
         let archived: Vec<String> = load_archive(&core, &id).into_iter().filter_map(|m| m.content).collect();
         assert!(archived.ends_with(&["first".to_string(), "second".to_string()]), "the retry archives what it drops: {archived:?}");
         assert_eq!(last_compaction(&core, &id).unwrap().digest, "digest");
@@ -1046,10 +1054,10 @@ mod tests {
         record_resume_point(&core, &id, 6);
         let candidate = vec![original[0].clone(), original[1].clone(), ChatMessage::user("digest"), original[7].clone()];
         FAIL_COMPACTION_TRANSCRIPT_WRITE.with(|fail| fail.set(true));
-        assert!(commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len()).is_err());
+        assert!(commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len(), 2).is_err());
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![6], "boundaries restored");
         assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
-        commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len()).unwrap();
+        commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len(), 2).unwrap();
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3], "boundaries shift with the prune that landed");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1069,7 +1077,7 @@ mod tests {
         std::fs::OpenOptions::new().append(true).open(archive_path(&core, &id)).unwrap()
             .write_all(b"{\"role\":\"user\",\"content\":\"torn").unwrap();
         let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
-        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len()).unwrap();
+        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len(), 2).unwrap();
         let archived: Vec<String> = load_archive(&core, &id).into_iter().filter_map(|m| m.content).collect();
         assert_eq!(archived, ["prior", "first", "second"], "every dropped message reads back");
         let _ = std::fs::remove_dir_all(dir);
@@ -1089,17 +1097,25 @@ mod tests {
         // and the pinned-prefix boundary is untouched.
         with_index(&core, |metas| {
             let m = metas.iter_mut().find(|m| m.id.as_str() == id.as_str()).unwrap();
-            m.resume_points = shifted_resume_points(&m.resume_points, 6, 3);
+            m.resume_points = shifted_resume_points(&m.resume_points, 6, 3, 2);
         }).unwrap();
         // The prune that fires this shift also inserted its digest note at
-        // index 2; collapsed boundaries land after it, never on it.
+        // the head, index 2 behind `[system, request]`; collapsed boundaries
+        // land after it, never on it.
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 7]);
+
+        // Behind `[system, note, request]` the head is 3 and the note lands
+        // there: a boundary inside the head stays, a collapsed one lands
+        // after the note, and a note insert leaves the head alone too.
+        assert_eq!(shifted_resume_points(&[2, 4, 10], 9, 6, 3), vec![2, 4, 7]);
+        assert_eq!(shifted_resume_points(&[2, 3, 10], 9, 10, 3), vec![2, 4, 11]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A prune that only truncated removes nothing and inserts its note at
-    /// index 2, so the transcript grows by one and every boundary from the
-    /// note onward must follow or replay dividers drift the other way.
+    /// the pinned head, so the transcript grows by one and every boundary
+    /// from the note onward must follow or replay dividers drift the other
+    /// way.
     #[test]
     fn a_note_insert_moves_replay_boundaries_up_one() {
         let dir =
@@ -1586,7 +1602,7 @@ mod tests {
                 assert_eq!(persisted, 0);
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
             }
-            assert!(commit_compaction(&core, &id, &[ChatMessage::system("replacement")], &[], None, 1).is_err());
+            assert!(commit_compaction(&core, &id, &[ChatMessage::system("replacement")], &[], None, 1, 2).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e.event, AgentEvent::Error { .. })));
@@ -1610,7 +1626,7 @@ mod tests {
         // Damage after attachment must also survive a rewrite or compaction.
         std::fs::write(messages_path(&core, &id), b"{damage after loading").unwrap();
         assert!(!save_messages(&core, &id, &messages, &mut persisted, true));
-        assert!(commit_compaction(&core, &id, &messages, &[], None, 2).is_err());
+        assert!(commit_compaction(&core, &id, &messages, &[], None, 2, 2).is_err());
         assert_eq!(std::fs::read(messages_path(&core, &id)).unwrap(), b"{damage after loading");
         let _ = std::fs::remove_dir_all(dir);
     }
