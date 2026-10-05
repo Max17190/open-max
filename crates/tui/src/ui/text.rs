@@ -1,10 +1,85 @@
 //! Terminal-cell aware text primitives shared by compact TUI surfaces.
 
+use std::borrow::Cow;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Cells a tab occupies in the transcript. A fixed width rather than tab
+/// stops: the transcript's gutters (the tool output indent, the fence rail)
+/// and the line numbers `read_file` prints shift content off any stop grid,
+/// which would draw the first level of indentation narrower than the rest.
+pub const TAB_WIDTH: usize = 4;
+
 pub fn width(text: &str) -> usize {
     text.width()
+}
+
+/// Cells one grapheme occupies once painted. The renderer drops any grapheme
+/// holding a control character, so a tab would vanish (and Unicode width
+/// counts every other control as one cell it never gets); the wrapper draws a
+/// tab as [`TAB_WIDTH`] spaces instead and every other control as nothing.
+pub fn cell_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        TAB_WIDTH
+    } else if grapheme.contains(char::is_control) {
+        0
+    } else {
+        grapheme.width()
+    }
+}
+
+/// One line of captured program output without its complete CSI (`ESC [`,
+/// colors and cursor moves) and OSC (`ESC ]`, titles and hyperlinks, ended by
+/// BEL or `ESC \`) escape sequences. The renderer drops the ESC byte and
+/// paints the rest, so a red `error` would read `[31merror[0m`. An incomplete
+/// sequence is left as it is, and none spans a newline: removing text the
+/// program did not clearly mark as a sequence would hide output.
+pub fn strip_escapes(text: &str) -> Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut kept = 0usize;
+    let mut at = 0usize;
+    while let Some(found) = text[at..].find('\u{1b}') {
+        let esc = at + found;
+        match escape_len(&text.as_bytes()[esc..]) {
+            Some(len) => {
+                out.push_str(&text[kept..esc]);
+                at = esc + len;
+                kept = at;
+            }
+            None => at = esc + 1,
+        }
+    }
+    out.push_str(&text[kept..]);
+    Cow::Owned(out)
+}
+
+/// Byte length of the complete CSI or OSC sequence `seq` starts with (its
+/// first byte is ESC). Every byte that can end one is ASCII, so the length
+/// always lands on a char boundary.
+fn escape_len(seq: &[u8]) -> Option<usize> {
+    match seq.get(1)? {
+        b'[' => {
+            // Parameter and intermediate bytes, then one final byte.
+            let end = 2 + seq[2..].iter().position(|b| !(0x20..=0x3f).contains(b))?;
+            (0x40..=0x7e).contains(&seq[end]).then_some(end + 1)
+        }
+        b']' => {
+            for (i, &b) in seq.iter().enumerate().skip(2) {
+                match b {
+                    0x07 => return Some(i + 1),
+                    0x1b => return (seq.get(i + 1) == Some(&b'\\')).then_some(i + 2),
+                    b'\n' => return None,
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Clip to `max` terminal cells without splitting a grapheme cluster.
@@ -175,6 +250,43 @@ mod tests {
         let (s, e) = line_bounds("a\n\nb", 2);
         assert_eq!(s, e);
         assert_eq!(line_bounds("", 0), (0, 0));
+    }
+
+    #[test]
+    fn strip_escapes_removes_complete_sequences_and_keeps_the_rest() {
+        let plain = "no escapes\there";
+        assert!(matches!(strip_escapes(plain), Cow::Borrowed(_)));
+        // SGR colors, a cursor move, and private-mode parameters.
+        assert_eq!(
+            strip_escapes("\u{1b}[1;31merror\u{1b}[0m: \u{1b}[2Kdone\u{1b}[?25h"),
+            "error: done"
+        );
+        // OSC 8 hyperlinks under both terminators, around non-ASCII text.
+        assert_eq!(
+            strip_escapes("\u{1b}]8;;https://e.x/é\u{7}café\u{1b}]8;;\u{1b}\\!"),
+            "café!"
+        );
+        // Incomplete and other sequences stay: they are not clearly markup.
+        for kept in [
+            "cut \u{1b}[31",
+            "cut \u{1b}",
+            "title \u{1b}]0;never ended",
+            "title \u{1b}]0;ended\non the next line\u{7}",
+            "\u{1b}(B",
+        ] {
+            assert_eq!(strip_escapes(kept), kept);
+        }
+        // A broken sequence does not swallow the complete one after it.
+        assert_eq!(strip_escapes("bad \u{1b}[3\u{1b}[0m"), "bad \u{1b}[3");
+    }
+
+    #[test]
+    fn cell_width_matches_what_the_renderer_paints() {
+        assert_eq!(cell_width("\t"), TAB_WIDTH);
+        assert_eq!(cell_width("\u{1b}"), 0);
+        assert_eq!(cell_width("a"), 1);
+        assert_eq!(cell_width("漢"), 2);
+        assert_eq!(cell_width("👩‍💻"), 2);
     }
 
     #[test]
