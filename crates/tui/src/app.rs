@@ -477,14 +477,16 @@ pub struct App {
     status_width: u16,
 }
 
-/// Returns the warnings that must wait for the restored terminal: anything
-/// written before then lands on the alternate screen and vanishes with it.
+/// Returns how the loop ended and, apart from it, the warnings that must wait
+/// for the restored terminal: anything written before then lands on the
+/// alternate screen and vanishes with it. They come back on a terminal error
+/// too, since the exit discard ran either way.
 pub async fn run(
     mut terminal: Term,
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: Args,
-) -> std::io::Result<Vec<String>> {
+) -> (std::io::Result<()>, Vec<String>) {
     let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut app = App::new(core.clone(), project, files_tx);
@@ -497,7 +499,7 @@ pub async fn run(
     drop(args);
     // Every way out of the loop, a failed terminal included, leaves here.
     let warnings = app.discard_created_sessions_on_exit();
-    result.map(|()| warnings)
+    (result, warnings)
 }
 
 async fn event_loop(
