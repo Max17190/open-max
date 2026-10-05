@@ -156,12 +156,12 @@ where
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
             Long("run-examples") => out.run_examples = true,
-            Long("approve") => out.approve = Some(parser.value()?.string()?),
-            Long("forget") => out.forget = Some(parser.value()?.string()?),
+            Long("approve") => set_once(&mut out.approve, "--approve", &mut parser)?,
+            Long("forget") => set_once(&mut out.forget, "--forget", &mut parser)?,
             Long("ledger") => out.ledger = true,
-            Long("recall") => out.recall = Some(parser.value()?.string()?),
+            Long("recall") => set_once(&mut out.recall, "--recall", &mut parser)?,
             Long("ledger-repair") => out.ledger_repair = true,
-            Long("spec") => out.spec = Some(parser.value()?.string()?),
+            Long("spec") => set_once(&mut out.spec, "--spec", &mut parser)?,
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
@@ -182,6 +182,22 @@ where
         flush_prompt_tokens(&mut out.prompts, &mut current)?;
     }
     Ok(out)
+}
+
+/// Store the value of an operation that acts on one thing. A second
+/// occurrence would replace the first, which was then dropped without a word
+/// (`--approve a --approve b` approved only b and exited 0), so it is refused.
+fn set_once(
+    slot: &mut Option<String>,
+    flag: &str,
+    parser: &mut lexopt::Parser,
+) -> Result<(), lexopt::Error> {
+    use lexopt::ValueExt;
+    if slot.is_some() {
+        return Err(lexopt::Error::from(format!("{flag} given twice; run one at a time")));
+    }
+    *slot = Some(parser.value()?.string()?);
+    Ok(())
 }
 
 fn flush_prompt_tokens(
@@ -254,10 +270,11 @@ fn approve_command(path: &std::path::Path) -> String {
 /// when it is done, before the next one is considered. A second operation,
 /// or an option only another operation reads, was dropped without a word and
 /// the run exited as if that work had happened: `--check --ledger` printed
-/// history and exited 0 having validated nothing. Every combination is
-/// decided here, and each refusal names both sides of the conflict. The
-/// destructure below is exhaustive, so a new `CliArgs` field stops compiling
-/// here until it is placed among the operations or options.
+/// history and exited 0 having validated nothing. Every combination of
+/// different flags is decided here, and each refusal names both sides of the
+/// conflict (one operation given twice is refused while parsing, by
+/// `set_once`). The destructure below is exhaustive, so a new `CliArgs` field
+/// stops compiling here until it is placed among the operations or options.
 fn refusal(cli: &CliArgs) -> Option<String> {
     let CliArgs {
         continue_session,
@@ -325,10 +342,10 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         });
     }
     if !prompts.is_empty() && operation != Some("--print") {
-        // A stray word is a prompt only to the interactive session; beside a
-        // named operation it was most likely meant for that operation (a path
-        // after --check), so the refusal names it rather than pointing at
-        // --print.
+        // With no operation named, a stray word is most likely a prompt
+        // missing its -p, so that refusal points at --print; beside a named
+        // operation it was most likely meant for that operation (a path
+        // after --check), so the refusal names the word instead.
         let words = prompts.join(" ");
         return Some(match operation {
             None => "unexpected arguments (use --print for headless)".to_string(),
@@ -2314,6 +2331,24 @@ mod tests {
         assert!(parse_args_from(["-p"]).is_err());
     }
 
+    /// An operation that names one thing to act on, given twice, kept only
+    /// the second value: `--approve a.toml --approve b.toml` approved b.toml
+    /// alone and exited 0, leaving the gate in a.toml inert while the human
+    /// believed it approved.
+    #[test]
+    fn an_operation_given_twice_is_refused_naming_it() {
+        for flag in ["--approve", "--forget", "--spec", "--recall"] {
+            let err = parse_args_from([flag, "a", flag, "b"])
+                .err()
+                .unwrap_or_else(|| panic!("{flag} given twice must be refused"))
+                .to_string();
+            assert!(err.contains(flag) && err.contains("twice"), "{flag}: {err}");
+        }
+        // A model or provider given twice keeps the conventional last one.
+        let cli = parse_args_from(["-m", "a", "-m", "b", "--provider", "x", "--provider", "y"]).unwrap();
+        assert_eq!((cli.model.as_deref(), cli.provider.as_deref()), (Some("b"), Some("y")));
+    }
+
     /// Every operation a command line can select, as its args and the name a
     /// refusal gives it. `-p` comes last in any line built from these: the
     /// tokens after it are its prompt. An empty name is the interactive
@@ -2418,11 +2453,12 @@ mod tests {
         }
     }
 
-    /// A stray word is a prompt only to the interactive session. Beside a
-    /// named operation it is most often meant for that operation
-    /// (`--check x.toml`, `--check --stdio stream.jsonl`), so pointing at
-    /// --print sends the user the wrong way: the refusal names the word
-    /// instead, and an operation that reads stdin says so.
+    /// With no operation named, a stray word is most likely a prompt missing
+    /// its -p, so that refusal points at --print. Beside a named operation it
+    /// is most likely meant for that operation (`--check x.toml`,
+    /// `--check --stdio stream.jsonl`), so pointing at --print sends the user
+    /// the wrong way: the refusal names the word instead, and an operation
+    /// that reads stdin says so.
     #[test]
     fn a_stray_word_beside_an_operation_is_named_not_sent_to_print() {
         for (operation, name) in OPERATIONS {
