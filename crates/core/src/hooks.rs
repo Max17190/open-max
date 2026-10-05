@@ -1273,6 +1273,7 @@ async fn run_hook(
         },
         sandbox: None,
         env_allowlist: None,
+        self_link: false,
     };
 
     match execution::run_process(request, cancel.clone()).await {
@@ -2499,6 +2500,45 @@ tool = "bash"
             .pre_tool_use("sess", "read_file", &serde_json::json!({"path": "a"}), &tmp, &cancel)
             .await;
         assert_eq!(allow, PreToolResult::Allow);
+    }
+
+    /// The agent's account can write the harness link directory. On an
+    /// approved hook's PATH, a `python3` planted there would run in place of
+    /// the system binary the human approved, and no sweep before the spawn
+    /// stops one planted while the hook runs. A hook keeps the PATH the
+    /// harness inherited.
+    #[tokio::test]
+    async fn an_approved_hook_never_gets_the_harness_link_on_path() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // Every PATH entry holding an `openmax` symlink, whatever PATH's
+        // length (a block reason is capped), reported by blocking.
+        let script = write_script(
+            &tmp,
+            "path.sh",
+            "#!/bin/sh\nIFS=:\nfor dir in $PATH; do [ -L \"$dir/openmax\" ] && echo \"$dir\"; done\nexit 1\n",
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "path.toml",
+            &format!("event = \"pre_tool_use\"\ncommand = \"{}\"\n", script.display()),
+        );
+        let hooks = discover_for_test(&tmp);
+        let cancel = Arc::new(CancelToken::default());
+        let result = hooks
+            .pre_tool_use("sess", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        let PreToolResult::Block { reason } = result else {
+            panic!("expected the hook to report its PATH: {result:?}");
+        };
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let linked: Vec<&str> = reason
+            .lines()
+            .filter(|dir| std::fs::read_link(Path::new(dir).join("openmax")).ok().as_ref() == Some(&exe))
+            .collect();
+        assert!(linked.is_empty(), "an approved hook got the harness link on PATH: {linked:?}");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]

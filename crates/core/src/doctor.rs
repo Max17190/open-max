@@ -1484,9 +1484,9 @@ impl CommandProblem {
 
 /// Why `command` will not spawn from this checkout, if it will not. A path
 /// (contains '/') resolves against the project root, exactly as the runtime
-/// spawns it; a bare name resolves on the PATH a child gets. This warns
-/// rather than errors: check-time and run-time environments legitimately
-/// differ (CI without the tool installed, a script the agent writes next).
+/// spawns it; a bare name resolves on PATH. This warns rather than errors:
+/// check-time and run-time environments legitimately differ (CI without the
+/// tool installed, a script the agent writes next).
 fn missing_command_reason(
     command: &str,
     project_root: &Path,
@@ -1522,7 +1522,7 @@ fn missing_command_reason(
         }
         return None;
     }
-    let found = crate::execution::child_path().is_some_and(|paths| {
+    let found = std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| dir.join(command).is_file())
     });
     (!found).then(|| {
@@ -3777,17 +3777,6 @@ mod tests {
             }
             other => panic!("a command missing from PATH must name its own repair: {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// --check judges a bare name on the PATH a child gets, where the self
-    /// link puts the running harness first: a hook or tool running a bare
-    /// `openmax` spawns fine even when the harness's own PATH holds none.
-    #[cfg(unix)]
-    #[test]
-    fn a_bare_openmax_command_is_on_the_child_path() {
-        let root = temp_project();
-        assert_eq!(missing_command_reason("openmax", &root).map(|(_, reason)| reason), None);
         let _ = std::fs::remove_dir_all(root);
     }
 

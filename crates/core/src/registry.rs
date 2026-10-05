@@ -1256,6 +1256,7 @@ async fn spawn_external(
         },
         sandbox,
         env_allowlist: Some(tool.env.clone()),
+        self_link: false,
     };
 
     match execution::run_process(request, cancel).await {
@@ -2065,6 +2066,41 @@ mod tests {
         std::env::remove_var("OPENMAX_TEST_DROP");
         assert!(out.ok, "{}", out.output);
         assert_eq!(out.output.trim(), "kept|", "declared env arrives; the rest is scrubbed");
+    }
+
+    /// The agent's account can write the harness link directory. On an
+    /// approved tool's PATH, a name planted there would run in place of the
+    /// system binary the human approved, and no sweep before the spawn stops
+    /// one planted while the tool runs. A tool's scrubbed baseline keeps the
+    /// PATH the harness inherited.
+    #[tokio::test]
+    async fn an_external_tool_never_gets_the_harness_link_on_path() {
+        let dir = std::env::temp_dir().join(format!("openmax-pathtool-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/pathcheck.toml"),
+            "name = \"pathcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf %s \\\"$PATH\\\"\"]\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&dir.join("data"), &project);
+        let out = registry
+            .execute(
+                "pathcheck",
+                &serde_json::json!({}),
+                &dir.join("data"),
+                &project,
+                tools::OutputCaps::default(),
+                Arc::new(CancelToken::default()),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(out.ok, "{}", out.output);
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let linked: Vec<PathBuf> = std::env::split_paths(out.output.trim())
+            .filter(|entry| std::fs::read_link(entry.join("openmax")).ok().as_ref() == Some(&exe))
+            .collect();
+        assert!(linked.is_empty(), "an approved tool got the harness link on PATH: {linked:?}");
     }
 
     #[test]
