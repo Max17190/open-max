@@ -377,6 +377,47 @@ jobs:
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
+      - name: Run the npm launcher under node or bun
+        # LOCAL EDIT, not generated; see the note on the "Install dist" step in
+        # `plan`, and re-apply this step after regenerating.
+        #
+        # dist's launcher starts with `#!/usr/bin/env node`, so a machine with
+        # bun and no Node.js installs the package and then cannot run it. Its
+        # shebang is replaced by `#!/bin/sh` and one line that sh runs to exec
+        # the same file with node, or with bun when node is absent; to node and
+        # bun that line is a string statement and a comment. Fails if the
+        # launcher or its `bin` map ever changes shape, rather than publishing
+        # it unpatched. That guard checks shape, not that bun runs the rest of
+        # the launcher: the launcher only changes when cargo-dist-version does,
+        # so after bumping it, install the patched package and run `openmax`
+        # once with bun and no node before tagging. Only the registry gets the
+        # patched tarball: the copy on
+        # the GitHub Release, uploaded by `host` before this job runs, keeps
+        # dist's launcher so it still matches sha256.sum.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/launcher-head" <<'SH'
+          #!/bin/sh
+          ':' //; r=$(command -v node || command -v bun) || { echo "openmax: needs node or bun on PATH" >&2; exit 127; }; exec "$r" "$0" "$@"
+          SH
+          for pkg in npm/*-npm-package.tar.gz; do
+            dir=$(mktemp -d)
+            tar xzf "$pkg" -C "$dir"
+            # Assigned first: errexit ignores a failed substitution in a for list.
+            bins=$(jq -er '.bin | objects | .[]' "$dir/package/package.json")
+            for bin in $bins; do
+              f="$dir/package/$bin"
+              # Line 2 must be blank: a line starting with ( [ or ` would turn
+              # the ':' string above it into a call.
+              [ "$(head -n 1 "$f")" = '#!/usr/bin/env node' ] && [ -z "$(sed -n 2p "$f")" ] || {
+                echo "unexpected launcher in $bin" >&2; exit 1; }
+              { cat "$RUNNER_TEMP/launcher-head"; tail -n +2 "$f"; } > "$f.new"
+              mv "$f.new" "$f"
+              chmod 755 "$f"
+            done
+            tar czf "$pkg" -C "$dir" package
+          done
       - run: |
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
             pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
