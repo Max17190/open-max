@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -516,9 +515,9 @@ fn with_lock<R>(dir: &Path, f: impl FnOnce() -> Result<R, String>) -> Result<R, 
         .write(true)
         .open(lock_path(dir))
         .map_err(|e| format!("cannot open ledger lock: {e}"))?;
-    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
+    lock.lock().map_err(|e| format!("cannot lock ledger: {e}"))?;
     let result = f();
-    let _ = fs2::FileExt::unlock(&lock);
+    let _ = lock.unlock();
     result
 }
 
@@ -1841,7 +1840,7 @@ pub fn record_usage(
         .write(true)
         .open(lock_path(&dir))
         .map_err(|e| format!("cannot open ledger lock: {e}"))?;
-    lock.lock_exclusive().map_err(|e| format!("cannot lock ledger: {e}"))?;
+    lock.lock().map_err(|e| format!("cannot lock ledger: {e}"))?;
     let result = (|| {
         // A malformed usage file starts over rather than blocking turns:
         // usage is telemetry, not policy.
@@ -1872,7 +1871,7 @@ pub fn record_usage(
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         crate::sessions::write_atomic(&usage_path(&dir), json)
     })();
-    let _ = fs2::FileExt::unlock(&lock);
+    let _ = lock.unlock();
     result
 }
 
@@ -2029,6 +2028,45 @@ mod tests {
         let records = history(&data, &root).unwrap();
         assert_eq!(records.len(), 3);
         assert!(records[2].sha256.is_none());
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ledger.lock speaks the same flock(2) protocol as the session locks:
+    /// both writers that take it must wait while an older binary on this data
+    /// dir holds it, or two hash-chain appends race and break the chain.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_writes_wait_for_a_raw_flock_holder() {
+        let data = temp("flock-data");
+        let root = temp("flock-proj");
+        let dir = project_dir(&data, &root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = crate::sessions::raw_flock(&lock_path(&dir)).expect("ledger.lock is idle");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let syncer = {
+            let (data, root, done_tx) = (data.clone(), root.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
+                sync(&data, &root, &files, Actor::External, None).unwrap();
+                done_tx.send("sync").unwrap();
+            })
+        };
+        let usage = {
+            let (data, root) = (data.clone(), root.clone());
+            std::thread::spawn(move || {
+                let delta = UsageDelta { tools: vec![("t".into(), true)], skills: Vec::new() };
+                record_usage(&data, &root, &delta).unwrap();
+                done_tx.send("record_usage").unwrap();
+            })
+        };
+        let early = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(early.is_err(), "{early:?} ran while an older binary held ledger.lock");
+        drop(older);
+        syncer.join().unwrap();
+        usage.join().unwrap();
+        assert_eq!(history(&data, &root).unwrap().len(), 1);
+        assert_eq!(load_usage(&data, &root).unwrap().total_calls, 1);
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }

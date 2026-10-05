@@ -74,7 +74,6 @@ pub(crate) fn ensure_owned(core: &Core, id: &str) -> Result<(), String> {
 }
 
 fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Result<(), String> {
-    use fs2::FileExt;
     let mut owners = core.session_owners.lock().unwrap();
     if let Some(owner) = owners.get_mut(id) {
         if reactivate {
@@ -86,10 +85,10 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
     let path = sessions_dir(core).join(format!("{id}.lock"));
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
-    file.try_lock_exclusive().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            format!("session {id} is already open in another process; close it there or start a new session")
-        } else { format!("cannot lock session {id}: {e}") }
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock =>
+            format!("session {id} is already open in another process; close it there or start a new session"),
+        std::fs::TryLockError::Error(e) => format!("cannot lock session {id}: {e}"),
     })?;
     if validate { load_messages(core, id)?; }
     owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
@@ -473,14 +472,16 @@ fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
 /// cycles interleave, the loser's `create` entry vanishes from the index, and
 /// the still-indexed gate then silently drops every write that session makes
 /// for the rest of its life - transcript included. Same flock discipline as
-/// the ledger and trust stores.
+/// the ledger and trust stores. std's `File::lock` and `try_lock` are flock(2)
+/// on Linux and macOS, the lock every released binary takes; where std has no
+/// file lock (Android, DragonFly) they return Unsupported, so every store
+/// refuses to write rather than write unlocked.
 ///
 /// Callers must already hold `sessions_lock`: flock is per open file
 /// description, so that is what keeps one process from contending with
 /// itself (see the ledger's `with_lock` note). The lock releases when the
 /// returned handle drops.
 fn lock_index(core: &Core) -> Result<std::fs::File, String> {
-    use fs2::FileExt;
     let dir = sessions_dir(core);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("index.lock");
@@ -490,9 +491,22 @@ fn lock_index(core: &Core) -> Result<std::fs::File, String> {
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    file.lock_exclusive()
+    file.lock()
         .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
     Ok(file)
+}
+
+/// Take a lock file the way every released binary does: an exclusive flock(2)
+/// on its own open file description, without blocking. `None` while another
+/// holder has it. Tests use it to stand in for an older binary sharing the
+/// data dir, because std's `File::lock` must keep excluding that binary.
+#[cfg(all(test, unix))]
+pub(crate) fn raw_flock(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+        .open(path).unwrap();
+    let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    held.then_some(file)
 }
 
 /// Read-modify-write the index under the state lock (concurrent turns in
@@ -1757,6 +1771,44 @@ mod tests {
         detach(&first, &id).unwrap();
         attach(&second, &id).unwrap();
         assert!(dir.join("sessions").join(format!("{id}.lock")).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The lock protocol is part of the on-disk format: every released binary
+    /// takes an exclusive flock(2) on these files, and an older and a newer
+    /// binary often run side by side on one data dir. A raw flock stands in
+    /// for the older binary, so a locking primitive that does not see flock
+    /// locks (fcntl record locks on Linux) fails here instead of letting two
+    /// versions write one session or one index at once.
+    #[cfg(unix)]
+    #[test]
+    fn session_and_index_locks_exclude_a_raw_flock_holder() {
+        let dir = std::env::temp_dir().join(format!("openmax-flock-compat-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let session_lock = sessions_dir(&core).join(format!("{id}.lock"));
+
+        let older = raw_flock(&session_lock).expect("nothing holds the session yet");
+        assert!(attach(&core, &id).unwrap_err().contains("another process"));
+        drop(older);
+        attach(&core, &id).unwrap();
+        assert!(raw_flock(&session_lock).is_none(), "an older binary must not attach this session");
+
+        let older = raw_flock(&sessions_dir(&core).join("index.lock")).expect("the index is idle");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let creator = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                create(&core, "/tmp/p".into()).unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "an index write must wait while an older binary holds index.lock"
+        );
+        drop(older);
+        creator.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
