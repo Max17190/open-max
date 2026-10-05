@@ -1039,7 +1039,11 @@ fn enable_mode(mode: u8, command: impl crossterm::Command) {
 /// Hand the terminal back to the shell. Every exit path calls it, and only
 /// the first call after a mode was enabled does anything.
 fn restore_terminal() {
-    let restored = write_restore(&mut std::io::stdout(), &TERM_MODES);
+    // Held until raw mode is off too: a concurrent caller (the forced exit
+    // on a second signal) blocks here instead of finding the modes claimed
+    // but not yet undone, exiting, and leaving the shell raw.
+    let mut out = std::io::stdout().lock();
+    let restored = write_restore(&mut out, &TERM_MODES);
     // Last, so whatever prints next (an error, a panic report) lands on a
     // cooked terminal.
     if restored & MODE_RAW != 0 {
@@ -1108,33 +1112,47 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
 /// event loop as a quit, so the session ends through the normal exit path;
 /// a second means that path is stuck, so the terminal is restored here and
 /// the process exits.
+///
+/// The watcher runs on its own thread and runtime. When main returns, the
+/// main runtime drops its tasks and then waits on blocking work still
+/// running (a grep, a scan), while the handlers stay installed; a watcher
+/// on that runtime would leave every signal through that wait swallowed.
 #[cfg(unix)]
 fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
     use futures_util::future::select_all;
     use tokio::signal::unix::{signal, SignalKind};
     let quit = std::sync::Arc::new(tokio::sync::Notify::new());
-    // Registered here, not when the task first runs, so a signal that lands
-    // during startup still ends the session cleanly.
-    let mut signals: Vec<_> =
-        [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()]
-            .into_iter()
-            .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
-            .collect();
-    if signals.is_empty() {
-        return quit;
-    }
     let event_loop = quit.clone();
-    tokio::spawn(async move {
-        select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
-        event_loop.notify_one();
-        let (_, second, _) =
+    let (registered, ready) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_io().build() else {
+            return;
+        };
+        runtime.block_on(async move {
+            let mut signals: Vec<_> =
+                [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()]
+                    .into_iter()
+                    .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
+                    .collect();
+            let _ = registered.send(());
+            if signals.is_empty() {
+                return;
+            }
             select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
-        // Held until exit (the lock is reentrant, so the restore still
-        // writes): the event loop must not paint over the restored shell.
-        let _stdout = std::io::stdout().lock();
-        restore_terminal();
-        std::process::exit(128 + signals[second].0);
+            event_loop.notify_one();
+            let (_, second, _) =
+                select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
+            // Held until exit (the lock is reentrant, so the restore still
+            // writes): the event loop must not paint over the restored shell.
+            let _stdout = std::io::stdout().lock();
+            restore_terminal();
+            std::process::exit(128 + signals[second].0);
+        });
     });
+    // Return only once the handlers are registered, so a signal that lands
+    // during startup still ends the session cleanly. A watcher that never
+    // started drops its sender, which ends this wait too.
+    let _ = ready.recv();
     quit
 }
 
@@ -1996,21 +2014,53 @@ mod tests {
         assert_eq!(RESTORES.load(Ordering::SeqCst), 1, "a UI panic must restore the terminal");
     }
 
+    /// Two exit paths can restore at once: the normal exit after a first
+    /// signal, and the forced exit on a second one. A restore claims the
+    /// modes only while it holds stdout, so a caller that finds nothing left
+    /// to undo knows the other restore has finished, raw mode included.
+    /// Claiming them outside the lock let the forced exit find them claimed
+    /// but not yet undone, and leave the shell in raw mode.
+    #[test]
+    fn restore_claims_the_modes_only_while_holding_stdout() {
+        let held = std::io::stdout().lock();
+        // Raw mode alone writes no bytes, and leaving it is a no-op in a
+        // process that never entered it.
+        TERM_MODES.fetch_or(MODE_RAW, Ordering::SeqCst);
+        let restore = std::thread::spawn(restore_terminal);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let unclaimed = TERM_MODES.load(Ordering::SeqCst);
+        drop(held);
+        restore.join().unwrap();
+        assert_eq!(
+            unclaimed, MODE_RAW,
+            "a restore claimed the modes while another caller held stdout"
+        );
+        assert_eq!(TERM_MODES.load(Ordering::SeqCst), 0);
+    }
+
     /// SIGTERM's default action ends the process on the spot with every
     /// terminal mode still on; the watcher hands it to the event loop as a
-    /// quit, so the normal exit path restores the terminal.
+    /// quit, so the normal exit path restores the terminal. The watcher must
+    /// outlive the runtime that started it: when main returns, that runtime
+    /// drops its tasks and then waits on blocking work still running (a
+    /// grep, a scan), and the handlers it installed stay in place, so a
+    /// watcher on it would leave every signal through that wait swallowed.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn sigterm_reaches_the_event_loop_as_a_quit() {
-        let quit = watch_quit_signals();
+    #[test]
+    fn sigterm_reaches_the_quit_after_the_starting_runtime_is_gone() {
+        let runtime =
+            || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let quit = runtime().block_on(async { watch_quit_signals() });
         let status = std::process::Command::new("kill")
             .args(["-TERM", &std::process::id().to_string()])
             .status()
             .unwrap();
         assert!(status.success());
-        tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
-            .await
-            .expect("SIGTERM must reach the event loop as a quit");
+        runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
+                .await
+                .expect("SIGTERM must reach the event loop as a quit")
+        });
     }
 
     #[test]
