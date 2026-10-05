@@ -218,6 +218,9 @@ fn conversation_layout(
 
 pub struct Args {
     pub continue_session: bool,
+    /// Notified when a signal asks the session to end. The loop treats it
+    /// as /quit, so the normal exit path restores the terminal.
+    pub quit: Arc<tokio::sync::Notify>,
 }
 
 #[derive(PartialEq)]
@@ -385,6 +388,8 @@ pub async fn run(
     let mut app = App::new(core.clone(), project, files_tx);
 
     app.startup(&args).await;
+    let quit = args.quit.notified();
+    tokio::pin!(quit);
 
     // Terminal events are forwarded through a channel so the core-event arm
     // can be gated on `input_rx.is_empty()` — a token firehose must never
@@ -421,6 +426,8 @@ pub async fn run(
     loop {
         tokio::select! {
             biased;
+            // First, so a signal cannot wait behind a token stream.
+            _ = &mut quit => app.should_quit = true,
             // Streaming sits above input but is gated on the input queue
             // being empty: input-first would let held keys starve redraws,
             // while the gate keeps cancel/quit ahead of the firehose.
