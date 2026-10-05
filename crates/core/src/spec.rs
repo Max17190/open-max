@@ -900,9 +900,9 @@ refreeze receipt, or a policy/providers/settings/approval notice - surfaced
 here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
-model request is being resent after a transport failure, a 429, or a stream
-that died before any reply text; thinking already streamed for that attempt
-is void), `diff` (call_id,
+model request is being resent after a transport failure, a 429 or transient
+5xx, or a stream that died before any reply text; thinking already streamed
+for that attempt is void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
