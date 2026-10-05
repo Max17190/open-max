@@ -89,9 +89,9 @@ fn manifest_toml_reason(err: &toml::de::Error, surface: &str) -> String {
 
 const TOOLS: &str = r#"# External tools
 
-(Every `openmax ...` command below means the binary running THIS session:
-`$OPENMAX_BIN` is set on every process the harness spawns. A bare `openmax`
-on PATH may be a different, older build that prints the same version.)
+(Every `openmax ...` command below runs the binary hosting THIS session: in
+every process the harness spawns outside a sandboxed probe, a bare `openmax`
+resolves to it first on PATH, and `$OPENMAX_BIN` names it.)
 
 One TOML file per tool: `.openmax/tools/<name>.toml` (project) or
 `~/.openmax/tools/<name>.toml` (global). Project wins on name collision.

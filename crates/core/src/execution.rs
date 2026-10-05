@@ -482,6 +482,81 @@ fn apply_sandbox(
     }
 }
 
+/// The directory whose one entry, `openmax`, links to the executable running
+/// this harness; every unsandboxed child gets it first on PATH. None leaves
+/// PATH as inherited, which is never a wrong link.
+///
+/// Lifecycle: the name derives from the account and the canonical executable
+/// path, so whichever process writes the directory writes the same link.
+/// Concurrent harnesses on one build share it, different builds never touch
+/// each other's, and nothing needs removing on exit: a crash leaves nothing
+/// a later run could misread, and the OS temp cleaner reaps the directories
+/// of builds no longer run. The link is checked on every spawn and renamed
+/// back into place when something removed or replaced it, and a link whose
+/// binary has since been deleted keeps the directory off PATH.
+#[cfg(unix)]
+fn self_link_dir() -> Option<PathBuf> {
+    static TARGET: std::sync::OnceLock<Option<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
+    let (exe, dir) = TARGET
+        .get_or_init(|| {
+            // Canonical, so a harness started through the link lands on the
+            // same directory instead of linking to a link.
+            let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+            let digest = crate::ledger::sha256_hex(exe.as_os_str().as_encoded_bytes());
+            let uid = unsafe { libc::geteuid() };
+            let dir = std::env::temp_dir().join(format!("openmax-{uid}-{}", &digest[..16]));
+            Some((exe, dir))
+        })
+        .as_ref()?;
+    ensure_self_link(dir, exe).ok()?;
+    Some(dir.clone())
+}
+
+#[cfg(not(unix))]
+fn self_link_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn ensure_self_link(dir: &Path, exe: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // The temp dir can be shared between accounts (/tmp on Linux), and an
+    // entry first on PATH runs under every bare `openmax`: only a directory
+    // this account owns and nobody else can write may hold it, or another
+    // account could create the name first and swap the link mid-session.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other("self link directory is not private to this account"));
+    }
+    let link = dir.join("openmax");
+    if std::fs::read_link(&link).ok().as_deref() != Some(exe) {
+        // Staged, then renamed over: a concurrent harness on the same build
+        // never sees the name missing.
+        let staged = dir.join(format!(".openmax-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(exe, &staged)?;
+        if let Err(error) = std::fs::rename(&staged, &link) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
+    // Follows the link: a binary deleted since (an uninstall, a cleaned
+    // target dir) must not leave a dangling entry first on PATH.
+    std::fs::metadata(&link).map(|_| ())
+}
+
+/// The child's PATH: the self link directory first, then the inherited
+/// entries without it, so a harness started from a harness's child does not
+/// stack another copy per level.
+fn path_with_self_link(dir: &Path, inherited: &std::ffi::OsStr) -> Option<OsString> {
+    let rest = std::env::split_paths(inherited).filter(|entry| entry != dir);
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
+}
+
 /// Execute one native process with concurrent bounded output capture.
 pub(crate) async fn run_process(
     request: ProcessRequest,
@@ -541,14 +616,21 @@ pub(crate) async fn run_process(
     // inherit the attestation, grant authority. Stripped unconditionally;
     // no child of the harness is the human.
     command.env_remove("OPENMAX_HUMAN_ATTEST");
-    // Name the binary that is running this session. Every spec tells the
-    // agent to shell out to `openmax --check` / `--spec`, and a PATH
-    // `openmax` can be an older build than the harness hosting the session,
-    // teaching claims that build has since retracted - both print the same
-    // version string. `$OPENMAX_BIN` is the same
-    // build by construction. Not applied under a sandbox: a probe gets no
-    // handle to the harness.
+    // Point the child at the binary that is running this session. The
+    // prompt, receipts, and every spec tell the agent to shell out to a bare
+    // `openmax`, and the first one on the inherited PATH can be an older
+    // build than the harness hosting the session, teaching claims that build
+    // has since retracted - both print the same version string. So a bare
+    // `openmax` resolves through the self link first, and `$OPENMAX_BIN`
+    // names the same build. Applied after the allowlist so a manifest that
+    // lists PATH cannot undo it. Not applied under a sandbox: a probe gets
+    // no handle to the harness.
     if request.sandbox.is_none() {
+        if let (Some(dir), Some(inherited)) = (self_link_dir(), std::env::var_os("PATH")) {
+            if let Some(path) = path_with_self_link(&dir, &inherited) {
+                command.env("PATH", path);
+            }
+        }
         if let Ok(exe) = std::env::current_exe() {
             command.env("OPENMAX_BIN", exe);
         }
@@ -1030,6 +1112,92 @@ mod tests {
         let got = String::from_utf8_lossy(&output.stdout.head).to_string();
         let expected = std::env::current_exe().unwrap().to_string_lossy().to_string();
         assert_eq!(got, expected, "OPENMAX_BIN must name the running executable");
+    }
+
+    /// The prompt, receipts, and --check rows tell the agent to run a bare
+    /// `openmax` through bash, and children inherit PATH: an older install
+    /// earlier on it would answer with claims this build has retracted,
+    /// under the same version string. A decoy first on the inherited PATH
+    /// must lose to a link to the running executable, in a shell (bash and
+    /// hooks inherit the environment) and in an external tool's scrubbed
+    /// baseline alike.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bare_openmax_in_a_child_runs_the_running_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let decoy = std::env::temp_dir().join(format!("omx-decoy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&decoy).unwrap();
+        let decoy_bin = decoy.join("openmax");
+        std::fs::write(&decoy_bin, "#!/bin/sh\necho decoy\n").unwrap();
+        std::fs::set_permissions(&decoy_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The one test that moves PATH; restored before any assertion runs.
+        let inherited = std::env::var_os("PATH");
+        let mut entries = vec![decoy.clone()];
+        entries.extend(inherited.iter().flat_map(std::env::split_paths));
+        std::env::set_var("PATH", std::env::join_paths(entries).unwrap());
+        let shell = ["/bin/bash", "/usr/bin/bash"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap_or("/bin/sh");
+        let mut resolved = Vec::new();
+        for env_allowlist in [None, Some(Vec::new())] {
+            let mut request = request(shell, &["-c", "command -v openmax"]);
+            request.capture.head_bytes = 4096;
+            request.env_allowlist = env_allowlist;
+            resolved.push(run_process(request, Arc::new(CancelToken::default())).await);
+        }
+        match inherited {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&decoy);
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        for output in resolved {
+            let output = output.unwrap();
+            let found = PathBuf::from(String::from_utf8_lossy(&output.stdout.head).trim());
+            assert_eq!(
+                std::fs::read_link(&found).ok(),
+                Some(exe.clone()),
+                "`openmax` in a child resolved to {}, not a link to the running executable",
+                found.display()
+            );
+        }
+    }
+
+    /// The self link directory is shared and never cleaned up, so every
+    /// spawn re-checks it: a replaced link is put back, a deleted build keeps
+    /// the directory off PATH instead of leaving a dangling first entry, a
+    /// directory another account can write is never used, and a nested
+    /// harness does not stack a second copy of the entry.
+    #[cfg(unix)]
+    #[test]
+    fn the_self_link_is_rechecked_and_never_left_dangling_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("omx-selflink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("build");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        let dir = base.join("links");
+        let link = dir.join("openmax");
+        ensure_self_link(&dir, &exe).expect("a fresh directory gets the link");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), &link).unwrap();
+        ensure_self_link(&dir, &exe).expect("a replaced link is put back");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+
+        std::fs::remove_file(&exe).unwrap();
+        assert!(ensure_self_link(&dir, &exe).is_err(), "a link to a deleted build must stay off PATH");
+
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_self_link(&dir, &exe).is_err(), "a directory others can write is never used");
+
+        let inherited = std::env::join_paths([dir.clone(), "/usr/bin".into(), dir.clone()]).unwrap();
+        let path = path_with_self_link(&dir, &inherited).unwrap();
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), vec![dir.clone(), "/usr/bin".into()]);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// A bash heredoc (and process substitution) writes a temp file; a
