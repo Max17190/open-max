@@ -749,11 +749,12 @@ impl App {
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
-                Some(meta) => {
+                Ok(Some(meta)) => {
                     self.session_id = Some(meta.id.clone());
                     self.replay(&meta.id);
                 }
-                None => self.note("no previous session here; starting fresh"),
+                Ok(None) => self.note("no previous session here; starting fresh"),
+                Err(e) => self.error(&e),
             }
         }
     }
@@ -2246,8 +2247,16 @@ impl App {
         let session_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
-                let meta = sessions::create(&self.core, self.project.display().to_string())
-                    .map_err(std::io::Error::other)?;
+                // A refused session (a damaged index) is the user's to see
+                // and repair, not an I/O error: returned through the event
+                // loop, it would close the app on the first prompt.
+                let meta = match sessions::create(&self.core, self.project.display().to_string()) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        self.error(&e);
+                        return Ok(());
+                    }
+                };
                 self.session_id = Some(meta.id.clone());
                 self.created_session = true;
                 self.resumed_awaiting_hydration = false;
@@ -2462,16 +2471,15 @@ impl App {
                 Some(mode) => { self.select_approval_mode(mode); }
                 None => self.note("usage: /approvals auto|ask|readonly"),
             },
-            "resume" => {
-                let items = sessions::list(&self.core, &self.project.display().to_string());
-                if items.is_empty() {
-                    self.note("no sessions in this project yet");
-                } else {
+            "resume" => match sessions::list(&self.core, &self.project.display().to_string()) {
+                Ok(items) if items.is_empty() => self.note("no sessions in this project yet"),
+                Ok(items) => {
                     self.sessions_panel = Some(sessions_ui::SessionsState::new(items));
                     self.completion = None;
                     self.mode = Mode::Sessions;
                 }
-            }
+                Err(e) => self.error(&e),
+            },
             "reload" => match &self.session_id {
                 None => self.note("no session yet; a new session always freezes the current config"),
                 Some(id) => {
@@ -5513,6 +5521,66 @@ mod tests {
             Core::new(dir.clone()).unwrap().0.approval_mode(&app.project),
             config::ApprovalMode::Readonly,
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A damaged session index: a JSON array that ends inside its first
+    /// entry.
+    fn damage_session_index(data_dir: &std::path::Path) -> std::path::PathBuf {
+        let index = data_dir.join("sessions").join("index.json");
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(&index, "[{").unwrap();
+        index
+    }
+
+    /// A damaged session index refuses the session a first prompt creates.
+    /// Returned as an I/O error, that refusal unwound the event loop and
+    /// closed the app on the first prompt in every project. It belongs in
+    /// the transcript, naming the file, with the app still running and the
+    /// damaged bytes left for the user to recover.
+    #[tokio::test]
+    async fn a_damaged_session_index_is_reported_and_the_app_keeps_running() {
+        let (mut app, dir) = app_fixture();
+        let index = damage_session_index(&dir);
+
+        app.composer.load("hello");
+        app.on_term_event(TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+            .await
+            .expect("a refused session must not end the event loop");
+
+        let shown = app.transcript.export_text();
+        assert!(
+            shown.contains(&index.display().to_string()),
+            "the error must name the damaged index: {shown}"
+        );
+        assert!(!app.should_quit && !app.running && app.session_id.is_none());
+        assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `--continue` and `/resume` read the same index. A damaged one is
+    /// history the app cannot read, not an empty past: each must name the
+    /// file rather than report that there is nothing to resume.
+    #[tokio::test]
+    async fn continue_and_resume_name_a_damaged_session_index() {
+        let (mut app, dir) = app_fixture();
+        let index = damage_session_index(&dir);
+        let path = index.display().to_string();
+
+        app.startup(&super::Args { continue_session: true }).await;
+        let continued = app.transcript.export_text();
+        assert!(
+            continued.contains(&path) && !continued.contains("no previous session"),
+            "--continue must name the damaged index: {continued}"
+        );
+
+        app.handle_submit("/resume".into()).await.unwrap();
+        let resumed = app.transcript.export_text()[continued.len()..].to_string();
+        assert!(
+            resumed.contains(&path) && !resumed.contains("no sessions"),
+            "/resume must name the damaged index: {resumed}"
+        );
+        assert!(app.sessions_panel.is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 

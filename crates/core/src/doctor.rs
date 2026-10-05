@@ -775,6 +775,18 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
 
+    // A damaged session index refuses every new session and every
+    // `--continue`, in every project, until it is moved aside. Only damage
+    // is a finding: a healthy index is state, not configuration.
+    if let Some((path, reason)) = crate::sessions::index_damage(data_dir) {
+        let aside = path.with_extension("json.damaged");
+        findings.push(Finding {
+            kind: "sessions",
+            status: Status::Err(format!("{reason}: mv {} {}", shell_quote(&path), shell_quote(&aside))),
+            path,
+        });
+    }
+
     findings.extend(inline_program_findings(data_dir, project_root));
     findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));
@@ -4328,7 +4340,7 @@ mod tests {
         write(data.join("prompt/review.md"), "Review.\n");
         write(data.join("tools/deploy.sh"), "#!/bin/sh\ntrue\n");
         write(data.join("ledger/log.jsonl"), "{}\n");
-        write(data.join("sessions/index.json"), "{}\n");
+        write(data.join("sessions/index.json"), "[]\n");
         write(data.join("notes.txt"), "scratch\n");
 
         let findings: Vec<Finding> = check_at(&root, &data)
@@ -4351,6 +4363,32 @@ mod tests {
                 "{legit} is legitimate and must not warn: {findings:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A damaged session index refuses every new session and every
+    /// `--continue`, in every project, so the command whose job is naming
+    /// what is broken names it, with the repair. A healthy index is silent.
+    #[test]
+    fn a_damaged_session_index_is_an_error_with_its_repair() {
+        let root = temp_project();
+        let data = root.join("data");
+        let index = data.join("sessions/index.json");
+        write(index.clone(), "[]\n");
+        assert!(!check_at(&root, &data).iter().any(|f| f.path == index), "a healthy index is not a finding");
+
+        write(index.clone(), "[{");
+        let findings = check_at(&root, &data);
+        let finding = findings
+            .iter()
+            .find(|f| f.path == index)
+            .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
+        assert!(
+            matches!(&finding.status, Status::Err(reason) if reason.contains("mv ")),
+            "a damaged index is an error that carries its repair: {finding:?}"
+        );
+        assert!(has_errors(&findings));
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{", "--check never rewrites the index");
         let _ = std::fs::remove_dir_all(root);
     }
 

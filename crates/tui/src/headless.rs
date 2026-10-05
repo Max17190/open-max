@@ -34,10 +34,14 @@ pub async fn run(
 
     let session_id = if args.continue_session {
         match sessions::latest(&core, &project_key) {
-            Some(meta) => meta.id,
-            None => {
+            Ok(Some(meta)) => meta.id,
+            Ok(None) => {
                 eprintln!("openmax: no prior session in this directory to continue");
                 return 2;
+            }
+            Err(e) => {
+                eprintln!("openmax: {}", one_line(&e));
+                return 1;
             }
         }
     } else {
