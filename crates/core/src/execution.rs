@@ -491,9 +491,10 @@ fn apply_sandbox(
 /// Concurrent harnesses on one build share it, different builds never touch
 /// each other's, and nothing needs removing on exit: a crash leaves nothing
 /// a later run could misread, and the OS temp cleaner reaps the directories
-/// of builds no longer run. The link is checked on every spawn and renamed
-/// back into place when something removed or replaced it, and a link whose
-/// binary has since been deleted keeps the directory off PATH.
+/// of builds no longer run. The directory is checked on every spawn: the
+/// link is renamed back into place when something removed or replaced it,
+/// any other entry is removed, and a link whose binary has since been
+/// deleted keeps the directory off PATH.
 #[cfg(unix)]
 fn self_link_dir() -> Option<PathBuf> {
     static TARGET: std::sync::OnceLock<Option<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
@@ -504,7 +505,13 @@ fn self_link_dir() -> Option<PathBuf> {
             let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
             let digest = crate::ledger::sha256_hex(exe.as_os_str().as_encoded_bytes());
             let uid = unsafe { libc::geteuid() };
-            let dir = std::env::temp_dir().join(format!("openmax-{uid}-{}", &digest[..16]));
+            // A per-account runtime directory, where one exists, so another
+            // account cannot take the name first the way it can in /tmp.
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute() && dir.is_dir())
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join(format!("openmax-{uid}-{}", &digest[..16]));
             Some((exe, dir))
         })
         .as_ref()?;
@@ -533,6 +540,27 @@ fn ensure_self_link(dir: &Path, exe: &Path) -> io::Result<()> {
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
         return Err(io::Error::other("self link directory is not private to this account"));
     }
+    // The agent's own account can write here too, and this directory comes
+    // first on every approved hook's and tool's PATH: a `python3` planted
+    // beside the link would run in place of the system binary the human
+    // read when approving `command = "python3"`. Only the link, and another
+    // harness's staged link mid-rename, may stay; anything that cannot be
+    // removed keeps the directory off PATH.
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "openmax" || is_staged_link(&name) {
+            continue;
+        }
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(entry.path()),
+            _ => std::fs::remove_file(entry.path()),
+        };
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
     let link = dir.join("openmax");
     if std::fs::read_link(&link).ok().as_deref() != Some(exe) {
         // Staged, then renamed over: a concurrent harness on the same build
@@ -547,6 +575,26 @@ fn ensure_self_link(dir: &Path, exe: &Path) -> io::Result<()> {
     // Follows the link: a binary deleted since (an uninstall, a cleaned
     // target dir) must not leave a dangling entry first on PATH.
     std::fs::metadata(&link).map(|_| ())
+}
+
+/// The name `ensure_self_link` stages a link under before renaming it into
+/// place; no command is ever run by such a name.
+#[cfg(unix)]
+fn is_staged_link(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(".openmax-"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// The PATH every unsandboxed child of the harness gets: the self link
+/// directory first, then the harness's own entries. The approval binding
+/// and --check resolve bare command names on this, so they judge the
+/// binary the spawn will run. None when the harness has no PATH.
+pub(crate) fn child_path() -> Option<OsString> {
+    let inherited = std::env::var_os("PATH")?;
+    self_link_dir()
+        .and_then(|dir| path_with_self_link(&dir, &inherited))
+        .or(Some(inherited))
 }
 
 /// The child's PATH: the self link directory first, then the inherited
@@ -626,10 +674,8 @@ pub(crate) async fn run_process(
     // lists PATH cannot undo it. Not applied under a sandbox: a probe gets
     // no handle to the harness.
     if request.sandbox.is_none() {
-        if let (Some(dir), Some(inherited)) = (self_link_dir(), std::env::var_os("PATH")) {
-            if let Some(path) = path_with_self_link(&dir, &inherited) {
-                command.env("PATH", path);
-            }
+        if let Some(path) = child_path() {
+            command.env("PATH", path);
         }
         if let Ok(exe) = std::env::current_exe() {
             command.env("OPENMAX_BIN", exe);
@@ -1165,10 +1211,11 @@ mod tests {
     }
 
     /// The self link directory is shared and never cleaned up, so every
-    /// spawn re-checks it: a replaced link is put back, a deleted build keeps
-    /// the directory off PATH instead of leaving a dangling first entry, a
-    /// directory another account can write is never used, and a nested
-    /// harness does not stack a second copy of the entry.
+    /// spawn re-checks it: a replaced link is put back, anything planted
+    /// beside it is removed, a deleted build keeps the directory off PATH
+    /// instead of leaving a dangling first entry, a directory another account
+    /// can write is never used, and a nested harness does not stack a second
+    /// copy of the entry.
     #[cfg(unix)]
     #[test]
     fn the_self_link_is_rechecked_and_never_left_dangling_on_path() {
@@ -1187,6 +1234,16 @@ mod tests {
         ensure_self_link(&dir, &exe).expect("a replaced link is put back");
         assert_eq!(std::fs::read_link(&link).unwrap(), exe);
 
+        // Only the link and a concurrent harness's staged link may stay.
+        let staged = dir.join(format!(".openmax-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(&exe, &staged).unwrap();
+        std::fs::write(dir.join("python3"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(dir.join("bin/nested")).unwrap();
+        ensure_self_link(&dir, &exe).expect("planted entries are cleared");
+        let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, vec![staged.file_name().unwrap().to_os_string(), "openmax".into()]);
+
         std::fs::remove_file(&exe).unwrap();
         assert!(ensure_self_link(&dir, &exe).is_err(), "a link to a deleted build must stay off PATH");
 
@@ -1198,6 +1255,42 @@ mod tests {
         let path = path_with_self_link(&dir, &inherited).unwrap();
         assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), vec![dir.clone(), "/usr/bin".into()]);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Every hook and tool gets the self link directory first on PATH, the
+    /// agent's own account can write it, and the approval binding resolves a
+    /// bare `python3` to the system binary the human read. Any other name
+    /// in that directory would shadow it in every approved spawn, so each
+    /// spawn clears everything but the link first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_name_planted_beside_the_self_link_never_runs() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = self_link_dir().expect("this host can place the self link");
+        for env_allowlist in [None, Some(Vec::new())] {
+            let name = format!("omx-planted-{}", uuid::Uuid::new_v4().simple());
+            let planted = dir.join(&name);
+            // Created executable in one step: a concurrent spawn may clear
+            // the name at any moment, and a separate chmod would then fail.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(&planted)
+                .unwrap();
+            file.write_all(b"#!/bin/sh\necho planted-ran\n").unwrap();
+            drop(file);
+            let mut request = request(&name, &[]);
+            request.capture.head_bytes = 4096;
+            request.env_allowlist = env_allowlist;
+            let ran = run_process(request, Arc::new(CancelToken::default())).await;
+            let _ = std::fs::remove_file(&planted);
+            let stdout = ran
+                .map(|output| String::from_utf8_lossy(&output.stdout.head).into_owned())
+                .unwrap_or_default();
+            assert!(!stdout.contains("planted-ran"), "a name planted beside the self link ran");
+        }
     }
 
     /// A bash heredoc (and process substitution) writes a temp file; a

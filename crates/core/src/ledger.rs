@@ -1689,9 +1689,9 @@ fn read_code(path: PathBuf) -> BoundCode {
 }
 
 /// Where `command` will spawn from, resolved the way the spawn resolves it: a
-/// path against the project root (processes run there), a bare name on PATH.
-/// None means nothing resolves, which the caller treats as uncovered, not as
-/// nothing to cover.
+/// path against the project root (processes run there), a bare name on the
+/// PATH a child gets. None means nothing resolves, which the caller treats as
+/// uncovered, not as nothing to cover.
 ///
 /// A backslash counts as path syntax even though this harness targets unix:
 /// misreading `.\payload.cmd` as a bare name would leave agent-writable code
@@ -1706,7 +1706,7 @@ fn resolve_command(command: &str, project_root: &Path) -> Option<PathBuf> {
     // Bare names are almost always system binaries, but resolving them anyway
     // keeps a PATH entry inside the project from smuggling agent-written code
     // past the check.
-    std::env::var_os("PATH").and_then(|paths| {
+    crate::execution::child_path().and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| absolute_from(&dir.join(command).to_string_lossy(), project_root))
             .find(|candidate| candidate.is_file())
@@ -2524,6 +2524,21 @@ mod tests {
         // A genuine system binary is still covered by the manifest alone.
         assert!(bound_code("/bin/echo", &[], &root).is_empty());
         assert!(bound_code("sh", &[], &root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The binding must judge the binary the spawn runs. A child finds the
+    /// running harness first on PATH through the self link, so a bare
+    /// `openmax` command runs that build whatever the harness's own PATH
+    /// holds: an older install, or none at all, which bound it as missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_openmax_command_resolves_to_the_running_binary() {
+        let root = temp("self-link-proj");
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let found = resolve_command("openmax", &root).expect("a bare openmax resolves");
+        assert_eq!(std::fs::read_link(&found).ok(), Some(exe), "resolved {}", found.display());
+        assert!(bound_code("openmax", &[], &root).is_empty(), "the running build is not project code");
         let _ = std::fs::remove_dir_all(&root);
     }
 
