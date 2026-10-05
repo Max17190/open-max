@@ -486,11 +486,15 @@ const DIFF_BUDGET: Duration = Duration::from_millis(200);
 /// A finished write or edit: the diff for the UI and the summary the model
 /// reads. Counts from a diff cut off at its deadline can include unchanged
 /// lines, so the summary gives them as an upper bound, or the model takes an
-/// estimate for the size of its edit.
+/// estimate for the size of its edit. The caveat follows the "(+N −M)"
+/// group rather than going inside it: session replay reads the counts back
+/// from that exact group, and a replayed edit card would lose its badge.
 fn changed_file(verb: &str, root: &Path, path: &Path, old: &str, new: &str) -> ToolOutcome {
     let (diff, complete) = diff_strings(&rel_display(root, path), old, new);
-    let bound = if complete { "" } else { "at most " };
-    let summary = format!("{verb} {} ({bound}+{} −{})", diff.path, diff.added, diff.removed);
+    let mut summary = format!("{verb} {} (+{} −{})", diff.path, diff.added, diff.removed);
+    if !complete {
+        summary.push_str(" · counts are an upper bound");
+    }
     ToolOutcome { ok: true, output: summary, diff: Some(diff), ..Default::default() }
 }
 
@@ -1961,7 +1965,8 @@ mod tests {
     /// diff for the UI is quadratic in the file's length and a mutating
     /// call cannot be cancelled while it runs. A diff cut off at its deadline
     /// can count unchanged lines as rewritten, so the model is told its
-    /// counts are an upper bound rather than the size of the edit.
+    /// counts are an upper bound rather than the size of the edit, in a
+    /// summary whose counts a replayed session can still read.
     #[test]
     fn a_full_rewrite_of_a_large_file_reports_a_bounded_diff() {
         let root = temp_project();
@@ -1988,9 +1993,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the diff for a full rewrite must stop at its deadline");
         assert!(out.ok, "{}", out.output);
+        // The "(+N −M)" group stays intact ahead of the caveat: session
+        // replay reads the counts back from it to badge the edit card.
         assert_eq!(
             out.output,
-            format!("wrote big.txt (at most +{lines} −{lines})"),
+            format!("wrote big.txt (+{lines} −{lines}) · counts are an upper bound"),
             "a diff cut off at its deadline reports its counts as an upper bound"
         );
         let diff = out.diff.expect("a write reports its diff");
