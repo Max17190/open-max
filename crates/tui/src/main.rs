@@ -255,21 +255,40 @@ fn approve_command(path: &std::path::Path) -> String {
 /// or an option only another operation reads, was dropped without a word and
 /// the run exited as if that work had happened: `--check --ledger` printed
 /// history and exited 0 having validated nothing. Every combination is
-/// decided here, so a new flag cannot reach dispatch without being placed,
-/// and each refusal names both sides of the conflict.
+/// decided here, and each refusal names both sides of the conflict. The
+/// destructure below is exhaustive, so a new `CliArgs` field stops compiling
+/// here until it is placed among the operations or options.
 fn refusal(cli: &CliArgs) -> Option<String> {
+    let CliArgs {
+        continue_session,
+        model,
+        provider,
+        print,
+        json,
+        stdio,
+        check,
+        run_examples,
+        approve,
+        forget,
+        ledger,
+        recall,
+        ledger_repair,
+        spec,
+        trust_project,
+        prompts,
+    } = cli;
     // Each operation, named by its flag. `--check --stdio` is one operation
     // of its own: validating a protocol stream on stdin.
     let operations: Vec<&str> = [
-        (cli.spec.is_some(), "--spec"),
-        (cli.recall.is_some(), "--recall"),
-        (cli.ledger, "--ledger"),
-        (cli.ledger_repair, "--ledger-repair"),
-        (cli.approve.is_some(), "--approve"),
-        (cli.forget.is_some(), "--forget"),
-        (cli.check, if cli.stdio { "--check --stdio" } else { "--check" }),
-        (cli.stdio && !cli.check, "--stdio"),
-        (cli.print, "--print"),
+        (spec.is_some(), "--spec"),
+        (recall.is_some(), "--recall"),
+        (*ledger, "--ledger"),
+        (*ledger_repair, "--ledger-repair"),
+        (approve.is_some(), "--approve"),
+        (forget.is_some(), "--forget"),
+        (*check, if *stdio { "--check --stdio" } else { "--check" }),
+        (*stdio && !*check, "--stdio"),
+        (*print, "--print"),
     ]
     .into_iter()
     .filter_map(|(on, flag)| on.then_some(flag))
@@ -282,12 +301,12 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     // Each option and the operations that read it.
     const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
     let options: [(bool, &str, &[Option<&str>]); 6] = [
-        (cli.trust_project, "--trust-project", SESSIONS),
-        (cli.continue_session, "--continue", SESSIONS),
-        (cli.model.is_some(), "--model", SESSIONS),
-        (cli.provider.is_some(), "--provider", SESSIONS),
-        (cli.json, "--json", &[Some("--print"), Some("--check"), Some("--recall")]),
-        (cli.run_examples, "--run-examples", &[Some("--check")]),
+        (*trust_project, "--trust-project", SESSIONS),
+        (*continue_session, "--continue", SESSIONS),
+        (model.is_some(), "--model", SESSIONS),
+        (provider.is_some(), "--provider", SESSIONS),
+        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall")]),
+        (*run_examples, "--run-examples", &[Some("--check")]),
     ];
     for (on, flag, readers) in options {
         if !on || readers.contains(&operation) {
@@ -305,10 +324,22 @@ fn refusal(cli: &CliArgs) -> Option<String> {
             }
         });
     }
-    if !cli.prompts.is_empty() && operation != Some("--print") {
+    if !prompts.is_empty() && operation != Some("--print") {
+        // A stray word is a prompt only to the interactive session; beside a
+        // named operation it was most likely meant for that operation (a path
+        // after --check), so the refusal names it rather than pointing at
+        // --print.
+        let words = prompts.join(" ");
         return Some(match operation {
-            Some(operation) => format!("{operation} does not take a prompt (use --print for headless)"),
             None => "unexpected arguments (use --print for headless)".to_string(),
+            Some(operation) => {
+                let stdin = match operation {
+                    "--stdio" => "; it reads commands on stdin",
+                    "--check --stdio" => "; it reads the stream on stdin",
+                    _ => "",
+                };
+                format!("{operation} takes no other arguments (got '{words}'){stdin}")
+            }
         });
     }
     None
@@ -2385,5 +2416,31 @@ mod tests {
         ] {
             assert_eq!(refusal_of(args), None, "{args:?} is a valid command line");
         }
+    }
+
+    /// A stray word is a prompt only to the interactive session. Beside a
+    /// named operation it is most often meant for that operation
+    /// (`--check x.toml`, `--check --stdio stream.jsonl`), so pointing at
+    /// --print sends the user the wrong way: the refusal names the word
+    /// instead, and an operation that reads stdin says so.
+    #[test]
+    fn a_stray_word_beside_an_operation_is_named_not_sent_to_print() {
+        for (operation, name) in OPERATIONS {
+            if matches!(name, "" | "--print") {
+                continue;
+            }
+            let args: Vec<&str> = operation.iter().copied().chain(["stray.toml"]).collect();
+            let reason = refusal_of(&args).unwrap_or_else(|| panic!("{args:?} must be refused"));
+            assert!(
+                names(&reason, name) && reason.contains("'stray.toml'") && !reason.contains("--print"),
+                "{args:?}: {reason}"
+            );
+        }
+        for args in [&["--stdio", "x"][..], &["--check", "--stdio", "stream.jsonl"]] {
+            let reason = refusal_of(args).unwrap();
+            assert!(reason.contains("stdin"), "{args:?}: {reason}");
+        }
+        let reason = refusal_of(&["stray"]).unwrap();
+        assert!(reason.contains("--print"), "a stray word alone is likely a prompt: {reason}");
     }
 }
