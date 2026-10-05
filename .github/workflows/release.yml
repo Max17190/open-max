@@ -387,7 +387,11 @@ jobs:
         # the same file with node, or with bun when node is absent; to node and
         # bun that line is a string statement and a comment. Fails if the
         # launcher or its `bin` map ever changes shape, rather than publishing
-        # it unpatched. Only the registry gets the patched tarball: the copy on
+        # it unpatched. That guard checks shape, not that bun runs the rest of
+        # the launcher: the launcher only changes when cargo-dist-version does,
+        # so after bumping it, install the patched package and run `openmax`
+        # once with bun and no node before tagging. Only the registry gets the
+        # patched tarball: the copy on
         # the GitHub Release, uploaded by `host` before this job runs, keeps
         # dist's launcher so it still matches sha256.sum.
         shell: bash
