@@ -2213,6 +2213,7 @@ mod tests {
         for (package, unused) in [
             ("ratatui", "ratatui-macros"),
             ("ratatui", "ratatui-termwiz"),
+            ("ratatui", "ratatui-termina"),
             ("ratatui-core", "critical-section"),
             ("open-max-core", "fs2"),
         ] {

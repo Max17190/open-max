@@ -101,7 +101,7 @@ Every [release](https://github.com/Max17190/open-max/releases) also carries the
 plain tarballs and a `sha256.sum`, so you can download and verify by hand
 instead of piping a script into a shell.
 
-**From source** instead, which needs [Rust](https://rustup.rs):
+**From source** instead, which needs [Rust](https://rustup.rs) 1.89 or newer:
 
 ```sh
 git clone https://github.com/Max17190/open-max.git

@@ -5,6 +5,9 @@ members = ["crates/core", "crates/tui"]
 [workspace.package]
 version = "2026.10.0"
 edition = "2021"
+# std's `File::lock`, which the session, index, trust and ledger locks use,
+# needs 1.89; an older rustc otherwise fails on an unstable library feature.
+rust-version = "1.89"
 license = "MIT"
 authors = ["Open Max contributors"]
 repository = "https://github.com/Max17190/open-max"
