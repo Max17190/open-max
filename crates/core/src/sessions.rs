@@ -742,6 +742,27 @@ pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<
     })
 }
 
+/// One message was removed from index `at`, so the transcript shrinks by
+/// exactly that message and every boundary after it moves down one: the
+/// mirror of [`shift_resume_points_for_insert`]. A boundary on the removed
+/// message stays put and now marks the message that followed it, so two
+/// boundaries can meet there and become one. Hydration removes a tool reply
+/// that was saved after prompts instead of after its call.
+pub fn shift_resume_points_for_remove(core: &Core, id: &str, at: u64) -> Result<(), String> {
+    ensure_owned(core, id)?;
+    with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            for p in &mut m.resume_points {
+                if *p > at {
+                    *p -= 1;
+                }
+            }
+            m.resume_points.sort_unstable();
+            m.resume_points.dedup();
+        }
+    })
+}
+
 /// Record that a new sitting resumed this session with `message_index`
 /// messages already on disk. Index zero is an empty session, not a
 /// boundary; repeats (resuming again before any new turn) are deduplicated.
