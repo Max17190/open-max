@@ -688,7 +688,7 @@ async fn main() -> std::io::Result<()> {
     if let Some(path) = &cli.approve {
         // Approval is a human action, exactly like trust; see require_human
         // for the two walls and why the marker alone was not one.
-        require_human("approval", &format!("openmax --approve {path}"));
+        require_human("approval", &approve_command(std::path::Path::new(path)));
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let file = std::path::Path::new(path);
         let bytes = match std::fs::read(file) {

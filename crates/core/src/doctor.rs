@@ -1153,10 +1153,11 @@ async fn run_examples_within(
     }
     // Examples execute repository code with the user's authority, exactly like
     // a turn does, so they need the same trust decision. Plain --check only
-    // reads files and stays trust-free.
+    // reads files and stays trust-free. The repair names a grant on its own:
+    // --check refuses --trust-project, so adding the flag to this run fails.
     if !crate::trust::is_trusted(data_dir, project_root)? {
         return Err(format!(
-            "project {} is not trusted; inspect it, then rerun with --trust-project",
+            "project {} is not trusted; inspect it, then trust it once from a terminal with `openmax --trust-project`",
             project_root.display()
         ));
     }
@@ -3183,6 +3184,10 @@ mod tests {
         let refusal = examples(&root, &data).await.unwrap_err();
         assert!(refusal.contains("not trusted"), "{refusal}");
         assert!(refusal.contains("--trust-project"), "{refusal}");
+        // --check and --trust-project are separate operations, so the repair
+        // is a grant on its own, not a flag added to this run.
+        assert!(refusal.contains("from a terminal"), "{refusal}");
+        assert!(!refusal.contains("rerun with"), "{refusal}");
         assert!(!touched.exists(), "nothing may run in an untrusted project");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);

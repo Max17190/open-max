@@ -188,6 +188,15 @@ fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The printed repair is pasted into a shell, so a path with a space must
+    // come back quoted, not split into two arguments.
+    let out = bare(&["--approve", ".openmax/hooks/my gate.toml"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`openmax --approve '.openmax/hooks/my gate.toml'`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = bare(&["--trust-project", "-p", "hi"]);
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
     // The attestation (what cmd() sets) is what lets test automation through.
