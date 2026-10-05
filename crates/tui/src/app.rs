@@ -55,11 +55,83 @@ const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
 /// leaves normal scheduler overhead inside a 144 Hz display interval without
 /// busy-spinning. The loop remains event-driven, so idle produces no frames.
+/// It paces agent events and ticks; a keystroke paints at once (see
+/// `paint_pacing`).
 const MIN_DRAW_INTERVAL: Duration = Duration::from_micros(5_500);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
 const CORE_DRAIN_MAX: usize = 32;
+
+/// Mouse reporting for exactly what `on_term_event` handles: presses,
+/// releases, and the wheel (1000), drags (1002), SGR-encoded (1006) so columns
+/// past 223 survive. Crossterm's `EnableMouseCapture` also turns on
+/// any-motion tracking (1003), which reports every pointer movement: a loop
+/// wake per cell crossed, and bytes on the wire over SSH, for events nothing
+/// reads.
+#[cfg(not(windows))]
+pub(crate) struct EnableMouseTracking;
+
+/// Turns off exactly the modes `EnableMouseTracking` turned on, in reverse.
+#[cfg(not(windows))]
+pub(crate) struct DisableMouseTracking;
+
+#[cfg(not(windows))]
+impl crossterm::Command for EnableMouseTracking {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+    }
+}
+
+#[cfg(not(windows))]
+impl crossterm::Command for DisableMouseTracking {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1006l\x1b[?1002l\x1b[?1000l")
+    }
+}
+
+// The Windows console reports the mouse through its own input API, which
+// crossterm's capture commands switch as a whole.
+#[cfg(windows)]
+pub(crate) use crossterm::event::{
+    DisableMouseCapture as DisableMouseTracking, EnableMouseCapture as EnableMouseTracking,
+};
+
+/// What woke the loop, for paint pacing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// A key, paste, mouse, or focus event with no more input queued behind
+    /// it. Input with more still queued (a paste without bracketed paste)
+    /// wakes as `Other`, so a burst coalesces at the cap instead of painting
+    /// once per event.
+    Input,
+    /// Agent events, ticks, the file index, or a deferred paint coming due.
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Paint {
+    Now,
+    /// Hold until then, coalescing whatever else lands before it.
+    At(Instant),
+}
+
+/// When a dirty frame paints. A pending resize settles first, whatever woke
+/// the loop. After that, input paints at once: a frame costs well under a
+/// millisecond, so capping it would only delay the echo of a keystroke.
+/// Everything else paints at most once per `MIN_DRAW_INTERVAL`, which is
+/// what turns a token firehose into display-rate frames.
+fn paint_pacing(now: Instant, last_draw: Instant, resize_hold: Option<Instant>, wake: Wake) -> Paint {
+    if let Some(until) = resize_hold.filter(|&until| now < until) {
+        return Paint::At(until);
+    }
+    let next = last_draw + MIN_DRAW_INTERVAL;
+    if wake == Wake::Input || now >= next {
+        Paint::Now
+    } else {
+        Paint::At(next)
+    }
+}
 
 /// Fine-grained redraw reasons so spinner ticks can skip history rebuilds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -241,6 +313,10 @@ struct ToolMeta {
 pub struct App {
     core: Arc<Core>,
     project: PathBuf,
+    /// `project` resolved once at launch, the key its approval mode is read
+    /// by. The status line shows that mode on every chrome frame; resolving
+    /// the path there cost filesystem syscalls on every keystroke.
+    project_root: PathBuf,
     session_id: Option<String>,
     /// A /resume (or --continue) picked this session and no turn has
     /// hydrated it yet: /context's numbers are still today's-config
@@ -412,20 +488,22 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_period = TICK;
 
-    // Paint pacing: at most one frame per MIN_DRAW_INTERVAL. A redraw that
-    // arrives too early is deferred to `draw_deadline` and coalesced with
-    // everything else that lands before it.
+    // Paint pacing (see `paint_pacing`): a redraw that may not paint yet is
+    // deferred to `draw_deadline` and coalesced with everything else that
+    // lands before it. `resize_hold` is the end of the current resize storm.
     // An idle app has no armed tick and may receive no terminal event after
     // entering the alternate screen. Paint once before waiting so first launch
     // can never sit on a blank frame until the user presses a key.
     let mut last_draw = Instant::now();
     let mut draw_deadline: Option<Instant> = None;
+    let mut resize_hold: Option<Instant> = None;
     draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL)?;
     app.dirty.clear();
     // State the initial presence in the title; transitions are edge-driven.
     app.emit_presence_title();
 
     loop {
+        let mut wake = Wake::Other;
         tokio::select! {
             biased;
             // First, so a signal cannot wait behind a token stream.
@@ -451,9 +529,14 @@ pub async fn run(
                         // Terminals emit resize storms mid-drag; rewrapping
                         // the transcript on each one is wasted layout work.
                         app.dirty = Dirty::all();
-                        draw_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+                        resize_hold = Some(Instant::now() + RESIZE_DEBOUNCE);
                     }
-                    Some(e) => app.on_term_event(e).await?,
+                    Some(e) => {
+                        app.on_term_event(e).await?;
+                        if input_rx.is_empty() {
+                            wake = Wake::Input;
+                        }
+                    }
                     None => app.should_quit = true,
                 }
             }
@@ -481,14 +564,15 @@ pub async fn run(
         }
         if app.dirty.any() {
             let now = Instant::now();
-            let deferred = draw_deadline.is_some_and(|d| now < d);
-            if !deferred && now.duration_since(last_draw) >= MIN_DRAW_INTERVAL {
-                draw_frame(&mut terminal, &mut app, now.duration_since(last_draw))?;
-                last_draw = now;
-                draw_deadline = None;
-                app.dirty.clear();
-            } else if draw_deadline.is_none() {
-                draw_deadline = Some(last_draw + MIN_DRAW_INTERVAL);
+            match paint_pacing(now, last_draw, resize_hold, wake) {
+                Paint::Now => {
+                    draw_frame(&mut terminal, &mut app, now.duration_since(last_draw))?;
+                    last_draw = now;
+                    draw_deadline = None;
+                    resize_hold = None;
+                    app.dirty.clear();
+                }
+                Paint::At(when) => draw_deadline = Some(when),
             }
         }
     }
@@ -534,6 +618,7 @@ impl App {
         Self {
             composer: Composer::new(&core.data_dir, &project),
             core,
+            project_root: open_max_core::state::canonical_root(&project),
             project,
             session_id: None,
             resumed_awaiting_hydration: false,
@@ -1473,7 +1558,12 @@ impl App {
     }
 
     fn cycle_approval_mode(&mut self) {
-        self.select_approval_mode(self.core.approval_mode(&self.project).next());
+        self.select_approval_mode(self.approval_mode().next());
+    }
+
+    /// The mode the status line shows. Reads no filesystem.
+    fn approval_mode(&self) -> config::ApprovalMode {
+        self.core.approval_mode_canonical(&self.project_root)
     }
 
     /// Approval hit regions use the fixed order allow once, auto for project,
@@ -2439,7 +2529,7 @@ impl App {
                     kv("model", &model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
-                    kv("approvals", self.core.approval_mode(&self.project).as_str()),
+                    kv("approvals", self.approval_mode().as_str()),
                     kv(
                         "context",
                         &if context_tokens == 0 {
@@ -3589,7 +3679,7 @@ impl App {
             self.status_width = area.width;
             // Read the mode before taking the settings lock: the accessor
             // takes it too, and this mutex is not reentrant.
-            let approvals = self.core.approval_mode(&self.project).as_str().to_string();
+            let approvals = self.approval_mode().as_str().to_string();
             let model = self.core.settings.lock().unwrap().model.clone();
             let width = area.width as usize;
             let hint = self.status_hint();
@@ -4352,8 +4442,8 @@ mod tests {
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
         wide_status_right,
-        model_selection, presence_title, rect_contains, turn_end_rings,
-        App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
+        model_selection, paint_pacing, presence_title, rect_contains, turn_end_rings,
+        App, Dirty, Focus, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
     };
     use std::time::Duration;
     use crossterm::event::{
@@ -4442,6 +4532,73 @@ mod tests {
         let display_144hz = std::time::Duration::from_nanos(1_000_000_000 / 144);
         assert!(MIN_DRAW_INTERVAL < display_144hz);
         assert!(MIN_DRAW_INTERVAL < std::time::Duration::from_millis(6));
+    }
+
+    /// A keystroke frame costs well under a millisecond, so holding it to the
+    /// frame cap only delays the echo. The cap exists to coalesce a token
+    /// firehose, and it still does.
+    #[test]
+    fn keystrokes_paint_at_once_while_agent_frames_wait_for_the_cap() {
+        let last_draw = std::time::Instant::now();
+        let soon = last_draw + Duration::from_millis(1);
+        assert_eq!(paint_pacing(soon, last_draw, None, Wake::Input), Paint::Now);
+        assert_eq!(
+            paint_pacing(soon, last_draw, None, Wake::Other),
+            Paint::At(last_draw + MIN_DRAW_INTERVAL),
+        );
+        let later = last_draw + MIN_DRAW_INTERVAL;
+        assert_eq!(paint_pacing(later, last_draw, None, Wake::Other), Paint::Now);
+        // A resize storm still settles first: a keystroke mid-drag must not
+        // rewrap the transcript at a size the terminal is about to leave.
+        let settle = soon + Duration::from_millis(10);
+        assert_eq!(paint_pacing(soon, last_draw, Some(settle), Wake::Input), Paint::At(settle));
+        assert_eq!(paint_pacing(settle, last_draw, Some(settle), Wake::Input), Paint::Now);
+    }
+
+    /// Only presses, releases, drags, and the wheel are handled, so the
+    /// terminal reports exactly those: any-motion tracking (1003) sends a
+    /// report and wakes the loop on every pointer movement, which over SSH is
+    /// network traffic for nothing. Exit turns off exactly what was enabled.
+    #[cfg(not(windows))]
+    #[test]
+    fn mouse_tracking_reports_buttons_drags_and_wheel_but_not_bare_motion() {
+        use super::{DisableMouseTracking, EnableMouseTracking};
+        fn ansi(command: impl crossterm::Command) -> String {
+            let mut out = String::new();
+            command.write_ansi(&mut out).unwrap();
+            out
+        }
+        assert_eq!(ansi(EnableMouseTracking), "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert_eq!(ansi(DisableMouseTracking), "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    }
+
+    /// The status line shows the project's approval mode on every chrome
+    /// frame, so resolving the project path there put filesystem syscalls on
+    /// every keystroke. The root is resolved once at launch; removing the
+    /// launch path afterwards proves a draw no longer looks at the disk.
+    #[cfg(unix)]
+    #[test]
+    fn status_draw_reads_the_resolved_root_not_the_filesystem() {
+        let dir = crate::test_temp_dir("openmax-app-resolved-root");
+        let real = dir.join("real");
+        let link = dir.join("link");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &real).unwrap();
+        core.set_project_approval_mode(&link, config::ApprovalMode::Auto).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core, link.clone(), files_tx);
+        render_app(&mut app, 100, 12);
+        let before = line_text(&app.status_line);
+        assert!(before.ends_with("  auto "), "{before:?}");
+
+        fs::remove_file(&link).unwrap();
+        app.dirty.mark_chrome();
+        render_app(&mut app, 100, 12);
+        let after = line_text(&app.status_line);
+        assert!(after.ends_with("  auto "), "a draw re-resolved the project path: {after:?}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
