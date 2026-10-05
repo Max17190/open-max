@@ -10,8 +10,9 @@
 //! 500, 502, 503, 504, 529), and a stream that died before any reply text
 //! arrived. Each attempt resends the same bytes after an exponential backoff,
 //! stretched to a server's Retry-After, and tells the caller through
-//! [`StreamDelta::Retry`]. A 429 for an exhausted quota is reported at once:
-//! no wait would let it succeed.
+//! [`StreamDelta::Retry`]. A 429 for an exhausted quota, and a Retry-After
+//! longer than a minute, are reported at once: no wait the turn would take
+//! lets the request succeed.
 //! Once reply text has streamed, a retry would duplicate what the caller
 //! already showed, so a failure after that point is reported as a
 //! truncation instead. Reasoning deltas do not count: a retried attempt's
@@ -475,11 +476,17 @@ impl ChatClient {
                 if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
                 }
-                if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) {
+                // An ask past the cap outlasts any wait this turn takes:
+                // resending would only meet the same refusal.
+                let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
+                if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) && beyond_cap.is_none() {
                     if !resend_after(attempt, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
                     }
                     continue;
+                }
+                if let Some(secs) = beyond_cap {
+                    err.push_str(&format!(" (the server asks for a retry after {secs}s)"));
                 }
                 return Err(err);
             }
@@ -880,13 +887,14 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 /// Attempts per request. With [`BACKOFF_UNIT`] doubling up to
 /// [`BACKOFF_CAP`], the last attempt goes out about a minute after the
-/// first, later only when a server's Retry-After asks for longer waits
-/// (see [`backoff`]). A transient fault on the path to an endpoint (a reset
-/// or a TLS alert on send, a stream cut mid-reply) can recur for minutes and
-/// clears within seconds most times and within a minute at worst, so
-/// attempts packed into one second only ever observe the fault and end a
-/// turn the next connection would have completed. Every wait is announced
-/// and cancellable.
+/// first, later only when a server's Retry-After asks for longer waits, up
+/// to [`RETRY_AFTER_CAP_SECS`] each (see [`backoff`]); a longer ask is
+/// reported instead of retried. A transient fault on the path to an
+/// endpoint (a reset or a TLS alert on send, a stream cut mid-reply) can
+/// recur for minutes and clears within seconds most times and within a
+/// minute at worst, so attempts packed into one second only ever observe the
+/// fault and end a turn the next connection would have completed. Every
+/// wait is announced and cancellable.
 const MAX_ATTEMPTS: u32 = 8;
 /// Attempts in a row that may fail before any connection exists (refused,
 /// unresolvable, a connect timeout, a failed TLS handshake) before the
@@ -906,11 +914,11 @@ const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(test)]
 const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_millis(1);
 const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(16);
-/// The longest wait a Retry-After header can ask for, in seconds: a minute,
-/// the whole window of a per-minute rate limit. A longer ask is a limit that
-/// resets hours away, and holding the turn that long helps no one; the
-/// attempt goes out after the minute, announced and cancellable like every
-/// other.
+/// The longest Retry-After this client waits out, in seconds: a minute, the
+/// whole window of a per-minute rate limit. A longer ask is a limit that
+/// resets hours away (a daily quota, a maintenance window). No resend before
+/// then can succeed and holding the turn that long helps no one, so the
+/// refusal is reported at once with the server's wait.
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 /// Statuses that say the server could not take the request just now: a rate
@@ -1598,6 +1606,23 @@ mod tests {
         assert!(waited >= BACKOFF_UNIT * 40, "resent after {waited:?}, before the 40 units the server asked for");
     }
 
+    /// Stream against a server that sends `refusal` and then a finished
+    /// reply. Returns the outcome, the resends announced, and the requests
+    /// served.
+    async fn stream_after_refusal(refusal: String) -> (Result<CompletionResult, String>, usize, usize) {
+        let (url, served) = spawn_sse_sequence(vec![refusal, FINISHED.into()]);
+        let mut retries = 0;
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+                if let StreamDelta::Retry { .. } = d {
+                    retries += 1;
+                }
+            })
+            .await;
+        let served = *served.lock().unwrap();
+        (result, retries, served)
+    }
+
     /// An exhausted account also answers 429, but no wait makes it succeed:
     /// the bug this guards spent the whole retry budget, about a minute, on
     /// such a refusal before showing it. The server's message comes back
@@ -1609,22 +1634,32 @@ mod tests {
             "",
             r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#,
         );
-        let (url, served) = spawn_sse_sequence(vec![exhausted, FINISHED.into()]);
-        let mut retries = 0;
-        let result = ChatClient::new(url, None, "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
-                if let StreamDelta::Retry { .. } = d {
-                    retries += 1;
-                }
-            })
-            .await;
+        let (result, retries, served) = stream_after_refusal(exhausted).await;
         let Err(err) = result else { panic!("an exhausted quota is an error, not a resend") };
         assert_eq!(
             err,
             "backend returned 429 Too Many Requests: You exceeded your current quota, please check your plan and billing details."
         );
         assert_eq!(retries, 0);
-        assert_eq!(*served.lock().unwrap(), 1);
+        assert_eq!(served, 1);
+    }
+
+    /// A Retry-After past [`RETRY_AFTER_CAP_SECS`] is a limit that lifts
+    /// long after any wait a turn can take (a daily token limit, a
+    /// maintenance window). The bug this guards cut such an ask to the cap
+    /// and resent anyway on every attempt: minutes of waits, each answered
+    /// with the same refusal. It comes back at once with the server's wait,
+    /// so the user knows when to try again.
+    #[tokio::test]
+    async fn a_retry_after_past_the_cap_is_reported_without_a_retry() {
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let refused = status_response(status, "Retry-After: 3600\r\n", r#"{"error":{"message":"daily limit reached"}}"#);
+            let (result, retries, served) = stream_after_refusal(refused).await;
+            let Err(err) = result else { panic!("{status}: an ask past the cap is an error, not a resend") };
+            assert_eq!(err, format!("backend returned {status}: daily limit reached (the server asks for a retry after 3600s)"));
+            assert_eq!(retries, 0, "{status}");
+            assert_eq!(served, 1, "{status}");
+        }
     }
 
     #[test]
