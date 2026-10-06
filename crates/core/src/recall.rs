@@ -735,8 +735,9 @@ fn collect_chunks(
 
     // Already filtered to this project and sorted newest first; duplicate
     // index entries collapse so one session cannot scan (and bill the
-    // ceiling) more than once.
-    let mut metas = sessions::list(core, &root);
+    // ceiling) more than once. `recall` refuses a damaged index before
+    // collecting, so an error here has already been reported.
+    let mut metas = sessions::list(core, &root).unwrap_or_default();
     let mut seen_ids = std::collections::HashSet::new();
     metas.retain(|m| seen_ids.insert(m.id.clone()));
 

@@ -412,10 +412,34 @@ pub fn load_manifest(core: &Core, id: &str) -> Option<crate::registry::RegistryM
 /// the agent loop, and exactly wrong for a tool whose answer is trusted
 /// when it says nothing was found.
 pub fn index_diagnostic(core: &Core) -> Option<String> {
-    let _store = match lock_store(core) { Ok(store) => store, Err(reason) => return Some(reason) };
+    load_index_checked(core).err()
+}
+
+/// A frontend's refusal to start, continue, list, discard, or delete a
+/// session, pointing at `--check` when the refusal is the index's damage.
+/// Only frontends add the pointer, never the shared reason: `--check` gives
+/// the repair with the step that makes it safe (close every openmax), while
+/// a bare path acted on under a running session turns that session's later
+/// saves into silent no-ops. Any other refusal (a lock or write failure)
+/// passes through as is.
+pub fn refusal_with_repair(core: &Core, reason: String) -> String {
     match read_index(core) {
-        IndexRead::Damaged(reason) => Some(reason),
-        _ => None,
+        IndexRead::Damaged(damage) if damage == reason => {
+            format!("{reason}; run openmax --check for the repair")
+        }
+        _ => reason,
+    }
+}
+
+/// The index under `data_dir` and the reason, when it exists but cannot be
+/// read. For `--check`, which validates without a Core, so this takes no
+/// lock and creates no directory; the index is only ever replaced by an
+/// atomic rename, so an unlocked read sees one whole version or the other.
+pub(crate) fn index_damage(data_dir: &Path) -> Option<(PathBuf, String)> {
+    let path = data_dir.join("sessions").join("index.json");
+    match read_index_at(&path) {
+        IndexRead::Damaged(reason) => Some((path, reason)),
+        IndexRead::Missing | IndexRead::Loaded(_) => None,
     }
 }
 
@@ -430,8 +454,16 @@ enum IndexRead {
 }
 
 fn read_index(core: &Core) -> IndexRead {
-    let path = index_path(core);
-    let text = match std::fs::read_to_string(&path) {
+    read_index_at(&index_path(core))
+}
+
+/// The reason names the file and the problem, never a repair. It also
+/// reaches live sessions (the save warning, the compaction refusal, recall),
+/// and moving the index aside under one makes the still-indexed gate read
+/// its session as deleted, so every later save is dropped without a word.
+/// The repair is `--check`'s to give (see `doctor::check_at`).
+fn read_index_at(path: &Path) -> IndexRead {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexRead::Missing,
         Err(e) => {
@@ -451,10 +483,19 @@ fn read_index(core: &Core) -> IndexRead {
 }
 
 fn load_index(core: &Core) -> Vec<SessionMeta> {
-    let Ok(_store) = lock_store(core) else { return Vec::new(); };
+    load_index_checked(core).unwrap_or_default()
+}
+
+/// The index for a caller that reports what it finds to the user. A damaged
+/// index is an error naming the file, never an empty list: "no previous
+/// session" over a damaged index sends the user off to start fresh with
+/// nothing saying where their history went.
+fn load_index_checked(core: &Core) -> Result<Vec<SessionMeta>, String> {
+    let _store = lock_store(core)?;
     match read_index(core) {
-        IndexRead::Loaded(metas) => metas,
-        IndexRead::Missing | IndexRead::Damaged(_) => Vec::new(),
+        IndexRead::Loaded(metas) => Ok(metas),
+        IndexRead::Missing => Ok(Vec::new()),
+        IndexRead::Damaged(reason) => Err(reason),
     }
 }
 
@@ -892,9 +933,10 @@ fn records_end(bytes: &[u8]) -> usize {
     if start < bytes.len() && is_torn(&bytes[start..]) { start } else { bytes.len() }
 }
 
-/// Sessions for one project, most recently updated first.
-pub fn list(core: &Core, project: &str) -> Vec<SessionMeta> {
-    let mut metas: Vec<(usize, SessionMeta)> = load_index(core)
+/// Sessions for one project, most recently updated first. Err names a
+/// damaged index rather than listing nothing.
+pub fn list(core: &Core, project: &str) -> Result<Vec<SessionMeta>, String> {
+    let mut metas: Vec<(usize, SessionMeta)> = load_index_checked(core)?
         .into_iter()
         .enumerate()
         .filter(|(_, m)| m.project == project)
@@ -904,12 +946,12 @@ pub fn list(core: &Core, project: &str) -> Vec<SessionMeta> {
     // later index entry is the newer one and must sort first, or latest()
     // hands --continue an older same-second sibling.
     metas.sort_by_key(|(i, m)| std::cmp::Reverse((m.updated_at, *i)));
-    metas.into_iter().map(|(_, m)| m).collect()
+    Ok(metas.into_iter().map(|(_, m)| m).collect())
 }
 
 /// Most recent session for a project, if any (used by --continue).
-pub fn latest(core: &Core, project: &str) -> Option<SessionMeta> {
-    list(core, project).into_iter().next()
+pub fn latest(core: &Core, project: &str) -> Result<Option<SessionMeta>, String> {
+    Ok(list(core, project)?.into_iter().next())
 }
 
 pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
@@ -1439,9 +1481,9 @@ mod tests {
             }
         })
         .unwrap();
-        let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
+        let listed: Vec<String> = list(&core, "/tmp/tie").unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(listed, vec![c.clone(), b.clone(), a.clone()]);
-        assert_eq!(latest(&core, "/tmp/tie").unwrap().id, c);
+        assert_eq!(latest(&core, "/tmp/tie").unwrap().unwrap().id, c);
 
         // Touch recency inside the same second: touching the OLDEST session
         // must make it the latest, so the touched entry re-appends instead
@@ -1454,8 +1496,8 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(latest(&core, "/tmp/tie").unwrap().id, a);
-        let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
+        assert_eq!(latest(&core, "/tmp/tie").unwrap().unwrap().id, a);
+        let listed: Vec<String> = list(&core, "/tmp/tie").unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(listed, vec![a, c, b]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1480,7 +1522,7 @@ mod tests {
         assert_eq!(discard_if_empty(&core, &manifest_only), Ok(true));
         assert!(!manifest_path(&core, &manifest_only).exists(), "its files go with it");
         assert_eq!(discard_if_empty(&core, &kept), Ok(false), "a transcript is history");
-        let ids: Vec<String> = list(&core, "/tmp/p").into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = list(&core, "/tmp/p").unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![kept.clone()]);
 
         // An index that cannot be rewritten leaves the entry, and says so
@@ -1763,6 +1805,48 @@ mod tests {
                 if message.contains("does not parse"))
         });
         assert!(warned, "dropping a transcript over a damaged index must be loud");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Readers that answer "what history is there" name a damaged index
+    /// instead of answering "none": `--continue` would otherwise report no
+    /// previous session over a file full of them. Every refusal names the
+    /// file, removals included (a frontend discards the empty session it
+    /// leaves), and `--check` sees the same damage without a Core. The shared
+    /// reason carries no repair: it also reaches live sessions, where moving
+    /// the index aside turns every later save into a silent no-op. A
+    /// frontend's refusal points at `--check`, and only for the damage: a
+    /// lock or write failure is not something `--check` repairs.
+    #[test]
+    fn a_damaged_index_is_named_to_readers_not_reported_as_empty() {
+        let dir = std::env::temp_dir().join(format!("openmax-damaged-read-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        std::fs::write(index_path(&core), "[{").unwrap();
+        let path = index_path(&core).display().to_string();
+
+        let refusals = [
+            latest(&core, "/tmp/p").unwrap_err(),
+            list(&core, "/tmp/p").unwrap_err(),
+            create(&core, "/tmp/p".into()).unwrap_err(),
+            index_diagnostic(&core).unwrap(),
+            discard_if_empty(&core, &id).unwrap_err(),
+            delete(&core, &id).unwrap_err(),
+        ];
+        for reason in refusals {
+            assert!(reason.contains(&path), "{reason}");
+            assert!(!reason.contains("move it aside") && !reason.contains("--check"), "{reason}");
+            let refusal = refusal_with_repair(&core, reason.clone());
+            assert_eq!(refusal, format!("{reason}; run openmax --check for the repair"));
+        }
+        let unrelated = format!("cannot lock {path}: busy");
+        assert_eq!(refusal_with_repair(&core, unrelated.clone()), unrelated);
+        assert_eq!(index_damage(&dir).map(|(at, _)| at), Some(index_path(&core)));
+        assert_eq!(std::fs::read_to_string(index_path(&core)).unwrap(), "[{");
+
+        std::fs::remove_file(index_path(&core)).unwrap();
+        assert!(latest(&core, "/tmp/p").unwrap().is_none(), "a missing index is an empty store");
+        assert!(index_damage(&dir).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2225,7 +2309,7 @@ mod tests {
         assert!(delete(&core, &id).unwrap_err().contains("another process"));
         assert!(discard_if_empty(&core, &id).unwrap_err().contains("another process"));
         assert!(session_lock.exists(), "a lock file an older binary holds was unlinked");
-        assert!(list(&core, "/tmp/p").iter().any(|m| m.id == id), "a held session was removed");
+        assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "a held session was removed");
         drop(older);
         assert_eq!(discard_if_empty(&core, &id), Ok(true));
         assert!(!session_lock.exists());
@@ -2372,7 +2456,7 @@ mod tests {
 
         assert_eq!(discard.join().unwrap(), Ok(false), "a session with a transcript is history");
         assert_eq!(load_messages(&core, &id).unwrap().map(|m| m.len()), Some(1));
-        assert!(list(&core, "/tmp/p").iter().any(|m| m.id == id), "and it stays indexed");
+        assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "and it stays indexed");
         let _ = std::fs::remove_dir_all(dir);
     }
 

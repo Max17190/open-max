@@ -7553,7 +7553,7 @@ mod tests {
             "blocked text must not enter the transcript: {messages:?}"
         );
         // Session index title must not absorb blocked text (secret fail-open).
-        let listed = sessions::list(&core, &project_key);
+        let listed = sessions::list(&core, &project_key).unwrap();
         let title = listed.iter().find(|m| m.id == id).expect("session in index").title.clone();
         assert_eq!(title, sessions::UNTITLED, "blocked prompt must not set the title");
 

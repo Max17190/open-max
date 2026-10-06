@@ -33,8 +33,9 @@ whole line at 256 KiB of content; `truncated` says whether anything was cut.
 The session file on disk remains the full record. No live events are replayed,
 so a `token` stream always means a running turn.
 
-A continued session must have a readable transcript and no other writable
-owner. Failure is reported on stderr with a nonzero exit before the handshake.
+A continued session must have a readable session index and transcript and no
+other writable owner. Failure is reported on stderr with a nonzero exit before
+the handshake.
 The process retains ownership while waiting for commands, including between turns.
 
 ## Commands (stdin)

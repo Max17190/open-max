@@ -775,6 +775,39 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
 
+    // A damaged session index refuses every new session and every
+    // `--continue`, in every project, until it is moved aside. Only damage
+    // is a finding: a healthy index is state, not configuration. Moving it
+    // is the whole repair (a missing index is an empty store), but only
+    // with openmax closed: a running session whose entry leaves with the
+    // file reads as deleted, and its later saves are dropped silently. The
+    // target is a name not yet taken, so a second incident never overwrites
+    // the copy an earlier one moved aside. That name is only free when this
+    // prints; `-n` keeps it so when the command runs later (rerun from shell
+    // history, or copied from an older `--check`), and a skipped move leaves
+    // the index damaged, so the next `--check` names a free target again.
+    // `-n` skips without a word and exits 0, so the command checks that the
+    // index left and, when it did not, says so and exits nonzero: a silent
+    // skip, or a zero status a script checks, reads as a done repair while
+    // every session still refuses.
+    if let Some((path, reason)) = crate::sessions::index_damage(data_dir) {
+        let mut aside = path.with_extension("json.damaged");
+        let mut n = 1;
+        while std::fs::symlink_metadata(&aside).is_ok() {
+            n += 1;
+            aside = path.with_extension(format!("json.damaged-{n}"));
+        }
+        let index = shell_quote(&path);
+        findings.push(Finding {
+            kind: "sessions",
+            status: Status::Err(format!(
+                "{reason}; close every openmax, then move it aside to start a new index: mv -n {index} {} && test ! -e {index} || {{ echo 'the index was not moved; run openmax --check again'; false; }}",
+                shell_quote(&aside)
+            )),
+            path,
+        });
+    }
+
     findings.extend(inline_program_findings(data_dir, project_root));
     findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));
@@ -4328,7 +4361,7 @@ mod tests {
         write(data.join("prompt/review.md"), "Review.\n");
         write(data.join("tools/deploy.sh"), "#!/bin/sh\ntrue\n");
         write(data.join("ledger/log.jsonl"), "{}\n");
-        write(data.join("sessions/index.json"), "{}\n");
+        write(data.join("sessions/index.json"), "[]\n");
         write(data.join("notes.txt"), "scratch\n");
 
         let findings: Vec<Finding> = check_at(&root, &data)
@@ -4351,6 +4384,98 @@ mod tests {
                 "{legit} is legitimate and must not warn: {findings:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A damaged session index refuses every new session and every
+    /// `--continue`, in every project, so the command whose job is naming
+    /// what is broken names it, with the repair. A healthy index is silent.
+    /// The copyable `mv` targets a name that does not exist yet: a fixed
+    /// name would overwrite the copy an earlier incident moved aside, and
+    /// with it the only record of that index's sessions.
+    #[test]
+    fn a_damaged_session_index_is_an_error_with_its_repair() {
+        let root = temp_project();
+        let data = root.join("data");
+        let index = data.join("sessions/index.json");
+        write(index.clone(), "[]\n");
+        assert!(!check_at(&root, &data).iter().any(|f| f.path == index), "a healthy index is not a finding");
+
+        let earlier = data.join("sessions/index.json.damaged");
+        write(earlier.clone(), "[{\"id\":\"earlier\"");
+        write(index.clone(), "[{");
+        let findings = check_at(&root, &data);
+        let finding = findings
+            .iter()
+            .find(|f| f.path == index)
+            .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
+        let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
+        let (target, _) = reason
+            .rsplit_once(&format!("mv -n {} '", shell_quote(&index)))
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
+        let target = PathBuf::from(target);
+        assert!(target.starts_with(data.join("sessions")) && target != index, "{reason}");
+        assert!(!target.exists(), "the repair must not overwrite {}: {reason}", target.display());
+        assert!(has_errors(&findings));
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{", "--check never rewrites the index");
+        assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "[{\"id\":\"earlier\"");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The free target is chosen when `--check` prints, but the user runs
+    /// the command later: rerun from shell history after a second incident,
+    /// or copied from an older `--check` whose name another move has since
+    /// taken. A plain `mv` then replaces that copy, and with it the only
+    /// record of its index's sessions. The printed command must leave a copy
+    /// that appeared in between alone, say that it moved nothing and exit
+    /// nonzero (a silent skip, or a zero status a script checks, reads as a
+    /// done repair while every session still refuses), and still do the
+    /// repair once `--check` names a free target again.
+    #[test]
+    fn a_damaged_index_repair_never_overwrites_a_copy_made_after_check() {
+        let root = temp_project();
+        let data = root.join("data");
+        let index = data.join("sessions/index.json");
+        write(index.clone(), "[{");
+        let repair = |data: &Path| {
+            let findings = check_at(&root, data);
+            let finding = findings
+                .iter()
+                .find(|f| f.path == index)
+                .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
+            let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
+            let (_, command) = reason
+                .split_once("move it aside to start a new index: ")
+                .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
+            command.to_string()
+        };
+
+        let stale = repair(&data);
+        let taken = data.join("sessions/index.json.damaged");
+        assert!(stale.contains(&format!("mv -n {} {}", shell_quote(&index), shell_quote(&taken))), "{stale}");
+        write(taken.clone(), "[{\"id\":\"earlier\"");
+        let skipped = std::process::Command::new("/bin/sh").arg("-c").arg(&stale).output().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "[{\"id\":\"earlier\"",
+            "the repair must not overwrite a copy made after --check: {stale}"
+        );
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{");
+        let said = String::from_utf8_lossy(&skipped.stdout);
+        assert!(
+            said.contains("not moved") && said.contains("openmax --check"),
+            "a skipped repair must say so, not pass as done: {stale}: {said}"
+        );
+        assert!(!skipped.status.success(), "a repair that moved nothing must exit nonzero: {stale}");
+
+        let fresh = repair(&data);
+        let run = std::process::Command::new("/bin/sh").arg("-c").arg(&fresh).output().unwrap();
+        assert!(run.status.success(), "{fresh}: {}", String::from_utf8_lossy(&run.stderr));
+        assert!(run.stdout.is_empty(), "a done repair reports nothing: {}", String::from_utf8_lossy(&run.stdout));
+        assert!(!index.exists(), "the repair moves the damaged index aside: {fresh}");
+        assert_eq!(std::fs::read_to_string(data.join("sessions/index.json.damaged-2")).unwrap(), "[{");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "[{\"id\":\"earlier\"");
         let _ = std::fs::remove_dir_all(root);
     }
 

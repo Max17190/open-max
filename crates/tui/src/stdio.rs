@@ -81,17 +81,23 @@ pub async fn run(
 
     let (session_id, continued) = if args.continue_session {
         match sessions::latest(&core, &project_key) {
-            Some(meta) => (meta.id, true),
-            None => {
+            Ok(Some(meta)) => (meta.id, true),
+            Ok(None) => {
                 eprintln!("openmax: no prior session in this directory to continue");
                 return 2;
+            }
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
+                return 1;
             }
         }
     } else {
         match sessions::create(&core, project_key.clone()) {
             Ok(meta) => (meta.id, false),
             Err(e) => {
-                eprintln!("openmax: failed to create session: {e}");
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
                 return 1;
             }
         }
@@ -181,6 +187,7 @@ async fn drive<W: Write>(
     let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, out).await;
     if fresh {
         if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            let e = sessions::refusal_with_repair(&core, e);
             // One line, like every other harness line on stderr: the reason
             // quotes the index path, an authored byte string.
             eprintln!(
@@ -933,7 +940,7 @@ mod tests {
         )
         .await;
 
-        let title = sessions::latest(&core, &dir.display().to_string()).unwrap().title;
+        let title = sessions::latest(&core, &dir.display().to_string()).unwrap().unwrap().title;
         assert_eq!(title, "MARKER: greet world", "the raw slash line must not be submitted");
         // The turn really started: the only error is the missing endpoint.
         let errors: Vec<&str> = lines
@@ -958,12 +965,12 @@ mod tests {
         let (_lines, code, core, dir) = drive_in_project(|_| {}, false, vec![Command::Quit]).await;
         assert_eq!(code, 0);
         let key = dir.display().to_string();
-        assert!(sessions::list(&core, &key).is_empty(), "nothing to resume was left indexed");
+        assert!(sessions::list(&core, &key).unwrap().is_empty(), "nothing to resume was left indexed");
         let _ = std::fs::remove_dir_all(dir);
 
         let (_lines, _code, core, dir) = drive_in_project(|_| {}, true, vec![Command::Quit]).await;
         let key = dir.display().to_string();
-        assert_eq!(sessions::list(&core, &key).len(), 1, "a transcript is history");
+        assert_eq!(sessions::list(&core, &key).unwrap().len(), 1, "a transcript is history");
         let _ = std::fs::remove_dir_all(dir);
     }
 

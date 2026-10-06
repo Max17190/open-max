@@ -34,17 +34,22 @@ pub async fn run(
 
     let session_id = if args.continue_session {
         match sessions::latest(&core, &project_key) {
-            Some(meta) => meta.id,
-            None => {
+            Ok(Some(meta)) => meta.id,
+            Ok(None) => {
                 eprintln!("openmax: no prior session in this directory to continue");
                 return 2;
+            }
+            Err(e) => {
+                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(&core, e)));
+                return 1;
             }
         }
     } else {
         match sessions::create(&core, project_key) {
             Ok(meta) => meta.id,
             Err(e) => {
-                eprintln!("openmax: failed to create session: {e}");
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
                 return 1;
             }
         }
@@ -56,6 +61,7 @@ pub async fn run(
     // nothing behind it.
     if !args.continue_session {
         if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            let e = sessions::refusal_with_repair(&core, e);
             // The reason quotes the index path, an authored byte string, so it
             // is flattened like every other harness line on this stream.
             eprintln!("openmax: warning: the empty session {session_id} stays indexed: {}", one_line(&e));

@@ -408,7 +408,9 @@ extensions that were never used.
 `openmax --check` parses tools, skills, templates, hooks, permissions, and
 `providers.json`, then prints per-file results with the reason anything would
 be ignored, fail closed, or fail at request time. The agent is instructed to
-run it after writing extension files.
+run it after writing extension files. It also reads the session index: a
+damaged one is an `err` row whose message carries the repair (close every
+openmax, then move the file aside to the name the row gives).
 
 Each line is `ok`, `warn`, or `err`, and only `err` exits nonzero:
 

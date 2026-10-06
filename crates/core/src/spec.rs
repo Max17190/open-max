@@ -959,7 +959,8 @@ do not fold it into `detail`.
 For an admitted turn, `done` follows cleanup of running state and the cancellation
 token; the client may immediately submit another turn. A continued session is
 claimed before the handshake and stays owned between turns. An unreadable or
-damaged transcript, or a competing owner, causes a nonzero exit before hello.
+damaged session index or transcript, or a competing owner, causes a nonzero
+exit before hello.
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
