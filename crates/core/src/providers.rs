@@ -71,6 +71,8 @@ struct ProviderConfigFile {
     models: Vec<ProviderModel>,
     #[serde(default)]
     compat: CompatFlagsFile,
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,6 +90,9 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     pub models: Vec<ProviderModel>,
     pub compat: CompatFlags,
+    /// Seconds the endpoint may send nothing before an attempt is given up;
+    /// unset means the client's default.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -108,6 +113,12 @@ pub struct ActiveEndpoint {
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     pub compat: CompatFlags,
+    /// The provider's `idle_timeout_secs`, when it sets one.
+    pub idle_timeout_secs: Option<u64>,
+    /// Set when a key is configured in settings but withheld from this
+    /// endpoint because it is another server: why no key was sent and how to
+    /// give the provider its own, for the error a 401 from it reports.
+    pub key_hint: Option<String>,
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {
@@ -196,6 +207,7 @@ fn parse_providers_file(text: &str) -> Result<BTreeMap<String, ProviderConfig>, 
                     headers: raw.headers,
                     models: raw.models,
                     compat: raw.compat.into(),
+                    idle_timeout_secs: raw.idle_timeout_secs,
                 },
             )
         })
@@ -244,6 +256,9 @@ pub(crate) fn check_file(path: &Path) -> Option<Result<(usize, Vec<String>), Str
                     "provider '{name}' has an invalid base_url: {e}"
                 )))
             }
+        }
+        if provider.idle_timeout_secs == Some(0) {
+            return Some(Err(format!("provider '{name}' has zero idle_timeout_secs")));
         }
         for (header, value) in &provider.headers {
             if reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
@@ -303,7 +318,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
         let Some(provider) = provider.as_object() else { continue };
         unknown_keys(
             provider,
-            &["base_url", "api_key", "api_key_env", "headers", "models", "compat"],
+            &["base_url", "api_key", "api_key_env", "headers", "models", "compat", "idle_timeout_secs"],
             &format!("in provider '{name}'"),
             &mut out,
         );
@@ -516,11 +531,17 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         // Keep room for system + task history; never let max_tokens eat the window.
         let max_allowed = context_tokens.saturating_sub(2048).max(1);
         max_tokens = max_tokens.min(max_allowed);
-        let api_key = resolve_api_key(
-            p.api_key.as_deref(),
-            &p.api_key_env,
-            settings.api_key.as_deref(),
-        );
+        // The settings key was configured for settings.base_url: a provider
+        // with no key of its own inherits it only when it is that server.
+        // Sent anywhere else, it hands one server's credential to another.
+        let (api_key, key_hint) = match provider_key(p.api_key.as_deref(), &p.api_key_env) {
+            Some(key) => (Some(key), None),
+            None => match settings_key(settings.api_key.as_deref()) {
+                Some(key) if same_server(base_url, &settings.base_url) => (Some(key), None),
+                Some(_) => (None, Some(withheld_key_hint(name, p))),
+                None => (None, None),
+            },
+        };
         let headers = expand_headers(&p.headers);
         return Ok(ActiveEndpoint {
             provider: Some(name.clone()),
@@ -532,6 +553,8 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             max_tokens,
             temperature: settings.temperature,
             compat: p.compat.clone(),
+            idle_timeout_secs: p.idle_timeout_secs,
+            key_hint,
         });
     }
 
@@ -554,29 +577,29 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     Ok(ActiveEndpoint {
         provider: None,
         base_url: base_url.to_string(),
-        api_key: resolve_api_key(None, &[], settings.api_key.as_deref()),
+        api_key: settings_key(settings.api_key.as_deref()),
         headers: Vec::new(),
         model: model.to_string(),
         context_tokens,
         max_tokens,
         temperature: settings.temperature,
         compat: CompatFlags::defaults_for_missing(),
+        idle_timeout_secs: None,
+        key_hint: None,
     })
 }
 
-fn resolve_api_key(
-    provider_key: Option<&str>,
-    provider_env: &[String],
-    settings_key: Option<&str>,
-) -> Option<String> {
-    if let Some(k) = provider_key {
+/// A provider's own key: its `api_key`, else the first non-empty variable
+/// its `api_key_env` names.
+fn provider_key(key: Option<&str>, env: &[String]) -> Option<String> {
+    if let Some(k) = key {
         if let Some(v) = expand_secret(k) {
             if !v.is_empty() {
                 return Some(v);
             }
         }
     }
-    for name in provider_env {
+    for name in env {
         if let Ok(v) = std::env::var(name) {
             let v = v.trim().to_string();
             if !v.is_empty() {
@@ -584,7 +607,13 @@ fn resolve_api_key(
             }
         }
     }
-    if let Some(k) = settings_key {
+    None
+}
+
+/// The key configured for settings.base_url: settings.api_key, else
+/// `OPENMAX_API_KEY`.
+fn settings_key(key: Option<&str>) -> Option<String> {
+    if let Some(k) = key {
         if let Some(v) = expand_secret(k) {
             if !v.is_empty() {
                 return Some(v);
@@ -598,6 +627,29 @@ fn resolve_api_key(
         }
     }
     None
+}
+
+/// Whether two base URLs name the same server: scheme, host, and port
+/// (explicit or the scheme's default) all match. The path does not count.
+/// A URL that does not parse matches nothing.
+fn same_server(a: &str, b: &str) -> bool {
+    let server = |url: &str| {
+        let url = reqwest::Url::parse(url.trim()).ok()?;
+        Some((url.scheme().to_string(), url.host_str()?.to_string(), url.port_or_known_default()?))
+    };
+    server(a).is_some_and(|a| server(b) == Some(a))
+}
+
+/// What a 401 from provider `name` adds when the settings key was withheld
+/// from it: why no key went out, and how to give the provider its own.
+fn withheld_key_hint(name: &str, p: &ProviderConfig) -> String {
+    let fix = match p.api_key_env.first() {
+        Some(var) => format!("export {var}, which provider '{name}' reads its key from"),
+        None => format!("give provider '{name}' its own key with api_key_env in ~/.openmax/providers.json"),
+    };
+    format!(
+        " (no key was sent: the key in settings.json or OPENMAX_API_KEY goes only to the server settings.base_url names, by scheme, host, and port; {fix})"
+    )
 }
 
 /// Expand secrets:
@@ -714,6 +766,23 @@ mod tests {
             .unwrap()
             .unwrap_err()
             .contains("invalid JSON"));
+
+        // An idle interval is a known key; zero would end every attempt at once.
+        std::fs::write(
+            &path,
+            r#"{"providers":{"slow":{"base_url":"http://localhost/v1","idle_timeout_secs":1800}}}"#,
+        )
+        .unwrap();
+        assert_eq!(check_file(&path).unwrap().unwrap(), (1, Vec::new()));
+        std::fs::write(
+            &path,
+            r#"{"providers":{"slow":{"base_url":"http://localhost/v1","idle_timeout_secs":0}}}"#,
+        )
+        .unwrap();
+        assert!(check_file(&path)
+            .unwrap()
+            .unwrap_err()
+            .contains("zero idle_timeout_secs"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -886,6 +955,60 @@ mod tests {
         let ep = resolve(&s, &dir).unwrap();
         assert_eq!(ep.api_key.as_deref(), Some("from-env"));
         std::env::remove_var(&var);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The bug this guards: a provider with no key of its own was handed the
+    /// key settings.json holds for settings.base_url, whatever host the
+    /// provider names, so one server's credential went to another. Only the
+    /// same scheme, host, and port inherits it (the path does not matter);
+    /// any other provider resolves with no key and a hint for the 401 it
+    /// will get, naming how to give it its own.
+    #[test]
+    fn a_settings_key_is_inherited_only_by_its_own_host() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        let unset = format!("OPENMAX_TEST_UNSET_{}", uuid::Uuid::new_v4().simple());
+        let sized = r#""models": [{"id": "m", "context_tokens": 8192}]"#;
+        write_providers(
+            &dir,
+            &format!(
+                r#"{{"providers": {{
+                  "same": {{"base_url": "https://API.example.com:443/v2", {sized}}},
+                  "other_host": {{"base_url": "https://other.example.net/v1", {sized}}},
+                  "other_port": {{"base_url": "https://api.example.com:8443/v1", {sized}}},
+                  "plain": {{"base_url": "http://api.example.com/v1", {sized}}},
+                  "unset_env": {{"base_url": "https://other.example.net/v1", "api_key_env": "{unset}", {sized}}}
+                }}}}"#
+            ),
+        );
+        let mut s = Settings {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: Some("sk-settings".into()),
+            model: "m".into(),
+            provider: Some("same".into()),
+            ..Default::default()
+        };
+        let ep = resolve(&s, &dir).unwrap();
+        assert_eq!(ep.api_key.as_deref(), Some("sk-settings"));
+        assert_eq!(ep.key_hint, None);
+
+        for name in ["other_host", "other_port", "plain"] {
+            s.provider = Some(name.into());
+            let ep = resolve(&s, &dir).unwrap();
+            assert_eq!(ep.api_key, None, "{name} is another server");
+            let hint = ep.key_hint.expect("a withheld key explains the 401 it causes");
+            assert!(hint.contains(&format!("provider '{name}'")) && hint.contains("api_key_env"), "{hint}");
+        }
+        // A provider whose own variable is unset is told to set that one.
+        s.provider = Some("unset_env".into());
+        let ep = resolve(&s, &dir).unwrap();
+        assert_eq!(ep.api_key, None);
+        assert!(ep.key_hint.is_some_and(|hint| hint.contains(&unset)));
+
+        // With no settings.base_url, the key belongs to no provider's host.
+        s.provider = Some("same".into());
+        s.base_url.clear();
+        assert_eq!(resolve(&s, &dir).unwrap().api_key, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
