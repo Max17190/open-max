@@ -193,14 +193,14 @@ fn update(data_dir: &Path, change: impl FnOnce(&mut TrustFile) -> Result<(), Str
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
-    lock.lock()
+    // Released on every return, refusals included (see `FileLock`).
+    let _lock = crate::sessions::FileLock::wait(lock)
         .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
 
     let mut file = load(data_dir)?;
     change(&mut file)?;
     let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
     crate::sessions::write_atomic(&trust_path(data_dir), json)?;
-    lock.unlock().map_err(|e| format!("cannot unlock {}: {e}", lock_path.display()))?;
     Ok(())
 }
 
@@ -431,6 +431,28 @@ mod tests {
         assert!(is_trusted(&data, &project).unwrap());
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// A refused change releases trust.lock at once, like a saved one. A
+    /// child being spawned holds a copy of the lock's descriptor until it
+    /// execs, so a release that only closed it kept every other process's
+    /// trust write waiting on that child.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_trust_change_frees_its_lock_while_a_child_is_spawning() {
+        let data = temp_dir("spawn-data");
+        let mut spawning = None;
+        let refused = update(&data, |_| {
+            spawning = Some(crate::execution::PausedSpawn::start());
+            Err("refused".into())
+        });
+        assert_eq!(refused, Err("refused".to_string()));
+        assert!(
+            crate::sessions::raw_flock(&trust_lock_path(&data)).is_some(),
+            "a refused change left trust.lock held by a spawning child"
+        );
+        drop(spawning);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[cfg(unix)]
