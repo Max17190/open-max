@@ -55,8 +55,8 @@ const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
 /// leaves normal scheduler overhead inside a 144 Hz display interval without
 /// busy-spinning. The loop remains event-driven, so idle produces no frames.
-/// It paces agent events and ticks; a keystroke paints at once (see
-/// `paint_pacing`).
+/// It paces agent events, ticks, and machine-speed input; a keystroke paints
+/// at once (see `paint_pacing`).
 const MIN_DRAW_INTERVAL: Duration = Duration::from_micros(5_500);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
@@ -120,13 +120,24 @@ enum Paint {
 /// the loop. After that, input paints at once: a frame costs well under a
 /// millisecond, so capping it would only delay the echo of a keystroke.
 /// Everything else paints at most once per `MIN_DRAW_INTERVAL`, which is
-/// what turns a token firehose into display-rate frames.
-fn paint_pacing(now: Instant, last_draw: Instant, resize_hold: Option<Instant>, wake: Wake) -> Paint {
+/// what turns a token firehose into display-rate frames. That includes input
+/// landing within the cap of a frame that already showed input
+/// (`last_drew_input`): nobody types faster than a display refreshes, and a
+/// paste without bracketed paste can arrive one character per wake, each
+/// handled before the next lands, so painting each would draw frames no
+/// display can show.
+fn paint_pacing(
+    now: Instant,
+    last_draw: Instant,
+    last_drew_input: bool,
+    resize_hold: Option<Instant>,
+    wake: Wake,
+) -> Paint {
     if let Some(until) = resize_hold.filter(|&until| now < until) {
         return Paint::At(until);
     }
     let next = last_draw + MIN_DRAW_INTERVAL;
-    if wake == Wake::Input || now >= next {
+    if (wake == Wake::Input && !last_drew_input) || now >= next {
         Paint::Now
     } else {
         Paint::At(next)
@@ -493,12 +504,15 @@ pub async fn run(
     // Paint pacing (see `paint_pacing`): a redraw that may not paint yet is
     // deferred to `draw_deadline` and coalesced with everything else that
     // lands before it. `resize_hold` is the end of the current resize storm.
+    // `input_unpainted` marks input handled since the last paint, and
+    // `last_drew_input` whether that paint showed some.
     // An idle app has no armed tick and may receive no terminal event after
     // entering the alternate screen. Paint once before waiting so first launch
     // can never sit on a blank frame until the user presses a key.
     let mut last_draw = Instant::now();
     let mut draw_deadline: Option<Instant> = None;
     let mut resize_hold: Option<Instant> = None;
+    let (mut input_unpainted, mut last_drew_input) = (false, false);
     draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL)?;
     app.dirty.clear();
     // State the initial presence in the title; transitions are edge-driven.
@@ -535,6 +549,7 @@ pub async fn run(
                     }
                     Some(e) => {
                         app.on_term_event(e).await?;
+                        input_unpainted = true;
                         if input_rx.is_empty() {
                             wake = Wake::Input;
                         }
@@ -566,10 +581,11 @@ pub async fn run(
         }
         if app.dirty.any() {
             let now = Instant::now();
-            match paint_pacing(now, last_draw, resize_hold, wake) {
+            match paint_pacing(now, last_draw, last_drew_input, resize_hold, wake) {
                 Paint::Now => {
                     draw_frame(&mut terminal, &mut app, now.duration_since(last_draw))?;
                     last_draw = now;
+                    last_drew_input = std::mem::take(&mut input_unpainted);
                     draw_deadline = None;
                     resize_hold = None;
                     app.dirty.clear();
@@ -4564,18 +4580,56 @@ mod tests {
     fn keystrokes_paint_at_once_while_agent_frames_wait_for_the_cap() {
         let last_draw = std::time::Instant::now();
         let soon = last_draw + Duration::from_millis(1);
-        assert_eq!(paint_pacing(soon, last_draw, None, Wake::Input), Paint::Now);
+        assert_eq!(paint_pacing(soon, last_draw, false, None, Wake::Input), Paint::Now);
         assert_eq!(
-            paint_pacing(soon, last_draw, None, Wake::Other),
+            paint_pacing(soon, last_draw, false, None, Wake::Other),
             Paint::At(last_draw + MIN_DRAW_INTERVAL),
         );
         let later = last_draw + MIN_DRAW_INTERVAL;
-        assert_eq!(paint_pacing(later, last_draw, None, Wake::Other), Paint::Now);
+        assert_eq!(paint_pacing(later, last_draw, false, None, Wake::Other), Paint::Now);
         // A resize storm still settles first: a keystroke mid-drag must not
         // rewrap the transcript at a size the terminal is about to leave.
         let settle = soon + Duration::from_millis(10);
-        assert_eq!(paint_pacing(soon, last_draw, Some(settle), Wake::Input), Paint::At(settle));
-        assert_eq!(paint_pacing(settle, last_draw, Some(settle), Wake::Input), Paint::Now);
+        assert_eq!(paint_pacing(soon, last_draw, false, Some(settle), Wake::Input), Paint::At(settle));
+        assert_eq!(paint_pacing(settle, last_draw, false, Some(settle), Wake::Input), Paint::Now);
+    }
+
+    /// Input that lands within the cap of the last frame that showed input is
+    /// machine speed (a paste without bracketed paste, synthetic typing), and
+    /// each event can be handled before the next arrives, so nothing is ever
+    /// queued behind it. Painting each one would produce frames faster than
+    /// any display shows them: 400 characters 1 ms apart painted 400 frames.
+    #[test]
+    fn input_faster_than_the_frame_cap_coalesces_at_the_cap() {
+        let start = std::time::Instant::now();
+        let (mut last_draw, mut last_drew_input) = (start, false);
+        let mut deadline = None;
+        let mut frames = Vec::new();
+        for ms in 1..=400 {
+            let now = start + Duration::from_millis(ms);
+            // A deferred paint that came due before this key paints first.
+            if let Some(due) = deadline.filter(|&due| due <= now) {
+                (last_draw, last_drew_input, deadline) = (due, true, None);
+                frames.push(due);
+            }
+            match paint_pacing(now, last_draw, last_drew_input, None, Wake::Input) {
+                Paint::Now => {
+                    (last_draw, last_drew_input) = (now, true);
+                    frames.push(now);
+                }
+                Paint::At(when) => deadline = Some(when),
+            }
+        }
+        // The first key after an agent frame still echoes at once.
+        assert_eq!(frames[0], start + Duration::from_millis(1));
+        for pair in frames.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= MIN_DRAW_INTERVAL,
+                "{} frames for 400 keys, two of them {gap:?} apart",
+                frames.len()
+            );
+        }
     }
 
     /// Only presses, releases, drags, and the wheel are handled, so the
