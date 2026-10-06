@@ -1007,7 +1007,8 @@ between calls, a login done once per process) is not supported yet.
 ## Commands
 
 - `openmax --mcp-list -- <server command...>` prints the server's tools as a
-  skill body: a header, then one line per tool,
+  skill body: a header, the server's instructions (when it gives any) as a
+  quoted block, then one line per tool,
   `- name(arg: type, opt?: type): description`, required arguments first and
   `?` marking an optional one. With `--json` it prints the full tool
   definitions instead.

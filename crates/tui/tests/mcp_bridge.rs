@@ -18,13 +18,15 @@ use serde_json::{json, Value};
 
 const FIXTURE: &str = "--mcp-fixture";
 
-const TESTS: [(&str, fn()); 6] = [
+const TESTS: [(&str, fn()); 8] = [
     ("a_proxy_tool_written_from_the_spec_lists_and_calls_through_openmax", proxy_tool_from_the_spec),
     ("an_is_error_result_exits_nonzero_with_its_text", is_error_result),
     ("a_malformed_reply_is_reported_and_exits_nonzero", malformed_reply),
     ("a_server_that_never_answers_times_out_and_is_stopped", silent_server),
+    ("a_server_that_stops_reading_cannot_stall_a_large_call", stalled_server),
     ("every_page_of_tools_is_listed", paginated_list),
     ("a_server_request_is_answered_and_a_notification_ignored", server_traffic_mid_call),
+    ("this_harness_reads_libtest_options_as_libtest_does", harness_options),
 ];
 
 fn main() {
@@ -33,26 +35,13 @@ fn main() {
         serve(&args[1..]);
         return;
     }
-    // Enough of libtest's command line for `cargo test <filter>`, `--exact`,
-    // `--list`, and `--ignored` (this target has no ignored tests) to mean
-    // what they mean everywhere else.
+    let selected = select(&args);
     if args.iter().any(|a| a == "--list") {
-        for (name, _) in TESTS {
+        for (name, _) in &selected {
             println!("{name}: test");
         }
         return;
     }
-    let exact = args.iter().any(|a| a == "--exact");
-    let filters: Vec<&str> =
-        args.iter().filter(|a| !a.starts_with('-')).map(String::as_str).collect();
-    let selected: Vec<(&str, fn())> = TESTS
-        .into_iter()
-        .filter(|_| !args.iter().any(|a| a == "--ignored"))
-        .filter(|(name, _)| {
-            filters.is_empty()
-                || filters.iter().any(|f| if exact { name == f } else { name.contains(f) })
-        })
-        .collect();
     println!("\nrunning {} tests", selected.len());
     let mut failed = Vec::new();
     for (name, test) in &selected {
@@ -73,21 +62,55 @@ fn main() {
     }
 }
 
+/// The tests a libtest command line selects, so `cargo test <filter>`,
+/// `--exact`, `--skip`, `--list`, and `--ignored` (this target has no ignored
+/// tests) mean what they mean everywhere else. The value after a libtest
+/// option that takes one is that option's, never a name filter.
+fn select(args: &[String]) -> Vec<(&'static str, fn())> {
+    let (mut filters, mut skips) = (Vec::new(), Vec::new());
+    let (mut exact, mut ignored) = (false, false);
+    let mut words = args.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        match word {
+            "--exact" => exact = true,
+            "--ignored" => ignored = true,
+            "--skip" => skips.extend(words.next()),
+            "--test-threads" | "--color" | "--format" | "--logfile" | "--shuffle-seed" | "-Z" => {
+                words.next();
+            }
+            _ if word.starts_with("--skip=") => skips.push(&word["--skip=".len()..]),
+            _ if word.starts_with('-') => {}
+            filter => filters.push(filter),
+        }
+    }
+    let matches = |name: &str, filter: &str| if exact { name == filter } else { name.contains(filter) };
+    TESTS
+        .into_iter()
+        .filter(|_| !ignored)
+        .filter(|(name, _)| filters.is_empty() || filters.iter().any(|f| matches(name, f)))
+        .filter(|(name, _)| !skips.iter().any(|f| matches(name, f)))
+        .collect()
+}
+
 // ---------------------------------------------------------------- fixture
 
 /// One fixture MCP server. Modes: `basic` (two tools, `echo` and `fail`),
 /// `paged` (four tools over three tools/list pages), `malformed` (answers
 /// initialize with a line that is not JSON-RPC), `unsupported` (answers with
-/// a protocol version no client knows), and `silent <pidfile>` (never reads
-/// or writes, and ignores its closed stdin).
+/// a protocol version no client knows), `silent <pidfile>` (never reads or
+/// writes, and ignores its closed stdin), and `stalled <pidfile>` (answers
+/// initialize, then never reads again).
 fn serve(args: &[String]) {
     let mode = args.first().map(String::as_str).unwrap_or("basic");
     // A line on stderr, which the bridge must pass through to its caller.
     eprintln!("fixture {mode}: serving");
-    if mode == "silent" {
+    let write_pid = || {
         if let Some(pidfile) = args.get(1) {
             std::fs::write(pidfile, std::process::id().to_string()).unwrap();
         }
+    };
+    if mode == "silent" {
+        write_pid();
         std::thread::sleep(Duration::from_secs(120));
         return;
     }
@@ -113,11 +136,22 @@ fn serve(args: &[String]) {
                     out.flush().unwrap();
                     continue;
                 }
-                result(json!({
+                let reply = result(json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "fixture", "version": "1.0.0"},
-                }))
+                }));
+                if mode == "stalled" {
+                    // Alive, but its stdin fills up and stays full. The 30
+                    // seconds stay under `finish`'s bound, so a bridge that
+                    // waits for this exit fails its assertions instead of
+                    // hanging the suite.
+                    send(&mut out, &reply);
+                    write_pid();
+                    std::thread::sleep(Duration::from_secs(30));
+                    return;
+                }
+                reply
             }
             "notifications/initialized" => {
                 initialized = true;
@@ -520,6 +554,23 @@ fn silent_server() {
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
 
+/// A server that stops reading its stdin cannot hold the bridge on a write:
+/// a call larger than any pipe buffer still ends at the timeout, and the
+/// server is stopped.
+fn stalled_server() {
+    let (dir, _) = fresh_dirs("stalled");
+    let pidfile = dir.join("pid");
+    let call = json!({"tool": "echo", "arguments": {"text": "x".repeat(1 << 20)}}).to_string();
+    let run = bridge(&["--mcp-timeout", "1", "--mcp-call"], &["stalled", pidfile.to_str().unwrap()], &call);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(run.stderr.contains("did not answer tools/call within 1s"), "{}", run.stderr);
+    assert!(run.elapsed < Duration::from_secs(15), "{:?}", run.elapsed);
+    let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    // SAFETY: signal 0 only asks whether the process exists.
+    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the stalled server outlived the run");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
 /// tools/list is paginated: every page is fetched with the cursor the last
 /// one returned, and the list and JSON forms both carry every tool, once.
 fn paginated_list() {
@@ -553,4 +604,38 @@ fn server_traffic_mid_call() {
         run.stderr
     );
     assert!(run.stderr.contains("fixture basic: serving"), "{}", run.stderr);
+}
+
+/// `cargo test -- <libtest options>` reaches this target too. An option's
+/// value read as a name filter, or `--skip` read as a selection, would drop
+/// this whole suite while the run still reports ok.
+fn harness_options() {
+    let names = |args: &[&str]| -> Vec<&str> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        select(&args).into_iter().map(|(name, _)| name).collect()
+    };
+    let all: Vec<&str> = TESTS.iter().map(|(name, _)| *name).collect();
+    let silent = "a_server_that_never_answers_times_out_and_is_stopped";
+    let others: Vec<&str> = all.iter().copied().filter(|name| *name != silent).collect();
+    assert_eq!(names(&[]), all);
+    for values in [
+        &["--test-threads", "1"][..],
+        &["--color", "always"],
+        &["--format", "pretty"],
+        &["--logfile", "out.txt"],
+        &["--shuffle-seed", "7"],
+        &["-Z", "unstable-options"],
+        &["--test-threads=1", "--nocapture", "-q"],
+    ] {
+        assert_eq!(names(values), all, "{values:?}");
+    }
+    assert_eq!(names(&["--skip", "never_answers"]), others);
+    assert_eq!(names(&["--skip=never_answers"]), others);
+    assert_eq!(names(&["--skip", "never_answers", "--exact"]), all, "--exact applies to --skip");
+    assert_eq!(names(&["--exact", "--skip", silent]), others);
+    assert_eq!(names(&["never_answers", "--test-threads", "1"]), [silent]);
+    assert_eq!(names(&["never_answers", "--exact"]), Vec::<&str>::new());
+    assert_eq!(names(&[silent, "--exact"]), [silent]);
+    assert_eq!(names(&["--ignored"]), Vec::<&str>::new());
+    assert_eq!(names(&["--include-ignored"]), all);
 }

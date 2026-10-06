@@ -145,15 +145,19 @@ fn kind(value: &Value) -> &'static str {
     }
 }
 
-/// One running server: its stdin for requests, and a reader thread turning
-/// its stdout into lines, so every wait can be bounded by a timeout.
+/// One running server, with a writer thread feeding its stdin and a reader
+/// thread turning its stdout into lines. The thread that waits touches
+/// neither pipe, so each wait is bounded by the timeout whatever the server
+/// does: one that stops reading cannot hold a request larger than the pipe
+/// buffer forever.
 struct Session {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// The writer thread's queue; dropping it closes the server's stdin once
+    /// the queue drains.
+    writes: Option<mpsc::Sender<Vec<u8>>>,
     lines: mpsc::Receiver<Result<Vec<u8>, String>>,
     timeout: Duration,
     next_id: u64,
-    stopped: bool,
 }
 
 impl Session {
@@ -175,12 +179,15 @@ impl Session {
                 )
             })?;
         let stdout = child.stdout.take().expect("stdout is piped");
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().expect("stdin is piped");
         let (tx, lines) = mpsc::channel();
-        // Detached: a server can leave a descendant holding its stdout open,
-        // and the run must not wait on that to end.
+        let (writes, rx) = mpsc::channel();
+        // Both detached: a server can leave a descendant holding its stdout
+        // open, or stop reading its stdin, and the run must not wait on
+        // either to end.
         std::thread::spawn(move || read_lines(stdout, tx));
-        Ok(Self { child, stdin, lines, timeout, next_id: 1, stopped: false })
+        std::thread::spawn(move || write_lines(stdin, rx));
+        Ok(Self { child, writes: Some(writes), lines, timeout, next_id: 1 })
     }
 
     /// The handshake: ask for the newest revision this client speaks, accept
@@ -332,16 +339,15 @@ impl Session {
         }
     }
 
+    /// Queue one message for the writer thread. It fails only once the
+    /// writer has stopped, which a failed write to the server causes.
     fn send(&mut self, message: &Value, method: &str) -> Result<(), String> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err(format!("the server's stdin is closed before {method}"));
-        };
         let mut line = message.to_string();
         line.push('\n');
-        if stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()).is_err() {
-            return Err(self.closed(method));
+        match &self.writes {
+            Some(writes) if writes.send(line.into_bytes()).is_ok() => Ok(()),
+            _ => Err(self.closed(method)),
         }
-        Ok(())
     }
 
     fn silent(&self, method: &str) -> String {
@@ -368,13 +374,25 @@ impl Session {
         }
     }
 
+    fn exited_within(&mut self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Drop for Session {
     /// Stop the server the way the stdio transport defines: close its stdin,
     /// then SIGTERM, then SIGKILL, each after a grace period, and reap it.
-    fn stop(&mut self) {
-        if std::mem::replace(&mut self.stopped, true) {
-            return;
-        }
-        drop(self.stdin.take());
+    /// Closing the queue closes stdin once the writer drains it; a writer
+    /// stuck on a server that stopped reading is freed when the server dies.
+    fn drop(&mut self) {
+        drop(self.writes.take());
         if self.exited_within(STOP_GRACE) {
             return;
         }
@@ -392,22 +410,15 @@ impl Session {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-
-    fn exited_within(&mut self, grace: Duration) -> bool {
-        let deadline = Instant::now() + grace;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return true,
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-                _ => return false,
-            }
-        }
-    }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.stop();
+/// Write each queued message to the server's stdin, ending when the queue
+/// closes (which closes stdin) or a write fails.
+fn write_lines(mut stdin: ChildStdin, rx: mpsc::Receiver<Vec<u8>>) {
+    for line in rx {
+        if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
+            return;
+        }
     }
 }
 
