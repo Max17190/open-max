@@ -77,7 +77,7 @@ one).
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha`, and optional `env` (see below) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
-| `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
+| `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
 | `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed, or a hook file on disk is not loaded; the turn proceeded) |

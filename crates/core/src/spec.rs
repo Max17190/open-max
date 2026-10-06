@@ -950,8 +950,8 @@ stream or reply the provider failed with a rate limit, an overload, or a
 server fault; thinking already streamed for that attempt is void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
-outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
-each recorded capability-file change and its actor), `schemas_over_budget`
+outcome), `refrozen` (tools, skills, changes: the refreeze receipt, one line
+per tool or skill file added, modified, or removed), `schemas_over_budget`
 (schema_tokens, budget_tokens: the installed tools take most of what the
 window can spend, so compaction runs early and stops entirely once they
 reach it; advisory, at most once per session), `compacted` (tokens_before,

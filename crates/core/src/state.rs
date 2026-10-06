@@ -28,10 +28,6 @@ use crate::config::Settings;
 use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
-/// One extension generation exactly as a freeze captured it: for each file,
-/// its path, sha256, and bytes.
-pub type ExtensionGeneration = Vec<(PathBuf, String, Vec<u8>)>;
-
 /// In-memory state of one agent session.
 #[derive(Default, Clone)]
 pub struct SessionData {
@@ -58,17 +54,6 @@ pub struct SessionData {
     /// context window. The condition holds on every turn once it holds at all,
     /// so the advisory is emitted once and not per turn.
     pub schemas_over_budget_reported: bool,
-    /// Whether the ledger has reconciled with the extension files this session
-    /// froze. False until the first turn start: a freeze reads disk directly,
-    /// so changes made while no session was running would otherwise never be
-    /// recorded - and the next mid-turn sync would sweep them up as the
-    /// agent's own work.
-    pub ledger_synced: bool,
-    /// A turn-start generation the ledger could not record. Held so a later
-    /// mid-turn sync lands it as external work first: the delta that sync
-    /// records would otherwise span a human's pre-session edits and file
-    /// them as the agent's. In memory only; see `agent::settle_ledger`.
-    pub unrecorded_external: Option<ExtensionGeneration>,
     /// Content hashes of policy notices (inert allow rules, hooks that did
     /// not load) already narrated to the MODEL this session. The condition
     /// holds every turn once it holds at all, so the transcript gets one
@@ -80,9 +65,11 @@ pub struct SessionData {
     /// seeded from the chain at build, then advanced as new events are
     /// narrated. An approval recorded outside the running session (a human
     /// at another terminal, #199) reaches it through no other channel - the
-    /// refreeze receipt names file changes, not approvals - so the turn
-    /// start names any it has not seen.
-    pub seen_ledger_events: HashSet<u64>,
+    /// refreeze receipt names file changes, not approvals - so a turn start
+    /// outside auto names any it has not seen. None until the chain was
+    /// first read: auto never consults it, so a session built in auto is
+    /// seeded by its first turn in another mode, which narrates nothing.
+    pub seen_ledger_events: Option<HashSet<u64>>,
     /// Server-reported `prompt_tokens` over the local estimate of the same
     /// request, as last observed on a turn's completion. The bytes/4
     /// estimator under-counts BPE tokenizers on code, by far more than the
@@ -264,10 +251,9 @@ impl Core {
     /// Settings say how to reach an endpoint and what a turn may spend. A
     /// history search uses neither, so an unreadable settings file - a key
     /// from a newer build, a hand edit, a stray comma - must not also make the
-    /// project's own history unreadable. `--ledger` already reads its store
-    /// without loading settings at all; this puts `--recall` on the same
-    /// footing, and leaves the fail-closed rule exactly where it earns its
-    /// keep: the paths that spend money and run tools.
+    /// project's own history unreadable. This leaves the fail-closed rule
+    /// exactly where it earns its keep: the paths that spend money and run
+    /// tools.
     ///
     /// The failure is returned, never swallowed. Degrading silently to
     /// defaults would hide a real misconfiguration behind a working search;

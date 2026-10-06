@@ -760,15 +760,19 @@ async fn an_unverifiable_ledger_blocks_the_turn_and_names_the_repair() {
         "name = \"docsearch\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n",
     )
     .unwrap();
+    // A human approval is what writes the chain.
+    let manifest = project.join(".openmax/tools/docsearch.toml");
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
     let (base_url, bodies) = recording_endpoint(vec![completion_with_text("turn one")]).await;
     write_config(&data, &base_url, &project);
     let (core, mut rx) = Core::new(data.clone()).unwrap();
-    // Turn one: healthy ledger (the freeze seeds it), the turn runs.
+    // Turn one: healthy ledger, the turn runs.
     drive_turn(&core, &mut rx, "unver", &project, "one").await;
     // The log gains a tail with no pending pin: tampering, not a crash, so
     // every verified read now refuses.
     let log = open_max_core::ledger::project_dir(&data, &project).join("log.jsonl");
-    assert!(log.is_file(), "the first turn's sync seeded the ledger");
+    assert!(log.is_file(), "the approval wrote the chain");
     let mut text = std::fs::read_to_string(&log).unwrap();
     text.push_str("{\"forged\": true}\n");
     std::fs::write(&log, text).unwrap();
@@ -826,6 +830,10 @@ async fn a_cached_approval_does_not_survive_an_in_place_ledger_rewrite() {
         "name = \"docsearch\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n",
     )
     .unwrap();
+    // A human approval is what writes the chain.
+    let manifest = project.join(".openmax/tools/docsearch.toml");
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &manifest, &[sha]).unwrap();
     // Two completions on purpose: the second must never be requested. If the
     // stale cache passes the gate, turn two consumes it and the assertions
     // below catch the second body.
@@ -842,7 +850,7 @@ async fn a_cached_approval_does_not_survive_an_in_place_ledger_rewrite() {
     // same pin file, broken chain.
     let log = open_max_core::ledger::project_dir(&data, &project).join("log.jsonl");
     let text = std::fs::read_to_string(&log).unwrap();
-    let first_line = text.lines().next().expect("the freeze seeded a record");
+    let first_line = text.lines().next().expect("the approval wrote a record");
     let record: serde_json::Value = serde_json::from_str(first_line).unwrap();
     let sha = record["sha256"].as_str().expect("the record carries a hash").to_string();
     let mut flipped = sha.clone();

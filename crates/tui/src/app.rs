@@ -2932,7 +2932,7 @@ impl App {
                 }
             }
             AgentEvent::Refrozen { tools, skills, changes } => {
-                // The receipt: what changed and who changed it, so the action
+                // The receipt: which capability files changed, so the action
                 // space never mutates silently (a poisoned skill arriving via
                 // git pull is announced, not slipped in).
                 let detail = if changes.is_empty() {
