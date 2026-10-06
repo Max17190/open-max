@@ -12,8 +12,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::{execute, queue};
 use open_max_core::state::{default_data_dir, Core};
@@ -1057,7 +1056,7 @@ async fn main() -> std::io::Result<()> {
     enable_mode(MODE_PASTE, crossterm::event::EnableBracketedPaste);
     // Mouse capture for wheel scrolling of the transcript. Terminals still
     // allow text selection with the usual modifier (Option on macOS).
-    enable_mode(MODE_MOUSE, EnableMouseCapture);
+    enable_mode(MODE_MOUSE, app::EnableMouseTracking);
     // Focus reports gate the turn-done ring on the user being away.
     enable_mode(MODE_FOCUS, crossterm::event::EnableFocusChange);
 
@@ -1076,8 +1075,8 @@ async fn main() -> std::io::Result<()> {
 /// Terminal modes the fullscreen session has switched on, one bit each.
 /// Every exit path (quit, a signal, a failed init, a UI panic) ends in
 /// `restore_terminal`, which undoes exactly these. A mode left on outlives
-/// the process: mouse reporting alone turns every later mouse move into
-/// escape bytes typed at the shell prompt.
+/// the process: mouse reporting alone turns every later click, drag, and
+/// scroll into escape bytes typed at the shell prompt.
 static TERM_MODES: AtomicU8 = AtomicU8::new(0);
 const MODE_RAW: u8 = 1;
 const MODE_TITLE: u8 = 1 << 1;
@@ -1132,7 +1131,7 @@ fn write_restore<W: Write>(out: &mut W, modes: &AtomicU8) -> u8 {
         let _ = queue!(out, DisableFocusChange);
     }
     if on & MODE_MOUSE != 0 {
-        let _ = queue!(out, DisableMouseCapture);
+        let _ = queue!(out, app::DisableMouseTracking);
     }
     if on & MODE_PASTE != 0 {
         let _ = queue!(out, DisableBracketedPaste);
@@ -2031,7 +2030,8 @@ mod tests {
     /// Every mode the fullscreen session switched on is switched off by the
     /// one restore, and only once: the panic hook and the exit path can both
     /// run it. A mode left on outlives the process, and mouse reporting above
-    /// all turns every later mouse move into escape bytes at the shell prompt.
+    /// all turns every later click, drag, and scroll into escape bytes at the
+    /// shell prompt.
     #[test]
     fn restore_disables_every_enabled_mode_exactly_once() {
         let all = MODE_RAW
@@ -2049,7 +2049,7 @@ mod tests {
             ("synchronized update", ansi(crossterm::terminal::EndSynchronizedUpdate)),
             ("hidden cursor", ansi(crossterm::cursor::Show)),
             ("focus reports", ansi(crossterm::event::DisableFocusChange)),
-            ("mouse capture", ansi(DisableMouseCapture)),
+            ("mouse reporting", ansi(app::DisableMouseTracking)),
             ("bracketed paste", ansi(crossterm::event::DisableBracketedPaste)),
             ("keyboard flags", ansi(PopKeyboardEnhancementFlags)),
             ("alternate screen", ansi(crossterm::terminal::LeaveAlternateScreen)),
