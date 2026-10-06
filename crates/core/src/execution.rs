@@ -46,7 +46,8 @@ pub(crate) struct ProcessRequest {
     /// has approved yet: see [`SandboxPolicy`].
     pub sandbox: Option<SandboxPolicy>,
     /// Env var NAMES forwarded from the parent environment. `None` = the
-    /// full host environment (bash, hooks: the user's shell). `Some(names)`
+    /// full host environment (bash, hooks: the user's shell) with git's
+    /// terminal prompt turned off. `Some(names)`
     /// = scrub, then a baseline (PATH, HOME, LANG, TERM from the parent)
     /// plus exactly the named variables - external tools, whose manifest
     /// declares the list, making the credential grant part of the bytes a
@@ -662,6 +663,13 @@ pub(crate) async fn run_process(
                 command.env(name, value);
             }
         }
+    } else {
+        // Bash and hooks keep the user's whole environment, but git must not
+        // prompt for credentials: the child has no terminal to answer on
+        // (see `configure_process_group`). Turned off, git fails at once and
+        // names the cause. A credential helper or askpass program still
+        // answers first.
+        command.env("GIT_TERMINAL_PROMPT", "0");
     }
     // Mark every native child as agent-spawned. Trust grants are human
     // actions: the CLI refuses --trust-project (and the interactive trust
@@ -702,7 +710,10 @@ pub(crate) async fn run_process(
             command.stdin(std::process::Stdio::piped());
         }
     }
-    configure_process_group(&mut command);
+    // A sandboxed probe keeps the group it has always had: it starts only
+    // from `openmax --check --run-examples`, never from a session the TUI
+    // draws.
+    configure_process_group(&mut command, request.sandbox.is_none());
 
     let mut child = command.spawn().map_err(ProcessError::Spawn)?;
     let pid = child.id();
@@ -996,14 +1007,39 @@ async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     true
 }
 
+/// Make the child lead its own process group, the unit every termination
+/// path signals: a cancel or a timeout stops the whole tree, and members left
+/// behind after a normal exit are found and stopped.
+///
+/// With `new_session` the child also leads a new session, which has no
+/// controlling terminal. A child in the harness's session can open the
+/// terminal the TUI draws on: a git credential prompt, an ssh host-key
+/// question, or sudo then writes over the screen, and its read stops the
+/// child (a background group may not read its terminal) until the call times
+/// out. In a session of its own, opening /dev/tty fails at once and the
+/// command reports why. A session leader's group id is its own pid, so the
+/// group signals and the check for members left behind are unchanged.
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+fn configure_process_group(command: &mut Command, new_session: bool) {
     use std::os::unix::process::CommandExt;
-    command.as_std_mut().process_group(0);
+    if !new_session {
+        command.as_std_mut().process_group(0);
+        return;
+    }
+    // Runs between fork and exec, where only async-signal-safe calls are
+    // allowed, and setsid is one. A failure fails the spawn rather than
+    // running the command on the terminal. std has no stable way to ask
+    // posix_spawn for a new session, so these spawns take its fork path.
+    unsafe {
+        command.as_std_mut().pre_exec(|| match libc::setsid() {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_: &mut Command) {}
+fn configure_process_group(_: &mut Command, _: bool) {}
 
 #[cfg(unix)]
 fn send_termination(_: &mut Child, pid: Option<u32>) {
@@ -1627,5 +1663,152 @@ mod tests {
             !marker.exists(),
             "background descendant survived process cleanup"
         );
+    }
+
+    /// A timeout stops everything the command started, not just the shell:
+    /// a background descendant that ignores SIGTERM is still killed once the
+    /// grace runs out, so nothing keeps running after the call reported its
+    /// timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_stops_every_process_the_command_started() {
+        let dir = std::env::temp_dir().join(format!("openmax-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (started, survived) = (dir.join("started"), dir.join("survived"));
+        // The shell waits for the descendant to start, so the timeout stops
+        // a tree and not a lone shell.
+        let script = format!(
+            "(trap '' TERM; : > '{}'; sleep 2; : > '{}') & while [ ! -e '{}' ]; do sleep 0.05; done; sleep 30",
+            started.display(),
+            survived.display(),
+            started.display()
+        );
+        let mut request = request("/bin/sh", &["-c", &script]);
+        request.timeout = Duration::from_secs(1);
+        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        assert!(matches!(output.termination, Termination::TimedOut));
+        assert!(started.exists(), "the descendant never ran, so this proved nothing");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let survivor = survived.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!survivor, "a descendant outlived the timeout that stopped its command");
+    }
+
+    /// A command that prompts on the terminal (a git credential prompt, an
+    /// ssh host-key question, sudo) has nobody to answer it: the TUI owns the
+    /// screen and the keyboard. A child in the harness's session could open
+    /// that terminal, so the prompt drew over the TUI, and the read stopped
+    /// the child (a background group may not read its terminal) until the
+    /// call timed out. A child that leads its own session has no terminal to
+    /// open: the command fails at once, and nothing reaches the screen.
+    ///
+    /// The harness side must hold a controlling terminal for this to prove
+    /// anything, and the shared test process must not be given one, so the
+    /// probe runs in a child whose terminal is a fresh pseudo-terminal.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_prompts_on_the_terminal_fails_at_once() {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "OPENMAX_TEST_TERMINAL_PROMPT";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(
+                std::fs::File::open("/dev/tty").is_ok(),
+                "the harness side must hold a controlling terminal"
+            );
+            let mut request = request(
+                "/bin/sh",
+                &["-c", "printf 'Password: ' > /dev/tty && read -r answer < /dev/tty"],
+            );
+            request.timeout = Duration::from_secs(10);
+            let runtime =
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let output = runtime
+                .block_on(run_process(request, Arc::new(CancelToken::default())))
+                .unwrap();
+            assert!(
+                matches!(output.termination, Termination::Exited(status) if !status.success()),
+                "a command that prompted on the terminal waited there until its timeout"
+            );
+            return;
+        }
+
+        let (mut controller, terminal) = pseudo_terminal();
+        let mut probe = std::process::Command::new(std::env::current_exe().unwrap());
+        probe
+            .args(["--exact", "execution::tests::a_command_that_prompts_on_the_terminal_fails_at_once"])
+            .env(CHILD, "1")
+            .stdin(terminal)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // A new session whose controlling terminal is the pseudo-terminal on
+        // stdin: what a TUI started from an interactive shell holds.
+        unsafe {
+            probe.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = probe.spawn().unwrap();
+        // Only the probe holds the terminal end now, so the controller reads
+        // end-of-file once it exits. It is read while the probe runs: a
+        // session leader's exit can wait for its terminal's output to drain.
+        drop(probe);
+        let (sent, screen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut chunk = [0_u8; 1024];
+            while let Ok(read @ 1..) = controller.read(&mut chunk) {
+                if sent.send(chunk[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let out = child.wait_with_output().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut shown = Vec::new();
+        while let Ok(bytes) = screen.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            shown.extend(bytes);
+        }
+        let shown = String::from_utf8_lossy(&shown);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(shown.is_empty(), "the prompt reached the terminal: {shown:?}\n{stdout}");
+        // "1 passed" rules out a filter that matched nothing and exited 0.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A pseudo-terminal: the controller end the test reads, and the terminal
+    /// end a child takes as its controlling terminal.
+    #[cfg(unix)]
+    fn pseudo_terminal() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        // SAFETY: posix_openpt returns a new descriptor that the File then
+        // owns, and ptsname's static buffer is copied out before any other
+        // pty call.
+        let (controller, path) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(fd >= 0, "posix_openpt: {}", io::Error::last_os_error());
+            let controller = std::fs::File::from_raw_fd(fd);
+            assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", io::Error::last_os_error());
+            assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", io::Error::last_os_error());
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null(), "ptsname: {}", io::Error::last_os_error());
+            let path = std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr(name).to_bytes());
+            (controller, path.to_owned())
+        };
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .unwrap();
+        (controller, terminal)
     }
 }

@@ -193,7 +193,7 @@ File formats, hook events, permission rule syntax (including the in-session repa
 
 ## Native execution and privacy
 
-The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
+The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max. They run without a controlling terminal, so a command that prompts on the terminal (a password, an ssh host key) fails at once instead of drawing over the TUI and waiting out its timeout. `bash` and hooks also get `GIT_TERMINAL_PROMPT=0`, so git names the cause. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
 Open Max itself does not phone home. Apart from native child processes, the harness contacts only the model endpoint you configure.
 

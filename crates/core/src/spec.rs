@@ -133,7 +133,9 @@ writes the call's JSON arguments to stdin as one newline-terminated line, and
 returns stdout as the result.
 Nonzero exit makes the result an error carrying `exit code N` plus output.
 Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
-7 days. The tool runs in its own process group. When the tool exits, any
+7 days. The tool runs in its own session and process group, with no
+controlling terminal, so a command in it that prompts on the terminal (a
+password, an ssh host key) fails at once. When the tool exits, any
 process still in that group is terminated (`&`, `nohup` and `disown` leave a
 process there), and the result carries a note saying so. Cleanup reaches only
 that group: a process that moved itself to a new session or group is neither
