@@ -23,7 +23,12 @@ openmax --check                       # validate extension files and the session
 openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
 openmax --stdio                       # full session over JSONL pipes
+openmax --mcp-list -- <server>        # list an MCP server's tools
 ```
+
+`openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
+client, used by the proxy tool an MCP server is adopted through; see
+[extending](extending.md#mcp-servers) and `openmax --spec mcp`.
 
 `openmax --check --json` prints the same findings as one JSON array of
 `{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),

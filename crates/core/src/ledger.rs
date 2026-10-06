@@ -469,10 +469,8 @@ fn with_lock<R>(dir: &Path, f: impl FnOnce() -> Result<R, String>) -> Result<R, 
         .write(true)
         .open(lock_path(dir))
         .map_err(|e| format!("cannot open ledger lock: {e}"))?;
-    lock.lock().map_err(|e| format!("cannot lock ledger: {e}"))?;
-    let result = f();
-    let _ = lock.unlock();
-    result
+    let _lock = crate::sessions::FileLock::wait(lock).map_err(|e| format!("cannot lock ledger: {e}"))?;
+    f()
 }
 
 fn unix_now() -> u64 {
@@ -1554,7 +1552,7 @@ pub fn record_usage(
         .write(true)
         .open(lock_path(&dir))
         .map_err(|e| format!("cannot open ledger lock: {e}"))?;
-    lock.lock().map_err(|e| format!("cannot lock ledger: {e}"))?;
+    let lock = crate::sessions::FileLock::wait(lock).map_err(|e| format!("cannot lock ledger: {e}"))?;
     let result = (|| {
         // A malformed usage file starts over rather than blocking turns:
         // usage is telemetry, not policy.
@@ -1585,7 +1583,7 @@ pub fn record_usage(
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         crate::sessions::write_atomic(&usage_path(&dir), json)
     })();
-    let _ = lock.unlock();
+    drop(lock);
     result
 }
 

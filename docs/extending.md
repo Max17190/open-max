@@ -52,6 +52,32 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
+## MCP servers
+
+There is no MCP client in the agent loop. A server is adopted through the two
+surfaces above: one proxy tool per server with a `{tool, arguments}` schema,
+and one skill whose body lists the server's tools. Every request pays only
+for that schema and the skill's index line; the server's own tool schemas are
+read when the skill is. The `openmax` binary is the bridge between them, so a
+host needs nothing installed besides the server.
+
+```sh
+openmax --mcp-list -- npx -y @modelcontextprotocol/server-filesystem ~/notes
+echo '{"tool":"list_allowed_directories","arguments":{}}' |
+  openmax --mcp-call -- npx -y @modelcontextprotocol/server-filesystem ~/notes
+```
+
+`--mcp-list` prints the tools as a skill body, one line each with a compact
+argument summary (`--json` prints the full definitions). `--mcp-call` reads
+the call on stdin and prints the result's text; a tool error or a protocol
+error exits 1 with the reason. Each run starts the server, performs the
+initialize handshake, makes one request (every page of tools/list, or one
+tools/call), and stops it, with every wait bounded by `--mcp-timeout`
+(default 30 seconds). A server that needs a persistent session is not
+supported yet. `openmax --spec mcp` prints the recipe the agent follows: the
+proxy tool's TOML, with the server's credentials granted through `env`, and
+the shell lines that generate the skill.
+
 ## Memory
 
 One durable fact per markdown file under `.openmax/memory/`, written with the
@@ -434,12 +460,12 @@ loop never loads it and so never fails closed on it.
 ## Self-description
 
 `openmax --spec <surface>` prints the complete authoring contract for one
-surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`, or
-`stdio`): file grammar, field caps and defaults, hook stdin payload shapes, and
-activation timing. The frozen prompt carries only a one-line pointer to it, so
-the full contract costs zero tokens until the agent reads it, and the printed
-examples are parsed by the same validation code in tests so the text cannot
-drift from the binary.
+surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
+`stdio`, or `mcp`): file grammar, field caps and defaults, hook stdin payload
+shapes, and activation timing. The frozen prompt carries only a one-line
+pointer to it, so the full contract costs zero tokens until the agent reads
+it, and the printed examples are parsed by the same validation code in tests
+so the text cannot drift from the binary.
 
 ## Freezing and re-freezing
 

@@ -3,6 +3,7 @@ mod clipboard;
 mod completion;
 mod headless;
 mod input;
+mod mcp;
 mod stdio;
 mod theme;
 mod ui;
@@ -68,7 +69,20 @@ options:
                          stdin against the openmax-stdio contract instead
       --spec <surface>   print the authoring contract for one surface and
                          exit (tools, skills, prompts, hooks, permissions,
-                         providers, settings, memory, recall, stdio, usage)
+                         providers, settings, memory, recall, stdio, mcp,
+                         usage)
+      --mcp-list -- <server command...>
+                         start an MCP stdio server, print its tools as a
+                         skill body (name, arguments, description), and stop
+                         it; with --json, the full tool definitions
+      --mcp-call -- <server command...>
+                         call one tool of an MCP stdio server: reads
+                         {\"tool\":\"<name>\",\"arguments\":{...}} on stdin
+                         and prints the result's text; a tool or protocol
+                         error exits 1. Recipe: --spec mcp
+      --mcp-timeout <secs>
+                         with --mcp-list or --mcp-call, the longest wait for
+                         each server reply (default 30, at most 3600)
       --trust-project    trust this exact project root in auto mode (a project
                          already trusted keeps its mode), then run
   -V, --version          print the version
@@ -104,6 +118,15 @@ struct CliArgs {
     ledger_repair: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
     spec: Option<String>,
+    /// `--mcp-list`: print an MCP server's tools as a skill body.
+    mcp_list: bool,
+    /// `--mcp-call`: call one tool of an MCP server, read on stdin.
+    mcp_call: bool,
+    /// The MCP server's own command line: every word after `--`, kept as
+    /// separate argv words (prompt words are joined with spaces).
+    mcp_server: Option<Vec<OsString>>,
+    /// `--mcp-timeout`: seconds each wait for an MCP server reply may take.
+    mcp_timeout: Option<u64>,
     trust_project: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
@@ -135,13 +158,28 @@ where
         recall: None,
         ledger_repair: false,
         spec: None,
+        mcp_list: false,
+        mcp_call: false,
+        mcp_server: None,
+        mcp_timeout: None,
         trust_project: false,
         prompts: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
     let mut current: Vec<String> = Vec::new();
     let mut parser = lexopt::Parser::from_args(args);
-    while let Some(arg) = parser.next()? {
+    loop {
+        // Once an MCP operation is named, a `--` starts the server's command
+        // line, which is the server's to parse: `npx -y pkg` must not reach
+        // this parser as a `-y` option.
+        if (out.mcp_list || out.mcp_call) && out.mcp_server.is_none() {
+            if let Some(mut raw) = parser.try_raw_args() {
+                if raw.next_if(|word| word == "--").is_some() {
+                    out.mcp_server = Some(raw.collect());
+                }
+            }
+        }
+        let Some(arg) = parser.next()? else { break };
         match arg {
             Short('c') | Long("continue") => out.continue_session = true,
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
@@ -163,6 +201,9 @@ where
             Long("recall") => set_once(&mut out.recall, "--recall", &mut parser)?,
             Long("ledger-repair") => out.ledger_repair = true,
             Long("spec") => set_once(&mut out.spec, "--spec", &mut parser)?,
+            Long("mcp-list") => out.mcp_list = true,
+            Long("mcp-call") => out.mcp_call = true,
+            Long("mcp-timeout") => out.mcp_timeout = Some(parser.value()?.parse()?),
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
@@ -173,6 +214,12 @@ where
                 std::process::exit(0);
             }
             Value(v) => current.push(v.string()?),
+            _ if out.mcp_list || out.mcp_call => {
+                return Err(lexopt::Error::from(format!(
+                    "{}; an MCP server's command and its options go after --",
+                    arg.unexpected()
+                )));
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -292,6 +339,10 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         recall,
         ledger_repair,
         spec,
+        mcp_list,
+        mcp_call,
+        mcp_server,
+        mcp_timeout,
         trust_project,
         prompts,
     } = cli;
@@ -299,6 +350,8 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     // of its own: validating a protocol stream on stdin.
     let operations: Vec<&str> = [
         (spec.is_some(), "--spec"),
+        (*mcp_list, "--mcp-list"),
+        (*mcp_call, "--mcp-call"),
         (recall.is_some(), "--recall"),
         (*ledger, "--ledger"),
         (*ledger_repair, "--ledger-repair"),
@@ -318,13 +371,15 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     let operation = operations.first().copied();
     // Each option and the operations that read it.
     const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
-    let options: [(bool, &str, &[Option<&str>]); 6] = [
+    const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
+    let options: [(bool, &str, &[Option<&str>]); 7] = [
         (*trust_project, "--trust-project", SESSIONS),
         (*continue_session, "--continue", SESSIONS),
         (model.is_some(), "--model", SESSIONS),
         (provider.is_some(), "--provider", SESSIONS),
-        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall")]),
+        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
+        (mcp_timeout.is_some(), "--mcp-timeout", MCP),
     ];
     for (on, flag, readers) in options {
         if !on || readers.contains(&operation) {
@@ -352,14 +407,26 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         return Some(match operation {
             None => "unexpected arguments (use --print for headless)".to_string(),
             Some(operation) => {
-                let stdin = match operation {
+                let hint = match operation {
                     "--stdio" => "; it reads commands on stdin",
                     "--check --stdio" => "; it reads the stream on stdin",
+                    "--mcp-list" => "; the server's command goes after --",
+                    "--mcp-call" => "; the server's command goes after --, and the call on stdin",
                     _ => "",
                 };
-                format!("{operation} takes no other arguments (got '{words}'){stdin}")
+                format!("{operation} takes no other arguments (got '{words}'){hint}")
             }
         });
+    }
+    if let Some(operation @ ("--mcp-list" | "--mcp-call")) = operation {
+        if mcp_server.as_ref().is_none_or(|words| words.is_empty()) {
+            return Some(format!(
+                "{operation} needs the MCP server's command after --: openmax {operation} -- <command> [args...]"
+            ));
+        }
+    }
+    if mcp_timeout.is_some_and(|secs| !(1..=mcp::MAX_TIMEOUT_SECS).contains(&secs)) {
+        return Some(format!("--mcp-timeout takes 1 to {} seconds", mcp::MAX_TIMEOUT_SECS));
     }
     None
 }
@@ -405,11 +472,27 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    if cli.mcp_list || cli.mcp_call {
+        // A one-shot protocol client, outside the agent loop: no session, no
+        // endpoint, no state dir, no trust. What it starts is the command the
+        // caller named, run exactly as the caller could run it.
+        let server = cli.mcp_server.as_deref().unwrap_or_default();
+        let timeout = std::time::Duration::from_secs(
+            cli.mcp_timeout.unwrap_or(mcp::DEFAULT_TIMEOUT_SECS),
+        );
+        let code = match cli.mcp_list {
+            true => mcp::list(server, timeout, cli.json),
+            false => mcp::call(server, timeout),
+        };
+        std::process::exit(code);
+    }
+
     if let Some(query) = &cli.recall {
         // Read-only introspection, like --check: no session, no endpoint,
         // no trust gate. Recall only ever surfaces this project's own history
-        // (the session index is keyed by project), and the project key is the
-        // same raw current_dir form session creation stores.
+        // (the session index is keyed by project), and the index matches
+        // this path, as given or resolved, against the resolved path each
+        // session was recorded in.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // Settings are how a turn reaches a provider and what it may spend;
         // recall reads neither, so a settings file this process will never act
@@ -2243,9 +2326,10 @@ mod tests {
 
     /// Every operation a command line can select, as its args and the name a
     /// refusal gives it. `-p` comes last in any line built from these: the
-    /// tokens after it are its prompt. An empty name is the interactive
-    /// session.
-    const OPERATIONS: [(&[&str], &str); 11] = [
+    /// tokens after it are its prompt. An MCP operation's server command
+    /// comes after `--`, so `refusal_of` closes such a line with one. An
+    /// empty name is the interactive session.
+    const OPERATIONS: [(&[&str], &str); 13] = [
         (&[], ""),
         (&["--spec", "tools"], "--spec"),
         (&["--recall", "q"], "--recall"),
@@ -2257,6 +2341,8 @@ mod tests {
         (&["--check", "--stdio"], "--check --stdio"),
         (&["--stdio"], "--stdio"),
         (&["-p", "x"], "--print"),
+        (&["--mcp-list"], "--mcp-list"),
+        (&["--mcp-call"], "--mcp-call"),
     ];
 
     /// Whether a refusal names `flag` as a whole flag, so `--ledger` is not
@@ -2268,7 +2354,9 @@ mod tests {
     }
 
     fn refusal_of(args: &[&str]) -> Option<String> {
-        refusal(&parse_args_from(args.iter().copied()).unwrap())
+        let mcp = args.iter().any(|a| a.starts_with("--mcp-") && *a != "--mcp-timeout");
+        let server: &[&str] = if mcp { &["--", "srv"] } else { &[] };
+        refusal(&parse_args_from(args.iter().chain(server).copied()).unwrap())
     }
 
     /// Every pair of operations is refused before either runs, naming both:
@@ -2308,13 +2396,14 @@ mod tests {
     #[test]
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
-        let options: [(&[&str], &str, &[&str]); 7] = [
+        let options: [(&[&str], &str, &[&str]); 8] = [
             (&["--trust-project"], "--trust-project", sessions),
             (&["--continue"], "--continue", sessions),
             (&["-m", "m"], "--model", sessions),
             (&["--provider", "p"], "--provider", sessions),
-            (&["--json"], "--json", &["--print", "--check", "--recall"]),
+            (&["--json"], "--json", &["--print", "--check", "--recall", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
+            (&["--mcp-timeout", "5"], "--mcp-timeout", &["--mcp-list", "--mcp-call"]),
             // A bare word is a prompt, which only --print reads.
             (&["extra"], "", &["--print"]),
         ];
@@ -2340,8 +2429,73 @@ mod tests {
             &["--trust-project", "--continue", "-m", "m", "--provider", "p", "-p", "--json", "x"],
             &["--trust-project", "--continue", "--stdio"],
             &["--recall", "q", "--json"],
+            &["--mcp-timeout", "60", "--mcp-list", "--json"],
+            &["--mcp-call", "--mcp-timeout", "60"],
         ] {
             assert_eq!(refusal_of(args), None, "{args:?} is a valid command line");
+        }
+    }
+
+    /// An MCP server's command line belongs to the server: every word after
+    /// `--` reaches it as its own argv word, options included, while `--`
+    /// keeps its ordinary meaning on a line with no MCP operation.
+    #[test]
+    fn the_mcp_server_command_is_every_word_after_the_separator() {
+        let words = ["--mcp-timeout", "5", "--mcp-call", "--", "npx", "-y", "@scope/server", "--port", "3"];
+        let cli = parse_args_from(words).unwrap();
+        assert!(cli.mcp_call && !cli.mcp_list && cli.prompts.is_empty());
+        assert_eq!(cli.mcp_timeout, Some(5));
+        let server: Vec<&str> =
+            cli.mcp_server.iter().flatten().map(|w| w.to_str().unwrap()).collect();
+        assert_eq!(server, ["npx", "-y", "@scope/server", "--port", "3"]);
+        assert_eq!(refusal(&cli), None);
+        // One `--`: a second belongs to the server too.
+        let cli = parse_args_from(["--mcp-list", "--json", "--", "srv", "--", "x"]).unwrap();
+        assert_eq!(cli.mcp_server.unwrap(), ["srv", "--", "x"]);
+        // Without an MCP operation, `--` still ends openmax's own options.
+        let cli = parse_args_from(["-p", "--", "--literal"]).unwrap();
+        assert_eq!(cli.prompts, ["--literal"]);
+        assert!(cli.mcp_server.is_none());
+    }
+
+    /// Each way an MCP command line goes wrong is refused before anything
+    /// runs, and the refusal says where the server's command belongs.
+    #[test]
+    fn an_mcp_operation_without_a_server_command_is_refused() {
+        for args in [&["--mcp-list"][..], &["--mcp-call", "--"]] {
+            let reason = refusal(&parse_args_from(args.iter().copied()).unwrap()).unwrap();
+            assert!(reason.contains("needs the MCP server's command after --"), "{args:?}: {reason}");
+        }
+        let reason = refusal(&parse_args_from(["--mcp-list", "srv"]).unwrap()).unwrap();
+        assert!(reason.contains("'srv'") && reason.contains("after --"), "{reason}");
+        let err = parse_args_from(["--mcp-list", "npx", "-y", "pkg"]).err().unwrap().to_string();
+        assert!(err.contains("go after --"), "{err}");
+        for secs in ["0", "3601"] {
+            let cli = parse_args_from(["--mcp-timeout", secs, "--mcp-list", "--", "srv"]).unwrap();
+            assert_eq!(refusal(&cli).as_deref(), Some("--mcp-timeout takes 1 to 3600 seconds"));
+        }
+        assert!(parse_args_from(["--mcp-timeout", "soon", "--mcp-list", "--", "srv"]).is_err());
+    }
+
+    /// `--spec mcp` is what the agent copies from, so every command it shows
+    /// must be a command line this binary runs as written.
+    #[test]
+    fn every_command_the_mcp_spec_shows_is_accepted() {
+        let spec = open_max_core::spec::render("mcp").expect("--spec mcp renders");
+        let mut shown = Vec::new();
+        for (at, _) in spec.match_indices("openmax --") {
+            // A command ends at its closing backtick, a shell operator, or
+            // the end of its line.
+            let rest = &spec[at..];
+            let end = rest.find(['`', ')', '>', '&', '|', '\n']).unwrap_or(rest.len());
+            let words: Vec<&str> = rest[..end].split_whitespace().skip(1).collect();
+            let cli = parse_args_from(words.iter().copied())
+                .unwrap_or_else(|e| panic!("{words:?} does not parse: {e}"));
+            assert_eq!(refusal(&cli), None, "{words:?}");
+            shown.push(words.join(" "));
+        }
+        for operation in ["--mcp-list --", "--mcp-call --", "--mcp-list -- notes-server --stdio"] {
+            assert!(shown.iter().any(|c| c.starts_with(operation)), "{operation} is shown: {shown:?}");
         }
     }
 

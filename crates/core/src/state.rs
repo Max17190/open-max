@@ -136,8 +136,10 @@ pub struct Core {
     pub cancel_flags: Mutex<HashMap<String, Arc<CancelToken>>>,
     /// Pending tool-approval prompts awaiting a user decision.
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
-    /// Serializes read-modify-write cycles on the session index file.
-    pub sessions_lock: Mutex<()>,
+    /// Serializes this process's session store writes, the index's
+    /// read-modify-write cycles included, and guards what it knows about the
+    /// store without reading it (`sessions::StoreMemo`).
+    pub(crate) sessions_lock: Mutex<crate::sessions::StoreMemo>,
     /// Process ownership lasts as long as writable session state is attached.
     pub(crate) session_owners: Mutex<HashMap<String, crate::sessions::SessionOwner>>,
     /// Panic restorations must finish before the terminal receipt releases a turn.
