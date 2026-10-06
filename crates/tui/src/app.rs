@@ -5574,7 +5574,7 @@ mod tests {
         let index = damage_session_index(&dir);
         let path = index.display().to_string();
 
-        app.startup(&super::Args { continue_session: true }).await;
+        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
         let continued = app.transcript.export_text();
         assert!(
             continued.contains(&path)
