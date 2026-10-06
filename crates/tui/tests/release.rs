@@ -92,6 +92,30 @@ const DIST_DEFAULT_RUNNERS: &[(&str, &str)] = &[
     ("x86_64-unknown-linux-musl", "ubuntu-22.04"),
 ];
 
+/// The runner a `github-custom-runners` entry releases `target` on.
+/// cargo-dist reads a runner name and a table that sets only `runner` the
+/// same way, and ignores keys it does not know. A `host` or `container` can
+/// also change how the release builds (a cross-compile, or another image and C
+/// library), which ci.yml does not mirror, so an entry that sets either fails
+/// rather than passing on its runner alone.
+fn custom_runner<'a>(target: &str, entry: &'a toml::Value) -> &'a str {
+    let runner = match entry {
+        toml::Value::Table(table) => {
+            for key in ["host", "container"] {
+                assert!(
+                    !table.contains_key(key),
+                    "{target}'s custom runner sets `{key}`, which ci.yml does not mirror: {entry:?}"
+                );
+            }
+            table.get("runner")
+        }
+        name => Some(name),
+    };
+    runner
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{target}'s custom runner names no runner: {entry:?}"))
+}
+
 /// CI builds exactly the targets a tag publishes, each on the runner the
 /// release builds it on, and gates every binary's size, on every run, with
 /// the profile the published binaries are built with.
@@ -115,11 +139,7 @@ fn ci_builds_and_size_gates_every_release_target() {
         .map(|runners| runners.as_table().expect("github-custom-runners is a table of target = runner"));
     for (target, runner) in &matrix {
         let released = match custom.and_then(|runners| runners.get(target)) {
-            // A table here also sets a host or container, which ci.yml does
-            // not mirror, so it fails rather than passing on the runner alone.
-            Some(custom) => custom
-                .as_str()
-                .unwrap_or_else(|| panic!("{target}'s custom runner is not a runner name, which ci.yml cannot mirror: {custom:?}")),
+            Some(entry) => custom_runner(target, entry),
             None => DIST_DEFAULT_RUNNERS
                 .iter()
                 .find(|(t, _)| t == target)
