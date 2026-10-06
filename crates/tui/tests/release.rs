@@ -69,9 +69,27 @@ fn ci_release_matrix() -> Vec<(String, String)> {
     entries
 }
 
-/// CI builds exactly the targets a tag publishes, on the runner the release
-/// builds each one on where the manifest chooses it, and gates every binary's
-/// size, on every run, with the profile the published binaries are built with.
+/// The cargo-dist release the runners below were read from.
+const DIST_VERSION: &str = "0.32.0";
+
+/// The runner `dist plan` assigns each target when the manifest's
+/// `github-custom-runners` does not choose one. They live in the dist binary,
+/// not in any file here, and a dist bump can move a target to a runner whose
+/// OS image or C library differs from the one CI builds it on, so they are
+/// recorded here against [`DIST_VERSION`] and re-read from
+/// `dist plan --output-format=json` on a bump.
+const DIST_DEFAULT_RUNNERS: &[(&str, &str)] = &[
+    ("aarch64-apple-darwin", "macos-14"),
+    ("x86_64-apple-darwin", "macos-15-intel"),
+    ("aarch64-unknown-linux-gnu", "ubuntu-22.04-arm"),
+    ("x86_64-unknown-linux-gnu", "ubuntu-22.04"),
+    ("aarch64-unknown-linux-musl", "ubuntu-22.04-arm"),
+    ("x86_64-unknown-linux-musl", "ubuntu-22.04"),
+];
+
+/// CI builds exactly the targets a tag publishes, each on the runner the
+/// release builds it on, and gates every binary's size, on every run, with
+/// the profile the published binaries are built with.
 #[test]
 fn ci_builds_and_size_gates_every_release_target() {
     let matrix = ci_release_matrix();
@@ -81,13 +99,31 @@ fn ci_builds_and_size_gates_every_release_target() {
     published.sort_unstable();
     assert_eq!(built, published, "CI's release-build matrix is not the set of targets a tag publishes");
 
-    for line in manifest_table("workspace.metadata.dist.github-custom-runners").lines() {
-        let Some((target, runner)) = line.split_once(" = ").filter(|_| !line.starts_with('#')) else {
-            continue;
-        };
-        let runner = runner.trim_matches('"');
-        let ci = matrix.iter().find(|(t, _)| t == target).map(|(_, r)| r.as_str());
-        assert_eq!(ci, Some(runner), "the release builds {target} on {runner}");
+    let dist = manifest_table("workspace.metadata.dist");
+    let dist_version = dist
+        .lines()
+        .find_map(|line| line.strip_prefix("cargo-dist-version = "))
+        .map(|version| version.trim_matches('"'));
+    assert_eq!(
+        dist_version,
+        Some(DIST_VERSION),
+        "cargo-dist changed, and with it maybe the runner a target is released from: re-read DIST_DEFAULT_RUNNERS from `dist plan --output-format=json` and re-sync ci.yml's release-build matrix"
+    );
+    let custom_runners = manifest_table("workspace.metadata.dist.github-custom-runners");
+    let custom: Vec<(&str, &str)> = custom_runners
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once(" = "))
+        .map(|(target, runner)| (target, runner.trim_matches('"')))
+        .collect();
+    for (target, runner) in &matrix {
+        let released = custom
+            .iter()
+            .chain(DIST_DEFAULT_RUNNERS)
+            .find(|(t, _)| t == target)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("no release runner recorded for {target}: add the one `dist plan` assigns it to DIST_DEFAULT_RUNNERS"));
+        assert_eq!(runner, released, "the release builds {target} on {released}, but CI builds it on {runner}");
     }
 
     let job = ci_job("release-build");

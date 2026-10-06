@@ -50,7 +50,8 @@ libc = "0.2"
 # bumping cargo-dist-version below means regenerating by hand, re-applying the
 # verification step, and re-pinning its hash in the same commit. A bump can
 # also move a target to another runner: CI's release-build matrix builds each
-# target where `dist plan --output-format=json` assigns it, so re-sync it too.
+# target where `dist plan --output-format=json` assigns it, so re-sync it, and
+# the default runners crates/tui/tests/release.rs records, too.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"

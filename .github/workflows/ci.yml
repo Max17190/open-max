@@ -59,7 +59,7 @@ jobs:
   # on the runner `dist plan` assigns it and with the packages the release
   # installs there, and a target that stops building fails the pull request
   # that broke it instead of the next release. crates/tui/tests/release.rs
-  # keeps this matrix equal to the published targets.
+  # keeps this matrix equal to the published targets and their runners.
   release-build:
     name: Release build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
