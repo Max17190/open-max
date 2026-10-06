@@ -86,7 +86,7 @@ fn damaged_continuation_preserves_bytes_before_hooks_or_provider_requests() {
     let id = open_max_core::sessions::create(&core, canonical.display().to_string()).unwrap().id;
     drop(core);
     let transcript = data.join("sessions").join(format!("{id}.messages.json"));
-    let bytes = b"{\"role\":\"user\",\"content\":\"preserve\"}\n{torn record";
+    let bytes = b"{\"role\":\"user\",\"content\":\"preserve\"}\n{damaged record}\n";
     std::fs::write(&transcript, bytes).unwrap();
     std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
     std::fs::write(project.join(".openmax/hooks/submit.toml"),
