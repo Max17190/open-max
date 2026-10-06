@@ -649,15 +649,18 @@ Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
 - `compat` (optional): wire quirks for picky servers:
   `{"use_max_completion_tokens": false, "send_stream_options": true}` are the
   defaults.
-- `idle_timeout_secs` (optional, default 600): how long the endpoint may send
+- `idle_timeout_secs` (optional, default 600): a positive number of seconds
+  (`--check` rejects 0; it never disables the timeout) the endpoint may send
   nothing at all (no headers, no bytes, no SSE keepalive comment) before the
-  attempt ends; if no response or no reply text has arrived yet, it is
-  resent. Raise it for a local server that works through a long prompt
+  attempt ends. If no response has arrived, or a stream goes silent before
+  any reply text, it is resent; a stream silent after reply text is reported
+  truncated. Raise it for a local server that works through a long prompt
   silently for longer.
 
-A key or Authorization header never goes over plain http to another machine:
-such a request fails with an error before anything is sent. Use https, or a
-loopback address (127.0.0.1, ::1, localhost) for a server on this machine.
+A key, Authorization header, or user:password in `base_url` never goes over
+plain http to another machine: such a request fails with an error before
+anything is sent. Use https, or a loopback address (127.0.0.1, ::1,
+localhost) for a server on this machine.
 
 Select a provider with `"provider"` in settings.json, the `--provider` CLI
 option, or `/provider`; `/model` picks provider and model as one pair. This

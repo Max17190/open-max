@@ -19,9 +19,10 @@ optional `~/.openmax/providers.json` for a catalog of named endpoints.
 `base_url` is the root of your model's HTTP API (the harness calls
 `chat/completions` on it). Set `model` to the id that server expects. Set
 `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. A key never
-crosses plain http to another machine: with a key configured and an `http://`
-`base_url` that is not a loopback address (`127.0.0.1`, `::1`, or `localhost`),
-every request fails with an error instead of sending it. Use https, or a
+crosses plain http to another machine: with a key (or `user:password` in the
+`base_url`) configured and an `http://` `base_url` that is not a loopback
+address (`127.0.0.1`, `::1`, or `localhost`), every request fails with an
+error instead of sending it. Use https, or a
 loopback address for a server on this machine; a server that needs no key works
 over http once none is configured.
 `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and
@@ -163,7 +164,8 @@ reply bytes, not even an SSE keepalive comment) for 10 minutes ends the
 attempt. If no response arrives, or a stream goes silent before any reply
 text, the attempt is resent like a dropped connection; a stream that goes
 silent after reply text is reported truncated. A provider's
-`idle_timeout_secs` sets a different interval for that provider.
+`idle_timeout_secs` sets a different interval for that provider, in seconds
+(0 does not disable it, and `--check` rejects it).
 
 Open Max works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud
 gateways (OpenRouter and similar), and private proxies.

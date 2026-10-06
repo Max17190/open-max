@@ -41,8 +41,8 @@
 //! reported as truncated rather than treated as a complete reply.
 //!
 //! A credential never crosses plain http to another machine: a request that
-//! would carry the key or an Authorization header that way is refused
-//! before it is sent.
+//! would carry the key, an Authorization header, or user:password from the
+//! base_url that way is refused before it is sent.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -471,11 +471,15 @@ impl ChatClient {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 
-    /// Whether a request carries a credential: the key, or an Authorization
-    /// header among the provider's headers.
+    /// Whether a request carries a credential: the key, an Authorization
+    /// header among the provider's headers, or user:password in the
+    /// base_url, which the HTTP client turns into a Basic Authorization
+    /// header.
     fn sends_credential(&self) -> bool {
         self.api_key.as_deref().is_some_and(|key| !key.is_empty())
             || self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            || reqwest::Url::parse(self.base_url.trim())
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
     }
 
     /// The stamp for reasoning this endpoint produces: the first 16 hex chars
@@ -1304,7 +1308,7 @@ fn plain_http_refusal(base_url: &str) -> Option<String> {
         });
     (!this_machine).then(|| {
         format!(
-            "refusing to send credentials over plain http to {host}, where anyone on the network path can read them: use an https base_url, or a loopback address (127.0.0.1, ::1, or localhost) for a server on this machine. A server that needs no key works over http once none is configured for it (api_key, api_key_env, OPENMAX_API_KEY, or an Authorization header)"
+            "refusing to send credentials over plain http to {host}, where anyone on the network path can read them: use an https base_url, or a loopback address (127.0.0.1, ::1, or localhost) for a server on this machine. A server that needs no key works over http once none is configured for it (api_key, api_key_env, OPENMAX_API_KEY, an Authorization header, or user:password in the base_url)"
         )
     })
 }
@@ -2613,16 +2617,19 @@ mod tests {
 
     /// The bug this guards: the key went out as a bearer header over plain
     /// http to any host, readable anywhere on the path. A request that would
-    /// carry a credential (the key, or an Authorization header) over http to
-    /// another machine is refused before anything is sent, naming the fix;
-    /// over loopback, to a server on this machine, it goes out.
+    /// carry a credential (the key, an Authorization header, or user:password
+    /// in the base_url, which the HTTP client sends as Basic auth) over http
+    /// to another machine is refused before anything is sent, naming the
+    /// fix; over loopback, to a server on this machine, it goes out.
     #[tokio::test]
     async fn a_key_never_crosses_plain_http_to_another_machine() {
-        for (key, headers) in [
-            (Some("sk-test".to_string()), Vec::new()),
-            (None, vec![("Authorization".to_string(), "Bearer sk-test".to_string())]),
+        for (base_url, key, headers) in [
+            ("http://models.example.invalid/v1", Some("sk-test".to_string()), Vec::new()),
+            ("http://models.example.invalid/v1", None, vec![("Authorization".to_string(), "Bearer sk-test".to_string())]),
+            ("http://user:secret@models.example.invalid/v1", None, Vec::new()),
+            ("http://:secret@models.example.invalid/v1", None, Vec::new()),
         ] {
-            let mut client = ChatClient::new("http://models.example.invalid/v1".into(), key, "m".into(), None, 64);
+            let mut client = ChatClient::new(base_url.into(), key, "m".into(), None, 64);
             client.headers = headers;
             let mut retries = 0;
             let err = client
@@ -2632,6 +2639,7 @@ mod tests {
                 .expect("a key over plain http to another machine is refused");
             assert!(err.starts_with("refusing to send"), "{err}");
             assert!(err.contains("models.example.invalid") && err.contains("https") && err.contains("127.0.0.1"), "{err}");
+            assert!(err.contains("user:password in the base_url") && !err.contains("secret"), "{err}");
             assert_eq!(retries, 0, "nothing was sent, so nothing was resent");
         }
 
