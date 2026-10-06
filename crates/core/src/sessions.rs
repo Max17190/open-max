@@ -69,7 +69,7 @@ pub struct SessionMeta {
 /// the session it then owns is no longer indexed, and every release drops
 /// writes to such a session.
 pub(crate) struct SessionOwner {
-    _file: std::fs::File,
+    _file: FileLock,
     detach: bool,
 }
 
@@ -99,7 +99,7 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
     let path = lock_path(core, id);
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
-    file.try_lock().map_err(|e| match e {
+    let file = FileLock::try_take(file).map_err(|e| match e {
         std::fs::TryLockError::WouldBlock =>
             format!("session {id} is already open in another process; close it there or start a new session"),
         std::fs::TryLockError::Error(e) => format!("cannot lock session {id}: {e}"),
@@ -540,7 +540,7 @@ fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
 /// description, so that is what keeps one process from contending with
 /// itself (see the ledger's `with_lock` note). The lock releases when the
 /// returned handle drops.
-fn lock_index(core: &Core) -> Result<std::fs::File, String> {
+fn lock_index(core: &Core) -> Result<FileLock, String> {
     let dir = sessions_dir(core);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("index.lock");
@@ -550,22 +550,57 @@ fn lock_index(core: &Core) -> Result<std::fs::File, String> {
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    file.lock()
-        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
-    Ok(file)
+    FileLock::wait(file)
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))
+}
+
+/// An exclusive lock held on an open lock file, released by an explicit
+/// unlock when dropped, before the file closes. flock(2) belongs to the open
+/// file description, not to one descriptor, and a child being spawned holds
+/// a copy of every descriptor this process has open until it execs (bash,
+/// tools, and hooks all spawn that way, see `configure_process_group`).
+/// Closing only this copy would keep the lock held until that child exec'd:
+/// a session released and reopened in the window is refused as open in
+/// another process, and other processes waiting on the lock stall. The
+/// unlock releases it whatever copies remain. The lock taken is unchanged,
+/// so older binaries still exclude this one and are excluded by it.
+pub(crate) struct FileLock(std::fs::File);
+
+impl FileLock {
+    /// Wait until the lock is free, then take it.
+    pub(crate) fn wait(file: std::fs::File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    /// Take the lock, or fail at once while another holder has it.
+    pub(crate) fn try_take(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Should the unlock fail, closing the file still releases the lock
+        // once no spawning child holds a copy.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Take a lock file the way every released binary does: an exclusive flock(2)
 /// on its own open file description, without blocking. `None` while another
 /// holder has it. Tests use it to stand in for an older binary sharing the
-/// data dir, because std's `File::lock` must keep excluding that binary.
+/// data dir, because std's `File::lock` must keep excluding that binary. It
+/// is released like the harness's own locks, so a child another test is
+/// spawning cannot hold it past the drop.
 #[cfg(all(test, unix))]
-pub(crate) fn raw_flock(path: &std::path::Path) -> Option<std::fs::File> {
+pub(crate) fn raw_flock(path: &std::path::Path) -> Option<FileLock> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(path).unwrap();
     let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    held.then_some(file)
+    held.then_some(FileLock(file))
 }
 
 /// Read-modify-write the index under the state lock (concurrent turns in
@@ -585,7 +620,7 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
-fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, ()>, std::fs::File), String> {
+fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, ()>, FileLock), String> {
     let guard = core.sessions_lock.lock().unwrap();
     let flock = lock_index(core)?;
     Ok((guard, flock))
@@ -2343,6 +2378,51 @@ mod tests {
         drop(older);
         assert_eq!(discard_if_empty(&core, &id), Ok(true));
         assert!(!session_lock.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A released session must be free at once, not when the last copy of
+    /// its lock descriptor closes. flock belongs to the open file
+    /// description, and a child being spawned holds a copy of every open
+    /// descriptor until it execs: a release that only closed the harness's
+    /// copy left the session locked while any bash call, tool, or hook was
+    /// mid-spawn, and reopening it then was refused as open in another
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_session_reopens_while_a_child_is_spawning() {
+        let dir = std::env::temp_dir().join(format!("openmax-spawn-session-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let (other, _other_rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+
+        let spawning = crate::execution::PausedSpawn::start();
+        detach(&core, &id).unwrap();
+        attach(&core, &id).expect("a released session reopens while a child is spawning");
+        detach(&core, &id).unwrap();
+        attach(&other, &id).expect("another process takes a released session while a child is spawning");
+        assert!(attach(&core, &id).unwrap_err().contains("another process"), "a held session stays exclusive");
+        drop(spawning);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The index lock is released the same way, or every other process's
+    /// index write waits on a child it never started.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_index_lock_is_free_while_a_child_is_spawning() {
+        let dir = std::env::temp_dir().join(format!("openmax-spawn-index-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let store = lock_store(&core).unwrap();
+
+        let spawning = crate::execution::PausedSpawn::start();
+        drop(store);
+        assert!(
+            raw_flock(&sessions_dir(&core).join("index.lock")).is_some(),
+            "a released index lock stayed held by a spawning child"
+        );
+        drop(spawning);
         let _ = std::fs::remove_dir_all(dir);
     }
 
