@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use crate::config::ApprovalMode;
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 const TRUST_VERSION: u32 = 1;
@@ -158,14 +157,14 @@ fn update(data_dir: &Path, change: impl FnOnce(&mut TrustFile) -> Result<(), Str
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
-    lock.lock_exclusive()
+    lock.lock()
         .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
 
     let mut file = load(data_dir)?;
     change(&mut file)?;
     let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
     crate::sessions::write_atomic(&trust_path(data_dir), json)?;
-    FileExt::unlock(&lock).map_err(|e| format!("cannot unlock {}: {e}", lock_path.display()))?;
+    lock.unlock().map_err(|e| format!("cannot unlock {}: {e}", lock_path.display()))?;
     Ok(())
 }
 
@@ -335,6 +334,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(project_a);
         let _ = std::fs::remove_dir_all(project_b);
+    }
+
+    /// trust.lock speaks the same flock(2) protocol as the session locks: a
+    /// write must wait while an older binary on this data dir holds it, or
+    /// the two read-modify-writes interleave and one trust decision is lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_trust_write_waits_for_a_raw_flock_holder() {
+        let data = temp_dir("flock-data");
+        let project = temp_dir("flock-project");
+        let older = crate::sessions::raw_flock(&trust_lock_path(&data)).expect("trust.lock is idle");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let (data, project) = (data.clone(), project.clone());
+            std::thread::spawn(move || {
+                trust_project(&data, &project).unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "a trust write must wait while an older binary holds trust.lock"
+        );
+        drop(older);
+        writer.join().unwrap();
+        assert!(is_trusted(&data, &project).unwrap());
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[cfg(unix)]

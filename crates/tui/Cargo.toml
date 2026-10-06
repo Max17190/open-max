@@ -3,6 +3,7 @@ name = "openmax"
 description = "Open Max: barebones high-performance agent harness TUI"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -20,7 +21,10 @@ path = "src/main.rs"
 
 [dependencies]
 open-max-core = { path = "../core" }
-ratatui = "0.30.2"
+# Only the crossterm backend. The defaults add the calendar widget (and the
+# `time` crate family behind it), ratatui-macros and a layout cache, none of
+# which the TUI calls; the crossterm backend still enables underline colors.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio.workspace = true
 futures-util.workspace = true
