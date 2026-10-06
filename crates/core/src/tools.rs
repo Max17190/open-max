@@ -404,9 +404,10 @@ pub async fn execute(
     let name = name.to_string();
     let args = args.clone();
     let root = root.to_path_buf();
+    let task_cancel = cancel.clone();
     let task = tokio::task::spawn_blocking(move || match name.as_str() {
             "list_dir" => list_dir(&root, &args),
-            "read_file" => read_file(&root, &args),
+            "read_file" => read_file(&root, &args, &task_cancel),
             "write_file" => write_file(&root, &args),
             "edit_file" => edit_file(&root, &args),
             "glob" => glob_tool(&root, &args),
@@ -474,7 +475,7 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(output)
 }
 
-fn read_file(root: &Path, args: &Value) -> ToolOutcome {
+fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
@@ -511,8 +512,9 @@ fn read_file(root: &Path, args: &Value) -> ToolOutcome {
                 m.len()
             ))
         }
-        Ok(m) if m.len() > MAX_FILE_BYTES => match stream_window(&path, &mut window) {
+        Ok(m) if m.len() > MAX_FILE_BYTES => match stream_window(&path, &mut window, cancel) {
             Ok(total) => total,
+            Err(_) if cancel.is_cancelled() => return ToolOutcome::err("tool cancelled by user"),
             Err(e) => return read_error(e),
         },
         Ok(_) => {
@@ -602,8 +604,12 @@ impl ReadWindow {
 /// count. Lines are read one at a time and only those in the window are
 /// decoded, each held to the prefix that `ReadWindow::push` can show, so
 /// memory stays bounded however long the file or any of its lines runs.
-fn stream_window(path: &Path, window: &mut ReadWindow) -> std::io::Result<usize> {
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+///
+/// The count reads to the end of a file of any size, so the read stops once
+/// the call is cancelled: the caller has stopped waiting for it by then.
+fn stream_window(path: &Path, window: &mut ReadWindow, cancel: &CancelToken) -> std::io::Result<usize> {
+    let file = Cancellable { file: std::fs::File::open(path)?, cancel };
+    let mut reader = std::io::BufReader::new(file);
     let mut kept = Vec::new();
     let mut n = 0;
     loop {
@@ -624,6 +630,21 @@ fn stream_window(path: &Path, window: &mut ReadWindow) -> std::io::Result<usize>
             Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         };
         window.push(n, line, len);
+    }
+}
+
+/// A file whose reads fail once the call reading it is cancelled.
+struct Cancellable<'a> {
+    file: std::fs::File,
+    cancel: &'a CancelToken,
+}
+
+impl std::io::Read for Cancellable<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other("tool cancelled by user"));
+        }
+        std::io::Read::read(&mut self.file, buf)
     }
 }
 
@@ -1728,6 +1749,11 @@ mod tests {
         assert!(out.ok, "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("mixed.txt")).unwrap(), "one\r\n2\n3\r\n");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// read_file in a call nothing cancels.
+    fn read_file(root: &Path, args: &Value) -> ToolOutcome {
+        super::read_file(root, args, &CancelToken::default())
     }
 
     fn temp_project() -> PathBuf {
@@ -2851,6 +2877,21 @@ mod tests {
         let out = read_file(&root, &json!({"path": "big.log"}));
         let advice = format!("file too large ({len} bytes); read a range of lines with offset and limit");
         assert_eq!((out.ok, out.output.as_str()), (false, advice.as_str()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The caller stops waiting for a read once the call is cancelled, but a
+    /// window of a large file went on reading to the end of the file to count
+    /// its lines, however large the file.
+    #[test]
+    fn a_cancelled_read_of_a_large_file_stops_reading() {
+        let root = temp_project();
+        let line = "row of a large log\n";
+        std::fs::write(root.join("big.log"), line.repeat(MAX_FILE_BYTES as usize / line.len() + 1)).unwrap();
+        let cancel = CancelToken::default();
+        cancel.cancel();
+        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), &cancel);
+        assert_eq!((out.ok, out.output.as_str()), (false, "tool cancelled by user"));
         let _ = std::fs::remove_dir_all(root);
     }
 
