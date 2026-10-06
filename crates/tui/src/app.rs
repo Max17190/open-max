@@ -7112,6 +7112,42 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A prompt a hook rejects is rolled back from above the notices its
+    /// turn already painted. A selection handled before the next paint
+    /// takes the notice under the pointer, not the one that slid into its
+    /// place in the transcript.
+    #[tokio::test]
+    async fn a_selection_after_a_rejected_prompt_takes_the_painted_notice() {
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("a prompt a hook rejects");
+        app.pending_submit = Some("a prompt a hook rejects".into());
+        for index in 0..3 {
+            app.on_agent_event(AgentEvent::HookFailed {
+                hook: "lint".into(),
+                event: "user_prompt_submit".into(),
+                detail: format!("notice {index}"),
+            });
+        }
+        let painted = render_app(&mut app, 80, 20);
+        app.on_agent_event(AgentEvent::Done {
+            stop_reason: "blocked".into(),
+        });
+        let shown = rows(&painted);
+        let row = shown.iter().position(|text| text.contains("notice 0")).unwrap();
+        let byte = shown[row].find("notice 0").unwrap();
+        let from = shown[row][..byte].chars().count() as u16;
+        let (row, to) = (row as u16, from + 7);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), from),
+            (MouseEventKind::Drag(MouseButton::Left), to),
+            (MouseEventKind::Up(MouseButton::Left), to),
+        ] {
+            app.on_term_event(mouse(kind, column, row)).await.unwrap();
+        }
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("notice 0"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn growing_taller_releases_the_scrollbar_column_with_one_rewrap() {
         let (mut app, dir) = app_fixture();

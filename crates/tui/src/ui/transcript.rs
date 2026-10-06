@@ -40,6 +40,9 @@ pub enum BlockKind {
 
 struct Block {
     kind: BlockKind,
+    /// Push order, never reused, so ids rise along `Transcript::blocks`.
+    /// Names the block for rows painted before a removal shifted its index.
+    id: u64,
     /// Full content when expanded (or the only content when not foldable).
     raw: Vec<Line<'static>>,
     /// Compact body when foldable; shown while `folded`.
@@ -209,6 +212,7 @@ impl Block {
         let search_lower = lower_for_search(&selectable);
         Self {
             kind,
+            id: 0,
             raw_cells: LineCells::measure(&raw),
             compact_cells: LineCells::default(),
             raw,
@@ -276,6 +280,7 @@ impl Block {
         let selectable_chars = selectable.chars().count();
         Self {
             kind: BlockKind::Tool,
+            id: 0,
             raw_cells: LineCells::measure(&full_lines),
             compact_cells: LineCells::measure(&compact),
             raw: full_lines,
@@ -381,17 +386,23 @@ pub struct WrapAnchor {
 /// it changes height, and wrapping does that between any two frames (a
 /// scroll wraps the blocks it crosses), so a pointer event resolved through
 /// the last frame's indices would land rows above the text under the
-/// pointer. This names the painted text until its own block changes. See
+/// pointer. A block index shifts as well, when a rejected prompt is removed
+/// from above the row, so the block is named by its id; the index it had
+/// when painted only saves the search while nothing was removed. This
+/// names the painted text until its own block changes. See
 /// [`Transcript::paint_rows`] and [`Transcript::line_of`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowRef {
     block: usize,
+    id: u64,
     row: usize,
 }
 
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
+    /// Id of the next block pushed.
+    next_id: u64,
     /// First wrapped line of each block; `total` closes the last range. The
     /// per-block caches own the only copy of every wrapped line, so
     /// re-measuring after a fold toggle or width change is index
@@ -454,7 +465,9 @@ impl Transcript {
     /// grows by the rows the block adds below it. With the view's bottom
     /// edge inside the live tail, those rows move the tail under the edge,
     /// so they are counted exactly.
-    fn push_block(&mut self, block: Block) {
+    fn push_block(&mut self, mut block: Block) {
+        block.id = self.next_id;
+        self.next_id += 1;
         let bi = self.blocks.len();
         let wrap_now = self.offset > 0 && self.offset < self.view.1;
         #[cfg(test)]
@@ -911,22 +924,30 @@ impl Transcript {
                     paint_line(buf, row, None, line);
                 }
             }
-            painted.push(line.map(|_| RowRef { block: bi, row: li }));
+            painted.push(line.map(|_| RowRef {
+                block: bi,
+                id: block.id,
+                row: li,
+            }));
             li += 1;
         }
     }
 
     /// The current index of a row a frame painted, or None once its block
     /// is gone or no longer wraps to that row. Pointer events address rows
-    /// this way, so wrapping between the paint and the event cannot move
-    /// what they hit.
+    /// this way, so wrapping or a removal between the paint and the event
+    /// cannot move what they hit.
     pub fn line_of(&mut self, at: RowRef) -> Option<usize> {
-        let block = self.blocks.get(at.block)?;
+        let bi = match self.blocks.get(at.block) {
+            Some(block) if block.id == at.id => at.block,
+            _ => self.blocks.binary_search_by_key(&at.id, |block| block.id).ok()?,
+        };
+        let block = &self.blocks[bi];
         if !block.is_wrapped_at(self.width) || at.row >= block.cache.len() {
             return None;
         }
         self.ensure_index();
-        Some(self.block_starts[at.block] + at.row)
+        Some(self.block_starts[bi] + at.row)
     }
 
     pub fn len(&mut self) -> usize {
@@ -2670,6 +2691,42 @@ mod tests {
                 assert_eq!(found, (start..end).map(Some).collect::<Vec<_>>());
             }
         }
+    }
+
+    /// A prompt rejected by a hook is removed from above the notices the
+    /// hook already put on screen. Rows painted before the removal must
+    /// still name those notices: a row named by the block's index would
+    /// name the block that slid into it, so a selection before the next
+    /// paint would copy a different notice than the one under the pointer.
+    #[test]
+    fn painted_rows_keep_their_text_when_a_block_above_is_removed() {
+        let mut t = Transcript::new();
+        t.set_width(30);
+        t.push_assistant(vec![Line::from("an earlier reply")]);
+        t.push_user(vec![Line::from("a prompt a hook rejects")]);
+        t.push(vec![Line::from("first hook notice")]);
+        t.push(vec![Line::from("second hook notice")]);
+        t.push(vec![Line::from("third hook notice")]);
+        let total = t.lines().len();
+        let area = Rect::new(0, 0, 30, total as u16);
+        let mut rows = Vec::new();
+        t.paint_rows(&mut Buffer::empty(area), area, 0, total, None, &mut rows);
+        let text_of = |t: &mut Transcript, at: Option<RowRef>| {
+            let line = at.and_then(|at| t.line_of(at))?;
+            t.line_at(line).map(|line| lines_to_plain(std::slice::from_ref(line)))
+        };
+        let painted: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
+        let prompt = t.block_starts[1]..t.block_starts[2];
+        assert!(t.pop_last_user());
+        let found: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
+        // The removed prompt's rows name nothing; every other row still
+        // names the text it painted.
+        let expected: Vec<_> = painted
+            .into_iter()
+            .enumerate()
+            .map(|(row, text)| text.filter(|_| !prompt.contains(&row)))
+            .collect();
+        assert_eq!(found, expected);
     }
 
     #[test]
