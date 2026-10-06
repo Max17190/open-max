@@ -284,28 +284,81 @@ pub fn tool_schemas() -> &'static Value {
 fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel = rel.trim();
     let joined = if rel.is_empty() || rel == "." { root.to_path_buf() } else { root.join(rel) };
-    // Canonicalize the deepest existing ancestor so traversal via `..` is caught
-    // even for paths that don't exist yet (e.g. write_file targets).
-    let mut probe = joined.clone();
-    let mut tail = Vec::new();
-    while !probe.exists() {
-        match (probe.file_name(), probe.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name.to_os_string());
-                probe = parent.to_path_buf();
-            }
-            _ => return Err("invalid path".into()),
-        }
-    }
-    let mut canon = probe.canonicalize().map_err(|e| format!("cannot resolve path: {e}"))?;
-    for part in tail.iter().rev() {
-        canon.push(part);
-    }
+    let (canon, names_dir) = canonical_target(joined.clone())?;
     let root_canon = root.canonicalize().map_err(|e| format!("cannot resolve project root: {e}"))?;
     if !canon.starts_with(&root_canon) {
         return Err(format!("path escapes the project root: {rel}"));
     }
+    // The OS refuses `notes.txt/`, or a link whose target is `notes.txt/`,
+    // because the separator demands a directory. The resolved path has lost
+    // that separator (and canonicalization ignores it on some platforms), so
+    // without this a write would reach `notes.txt` itself. The OS's own
+    // lookup decides for an entry that exists; the flag covers one that a
+    // write would create.
+    let os_refuses = std::fs::metadata(&joined).is_err_and(|e| e.kind() == std::io::ErrorKind::NotADirectory);
+    if os_refuses || (names_dir && !canon.is_dir()) {
+        return Err(format!("not a directory: {rel}"));
+    }
     Ok(canon)
+}
+
+/// Where a file operation on `path` lands, for paths that may not exist yet
+/// (write_file targets): the deepest existing ancestor canonicalized, plus the
+/// missing tail, so traversal via `..` is caught.
+///
+/// An ancestor counts as existing when its directory holds the entry, even as
+/// a dangling symlink. `Path::exists` follows links and is false for a
+/// dangling one, so its name used to join the unresolved tail and pass the
+/// root check, and the write then followed it and created the target outside
+/// the project. A dangling link is resolved to its target instead, which is
+/// where anything created through it lands.
+///
+/// A trailing separator or `.` makes lstat follow the final link, so a link
+/// probed as `link/` looked missing and its bare name joined the tail. Each
+/// hop probes the lexically normalized path, which also covers link targets
+/// that end in a separator. Normalizing drops the separator's demand for a
+/// directory, so the returned flag reports whether any hop made it.
+fn canonical_target(mut path: PathBuf) -> Result<(PathBuf, bool), String> {
+    // Bounds a chain or loop of dangling links, as the OS bounds link hops.
+    const MAX_LINK_HOPS: usize = 40;
+    let mut names_dir = false;
+    for _ in 0..MAX_LINK_HOPS {
+        // Every hop's final component is the operation's final entry, so a
+        // separator on any of them binds the entry the path ends at.
+        names_dir |= demands_directory(&path);
+        let mut probe: PathBuf = path.components().collect();
+        let mut tail = Vec::new();
+        while probe.symlink_metadata().is_err() {
+            match (probe.file_name(), probe.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name.to_os_string());
+                    probe = parent.to_path_buf();
+                }
+                _ => return Err("invalid path".into()),
+            }
+        }
+        let mut canon = match probe.canonicalize() {
+            Ok(canon) => canon,
+            Err(_) if probe.is_symlink() => {
+                let target = std::fs::read_link(&probe).map_err(|e| format!("cannot resolve path: {e}"))?;
+                path = probe.parent().map(|dir| dir.join(&target)).unwrap_or(target);
+                path.extend(tail.iter().rev());
+                continue;
+            }
+            Err(e) => return Err(format!("cannot resolve path: {e}")),
+        };
+        canon.extend(tail.iter().rev());
+        return Ok((canon, names_dir));
+    }
+    Err("cannot resolve path: too many levels of symbolic links".into())
+}
+
+/// Whether `path` ends in a separator or a `.` component, either of which
+/// makes the OS require the entry it names to be a directory.
+fn demands_directory(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
+    bytes.last().is_some_and(|&b| std::path::is_separator(char::from(b)))
 }
 
 fn rel_display(root: &Path, path: &Path) -> String {
@@ -738,6 +791,14 @@ fn touches_git(rel: &Path) -> bool {
     rel.components().any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
 }
 
+/// Walks never descend through a link, but they do yield links, and
+/// `is_file` and `read_to_string` follow them: a link in the project to a
+/// file outside it would be listed by glob and read by grep. A link counts as
+/// a project file only when its target is inside the canonical root.
+fn link_stays_in_root(entry: &ignore::DirEntry, root_canon: &Path) -> bool {
+    !entry.path_is_symlink() || entry.path().canonicalize().is_ok_and(|p| p.starts_with(root_canon))
+}
+
 /// Model-issued patterns routinely arrive scoped `./like/this` or
 /// `/like/this`. Matching runs against root-relative paths, so either prefix
 /// makes a pattern that can never match anything; both mean
@@ -773,22 +834,28 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
         Ok(g) => g.compile_matcher(),
         Err(e) => return ToolOutcome::err(format!("invalid glob: {e}")),
     };
+    let root_canon = match root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return ToolOutcome::err(format!("cannot resolve project root: {e}")),
+    };
     let walk_root = glob_walk_root(root, pattern);
     // The walker's filter skips entries named .git during descent, but never
     // the walk root itself, so a pattern scoped at or under .git would start
-    // inside the excluded tree. Canonicalizing catches a symlinked prefix
-    // that aliases .git without naming it (walk roots are followed even
-    // though the walk itself never follows links).
+    // inside the excluded tree. Walk roots are also followed even though the
+    // walk itself never follows links, so a symlinked prefix walks wherever
+    // it points. The canonical prefix is the authority for both: it catches a
+    // prefix that aliases .git without naming it, and one that leaves the
+    // project.
     if walk_root.as_path() != root {
+        // A nonexistent prefix walks nothing; let the normal path answer.
+        let canon = walk_root.canonicalize().ok();
+        if canon.as_ref().is_some_and(|c| !c.starts_with(&root_canon)) {
+            return ToolOutcome::err(format!("path escapes the project root: {pattern}"));
+        }
         let scoped_into_git =
             walk_root.strip_prefix(root).map(touches_git).unwrap_or(true);
-        let aliases_git = match (walk_root.canonicalize(), root.canonicalize()) {
-            (Ok(canon), Ok(root_canon)) => {
-                canon.strip_prefix(&root_canon).map(touches_git).unwrap_or(true)
-            }
-            // A nonexistent prefix walks nothing; let the normal path answer.
-            _ => false,
-        };
+        let aliases_git =
+            canon.as_deref().and_then(|c| c.strip_prefix(&root_canon).ok()).is_some_and(touches_git);
         if scoped_into_git || aliases_git {
             return ToolOutcome::err(".git is excluded from search");
         }
@@ -796,7 +863,7 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
     let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
     for entry in project_walk(&walk_root).flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || !link_stays_in_root(&entry, &root_canon) {
             continue;
         }
         let rel = rel_display(root, path);
@@ -830,14 +897,14 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
     };
+    let root_canon = match root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return ToolOutcome::err(format!("cannot resolve project root: {e}")),
+    };
     // resolve() canonicalized, so a path (or a symlink) that lands inside
     // .git names it here even when the argument never did. The walker's
     // filter cannot help once .git is the walk root.
-    let inside_git = match root.canonicalize() {
-        Ok(root_canon) => search_root.strip_prefix(&root_canon).map(touches_git).unwrap_or(false),
-        Err(_) => false,
-    };
-    if inside_git {
+    if search_root.strip_prefix(&root_canon).map(touches_git).unwrap_or(false) {
         return ToolOutcome::err(".git is excluded from search");
     }
     let file_matcher = match args["glob"].as_str() {
@@ -880,7 +947,7 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
                 }
                 let Ok(entry) = entry else { return WalkState::Continue };
                 let path = entry.path();
-                if !path.is_file() {
+                if !path.is_file() || !link_stays_in_root(&entry, &root_canon) {
                     return WalkState::Continue;
                 }
                 if let Some(m) = &file_matcher {
@@ -1387,6 +1454,159 @@ mod tests {
         assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
         let out = glob_tool(&root, &json!({"pattern": "gitlink/*"}));
         assert!(!out.ok && out.output.contains("excluded from search"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn outside_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openmax-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// A dangling link does not "exist" to `Path::exists`, so its name used to
+    /// pass the root check as a not-yet-created file, and the write then
+    /// followed it and created the target outside the project. A cloned
+    /// repository can ship such a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_cannot_carry_a_write_outside_the_root() {
+        let root = temp_project();
+        let outside = outside_dir();
+        std::os::unix::fs::symlink(outside.join("planted.txt"), root.join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink(outside.join("missing"), root.join("cache")).unwrap();
+        // A link to a dangling link is the same escape one hop later.
+        std::os::unix::fs::symlink("notes.txt", root.join("relay.txt")).unwrap();
+        // A trailing separator or "." on the path, or on a link's target,
+        // makes lstat follow the final link: its name must not pass as a
+        // file that does not exist yet.
+        std::os::unix::fs::symlink("notes.txt/", root.join("trail.txt")).unwrap();
+
+        let paths =
+            ["notes.txt", "cache/planted.txt", "relay.txt", "src/../notes.txt", "notes.txt/", "notes.txt/.", "trail.txt"];
+        for path in paths {
+            let out = write_file(&root, &json!({"path": path, "content": "x\n"}));
+            assert!(!out.ok, "{path}: write through a dangling link succeeded: {}", out.output);
+            assert!(out.output.contains("path escapes the project root"), "{path}: {}", out.output);
+        }
+        let out = edit_file(&root, &json!({"path": "notes.txt", "old_string": "a", "new_string": "b"}));
+        assert!(!out.ok, "{}", out.output);
+        assert!(!outside.join("planted.txt").exists(), "a write landed outside the root");
+        assert!(!outside.join("missing").exists(), "a directory was created outside the root");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// `is_file` and `read_to_string` follow links, so a link inside the
+    /// project to a file outside it used to be read by grep and listed by
+    /// glob. A glob prefix that leaves the project through a link must be
+    /// refused as the escape it is.
+    #[cfg(unix)]
+    #[test]
+    fn search_tools_do_not_follow_symlinks_out_of_the_root() {
+        let root = temp_project();
+        let outside = outside_dir();
+        std::fs::write(outside.join("secret.txt"), "alpha outside the project\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("vendor")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("docs/leak.txt")).unwrap();
+
+        let out = grep_tool(&root, &json!({"pattern": "outside the project"}));
+        assert!(out.ok && out.output == "no matches", "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "outside the project", "path": "docs"}));
+        assert!(out.ok && out.output == "no matches", "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "alpha", "path": "vendor"}));
+        assert!(!out.ok && out.output.contains("path escapes the project root"), "{}", out.output);
+
+        let out = glob_tool(&root, &json!({"pattern": "**/*.txt"}));
+        assert!(!out.output.contains("leak.txt"), "{}", out.output);
+        // The refusal names the escape; it is not a .git exclusion.
+        for pattern in ["vendor/**", "vendor/*.txt"] {
+            let out = glob_tool(&root, &json!({"pattern": pattern}));
+            assert!(!out.output.contains("secret.txt"), "{pattern}: {}", out.output);
+            assert!(!out.ok && out.output.contains("path escapes the project root"), "{pattern}: {}", out.output);
+        }
+
+        let out = list_dir(&root, &json!({"path": "vendor"}));
+        assert!(!out.ok && out.output.contains("path escapes the project root"), "{}", out.output);
+        let out = read_file(&root, &json!({"path": "docs/leak.txt"}));
+        assert!(!out.ok && out.output.contains("path escapes the project root"), "{}", out.output);
+        // A trailing separator or "." must not hide the link's final hop.
+        for path in ["docs/leak.txt/", "docs/leak.txt/."] {
+            let out = read_file(&root, &json!({"path": path}));
+            assert!(!out.ok && out.output.contains("path escapes the project root"), "{path}: {}", out.output);
+            let out = edit_file(&root, &json!({"path": path, "old_string": "alpha", "new_string": "beta"}));
+            assert!(!out.ok && out.output.contains("path escapes the project root"), "{path}: {}", out.output);
+            let out = grep_tool(&root, &json!({"pattern": "alpha", "path": path}));
+            assert!(!out.ok && out.output.contains("path escapes the project root"), "{path}: {}", out.output);
+        }
+        assert_eq!(std::fs::read_to_string(outside.join("secret.txt")).unwrap(), "alpha outside the project\n");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// Confinement judges where a link lands, not that it is a link: links
+    /// that stay in the project work in every file tool, dangling or not.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_that_stay_in_the_root_keep_working() {
+        let root = temp_project();
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("src/a.rs", root.join("a_link.rs")).unwrap();
+        std::os::unix::fs::symlink(root.join("docs/new.md"), root.join("pending.md")).unwrap();
+
+        let out = glob_tool(&root, &json!({"pattern": "alias/**/*.rs"}));
+        assert!(out.ok && out.output.contains("alias/deep/b.rs"), "{}", out.output);
+        let out = glob_tool(&root, &json!({"pattern": "*.rs"}));
+        assert!(out.ok && out.output.contains("a_link.rs"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "alpha_two"}));
+        assert!(out.ok && out.output.contains("a_link.rs:2:"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "alpha_three", "path": "alias"}));
+        assert!(out.ok && out.output.contains("deep/b.rs:1:"), "{}", out.output);
+        let out = list_dir(&root, &json!({"path": "alias"}));
+        assert!(out.ok && out.output.contains("a.rs"), "{}", out.output);
+        let out = read_file(&root, &json!({"path": "a_link.rs"}));
+        assert!(out.ok && out.output.contains("alpha_two"), "{}", out.output);
+
+        let out = write_file(&root, &json!({"path": "pending.md", "content": "landed\n"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("docs/new.md")).unwrap(), "landed\n");
+        let out = write_file(&root, &json!({"path": "alias/fresh.rs", "content": "fn f() {}\n"}));
+        assert!(out.ok, "{}", out.output);
+        assert!(root.join("src/fresh.rs").exists());
+        let out = edit_file(&root, &json!({"path": "a_link.rs", "old_string": "alpha_two", "new_string": "beta"}));
+        assert!(out.ok, "{}", out.output);
+        assert!(std::fs::read_to_string(root.join("src/a.rs")).unwrap().contains("beta"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A trailing separator or `.`, on the path or on a link's target, makes
+    /// the OS require a directory: opening a link to `important.txt/` fails.
+    /// Resolution drops the separator to find the entry, so without keeping
+    /// that requirement a write through such a link overwrote `important.txt`.
+    #[cfg(unix)]
+    #[test]
+    fn a_trailing_separator_still_requires_a_directory() {
+        let root = temp_project();
+        std::fs::write(root.join("important.txt"), "original\n").unwrap();
+        std::os::unix::fs::symlink("important.txt/", root.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("fresh.txt/", root.join("pending.txt")).unwrap();
+
+        for path in ["link.txt", "important.txt/", "important.txt/.", "pending.txt", "fresh.txt/"] {
+            let out = write_file(&root, &json!({"path": path, "content": "overwritten\n"}));
+            assert!(!out.ok && out.output.contains("not a directory"), "{path}: {}", out.output);
+        }
+        for path in ["link.txt", "important.txt/"] {
+            let out = read_file(&root, &json!({"path": path}));
+            assert!(!out.ok && out.output.contains("not a directory"), "{path}: {}", out.output);
+            let out = edit_file(&root, &json!({"path": path, "old_string": "original", "new_string": "edited"}));
+            assert!(!out.ok && out.output.contains("not a directory"), "{path}: {}", out.output);
+        }
+        assert_eq!(std::fs::read_to_string(root.join("important.txt")).unwrap(), "original\n");
+        assert!(!root.join("fresh.txt").exists(), "a file was created where a directory was named");
+        // A directory named with a trailing separator still resolves.
+        let out = list_dir(&root, &json!({"path": "src/"}));
+        assert!(out.ok && out.output.contains("a.rs"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "alpha_three", "path": "src/deep/."}));
+        assert!(out.ok && out.output.contains("b.rs:1:"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
