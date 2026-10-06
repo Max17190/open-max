@@ -689,7 +689,7 @@ async fn main() -> std::io::Result<()> {
     if let Some(path) = &cli.approve {
         // Approval is a human action, exactly like trust; see require_human
         // for the two walls and why the marker alone was not one.
-        require_human("approval", &format!("openmax --approve {path}"));
+        require_human("approval", &approve_command(std::path::Path::new(path)));
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let file = std::path::Path::new(path);
         let bytes = match std::fs::read(file) {
@@ -1599,11 +1599,10 @@ fn ensure_project_trust(
             ));
         }
         // Same second wall as --approve: a human at a terminal, or an
-        // explicit attestation for automation a human runs.
-        require_human(
-            "a trust grant",
-            &format!("openmax --trust-project (in {})", project.display()),
-        );
+        // explicit attestation for automation a human runs. The repair is
+        // printed as one command to paste, so it carries the directory as a
+        // quoted `cd`: a parenthesized note is a shell syntax error.
+        require_human("a trust grant", &open_max_core::doctor::trust_command(project));
         let trusted = open_max_core::trust::trust_project(data_dir, project)?;
         eprintln!("openmax: trusted project {}", trusted.display());
         return Ok(());
@@ -1612,9 +1611,15 @@ fn ensure_project_trust(
         return Ok(());
     }
     if agent_spawned || cli.print || cli.stdio || !std::io::stdin().is_terminal() {
+        // Name a grant that works for every caller here: a frontend's stdin is
+        // its protocol pipe, and telling it to add --trust-project only leads
+        // to require_human's no-terminal refusal. The grant is pasted into a
+        // terminal that is rarely in the project, so it carries the project
+        // (see trust_command).
         return Err(format!(
-            "project {} is not trusted; inspect it, then rerun with --trust-project",
-            project.display()
+            "project {} is not trusted; inspect it, then trust it once from a terminal with `{}`",
+            project.display(),
+            open_max_core::doctor::trust_command(project)
         ));
     }
 

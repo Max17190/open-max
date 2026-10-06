@@ -188,6 +188,15 @@ fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The printed repair is pasted into a shell, so a path with a space must
+    // come back quoted, not split into two arguments.
+    let out = bare(&["--approve", ".openmax/hooks/my gate.toml"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`openmax --approve '.openmax/hooks/my gate.toml'`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = bare(&["--trust-project", "-p", "hi"]);
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
     // The attestation (what cmd() sets) is what lets test automation through.
@@ -196,6 +205,273 @@ fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// What a user's shell, a CI job, or a frontend actually runs: none of the
+/// attestation `cmd` adds for test convenience.
+fn plain_cmd(project: &Path, home: &Path) -> Command {
+    let mut c = cmd(project, home);
+    c.env_remove("OPENMAX_HUMAN_ATTEST");
+    c
+}
+
+/// A pseudo-terminal: the controller end the test keeps, and the terminal end
+/// a child gets as stdin, which is what an interactive shell hands openmax.
+/// The controller must outlive the child.
+fn pseudo_terminal() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    // SAFETY: posix_openpt returns a new descriptor that the File then owns,
+    // and ptsname's static buffer is copied out before any other pty call.
+    let (controller, path) = unsafe {
+        let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+        let controller = std::fs::File::from_raw_fd(fd);
+        assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", std::io::Error::last_os_error());
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "ptsname: {}", std::io::Error::last_os_error());
+        let path = std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr(name).to_bytes());
+        (controller, path.to_owned())
+    };
+    let terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path)
+        .unwrap();
+    (controller, terminal)
+}
+
+/// Every line of a ```sh block that runs `--trust-project`.
+fn documented_trust_commands(markdown: &str) -> Vec<String> {
+    let mut shell_block = None;
+    let mut lines = Vec::new();
+    for line in markdown.lines().map(str::trim) {
+        if let Some(lang) = line.strip_prefix("```") {
+            shell_block = match shell_block {
+                Some(_) => None,
+                None => Some(matches!(lang, "sh" | "bash")),
+            };
+        } else if shell_block == Some(true) && line.contains("--trust-project") {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+/// The words and trailing comment of one documented shell line, split the
+/// way sh splits the forms the docs use: bare words, double-quoted strings,
+/// and a `# comment`.
+fn shell_words(line: &str) -> (Vec<String>, String) {
+    let (mut words, mut word, mut quoted) = (Vec::new(), None::<String>, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                word.get_or_insert_with(String::new);
+            }
+            '#' if !quoted && word.is_none() => return (words, chars.as_str().trim().to_string()),
+            c if c.is_whitespace() && !quoted => words.extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    assert!(!quoted, "unterminated quote in a documented command: {line}");
+    words.extend(word);
+    (words, String::new())
+}
+
+/// Read the stdio handshake, then quit through `input`. The child's stdout
+/// closing first (a refusal) is reported with its exit and stderr, and a
+/// child that stays alive without a handshake is killed at a deadline rather
+/// than hanging the test.
+fn stdio_handshake(
+    mut child: std::process::Child,
+    input: &mut dyn Write,
+) -> Result<std::process::Output, String> {
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut hello = String::new();
+        stdout.read_line(&mut hello).unwrap();
+        let _ = tx.send((hello, stdout));
+    });
+    // The reader comes back with the line and is held until the child exits,
+    // so nothing it writes after the handshake meets a closed pipe.
+    let (hello, _stdout) = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(read) => read,
+        Err(e) => {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            return Err(format!(
+                "no stdio handshake ({e}): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    };
+    if !hello.contains("\"hello\"") {
+        let out = finish_with_deadline(child);
+        return Err(format!(
+            "no stdio handshake (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    input.write_all(b"{\"cmd\":\"quit\"}\n").unwrap();
+    Ok(finish_with_deadline(child))
+}
+
+/// Run one documented trust command exactly as written, in a fresh project,
+/// in the context the docs give it: a line commented `from a terminal` gets a
+/// terminal on stdin, any other line gets the pipe a frontend or a CI job
+/// hands it. No variable is set that the line does not set itself. Success is
+/// the documented result: the run itself works, the project is trusted, and a
+/// frontend's plain `openmax --stdio` then starts with no flag.
+fn run_documented_trust_command(line: &str) -> Result<(), String> {
+    let (words, comment) = shell_words(line);
+    let at = words.iter().position(|w| w == "openmax").ok_or("no openmax invocation")?;
+    let (project, home) = fresh_dirs("documented-trust");
+    let (base_url, _requests, _server) = spawn_stub_server();
+    write_settings(&home, &base_url);
+    let mut command = plain_cmd(&project, &home);
+    for assignment in &words[..at] {
+        let (name, value) = assignment
+            .split_once('=')
+            .ok_or_else(|| format!("unexpected word before openmax: {assignment}"))?;
+        command.env(name, value);
+    }
+    let args = &words[at + 1..];
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut controller = None;
+    if comment.contains("from a terminal") {
+        let (pty, terminal) = pseudo_terminal();
+        controller = Some(pty);
+        command.stdin(terminal);
+    } else {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().unwrap();
+    let out = if args.iter().any(|a| a == "--stdio") {
+        let mut pipe = child.stdin.take();
+        let input: &mut dyn Write = match (&mut controller, &mut pipe) {
+            (Some(pty), _) => pty,
+            (None, Some(pipe)) => pipe,
+            (None, None) => unreachable!("stdin is piped when no terminal is given"),
+        };
+        stdio_handshake(child, input)?
+    } else if args.iter().any(|a| a == "-p") {
+        finish_with_deadline(child)
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("neither -p nor --stdio: teach this test the documented result".into());
+    };
+    drop(controller);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() != Some(0) {
+        return Err(format!("exit {:?}: {}", out.status.code(), stderr.trim()));
+    }
+    if args.iter().any(|a| a == "-p") && !stdout.contains("stub says hi") {
+        return Err(format!("the turn did not reach stdout: {stdout}\n{stderr}"));
+    }
+    if open_max_core::trust::is_trusted(&home.join(".openmax"), &project) != Ok(true) {
+        return Err("the project is not trusted afterwards".into());
+    }
+    let mut frontend = plain_cmd(&project, &home)
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = frontend.stdin.take().unwrap();
+    let out = stdio_handshake(frontend, &mut pipe).map_err(|e| format!("frontend afterwards: {e}"))?;
+    if out.status.code() != Some(0) {
+        return Err(format!("frontend afterwards exited {:?}", out.status.code()));
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    Ok(())
+}
+
+/// Every trust command the README and the guides show runs verbatim and gets
+/// its documented result. A frontend spawns its command with stdin as the
+/// protocol pipe and CI has no terminal at all, so a command that only works
+/// when a human types it must say so, and the ones meant for a frontend or
+/// automation must work without one.
+#[test]
+fn documented_trust_commands_work_as_written() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut docs = vec![root.join("README.md")];
+    docs.extend(
+        std::fs::read_dir(root.join("docs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md")),
+    );
+    let (mut checked, mut failures) = (0, Vec::new());
+    for doc in docs {
+        let text = std::fs::read_to_string(&doc).unwrap();
+        for line in documented_trust_commands(&text) {
+            checked += 1;
+            if let Err(why) = run_documented_trust_command(&line) {
+                failures.push(format!("{}: `{line}`: {why}", doc.display()));
+            }
+        }
+    }
+    assert!(checked > 0, "the docs show no trust command, so this test pins nothing");
+    assert!(
+        failures.is_empty(),
+        "documented trust commands that do not work as written:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A frontend's stdin is its protocol pipe, never a terminal, so it cannot
+/// grant trust, and the refusal it gets on an untrusted project must name a
+/// grant that works for it rather than the flag that cannot. The grant the
+/// no-terminal refusal prints must paste into a shell as written, from a
+/// project whose path a shell would split.
+#[test]
+fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
+    let (base, home) = fresh_dirs("frontend-trust");
+    let project = base.join("my proj");
+    std::fs::create_dir_all(&project).unwrap();
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let spawn = |args: &[&str]| {
+        finish_with_deadline(
+            plain_cmd(&project, &home)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let out = spawn(&["--trust-project", "--stdio"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("no terminal"), "{stderr}");
+    let repair = format!(
+        "`cd {} && openmax --trust-project`",
+        open_max_core::doctor::shell_quote(&std::fs::canonicalize(&project).unwrap())
+    );
+    assert!(stderr.contains(&repair), "the printed grant must paste as written: {stderr}");
+    assert!(out.stdout.is_empty(), "a refused grant must not start a session");
+    assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &project), Ok(false));
+
+    // The frontend's user pastes this into a terminal that is usually not in
+    // the project, and a grant covers its subtree, so the repair must carry
+    // the project rather than trust wherever that terminal happens to be.
+    let out = spawn(&["--stdio"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("not trusted") && stderr.contains("from a terminal"), "{stderr}");
+    assert!(stderr.contains(&repair), "the grant must name the refused project: {stderr}");
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
 
 #[test]

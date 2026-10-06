@@ -30,3 +30,8 @@ lexopt = "0.3"
 unicode-width = "0.2"
 unicode-segmentation = "1.13"
 ignore.workspace = true
+
+[dev-dependencies]
+# The CLI tests give a child a pseudo-terminal on stdin, which is how an
+# interactive shell runs openmax.
+libc.workspace = true
