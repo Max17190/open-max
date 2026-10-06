@@ -799,12 +799,13 @@ Supersede, do not duplicate: update the existing file when a fact changes
 (date-stamp facts that can go stale). Near-duplicate files split the access
 history that keeps a fact alive.
 
-Activation: a memory write moves the extension fingerprint, so the harness
-re-freezes after the writing call and the fact is indexed in your prompt from
-your next step (the refreeze receipt says "Memory index indexed: <name>");
-the index also rebuilds at session creation, /reload, and any other re-freeze.
-Verify what you wrote with `openmax --check` (it names every ignored file and
-why, and what the index will show).
+Activation: a memory write does not re-freeze. The index is frozen with the
+prompt, and rewriting the prompt would discard the provider's prompt cache to
+show you a fact your own write already put in context. The index rebuilds at
+session creation, /reload, and any re-freeze a tool or skill change causes
+(that receipt then says "Memory index rebuilt with this refreeze (indexed:
+<name>)"). Verify what you wrote with `openmax --check` (it names every
+ignored file and why, and what the index will show).
 
 ## Searching what was kept
 

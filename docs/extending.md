@@ -61,6 +61,9 @@ only on demand. At session creation the live memories are ranked by ACT-R
 base-level activation (each past access at age `t` hours contributes
 `t^-0.5`; activation is the log of the sum, so one recall revives an old
 memory) and injected as one index line each under a 1500-byte budget. The
+index is frozen with the prompt: writing a memory mid-session does not
+re-freeze, so the prompt cache survives the write, and the new line appears at
+the next session, `/reload`, or a re-freeze a tool or skill change causes. The
 harness logs accesses through `read_file`, `write_file`, and `edit_file` to
 `.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
 over 21 days old leaves the index but stays searchable on disk. The harness

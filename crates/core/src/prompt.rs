@@ -704,7 +704,7 @@ mod tests {
     /// the executed mutating call that wrote them and at turn start, hooks
     /// from the next turn, templates on next use, permission rules at turn
     /// start (one-directional within a turn), providers on the next turn's
-    /// re-read, and a memory write through the extension fingerprint. It
+    /// re-read, and memory at the next re-freeze, never on its own write. It
     /// lives in the surface specs the pointer sends the model to. The
     /// pointer promises those specs carry it, so both halves are pinned
     /// here for every authoring surface the pointer names: the prefix stays
@@ -724,7 +724,7 @@ mod tests {
         states("prompts", "Activation: next invocation");
         states("permissions", "rules are re-read at turn start");
         states("providers", "providers.json is re-read every turn");
-        states("memory", "a memory write moves the extension fingerprint");
+        states("memory", "a memory write does not re-freeze");
     }
 
     #[test]
