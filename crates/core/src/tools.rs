@@ -375,6 +375,12 @@ fn arg<T: std::str::FromStr>(args: &Value, key: &str, native: fn(&Value) -> Opti
     native(value).or_else(|| value.as_str()?.trim().to_ascii_lowercase().parse().ok())
 }
 
+/// The file a read, write or edit names. A blank path names none: resolved,
+/// it reached the project root, and the error that followed named nothing.
+fn file_path_arg(args: &Value) -> Option<&str> {
+    args["path"].as_str().filter(|p| !p.trim().is_empty())
+}
+
 pub async fn execute(
     name: &str,
     args: &Value,
@@ -468,7 +474,7 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
 }
 
 fn read_file(root: &Path, args: &Value) -> ToolOutcome {
-    let Some(rel) = args["path"].as_str() else {
+    let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
     let path = match resolve(root, rel) {
@@ -496,9 +502,13 @@ fn read_file(root: &Path, args: &Value) -> ToolOutcome {
         }
         // The cap keeps a whole-file read of a huge file out of memory. A
         // window of one streams instead: this refusal tells the model to
-        // ask for one, and refusing that too leaves it nothing to retry.
+        // ask for one, and refusing that too leaves it nothing to retry. It
+        // names nothing else, because grep skips a file this large.
         Ok(m) if m.len() > MAX_FILE_BYTES && !asked_for_window => {
-            return ToolOutcome::err(format!("file too large ({} bytes); use grep or read with offset/limit", m.len()))
+            return ToolOutcome::err(format!(
+                "file too large ({} bytes); read a range of lines with offset and limit",
+                m.len()
+            ))
         }
         Ok(m) if m.len() > MAX_FILE_BYTES => match stream_window(&path, &mut window) {
             Ok(total) => total,
@@ -707,7 +717,7 @@ fn diff_strings(rel: &str, old: &str, new: &str) -> (DiffInfo, bool) {
 }
 
 fn write_file(root: &Path, args: &Value) -> ToolOutcome {
-    let Some(rel) = args["path"].as_str() else {
+    let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
     let Some(content) = args["content"].as_str() else {
@@ -835,7 +845,7 @@ fn to_crlf(text: &str) -> String {
 }
 
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
-    let Some(rel) = args["path"].as_str() else {
+    let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
     let (Some(old_string), Some(new_string)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
@@ -911,7 +921,8 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     changed_file("edited", root, &path, &old, &new)
 }
 
-/// The walk glob and grep share, from `walk_root`.
+/// The walk glob and grep share, from `walk_root` in the project whose
+/// canonical root is `root_canon`.
 ///
 /// Hidden files are searchable: the agent's own extension surface lives in
 /// dot-directories (`.openmax/tools`, `.agents`, `.github`), and a walker
@@ -920,21 +931,52 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
 ///
 /// The walker reads .gitignore only inside a repository by default, which in
 /// a project without one sent glob and grep through the node_modules and
-/// build output it ignores. Outside a repository the rules apply regardless.
-/// Inside one the default stays, because only the default stops reading them
-/// at the repository's root: without it a .gitignore above the root, such as
-/// a home directory kept in git that ignores `*`, would hide the project.
-fn project_walker(walk_root: &Path) -> ignore::WalkBuilder {
+/// build output it ignores. Inside a repository the default stays: it reads
+/// them up to the repository's root and no further, so a .gitignore above
+/// it, such as a home directory kept in git that ignores `*`, cannot hide
+/// the project. Outside one nothing marks where to stop: told to read them
+/// anyway, the walker reads every .gitignore up to the filesystem root,
+/// ones git never applies there. So outside a repository it reads no ignore
+/// file above the walk root, and the filter applies the ones that count:
+/// the project's .gitignore files from its root down, and .ignore files
+/// from every ancestor, as the walker always has.
+fn project_walker(root_canon: &Path, walk_root: &Path) -> ignore::WalkBuilder {
     // The markers and the canonical ancestors the walker itself checks.
     let canon = walk_root.canonicalize().unwrap_or_else(|_| walk_root.to_path_buf());
     let in_repository = canon.ancestors().any(|dir| dir.join(".git").exists() || dir.join(".jj").exists());
+    // Nearest first, and .ignore ahead of .gitignore, as the walker ranks them.
+    let mut above: Vec<ignore::gitignore::Gitignore> = Vec::new();
+    if !in_repository {
+        let ancestors = || canon.ancestors().skip(1);
+        let ignores = ancestors().map(|dir| dir.join(".ignore"));
+        let gitignores = ancestors().take_while(|dir| dir.starts_with(root_canon)).map(|dir| dir.join(".gitignore"));
+        above = ignores
+            .chain(gitignores)
+            .map(|file| ignore::gitignore::Gitignore::new(file).0)
+            .filter(|rules| !rules.is_empty())
+            .collect();
+    }
+    let walk_from = walk_root.to_path_buf();
     let mut walker = ignore::WalkBuilder::new(walk_root);
     walker
         .hidden(false)
-        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
+        .filter_entry(move |e| {
+            if e.file_name() == std::ffi::OsStr::new(".git") {
+                return false;
+            }
+            if above.is_empty() {
+                return true;
+            }
+            // The rules are rooted at canonical directories, as the walker's own are.
+            let path = canon.join(e.path().strip_prefix(&walk_from).unwrap_or(e.path()));
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            let verdict = above.iter().map(|rules| rules.matched(&path, is_dir)).find(|m| !m.is_none());
+            !verdict.is_some_and(|m| m.is_ignore())
+        })
         .git_ignore(true)
         .git_global(true)
         .require_git(in_repository)
+        .parents(in_repository)
         .max_depth(Some(24));
     walker
 }
@@ -1040,7 +1082,7 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
         }
     }
     let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for entry in project_walker(&walk_root).build().flatten() {
+    for entry in project_walker(&root_canon, &walk_root).build().flatten() {
         let path = entry.path();
         if !path.is_file() || !link_stays_in_root(&entry, &root_canon) {
             continue;
@@ -1113,7 +1155,7 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
     let not_text = AtomicUsize::new(0);
     let unreadable = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(12);
-    project_walker(&search_root)
+    project_walker(&root_canon, &search_root)
         .threads(threads)
         .build_parallel()
         .run(|| {
@@ -1758,6 +1800,17 @@ mod tests {
         let out = grep_tool(&root, &json!({"pattern": "alpha_vendored"}));
         assert_eq!(out.output, "src/app.js:1: alpha_vendored\n", "ignored directories are not searched");
 
+        // A walk that starts below the root still applies the root's rules,
+        // and a path named outright is searched even though they ignore it.
+        std::fs::create_dir_all(root.join("src/build")).unwrap();
+        std::fs::write(root.join("src/build/gen.js"), "alpha_vendored\n").unwrap();
+        let out = glob_tool(&root, &json!({"pattern": "src/**/*.js"}));
+        assert_eq!(out.output, "src/app.js", "a scoped glob applies the root's .gitignore");
+        let out = grep_tool(&root, &json!({"pattern": "alpha_vendored", "path": "src"}));
+        assert_eq!(out.output, "src/app.js:1: alpha_vendored\n", "a scoped grep applies the root's .gitignore");
+        let out = grep_tool(&root, &json!({"pattern": "alpha_vendored", "path": "build"}));
+        assert_eq!(out.output, "build/out.js:1: alpha_vendored\n", "a named path is searched");
+
         // Inside a repository the rules stop at its root as before: a
         // .gitignore above it, such as a home directory's "*", must not hide
         // the project.
@@ -1773,6 +1826,33 @@ mod tests {
         let out = grep_tool(&project, &json!({"pattern": "alpha"}));
         assert_eq!(out.output, "src/lib.rs:1: fn alpha() {}\n");
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outer);
+    }
+
+    /// Outside a repository nothing marks where git's rules stop, so a walker
+    /// told to read .gitignore there read every one up to the filesystem
+    /// root. git applies none of them, and one that ignores `*` (a home
+    /// directory whose dotfiles are tracked from elsewhere) hid the whole
+    /// project: glob and grep answered as if it were empty.
+    #[test]
+    fn a_gitignore_above_a_project_without_git_cannot_hide_it() {
+        let outer = outside_dir();
+        std::fs::write(outer.join(".gitignore"), "*\n").unwrap();
+        // A .ignore file applies from any ancestor, as it always has.
+        std::fs::write(outer.join(".ignore"), "*.secret\n").unwrap();
+        let project = outer.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/lib.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(project.join("src/key.secret"), "alpha\n").unwrap();
+
+        for pattern in ["**/*", "src/*"] {
+            let out = glob_tool(&project, &json!({"pattern": pattern}));
+            assert_eq!(out.output, "src/lib.rs", "glob {pattern}");
+        }
+        for path in [".", "src"] {
+            let out = grep_tool(&project, &json!({"pattern": "alpha", "path": path}));
+            assert_eq!(out.output, "src/lib.rs:1: fn alpha() {}\n", "grep in {path}");
+        }
         let _ = std::fs::remove_dir_all(outer);
     }
 
@@ -2588,9 +2668,13 @@ mod tests {
         assert_eq!(out.output, format!("{total:>5} row {total} of a large log\n"));
         let out = read_file(&root, &json!({"path": "big.log", "offset": total + 1}));
         assert!(!out.ok && out.output.contains(&format!("past the end of big.log ({total} lines)")), "{}", out.output);
-        // A whole-file read is still refused, with advice that now works.
+        // A whole-file read is still refused, and the refusal names only the
+        // window above: grep skips a file this large, so pointing the model
+        // at it cost a turn on a search that never looked inside.
+        let len = std::fs::metadata(root.join("big.log")).unwrap().len();
         let out = read_file(&root, &json!({"path": "big.log"}));
-        assert!(!out.ok && out.output.contains("file too large"), "{}", out.output);
+        let advice = format!("file too large ({len} bytes); read a range of lines with offset and limit");
+        assert_eq!((out.ok, out.output.as_str()), (false, advice.as_str()));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2638,6 +2722,16 @@ mod tests {
         assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
         let out = edit_file(&root, &json!({"old_string": "a", "new_string": "b"}));
         assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
+        // A blank path names no file either; resolved, it reached the
+        // project root and produced an error about a nameless directory.
+        for blank in ["", "  "] {
+            let out = read_file(&root, &json!({"path": blank}));
+            assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"), "{blank:?}");
+            let out = write_file(&root, &json!({"path": blank, "content": "x\n"}));
+            assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"), "{blank:?}");
+            let out = edit_file(&root, &json!({"path": blank, "old_string": "a", "new_string": "b"}));
+            assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"), "{blank:?}");
+        }
 
         // A file that is not UTF-8 keeps its own message.
         std::fs::write(root.join("latin1.txt"), b"caf\xe9\n").unwrap();
