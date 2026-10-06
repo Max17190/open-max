@@ -71,12 +71,18 @@ lossless record. The `compaction` hook observes each prune.
 
 ## Approvals
 
-Select the mode with `/approvals auto|ask|readonly`, **Shift+Tab**, or the
-approval card's **Auto for project** choice. Every selector saves the same
-choice in `~/.openmax/trust.json` for this exact canonical project path.
-It survives new sessions and restarts, including headless and stdio runs.
-Other projects keep their own choice or the `settings.json` default, which
-is `ask`. Symlink aliases share the choice. A subdirectory of the project,
+Each trusted project's mode is saved in `~/.openmax/trust.json` for its exact
+canonical path, and the trust grant records it in the same write: `auto`,
+unless you answer `a` (`ask`) or `r` (`readonly`) at the interactive trust
+prompt. `--trust-project` records `auto`. A project that is already trusted
+keeps its mode when trust is granted again. Change the mode with
+`/approvals auto|ask|readonly`, **Shift+Tab**, or the approval card's **Auto
+for project** choice; every selector saves the same choice. It survives new
+sessions and restarts, including headless and stdio runs, and does not change
+other projects. The `settings.json` `approval_mode` (default `ask`) applies
+only where neither the project nor an enclosing one has a saved mode, such as
+a project trusted by an earlier version; select a mode there once to save
+one. Symlink aliases share the choice. A subdirectory of the project,
 including a worktree placed under it (such as `.worktrees/`) where a
 delegated `openmax -p` child starts, follows the nearest enclosing project's
 choice unless it has a saved choice of its own. Inheritance follows the path,
@@ -100,11 +106,12 @@ If the mode changes during pre-tool checks, those calls are refused without
 replaying hooks. The agent can request them again under the new mode.
 Returning to `ask` restores content requirements for anything created in `auto`.
 
-Only a human-controlled frontend can select a saved mode. Agent-spawned
-processes can use an existing choice but cannot change it through the mode
-command. Trust and settings are read at process launch; editing either file
-from a tool does not change that process's chosen mode. These controls govern
-dispatch and are not OS isolation.
+Only a human can select a saved mode: at the trust grant, or with the
+selectors above in a human-controlled frontend. Agent-spawned processes can
+use an existing choice but can neither grant trust nor change the choice
+through the mode command. Trust and settings are read at process launch;
+editing either file from a tool does not change that process's chosen mode.
+These controls govern dispatch and are not OS isolation.
 
 ## Multiple providers
 
@@ -175,16 +182,18 @@ session, and the harness strips it from every process it spawns:
 OPENMAX_HUMAN_ATTEST=1 openmax --trust-project -p "summarize this repo"
 ```
 
-Trust is persisted for the exact canonical path in `~/.openmax/trust.json`. It
+Trust is persisted for the exact canonical path in `~/.openmax/trust.json`,
+together with the project's approval mode (see [approvals](#approvals)). It
 authorizes the harness to run in that project; it does not sandbox project
 code.
 
 ## Hardened profile
 
-Use `/approvals ask` when you want confirmation. In `auto`, bash and valid
-extensions run with your account's host authority without a prompt. A
-permission `ask` rule does not override that choice. Use `deny` to prohibit a
-tool or command pattern, or switch to `readonly` to disable mutating calls.
+Answer `a` at the trust prompt, or use `/approvals ask`, when you want
+confirmation. In `auto`, bash and valid extensions run with your account's
+host authority without a prompt. A permission `ask` rule does not override
+that choice. Use `deny` to prohibit a tool or command pattern, or switch to
+`readonly` to disable mutating calls.
 
 External tools receive a scrubbed baseline environment plus the variable names
 listed in their manifests. In `ask`, content approval covers the manifest and

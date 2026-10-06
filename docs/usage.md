@@ -5,8 +5,10 @@ cd ~/code/my-app
 openmax
 ```
 
-On the first interactive run, inspect the project and accept the trust prompt.
-See [configuration](configuration.md#project-trust) for headless and stdio
+On the first interactive run, inspect the project and answer the trust
+prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
+Change the mode later with `/approvals` or **Shift+Tab**. See
+[configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
 ## Command line
@@ -36,9 +38,10 @@ permission rules, `pre_tool_use` hooks, and `approval_mode` exactly as a turn
 does. See [extending](extending.md#proof-of-life).
 
 In print mode, text goes to stdout and tool progress to stderr. With `--json`,
-each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
-`approval_mode`; select `/approvals auto` once in the trusted project for
-unattended runs.
+each `AgentEvent` is one JSON line on stdout. Mutating tools honor the
+project's approval mode, and a print run declines every approval request, so
+unattended runs need `auto`: the mode a trust grant records unless you pick
+another. For a project in `ask`, select `/approvals auto` once.
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in

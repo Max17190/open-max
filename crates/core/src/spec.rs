@@ -703,12 +703,16 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `api_key`: literal, or `$ENV_VAR` indirection; `OPENMAX_API_KEY` also works.
 - `model`: model id sent with every request.
 - `approval_mode`: `auto` | `ask` | `readonly`; default ask. Used only when
-  neither this project nor an enclosing one has a saved choice. /approvals,
-  Shift+Tab, and the card's Auto for project choice persist in trust.json
-  under the canonical root, not in settings.json. They do not change other
-  projects. Auto includes extension execution without content approvals;
-  deny rules and validation still apply. Agent-spawned clients cannot change
-  the saved mode.
+  neither this project nor an enclosing one has a saved choice, such as a
+  project trusted by an earlier version. The trust grant saves the choice:
+  auto, unless the human picks ask or readonly at the trust prompt
+  (`--trust-project` saves auto; an already trusted project keeps its mode).
+  /approvals, Shift+Tab, and the card's Auto for project choice change it.
+  All of these persist in trust.json under the canonical root, not in
+  settings.json, and do not change other projects. Auto includes extension
+  execution without content approvals; deny rules and validation still
+  apply. Agent-spawned clients can neither grant trust nor change the saved
+  mode.
 - `context_tokens`: the model's context window in tokens. REQUIRED here or
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or

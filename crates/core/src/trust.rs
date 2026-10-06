@@ -86,16 +86,52 @@ pub fn is_trusted(data_dir: &Path, project_root: &Path) -> Result<bool, String> 
         .any(|p| canonical == *p || canonical.starts_with(p)))
 }
 
-/// Persist trust for the exact canonical project root.
+/// Persist trust for the exact canonical project root and record no mode, so
+/// it runs under an enclosing root's saved choice or the settings value: the
+/// state of a project trusted before trust grants recorded a mode. A human
+/// trust grant goes through [`grant_trust`].
 pub fn trust_project(data_dir: &Path, project_root: &Path) -> Result<PathBuf, String> {
+    Ok(grant(data_dir, project_root, None)?.0)
+}
+
+/// The human trust grant (the interactive prompt and `--trust-project`):
+/// persist trust for the exact canonical project root and, in the same
+/// write, save `mode` as its approval mode. A settings default cannot carry
+/// that choice, because every settings save writes the whole file and so
+/// most settings files already say `ask` without the user choosing it.
+///
+/// Only a root that gains trust here gets a mode. One already covered by
+/// trust keeps what governs it now (its own or an enclosing saved choice,
+/// else the settings value): granting again must not overwrite a choice the
+/// user made since, and a project trusted before grants recorded a mode keeps
+/// its behavior. Returns the canonical root and the mode recorded, if any.
+pub fn grant_trust(
+    data_dir: &Path,
+    project_root: &Path,
+    mode: ApprovalMode,
+) -> Result<(PathBuf, Option<ApprovalMode>), String> {
+    grant(data_dir, project_root, Some(mode))
+}
+
+fn grant(
+    data_dir: &Path,
+    project_root: &Path,
+    mode: Option<ApprovalMode>,
+) -> Result<(PathBuf, Option<ApprovalMode>), String> {
     let canonical = canonical_project(project_root)?;
+    let mut recorded = None;
     update(data_dir, |file| {
+        let covered = file.projects.iter().any(|root| canonical.starts_with(root));
+        if let Some(mode) = mode.filter(|_| !covered) {
+            file.approval_modes.insert(canonical.clone(), mode);
+            recorded = Some(mode);
+        }
         file.projects.push(canonical.clone());
         file.projects.sort();
         file.projects.dedup();
         Ok(())
     })?;
-    Ok(canonical)
+    Ok((canonical, recorded))
 }
 
 /// Snapshot project choices at launch. They are never adopted from disk
@@ -276,6 +312,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(untrusted);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(sibling);
+    }
+
+    /// A grant records its mode only for a root it newly trusts. Granting a
+    /// root again, or a subdirectory of a trusted one, leaves the mode that
+    /// governs it as it was: a choice saved since the first grant survives,
+    /// and a project trusted before grants recorded a mode keeps resolving
+    /// to the settings value.
+    #[test]
+    fn a_grant_records_its_mode_only_for_a_root_it_newly_trusts() {
+        let data = temp_dir("grant-data");
+        let fresh = temp_dir("grant-fresh");
+        let earlier = temp_dir("grant-earlier");
+        let sub = fresh.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let (root, recorded) = grant_trust(&data, &fresh, ApprovalMode::Auto).unwrap();
+        assert_eq!((root, recorded), (std::fs::canonicalize(&fresh).unwrap(), Some(ApprovalMode::Auto)));
+        assert_eq!(approval_mode(&data, &fresh, ApprovalMode::Ask).unwrap(), ApprovalMode::Auto);
+
+        set_approval_mode(&data, &fresh, ApprovalMode::Readonly).unwrap();
+        assert_eq!(grant_trust(&data, &fresh, ApprovalMode::Auto).unwrap().1, None, "granting again records nothing");
+        assert_eq!(approval_mode(&data, &fresh, ApprovalMode::Ask).unwrap(), ApprovalMode::Readonly, "a choice saved since survives");
+        assert_eq!(grant_trust(&data, &sub, ApprovalMode::Ask).unwrap().1, None, "a covered subdirectory records nothing");
+        assert!(is_trusted(&data, &sub).unwrap());
+        assert_eq!(approval_mode(&data, &sub, ApprovalMode::Ask).unwrap(), ApprovalMode::Readonly, "it keeps its project's choice");
+
+        trust_project(&data, &earlier).unwrap();
+        assert_eq!(grant_trust(&data, &earlier, ApprovalMode::Auto).unwrap().1, None);
+        assert_eq!(approval_mode(&data, &earlier, ApprovalMode::Ask).unwrap(), ApprovalMode::Ask, "an earlier trust keeps the settings value");
+
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(fresh);
+        let _ = std::fs::remove_dir_all(earlier);
     }
 
     #[test]

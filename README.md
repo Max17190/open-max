@@ -24,7 +24,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **Small by default.** Seven built-in tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`) and a short system prompt. Old tool output is dropped before your task is, and dropped context is summarized by your own model into a compact note (heuristic digest as fallback) whose address points at the lossless archive of everything dropped — compaction is a bounded view over a record you can always read back.
 - **Your model, your server.** One `base_url`, or several named endpoints in `providers.json` switched with `/model`. Works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud gateways (OpenRouter and similar), and private proxies.
 - **Trust before execution.** An exact canonical project root must be trusted before any agent turn or project behavior starts. Interactive use asks once; headless and stdio runs fail closed until a human grants trust with `--trust-project`.
-- **Approvals by default.** `write_file`, `edit_file`, and `bash` wait for approval in `ask` mode. Use `auto` for unattended runs or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
+- **Newly trusted projects run in auto.** Trusting a project records its approval mode, `auto` unless you pick another: tools and extensions run without per-call approval while deny rules, hooks, and execution reports stay active. Pick `ask` to have `write_file`, `edit_file`, and `bash` wait for approval, or `readonly` to block mutating tools. Approvals and permissions decide whether Open Max dispatches a tool call; they are not OS isolation.
 - **File based extensions.** Drop TOML tools, `SKILL.md` skills, prompt templates, and process hooks under project or home config. No fork required. The agent writes them itself and the harness re-freezes as soon as a mutating call lands, so a tool the agent writes is a tool the agent uses on its very next step.
 - **File based memory.** One durable fact per file in `.openmax/memory/`, written by the agent, surfaced as an index line in future sessions, ranked by recency and frequency of observed use. Old entries fade from the index and remain searchable on disk until the user or agent deletes them. No database, no daemon, no embeddings; zero prompt cost when empty.
 - **Recall over everything kept.** `openmax --recall "<query>"` searches this project's past sessions, compaction archives, digests, and memories in one bounded streaming pass — BM25 relevance fused with the same recency law, ranked excerpts, each citing the file with the full record. No index to build or maintain: the stores on disk stay the single source of truth.
@@ -128,10 +128,13 @@ Edit `~/.openmax/settings.json`:
 
 `base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. Set `context_tokens` to the context window the server actually serves for that model; nothing is queried, and a guessed window is wrong in one direction or the other. There is no default endpoint, model, or window: until all three are configured (here or through a named provider), Open Max refuses to start a turn with an error that says exactly what to set.
 
-`/approvals auto` saves the execution choice for the current trusted project.
-Shift+Tab and the approval card's Auto for project choice save the same setting.
-Auto covers extension creation and repair without further confirmation;
-validation, deny rules, and execution reports remain active. See
+Trusting a project records its approval mode: `auto` unless you pick `ask` or
+`readonly` at the trust prompt. Auto covers extension creation and repair
+without further confirmation; validation, deny rules, and execution reports
+remain active. `/approvals auto|ask|readonly`, Shift+Tab, and the approval
+card's Auto for project choice change the saved mode for the current trusted
+project. `approval_mode` in settings.json applies only to a project with no
+saved mode, such as one trusted by an earlier version. See
 [approval modes](docs/configuration.md#approvals).
 
 A settings file that exists but does not parse, uses an unknown key, or sets an unrecognized `approval_mode` is a startup error (fail closed): Open Max exits with the parse reason instead of silently reverting your endpoint and approval policy to defaults.
@@ -145,7 +148,7 @@ cd ~/code/my-app
 openmax
 ```
 
-On the first interactive run, inspect the project and accept the trust prompt. Headless and stdio runs never prompt: grant trust once from a terminal with `--trust-project`, and later runs, including a frontend's `openmax --stdio`, need no flag:
+On the first interactive run, inspect the project and answer the trust prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`. Headless and stdio runs never prompt: grant trust once from a terminal with `--trust-project`, which records `auto`, and later runs, including a frontend's `openmax --stdio`, need no flag:
 
 ```sh
 openmax --continue                                 # resume latest session here
