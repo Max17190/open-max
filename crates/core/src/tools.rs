@@ -1173,6 +1173,7 @@ async fn bash_tool(
         },
         sandbox: None,
         env_allowlist: None,
+        self_link: true,
     };
     match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
@@ -1874,6 +1875,45 @@ mod tests {
             assert!(kept.len() + line >= (cap - "\n[stderr]\n".len()) / 2, "{text}");
         }
         assert!(body.replace('…', "").len() <= cap, "{text}");
+    }
+
+    /// The prompt, receipts, and --check rows tell the agent to run a bare
+    /// `openmax` through bash, and bash inherits PATH: an older install
+    /// earlier on it would answer with claims this build has retracted,
+    /// under the same version string. A bare `openmax` must resolve to a
+    /// link to the running executable, from the first PATH entry, so no
+    /// inherited install can come before it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bare_openmax_in_bash_runs_the_running_binary() {
+        // Read from inside the shell instead of moving this process's PATH:
+        // tests run in parallel and share one environment.
+        let root = temp_project();
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "command -v openmax && printf '%s\\n' \"${PATH%%:*}\""}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(out.ok, "{}", out.output);
+        let mut lines = out.output.lines().map(|line| PathBuf::from(line.trim()));
+        let found = lines.next().unwrap_or_default();
+        let first = lines.next().unwrap_or_default();
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        assert_eq!(
+            std::fs::read_link(&found).ok(),
+            Some(exe),
+            "`openmax` in bash resolved to {}, not a link to the running executable",
+            found.display()
+        );
+        assert_eq!(
+            found.parent(),
+            Some(first.as_path()),
+            "the link's directory must be first on PATH, ahead of any inherited install"
+        );
     }
 
     /// A command that succeeds reports its size just as a failing one does.
