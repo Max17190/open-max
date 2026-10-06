@@ -245,8 +245,9 @@ async fn run_turn_events(
             AgentEvent::Refrozen { tools, skills, changes } => {
                 if !json {
                     // `changes` names the capability files that changed; a
-                    // refreeze can name none (a skill body edit), and the
-                    // line must not end in a colon with nothing after it.
+                    // refreeze can name none (a manifest that turned
+                    // unreadable), and the line must not end in a colon with
+                    // nothing after it.
                     let what = match changes.is_empty() {
                         true => String::new(),
                         false => format!(": {}", changes.join(", ")),

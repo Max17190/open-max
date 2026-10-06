@@ -37,16 +37,6 @@ pub enum Actor {
     External,
 }
 
-impl Actor {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Actor::Initial => "initial",
-            Actor::Session => "session",
-            Actor::External => "external",
-        }
-    }
-}
-
 /// What a record asserts. Omitted from the wire for `Change` and defaulted on
 /// read, so every line an older harness wrote keeps its exact bytes and its
 /// place in the chain.
@@ -2220,8 +2210,7 @@ mod tests {
         let manifest = root.join("gate.toml");
         let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
         std::fs::write(&manifest, body).unwrap();
-        // gate.sh's bytes are b"script", so its sha is the second vouched hash
-        // and its object is stored - the approval records only restorable bytes.
+        // gate.sh's bytes are b"script", so its sha is the second vouched hash.
         std::fs::write(root.join("gate.sh"), "script").unwrap();
         let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
         approve_capability(&data, &root, &manifest, &shas).unwrap();

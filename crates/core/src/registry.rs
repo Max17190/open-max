@@ -103,13 +103,14 @@ pub struct Registry {
     /// reason. Receipts and the unknown-tool error name these so a broken
     /// write is never mistaken for a live capability.
     pub broken: Vec<(PathBuf, String)>,
-    /// Every capability file path THIS freeze's capture actually read (tool
-    /// manifests and SKILL.mds). The refreeze receipt asks whether a path
-    /// still existed in this generation without a second disk probe, which
-    /// would race the capture it claims to describe. Empty for a
-    /// manifest-restored registry, which only ever sits on the outgoing side
-    /// of that comparison.
-    pub(crate) read_paths: std::collections::HashSet<PathBuf>,
+    /// Every capability file THIS freeze's capture actually read (tool
+    /// manifests and SKILL.mds), with a hash of the bytes it read. The
+    /// refreeze receipt compares two generations file by file from these
+    /// without a second disk probe, which would race the capture it claims
+    /// to describe. None for a registry no capture built (manifest-restored
+    /// or built-ins only), which only ever sits on the outgoing side of that
+    /// comparison. In memory only, never persisted.
+    pub(crate) read_paths: Option<HashMap<PathBuf, u64>>,
     /// Broken TOOL manifests with the name each occupies: the declared name,
     /// or the file stem when the document is too broken to yield one - the
     /// same derivation the withhold pass uses. Lets the unknown-tool error
@@ -166,10 +167,10 @@ pub(crate) struct ExtensionSnapshot {
     tools_omitted: usize,
     /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
     skills_omitted: usize,
-    /// Every capability file path this generation read. Paths only: the
-    /// bytes were parsed and fingerprinted where they were read, and nothing
-    /// downstream needs a copy or a second hash of them.
-    read_paths: Vec<PathBuf>,
+    /// Every capability file this generation read, with a hash of its bytes
+    /// taken where they were read: the receipt names a changed file from
+    /// this, so nothing downstream needs a copy of the bytes.
+    read_paths: Vec<(PathBuf, u64)>,
     /// Files read but not loaded, with the reason. The bytes are already in
     /// the fingerprint (a broken write still triggers a refreeze); keeping
     /// the reason lets that refreeze's receipt say the tool is NOT live.
@@ -205,7 +206,15 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    let mut read_paths: Vec<PathBuf> = Vec::new();
+    let mut read_paths: Vec<(PathBuf, u64)> = Vec::new();
+    // One file's content identity, for the refreeze receipt. The fingerprint
+    // still hashes the bytes itself, so the value persisted sessions recorded
+    // does not move.
+    let identity = |bytes: &[u8]| {
+        let mut file = DefaultHasher::new();
+        bytes.hash(&mut file);
+        file.finish()
+    };
     // (path, reason, dir precedence index, declared name if recoverable):
     // tools are keyed by DECLARED name, not file stem, so a collision between
     // a broken file and a loaded definition must be judged on the name the
@@ -245,7 +254,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             };
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
-            read_paths.push(path.clone());
+            read_paths.push((path.clone(), identity(&bytes)));
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 broken_at.push((path, "not valid UTF-8".into(), dir_index, None));
                 continue;
@@ -324,7 +333,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let bytes = std::fs::read(&path).ok();
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
-            read_paths.push(path.clone());
+            read_paths.push((path.clone(), identity(&bytes)));
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 broken.push((path, "not valid UTF-8".into()));
                 continue;
@@ -445,7 +454,7 @@ impl Registry {
         registry.ext_fingerprint = snapshot.fingerprint;
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
-        registry.read_paths = snapshot.read_paths.into_iter().collect();
+        registry.read_paths = Some(snapshot.read_paths.into_iter().collect());
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
         registry.shadowed_skills = snapshot.shadowed_skills;
@@ -502,7 +511,7 @@ impl Registry {
             tools_omitted: 0,
             ext_fingerprint: 0,
             broken: Vec::new(),
-            read_paths: std::collections::HashSet::new(),
+            read_paths: None,
             broken_tools: Vec::new(),
             shadowed_skills: Vec::new(),
             memory_files: None,

@@ -381,7 +381,9 @@ project's records are kept, and exits 0.
 
 Every re-freeze announces a receipt - the `refrozen` event lists each tool or
 skill file added, modified, or removed - so the agent's action space never
-mutates silently.
+mutates silently. The first re-freeze after a session resumes compares against
+the session's saved manifest, which carries only the loaded tools and the skill
+index, so a skill body edited while the session was closed is not named there.
 
 A ledger that cannot be verified stops appending (a chain nobody can trust
 must not be extended) and revokes every approval it held, so outside `auto`
