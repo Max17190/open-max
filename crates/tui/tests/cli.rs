@@ -858,6 +858,46 @@ fn an_unverifiable_ledger_is_refused_and_repairable() {
     );
 }
 
+/// Each early-exit operation runs and exits before the next one is
+/// considered, so a second operation on the same command line was dropped
+/// without a word: `--check --ledger` printed history and exited 0 having
+/// validated nothing. Any two operations are refused before either runs, with
+/// the usage exit and a first line that names both.
+#[test]
+fn two_operations_on_one_command_line_are_refused_naming_both() {
+    let (project, home) = fresh_dirs("two-operations");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    let cases: [(&[&str], [&str; 2]); 3] = [
+        (&["--check", "--ledger"], ["--check", "--ledger"]),
+        (&["-p", "x", "--approve", ".openmax/hooks/gate.toml"], ["--print", "--approve"]),
+        (&["--stdio", "--forget", ".openmax/hooks/gate.toml"], ["--stdio", "--forget"]),
+    ];
+    let mut wrong = Vec::new();
+    for (args, named) in cases {
+        let out = cmd(&project, &home).args(args).stdin(Stdio::null()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The usage text that follows a refusal names every flag, so only the
+        // first line shows whether the refusal named this conflict.
+        let first = stderr.lines().next().unwrap_or_default();
+        if out.status.code() != Some(2) || !named.iter().all(|flag| first.contains(flag)) {
+            wrong.push(format!("{args:?} exited {:?}: {first}", out.status.code()));
+        }
+    }
+    assert!(wrong.is_empty(), "each pair must exit 2 naming both:\n{}", wrong.join("\n"));
+    // Refused before either ran: the approval was never recorded.
+    assert!(
+        !home.join(".openmax").join("ledger").exists(),
+        "a refused --approve must record nothing"
+    );
+}
+
 #[test]
 fn stdio_handshake_speaks_the_contract() {
     let (project, home) = fresh_dirs("stdio");

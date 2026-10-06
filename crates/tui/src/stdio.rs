@@ -1018,16 +1018,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Every stdin command the reader accepts and every bespoke stdout line
-    /// the session emits must appear in the printed contract: a frontend is
-    /// written against `openmax --spec stdio` and judged by `validate_line`,
-    /// so a name the spec omits is either a capability its author cannot
-    /// discover or a line their client rejects on arrival. The match is
-    /// exhaustive, so adding a Command variant without teaching the spec
-    /// stops compiling here.
-    #[test]
-    fn the_spec_names_every_command_and_bespoke_line() {
-        let text = open_max_core::spec::render("stdio").unwrap();
+    /// Every stdin command the reader accepts, by wire name. The match is
+    /// exhaustive, so adding a Command variant without listing it here stops
+    /// compiling, and every surface checked against this list sees it.
+    fn accepted_commands() -> Vec<&'static str> {
         let wire = [
             r#"{"cmd":"user","text":"hi"}"#,
             r#"{"cmd":"approve","approval_id":"a","approved":true}"#,
@@ -1036,16 +1030,27 @@ mod tests {
             r#"{"cmd":"cancel"}"#,
             r#"{"cmd":"quit"}"#,
         ];
-        for line in wire {
-            let cmd: Command = serde_json::from_str(line).expect(line);
-            let name = match cmd {
+        wire.iter()
+            .map(|line| match serde_json::from_str::<Command>(line).expect(line) {
                 Command::User { .. } => "user",
                 Command::Approve { .. } => "approve",
                 Command::ApprovalMode { .. } => "approval_mode",
                 Command::Reload => "reload",
                 Command::Cancel => "cancel",
                 Command::Quit => "quit",
-            };
+            })
+            .collect()
+    }
+
+    /// Every stdin command the reader accepts and every bespoke stdout line
+    /// the session emits must appear in the printed contract: a frontend is
+    /// written against `openmax --spec stdio` and judged by `validate_line`,
+    /// so a name the spec omits is either a capability its author cannot
+    /// discover or a line their client rejects on arrival.
+    #[test]
+    fn the_spec_names_every_command_and_bespoke_line() {
+        let text = open_max_core::spec::render("stdio").unwrap();
+        for name in accepted_commands() {
             assert!(
                 text.contains(&format!("\"cmd\":\"{name}\"")),
                 "--spec stdio never names command '{name}'"
@@ -1057,6 +1062,28 @@ mod tests {
                 "--spec stdio never names bespoke line '{ty}'"
             );
         }
+    }
+
+    /// `--help` is where a frontend author first meets `--stdio`, so its
+    /// command list must be the protocol's: a command it omits is a
+    /// capability nobody finds there. The `{"cmd":...}` list is parsed and
+    /// compared as a SET, so a reflow cannot hide a missing or stale name.
+    #[test]
+    fn help_names_every_command() {
+        let help = crate::HELP;
+        let start = help.find("--stdio ").expect("--stdio is documented");
+        let open = help[start..].find(r#"{"cmd":"#).expect("--stdio lists its commands")
+            + start
+            + r#"{"cmd":"#.len();
+        let close = help[open..].find('}').expect("the list closes") + open;
+        let mut listed: Vec<&str> = help[open..close]
+            .split('|')
+            .map(|name| name.trim().trim_matches('"'))
+            .collect();
+        listed.sort_unstable();
+        let mut accepted = accepted_commands();
+        accepted.sort_unstable();
+        assert_eq!(listed, accepted, "--help's --stdio list must equal the commands stdin accepts");
     }
 
     #[test]
