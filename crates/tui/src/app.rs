@@ -749,11 +749,12 @@ impl App {
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
-                Some(meta) => {
+                Ok(Some(meta)) => {
                     self.session_id = Some(meta.id.clone());
                     self.replay(&meta.id);
                 }
-                None => self.note("no previous session here; starting fresh"),
+                Ok(None) => self.note("no previous session here; starting fresh"),
+                Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
             }
         }
     }
@@ -968,6 +969,7 @@ impl App {
     /// failure is reported: the entry it leaves is the one this prevents.
     fn discard_if_empty(&mut self, id: &str) {
         if let Err(e) = sessions::discard_if_empty(&self.core, id) {
+            let e = sessions::refusal_with_repair(&self.core, e);
             self.error(&format!("the empty session {id} stays indexed: {e}"));
         }
     }
@@ -983,6 +985,7 @@ impl App {
         ids.into_iter()
             .filter_map(|id| {
                 let e = sessions::discard_if_empty(&self.core, &id).err()?;
+                let e = sessions::refusal_with_repair(&self.core, e);
                 Some(format!("the empty session {id} stays indexed: {e}"))
             })
             .collect()
@@ -2153,7 +2156,7 @@ impl App {
                             self.note("no sessions left in this project");
                         }
                     }
-                    Err(e) => self.error(&e),
+                    Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
                 }
             }
             return;
@@ -2246,8 +2249,16 @@ impl App {
         let session_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
-                let meta = sessions::create(&self.core, self.project.display().to_string())
-                    .map_err(std::io::Error::other)?;
+                // A refused session (a damaged index) is the user's to see
+                // and repair, not an I/O error: returned through the event
+                // loop, it would close the app on the first prompt.
+                let meta = match sessions::create(&self.core, self.project.display().to_string()) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        self.error(&sessions::refusal_with_repair(&self.core, e));
+                        return Ok(());
+                    }
+                };
                 self.session_id = Some(meta.id.clone());
                 self.created_session = true;
                 self.resumed_awaiting_hydration = false;
@@ -2462,16 +2473,15 @@ impl App {
                 Some(mode) => { self.select_approval_mode(mode); }
                 None => self.note("usage: /approvals auto|ask|readonly"),
             },
-            "resume" => {
-                let items = sessions::list(&self.core, &self.project.display().to_string());
-                if items.is_empty() {
-                    self.note("no sessions in this project yet");
-                } else {
+            "resume" => match sessions::list(&self.core, &self.project.display().to_string()) {
+                Ok(items) if items.is_empty() => self.note("no sessions in this project yet"),
+                Ok(items) => {
                     self.sessions_panel = Some(sessions_ui::SessionsState::new(items));
                     self.completion = None;
                     self.mode = Mode::Sessions;
                 }
-            }
+                Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
+            },
             "reload" => match &self.session_id {
                 None => self.note("no session yet; a new session always freezes the current config"),
                 Some(id) => {
@@ -4683,7 +4693,7 @@ mod tests {
         let mut app = App::new(core.clone(), dir.clone(), files_tx);
         let key = dir.display().to_string();
         let ids = |core: &std::sync::Arc<Core>| -> Vec<String> {
-            open_max_core::sessions::list(core, &key).into_iter().map(|m| m.id).collect()
+            open_max_core::sessions::list(core, &key).unwrap().into_iter().map(|m| m.id).collect()
         };
 
         // Settled before the user moves on.
@@ -5514,6 +5524,113 @@ mod tests {
             config::ApprovalMode::Readonly,
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A damaged session index: a JSON array that ends inside its first
+    /// entry.
+    fn damage_session_index(data_dir: &std::path::Path) -> std::path::PathBuf {
+        let index = data_dir.join("sessions").join("index.json");
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(&index, "[{").unwrap();
+        index
+    }
+
+    /// Where a refusal over a damaged index sends the user: `--check` gives
+    /// the repair with the step that makes it safe.
+    const REPAIR_POINTER: &str = "run openmax --check for the repair";
+
+    /// A damaged session index refuses the session a first prompt creates.
+    /// Returned as an I/O error, that refusal unwound the event loop and
+    /// closed the app on the first prompt in every project. It belongs in
+    /// the transcript, naming the file and pointing at `--check` for the
+    /// repair, with the app still running and the damaged bytes left for
+    /// the user to recover.
+    #[tokio::test]
+    async fn a_damaged_session_index_is_reported_and_the_app_keeps_running() {
+        let (mut app, dir) = app_fixture();
+        let index = damage_session_index(&dir);
+
+        app.composer.load("hello");
+        app.on_term_event(TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+            .await
+            .expect("a refused session must not end the event loop");
+
+        let shown = app.transcript.export_text();
+        assert!(
+            shown.contains(&index.display().to_string()),
+            "the error must name the damaged index: {shown}"
+        );
+        assert!(shown.contains(REPAIR_POINTER), "the error must point at the repair: {shown}");
+        assert!(!app.should_quit && !app.running && app.session_id.is_none());
+        assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `--continue` and `/resume` read the same index. A damaged one is
+    /// history the app cannot read, not an empty past: each must name the
+    /// file, and point at `--check` for the repair, rather than report that
+    /// there is nothing to resume.
+    #[tokio::test]
+    async fn continue_and_resume_name_a_damaged_session_index() {
+        let (mut app, dir) = app_fixture();
+        let index = damage_session_index(&dir);
+        let path = index.display().to_string();
+
+        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        let continued = app.transcript.export_text();
+        assert!(
+            continued.contains(&path)
+                && continued.contains(REPAIR_POINTER)
+                && !continued.contains("no previous session"),
+            "--continue must name the damaged index: {continued}"
+        );
+
+        app.handle_submit("/resume".into()).await.unwrap();
+        let resumed = app.transcript.export_text()[continued.len()..].to_string();
+        assert!(
+            resumed.contains(&path) && resumed.contains(REPAIR_POINTER) && !resumed.contains("no sessions"),
+            "/resume must name the damaged index: {resumed}"
+        );
+        assert!(app.sessions_panel.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An empty session this app created is discarded when the user leaves
+    /// it, and that removal rewrites the index, so an index damaged since
+    /// the session began refuses it. The warning that the entry stays must
+    /// name the file and point at `--check` for the repair like every other
+    /// refusal over the damage, both in the transcript (/new) and among the
+    /// warnings printed once the terminal is restored (quitting).
+    #[tokio::test]
+    async fn an_empty_session_left_over_a_damaged_index_points_at_the_repair() {
+        let dir = crate::test_temp_dir("openmax-app-discard-damaged");
+        let (core, mut core_rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core.clone(), dir.clone(), files_tx);
+
+        // Nothing is configured, so the turn fails before its first save.
+        app.handle_submit("hello".into()).await.unwrap();
+        let id = app.session_id.clone().unwrap();
+        settle(&mut app, &mut core_rx, &id).await;
+        let index = damage_session_index(&dir);
+        let path = index.display().to_string();
+
+        let warnings = app.discard_created_sessions_on_exit();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("stays indexed") && warnings[0].contains(&path) && warnings[0].contains(REPAIR_POINTER),
+            "the exit warning must name the damaged index and the repair: {warnings:?}"
+        );
+
+        app.handle_submit("/new".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(
+            shown.contains("stays indexed") && shown.contains(&path) && shown.contains(REPAIR_POINTER),
+            "/new must name the damaged index and the repair: {shown}"
+        );
+        assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// Plain Tab keeps its own job.

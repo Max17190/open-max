@@ -104,6 +104,49 @@ fn damaged_continuation_preserves_bytes_before_hooks_or_provider_requests() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// A damaged session index is history openmax cannot read, not an empty past:
+/// `--continue` names the file instead of reporting that no prior session
+/// exists, a new session is refused the same way, and `--check` lists it as
+/// an error with the repair. Each refusal points at `--check` rather than
+/// leaving the user with a bare path to move while another openmax may still
+/// be saving to it. The damaged bytes stay as they were and no request
+/// reaches the model.
+#[test]
+fn a_damaged_session_index_is_named_by_continue_and_check() {
+    let (project, home) = fresh_dirs("damaged-index");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    write_settings(&home, &format!("http://{}/v1", server.local_addr().unwrap()));
+    let index = home.join(".openmax/sessions/index.json");
+    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+    std::fs::write(&index, "[{").unwrap();
+    let path = index.display().to_string();
+    for args in [
+        vec!["--trust-project", "--continue", "-p", "hello"],
+        vec!["--trust-project", "--continue", "--stdio"],
+        vec!["--trust-project", "-p", "hello"],
+        vec!["--trust-project", "--stdio"],
+    ] {
+        let output = finish_with_deadline(cmd(&project, &home).args(&args)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(&path), "{args:?} must name the damaged index: {error}");
+        assert!(error.contains("run openmax --check for the repair"), "{args:?} must point at the repair: {error}");
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {error}");
+        assert!(output.stdout.is_empty(), "{args:?} must fail before any output");
+        assert_eq!(std::fs::read(&index).unwrap(), b"[{");
+    }
+    let check = cmd(&project, &home).arg("--check").output().unwrap();
+    let report = String::from_utf8_lossy(&check.stdout);
+    let row = report.lines().find(|line| line.contains(&path))
+        .unwrap_or_else(|| panic!("--check must list the damaged index: {report}"));
+    assert!(row.starts_with("err") && row.contains("mv "), "{row}");
+    assert_eq!(check.status.code(), Some(1), "{report}");
+    assert_eq!(std::fs::read(&index).unwrap(), b"[{");
+    assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// A fresh project dir plus a fresh HOME, so trust and settings never leak
 /// between tests or into the developer's real ~/.openmax.
 fn fresh_dirs(tag: &str) -> (PathBuf, PathBuf) {
