@@ -53,6 +53,13 @@ pub(crate) struct ProcessRequest {
     /// human approves. Ignored under `sandbox`: a probe stays fully
     /// scrubbed whatever its manifest asks for.
     pub env_allowlist: Option<Vec<String>>,
+    /// Put the self link, a bare `openmax` naming the running harness, first
+    /// on the child's PATH. Only the agent's shell sets it. The agent's
+    /// account can write that directory, so on a hook's or tool's PATH a
+    /// name planted there while it runs would replace the system binary the
+    /// human approved, and the approval binding hashes no code outside the
+    /// project. Ignored under `sandbox`.
+    pub self_link: bool,
 }
 
 /// Containment for a probe run: no network, filesystem reads allowed, writes
@@ -482,6 +489,133 @@ fn apply_sandbox(
     }
 }
 
+/// The directory whose one entry, `openmax`, links to the executable running
+/// this harness; the agent's shell gets it first on PATH. None leaves PATH as
+/// inherited, which is never a wrong link.
+///
+/// Lifecycle: the name derives from the account and the canonical executable
+/// path, so whichever process writes the directory writes the same link.
+/// Concurrent harnesses on one build share it, different builds never touch
+/// each other's, and nothing needs removing on exit: a crash leaves nothing
+/// a later run could misread, and the OS temp cleaner reaps the directories
+/// of builds no longer run. The directory is checked on every spawn: the
+/// link is renamed back into place when something removed or replaced it,
+/// any other entry is removed, and a link whose binary has since been
+/// deleted keeps the directory off PATH. A build installed over this one at
+/// the same path is what the link then runs, as `$OPENMAX_BIN` names it: the
+/// replaced bytes have no path left to link to, and dropping the link would
+/// hand a bare `openmax` back to whichever install comes first on the
+/// inherited PATH, possibly an older one.
+#[cfg(unix)]
+fn self_link_dir() -> Option<PathBuf> {
+    static TARGET: std::sync::OnceLock<Option<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
+    let (exe, dir) = TARGET
+        .get_or_init(|| {
+            // Canonical, so a harness started through the link lands on the
+            // same directory instead of linking to a link.
+            let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+            let digest = crate::ledger::sha256_hex(exe.as_os_str().as_encoded_bytes());
+            let uid = unsafe { libc::geteuid() };
+            // A per-account runtime directory, where one exists, so another
+            // account cannot take the name first the way it can in /tmp.
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute() && dir.is_dir())
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join(format!("openmax-{uid}-{}", &digest[..16]));
+            Some((exe, dir))
+        })
+        .as_ref()?;
+    ensure_self_link(dir, exe).ok()?;
+    Some(dir.clone())
+}
+
+#[cfg(not(unix))]
+fn self_link_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn ensure_self_link(dir: &Path, exe: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // The temp dir can be shared between accounts (/tmp on Linux), and an
+    // entry first on PATH runs under every bare `openmax`: only a directory
+    // this account owns and nobody else can write may hold it, or another
+    // account could create the name first and swap the link mid-session.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other("self link directory is not private to this account"));
+    }
+    // The agent's own account can write here too, and this directory comes
+    // first on the PATH of every bash command: a `python3` planted beside the
+    // link by one command would replace the system binary in every later
+    // one, including a command a human read and approved. Only the link, and
+    // another harness's staged link mid-rename, may stay; anything that
+    // cannot be removed keeps the directory off PATH.
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "openmax" || is_staged_link(&name) {
+            continue;
+        }
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(entry.path()),
+            _ => std::fs::remove_file(entry.path()),
+        };
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    let link = dir.join("openmax");
+    if std::fs::read_link(&link).ok().as_deref() != Some(exe) {
+        // Staged, then renamed over: a concurrent harness on the same build
+        // never sees the name missing.
+        let staged = dir.join(format!(".openmax-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(exe, &staged)?;
+        if let Err(error) = std::fs::rename(&staged, &link) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
+    // Follows the link: a binary deleted since (an uninstall, a cleaned
+    // target dir) must not leave a dangling entry first on PATH.
+    std::fs::metadata(&link).map(|_| ())
+}
+
+/// The name `ensure_self_link` stages a link under before renaming it into
+/// place; no command is ever run by such a name.
+#[cfg(unix)]
+fn is_staged_link(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(".openmax-"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// The PATH the agent's shell gets: the self link directory first, then the
+/// harness's own entries. None when the harness has no PATH: a PATH holding
+/// only the link would hide every system binary from the shell, which falls
+/// back to its own default search path only while PATH is unset.
+fn child_path() -> Option<OsString> {
+    let inherited = std::env::var_os("PATH")?;
+    self_link_dir()
+        .and_then(|dir| path_with_self_link(&dir, &inherited))
+        .or(Some(inherited))
+}
+
+/// The child's PATH: the self link directory first, then the inherited
+/// entries without it, so a harness started from a harness's child does not
+/// stack another copy per level.
+fn path_with_self_link(dir: &Path, inherited: &std::ffi::OsStr) -> Option<OsString> {
+    let rest = std::env::split_paths(inherited).filter(|entry| entry != dir);
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
+}
+
 /// Execute one native process with concurrent bounded output capture.
 pub(crate) async fn run_process(
     request: ProcessRequest,
@@ -541,14 +675,21 @@ pub(crate) async fn run_process(
     // inherit the attestation, grant authority. Stripped unconditionally;
     // no child of the harness is the human.
     command.env_remove("OPENMAX_HUMAN_ATTEST");
-    // Name the binary that is running this session. Every spec tells the
-    // agent to shell out to `openmax --check` / `--spec`, and a PATH
-    // `openmax` can be an older build than the harness hosting the session,
-    // teaching claims that build has since retracted - both print the same
-    // version string. `$OPENMAX_BIN` is the same
-    // build by construction. Not applied under a sandbox: a probe gets no
-    // handle to the harness.
+    // Point the child at the binary that is running this session. The
+    // prompt, receipts, and every spec tell the agent to shell out to a bare
+    // `openmax`, and the first one on the inherited PATH can be an older
+    // build than the harness hosting the session, teaching claims that build
+    // has since retracted - both print the same version string. So in the
+    // agent's shell a bare `openmax` resolves through the self link first;
+    // hooks and tools keep the inherited PATH (see `self_link`), and
+    // `$OPENMAX_BIN` names the same build in every one of them. Not applied
+    // under a sandbox: a probe gets no handle to the harness.
     if request.sandbox.is_none() {
+        if request.self_link {
+            if let Some(path) = child_path() {
+                command.env("PATH", path);
+            }
+        }
         if let Ok(exe) = std::env::current_exe() {
             command.env("OPENMAX_BIN", exe);
         }
@@ -942,6 +1083,7 @@ mod tests {
             },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         }
     }
 
@@ -984,6 +1126,7 @@ mod tests {
             },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
@@ -1004,6 +1147,7 @@ mod tests {
             capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         std::env::remove_var("OPENMAX_HUMAN_ATTEST");
@@ -1025,11 +1169,93 @@ mod tests {
             capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         let got = String::from_utf8_lossy(&output.stdout.head).to_string();
         let expected = std::env::current_exe().unwrap().to_string_lossy().to_string();
         assert_eq!(got, expected, "OPENMAX_BIN must name the running executable");
+    }
+
+    /// The self link directory is shared and never cleaned up, so every
+    /// spawn re-checks it: a replaced link is put back, anything planted
+    /// beside it is removed, a deleted build keeps the directory off PATH
+    /// instead of leaving a dangling first entry, a directory another account
+    /// can write is never used, and a nested harness does not stack a second
+    /// copy of the entry.
+    #[cfg(unix)]
+    #[test]
+    fn the_self_link_is_rechecked_and_never_left_dangling_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("omx-selflink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("build");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        let dir = base.join("links");
+        let link = dir.join("openmax");
+        ensure_self_link(&dir, &exe).expect("a fresh directory gets the link");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), &link).unwrap();
+        ensure_self_link(&dir, &exe).expect("a replaced link is put back");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+
+        // Only the link and a concurrent harness's staged link may stay.
+        let staged = dir.join(format!(".openmax-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(&exe, &staged).unwrap();
+        std::fs::write(dir.join("python3"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(dir.join("bin/nested")).unwrap();
+        ensure_self_link(&dir, &exe).expect("planted entries are cleared");
+        let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, vec![staged.file_name().unwrap().to_os_string(), "openmax".into()]);
+
+        std::fs::remove_file(&exe).unwrap();
+        assert!(ensure_self_link(&dir, &exe).is_err(), "a link to a deleted build must stay off PATH");
+
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_self_link(&dir, &exe).is_err(), "a directory others can write is never used");
+
+        let inherited = std::env::join_paths([dir.clone(), "/usr/bin".into(), dir.clone()]).unwrap();
+        let path = path_with_self_link(&dir, &inherited).unwrap();
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), vec![dir.clone(), "/usr/bin".into()]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The agent's shell gets the self link directory first on PATH, and the
+    /// agent's own account can write it: a `python3` planted there by one
+    /// command would replace the system binary in every later one, including
+    /// a command a human read and approved. So each such spawn clears
+    /// everything but the link first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_name_planted_beside_the_self_link_never_runs() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = self_link_dir().expect("this host can place the self link");
+        let name = format!("omx-planted-{}", uuid::Uuid::new_v4().simple());
+        let planted = dir.join(&name);
+        // Created executable in one step: a concurrent spawn may clear the
+        // name at any moment, and a separate chmod would then fail.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&planted)
+            .unwrap();
+        file.write_all(b"#!/bin/sh\necho planted-ran\n").unwrap();
+        drop(file);
+        let mut request = request(&name, &[]);
+        request.capture.head_bytes = 4096;
+        request.self_link = true;
+        let ran = run_process(request, Arc::new(CancelToken::default())).await;
+        let _ = std::fs::remove_file(&planted);
+        let stdout = ran
+            .map(|output| String::from_utf8_lossy(&output.stdout.head).into_owned())
+            .unwrap_or_default();
+        assert!(!stdout.contains("planted-ran"), "a name planted beside the self link ran");
     }
 
     /// A bash heredoc (and process substitution) writes a temp file; a
@@ -1067,6 +1293,7 @@ mod tests {
             },
             sandbox: Some(SandboxPolicy { rw_scratch: scratch.to_path_buf() }),
             env_allowlist: None,
+            self_link: false,
         }
     }
 
