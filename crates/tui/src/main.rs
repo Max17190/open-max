@@ -408,7 +408,8 @@ async fn main() -> std::io::Result<()> {
         // Read-only introspection, like --ledger: no session, no endpoint,
         // no trust gate. Recall only ever surfaces this project's own history
         // (the session index is keyed by project), and the index matches
-        // this path against every spelling it stored for the same directory.
+        // this path, as given or resolved, against the resolved path each
+        // session was recorded in.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // Settings are how a turn reaches a provider and what it may spend;
         // recall reads neither, so a settings file this process will never act

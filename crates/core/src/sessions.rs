@@ -1081,30 +1081,23 @@ fn records_end(bytes: &[u8]) -> usize {
 /// Sessions for one project, most recently updated first. Err names a
 /// damaged index rather than listing nothing.
 ///
-/// A session belongs to `project` when both paths name the same directory,
-/// resolved on both sides (`state::canonical_root`, the form trust and
-/// history key a project by). The index keeps each path as its frontend
-/// spelled it and is never rewritten for this, so a directory reached
-/// through a symlink, or moved and linked back, would otherwise hide its
-/// sessions from `--continue`, `/resume`, and `--recall` under another
-/// spelling. Each distinct stored path resolves once, not once per session.
-/// Only an absolute stored path resolves: a relative one (the "." a frontend
-/// stores when it cannot read its working directory) named the writer's
-/// directory, and resolving it here would name the reader's, listing it
-/// under every project.
+/// A session belongs to `project` when its stored path is the requested one
+/// as spelled or as resolved (`state::canonical_root`). Frontends store the
+/// working directory as the OS reports it, already resolved, which is the
+/// form trust keys a project by, so a lookup spelled through a symlink
+/// (`/tmp` for `/private/tmp`) still finds them. A stored path is never
+/// resolved again: it names the directory the session was recorded in, and
+/// once a symlink takes that path's place (the directory moved), the path
+/// leads to another project, and resolving it would hand that project this
+/// one's history through `--continue`, `/resume`, and `--recall`. A relative
+/// stored path (the "." a frontend stores when it cannot read its working
+/// directory) therefore matches only its own spelling, never every project.
 pub fn list(core: &Core, project: &str) -> Result<Vec<SessionMeta>, String> {
     let wanted = crate::state::canonical_root(Path::new(project));
-    let mut same_project: HashMap<String, bool> = HashMap::new();
     let mut metas: Vec<(usize, SessionMeta)> = load_index_checked(core)?
         .into_iter()
         .enumerate()
-        .filter(|(_, m)| {
-            m.project == project
-                || *same_project.entry(m.project.clone()).or_insert_with(|| {
-                    let stored = Path::new(&m.project);
-                    stored.is_absolute() && crate::state::canonical_root(stored) == wanted
-                })
-        })
+        .filter(|(_, m)| m.project == project || Path::new(&m.project) == wanted.as_path())
         .collect();
     // updated_at is whole seconds and the index is append-ordered, so two
     // sessions touched in the same second tie on the timestamp alone; the
@@ -2838,10 +2831,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The index keeps each project path as its frontend spelled it, while
-    /// trust and history resolve it. A directory reached through a symlink,
-    /// or moved and linked back, is still one project: its sessions list,
-    /// and `--continue` takes the latest, from any spelling of the path.
+    /// Frontends record a session under the working directory as the OS
+    /// reports it, already resolved, which is the form trust keys a project
+    /// by. A lookup spelled through a symlink (`/tmp` for `/private/tmp`)
+    /// still lists them, and `--continue` takes the latest.
     #[cfg(unix)]
     #[test]
     fn a_project_lists_its_sessions_from_any_spelling_of_its_path() {
@@ -2853,23 +2846,51 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let (core, _rx) = Core::new(dir.join("data")).unwrap();
         let spell = |path: &Path| path.display().to_string();
-        let through_link = create(&core, spell(&link)).unwrap().id;
-        let direct = create(&core, spell(&real)).unwrap().id;
-        create(&core, spell(&dir.join("other"))).unwrap();
-        touch_at(&core, &through_link, 1_000);
-        touch_at(&core, &direct, 2_000);
+        let resolved = std::fs::canonicalize(&real).unwrap();
+        let older = create(&core, spell(&resolved)).unwrap().id;
+        let newer = create(&core, spell(&resolved)).unwrap().id;
+        create(&core, spell(&std::fs::canonicalize(dir.join("other")).unwrap())).unwrap();
+        touch_at(&core, &older, 1_000);
+        touch_at(&core, &newer, 2_000);
 
-        for spelling in [real.clone(), link.clone(), std::fs::canonicalize(&real).unwrap()] {
-            let listed: Vec<String> = list(&core, &spell(&spelling)).unwrap().into_iter().map(|m| m.id).collect();
-            assert_eq!(listed, vec![direct.clone(), through_link.clone()], "{}", spelling.display());
+        for spelling in [&real, &link, &resolved] {
+            let listed: Vec<String> = list(&core, &spell(spelling)).unwrap().into_iter().map(|m| m.id).collect();
+            assert_eq!(listed, vec![newer.clone(), older.clone()], "{}", spelling.display());
         }
-        touch_at(&core, &through_link, 3_000);
-        assert_eq!(latest(&core, &spell(&real)).unwrap().unwrap().id, through_link);
-        assert_eq!(
-            std::fs::read_to_string(index_path(&core)).unwrap().matches(&spell(&link)).count(),
-            1,
-            "a lookup leaves every stored path as it was"
-        );
+        touch_at(&core, &older, 3_000);
+        assert_eq!(latest(&core, &spell(&link)).unwrap().unwrap().id, older);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A stored path is the directory a session was recorded in, resolved
+    /// when it was recorded. Once that directory moves and a symlink to
+    /// another project takes its place, the path leads to the other project,
+    /// as it does for trust. Resolving the stored path again at lookup would
+    /// hand the other project this one's history through `--continue`,
+    /// `/resume`, and `--recall`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_takes_a_projects_place_does_not_carry_its_history() {
+        let dir = std::env::temp_dir().join(format!("openmax-retargeted-{}", uuid::Uuid::new_v4()));
+        let first = dir.join("first");
+        let second = dir.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let spell = |path: &Path| path.display().to_string();
+        let recorded = std::fs::canonicalize(&first).unwrap();
+        let theirs = create(&core, spell(&recorded)).unwrap().id;
+        let ours = create(&core, spell(&std::fs::canonicalize(&second).unwrap())).unwrap().id;
+        touch_at(&core, &ours, 1_000);
+        touch_at(&core, &theirs, 2_000);
+
+        std::fs::rename(&recorded, dir.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&second, &recorded).unwrap();
+        for spelling in [second.clone(), std::fs::canonicalize(&second).unwrap()] {
+            let listed: Vec<String> = list(&core, &spell(&spelling)).unwrap().into_iter().map(|m| m.id).collect();
+            assert_eq!(listed, vec![ours.clone()], "{}", spelling.display());
+        }
+        assert_eq!(latest(&core, &spell(&second)).unwrap().unwrap().id, ours);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2877,9 +2898,8 @@ mod tests {
     /// as ".", which names whatever directory the process that wrote it was
     /// in. Resolved by a later lookup it would name the lookup's own
     /// directory, so one stray entry would be every project's history and
-    /// `--continue` anywhere would resume a stranger's session. Only an
-    /// absolute stored path resolves; a relative one still matches only its
-    /// own spelling.
+    /// `--continue` anywhere would resume a stranger's session. A stored path
+    /// is never resolved, so a relative one matches only its own spelling.
     #[test]
     fn a_relative_project_path_is_no_other_projects_history() {
         let dir = std::env::temp_dir().join(format!("openmax-relative-{}", uuid::Uuid::new_v4()));
