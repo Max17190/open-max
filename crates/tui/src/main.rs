@@ -2188,9 +2188,9 @@ mod tests {
     /// its `underline-color` feature names the termwiz and termina backends,
     /// which puts dozens of never-built crates into Cargo.lock for every
     /// dependency scanner to report. The lockfile cannot show the calendar
-    /// itself (ratatui's `std` feature names `time` weakly, so it stays
-    /// listed but unbuilt); the macro crate, the backends and the cache are
-    /// what a return to the defaults brings back. File locks come from std,
+    /// (ratatui-widgets' `std` feature names `time` weakly, so Cargo.lock is
+    /// identical whether `time` is built or not), so the manifest line that
+    /// would turn it back on is checked instead. File locks come from std,
     /// which takes the same flock(2) lock fs2 did on Linux and macOS.
     #[test]
     fn the_lockfile_resolves_no_unused_dependency_features() {
@@ -2222,6 +2222,20 @@ mod tests {
                 "{package} still resolves {unused}"
             );
         }
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .unwrap();
+        let ratatui = manifest
+            .lines()
+            .find(|line| line.starts_with("ratatui ="))
+            .expect("Cargo.toml declares ratatui on one line");
+        assert!(
+            ratatui.contains("default-features = false")
+                && !ratatui.contains("\"all-widgets\"")
+                && !ratatui.contains("\"widget-calendar\""),
+            "ratatui builds its calendar widget: {ratatui}"
+        );
     }
 
     #[test]
