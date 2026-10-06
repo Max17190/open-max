@@ -107,9 +107,10 @@ pub struct Registry {
     /// manifests and SKILL.mds), with a hash of the bytes it read. The
     /// refreeze receipt compares two generations file by file from these
     /// without a second disk probe, which would race the capture it claims
-    /// to describe. None for a registry no capture built (manifest-restored
-    /// or built-ins only), which only ever sits on the outgoing side of that
-    /// comparison. In memory only, never persisted.
+    /// to describe. The session manifest carries them, so a resumed registry
+    /// compares the same way. None for built-ins only or a manifest written
+    /// before they were kept, which only ever sits on the outgoing side of
+    /// that comparison.
     pub(crate) read_paths: Option<HashMap<PathBuf, u64>>,
     /// Broken TOOL manifests with the name each occupies: the declared name,
     /// or the file stem when the document is too broken to yield one - the
@@ -686,6 +687,12 @@ pub struct RegistryManifest {
     /// sections.
     #[serde(default)]
     pub memory_rows: Option<Vec<(String, usize)>>,
+    /// Every capability file the freeze read, with the hash of the bytes it
+    /// read, so the first refreeze of a resumed session names each file that
+    /// changed while it was closed, a SKILL.md body edit included. Additive:
+    /// absent in older manifests, whose first receipt compares index lines.
+    #[serde(default)]
+    pub read_files: Option<Vec<(PathBuf, u64)>>,
 }
 
 /// Current manifest format. A manifest carrying any other version is treated
@@ -761,6 +768,12 @@ impl Registry {
             // re-suspending must keep the accounting its persisted prompt
             // still depends on.
             memory_rows: self.frozen_memory_rows.clone(),
+            read_files: self.read_paths.as_ref().map(|read| {
+                let mut files: Vec<(PathBuf, u64)> =
+                    read.iter().map(|(path, hash)| (path.clone(), *hash)).collect();
+                files.sort();
+                files
+            }),
             version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
@@ -804,6 +817,7 @@ impl Registry {
         // the persisted prompt, which is precisely what the manifest carries.
         registry.memory_files = manifest.memory_files.clone();
         registry.frozen_memory_rows = manifest.memory_rows.clone();
+        registry.read_paths = manifest.read_files.map(|files| files.into_iter().collect());
         registry
     }
 

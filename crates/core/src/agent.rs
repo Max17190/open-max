@@ -2126,10 +2126,11 @@ fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
 /// off the two registries, so it costs no disk access. When both came from a
 /// capture, every file either read is compared by the hash of the bytes it
 /// read: a SKILL.md body edit, a broken manifest, and a manifest the tool cap
-/// keeps out of the prompt are all named. An outgoing registry restored from
-/// a session manifest read nothing, so that one comparison falls back to
-/// what the manifest carries: a loaded tool by its content hash and an
-/// indexed skill by the index line the prompt shows for it. A file the new
+/// keeps out of the prompt are all named. A resumed session's manifest
+/// carries those hashes too. One written before they were kept does not, so
+/// that one comparison falls back to what it does carry: a loaded tool by
+/// its content hash and an indexed skill by the index line the prompt shows
+/// for it. A file the new
 /// capture read or failed to read is still on disk, so it is never called
 /// removed: the receipt's NOT-loaded clause names one it could not read.
 fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Vec<String> {
@@ -6026,6 +6027,42 @@ mod tests {
         assert_ne!(old.ext_fingerprint, new.ext_fingerprint, "the body edit refreezes");
 
         assert_eq!(generation_changes(&old, &new, &project), [".agents/skills/ship/SKILL.md modified"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A resumed session's registry is rebuilt from its manifest, not from a
+    /// capture. Without the per-file hashes its freeze read, the receipt
+    /// could only compare index lines, so a SKILL.md body edited while the
+    /// session was closed went live under "extension files changed" and was
+    /// never named. A manifest written before the hashes were kept still
+    /// loads and compares index lines.
+    #[test]
+    fn a_skill_body_edited_while_the_session_was_closed_is_named_on_resume() {
+        let dir = std::env::temp_dir().join(format!("openmax-t2resume-{}", uuid::Uuid::new_v4()));
+        let data = dir.join("data");
+        let project = dir.join("project");
+        let skill = project.join(".agents/skills/ship/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "---\nname: ship\ndescription: how to ship\n---\nrun the tests\n")
+            .unwrap();
+        let frozen = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        let saved = serde_json::to_string(&frozen.to_manifest()).unwrap();
+        let resumed = Registry::from_manifest(serde_json::from_str(&saved).unwrap());
+
+        std::fs::write(&skill, "---\nname: ship\ndescription: how to ship\n---\nskip the tests\n")
+            .unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        assert_ne!(resumed.ext_fingerprint, new.ext_fingerprint, "the body edit refreezes on resume");
+        assert_eq!(
+            generation_changes(&resumed, &new, &project),
+            [".agents/skills/ship/SKILL.md modified"]
+        );
+
+        let mut legacy: Value = serde_json::from_str(&saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("read_files");
+        let legacy = Registry::from_manifest(serde_json::from_value(legacy).unwrap());
+        assert!(generation_changes(&legacy, &new, &project).is_empty(), "index lines are unchanged");
 
         let _ = std::fs::remove_dir_all(dir);
     }
