@@ -35,6 +35,7 @@
 //! A stream that ends without `[DONE]` and without a `finish_reason` is
 //! reported as truncated rather than treated as a complete reply.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -675,6 +676,7 @@ async fn read_sse(
     let mut reasoning: Option<String> = None;
     // Empty until the server sends `reasoning_details` with an entry in it.
     let mut reasoning_details: Vec<Value> = Vec::new();
+    let mut open_details = OpenDetails::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
     // Did the server ever say it was done (a `[DONE]` line or a
@@ -794,7 +796,7 @@ async fn read_sse(
             }
             if let Some(Value::Array(parts)) = delta.reasoning_details {
                 for part in parts {
-                    merge_reasoning_detail(&mut reasoning_details, part);
+                    merge_reasoning_detail(&mut reasoning_details, &mut open_details, part);
                 }
             }
             if let Some(calls) = delta.tool_calls {
@@ -844,16 +846,26 @@ async fn read_sse(
     (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
 }
 
+/// Where each text or summary block of a streaming reply's
+/// `reasoning_details` has its latest entry, keyed by the block's `index` and
+/// the field its text streams in, so a part finds the entry it continues in
+/// one lookup. The server decides how many parts a stream has: a scan of the
+/// entries kept so far would make a stream of parts that each start a new
+/// block cost time quadratic in its length.
+type OpenDetails = HashMap<(u64, &'static str), usize>;
+
 /// Fold one streamed `reasoning_details` part into the reply's entries.
 /// OpenRouter streams a text or summary block in parts that share its
 /// `index` and `type`: the text arrives in pieces, and fields such as the
 /// signature arrive null at first and set in a later part. Such a part
-/// continues the latest entry with the same `index` and `type` (and no
-/// conflicting `id`): its text is appended, and a value it carries fills a
-/// field still null or empty. Any other part (an encrypted blob, a type this
-/// client does not know, an entry without an index) arrives whole and is
-/// kept as its own entry, since joining two such blobs would corrupt both.
-fn merge_reasoning_detail(details: &mut Vec<Value>, part: Value) {
+/// continues the latest entry with the same `index` and `type`: its text is
+/// appended, and a value it carries fills a field still null or empty. A
+/// part whose `id` conflicts with that entry's starts a new entry instead,
+/// which later parts of its block continue. Any other part (an encrypted
+/// blob, a type this client does not know, an entry without an index)
+/// arrives whole and is kept as its own entry, since joining two such blobs
+/// would corrupt both.
+fn merge_reasoning_detail(details: &mut Vec<Value>, open: &mut OpenDetails, part: Value) {
     let text_key = match part["type"].as_str() {
         Some("reasoning.text") => "text",
         Some("reasoning.summary") => "summary",
@@ -862,11 +874,16 @@ fn merge_reasoning_detail(details: &mut Vec<Value>, part: Value) {
             return;
         }
     };
-    let continues = |entry: &Value| {
-        let same = |key: &str| entry[key] == part[key];
-        part["index"].is_u64() && same("index") && same("type") && (entry["id"].is_null() || part["id"].is_null() || same("id"))
+    let Some(index) = part["index"].as_u64() else {
+        details.push(part);
+        return;
     };
-    let Some(Value::Object(entry)) = details.iter_mut().rev().find(|entry| continues(entry)) else {
+    // The entry's `index` and `type` are never null or empty, so merging
+    // never changes them: the entry stays under the key it was opened with.
+    let latest = open.get(&(index, text_key)).map(|&at| &mut details[at]);
+    let continued = latest.filter(|entry| entry["id"].is_null() || part["id"].is_null() || entry["id"] == part["id"]);
+    let Some(Value::Object(entry)) = continued else {
+        open.insert((index, text_key), details.len());
         details.push(part);
         return;
     };
@@ -2567,6 +2584,29 @@ mod tests {
         let mut without = reply.clone();
         without.reasoning_details = None;
         assert!(reply.estimated_tokens() > without.estimated_tokens(), "they ride every request, so they are counted");
+    }
+
+    /// The server decides how many `reasoning_details` parts a stream has, so
+    /// a part must find the entry it continues without scanning every entry
+    /// kept so far: a stream of parts that each start a new block (a fresh
+    /// `index`, or none) would otherwise cost time quadratic in its length
+    /// and stall the turn. Each such part stays its own entry, and a late
+    /// part of an early block still finds that block.
+    #[test]
+    fn many_reasoning_detail_blocks_each_keep_their_own_entry() {
+        let blocks = 10_000u64;
+        let (mut details, mut open) = (Vec::new(), OpenDetails::new());
+        for index in 0..blocks {
+            merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.text", "text": "a", "index": index}));
+            merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.summary", "summary": "s"}));
+        }
+        merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.text", "text": "b", "signature": "sig", "index": 0}));
+        let mut expected: Vec<Value> = (0..blocks)
+            .flat_map(|index| [json!({"type": "reasoning.text", "text": "a", "index": index}), json!({"type": "reasoning.summary", "summary": "s"})])
+            .collect();
+        expected[0] = json!({"type": "reasoning.text", "text": "ab", "signature": "sig", "index": 0});
+        assert_eq!(details.len(), expected.len(), "a part with a new index, or none, starts its own entry");
+        assert!(details == expected, "each block keeps its own entry, and a late part continues its block");
     }
 
     /// The bug this guards: a session that ran on DeepSeek and then moved to

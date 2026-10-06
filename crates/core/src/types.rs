@@ -67,7 +67,8 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     /// The reply's `reasoning_details`, kept opaque as the array the server
-    /// sent (parts it streamed under one index merged into one entry).
+    /// sent (the text or summary of a block it streamed in parts under one
+    /// index joined into one entry; every other part kept whole).
     /// OpenRouter carries signed and encrypted reasoning here, which the
     /// plain text above cannot, and a model whose reasoning is signed needs
     /// it back. Absent when the server sent none, like the two above, or an
