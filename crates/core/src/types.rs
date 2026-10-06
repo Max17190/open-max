@@ -70,7 +70,8 @@ pub struct ChatMessage {
     /// sent (parts it streamed under one index merged into one entry).
     /// OpenRouter carries signed and encrypted reasoning here, which the
     /// plain text above cannot, and a model whose reasoning is signed needs
-    /// it back. Absent when the server sent none, like the two above.
+    /// it back. Absent when the server sent none, like the two above, or an
+    /// empty array, which carries nothing to send back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_details: Option<Box<RawValue>>,
     /// Which endpoint produced the reasoning above and the `extra_content`

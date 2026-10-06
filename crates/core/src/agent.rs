@@ -6787,6 +6787,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// One read as OpenRouter streams it for a model that does not reason:
+    /// `"reasoning":null,"reasoning_details":[]` on every delta.
+    const EMPTY_DETAILS_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning\":null,\"reasoning_details\":[]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":null,\"reasoning\":null,\"reasoning_details\":[],\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":null,\"reasoning_details\":[]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// An empty `reasoning_details` array carries no signature, so it is no
+    /// details at all. Kept, it would stamp every reply of a model that does
+    /// not reason and change the bytes of its session file and of every later
+    /// request. The reply is saved and sent exactly as it was before details
+    /// were kept.
+    #[tokio::test]
+    async fn an_empty_reasoning_details_array_changes_no_bytes() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, bodies) = capturing_endpoint(EMPTY_DETAILS_TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        // An indexed session, so the reply reaches the session file.
+        let id = &sessions::create(&core, project.display().to_string()).unwrap().id;
+        turns_across(&core, &mut rx, id, &project, &[(&base_url, "what is in a.txt")]).await;
+
+        let plain = r#"{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}"#;
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one tool step, then the answer");
+        assert!(bodies[1].contains(plain), "the reply must go back as before: {}", bodies[1]);
+        assert!(!bodies[1].contains("reasoning_details"), "{}", bodies[1]);
+
+        let messages = transcript(&core, id).await;
+        let reply = messages.iter().find(|m| m.tool_calls.is_some()).unwrap();
+        assert!(reply.reasoning_details.is_none() && reply.reasoning_origin.is_none());
+        let saved = std::fs::read_to_string(core.data_dir.join("sessions").join(format!("{id}.messages.json"))).unwrap();
+        assert!(saved.lines().any(|line| line == plain), "the session file must hold the reply as before: {saved}");
+        assert!(!saved.contains("reasoning_details") && !saved.contains("reasoning_origin"), "{saved}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The unapproved-source card carries the probe evidence when a
     /// sandboxed example of exactly these bytes passed - prepended to the
     /// detail so clipping cannot hide it - and stays evidence-free for a

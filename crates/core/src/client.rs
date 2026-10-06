@@ -247,8 +247,10 @@ pub struct CompletionResult {
     pub reasoning_content: Option<String>,
     pub reasoning: Option<String>,
     /// The reply's `reasoning_details`, for the same message under the same
-    /// stamp: set when the server sent the key as an array, even an empty
-    /// one, since that too is what it expects back.
+    /// stamp: set when the server sent the key as an array with entries. An
+    /// empty one carries no signature, and OpenRouter sends it on every delta
+    /// of a model that does not reason, so it counts as absent: keeping it
+    /// would change the bytes of every such message on disk and on the wire.
     pub reasoning_details: Option<Box<RawValue>>,
     /// The server's reason, or `cancelled` (we stopped reading) or
     /// [`TRUNCATED`] (the server stopped writing without ever finishing).
@@ -671,8 +673,8 @@ async fn read_sse(
     // it. `None` until the server sends that key as a string, even an empty one.
     let mut reasoning_content: Option<String> = None;
     let mut reasoning: Option<String> = None;
-    // `None` until the server sends `reasoning_details` as an array.
-    let mut reasoning_details: Option<Vec<Value>> = None;
+    // Empty until the server sends `reasoning_details` with an entry in it.
+    let mut reasoning_details: Vec<Value> = Vec::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
     // Did the server ever say it was done (a `[DONE]` line or a
@@ -791,9 +793,8 @@ async fn read_sse(
                 }
             }
             if let Some(Value::Array(parts)) = delta.reasoning_details {
-                let details = reasoning_details.get_or_insert_with(Vec::new);
                 for part in parts {
-                    merge_reasoning_detail(details, part);
+                    merge_reasoning_detail(&mut reasoning_details, part);
                 }
             }
             if let Some(calls) = delta.tool_calls {
@@ -839,7 +840,7 @@ async fn read_sse(
         finish_reason = "tool_calls".into();
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
-    let reasoning_details = reasoning_details.and_then(|details| serde_json::value::to_raw_value(&details).ok());
+    let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
     (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
 }
 
@@ -1014,7 +1015,7 @@ fn parse_complete_response(
         .map(UsageJson::into_usage);
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
-    let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.is_array()).and_then(opaque);
+    let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
     Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
 }
 
@@ -2505,8 +2506,9 @@ mod tests {
     /// later part. Those parts come back as one entry per block, with the
     /// signature; encrypted blobs, and a block with another `id`, stay
     /// separate entries even under a shared index, since joining them would
-    /// corrupt them. An array the server sent empty is kept and returned
-    /// empty; a key of another shape is ignored without losing the chunk.
+    /// corrupt them. An array the server sent empty carries no signature and
+    /// is no details at all, as if absent; a key of another shape is ignored
+    /// without losing the chunk.
     #[tokio::test]
     async fn streamed_reasoning_details_are_merged_by_index() {
         let detail = |parts: &str| format!("data: {{\"choices\":[{{\"delta\":{{\"reasoning_details\":{parts}}},\"finish_reason\":null}}]}}\n\n");
@@ -2532,18 +2534,21 @@ mod tests {
             ])
         );
 
-        let empty = stream_once(&[detail("[]"), "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n".into()].concat()).await;
-        assert_eq!(empty.reasoning_details.as_deref().map(RawValue::get), Some("[]"));
+        // OpenRouter sends an empty array on every delta of a model that
+        // does not reason.
+        let empty = stream_once(&[detail("[]"), detail("[]"), "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"reasoning\":null,\"reasoning_details\":[]},\"finish_reason\":\"stop\"}]}\n\n".into()].concat()).await;
+        assert_eq!(empty.content, "ok");
+        assert!(empty.reasoning_details.is_none(), "{:?}", empty.reasoning_details);
         let absent = stream_once("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n").await;
         assert!(absent.reasoning_details.is_none());
 
-        // A one-shot JSON reply keeps its array as sent, an empty one too.
+        // A one-shot JSON reply keeps its array as sent, unless it is empty.
         let one_shot = |details: Value| {
             let reply = json!({"choices":[{"message":{"content":"ok","reasoning_details":details}}]});
             parse_complete_response(&reply, &mut |_| {}).unwrap().reasoning_details.map(|d| d.get().to_string())
         };
         assert_eq!(one_shot(json!([{"data": "x", "type": "reasoning.encrypted"}])).as_deref(), Some(r#"[{"data":"x","type":"reasoning.encrypted"}]"#));
-        assert_eq!(one_shot(json!([])).as_deref(), Some("[]"));
+        assert_eq!(one_shot(json!([])), None);
         assert_eq!(one_shot(Value::Null), None);
         assert_eq!(one_shot(json!("text")), None);
 
