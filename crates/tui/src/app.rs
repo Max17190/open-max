@@ -100,10 +100,10 @@ pub(crate) use crossterm::event::{
 /// What woke the loop, for paint pacing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wake {
-    /// A key, paste, mouse, or focus event with no more input queued behind
-    /// it. Input with more still queued (a paste without bracketed paste)
-    /// wakes as `Other`, so a burst coalesces at the cap instead of painting
-    /// once per event.
+    /// Input the next frame shows (see `App::on_input`) with no more input
+    /// queued behind it. Input with more still queued (a paste without
+    /// bracketed paste) wakes as `Other`, so a burst coalesces at the cap
+    /// instead of painting once per event.
     Input,
     /// Agent events, ticks, the file index, or a deferred paint coming due.
     Other,
@@ -504,8 +504,8 @@ pub async fn run(
     // Paint pacing (see `paint_pacing`): a redraw that may not paint yet is
     // deferred to `draw_deadline` and coalesced with everything else that
     // lands before it. `resize_hold` is the end of the current resize storm.
-    // `input_unpainted` marks input handled since the last paint, and
-    // `last_drew_input` whether that paint showed some.
+    // `input_unpainted` marks input handled since the last paint that the
+    // next frame shows, and `last_drew_input` whether that paint showed some.
     // An idle app has no armed tick and may receive no terminal event after
     // entering the alternate screen. Paint once before waiting so first launch
     // can never sit on a blank frame until the user presses a key.
@@ -548,10 +548,11 @@ pub async fn run(
                         resize_hold = Some(Instant::now() + RESIZE_DEBOUNCE);
                     }
                     Some(e) => {
-                        app.on_term_event(e).await?;
-                        input_unpainted = true;
-                        if input_rx.is_empty() {
-                            wake = Wake::Input;
+                        if app.on_input(e).await? {
+                            input_unpainted = true;
+                            if input_rx.is_empty() {
+                                wake = Wake::Input;
+                            }
                         }
                     }
                     None => app.should_quit = true,
@@ -924,6 +925,19 @@ impl App {
     }
 
     // ---------- terminal events ----------
+
+    /// Handles one input event and returns whether the next frame shows it,
+    /// which paint pacing counts as input awaiting a paint. A focus report
+    /// changes nothing on screen, even while an agent frame waits, and an
+    /// event that leaves nothing to paint (an ignored button) shows nothing
+    /// either. Counted as input, either would make the next agent frame
+    /// record that it showed input, and a keystroke within the cap of that
+    /// frame would wait for the cap instead of echoing at once.
+    async fn on_input(&mut self, event: TermEvent) -> std::io::Result<bool> {
+        let focus = matches!(event, TermEvent::FocusGained | TermEvent::FocusLost);
+        self.on_term_event(event).await?;
+        Ok(!focus && self.dirty.any())
+    }
 
     async fn on_term_event(&mut self, event: TermEvent) -> std::io::Result<()> {
         match event {
@@ -4630,6 +4644,36 @@ mod tests {
                 frames.len()
             );
         }
+    }
+
+    /// Input that changes nothing on screen is not input a frame shows. A
+    /// focus report counted as such made the next agent frame record that it
+    /// showed input, so a keystroke within the cap of that frame waited for
+    /// the cap instead of echoing at once.
+    #[tokio::test]
+    async fn input_that_changes_nothing_does_not_hold_back_the_next_keystroke() {
+        let (mut app, dir) = app_fixture();
+        // Mid-stream: an agent frame waits for the cap when focus returns.
+        app.dirty.clear();
+        app.dirty.mark_tail();
+        let mut input_unpainted = app.on_input(TermEvent::FocusGained).await.unwrap();
+        // An ignored button on a clean frame leaves nothing to paint either.
+        app.dirty.clear();
+        let right = mouse(MouseEventKind::Down(MouseButton::Right), 1, 1);
+        input_unpainted |= app.on_input(right).await.unwrap();
+        assert!(!app.dirty.any());
+        // The agent frame paints, then the user types 1 ms later.
+        let last_drew_input = std::mem::take(&mut input_unpainted);
+        let painted = std::time::Instant::now();
+        let key_at = painted + Duration::from_millis(1);
+        assert_eq!(
+            paint_pacing(key_at, painted, last_drew_input, None, Wake::Input),
+            Paint::Now,
+            "the first keystroke after a focus report waited for the cap",
+        );
+        let key = TermEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.on_input(key).await.unwrap(), "a keystroke is input its frame shows");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Only presses, releases, drags, and the wheel are handled, so the
