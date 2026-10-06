@@ -223,7 +223,9 @@ honest proof that a freshly written tool actually runs.
 Running an approved example is running the tool: an unsandboxed host process
 in the project root with no snapshot taken. So it passes the same gates a turn
 applies. The project must be trusted. Outside `auto`, a human must have approved the tool
-file's exact bytes with `openmax --approve <path>`, `pre_tool_use` hooks must
+file's exact bytes and the project-local code it runs with
+`openmax --approve <path>` (a script edited since then is probed in the
+sandbox, as an unapproved tool is), `pre_tool_use` hooks must
 allow the call, permission rules must admit it (`deny` refuses, and so does
 `ask` outside auto: nothing here can prompt, so write `effect = "allow"` for a tool whose
 example should run unattended), and `approval_mode` still governs
