@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every action is pinned to a full commit SHA, with its release in a trailing
+# comment: a tag can be moved to other code after review, and these jobs run
+# with this repository's token, while a commit cannot change under its SHA.
+# Bump an action by replacing both. rust-toolchain is versioned by branch
+# (stable, 1.97.0, ...), not by release, and its v1 tag follows master, so it is
+# pinned to a dated master commit and given its toolchain as an input.
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -16,13 +22,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test
         run: cargo test --workspace --locked
@@ -37,39 +45,66 @@ jobs:
       # Bumping this is a deliberate commit that carries its own fixes.
       - name: Clippy toolchain
         if: matrix.os == 'ubuntu-latest'
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
+          toolchain: 1.97.0
           components: clippy
 
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
         run: cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
 
+  # A release tag builds every target in Cargo.toml's [workspace.metadata.dist]
+  # and publishes nothing unless all of them build, so each one is built here,
+  # on the runner `dist plan` assigns it and with the packages the release
+  # installs there, and a target that stops building fails the pull request
+  # that broke it instead of the next release. crates/tui/tests/release.rs
+  # keeps this matrix equal to the published targets and their runners.
   release-build:
-    name: Release build (Ubuntu)
-    runs-on: ubuntu-latest
+    name: Release build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # ring compiles C, and a musl target needs musl's C toolchain for it.
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
+      # Only main saves these: six targets' caches from every pull request
+      # would push main's out of the repository's cache space.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
-        run: cargo build --release -p openmax --locked
+        run: cargo build --release -p openmax --locked --target ${{ matrix.target }}
 
-      # Soft gate: warn via workflow annotation, but do not fail the job.
+      # Hard gate: the job fails when the binary is over its target's budget.
+      # The budgets, and how to raise one, are in the script.
       - name: Check binary size
-        run: |
-          BIN=target/release/openmax
-          MAX_BYTES=$((8 * 1024 * 1024))
-          SIZE=$(stat -c%s "$BIN")
-          SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $SIZE / 1024 / 1024}")
-          echo "Binary size: ${SIZE_MB} MB ($SIZE bytes); soft limit: 8 MB"
-          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
-            echo "::warning::openmax binary is ${SIZE_MB} MB (soft limit: 8 MB)"
-          else
-            echo "Binary size is within the 8 MB soft limit."
-          fi
+        run: scripts/check-binary-size.sh ${{ matrix.target }} target/${{ matrix.target }}/release/openmax

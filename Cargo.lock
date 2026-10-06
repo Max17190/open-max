@@ -957,6 +957,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "unicode-segmentation",
  "unicode-width",
 ]

@@ -48,7 +48,10 @@ libc = "0.2"
 # fails the job because the checked-in workflow no longer matches what it would
 # generate. The cost is that dist will no longer update the workflow for us, so
 # bumping cargo-dist-version below means regenerating by hand, re-applying the
-# verification step, and re-pinning its hash in the same commit.
+# verification step, and re-pinning its hash in the same commit. A bump can
+# also move a target to another runner: CI's release-build matrix builds each
+# target where `dist plan --output-format=json` assigns it, so re-sync it, and
+# the default runners crates/tui/tests/release.rs records, too.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
