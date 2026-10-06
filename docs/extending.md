@@ -71,12 +71,12 @@ echo '{"tool":"list_allowed_directories","arguments":{}}' |
 argument summary (`--json` prints the full definitions). `--mcp-call` reads
 the call on stdin and prints the result's text; a tool error or a protocol
 error exits 1 with the reason. Each run starts the server, performs the
-initialize handshake, makes one request, and stops it, with every wait
-bounded by `--mcp-timeout` (default 30 seconds). A server that needs a
-persistent session is not supported yet. `openmax --spec mcp` prints the
-recipe the agent follows: the proxy tool's TOML, with the server's
-credentials granted through `env`, and the shell lines that generate the
-skill.
+initialize handshake, makes one request (every page of tools/list, or one
+tools/call), and stops it, with every wait bounded by `--mcp-timeout`
+(default 30 seconds). A server that needs a persistent session is not
+supported yet. `openmax --spec mcp` prints the recipe the agent follows: the
+proxy tool's TOML, with the server's credentials granted through `env`, and
+the shell lines that generate the skill.
 
 ## Memory
 
