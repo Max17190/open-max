@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use open_max_core::config::ApprovalMode;
+
 fn openmax_bin() -> &'static str {
     env!("CARGO_BIN_EXE_openmax")
 }
@@ -179,6 +181,13 @@ fn write_settings_with_mode(home: &Path, base_url: &str, approval_mode: &str) {
         ),
     )
     .unwrap();
+}
+
+/// Trust `project` as a human who answers `a` at the trust prompt does. For
+/// tests of the ask gates: `--trust-project` records auto, which skips them.
+fn trust_in_ask(project: &Path, home: &Path) {
+    let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), project, ApprovalMode::Ask);
+    assert_eq!(grant.unwrap().1, Some(ApprovalMode::Ask));
 }
 
 fn cmd(project: &Path, home: &Path) -> Command {
@@ -370,8 +379,9 @@ fn stdio_handshake(
 /// in the context the docs give it: a line commented `from a terminal` gets a
 /// terminal on stdin, any other line gets the pipe a frontend or a CI job
 /// hands it. No variable is set that the line does not set itself. Success is
-/// the documented result: the run itself works, the project is trusted, and a
-/// frontend's plain `openmax --stdio` then starts with no flag.
+/// the documented result: the run itself works, the project is trusted in
+/// auto although settings.json says ask, and a frontend's plain
+/// `openmax --stdio` then starts with no flag.
 fn run_documented_trust_command(line: &str) -> Result<(), String> {
     let (words, comment) = shell_words(line);
     let at = words.iter().position(|w| w == "openmax").ok_or("no openmax invocation")?;
@@ -422,6 +432,10 @@ fn run_documented_trust_command(line: &str) -> Result<(), String> {
     }
     if open_max_core::trust::is_trusted(&home.join(".openmax"), &project) != Ok(true) {
         return Err("the project is not trusted afterwards".into());
+    }
+    let mode = approval_mode(&home, &project);
+    if mode != ApprovalMode::Auto {
+        return Err(format!("the grant left the project in {}, not auto", mode.as_str()));
     }
     let mut frontend = plain_cmd(&project, &home)
         .arg("--stdio")
@@ -517,6 +531,51 @@ fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
     let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
 
+/// The mode a fresh launch in `project` runs under: the project's saved
+/// choice or an enclosing one, else the settings value.
+fn approval_mode(home: &Path, project: &Path) -> ApprovalMode {
+    open_max_core::state::Core::new(home.join(".openmax")).unwrap().0.approval_mode(project)
+}
+
+/// `--trust-project` records auto for the project in the same trust.json
+/// write as the trust itself, so a newly trusted project runs in auto even
+/// where settings.json says ask (as most files do without the user choosing
+/// it: every settings save writes the whole file). A project trusted before
+/// grants recorded a mode is not granted again: it keeps resolving to the
+/// settings value. An agent-spawned process still can neither trust nor
+/// record a mode.
+#[test]
+fn trust_project_records_auto_for_a_project_it_newly_trusts() {
+    let (project, home) = fresh_dirs("trust-mode");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto, "{stderr}");
+    assert!(stderr.contains("auto") && stderr.contains("/approvals"), "the grant must say what it recorded: {stderr}");
+
+    let earlier = project.parent().unwrap().join("earlier");
+    std::fs::create_dir_all(&earlier).unwrap();
+    open_max_core::trust::trust_project(&home.join(".openmax"), &earlier).unwrap();
+    let out = cmd(&earlier, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(approval_mode(&home, &earlier), ApprovalMode::Ask, "no retroactive mode: {stderr}");
+    assert!(stderr.contains("already trusted") && stderr.contains("unchanged"), "{stderr}");
+
+    let spawned = project.parent().unwrap().join("spawned");
+    std::fs::create_dir_all(&spawned).unwrap();
+    let out = cmd(&spawned, &home)
+        .env("OPENMAX_SESSION", "parent")
+        .args(["--trust-project", "-p", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &spawned), Ok(false));
+    let store = std::fs::read_to_string(home.join(".openmax/trust.json")).unwrap();
+    let spawned = std::fs::canonicalize(&spawned).unwrap();
+    assert!(!store.contains(spawned.to_str().unwrap()), "an agent-spawned grant recorded state: {store}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 #[test]
 fn an_untrusted_project_fails_closed_with_exit_3() {
     let (project, home) = fresh_dirs("trust");
@@ -598,8 +657,8 @@ fn run_examples_is_gated_and_reported_through_json() {
     assert_eq!(out.status.code(), Some(1));
     assert!(messages(&json(&out)).contains("not trusted"), "{}", messages(&json(&out)));
 
-    // Trust it (the endpoint is dead, so the turn fails after trust is stored).
-    cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    // Trust it in ask: the sandbox and approval gates below are ask's.
+    trust_in_ask(&project, &home);
 
     // Trusted but unapproved: each example probes in a sandbox with zero
     // host authority instead of refusing flat. The harmless prover passes
@@ -1213,8 +1272,9 @@ fn two_calls_to_an_unapproved_tool_cannot_batch_past_the_gate() {
     )
     .unwrap();
 
+    trust_in_ask(&project, &home);
     let out = cmd(&project, &home)
-        .args(["--trust-project", "--json", "-p", "peek twice"])
+        .args(["--json", "-p", "peek twice"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1269,8 +1329,9 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
     )
     .unwrap();
 
+    trust_in_ask(&project, &home);
     let out = cmd(&project, &home)
-        .args(["--trust-project", "--json", "-p", "peek at it"])
+        .args(["--json", "-p", "peek at it"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1772,25 +1833,9 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
         (sse_text("done"), true),
     ]);
     write_settings_with_mode(&home, &base_url, "ask");
-    // Trust as the human first (attested), then run the nested session the
-    // way an agent's bash would: session marker set, piped stdio, no tty.
-    {
-        // Trust without spending a scripted turn: handshake, then quit.
-        let mut trust = cmd(&project, &home)
-            .args(["--trust-project", "--stdio"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = trust.stdin.take().unwrap();
-        let mut hello = String::new();
-        BufReader::new(trust.stdout.take().unwrap()).read_line(&mut hello).unwrap();
-        assert!(hello.contains("\"hello\""), "{hello}");
-        writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
-        drop(stdin);
-        assert_eq!(trust.wait().unwrap().code(), Some(0));
-    }
+    // Trust as the human first, in ask, then run the nested session the way
+    // an agent's bash would: session marker set, piped stdio, no tty.
+    trust_in_ask(&project, &home);
     let mut child = cmd(&project, &home)
         .env("OPENMAX_SESSION", "1")
         .env_remove("OPENMAX_HUMAN_ATTEST")
@@ -1858,8 +1903,8 @@ fn an_unapproved_sandbox_non_pass_warns_and_does_not_fail_the_check() {
         "name = \"nonpass\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo boom >&2; exit 3\"]\n\n[example]\n",
     )
     .unwrap();
-    // Trust so examples run (the endpoint is dead; trust is stored regardless).
-    cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    // Trust in ask so examples run unapproved, as sandboxed probes.
+    trust_in_ask(&project, &home);
 
     let out = cmd(&project, &home).args(["--check", "--run-examples"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1924,7 +1969,9 @@ fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
         (sse_text("done"), true),
     ]);
     write_settings(&home, &base_url);
-    let mut select = cmd(&project, &home).args(["--trust-project", "--stdio"])
+    // Trusted in ask, so the auto below is the frontend's selection, not the grant's.
+    trust_in_ask(&project, &home);
+    let mut select = cmd(&project, &home).arg("--stdio")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     select.stdin.take().unwrap().write_all(b"{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}\n{\"cmd\":\"quit\"}\n").unwrap();
     let selected = select.wait_with_output().unwrap();
