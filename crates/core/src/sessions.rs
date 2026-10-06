@@ -142,16 +142,25 @@ pub(crate) struct StoreMemo {
     transcripts: HashMap<String, Stamp>,
 }
 
-/// A file as a stat sees it, its length and modification time. Every write
-/// moves one of them, short of an edit that keeps the length within one tick
-/// of the file system's clock.
-type Stamp = (u64, SystemTime);
+/// A file as a stat sees it: its length, modification time, and status-change
+/// time. The modification time alone can be put back, as a copy or sync that
+/// preserves timestamps does, while the change time moves on every write and
+/// every timestamp change and no caller can set it. Only a write that keeps
+/// the length within one tick of the file system's clock goes unseen.
+type Stamp = (u64, SystemTime, (i64, i64));
 
 /// None when the file is missing or cannot be stat'ed, which matches no
 /// remembered stamp, so whatever is there gets read.
 fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let changed = (0, 0);
+    Some((meta.len(), meta.modified().ok()?, changed))
 }
 
 /// Record the transcript this process just validated or wrote, as stamped
@@ -2769,8 +2778,8 @@ mod tests {
     /// whole transcript there made each turn cost more than the one before,
     /// though between turns an owned transcript changes only when something
     /// outside openmax writes it. So a turn start reads it again only once
-    /// its length or modification time moved past what this process last
-    /// validated or wrote, and damage written in between is still refused.
+    /// its stat stamp moved past what this process last validated or wrote,
+    /// and damage written in between is still refused.
     #[test]
     fn a_turn_start_rereads_an_owned_transcript_only_after_it_changed() {
         let dir = std::env::temp_dir().join(format!("openmax-turn-start-{}", uuid::Uuid::new_v4()));
@@ -2828,6 +2837,55 @@ mod tests {
         let reason = attach(&core, &id).unwrap_err();
         assert!(reason.contains("damaged at line 4"), "{reason}");
         assert_eq!(reads(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A stamp of length and modification time alone misses an outside edit
+    /// that keeps the length and puts the modification time back, as a copy
+    /// or sync that preserves timestamps does. The status-change time moves
+    /// on every write and every timestamp change, and no caller can set it,
+    /// so the next turn start still reads such an edit and refuses its damage.
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_start_rereads_a_transcript_edited_with_its_modification_time_restored() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("openmax-restored-mtime-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let messages = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        assert!(save_messages(&core, &id, &messages, &mut 0, false));
+        let path = messages_path(&core, &id);
+        let saved = std::fs::metadata(&path).unwrap();
+        // The edit lands on a later tick of the file system's clock than the
+        // save, as an edit by hand or by another program does: within one
+        // tick no stat field tells two writes of the same length apart.
+        let probe = dir.join("clock-probe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for tick in 0u64.. {
+            std::fs::write(&probe, tick.to_string()).unwrap();
+            let probed = std::fs::metadata(&probe).unwrap();
+            if (probed.ctime(), probed.ctime_nsec()) > (saved.ctime(), saved.ctime_nsec()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the file system clock never moved");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let mut damaged = std::fs::read(&path).unwrap();
+        let second_line = damaged.iter().position(|&b| b == b'\n').unwrap() + 1;
+        damaged[second_line] = b'x';
+        std::fs::write(&path, &damaged).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(saved.modified().unwrap()).unwrap();
+        let edited = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (edited.len(), edited.modified().unwrap()),
+            (saved.len(), saved.modified().unwrap()),
+            "the edit kept the length and modification time"
+        );
+
+        let reason = attach(&core, &id).unwrap_err();
+        assert!(reason.contains("damaged at line 2"), "{reason}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
