@@ -57,6 +57,10 @@ use crate::types::{estimate_tokens, AgentEvent, ChatMessage, ToolCall};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
+/// A batched call that auto admitted without asking about its content, still
+/// waiting for a slot when the mode left auto. Not declined: requested
+/// again, it takes the serial path, which raises the card.
+const MODE_LEFT_AUTO_BEFORE_START: &str = "Execution mode changed before this call started; this call was not executed. Request it again under the current mode.";
 /// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
 /// with no perceptible latency.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
@@ -707,6 +711,8 @@ async fn execute_readonly_batch(
 ) -> bool {
     let mut parsed: Vec<Value> = Vec::with_capacity(calls.len());
     let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
+    // Per call: admitted by auto without the content question being asked.
+    let mut unasked: Vec<bool> = Vec::with_capacity(calls.len());
     for call in calls {
         let name = call.function.name.as_str();
         // batchable_call already validated the JSON; Null (impossible) would
@@ -782,8 +788,9 @@ async fn execute_readonly_batch(
         // the serial path can prompt; if one still lands here, block rather
         // than run unapproved host code outside auto. The sites share one
         // predicate, so the batch path cannot drift away from the gate again.
+        let auto = ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto;
         let block = block.or_else(|| {
-            if ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto { return None; }
+            if auto { return None; }
             unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
                 |source| tools::ToolOutcome {
                     ok: false,
@@ -793,15 +800,18 @@ async fn execute_readonly_batch(
                 },
             )
         });
+        unasked.push(auto && block.is_none());
         blocked.push(block);
     }
 
+    let core = ctx.core;
     let data_dir = &ctx.core.data_dir;
     let futures: Vec<_> = calls
         .iter()
         .zip(parsed.iter())
         .zip(blocked.iter())
-        .map(|((call, args), block)| {
+        .zip(unasked.iter().copied())
+        .map(|(((call, args), block), unasked)| {
             let name = call.function.name.clone();
             let args = args.clone();
             let root = ctx.project_root.to_path_buf();
@@ -811,19 +821,36 @@ async fn execute_readonly_batch(
             let blocked_outcome = block.clone();
             async move {
                 if let Some(outcome) = blocked_outcome {
-                    return outcome;
+                    return (outcome, false);
                 }
-                registry.execute(&name, &args, data_dir, &root, caps, cancel).await
+                // Calls past the parallelism cap start only as earlier ones
+                // end, long after admission. Auto admitted this one without
+                // asking about its content; if the mode has left auto since,
+                // unapproved content must not start on that admission, or it
+                // runs under ask with no card. Read live, as the serial path
+                // reads the mode right before each call.
+                if unasked
+                    && core.approval_mode(&root) != ApprovalMode::Auto
+                    && unapproved_capability(&registry, data_dir, &root, &name).is_some()
+                {
+                    let refused = tools::ToolOutcome {
+                        ok: false,
+                        output: MODE_LEFT_AUTO_BEFORE_START.into(),
+                        ..Default::default()
+                    };
+                    return (refused, false);
+                }
+                (registry.execute(&name, &args, data_dir, &root, caps, cancel).await, true)
             }
         })
         .collect();
     let outcomes = collect_bounded(futures, ctx.parallelism).await;
 
     for (i, call) in calls.iter().enumerate() {
-        let outcome = &outcomes[i];
+        let (outcome, ran) = &outcomes[i];
         let name = call.function.name.as_str();
         let args = &parsed[i];
-        if blocked[i].is_none() {
+        if *ran {
             count_usage(ctx.usage, ctx.registry, ctx.project_root, name, args, outcome.ok);
             let failures = ctx
                 .hooks
@@ -7695,6 +7722,105 @@ mod tests {
         assert!(
             ends.iter().all(|(_, ok, _)| *ok),
             "no call may be declined without the human being asked: {ends:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A batch admits every call up front and then starts them behind the
+    /// parallelism cap, so a call can wait in the queue long after auto let
+    /// it in. Auto never asked whether the tool's content is approved; if
+    /// the user leaves auto while the call waits, starting it anyway runs
+    /// unapproved host code under ask with no card. Here the first call
+    /// holds the only slot while the mode turns to ask, and the queued
+    /// second call of the same unapproved tool must not start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_queued_batch_call_does_not_start_once_the_mode_leaves_auto() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        // Each run is counted, and a run says it started, then waits for the
+        // test to switch the mode before it ends.
+        let runs = project.join("runs");
+        let started = project.join("started");
+        let go = project.join("go");
+        let script = format!(
+            "echo run >> '{}'; touch '{}'; for i in $(seq 1 600); do [ -f '{}' ] && exit 0; sleep 0.05; done; exit 1",
+            runs.display(),
+            started.display(),
+            go.display(),
+        );
+        std::fs::write(
+            project.join(".openmax/tools/peek.toml"),
+            format!(
+                "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", {}]\n",
+                // A JSON string literal is a valid TOML basic string here.
+                serde_json::Value::String(script)
+            ),
+        )
+        .unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
+
+        let reply = tool_calls_sse(&[
+            ("c1", "peek", serde_json::json!({})),
+            ("c2", "peek", serde_json::json!({})),
+        ]);
+        let (base_url, _requests) = scripted_endpoint(&[&reply, STOP_SSE]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_agent_iterations = 3;
+            // One slot: the second call waits until the first ends.
+            s.max_parallel_tools = 1;
+        }
+
+        start_turn(core.clone(), "sess-batch-queue".into(), project.clone(), "peek".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut switched = false;
+        let mut cards = 0;
+        let mut ends: Vec<(String, bool, String)> = Vec::new();
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if !switched && started.exists() {
+                core.set_project_approval_mode(&project, ApprovalMode::Ask).unwrap();
+                std::fs::write(&go, "").unwrap();
+                switched = true;
+            }
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        cards += 1;
+                        core.respond_approval(&approval_id, false);
+                    }
+                    AgentEvent::ToolEnd { call_id, ok, output } => ends.push((call_id, ok, output)),
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) => panic!("event stream closed before Done"),
+                Err(_) => {}
+            }
+        }
+        assert!(switched, "the first call never started: {ends:?}");
+        assert_eq!(stop.as_deref(), Some("stop"), "{ends:?}");
+        assert_eq!(cards, 0, "a batch raises no card: {ends:?}");
+        let ran = std::fs::read_to_string(&runs).unwrap_or_default().lines().count();
+        assert_eq!(ran, 1, "the queued call ran under ask without a card: {ends:?}");
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        assert!(ends[0].0 == "c1" && ends[0].1, "{ends:?}");
+        assert_eq!(
+            (ends[1].0.as_str(), ends[1].1, ends[1].2.as_str()),
+            ("c2", false, MODE_LEFT_AUTO_BEFORE_START),
+            "the queued call is refused with a reason to ask again"
         );
 
         let _ = std::fs::remove_dir_all(dir);
