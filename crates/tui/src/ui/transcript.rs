@@ -376,6 +376,19 @@ pub struct WrapAnchor {
     lines_into_block: usize,
 }
 
+/// A painted history row by its content: the block and the row in that
+/// block's wrap. An absolute row index names other text once a block above
+/// it changes height, and wrapping does that between any two frames (a
+/// scroll wraps the blocks it crosses), so a pointer event resolved through
+/// the last frame's indices would land rows above the text under the
+/// pointer. This names the painted text until its own block changes. See
+/// [`Transcript::paint_rows`] and [`Transcript::line_of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRef {
+    block: usize,
+    row: usize,
+}
+
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
@@ -865,7 +878,8 @@ impl Transcript {
     /// the rows of `selected_bi`, which receive a quiet background. Text
     /// selection is painted later as a buffer overlay. Every block in the
     /// range must be wrapped, which [`Self::settle_view`] does for the
-    /// viewport.
+    /// viewport. Appends to `painted` what each row shows, in order, for
+    /// pointer events to find it again.
     pub fn paint_rows(
         &mut self,
         buf: &mut Buffer,
@@ -873,6 +887,7 @@ impl Transcript {
         start: usize,
         end: usize,
         selected_bi: Option<usize>,
+        painted: &mut Vec<Option<RowRef>>,
     ) {
         self.ensure_index();
         let end = end.min(self.total).min(start.saturating_add(usize::from(area.height)));
@@ -886,7 +901,8 @@ impl Transcript {
             }
             let block = &self.blocks[bi];
             debug_assert!(block.is_wrapped_at(self.width), "painted an unwrapped block");
-            if let Some(line) = block.cache.get(li).filter(|_| block.is_wrapped_at(self.width)) {
+            let line = block.cache.get(li).filter(|_| block.is_wrapped_at(self.width));
+            if let Some(line) = line {
                 let row = Rect { y, height: 1, ..area };
                 if selected_bi == Some(bi) {
                     let line = surface_line(line.clone(), self.width, theme::BORDER());
@@ -895,8 +911,22 @@ impl Transcript {
                     paint_line(buf, row, None, line);
                 }
             }
+            painted.push(line.map(|_| RowRef { block: bi, row: li }));
             li += 1;
         }
+    }
+
+    /// The current index of a row a frame painted, or None once its block
+    /// is gone or no longer wraps to that row. Pointer events address rows
+    /// this way, so wrapping between the paint and the event cannot move
+    /// what they hit.
+    pub fn line_of(&mut self, at: RowRef) -> Option<usize> {
+        let block = self.blocks.get(at.block)?;
+        if !block.is_wrapped_at(self.width) || at.row >= block.cache.len() {
+            return None;
+        }
+        self.ensure_index();
+        Some(self.block_starts[at.block] + at.row)
     }
 
     pub fn len(&mut self) -> usize {
@@ -2631,8 +2661,13 @@ mod tests {
                 let mut lines = Vec::new();
                 t.fill_viewport(&mut lines, start, end, selected);
                 Paragraph::new(lines).render(area, &mut expected);
-                t.paint_rows(&mut painted, area, start, end, selected);
+                let mut rows = Vec::new();
+                t.paint_rows(&mut painted, area, start, end, selected, &mut rows);
                 assert_eq!(painted, expected, "rows {start}..{end}, selected {selected:?}");
+                // Each painted row is found again at the line it painted.
+                let found: Vec<_> =
+                    rows.iter().map(|at| at.and_then(|at| t.line_of(at))).collect();
+                assert_eq!(found, (start..end).map(Some).collect::<Vec<_>>());
             }
         }
     }

@@ -30,7 +30,7 @@ use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::text::paint_line;
 use crate::ui::transcript::{
-    wrap_lines, Term, Transcript,
+    wrap_lines, RowRef, Term, Transcript,
 };
 use crate::ui::{context, extensions, markdown, model_picker};
 
@@ -421,9 +421,11 @@ pub struct App {
     /// running metadata, so a token only rebuilds that suffix.
     tail_stable_len: usize,
     tail_buf: Vec<Line<'static>>,
-    /// Absolute transcript line for each painted conversation row (None for
-    /// the sticky header and the live tail).
-    chat_line_map: Vec<Option<usize>>,
+    /// What each painted conversation row shows (None for the sticky header
+    /// and the live tail), by block and row in it: input handled before the
+    /// next paint can wrap history above the view, which moves every
+    /// absolute row index below it.
+    chat_line_map: Vec<Option<RowRef>>,
     chat_draw_area: Rect,
     /// Where the composer text last painted, so the wheel and the mouse can
     /// tell the prompt apart from the conversation above it.
@@ -1581,12 +1583,15 @@ impl App {
         (cell, row)
     }
 
-    fn transcript_position(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+    /// The transcript line and column under the pointer: the text the last
+    /// frame painted there, wherever it sits now.
+    fn transcript_position(&mut self, column: u16, row: u16) -> Option<(usize, usize)> {
         if !rect_contains(self.chat_draw_area, column, row) {
             return None;
         }
         let rendered_row = row.saturating_sub(self.chat_draw_area.y) as usize;
-        let line = self.chat_line_map.get(rendered_row).copied().flatten()?;
+        let painted = self.chat_line_map.get(rendered_row).copied().flatten()?;
+        let line = self.transcript.line_of(painted)?;
         let x = column.saturating_sub(self.chat_draw_area.x) as usize;
         Some((line, x))
     }
@@ -3473,7 +3478,8 @@ impl App {
     ///
     /// Only the blocks the viewport shows are wrapped, and every row is
     /// painted straight from its block's cache or the tail: a frame clones
-    /// no lines.
+    /// no lines except the selected block's, which take the selection
+    /// surface.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let layout_started = Instant::now();
         let mut content_w = area.width;
@@ -3577,10 +3583,6 @@ impl App {
             .take(visible - sticky_rows - history_rows)
             .count();
         let rows = sticky_rows + history_rows + tail_rows;
-        self.chat_line_map.clear();
-        self.chat_line_map.extend(std::iter::repeat_n(None, sticky_rows));
-        self.chat_line_map.extend((start..view_end).map(Some));
-        self.chat_line_map.extend(std::iter::repeat_n(None, tail_rows));
 
         let pad = area.height.saturating_sub(rows as u16);
         let draw_area = Rect {
@@ -3606,6 +3608,8 @@ impl App {
         } else {
             None
         };
+        self.chat_line_map.clear();
+        self.chat_line_map.extend(std::iter::repeat_n(None, sticky_rows));
         self.transcript.paint_rows(
             frame.buffer_mut(),
             Rect {
@@ -3615,7 +3619,10 @@ impl App {
             start,
             view_end,
             selected_bi,
+            &mut self.chat_line_map,
         );
+        self.chat_line_map.resize(sticky_rows + history_rows, None);
+        self.chat_line_map.extend(std::iter::repeat_n(None, tail_rows));
         let tail_from = start.max(hist_len) - hist_len;
         for (row, line) in self.tail_buf[tail_from..tail_from + tail_rows].iter().enumerate() {
             paint_line(
@@ -4272,14 +4279,14 @@ fn truncate_replay_output(output: &str) -> String {
 fn paint_text_selection(
     buffer: &mut ratatui::buffer::Buffer,
     transcript: &mut Transcript,
-    line_map: &[Option<usize>],
+    line_map: &[Option<RowRef>],
     area: Rect,
 ) {
     // One palette read for the whole overlay: the accessor takes the theme
     // lock, and the inner loop touches every selected cell per frame.
     let select_bg = theme::SELECT();
-    for (row, line_idx) in line_map.iter().copied().enumerate() {
-        let Some(line_idx) = line_idx else {
+    for (row, painted) in line_map.iter().copied().enumerate() {
+        let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
             continue;
         };
         let Some((start_col, end_col)) = transcript.selection_columns(line_idx) else {
@@ -4571,7 +4578,6 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use ratatui::text::Line;
-    use ratatui::widgets::{Paragraph, Widget};
     use ratatui::Terminal;
     use serde_json::json;
     use std::fs;
@@ -5152,12 +5158,11 @@ mod tests {
         assert!(transcript.update_text_selection_at(0, 7));
         transcript.finish_text_selection();
 
-        let mut lines = Vec::new();
-        transcript.fill_viewport(&mut lines, 0, 1, None);
         let area = Rect::new(0, 0, 20, 1);
         let mut buffer = Buffer::empty(area);
-        Paragraph::new(lines).render(area, &mut buffer);
-        paint_text_selection(&mut buffer, &mut transcript, &[Some(0)], area);
+        let mut rows = Vec::new();
+        transcript.paint_rows(&mut buffer, area, 0, 1, None, &mut rows);
+        paint_text_selection(&mut buffer, &mut transcript, &rows, area);
 
         assert_eq!(buffer[(1, 0)].bg, theme::USER_BG());
         assert_eq!(buffer[(2, 0)].bg, theme::SELECT());
@@ -7057,6 +7062,53 @@ mod tests {
             "80 rows allocated {tall} times per frame, 20 rows {short}"
         );
         assert!(tall < 80, "a frame showing 80 rows allocated {tall} times");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A press, drag, and release select the text the last frame painted
+    /// under the pointer, even when wheel input handled before the next
+    /// paint wrapped history above the view. Wrapping a block changes its
+    /// height and so the index of every row below it: resolved through the
+    /// last frame's row indices, the gesture selected and copied text from
+    /// rows above the one under the pointer.
+    #[tokio::test]
+    async fn a_selection_after_an_unpainted_scroll_takes_the_painted_text() {
+        let (mut app, dir) = app_fixture();
+        // A word to a row leaves most of each row empty, so every block
+        // wraps to far more rows than its estimate counts.
+        for block in 0..300 {
+            let words: Vec<String> =
+                (0..10).map(|word| format!("w{block:04}x{word:02}abcdefg")).collect();
+            app.transcript.push_user(vec![Line::from(words.join(" "))]);
+        }
+        for step in 0u16..12 {
+            let painted = render_app(&mut app, 29, 30);
+            let area = app.chat_draw_area;
+            // Wheel input queued behind the frame, handled before the next.
+            for _ in 0..1 + step % 3 {
+                app.on_term_event(mouse(MouseEventKind::ScrollUp, area.x, area.y))
+                    .await
+                    .unwrap();
+            }
+            // Below the sticky header row, a new row each step so no two
+            // presses make a double click.
+            let row = area.y + 1 + (step * 7) % (area.height - 1);
+            let (from, to) = (area.x + 2, area.x + 11);
+            for (kind, column) in [
+                (MouseEventKind::Down(MouseButton::Left), from),
+                (MouseEventKind::Drag(MouseButton::Left), to),
+                (MouseEventKind::Up(MouseButton::Left), to),
+            ] {
+                app.on_term_event(mouse(kind, column, row)).await.unwrap();
+            }
+            let shown: String = (from..=to).map(|x| painted[(x, row)].symbol()).collect();
+            assert_eq!(
+                app.transcript.selected_text().unwrap_or_default(),
+                shown.trim(),
+                "step {step}: the copy is not the text painted on row {row}"
+            );
+            app.transcript.clear_text_selection();
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
