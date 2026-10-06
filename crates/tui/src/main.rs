@@ -31,8 +31,9 @@ options:
       --json             with --print, emit AgentEvent envelopes as JSONL;
                          with --check, emit findings as one JSON array
       --stdio            bidirectional JSONL session: commands on stdin
-                         ({\"cmd\":\"user\"|\"approve\"|\"cancel\"|\"quit\"}), AgentEvent
-                         envelopes on stdout; the custom-frontend protocol
+                         ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
+                         \"reload\"|\"cancel\"|\"quit\"}), AgentEvent envelopes
+                         on stdout; the custom-frontend protocol
       --recall <query>   search this project's past sessions, archives,
                          compaction digests, and memories; prints ranked
                          excerpts, each cited as file:line so the full record
@@ -155,12 +156,12 @@ where
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
             Long("run-examples") => out.run_examples = true,
-            Long("approve") => out.approve = Some(parser.value()?.string()?),
-            Long("forget") => out.forget = Some(parser.value()?.string()?),
+            Long("approve") => set_once(&mut out.approve, "--approve", &mut parser)?,
+            Long("forget") => set_once(&mut out.forget, "--forget", &mut parser)?,
             Long("ledger") => out.ledger = true,
-            Long("recall") => out.recall = Some(parser.value()?.string()?),
+            Long("recall") => set_once(&mut out.recall, "--recall", &mut parser)?,
             Long("ledger-repair") => out.ledger_repair = true,
-            Long("spec") => out.spec = Some(parser.value()?.string()?),
+            Long("spec") => set_once(&mut out.spec, "--spec", &mut parser)?,
             Long("trust-project") => out.trust_project = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
@@ -181,6 +182,22 @@ where
         flush_prompt_tokens(&mut out.prompts, &mut current)?;
     }
     Ok(out)
+}
+
+/// Store the value of an operation that acts on one thing. A second
+/// occurrence would replace the first, which was then dropped without a word
+/// (`--approve a --approve b` approved only b and exited 0), so it is refused.
+fn set_once(
+    slot: &mut Option<String>,
+    flag: &str,
+    parser: &mut lexopt::Parser,
+) -> Result<(), lexopt::Error> {
+    use lexopt::ValueExt;
+    if slot.is_some() {
+        return Err(lexopt::Error::from(format!("{flag} given twice; run one at a time")));
+    }
+    *slot = Some(parser.value()?.string()?);
+    Ok(())
 }
 
 fn flush_prompt_tokens(
@@ -247,6 +264,105 @@ fn approve_command(path: &std::path::Path) -> String {
     format!("openmax --approve {}", open_max_core::doctor::shell_quote(path))
 }
 
+/// Why a command line is refused before anything runs, or None.
+///
+/// `main` performs one operation, and every operation but a session exits
+/// when it is done, before the next one is considered. A second operation,
+/// or an option only another operation reads, was dropped without a word and
+/// the run exited as if that work had happened: `--check --ledger` printed
+/// history and exited 0 having validated nothing. Every combination of
+/// different flags is decided here, and each refusal names both sides of the
+/// conflict (one operation given twice is refused while parsing, by
+/// `set_once`). The destructure below is exhaustive, so a new `CliArgs` field
+/// stops compiling here until it is placed among the operations or options.
+fn refusal(cli: &CliArgs) -> Option<String> {
+    let CliArgs {
+        continue_session,
+        model,
+        provider,
+        print,
+        json,
+        stdio,
+        check,
+        run_examples,
+        approve,
+        forget,
+        ledger,
+        recall,
+        ledger_repair,
+        spec,
+        trust_project,
+        prompts,
+    } = cli;
+    // Each operation, named by its flag. `--check --stdio` is one operation
+    // of its own: validating a protocol stream on stdin.
+    let operations: Vec<&str> = [
+        (spec.is_some(), "--spec"),
+        (recall.is_some(), "--recall"),
+        (*ledger, "--ledger"),
+        (*ledger_repair, "--ledger-repair"),
+        (approve.is_some(), "--approve"),
+        (forget.is_some(), "--forget"),
+        (*check, if *stdio { "--check --stdio" } else { "--check" }),
+        (*stdio && !*check, "--stdio"),
+        (*print, "--print"),
+    ]
+    .into_iter()
+    .filter_map(|(on, flag)| on.then_some(flag))
+    .collect();
+    if let [first, second, ..] = operations.as_slice() {
+        return Some(format!("{first} and {second} are separate operations; run them one at a time"));
+    }
+    // None is the interactive session.
+    let operation = operations.first().copied();
+    // Each option and the operations that read it.
+    const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
+    let options: [(bool, &str, &[Option<&str>]); 6] = [
+        (*trust_project, "--trust-project", SESSIONS),
+        (*continue_session, "--continue", SESSIONS),
+        (model.is_some(), "--model", SESSIONS),
+        (provider.is_some(), "--provider", SESSIONS),
+        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall")]),
+        (*run_examples, "--run-examples", &[Some("--check")]),
+    ];
+    for (on, flag, readers) in options {
+        if !on || readers.contains(&operation) {
+            continue;
+        }
+        return Some(match operation {
+            Some(operation) => format!("{operation} does not use {flag}; run them separately"),
+            None => {
+                let readers: Vec<&str> = readers.iter().flatten().copied().collect();
+                let readers = match readers.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => format!("{}, or {last}", rest.join(", ")),
+                    _ => readers.concat(),
+                };
+                format!("{flag} requires {readers}")
+            }
+        });
+    }
+    if !prompts.is_empty() && operation != Some("--print") {
+        // With no operation named, a stray word is most likely a prompt
+        // missing its -p, so that refusal points at --print; beside a named
+        // operation it was most likely meant for that operation (a path
+        // after --check), so the refusal names the word instead. The word may
+        // be a filename a glob expanded, so it is flattened to one line.
+        let words = open_max_core::text::one_line(&prompts.join(" "));
+        return Some(match operation {
+            None => "unexpected arguments (use --print for headless)".to_string(),
+            Some(operation) => {
+                let stdin = match operation {
+                    "--stdio" => "; it reads commands on stdin",
+                    "--check --stdio" => "; it reads the stream on stdin",
+                    _ => "",
+                };
+                format!("{operation} takes no other arguments (got '{words}'){stdin}")
+            }
+        });
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = match parse_args() {
@@ -257,57 +373,8 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    if cli.json && !cli.print && !cli.check && cli.recall.is_none() {
-        eprintln!("openmax: --json requires --print, --check, or --recall\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // --recall prints one report and exits, like --spec: swallowing another
-    // requested operation would look like success for work that never ran.
-    if cli.recall.is_some()
-        && (cli.check
-            || cli.stdio
-            || cli.print
-            || cli.run_examples
-            || cli.trust_project
-            || cli.continue_session
-            || cli.ledger
-            || cli.spec.is_some()
-            || cli.model.is_some()
-            || cli.provider.is_some()
-            || !cli.prompts.is_empty())
-    {
-        eprintln!("openmax: --recall is a standalone operation; run other options separately\n\n{HELP}");
-        std::process::exit(2);
-    }
-    if cli.stdio && (cli.print || !cli.prompts.is_empty()) {
-        eprintln!("openmax: --stdio takes commands on stdin, not flags or prompts\n\n{HELP}");
-        std::process::exit(2);
-    }
-    if cli.check && cli.trust_project {
-        eprintln!("openmax: --check and --trust-project are separate operations\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // --spec prints one contract and exits; silently swallowing any other
-    // requested option (e.g. --spec hooks --check, or --spec tools -m qwen)
-    // would look like success for work that never ran.
-    if cli.spec.is_some()
-        && (cli.check
-            || cli.stdio
-            || cli.print
-            || cli.run_examples
-            || cli.trust_project
-            || cli.continue_session
-            || cli.model.is_some()
-            || cli.provider.is_some()
-            || !cli.prompts.is_empty())
-    {
-        eprintln!("openmax: --spec is a standalone operation; run other options separately\n\n{HELP}");
-        std::process::exit(2);
-    }
-    // Same reason: --run-examples only does anything under --check, and a run
-    // that executed no example must never exit 0 as if it had.
-    if cli.run_examples && !cli.check {
-        eprintln!("openmax: --run-examples requires --check\n\n{HELP}");
+    if let Some(reason) = refusal(&cli) {
+        eprintln!("openmax: {reason}\n\n{HELP}");
         std::process::exit(2);
     }
 
@@ -962,11 +1029,6 @@ async fn main() -> std::io::Result<()> {
         )
         .await;
         std::process::exit(code);
-    }
-
-    if !cli.prompts.is_empty() {
-        eprintln!("openmax: unexpected arguments (use --print for headless)\n\n{HELP}");
-        std::process::exit(2);
     }
 
     // Signals are routed before the terminal changes, so none of them can
@@ -2273,5 +2335,169 @@ mod tests {
     fn empty_print_group_is_rejected() {
         assert!(parse_args_from(["-p", "-p", "second"]).is_err());
         assert!(parse_args_from(["-p"]).is_err());
+    }
+
+    /// An operation that names one thing to act on, given twice, kept only
+    /// the second value: `--approve a.toml --approve b.toml` approved b.toml
+    /// alone and exited 0, leaving the gate in a.toml inert while the human
+    /// believed it approved.
+    #[test]
+    fn an_operation_given_twice_is_refused_naming_it() {
+        for flag in ["--approve", "--forget", "--spec", "--recall"] {
+            let err = parse_args_from([flag, "a", flag, "b"])
+                .err()
+                .unwrap_or_else(|| panic!("{flag} given twice must be refused"))
+                .to_string();
+            assert!(err.contains(flag) && err.contains("twice"), "{flag}: {err}");
+        }
+        // A model or provider given twice keeps the conventional last one.
+        let cli = parse_args_from(["-m", "a", "-m", "b", "--provider", "x", "--provider", "y"]).unwrap();
+        assert_eq!((cli.model.as_deref(), cli.provider.as_deref()), (Some("b"), Some("y")));
+    }
+
+    /// Every operation a command line can select, as its args and the name a
+    /// refusal gives it. `-p` comes last in any line built from these: the
+    /// tokens after it are its prompt. An empty name is the interactive
+    /// session.
+    const OPERATIONS: [(&[&str], &str); 11] = [
+        (&[], ""),
+        (&["--spec", "tools"], "--spec"),
+        (&["--recall", "q"], "--recall"),
+        (&["--ledger"], "--ledger"),
+        (&["--ledger-repair"], "--ledger-repair"),
+        (&["--approve", "f"], "--approve"),
+        (&["--forget", "f"], "--forget"),
+        (&["--check"], "--check"),
+        (&["--check", "--stdio"], "--check --stdio"),
+        (&["--stdio"], "--stdio"),
+        (&["-p", "x"], "--print"),
+    ];
+
+    /// Whether a refusal names `flag` as a whole flag, so `--ledger` is not
+    /// satisfied by `--ledger-repair`.
+    fn names(reason: &str, flag: &str) -> bool {
+        reason.match_indices(flag).any(|(at, _)| {
+            reason[at + flag.len()..].chars().next().is_none_or(|c| matches!(c, ' ' | ';' | ','))
+        })
+    }
+
+    fn refusal_of(args: &[&str]) -> Option<String> {
+        refusal(&parse_args_from(args.iter().copied()).unwrap())
+    }
+
+    /// Every pair of operations is refused before either runs, naming both:
+    /// each one exits when it is done, so the second was dropped and the run
+    /// exited as if it had happened (`--check --ledger` validated nothing and
+    /// exited 0).
+    #[test]
+    fn every_pair_of_operations_is_refused_naming_both() {
+        // The interactive session is what runs when no operation is named,
+        // so it cannot be paired, and `--check --stdio` is already one.
+        let operations: Vec<_> = OPERATIONS
+            .iter()
+            .filter(|(_, name)| !name.is_empty() && *name != "--check --stdio")
+            .collect();
+        for (i, (a, a_name)) in operations.iter().enumerate() {
+            assert_eq!(refusal_of(a), None, "{a:?} alone is a valid command line");
+            for (b, b_name) in &operations[i + 1..] {
+                let args: Vec<&str> = a.iter().chain(b.iter()).copied().collect();
+                let reason = refusal_of(&args);
+                if (*a_name, *b_name) == ("--check", "--stdio") {
+                    assert_eq!(reason, None, "--check --stdio validates a protocol stream");
+                    continue;
+                }
+                let reason = reason.unwrap_or_else(|| panic!("{args:?} must be refused"));
+                assert!(names(&reason, a_name) && names(&reason, b_name), "{args:?}: {reason}");
+            }
+        }
+        // A third operation is refused even beside the one valid pair.
+        let reason = refusal_of(&["--check", "--stdio", "--ledger"]).unwrap();
+        assert!(names(&reason, "--check --stdio") && names(&reason, "--ledger"), "{reason}");
+    }
+
+    /// An option only another operation reads was dropped as silently as a
+    /// second operation was (`--ledger -m x` exited 0 having used no model).
+    /// Each option is placed against every operation: refused, naming both,
+    /// wherever it would be ignored, and accepted wherever it is read.
+    #[test]
+    fn an_option_the_operation_does_not_read_is_refused_naming_both() {
+        let sessions: &[&str] = &["", "--stdio", "--print"];
+        let options: [(&[&str], &str, &[&str]); 7] = [
+            (&["--trust-project"], "--trust-project", sessions),
+            (&["--continue"], "--continue", sessions),
+            (&["-m", "m"], "--model", sessions),
+            (&["--provider", "p"], "--provider", sessions),
+            (&["--json"], "--json", &["--print", "--check", "--recall"]),
+            (&["--run-examples"], "--run-examples", &["--check"]),
+            // A bare word is a prompt, which only --print reads.
+            (&["extra"], "", &["--print"]),
+        ];
+        for (option, flag, readers) in options {
+            for (operation, name) in OPERATIONS {
+                let args: Vec<&str> = option.iter().chain(operation.iter()).copied().collect();
+                let reason = refusal_of(&args);
+                if readers.contains(&name) {
+                    assert_eq!(reason, None, "{args:?} is a valid command line");
+                    continue;
+                }
+                let reason = reason.unwrap_or_else(|| panic!("{args:?} must be refused"));
+                assert!(
+                    (flag.is_empty() || names(&reason, flag))
+                        && (name.is_empty() || names(&reason, name)),
+                    "{args:?}: {reason}"
+                );
+            }
+        }
+        // The combinations the docs show still run.
+        for args in [
+            &["--check", "--json", "--run-examples"][..],
+            &["--trust-project", "--continue", "-m", "m", "--provider", "p", "-p", "--json", "x"],
+            &["--trust-project", "--continue", "--stdio"],
+            &["--recall", "q", "--json"],
+        ] {
+            assert_eq!(refusal_of(args), None, "{args:?} is a valid command line");
+        }
+    }
+
+    /// With no operation named, a stray word is most likely a prompt missing
+    /// its -p, so that refusal points at --print. Beside a named operation it
+    /// is most likely meant for that operation (`--check x.toml`,
+    /// `--check --stdio stream.jsonl`), so pointing at --print sends the user
+    /// the wrong way: the refusal names the word instead, and an operation
+    /// that reads stdin says so.
+    #[test]
+    fn a_stray_word_beside_an_operation_is_named_not_sent_to_print() {
+        for (operation, name) in OPERATIONS {
+            if matches!(name, "" | "--print") {
+                continue;
+            }
+            let args: Vec<&str> = operation.iter().copied().chain(["stray.toml"]).collect();
+            let reason = refusal_of(&args).unwrap_or_else(|| panic!("{args:?} must be refused"));
+            assert!(
+                names(&reason, name) && reason.contains("'stray.toml'") && !reason.contains("--print"),
+                "{args:?}: {reason}"
+            );
+        }
+        for args in [&["--stdio", "x"][..], &["--check", "--stdio", "stream.jsonl"]] {
+            let reason = refusal_of(args).unwrap();
+            assert!(reason.contains("stdin"), "{args:?}: {reason}");
+        }
+        let reason = refusal_of(&["stray"]).unwrap();
+        assert!(reason.contains("--print"), "a stray word alone is likely a prompt: {reason}");
+    }
+
+    /// The refused word is often a filename a glob expanded (`--check *` in a
+    /// cloned repo), so its bytes are someone else's. Echoed raw, a newline in
+    /// it forged a second `openmax:` line after the refusal and an ESC
+    /// repainted the terminal, so the word is flattened to one line.
+    #[test]
+    fn a_refused_stray_word_cannot_break_out_of_its_line() {
+        let word = "x\nopenmax: validation passed\u{1b}[2J\u{2028}y";
+        let reason = refusal_of(&["--check", word]).unwrap();
+        assert!(
+            !reason.chars().any(|c| c.is_control() || c == '\u{2028}'),
+            "the refusal kept a line-breaking character: {reason:?}"
+        );
+        assert!(reason.contains("openmax: validation passed"), "the word is still named: {reason:?}");
     }
 }
