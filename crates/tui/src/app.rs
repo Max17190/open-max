@@ -28,6 +28,7 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
+use crate::ui::text::paint_line;
 use crate::ui::transcript::{
     wrap_lines, Term, Transcript,
 };
@@ -144,7 +145,8 @@ fn paint_pacing(
     }
 }
 
-/// Fine-grained redraw reasons so spinner ticks can skip history rebuilds.
+/// Fine-grained redraw reasons, so token and spinner frames can reuse the
+/// header and status lines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Dirty {
     /// Finished transcript (blocks, scroll, selection, fold).
@@ -195,18 +197,6 @@ impl Dirty {
     fn clear(&mut self) {
         *self = Self::default();
     }
-}
-
-/// Viewport fingerprint for reusing the history portion of `chat_buf`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HistReuseKey {
-    hist_len: usize,
-    start: usize,
-    hist_view_end: usize,
-    sticky: bool,
-    focus_scroll: bool,
-    selected: Option<usize>,
-    width: u16,
 }
 
 /// Chat-mode geometry. The input owns the terminal's bottom edge; every
@@ -431,11 +421,8 @@ pub struct App {
     /// running metadata, so a token only rebuilds that suffix.
     tail_stable_len: usize,
     tail_buf: Vec<Line<'static>>,
-    chat_buf: Vec<Line<'static>>,
-    /// Lines in `chat_buf` that are sticky + history (before live tail).
-    hist_prefix_len: usize,
-    hist_reuse_key: Option<HistReuseKey>,
-    /// Absolute transcript line for each rendered row in `chat_buf`.
+    /// Absolute transcript line for each painted conversation row (None for
+    /// the sticky header and the live tail).
     chat_line_map: Vec<Option<usize>>,
     chat_draw_area: Rect,
     /// Where the composer text last painted, so the wheel and the mouse can
@@ -722,9 +709,6 @@ impl App {
             tail_content_len: 0,
             tail_stable_len: 0,
             tail_buf: Vec::new(),
-            chat_buf: Vec::new(),
-            hist_prefix_len: 0,
-            hist_reuse_key: None,
             chat_line_map: Vec::new(),
             chat_draw_area: Rect::default(),
             composer_draw_area: Rect::default(),
@@ -942,8 +926,6 @@ impl App {
         self.tail_content_len = 0;
         self.tail_stable_len = 0;
         self.tail_buf.clear();
-        self.hist_prefix_len = 0;
-        self.hist_reuse_key = None;
         self.chat_line_map.clear();
         self.chat_draw_area = Rect::default();
         self.composer_draw_area = Rect::default();
@@ -3489,8 +3471,9 @@ impl App {
     /// Finished transcript plus the live tail, bottom anchored, honoring the
     /// scroll offset (0 follows the latest output).
     ///
-    /// When only the live tail is dirty (spinner / tokens), the history prefix
-    /// of `chat_buf` is reused and the tail is re-stitched.
+    /// Only the blocks the viewport shows are wrapped, and every row is
+    /// painted straight from its block's cache or the tail: a frame clones
+    /// no lines.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let layout_started = Instant::now();
         let mut content_w = area.width;
@@ -3501,7 +3484,6 @@ impl App {
             self.perf_selection_ms = 0.0;
             return;
         }
-        let chat_dirty = self.dirty.chat;
 
         // Start from the previous frame's scrollbar decision. Re-deciding
         // from the full width on every paint re-wrapped the entire
@@ -3511,7 +3493,7 @@ impl App {
         if self.scrollbar_reserved && area.width > 1 {
             content_w = area.width - 1;
         }
-        // A width change re-wraps every block, and the bottom-anchored
+        // A width change re-measures every block, and the bottom-anchored
         // offset would resolve to different content afterward. Anchor the
         // history line at the viewport bottom by content and restore it
         // after the re-wrap; positions inside the live tail keep the
@@ -3527,17 +3509,20 @@ impl App {
         self.transcript.set_width(content_w);
         let mut tail_len = self.rebuild_tail(content_w);
 
-        let mut hist_len = self.transcript.len();
-        let mut total = hist_len + tail_len;
         let visible = area.height as usize;
+        // Whether history overflows is exact even though most blocks are
+        // only estimated: an estimate never exceeds the wrap, and history
+        // short enough to fit is wrapped whole to count it.
+        let total = self
+            .transcript
+            .len_exact_up_to(visible.saturating_sub(tail_len))
+            + tail_len;
         if total > visible && content_w == area.width && area.width > 1 {
             // Overflow began: rewrap once with a dedicated one-cell track.
             self.scrollbar_reserved = true;
             content_w = area.width - 1;
             self.transcript.set_width(content_w);
             tail_len = self.rebuild_tail(content_w);
-            hist_len = self.transcript.len();
-            total = hist_len + tail_len;
         } else if total <= visible && content_w < area.width {
             // Fits again at the narrowed width, so it also fits at the full
             // width (a wider wrap never yields more lines): reclaim the
@@ -3546,8 +3531,6 @@ impl App {
             content_w = area.width;
             self.transcript.set_width(content_w);
             tail_len = self.rebuild_tail(content_w);
-            hist_len = self.transcript.len();
-            total = hist_len + tail_len;
         }
         // Keep a scrolled-up reader stationary as the live tail changes.
         // History pushes already bump the offset; the tail below history
@@ -3563,11 +3546,12 @@ impl App {
         }
         self.last_content_w = content_w;
         self.last_tail_len = tail_len;
+        // Wrap what the view shows, now that the offset says where it is.
+        self.transcript.settle_view(visible, tail_len);
+        let hist_len = self.transcript.len();
+        let total = hist_len + tail_len;
         if total == 0 && self.pending_approval.is_none() {
-            self.chat_buf.clear();
             self.chat_line_map.clear();
-            self.hist_prefix_len = 0;
-            self.hist_reuse_key = None;
             self.chat_draw_area = Rect::default();
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
@@ -3582,66 +3566,23 @@ impl App {
         let end = total - offset;
         let start = end.saturating_sub(visible);
 
-        // Fingerprint sticky presence without cloning spans; clone only if we rebuild.
-        let has_sticky = offset > 0 && self.transcript.has_sticky_user(start);
-        let focus_scroll = self.focus == Focus::Scrollback;
-        let selected = self.transcript.selected();
-        let hist_view_end = end.min(hist_len);
-        let reuse_key = HistReuseKey {
-            hist_len,
-            start,
-            hist_view_end,
-            sticky: has_sticky,
-            focus_scroll,
-            selected,
-            width: content_w,
-        };
+        // Rows top to bottom: the sticky user header while scrolled away
+        // from it, the history in view, then the live tail below it.
+        let sticky_rows = usize::from(offset > 0 && self.transcript.has_sticky_user(start));
+        let view_end = start
+            .saturating_add(visible - sticky_rows)
+            .min(end.min(hist_len));
+        let history_rows = view_end.saturating_sub(start);
+        let tail_rows = (start.max(hist_len)..end)
+            .take(visible - sticky_rows - history_rows)
+            .count();
+        let rows = sticky_rows + history_rows + tail_rows;
+        self.chat_line_map.clear();
+        self.chat_line_map.extend(std::iter::repeat_n(None, sticky_rows));
+        self.chat_line_map.extend((start..view_end).map(Some));
+        self.chat_line_map.extend(std::iter::repeat_n(None, tail_rows));
 
-        let rebuild_hist = chat_dirty
-            || self.hist_reuse_key != Some(reuse_key)
-            || self.hist_prefix_len > self.chat_buf.len();
-
-        if rebuild_hist {
-            self.chat_buf.clear();
-            self.chat_line_map.clear();
-            // One clone of sticky spans: take ownership and insert the gutter.
-            if has_sticky {
-                if let Some(mut s) = self.transcript.sticky_user_line(start) {
-                    s.spans
-                        .insert(0, Span::styled("❯ ", Style::default().fg(theme::DIM())));
-                    self.chat_buf.push(s);
-                    self.chat_line_map.push(None);
-                }
-            }
-            let budget = visible.saturating_sub(self.chat_buf.len());
-            let view_end = start.saturating_add(budget).min(hist_view_end);
-            let selected_bi = if focus_scroll { selected } else { None };
-            // Single clone per viewport history line (reuse path skips this).
-            self.transcript
-                .fill_viewport(&mut self.chat_buf, start, view_end, selected_bi);
-            self.chat_line_map.extend((start..view_end).map(Some));
-            self.hist_prefix_len = self.chat_buf.len();
-            self.hist_reuse_key = Some(reuse_key);
-        } else {
-            self.chat_buf.truncate(self.hist_prefix_len);
-            self.chat_line_map.truncate(self.hist_prefix_len);
-        }
-
-        // Stitch visible tail after the history prefix.
-        let budget = visible.saturating_sub(self.chat_buf.len());
-        let mut idx = start.max(hist_len);
-        let mut taken = 0usize;
-        while taken < budget && idx < end {
-            let ti = idx - hist_len;
-            if ti < self.tail_buf.len() {
-                self.chat_buf.push(self.tail_buf[ti].clone());
-                self.chat_line_map.push(None);
-            }
-            idx += 1;
-            taken += 1;
-        }
-
-        let pad = area.height.saturating_sub(self.chat_buf.len() as u16);
+        let pad = area.height.saturating_sub(rows as u16);
         let draw_area = Rect {
             x: area.x,
             y: area.y + pad,
@@ -3649,7 +3590,41 @@ impl App {
             height: area.height - pad,
         };
         self.chat_draw_area = draw_area;
-        Paragraph::new(self.chat_buf.as_slice()).render(draw_area, frame.buffer_mut());
+        let row_at = |row: usize| Rect {
+            y: draw_area.y + row as u16,
+            height: 1,
+            ..draw_area
+        };
+        if sticky_rows > 0 {
+            if let Some(line) = self.transcript.sticky_user_line(start) {
+                let gutter = Span::styled("❯ ", Style::default().fg(theme::DIM()));
+                paint_line(frame.buffer_mut(), row_at(0), Some(&gutter), line);
+            }
+        }
+        let selected_bi = if self.focus == Focus::Scrollback {
+            self.transcript.selected()
+        } else {
+            None
+        };
+        self.transcript.paint_rows(
+            frame.buffer_mut(),
+            Rect {
+                height: history_rows as u16,
+                ..row_at(sticky_rows)
+            },
+            start,
+            view_end,
+            selected_bi,
+        );
+        let tail_from = start.max(hist_len) - hist_len;
+        for (row, line) in self.tail_buf[tail_from..tail_from + tail_rows].iter().enumerate() {
+            paint_line(
+                frame.buffer_mut(),
+                row_at(sticky_rows + history_rows + row),
+                None,
+                line,
+            );
+        }
         self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
 
         let selection_started = Instant::now();
@@ -6412,6 +6387,50 @@ mod tests {
         }
     }
 
+    /// First-paint, resize, and steady-frame cost at ten thousand blocks:
+    /// the frames that wrapped the whole history before blocks wrapped
+    /// lazily, and the frame that cloned every visible row. Not a
+    /// correctness test; run with:
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_resize_and_first_paint
+    #[test]
+    #[ignore]
+    fn measure_resize_and_first_paint_at_scale() {
+        use std::time::Instant;
+        const ROWS: u16 = 45;
+        let (mut app, dir) = app_fixture();
+        push_long_history(&mut app, 10_000);
+        let frame_at = |app: &mut App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, ROWS)).unwrap();
+            app.dirty.mark_chat();
+            let allocations = crate::allocations();
+            let started = Instant::now();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            (ms, crate::allocations() - allocations)
+        };
+        let (first_ms, first_allocs) = frame_at(&mut app, 140);
+        // A window dragged narrower and wider: every frame a new width.
+        let mut resize = Vec::new();
+        for width in [120, 139, 100, 141, 90, 133, 72, 140, 110, 125] {
+            resize.push(frame_at(&mut app, width));
+        }
+        let mut steady = Vec::new();
+        for _ in 0..50 {
+            steady.push(frame_at(&mut app, 125));
+        }
+        let worst = |samples: &[(f64, u64)]| {
+            samples.iter().fold((0f64, 0u64), |(ms, n), &(m, a)| (ms.max(m), n.max(a)))
+        };
+        let (resize_ms, resize_allocs) = worst(&resize);
+        let (steady_ms, steady_allocs) = worst(&steady);
+        println!(
+            "MEASURE 10000 blocks, {ROWS} rows: first paint {first_ms:.3} ms / {first_allocs} allocs, \
+             resize max {resize_ms:.3} ms / {resize_allocs} allocs, \
+             steady max {steady_ms:.3} ms / {steady_allocs} allocs"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The approval timeout is persisted without the `Error:` prefix
     /// (agent::tool_message_content keeps it verbatim so the model reads the
     /// stop instruction), so replay must classify it as the failure it was:
@@ -6773,6 +6792,271 @@ mod tests {
             render_app(&mut app, 40, 6);
         }
         assert_eq!(app.transcript.rewraps, settled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A long history, as a resumed marathon session leaves it: prose that
+    /// wraps at narrow widths, folded and failed tool cards, and notices.
+    fn push_long_history(app: &mut App, blocks: usize) {
+        let output = "src/ledger.rs:42: let hash = sha256(&bytes); // a grep or test log line\n"
+            .repeat(6);
+        for index in 0..blocks {
+            match index % 4 {
+                0 => app.insert_user_block(&format!(
+                    "turn {index}: inspect the ledger reconciliation and fix the failing test"
+                )),
+                1 => app.transcript.push_assistant(crate::ui::markdown::render(&format!(
+                    "Reply {index} with **markdown** long enough to wrap below a hundred \
+                     columns, a list:\n\n- alpha item\n- beta item\n\n```rust\nlet value = \
+                     compute(input);\n```"
+                ))),
+                2 => {
+                    let ok = index % 8 == 2;
+                    let compact =
+                        crate::ui::tool_card::tool_block("bash", "cargo test", ok, &output, None);
+                    app.transcript.push_tool(compact, output.clone(), ok);
+                }
+                _ => app.transcript.push(vec![Line::from(format!("history line {index}"))]),
+            }
+        }
+    }
+
+    /// A width change, the first paint of a long history, and a replay into
+    /// a painted window wrap only the blocks the viewport shows. Wrapping the
+    /// whole history made each of them linear in the session's length, every
+    /// block's wrap and its allocations on the UI loop in one frame. Every
+    /// block is at least one row, so a viewport of `ROWS` rows shows at most
+    /// `ROWS` blocks.
+    #[test]
+    fn resize_first_paint_and_replay_wrap_only_the_blocks_in_view() {
+        const BLOCKS: usize = 10_000;
+        const ROWS: u16 = 40;
+        let (mut app, dir) = app_fixture();
+        push_long_history(&mut app, BLOCKS);
+
+        let wraps_during = |app: &mut App, width: u16| {
+            let before = crate::ui::transcript::block_wraps();
+            render_app(app, width, ROWS);
+            crate::ui::transcript::block_wraps() - before
+        };
+        let first_paint = wraps_during(&mut app, 100);
+        assert!(
+            first_paint <= usize::from(ROWS),
+            "the first paint wrapped {first_paint} of {BLOCKS} blocks"
+        );
+        for width in [72, 130, 99] {
+            let resize = wraps_during(&mut app, width);
+            assert!(
+                resize <= usize::from(ROWS),
+                "a resize to {width} columns wrapped {resize} of {BLOCKS} blocks"
+            );
+        }
+
+        // Replay pushes every persisted message at the painted width.
+        let before = crate::ui::transcript::block_wraps();
+        push_long_history(&mut app, BLOCKS);
+        let replay = crate::ui::transcript::block_wraps() - before;
+        let next_paint = wraps_during(&mut app, 99);
+        assert!(
+            replay + next_paint <= usize::from(ROWS),
+            "a replay wrapped {replay} blocks and its paint {next_paint}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// One thing a reader or the agent does to the conversation view.
+    #[derive(Clone, Copy, Debug)]
+    enum ViewStep {
+        Size(u16, u16),
+        Up(usize),
+        Down(usize),
+        Top,
+        Follow,
+        Arrive(usize),
+        Stream,
+        Done,
+        Find(usize),
+        Prev,
+        Fold,
+        Expand,
+        Pop,
+        Focus,
+    }
+
+    fn apply_view_step(app: &mut App, step: ViewStep, index: usize) {
+        match step {
+            ViewStep::Size(..) => {}
+            ViewStep::Up(n) => app.transcript.scroll_up(n),
+            ViewStep::Down(n) => app.transcript.scroll_down(n),
+            ViewStep::Top => app.transcript.select_first(),
+            ViewStep::Follow => app.transcript.follow(),
+            ViewStep::Arrive(kind) => {
+                let text = format!(
+                    "arrival {index} while scrolled, long enough to wrap at narrow widths"
+                );
+                match kind % 3 {
+                    0 => app.transcript.push_assistant(crate::ui::markdown::render(&text)),
+                    1 => app.insert_user_block(&text),
+                    _ => {
+                        let output = format!("{text}\n").repeat(4);
+                        let compact = crate::ui::tool_card::tool_block(
+                            "bash", "cargo test", false, &output, None,
+                        );
+                        app.transcript.push_tool(compact, output, false);
+                    }
+                }
+            }
+            ViewStep::Stream => app.on_agent_event(AgentEvent::Token {
+                text: format!("streamed line {index} of a reply that wraps when narrow\n"),
+            }),
+            ViewStep::Done => {
+                let text = app.stream_text.clone();
+                app.on_agent_event(AgentEvent::MessageDone { text });
+            }
+            ViewStep::Find(block) => app.transcript.select_find_match(block),
+            ViewStep::Prev => app.transcript.select_prev(),
+            ViewStep::Fold => {
+                app.transcript.toggle_fold_selected();
+            }
+            ViewStep::Expand => {
+                app.transcript.expand_last_tool();
+            }
+            ViewStep::Pop => {
+                app.transcript.pop_last_user();
+            }
+            ViewStep::Focus => {
+                app.focus = match app.focus {
+                    Focus::Composer => Focus::Scrollback,
+                    Focus::Scrollback => Focus::Composer,
+                };
+            }
+        }
+    }
+
+    /// Paint `steps` into an app that wraps lazily and one that wraps every
+    /// block up front, both starting from `history` blocks, and require the
+    /// same frame after every step. Only the scrollbar marker, a proportion
+    /// of the estimated total, may differ.
+    fn assert_lazy_paints_like_eager(history: usize, steps: &[ViewStep]) {
+        let (mut lazy, lazy_dir) = app_fixture();
+        let (mut eager, eager_dir) = app_fixture();
+        eager.transcript.eager = true;
+        for app in [&mut lazy, &mut eager] {
+            push_long_history(app, history);
+        }
+        let (mut width, mut height) = (100, 30);
+        for (index, &step) in steps.iter().enumerate() {
+            if let ViewStep::Size(w, h) = step {
+                (width, height) = (w, h);
+            }
+            for app in [&mut lazy, &mut eager] {
+                apply_view_step(app, step, index);
+            }
+            // The header row names each fixture's own directory.
+            let painted = |app: &mut App| -> Vec<String> {
+                rows(&render_app(app, width, height))
+                    .into_iter()
+                    .skip(1)
+                    .map(|row| row.replace('▐', " "))
+                    .collect()
+            };
+            assert_eq!(
+                painted(&mut lazy),
+                painted(&mut eager),
+                "{history} blocks, step {index} ({step:?}) painted differently at {width}x{height}"
+            );
+        }
+        fs::remove_dir_all(lazy_dir).unwrap();
+        fs::remove_dir_all(eager_dir).unwrap();
+    }
+
+    /// `count` seeded steps of every kind over a history of `blocks` blocks.
+    fn random_view_steps(seed: u64, count: usize, blocks: usize) -> Vec<ViewStep> {
+        use ViewStep::*;
+        let mut seed = seed;
+        let mut roll = |bound: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % bound
+        };
+        (0..count)
+            .map(|_| match roll(22) {
+                0 | 1 => Size(20 + roll(121) as u16, 6 + roll(35) as u16),
+                2..=5 => Up(1 + roll(80)),
+                6..=9 => Down(1 + roll(80)),
+                10 => Top,
+                11 => Follow,
+                12 => Arrive(roll(3)),
+                13 | 14 => Stream,
+                15 => Done,
+                16 => Find(roll(blocks + 20)),
+                17 => Prev,
+                18 => Fold,
+                19 => Expand,
+                20 => Pop,
+                _ => Focus,
+            })
+            .collect()
+    }
+
+    /// Lazy wrapping is invisible: across scrolls, resizes, arrivals while
+    /// scrolled up, a streamed reply, find, block navigation, folds, and a
+    /// removed prompt, every frame paints exactly what wrapping every block
+    /// up front paints. Blocks off screen count their estimated heights, so
+    /// this pins that a scroll moves by exactly the rows it names and that
+    /// an estimate turning exact never moves what a scrolled reader is
+    /// looking at. A scripted walk, then seeded random ones over a long
+    /// history and over one short enough to fit on screen.
+    #[test]
+    fn lazy_wrapping_paints_exactly_what_eager_wrapping_paints() {
+        use ViewStep::*;
+        let scripted = [
+            Size(100, 30), Up(45), Size(40, 30), Down(3), Down(3), Down(3), Down(9),
+            Up(200), Size(72, 24), Top, Down(7), Size(120, 24), Down(13), Size(50, 24),
+            Arrive(0), Arrive(1), Arrive(2), Down(20), Down(20), Down(20), Stream, Up(30),
+            Stream, Size(64, 18), Stream, Down(5), Done, Down(40), Down(40), Follow,
+            Size(90, 20), Up(100), Size(33, 20), Down(25), Follow, Stream, Stream,
+            Focus, Find(37), Prev, Prev, Fold, Size(45, 16), Find(150), Done, Follow,
+        ];
+        assert_lazy_paints_like_eager(400, &scripted);
+        for seed in [1, 2] {
+            assert_lazy_paints_like_eager(400, &random_view_steps(seed, 300, 400));
+            assert_lazy_paints_like_eager(6, &random_view_steps(seed, 300, 6));
+        }
+    }
+
+    /// Heap allocations of one frame that repaints the conversation, after
+    /// earlier frames settled wrapping, the scrollbar, and every cache.
+    fn repaint_allocations(app: &mut App, width: u16, height: u16) -> u64 {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        for _ in 0..2 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            app.dirty.clear();
+        }
+        app.dirty.mark_chat();
+        let before = crate::allocations();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        crate::allocations() - before
+    }
+
+    /// A steady frame paints the visible rows straight from the block
+    /// caches. Cloning every visible line into a frame-sized vector, and
+    /// again into the paragraph that painted it, cost allocations per
+    /// visible row on every frame. So a taller window may not allocate more
+    /// per frame than a short one, and a frame allocates less than once per
+    /// row it shows.
+    #[test]
+    fn steady_frames_allocate_nothing_per_visible_row() {
+        let (mut app, dir) = app_fixture();
+        push_long_history(&mut app, 10_000);
+        let short = repaint_allocations(&mut app, 100, 20);
+        let tall = repaint_allocations(&mut app, 100, 80);
+        assert!(
+            tall <= short,
+            "80 rows allocated {tall} times per frame, 20 rows {short}"
+        );
+        assert!(tall < 80, "a frame showing 80 rows allocated {tall} times");
         fs::remove_dir_all(dir).unwrap();
     }
 
