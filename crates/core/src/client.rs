@@ -35,6 +35,7 @@
 //! A stream that ends without `[DONE]` and without a `finish_reason` is
 //! reported as truncated rather than treated as a complete reply.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -80,8 +81,10 @@ struct StreamOptions {
 
 /// The transcript as one endpoint receives it, borrowed so a request never
 /// copies it. Each message goes out as it serializes on disk, except that
-/// reasoning goes only to the endpoint that produced it (`origin` matches
-/// the message's `reasoning_origin`), and the stamp itself never goes.
+/// reasoning, `reasoning_details`, and each tool call's `extra_content` go
+/// only to the endpoint that produced them (`origin` matches the message's
+/// `reasoning_origin`), and the stamp itself never goes. What does go is
+/// the stored bytes, unchanged.
 struct WireMessages<'a> {
     messages: &'a [ChatMessage],
     origin: &'a str,
@@ -94,10 +97,11 @@ impl Serialize for WireMessages<'_> {
             WireMessage {
                 role: &m.role,
                 content: m.content.as_deref(),
-                tool_calls: m.tool_calls.as_deref(),
+                tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| replay),
                 reasoning: m.reasoning.as_deref().filter(|_| replay),
+                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
             }
         }))
     }
@@ -111,13 +115,45 @@ struct WireMessage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<&'a [ToolCall]>,
+    tool_calls: Option<WireToolCalls<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<&'a RawValue>,
+}
+
+/// One message's tool calls on the wire, each carrying its `extra_content`
+/// only when `replay` says the receiver produced it.
+struct WireToolCalls<'a> {
+    calls: &'a [ToolCall],
+    replay: bool,
+}
+
+impl Serialize for WireToolCalls<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.calls.iter().map(|c| WireToolCall {
+            id: &c.id,
+            kind: &c.kind,
+            function: &c.function,
+            extra_content: c.extra_content.as_deref().filter(|_| self.replay),
+        }))
+    }
+}
+
+/// One tool call on the wire. Fields, order, and skip rules follow
+/// `ToolCall`, so a call without `extra_content` keeps its exact bytes.
+#[derive(Serialize)]
+struct WireToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    function: &'a ToolCallFunction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_content: Option<&'a RawValue>,
 }
 
 /// Serialize the chat-completion request body once. Honors multi-provider
@@ -211,6 +247,12 @@ pub struct CompletionResult {
     /// string (`reasoning_fields` says which).
     pub reasoning_content: Option<String>,
     pub reasoning: Option<String>,
+    /// The reply's `reasoning_details`, for the same message under the same
+    /// stamp: set when the server sent the key as an array with entries. An
+    /// empty one carries no signature, and OpenRouter sends it on every delta
+    /// of a model that does not reason, so it counts as absent: keeping it
+    /// would change the bytes of every such message on disk and on the wire.
+    pub reasoning_details: Option<Box<RawValue>>,
     /// The server's reason, or `cancelled` (we stopped reading) or
     /// [`TRUNCATED`] (the server stopped writing without ever finishing).
     pub finish_reason: String,
@@ -249,6 +291,7 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+    extra_content: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +351,9 @@ struct StreamDeltaJson {
     content: Option<String>,
     reasoning_content: Option<String>,
     reasoning: Option<String>,
+    // Kept untyped, so an entry of a shape this client does not expect
+    // cannot fail the whole chunk and the content beside it.
+    reasoning_details: Option<Value>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -316,6 +362,8 @@ struct ToolCallDelta {
     index: Option<u64>,
     id: Option<String>,
     function: Option<ToolCallFnDelta>,
+    // Opaque: any JSON value parses, so it cannot fail the chunk either.
+    extra_content: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -626,6 +674,9 @@ async fn read_sse(
     // it. `None` until the server sends that key as a string, even an empty one.
     let mut reasoning_content: Option<String> = None;
     let mut reasoning: Option<String> = None;
+    // Empty until the server sends `reasoning_details` with an entry in it.
+    let mut reasoning_details: Vec<Value> = Vec::new();
+    let mut open_details = OpenDetails::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
     // Did the server ever say it was done (a `[DONE]` line or a
@@ -743,6 +794,11 @@ async fn read_sse(
                     on_delta(StreamDelta::Reasoning(text));
                 }
             }
+            if let Some(Value::Array(parts)) = delta.reasoning_details {
+                for part in parts {
+                    merge_reasoning_detail(&mut reasoning_details, &mut open_details, part);
+                }
+            }
             if let Some(calls) = delta.tool_calls {
                 for tc in calls {
                     let idx = tc.index.unwrap_or(0) as usize;
@@ -765,6 +821,9 @@ async fn read_sse(
                             partials[idx].arguments.push_str(&args);
                         }
                     }
+                    if let Some(extra) = tc.extra_content {
+                        partials[idx].extra_content = Some(extra);
+                    }
                 }
             }
         }
@@ -783,7 +842,65 @@ async fn read_sse(
         finish_reason = "tool_calls".into();
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage }, unfinished)
+    let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
+}
+
+/// Where each text or summary block of a streaming reply's
+/// `reasoning_details` has its latest entry, keyed by the block's `index` and
+/// the field its text streams in, so a part finds the entry it continues in
+/// one lookup. The server decides how many parts a stream has: a scan of the
+/// entries kept so far would make a stream of parts that each start a new
+/// block cost time quadratic in its length.
+type OpenDetails = HashMap<(u64, &'static str), usize>;
+
+/// Fold one streamed `reasoning_details` part into the reply's entries.
+/// OpenRouter streams a text or summary block in parts that share its
+/// `index` and `type`: the text arrives in pieces, and fields such as the
+/// signature arrive null at first and set in a later part. Such a part
+/// continues the latest entry with the same `index` and `type`: its text is
+/// appended, and a value it carries fills a field still null or empty. A
+/// part whose `id` conflicts with that entry's starts a new entry instead,
+/// which later parts of its block continue. Any other part (an encrypted
+/// blob, a type this client does not know, an entry without an index)
+/// arrives whole and is kept as its own entry, since joining two such blobs
+/// would corrupt both.
+fn merge_reasoning_detail(details: &mut Vec<Value>, open: &mut OpenDetails, part: Value) {
+    let text_key = match part["type"].as_str() {
+        Some("reasoning.text") => "text",
+        Some("reasoning.summary") => "summary",
+        _ => {
+            details.push(part);
+            return;
+        }
+    };
+    let Some(index) = part["index"].as_u64() else {
+        details.push(part);
+        return;
+    };
+    // The entry's `index` and `type` are never null or empty, so merging
+    // never changes them: the entry stays under the key it was opened with.
+    let latest = open.get(&(index, text_key)).map(|&at| &mut details[at]);
+    let continued = latest.filter(|entry| entry["id"].is_null() || part["id"].is_null() || entry["id"] == part["id"]);
+    let Some(Value::Object(entry)) = continued else {
+        open.insert((index, text_key), details.len());
+        details.push(part);
+        return;
+    };
+    let Value::Object(part) = part else { return };
+    for (key, value) in part {
+        match entry.get_mut(&key) {
+            Some(Value::String(held)) if key == text_key => {
+                if let Value::String(more) = value {
+                    held.push_str(&more);
+                }
+            }
+            Some(held) if !held.is_null() && held.as_str() != Some("") => {}
+            _ => {
+                entry.insert(key, value);
+            }
+        }
+    }
 }
 
 /// Which key one reply's reasoning goes back under: the one the server sent
@@ -813,6 +930,7 @@ fn cancelled_response() -> CompletionResult {
         tool_calls: Vec::new(),
         reasoning_content: None,
         reasoning: None,
+        reasoning_details: None,
         finish_reason: "cancelled".into(),
         usage: None,
     }
@@ -900,6 +1018,7 @@ fn parse_complete_response(
                 id: tc["id"].as_str().unwrap_or("").to_string(),
                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                 arguments: tc["function"]["arguments"].as_str().unwrap_or("").to_string(),
+                extra_content: opaque(&tc["extra_content"]),
             });
         }
     }
@@ -913,7 +1032,17 @@ fn parse_complete_response(
         .map(UsageJson::into_usage);
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
-    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage })
+    let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
+    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
+}
+
+/// A value from a one-shot reply, kept to send back; null is absent. It is
+/// encoded once, here, from the parsed reply, and goes out as stored.
+fn opaque(value: &Value) -> Option<Box<RawValue>> {
+    if value.is_null() {
+        return None;
+    }
+    serde_json::value::to_raw_value(value).ok()
 }
 
 fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
@@ -926,6 +1055,7 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
             id: if p.id.is_empty() { format!("call_{i}") } else { p.id },
             kind: "function".into(),
             function: ToolCallFunction { name: p.name, arguments: p.arguments },
+            extra_content: p.extra_content,
         })
         .collect()
 }
@@ -2320,11 +2450,163 @@ mod tests {
 
         let mut foreign = messages.clone();
         foreign[1].reasoning_content = Some("thought".into());
+        foreign[1].reasoning_details = Some(RawValue::from_string(r#"[{"type":"reasoning.encrypted","data":"x"}]"#.into()).unwrap());
+        foreign[1].tool_calls.as_mut().unwrap()[0].extra_content = Some(RawValue::from_string(r#"{"google":{"thought_signature":"s"}}"#.into()).unwrap());
         foreign[1].reasoning_origin = Some("elsewhere".into());
         assert_eq!(wire(&foreign, "o"), old_shape);
 
         let old: ChatMessage = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
         assert!(old.reasoning_content.is_none() && old.reasoning.is_none() && old.reasoning_origin.is_none());
+        assert!(old.reasoning_details.is_none());
+        let old: ToolCall = serde_json::from_str(r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}"#).unwrap();
+        assert!(old.extra_content.is_none());
+    }
+
+    /// Gemini streams each call whole, without an `index`, and puts its
+    /// thought signature in the call's `extra_content`; its next request
+    /// fails without it. The value comes back on that call exactly as it
+    /// arrived, through the session file too, to the endpoint that produced
+    /// it and to no other. A call beside it without one keeps its old bytes.
+    #[tokio::test]
+    async fn a_calls_extra_content_goes_back_as_it_came_to_its_endpoint_only() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"extra_content\": {\"google\": {\"thought_signature\": \"sig/A==\"}},\"function\":{\"arguments\":\"{}\",\"name\":\"bash\"},\"id\":\"c1\",\"type\":\"function\"}]},\"index\":0}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(result.finish_reason, "tool_calls");
+        let signature = r#"{"google": {"thought_signature": "sig/A=="}}"#;
+        assert_eq!(result.tool_calls[0].extra_content.as_deref().map(RawValue::get), Some(signature));
+        assert!(result.tool_calls[1].extra_content.is_none());
+
+        let client = |base: &str| ChatClient::new(base.into(), None, "m".into(), None, 64);
+        let (signing, other) = (client("http://signing/v1"), client("http://other/v1"));
+        let mut reply = ChatMessage::assistant(None, Some(result.tool_calls));
+        reply.reasoning_origin = Some(signing.origin());
+        let signed = concat!(
+            r#"[{"role":"assistant","tool_calls":["#,
+            r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"},"extra_content":{"google": {"thought_signature": "sig/A=="}}},"#,
+            r#"{"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"}}]}]"#,
+        );
+        let unsigned = concat!(
+            r#"[{"role":"assistant","tool_calls":["#,
+            r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}},"#,
+            r#"{"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"}}]}]"#,
+        );
+        assert_eq!(wire(std::slice::from_ref(&reply), &signing.origin()), signed);
+        assert_eq!(wire(std::slice::from_ref(&reply), &other.origin()), unsigned);
+
+        // The session file holds the same bytes, and a resumed session sends them.
+        let line = serde_json::to_string(&reply).unwrap();
+        assert!(line.contains(&format!(r#""extra_content":{signature}"#)), "{line}");
+        let resumed: ChatMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(wire(&[resumed], &signing.origin()), signed);
+        // Unstamped, it goes nowhere; it rides every request, so it is counted.
+        let mut unstamped = reply.clone();
+        unstamped.reasoning_origin = None;
+        assert_eq!(wire(std::slice::from_ref(&unstamped), &signing.origin()), unsigned);
+        unstamped.tool_calls.as_mut().unwrap()[0].extra_content = None;
+        assert!(reply.estimated_tokens() > unstamped.estimated_tokens());
+
+        // A one-shot JSON reply keeps it too; a null is no value.
+        let one_shot = json!({"choices":[{"message":{"tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sig"}}},
+            {"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"},"extra_content":null},
+        ]},"finish_reason":"tool_calls"}]});
+        let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap().tool_calls;
+        assert_eq!(calls[0].extra_content.as_deref().map(RawValue::get), Some(r#"{"google":{"thought_signature":"sig"}}"#));
+        assert!(calls[1].extra_content.is_none());
+    }
+
+    /// OpenRouter streams a signed model's `reasoning_details` in parts: a
+    /// block's text in pieces under one `index`, its signature null until a
+    /// later part. Those parts come back as one entry per block, with the
+    /// signature; encrypted blobs, and a block with another `id`, stay
+    /// separate entries even under a shared index, since joining them would
+    /// corrupt them. An array the server sent empty carries no signature and
+    /// is no details at all, as if absent; a key of another shape is ignored
+    /// without losing the chunk.
+    #[tokio::test]
+    async fn streamed_reasoning_details_are_merged_by_index() {
+        let detail = |parts: &str| format!("data: {{\"choices\":[{{\"delta\":{{\"reasoning_details\":{parts}}},\"finish_reason\":null}}]}}\n\n");
+        let sse = [
+            detail(r#"[{"type":"reasoning.summary","summary":"plan ","index":0},{"type":"reasoning.text","text":"think ","signature":null,"id":"t1","index":1}]"#),
+            detail(r#"[{"type":"reasoning.summary","summary":"done","index":0},{"type":"reasoning.text","text":"more","signature":null,"index":1}]"#),
+            detail(r#"[{"type":"reasoning.text","text":"","signature":"sig1","index":1},{"type":"reasoning.encrypted","data":"blobA","id":"e1","index":2},{"type":"reasoning.encrypted","data":"blobB","id":"e2","index":2}]"#),
+            detail(r#"[{"type":"reasoning.text","text":"second","signature":"sig2","id":"t2","index":1}]"#),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"reasoning_details\":{\"odd\":true}},\"finish_reason\":\"stop\"}]}\n\n".into(),
+        ]
+        .concat();
+        let result = stream_once(&sse).await;
+        assert_eq!(result.content, "ok", "a key of another shape must not cost the chunk its content");
+        let details: Value = serde_json::from_str(result.reasoning_details.as_deref().expect("the server sent details").get()).unwrap();
+        assert_eq!(
+            details,
+            json!([
+                {"type": "reasoning.summary", "summary": "plan done", "index": 0},
+                {"type": "reasoning.text", "text": "think more", "signature": "sig1", "id": "t1", "index": 1},
+                {"type": "reasoning.encrypted", "data": "blobA", "id": "e1", "index": 2},
+                {"type": "reasoning.encrypted", "data": "blobB", "id": "e2", "index": 2},
+                {"type": "reasoning.text", "text": "second", "signature": "sig2", "id": "t2", "index": 1},
+            ])
+        );
+
+        // OpenRouter sends an empty array on every delta of a model that
+        // does not reason.
+        let empty = stream_once(&[detail("[]"), detail("[]"), "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"reasoning\":null,\"reasoning_details\":[]},\"finish_reason\":\"stop\"}]}\n\n".into()].concat()).await;
+        assert_eq!(empty.content, "ok");
+        assert!(empty.reasoning_details.is_none(), "{:?}", empty.reasoning_details);
+        let absent = stream_once("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n").await;
+        assert!(absent.reasoning_details.is_none());
+
+        // A one-shot JSON reply keeps its array as sent, unless it is empty.
+        let one_shot = |details: Value| {
+            let reply = json!({"choices":[{"message":{"content":"ok","reasoning_details":details}}]});
+            parse_complete_response(&reply, &mut |_| {}).unwrap().reasoning_details.map(|d| d.get().to_string())
+        };
+        assert_eq!(one_shot(json!([{"data": "x", "type": "reasoning.encrypted"}])).as_deref(), Some(r#"[{"data":"x","type":"reasoning.encrypted"}]"#));
+        assert_eq!(one_shot(json!([])), None);
+        assert_eq!(one_shot(Value::Null), None);
+        assert_eq!(one_shot(json!("text")), None);
+
+        // They go back, as stored, beside the plain text, to their endpoint only.
+        let origin = ChatClient::new("http://a/v1".into(), None, "m".into(), None, 64).origin();
+        let mut reply = ChatMessage::assistant(Some("ok".into()), None);
+        reply.reasoning = Some("think more".into());
+        reply.reasoning_details = result.reasoning_details;
+        reply.reasoning_origin = Some(origin.clone());
+        let stored = reply.reasoning_details.as_deref().unwrap().get().to_string();
+        assert_eq!(
+            wire(std::slice::from_ref(&reply), &origin),
+            format!(r#"[{{"role":"assistant","content":"ok","reasoning":"think more","reasoning_details":{stored}}}]"#)
+        );
+        assert_eq!(wire(std::slice::from_ref(&reply), "elsewhere"), r#"[{"role":"assistant","content":"ok"}]"#);
+        let mut without = reply.clone();
+        without.reasoning_details = None;
+        assert!(reply.estimated_tokens() > without.estimated_tokens(), "they ride every request, so they are counted");
+    }
+
+    /// The server decides how many `reasoning_details` parts a stream has, so
+    /// a part must find the entry it continues without scanning every entry
+    /// kept so far: a stream of parts that each start a new block (a fresh
+    /// `index`, or none) would otherwise cost time quadratic in its length
+    /// and stall the turn. Each such part stays its own entry, and a late
+    /// part of an early block still finds that block.
+    #[test]
+    fn many_reasoning_detail_blocks_each_keep_their_own_entry() {
+        let blocks = 10_000u64;
+        let (mut details, mut open) = (Vec::new(), OpenDetails::new());
+        for index in 0..blocks {
+            merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.text", "text": "a", "index": index}));
+            merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.summary", "summary": "s"}));
+        }
+        merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.text", "text": "b", "signature": "sig", "index": 0}));
+        let mut expected: Vec<Value> = (0..blocks)
+            .flat_map(|index| [json!({"type": "reasoning.text", "text": "a", "index": index}), json!({"type": "reasoning.summary", "summary": "s"})])
+            .collect();
+        expected[0] = json!({"type": "reasoning.text", "text": "ab", "signature": "sig", "index": 0});
+        assert_eq!(details.len(), expected.len(), "a part with a new index, or none, starts its own entry");
+        assert!(details == expected, "each block keeps its own entry, and a late part continues its block");
     }
 
     /// The bug this guards: a session that ran on DeepSeek and then moved to
@@ -2419,6 +2701,7 @@ mod tests {
             id: "c1".into(),
             kind: "function".into(),
             function: ToolCallFunction { name: "bash".into(), arguments: "{}".into() },
+            extra_content: None,
         }
     }
 

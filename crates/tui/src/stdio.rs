@@ -855,6 +855,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             reasoning: None,
+            reasoning_details: None,
             reasoning_origin: None,
         };
         let messages = vec![
