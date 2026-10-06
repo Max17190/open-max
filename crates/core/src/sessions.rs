@@ -1929,6 +1929,7 @@ mod tests {
                 name: "read_file".into(),
                 arguments: r#"{"path":"src/a.rs"}"#.into(),
             },
+            extra_content: None,
         };
         let first = vec![
             ChatMessage::user("find the bug"),
@@ -2056,6 +2057,35 @@ mod tests {
             assert!(save_messages(&core, &id, &next, &mut 2, false));
             assert!(std::fs::read(&path).unwrap().starts_with(&damaged), "an append never cuts damage");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A transcript written before messages carried `reasoning_details` or a
+    /// call's `extra_content` loads with neither, and saving it again writes
+    /// the bytes it was read from: the additions are optional on disk and
+    /// never rewrite an older file into a new shape.
+    #[test]
+    fn a_transcript_from_before_reasoning_details_loads_and_saves_unchanged() {
+        let dir = std::env::temp_dir().join(format!("openmax-old-transcript-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let path = messages_path(&core, &id);
+        let old = concat!(
+            "{\"role\":\"system\",\"content\":\"rules\"}\n",
+            "{\"role\":\"user\",\"content\":\"read a.txt\"}\n",
+            "{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}],\"reasoning_content\":\"read it first\",\"reasoning_origin\":\"0123456789abcdef\"}\n",
+            "{\"role\":\"tool\",\"content\":\"alpha\",\"tool_call_id\":\"c1\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"done\"}\n",
+        );
+        std::fs::write(&path, old).unwrap();
+        let messages = load_messages(&core, &id).unwrap().expect("an older transcript resumes");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[2].reasoning_content.as_deref(), Some("read it first"));
+        assert_eq!(messages[2].reasoning_origin.as_deref(), Some("0123456789abcdef"));
+        assert!(messages.iter().all(|m| m.reasoning_details.is_none()));
+        assert!(messages[2].tool_calls.as_ref().unwrap().iter().all(|c| c.extra_content.is_none()));
+        assert!(save_messages(&core, &id, &messages, &mut 5, true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -39,6 +39,10 @@ ignore.workspace = true
 # pseudo-terminal on stdin, which is how an interactive shell runs openmax.
 libc.workspace = true
 
+[dev-dependencies]
+# The release test reads Cargo.toml the way cargo-dist does, as TOML.
+toml.workspace = true
+
 # The MCP bridge tests run their own binary again as a fixture MCP server. A
 # libtest binary prints its banner on stdout before any test runs, and stdout
 # is that server's protocol channel, so this target supplies its own main.

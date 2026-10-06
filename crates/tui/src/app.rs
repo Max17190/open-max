@@ -6300,10 +6300,12 @@ mod tests {
                         name: "read_file".into(),
                         arguments: "{\"path\":\"CHANGELOG.md\"}".into(),
                     },
+                    extra_content: None,
                 }]),
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             // File content that happens to look like an edit summary.
@@ -6314,6 +6316,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
         ];
@@ -6360,10 +6363,12 @@ mod tests {
                             name: "bash".into(),
                             arguments: "{\"command\":\"cargo test\"}".into(),
                         },
+                        extra_content: None,
                     }]),
                     tool_call_id: None,
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     reasoning_origin: None,
                 });
                 messages.push(open_max_core::types::ChatMessage {
@@ -6373,6 +6378,7 @@ mod tests {
                     tool_call_id: Some(format!("c{i}")),
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     reasoning_origin: None,
                 });
             }
@@ -6433,6 +6439,7 @@ mod tests {
                             name: "bash".into(),
                             arguments: "{\"command\":\"./deploy.sh\"}".into(),
                         },
+                        extra_content: None,
                     },
                     open_max_core::types::ToolCall {
                         id: "c2".into(),
@@ -6441,11 +6448,13 @@ mod tests {
                             name: "bash".into(),
                             arguments: "{\"command\":\"./probe.sh\"}".into(),
                         },
+                        extra_content: None,
                     },
                 ]),
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
@@ -6455,6 +6464,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             // A SUCCESSFUL command whose output merely opens with the same
@@ -6467,6 +6477,7 @@ mod tests {
                 tool_call_id: Some("c2".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
         ];
@@ -6516,10 +6527,12 @@ mod tests {
                         name: "write_file".into(),
                         arguments: "{\"path\":\"notes.md\",\"content\":\"x\"}".into(),
                     },
+                    extra_content: None,
                 }]),
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
@@ -6529,6 +6542,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
@@ -6538,6 +6552,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
         ];
