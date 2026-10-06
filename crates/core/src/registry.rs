@@ -2032,6 +2032,8 @@ mod tests {
     /// The env allowlist is enforced at spawn: declared names arrive,
     /// undeclared parent env - API keys included - does not. Both variables
     /// are set on the test process, so the only difference is the manifest.
+    /// The git terminal-prompt switch bash and hooks get is not added to a
+    /// tool's declared environment either.
     #[tokio::test]
     async fn an_external_tool_receives_only_its_declared_env() {
         let dir = std::env::temp_dir().join(format!("openmax-envtool-{}", uuid::Uuid::new_v4()));
@@ -2039,7 +2041,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/envcheck.toml"),
-            "name = \"envcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '%s|%s' \\\"$OPENMAX_TEST_KEEP\\\" \\\"$OPENMAX_TEST_DROP\\\"\"]\nenv = [\"OPENMAX_TEST_KEEP\"]\n",
+            "name = \"envcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '%s|%s|%s' \\\"$OPENMAX_TEST_KEEP\\\" \\\"$OPENMAX_TEST_DROP\\\" \\\"$GIT_TERMINAL_PROMPT\\\"\"]\nenv = [\"OPENMAX_TEST_KEEP\"]\n",
         )
         .unwrap();
         std::env::set_var("OPENMAX_TEST_KEEP", "kept");
@@ -2058,7 +2060,7 @@ mod tests {
         std::env::remove_var("OPENMAX_TEST_KEEP");
         std::env::remove_var("OPENMAX_TEST_DROP");
         assert!(out.ok, "{}", out.output);
-        assert_eq!(out.output.trim(), "kept|", "declared env arrives; the rest is scrubbed");
+        assert_eq!(out.output.trim(), "kept||", "declared env arrives; the rest is scrubbed");
     }
 
     /// The agent's account can write the harness link directory. On an

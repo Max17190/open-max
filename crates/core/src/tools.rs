@@ -2087,6 +2087,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// git asks for missing credentials on the terminal, and a bash call has
+    /// none to offer, so that prompt can only fail. With terminal prompts
+    /// off, git fails at once and names the cause, where a prompt it could
+    /// open drew over the TUI and then waited out the call's timeout. A
+    /// credential helper or askpass program still answers first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_in_bash_refuses_a_credential_prompt_at_once() {
+        let root = temp_project();
+        let seen = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "printf '[%s]' \"$GIT_TERMINAL_PROMPT\""}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert_eq!(seen.output, "[0]", "bash must run with git terminal prompts off");
+
+        match std::process::Command::new("git").arg("--version").output() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping the git half: git is not installed");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            Err(e) => panic!("cannot run git: {e}"),
+        }
+        // No helper, no askpass, no user or system config: the prompt is
+        // git's only way to a username. C locale, because the reason is
+        // matched as text.
+        let command = "printf 'protocol=https\\nhost=example.invalid\\n\\n' | \
+            env -u GIT_ASKPASS -u SSH_ASKPASS LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            git -c credential.helper= -c core.askPass= credential fill";
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": command, "timeout_secs": 30}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("terminal prompts disabled"), "{}", out.output);
+    }
+
     /// Commands ran under zsh wherever it was installed, so on every Mac a
     /// model's bash met 1-indexed arrays and unmatched globs as errors, and as
     /// a login shell that re-sourced profiles on every call. `${arr[1]}` naming

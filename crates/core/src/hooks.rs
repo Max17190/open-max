@@ -2886,6 +2886,26 @@ command = "{}"
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A hook gets the user's environment, but git cannot ask for credentials
+    /// in one: a hook has no terminal, and a gate waiting out its timeout on
+    /// a prompt blocks the call it guards. Terminal prompts are off, as in
+    /// bash, so git fails at once instead.
+    #[tokio::test]
+    async fn a_hook_runs_with_git_terminal_prompts_off() {
+        let dir = tempfile_dir();
+        write_hook_toml(
+            &dir,
+            "env.toml",
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '[%s]' \\\"$GIT_TERMINAL_PROMPT\\\"; exit 1\"]\n",
+        );
+        let hooks = discover_in_dirs(std::slice::from_ref(&dir));
+        let result = hooks
+            .pre_tool_use("s1", "bash", &serde_json::json!({}), &dir, &Arc::new(CancelToken::default()))
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(result, PreToolResult::Block { reason: "[0]".into() });
+    }
+
     fn tempfile_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("openmax-hooks-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
