@@ -21,7 +21,9 @@
 //! the user their work. The one thing that is not best-effort is ordering
 //! against deletion. Every writer re-checks under `sessions_lock` that the
 //! session is still indexed, so a session deleted mid-turn cannot be
-//! resurrected by an append that was already in flight.
+//! resurrected by an append that was already in flight. The answer comes from
+//! what this process knows (`StoreMemo`), not from reading the index on every
+//! write.
 //!
 //! The index itself is shared wider than one process: it is one file per data
 //! dir, and parallel openmax processes are normal usage. Its read-modify-write
@@ -30,6 +32,7 @@
 //! with sessions silently dropped from the index, which the still-indexed gate
 //! then converts into silently dropping their transcripts.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -89,13 +92,13 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
     let mut owners = core.session_owners.lock().unwrap();
     if let Some(owner) = owners.get_mut(id) {
         if reactivate {
-            load_messages(core, id)?;
+            revalidate_if_changed(core, id)?;
             owner.detach = false;
         }
         return Ok(());
     }
     // See `SessionOwner`: the open and the lock go under the store lock.
-    let _store = lock_store(core)?;
+    let (mut memo, _flock) = lock_store(core)?;
     let path = lock_path(core, id);
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
@@ -104,8 +107,75 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
             format!("session {id} is already open in another process; close it there or start a new session"),
         std::fs::TryLockError::Error(e) => format!("cannot lock session {id}: {e}"),
     })?;
-    if validate { load_messages_locked(core, id)?; }
+    if validate {
+        let seen = stamp(&messages_path(core, id));
+        load_messages_locked(core, id)?;
+        remember_transcript(&mut memo, id, seen);
+    }
+    // The one index read the session's writes cost while this claim lasts.
+    if matches!(read_index(core), IndexRead::Loaded(metas) if metas.iter().any(|m| m.id == id)) {
+        memo.listed.insert(id.to_string());
+    }
     owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
+    Ok(())
+}
+
+/// What this process knows about the session store, so that a steady-state
+/// write reads nothing back to learn it. The index lists every session of
+/// every project and is never pruned: a model request or a save that read it
+/// would cost more with every session ever recorded. Guarded by
+/// `Core::sessions_lock`, the lock every session write and removal holds, so
+/// a write never acts on an answer a removal has already changed.
+#[derive(Default)]
+pub(crate) struct StoreMemo {
+    /// Sessions this process holds and saw indexed when it claimed them. No
+    /// other process can remove one meanwhile, since every removal claims the
+    /// session first, so only this process's own removal or its release of
+    /// the claim can make an entry stale, and both take the entry out first.
+    listed: HashSet<String>,
+    /// Sessions this process removed. A write still in flight when its
+    /// session was removed (cancellation is cooperative) is dropped on this
+    /// record alone.
+    removed: HashSet<String>,
+    /// Each owned transcript as this process last validated or wrote it.
+    transcripts: HashMap<String, Stamp>,
+}
+
+/// A file as a stat sees it, its length and modification time. Every write
+/// moves one of them, short of an edit that keeps the length within one tick
+/// of the file system's clock.
+type Stamp = (u64, SystemTime);
+
+/// None when the file is missing or cannot be stat'ed, which matches no
+/// remembered stamp, so whatever is there gets read.
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Record the transcript this process just validated or wrote, as stamped
+/// before it was read or after it was written.
+fn remember_transcript(memo: &mut StoreMemo, id: &str, seen: Option<Stamp>) {
+    match seen {
+        Some(seen) => memo.transcripts.insert(id.to_string(), seen),
+        None => memo.transcripts.remove(id),
+    };
+}
+
+/// Validate an owned transcript again only when it changed since this
+/// process last validated or wrote it. Every turn start claims its session
+/// again, and reparsing the whole history there made each turn cost more
+/// than the one before. Between turns an owned transcript changes only when
+/// something outside openmax writes it, which moves its stamp, so damage
+/// written then is still refused before the turn runs.
+fn revalidate_if_changed(core: &Core, id: &str) -> Result<(), String> {
+    let (mut memo, _flock) = lock_store(core)?;
+    let seen = stamp(&messages_path(core, id));
+    if seen.is_some() && memo.transcripts.get(id) == seen.as_ref() {
+        return Ok(());
+    }
+    load_messages_locked(core, id)?;
+    remember_transcript(&mut memo, id, seen);
     Ok(())
 }
 
@@ -119,18 +189,29 @@ pub fn detach(core: &Core, id: &str) -> Result<(), String> {
         if let Some(owner) = owners.get_mut(id) { owner.detach = true; }
     } else {
         state.remove(id);
-        owners.remove(id);
+        release(core, &mut owners, id);
     }
     Ok(())
 }
 
 /// Called under both the session map and running locks, after turn cleanup.
-pub(crate) fn finish_detach(core: &Core, id: &str, state: &mut std::collections::HashMap<String, crate::state::SessionData>) {
+pub(crate) fn finish_detach(core: &Core, id: &str, state: &mut HashMap<String, crate::state::SessionData>) {
     let mut owners = core.session_owners.lock().unwrap();
     if owners.get(id).is_some_and(|owner| owner.detach) {
         state.remove(id);
-        owners.remove(id);
+        release(core, &mut owners, id);
     }
+}
+
+/// Let go of a claim. What it let this process know goes first: once the
+/// flock is released another process can claim and remove the session, and
+/// from then on only the index can say whether it still exists.
+fn release(core: &Core, owners: &mut HashMap<String, SessionOwner>, id: &str) {
+    let mut memo = core.sessions_lock.lock().unwrap();
+    memo.listed.remove(id);
+    memo.transcripts.remove(id);
+    drop(memo);
+    owners.remove(id);
 }
 
 pub const UNTITLED: &str = "New session";
@@ -184,8 +265,8 @@ pub fn unix_now() -> u64 {
 /// Append a compaction event. Best-effort: failures surface as an agent warning.
 #[cfg(test)]
 pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return;
     }
     let path = compaction_path(core, id);
@@ -238,8 +319,8 @@ pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return;
     }
     let Ok(line) = serde_json::to_string(record) else { return };
@@ -330,8 +411,8 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
         return true;
     }
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return true;
     }
     let mut lines = String::new();
@@ -385,8 +466,8 @@ pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::Registry
     // The last of the five session files to take the rule. A refreeze can be
     // in flight when the session is deleted, and cancellation is cooperative,
     // so without this the manifest outlives everything it described.
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return;
     }
     if let Err(e) = write_atomic(&manifest_path(core, id), json) {
@@ -473,6 +554,8 @@ fn read_index_at(path: &Path) -> IndexRead {
             ))
         }
     };
+    #[cfg(test)]
+    INDEX_BYTES_READ.with(|read| read.set(read.get() + text.len()));
     match serde_json::from_str(&text) {
         Ok(metas) => IndexRead::Loaded(metas),
         Err(e) => IndexRead::Damaged(format!(
@@ -500,24 +583,39 @@ fn load_index_checked(core: &Core) -> Result<Vec<SessionMeta>, String> {
 }
 
 /// Whether the session still exists, i.e. whether writing a sidecar for it is
-/// still meaningful.
+/// still meaningful: Ok(false) once it is gone, Err when only a damaged index
+/// could say.
 ///
 /// Every sidecar here is opened with `create`, so a write that lands after
 /// `delete` recreates the file it just removed. Cancellation narrows that
 /// window but cannot close it: a request already on the wire settles when it
-/// settles, and its usage record arrives afterwards. Checking the index makes
-/// the write a no-op instead, which is what "deleted" has to mean if it is to
+/// settles, and its usage record arrives afterwards. Answering no makes the
+/// write a no-op instead, which is what "deleted" has to mean if it is to
 /// mean anything.
 ///
-/// One small read per append. Compaction and archive appends happen at prune
-/// time, and a usage append happens once per request, next to a network round
-/// trip that costs several orders of magnitude more.
-/// Callers must already hold `sessions_lock`: an unlocked check is a
-/// time-of-check/time-of-use bug, because `delete` can remove the entry and
-/// the file between the check passing and the write landing, which recreates
-/// exactly the file that was deleted.
-fn still_indexed_locked(core: &Core, id: &str) -> bool {
-    matches!(read_index(core), IndexRead::Loaded(metas) if metas.iter().any(|m| m.id == id))
+/// `memo` answers for every session this process holds or removed, so a
+/// steady-state write reads nothing. The index answers only for the rest,
+/// such as a session claimed while the index was damaged or did not list it.
+/// Callers must already hold `sessions_lock` and pass what it guards: an
+/// unlocked check is a time-of-check/time-of-use bug, because `delete` can
+/// remove the entry and the file between the check passing and the write
+/// landing, which recreates exactly the file that was deleted.
+fn indexed_locked(memo: &StoreMemo, core: &Core, id: &str) -> Result<bool, String> {
+    if memo.removed.contains(id) {
+        return Ok(false);
+    }
+    if memo.listed.contains(id) {
+        return Ok(true);
+    }
+    match read_index(core) {
+        IndexRead::Loaded(metas) => Ok(metas.iter().any(|m| m.id == id)),
+        IndexRead::Missing => Ok(false),
+        IndexRead::Damaged(reason) => Err(reason),
+    }
+}
+
+fn still_indexed_locked(memo: &StoreMemo, core: &Core, id: &str) -> bool {
+    matches!(indexed_locked(memo, core, id), Ok(true))
 }
 
 fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
@@ -620,7 +718,7 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
-fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, ()>, FileLock), String> {
+fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, StoreMemo>, FileLock), String> {
     let guard = core.sessions_lock.lock().unwrap();
     let flock = lock_index(core)?;
     Ok((guard, flock))
@@ -654,6 +752,10 @@ thread_local! {
     static SYNCED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The OS error every directory sync on this thread fails with, if any.
     static FAIL_DIR_SYNC: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// Bytes this thread read from session indexes.
+    static INDEX_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Transcripts this thread read whole to load or validate them.
+    static TRANSCRIPT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Commit archive, digest record, replay boundaries, and transcript under one
@@ -683,7 +785,7 @@ pub(crate) fn commit_compaction(
     head: usize,
 ) -> Result<(), String> {
     ensure_owned(core, id)?;
-    let _store = lock_store(core)?;
+    let (mut memo, _flock) = lock_store(core)?;
     let mut metas = match read_index(core) {
         IndexRead::Loaded(metas) => metas,
         _ => return Err("compaction requires a readable session index".into()),
@@ -723,6 +825,7 @@ pub(crate) fn commit_compaction(
             Err(restore) => format!("{error}; the replay boundaries could not be restored either: {restore}"),
         });
     }
+    remember_transcript(&mut memo, id, stamp(&messages_path(core, id)));
     Ok(())
 }
 
@@ -970,11 +1073,26 @@ fn records_end(bytes: &[u8]) -> usize {
 
 /// Sessions for one project, most recently updated first. Err names a
 /// damaged index rather than listing nothing.
+///
+/// A session belongs to `project` when both paths name the same directory,
+/// resolved on both sides (`state::canonical_root`, the form trust and
+/// history key a project by). The index keeps each path as its frontend
+/// spelled it and is never rewritten for this, so a directory reached
+/// through a symlink, or moved and linked back, would otherwise hide its
+/// sessions from `--continue`, `/resume`, and `--recall` under another
+/// spelling. Each distinct stored path resolves once, not once per session.
 pub fn list(core: &Core, project: &str) -> Result<Vec<SessionMeta>, String> {
+    let wanted = crate::state::canonical_root(Path::new(project));
+    let mut same_project: HashMap<String, bool> = HashMap::new();
     let mut metas: Vec<(usize, SessionMeta)> = load_index_checked(core)?
         .into_iter()
         .enumerate()
-        .filter(|(_, m)| m.project == project)
+        .filter(|(_, m)| {
+            m.project == project
+                || *same_project
+                    .entry(m.project.clone())
+                    .or_insert_with(|| crate::state::canonical_root(Path::new(&m.project)) == wanted)
+        })
         .collect();
     // updated_at is whole seconds and the index is append-ordered, so two
     // sessions touched in the same second tie on the timestamp alone; the
@@ -1143,7 +1261,7 @@ fn remove(core: &Core, id: &str, only_if_empty: bool) -> Result<bool, String> {
     // The index entry and the files go under one lock. Dropping the entry
     // first and the files second would let an append pass its check against
     // the stale index and recreate what this call is removing.
-    let _store = lock_store(core)?;
+    let (mut memo, flock) = lock_store(core)?;
     // A turn of this process can save between the caller's look and this
     // lock. Every transcript write holds the lock, so the answer here is
     // final: a session that gained history in that window stays.
@@ -1159,6 +1277,11 @@ fn remove(core: &Core, id: &str, only_if_empty: bool) -> Result<bool, String> {
     };
     metas.retain(|m| m.id != id);
     save_index(core, &metas)?;
+    // Gone from the index, so gone for every write still in flight here,
+    // which learns it from this record rather than from the index.
+    memo.listed.remove(id);
+    memo.transcripts.remove(id);
+    memo.removed.insert(id.to_string());
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
     let _ = std::fs::remove_file(compaction_path(core, id));
@@ -1167,7 +1290,7 @@ fn remove(core: &Core, id: &str, only_if_empty: bool) -> Result<bool, String> {
     // Still held by the claim above, and unlinked under the store lock every
     // claim opens it under (see `SessionOwner`).
     let _ = std::fs::remove_file(lock_path(core, id));
-    drop(_store);
+    drop((memo, flock));
     if only_if_empty {
         core.cancel(id);
     }
@@ -1247,6 +1370,8 @@ fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("transcript {} is unreadable: {e}; original file preserved", path.display())),
     };
+    #[cfg(test)]
+    TRANSCRIPT_READS.with(|reads| reads.set(reads.get() + 1));
     let text = std::str::from_utf8(&bytes[..records_end(&bytes)])
         .map_err(|e| format!("transcript {} is unreadable: {e}; original file preserved", path.display()))?;
     let mut parsed = Vec::new();
@@ -1289,7 +1414,7 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         return false;
     }
     let path = messages_path(core, id);
-    let _store = match lock_store(core) {
+    let (mut memo, _flock) = match lock_store(core) {
         Ok(store) => store,
         Err(reason) => {
             core.send_agent(id, AgentEvent::Error { message: format!("failed to persist session: {reason}") });
@@ -1301,11 +1426,14 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
     // ends with an unconditional save. Without this the transcript of a
     // deleted session comes back, which is the one file that made the
     // deletion visible in the first place.
-    if !still_indexed_locked(core, id) {
-        // "Deleted" stays a silent no-op. A damaged index is a different
-        // state: the write is being dropped for a reason the user can fix,
-        // so say so instead of losing the transcript quietly.
-        if let IndexRead::Damaged(reason) = read_index(core) {
+    match indexed_locked(&memo, core, id) {
+        Ok(true) => {}
+        // "Deleted" stays a silent no-op.
+        Ok(false) => return true,
+        // A damaged index is a different state: the write is being dropped
+        // for a reason the user can fix, so say so instead of losing the
+        // transcript quietly.
+        Err(reason) => {
             core.send_agent(
                 id,
                 AgentEvent::Error {
@@ -1314,7 +1442,6 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
             );
             return false;
         }
-        return true;
     }
     let needs_rewrite = rewrite || messages.len() < *persisted;
     // Validate before replacing existing bytes. A failed append below may
@@ -1337,7 +1464,14 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
     // or a power cut interrupts leaves a fragment or an empty file, with no
     // complete record to resume from, so the session could never be
     // resumed; an interrupted rename leaves no transcript, a fresh session.
-    let result = if needs_rewrite || (*persisted == 0 && !messages.is_empty()) {
+    let whole = needs_rewrite || (*persisted == 0 && !messages.is_empty());
+    let wrote = whole || messages.len() > *persisted;
+    // Whether the file this save leaves holds only what this process
+    // validated or wrote, so the next turn start need not read it again
+    // (`revalidate_if_changed`): a whole write does, and an append does when
+    // nothing else wrote the file since this process last did.
+    let known = whole || stamp(&path).is_some_and(|seen| memo.transcripts.get(id) == Some(&seen));
+    let result = if whole {
         write_jsonl(&path, messages)
     } else if messages.len() > *persisted {
         // Append is best-effort for the common path. On any failure (including
@@ -1355,10 +1489,14 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
 
     match result {
         Ok(()) => {
+            if wrote {
+                remember_transcript(&mut memo, id, known.then(|| stamp(&path)).flatten());
+            }
             *persisted = messages.len();
             true
         }
         Err(e) => {
+            memo.transcripts.remove(id);
             core.send_agent(
                 id,
                 AgentEvent::Error {
@@ -2567,6 +2705,129 @@ mod tests {
         assert_eq!(discard.join().unwrap(), Ok(false), "a session with a transcript is history");
         assert_eq!(load_messages(&core, &id).unwrap().map(|m| m.len()), Some(1));
         assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "and it stays indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The index lists every session of every project and is never pruned,
+    /// so a write that reads it costs more with every session ever recorded.
+    /// Once a claim has seen its session indexed, a model request's usage
+    /// record, a transcript save, and a manifest save read none of it: no
+    /// other process can remove a session this one holds, since a removal
+    /// claims first. A removal by this process mid-turn is remembered, so the
+    /// turn's late writes are still dropped, without reading the index either.
+    #[test]
+    fn a_steady_state_request_and_save_read_no_index_bytes() {
+        let dir = std::env::temp_dir().join(format!("openmax-index-hot-path-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        for _ in 0..20 {
+            create(&core, "/tmp/elsewhere".into()).unwrap();
+        }
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let read = || INDEX_BYTES_READ.with(|read| read.replace(0));
+        read();
+
+        let usage = |ts| TokenUsage { ts, prompt_tokens: 10, completion_tokens: 1, cached_tokens: None };
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        for turn in 0..3 {
+            append_usage(&core, &id, &usage(turn));
+            messages.push(ChatMessage::user(format!("message {turn}")));
+            assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        }
+        assert!(save_messages(&core, &id, &messages, &mut persisted, true), "a rewrite too");
+        save_manifest(&core, &id, &crate::registry::Registry::builtin_only().to_manifest());
+        assert_eq!(read(), 0, "a steady-state request or save read the session index");
+        assert_eq!(load_usage(&core, &id).len(), 3);
+        assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), messages.len());
+
+        // Deleted while its turn runs, the session keeps its claim until the
+        // turn settles, and what the turn still writes is dropped.
+        core.running.lock().unwrap().insert(id.clone());
+        delete(&core, &id).unwrap();
+        read();
+        append_usage(&core, &id, &usage(9));
+        messages.push(ChatMessage::user("late"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false), "a deleted session's save is a silent no-op");
+        save_manifest(&core, &id, &crate::registry::Registry::builtin_only().to_manifest());
+        assert_eq!(read(), 0, "the deleted-session guard read the session index");
+        for suffix in ["messages.json", "manifest.json", "usage.jsonl"] {
+            assert!(!sessions_dir(&core).join(format!("{id}.{suffix}")).exists(), "{suffix} came back after delete");
+        }
+        core.running.lock().unwrap().remove(&id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every turn start claims its session again (`attach`). Reparsing the
+    /// whole transcript there made each turn cost more than the one before,
+    /// though between turns an owned transcript changes only when something
+    /// outside openmax writes it. So a turn start reads it again only once
+    /// its length or modification time moved past what this process last
+    /// validated or wrote, and damage written in between is still refused.
+    #[test]
+    fn a_turn_start_rereads_an_owned_transcript_only_after_it_changed() {
+        let dir = std::env::temp_dir().join(format!("openmax-turn-start-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        messages.push(ChatMessage::user("second"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        let reads = || TRANSCRIPT_READS.with(|reads| reads.replace(0));
+        reads();
+
+        attach(&core, &id).unwrap();
+        attach(&core, &id).unwrap();
+        assert_eq!(reads(), 0, "a turn start reparsed a transcript nothing had changed");
+
+        let path = messages_path(&core, &id);
+        let intact = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [intact.as_slice(), b"{damaged}\n"].concat()).unwrap();
+        assert!(attach(&core, &id).unwrap_err().contains("damaged at line 4"));
+        assert_eq!(reads(), 1);
+        let edited = [intact.as_slice(), b"{\"role\":\"user\",\"content\":\"added outside\"}\n"].concat();
+        std::fs::write(&path, edited).unwrap();
+        attach(&core, &id).unwrap();
+        attach(&core, &id).unwrap();
+        assert_eq!(reads(), 1, "a repaired transcript is read once, then trusted again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The index keeps each project path as its frontend spelled it, while
+    /// trust and history resolve it. A directory reached through a symlink,
+    /// or moved and linked back, is still one project: its sessions list,
+    /// and `--continue` takes the latest, from any spelling of the path.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_lists_its_sessions_from_any_spelling_of_its_path() {
+        let dir = std::env::temp_dir().join(format!("openmax-spelling-{}", uuid::Uuid::new_v4()));
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let spell = |path: &Path| path.display().to_string();
+        let through_link = create(&core, spell(&link)).unwrap().id;
+        let direct = create(&core, spell(&real)).unwrap().id;
+        create(&core, spell(&dir.join("other"))).unwrap();
+        touch_at(&core, &through_link, 1_000);
+        touch_at(&core, &direct, 2_000);
+
+        for spelling in [real.clone(), link.clone(), std::fs::canonicalize(&real).unwrap()] {
+            let listed: Vec<String> = list(&core, &spell(&spelling)).unwrap().into_iter().map(|m| m.id).collect();
+            assert_eq!(listed, vec![direct.clone(), through_link.clone()], "{}", spelling.display());
+        }
+        touch_at(&core, &through_link, 3_000);
+        assert_eq!(latest(&core, &spell(&real)).unwrap().unwrap().id, through_link);
+        assert_eq!(
+            std::fs::read_to_string(index_path(&core)).unwrap().matches(&spell(&link)).count(),
+            1,
+            "a lookup leaves every stored path as it was"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -106,6 +106,44 @@ fn damaged_continuation_preserves_bytes_before_hooks_or_provider_requests() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// A session is recorded under the project path as its frontend spelled it.
+/// One recorded through a symlink to the project, or before the project
+/// moved and was linked back, is still this project's history: run from the
+/// directory itself, `--recall` searches it and `--continue` resumes it.
+#[cfg(unix)]
+#[test]
+fn continue_and_recall_find_a_session_recorded_through_a_symlink() {
+    let (project, home) = fresh_dirs("symlinked-project");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    write_settings(&home, &format!("http://{}/v1", server.local_addr().unwrap()));
+    let link = project.parent().unwrap().join("link");
+    std::os::unix::fs::symlink(&project, &link).unwrap();
+    let (core, _) = open_max_core::state::Core::new(home.join(".openmax")).unwrap();
+    let id = open_max_core::sessions::create(&core, link.display().to_string()).unwrap().id;
+    let messages = [
+        open_max_core::types::ChatMessage::system("rules"),
+        open_max_core::types::ChatMessage::user("the quokkaberry rollout plan"),
+    ];
+    assert!(open_max_core::sessions::save_messages(&core, &id, &messages, &mut 0, false));
+    drop(core);
+
+    let recalled = cmd(&project, &home).args(["--recall", "quokkaberry", "--json"]).output().unwrap();
+    assert!(recalled.status.success(), "{}", String::from_utf8_lossy(&recalled.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&recalled.stdout).unwrap();
+    assert_eq!(report["sessions_scanned"], 1, "{report}");
+    assert!(report["hits"].as_array().unwrap().iter().any(|hit| hit["session"] == id.as_str()), "{report}");
+
+    let resumed = finish_with_deadline(cmd(&project, &home).args(["--trust-project", "--continue", "--stdio"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+    let hello: serde_json::Value = serde_json::from_slice(resumed.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(hello["session_id"], id.as_str());
+    assert_eq!(hello["continued"], true);
+    assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// A damaged session index is history openmax cannot read, not an empty past:
 /// `--continue` names the file instead of reporting that no prior session
 /// exists, a new session is refused the same way, and `--check` lists it as
