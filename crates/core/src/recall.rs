@@ -7,7 +7,7 @@
 //! <path>"); the memory PR made facts durable. Recall is the searchable form
 //! of the same commitment: what the harness preserved must be findable
 //! without hand-grepping home-dir JSONL over bash. It is a read-only
-//! standalone operation like `--ledger`: no session, no endpoint, no daemon,
+//! standalone operation like `--check`: no session, no endpoint, no daemon,
 //! and no derived index - the stores on disk stay the single source of truth
 //! and every scan reads them directly. At harness scale (megabytes, not the
 //! hundreds of millions of rows a database engine plans for) a bounded

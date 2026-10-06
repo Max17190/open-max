@@ -41,7 +41,8 @@ options:
                          budget:<tokens>, excerpt:<chars>; --json for
                          structured output. Full contract:
                          --spec recall
-      --ledger           print the capability-file history for this project
+      --ledger           deprecated: capability-file history is no longer
+                         recorded; prints where earlier records are kept
       --ledger-repair    quarantine an unverifiable ledger log (nothing is
                          deleted) and start a new chain; approvals in the
                          quarantined log must be granted again
@@ -405,7 +406,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     if let Some(query) = &cli.recall {
-        // Read-only introspection, like --ledger: no session, no endpoint,
+        // Read-only introspection, like --check: no session, no endpoint,
         // no trust gate. Recall only ever surfaces this project's own history
         // (the session index is keyed by project), and the project key is the
         // same raw current_dir form session creation stores.
@@ -439,215 +440,17 @@ async fn main() -> std::io::Result<()> {
     }
 
     if cli.ledger {
-        // Read-only history, like --check: no session, no endpoint, no trust.
+        // Capability-file history is no longer recorded, so there is nothing
+        // to print. The flag stays accepted so a script that calls it keeps
+        // working, and says where this project's records and the object
+        // copies earlier builds made are kept: as they are, never deleted.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let data_dir = default_data_dir();
-        match open_max_core::ledger::read(&data_dir, &project) {
-            Ok(history) if history.records.is_empty() => {
-                println!("no capability-file history for this project yet");
-                std::process::exit(0);
-            }
-            Ok(history) => {
-                use open_max_core::ledger::{Kind, ObjectState};
-                let objects = open_max_core::ledger::project_dir(&data_dir, &project).join("objects");
-                // Approvals are recorded by content hash; a path is carried
-                // when the caller knew one, and otherwise resolved from the
-                // change record that observed the same bytes.
-                let mut path_of: std::collections::HashMap<&str, &std::path::Path> =
-                    std::collections::HashMap::new();
-                for r in &history.records {
-                    if let (Kind::Change, Some(sha)) = (r.kind, &r.sha256) {
-                        path_of.insert(sha.as_str(), r.path.as_path());
-                    }
-                }
-                let mut states: std::collections::HashMap<&str, ObjectState> =
-                    std::collections::HashMap::new();
-                let mut damaged = 0usize;
-                let mut restorable = 0usize;
-                // Each intact object with the project path it belongs at, so the
-                // footer can print a `cp` command that actually runs. The
-                // history lines above abbreviate the sha to 12 chars for
-                // reading, but an object's filename is the full 64, so the bare
-                // `cp <objects>/<sha> <path>` template was never executable
-                // with what the history printed (Judge F).
-                let mut restore: Vec<(String, std::path::PathBuf)> = Vec::new();
-                for r in &history.records {
-                    let short = r.sha256.as_deref().map(|s| &s[..12.min(s.len())]);
-                    let where_ = match (r.path.as_os_str().is_empty(), r.sha256.as_deref()) {
-                        (false, _) => r.path.display().to_string(),
-                        (true, Some(sha)) => path_of
-                            .get(sha)
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(file not in this ledger)".to_string()),
-                        (true, None) => String::new(),
-                    };
-                    // Objects are the bytes rollback copies, so a rewritten
-                    // one is a backdoor with a documented delivery route:
-                    // verify on read, not only on write.
-                    let note = match (r.kind, r.sha256.as_deref()) {
-                        (Kind::Change, Some(sha)) => {
-                            restorable += 1;
-                            let state = *states.entry(sha).or_insert_with(|| {
-                                open_max_core::ledger::object_state(&data_dir, &project, sha)
-                            });
-                            match state {
-                                ObjectState::Intact => "",
-                                ObjectState::Missing => {
-                                    damaged += 1;
-                                    "  (object missing: cannot restore)"
-                                }
-                                ObjectState::Corrupt => {
-                                    damaged += 1;
-                                    "  (object CORRUPT: does not hash to its name - do not restore it)"
-                                }
-                            }
-                        }
-                        _ => "",
-                    };
-                    let session = r
-                        .session_id
-                        .as_deref()
-                        .map(|s| format!("  session {s}"))
-                        .unwrap_or_default();
-                    // One approval act can bless a manifest and the code it
-                    // runs; the audit has to show that it covered both - and
-                    // whether their bytes are actually stored. A bound object
-                    // that is missing or corrupt has nothing to restore, and
-                    // the footer's recipe must not imply otherwise.
-                    let bound = match r.also.len() {
-                        0 => String::new(),
-                        n => {
-                            let stored = r
-                                .also
-                                .iter()
-                                .filter(|sha| {
-                                    matches!(
-                                        *states.entry(sha.as_str()).or_insert_with(|| {
-                                            open_max_core::ledger::object_state(&data_dir, &project, sha)
-                                        }),
-                                        ObjectState::Intact
-                                    )
-                                })
-                                .count();
-                            // Each non-intact bound object is damage too, or
-                            // the footer prints an unqualified `restore with cp`
-                            // recipe while this approval cannot be fully
-                            // restored - same accounting the manifest path does.
-                            damaged += n - stored;
-                            let plural = if n == 1 { "" } else { "s" };
-                            if stored == n {
-                                format!("  (+{n} bound file{plural})")
-                            } else {
-                                format!(
-                                    "  (+{n} bound file{plural}, {} with no intact object)",
-                                    n - stored
-                                )
-                            }
-                        }
-                    };
-                    // The manifest object matters as much as the bound ones:
-                    // a damaged store can keep intact bound objects while the
-                    // PRIMARY manifest object is missing or corrupt, so the
-                    // row must not read as fully restorable.
-                    // Checked from the full sha, not the short
-                    // display form.
-                    let manifest_note =
-                        if open_max_core::ledger::approval_manifest_missing(&data_dir, &project, r) {
-                            // Count it as damaged too, or the footer prints an
-                            // unqualified `restore with cp` recipe while this
-                            // very approval cannot be fully restored.
-                            damaged += 1;
-                            "  (manifest bytes not stored: cannot restore the manifest)"
-                        } else {
-                            ""
-                        };
-                    let what = match (r.kind, short) {
-                        (Kind::Change, Some(sha)) => format!("change   {sha} {where_}"),
-                        (Kind::Change, None) => format!("removed  {:12} {where_}", ""),
-                        (Kind::Approval, Some(sha)) => {
-                            format!("approved {sha} {where_}{bound}{manifest_note}")
-                        }
-                        (Kind::Approval, None) => {
-                            format!("approved {:12} {where_} (path only)", "")
-                        }
-                        (Kind::PathRetired, _) => {
-                            format!("retired  {:12} {where_} (path no longer expected)", "")
-                        }
-                    };
-                    // The row carries the record's stored path, which is a
-                    // capability file's own name. One record is one row, the
-                    // same rule check_row applies to a finding.
-                    println!(
-                        "{}",
-                        open_max_core::text::one_line(&format!(
-                            "{} {:8} {what}{note}{session}",
-                            open_max_core::ledger::format_ts(r.ts),
-                            r.actor.as_str(),
-                        ))
-                    );
-                    // Record the runnable restore targets for the footer. A
-                    // change record names its own path and hash; an approval
-                    // names its manifest plus, per vouched hash in `also`, the
-                    // file the approved bytes bound it to - the second file
-                    // the deleted-hook recovery needs and that the old footer
-                    // never named. approval_restore_targets pairs them from
-                    // the record's own path list (hooks) or the stored
-                    // manifest object (tools record none), and refuses rather
-                    // than guesses when a card-skipped file leaves the lists
-                    // unequal. Only intact objects are offered; a missing or
-                    // corrupt one is already counted as damage above.
-                    match r.kind {
-                        Kind::Change => {
-                            if let Some(sha) = &r.sha256 {
-                                if states.get(sha.as_str()).copied() == Some(ObjectState::Intact) {
-                                    restore.push((sha.clone(), r.path.clone()));
-                                }
-                            }
-                        }
-                        Kind::Approval => {
-                            if let Some(sha) = &r.sha256 {
-                                if !r.path.as_os_str().is_empty()
-                                    && !open_max_core::ledger::approval_manifest_missing(
-                                        &data_dir, &project, r,
-                                    )
-                                {
-                                    restore.push((sha.clone(), r.path.clone()));
-                                }
-                            }
-                            restore.extend(open_max_core::ledger::approval_restore_targets(
-                                &data_dir, &project, r,
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                if history.interrupted_write {
-                    let authority = history.records[history.pinned..]
-                        .iter()
-                        .filter(|r| r.kind != open_max_core::ledger::Kind::Change)
-                        .count();
-                    if authority > 0 {
-                        println!(
-                            "\nnote: {authority} record(s) past the chain-head pin grant or retire authority; nobody's pin vouches for them, so they are inert until `openmax --ledger-repair` sets them aside"
-                        );
-                    } else {
-                        println!(
-                            "\nnote: the last append landed but its chain-head pin did not (an interrupted write); nothing was removed, and the next capability change re-pins it"
-                        );
-                    }
-                }
-                if let Some(summary) =
-                    ledger_objects_summary(objects.is_dir(), &restore, restorable, damaged, &objects)
-                {
-                    println!("{summary}");
-                }
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("openmax: {e}");
-                std::process::exit(1);
-            }
-        }
+        let dir = open_max_core::ledger::project_dir(&default_data_dir(), &project);
+        println!(
+            "--ledger is deprecated: capability-file history is no longer recorded; this project's existing records and objects are kept, unchanged, in {}",
+            dir.display()
+        );
+        std::process::exit(0);
     }
 
     if cli.ledger_repair {
@@ -703,7 +506,7 @@ async fn main() -> std::io::Result<()> {
                 println!(
                     "the ledger does not verify: {records} record(s), {approvals} of them approval-grade, will be set aside (nothing is deleted)."
                 );
-                println!("a new chain starts at the next capability change; every approval must be granted again.");
+                println!("a new chain starts at the next approval; every approval must be granted again.");
                 Some("quarantine")
             }
         };
@@ -731,7 +534,7 @@ async fn main() -> std::io::Result<()> {
                             outcome.records,
                             path.display()
                         );
-                        println!("a new chain starts at the next capability change; nothing was deleted, and the objects for rollback are untouched");
+                        println!("a new chain starts at the next approval; nothing was deleted, and stored objects are untouched");
                         if outcome.approvals > 0 {
                             println!(
                                 "{} approval(s) went with it: re-approve each file you still trust with `openmax --approve <path>`",
@@ -866,7 +669,7 @@ async fn main() -> std::io::Result<()> {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             eprintln!(
                 "openmax: --forget retires a human-installed policy, so it only runs at an interactive terminal.\n\
-                 without one, restore the file instead: `openmax --ledger` names the object holding its approved bytes"
+                 without one, restore the file to its approved bytes instead"
             );
             std::process::exit(3);
         }
@@ -1463,55 +1266,6 @@ async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>
 /// passed, or the resolved path the prompt printed - and nothing else does:
 /// the point is that a person read which policy is going away, so "y" is not
 /// enough.
-/// The trailing objects-store summary for `--ledger`. `restore` is every
-/// intact object paired with the path it belongs at, rendered as a runnable,
-/// shell-quoted `cp` line so the documented recovery ("an ordinary cp from the
-/// objects directory") can be copied and run - the old bare template named a
-/// 12-char sha prefix the history printed, but object filenames are the full
-/// 64, so it never worked (Judge F). `restorable` still counts the change
-/// records that named stored bytes: with none, a missing store is the normal
-/// state of an approvals-only ledger, not damage, so warning that "no version
-/// can be restored" would cry wolf over a ledger holding nothing restorable.
-fn ledger_objects_summary(
-    store_exists: bool,
-    restore: &[(String, std::path::PathBuf)],
-    restorable: usize,
-    damaged: usize,
-    objects: &std::path::Path,
-) -> Option<String> {
-    if store_exists {
-        let mut out = format!("\nobjects: {}", objects.display());
-        if !restore.is_empty() {
-            out.push_str(
-                "\nrestore a file to a stored version by copying its object back into place:",
-            );
-            let mut seen = std::collections::HashSet::new();
-            for (sha, path) in restore {
-                if seen.insert((sha.as_str(), path.as_path())) {
-                    out.push_str(&format!(
-                        "\n  cp {} {}",
-                        open_max_core::doctor::shell_quote(&objects.join(sha)),
-                        open_max_core::doctor::shell_quote(path)
-                    ));
-                }
-            }
-        }
-        if damaged > 0 {
-            out.push_str(&format!(
-                "\nwarning: {damaged} record(s) have no trustworthy object; those bytes cannot be restored from this ledger"
-            ));
-        }
-        Some(out)
-    } else if restorable > 0 {
-        Some(format!(
-            "\nobjects: {} is gone, so no version above can be restored from this ledger",
-            objects.display()
-        ))
-    } else {
-        None
-    }
-}
-
 fn forget_confirmed(answer: &str, given: &str, resolved: &std::path::Path) -> bool {
     let answer = answer.trim();
     !answer.is_empty() && (answer == given.trim() || answer == resolved.display().to_string())
@@ -1641,7 +1395,7 @@ fn print_usage_economics() {
         );
     }
     println!(
-        "\nprompt_chars are paid on every request while the extension is installed.\n{} recorded calls total. Delete what you do not use; openmax --ledger keeps the history restorable.",
+        "\nprompt_chars are paid on every request while the extension is installed.\n{} recorded calls total. Delete what you do not use.",
         usage.total_calls
     );
     if capped_out > 0 {
@@ -1951,46 +1705,6 @@ mod tests {
 
     use super::*;
     use std::sync::{Arc, Mutex};
-
-    /// An approvals-only ledger has no objects store because nothing ever
-    /// stored bytes; `--ledger` must not warn that "no version can be
-    /// restored" over records that were never restorable.
-    #[test]
-    fn approvals_only_ledger_reports_no_missing_objects() {
-        let objects = std::path::Path::new("/data/ledger/objects");
-        let none: &[(String, std::path::PathBuf)] = &[];
-        assert_eq!(ledger_objects_summary(false, none, 0, 0, objects), None);
-
-        // With stored bytes recorded, a missing store is real damage.
-        let gone = ledger_objects_summary(false, none, 2, 0, objects).unwrap();
-        assert!(gone.contains("is gone"), "{gone}");
-
-        // A present store with intact objects prints a runnable cp per object,
-        // using the FULL sha (the object filename) and shell-quoting both
-        // sides, not the bare un-runnable template the history's 12-char prefix
-        // never satisfied.
-        let restore = vec![(
-            "a".repeat(64),
-            std::path::PathBuf::from("/proj/.openmax/hooks/x's gate.toml"),
-        )];
-        let ok = ledger_objects_summary(true, &restore, 1, 0, objects).unwrap();
-        assert!(ok.contains("copying its object back"), "{ok}");
-        assert!(
-            ok.contains(&format!("cp '/data/ledger/objects/{}'", "a".repeat(64))),
-            "the cp names the full-sha object path: {ok}"
-        );
-        assert!(ok.contains(r"'/proj/.openmax/hooks/x'\''s gate.toml'"), "quoted target: {ok}");
-        assert!(!ok.contains("<sha>"), "no un-runnable placeholder remains: {ok}");
-        assert!(!ok.contains("warning"), "{ok}");
-
-        // A present store with nothing intact keeps the pointer, no recipe.
-        let bare = ledger_objects_summary(true, none, 0, 0, objects).unwrap();
-        assert!(bare.contains("objects: /data/ledger/objects"), "{bare}");
-        assert!(!bare.contains("cp "), "{bare}");
-
-        let hurt = ledger_objects_summary(true, &restore, 1, 1, objects).unwrap();
-        assert!(hurt.contains("1 record(s) have no trustworthy object"), "{hurt}");
-    }
 
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);

@@ -200,7 +200,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 /// resent on every request for the life of the session.
 const SELF_EXTENSION: &str = "\n\nWhen the user asks for a reusable capability (tool, skill, prompt template, hook, permission rule, provider, or memory), read its contract first with bash: openmax --spec <surface>. It gives the file path, format, approval, and activation rules; verify with openmax --check.\n\
 Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
-Past sessions and memories: openmax --recall \"<query>\"; capability-file history and restore: openmax --ledger. Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
+Past sessions and memories: openmax --recall \"<query>\". Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -414,10 +414,9 @@ mod tests {
         assert!(prompt.contains("activation rules"));
         assert!(prompt.contains("openmax --check"));
         assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
-        // The ledger is the only route to a capability file's approved
-        // versions and their restoration commands; neither --spec nor
-        // --recall exposes that, so the pointer has to.
-        assert!(prompt.contains("openmax --ledger"), "capability history must be findable");
+        // Capability-file history is no longer recorded, so a pointer to it
+        // would be bytes every request pays for a command with nothing to show.
+        assert!(!prompt.contains("openmax --ledger"), "no pointer to history that is not kept");
         assert!(prompt.contains("openmax -p or openmax --stdio"));
         assert!(prompt.contains("tmux"));
         // The per-surface paths moved into the contracts the pointer names.
@@ -761,9 +760,8 @@ mod tests {
     }
 
     /// The path-free base rules, extension pointer, and builtin schemas must
-    /// fit in 3,500 bytes (the payload measured 3,412 bytes, 770 tokens on a
-    /// current tokenizer, when the cap was set). Grounding sections have
-    /// separate caps. Measure the payload with
+    /// fit in 3,450 bytes (the payload measured 3,357 bytes when the cap was
+    /// set). Grounding sections have separate caps. Measure the payload with
     /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
     /// changing this budget; provider framing is not included.
     #[test]
@@ -791,7 +789,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 3_500;
+        const CAP: usize = 3_450;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \

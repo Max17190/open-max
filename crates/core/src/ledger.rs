@@ -1,21 +1,19 @@
 //! The capability ledger: a core-owned, append-only, hash-chained record of
-//! every observed change to the capability files that enter the frozen
-//! registry (external tool TOMLs and skill SKILL.mds), plus a
-//! content-addressed store of the bytes themselves.
+//! the content approvals a human granted for a project's capability files.
 //!
-//! Why the core owns this: the agent can write any file inside the project,
-//! so only the process that runs turns can honestly say *when* a capability
-//! file changed relative to the session lifecycle. The ledger lives outside
-//! the project (like `trust.json`), where the confined file tools never
-//! write. Each record embeds the sha256 of the previous record line, so a
-//! torn write or an edit that does not recompute the chain is detected. A
-//! deliberate rewrite of log and pin together is not: there is no key, and
-//! bash can reach the data dir. That is the honest ceiling without an OS
-//! sandbox, and the same ceiling trust already lives at.
+//! The ledger lives outside the project (like `trust.json`), where the
+//! confined file tools never write. Each record embeds the sha256 of the
+//! previous record line, so a torn write or an edit that does not recompute
+//! the chain is detected. A deliberate rewrite of log and pin together is
+//! not: there is no key, and bash can reach the data dir. That is the honest
+//! ceiling without an OS sandbox, and the same ceiling trust already lives at.
 //!
-//! Rollback is deliberately a file operation, not a product: `openmax
-//! --ledger` prints history with object paths, and restoring is `cp`. The
-//! core guarantees the history exists; using it stays ordinary file work.
+//! Earlier builds also recorded every change to a tool or skill file here,
+//! with a copy of its bytes under `objects/`. That history is no longer
+//! recorded: keeping it hashed and copied every capability file at every
+//! capture, and no gate ever consulted it. Logs that carry those change
+//! records still parse and verify, so an older binary and this one share a
+//! log, and stored objects are never deleted.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -24,18 +22,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Who changed a capability file, at the strength the core can prove.
+/// Who wrote a record, at the strength the core can prove.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Actor {
-    /// Present when this project's ledger was first populated; prior history
-    /// is unknowable, so no stronger claim is made.
+    /// A change record from a project's first recorded freeze. Only earlier
+    /// builds wrote change records; kept so their logs still parse.
     Initial,
-    /// Changed while an agent turn was running in the named session: the
-    /// mid-turn refreeze after a successful mutating call observed it.
+    /// An approval granted at a card in the named session (or, in a change
+    /// record from an earlier build, a change a mid-turn refreeze observed).
     Session,
-    /// Changed while no turn was running (a human edit, `git pull`, a
-    /// third-party install): observed at turn start or `/reload`.
+    /// An approval granted outside any session (`openmax --approve`), or a
+    /// retirement (`openmax --forget`).
     External,
 }
 
@@ -55,7 +53,8 @@ impl Actor {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// A capability file appeared, changed, or was removed.
+    /// A capability file appeared, changed, or was removed. Written only by
+    /// earlier builds; read so their logs still verify, and never authority.
     #[default]
     Change,
     /// A human approved this exact content for unattended execution.
@@ -80,11 +79,11 @@ impl Kind {
     }
 }
 
-/// One observed change. `sha256` is `None` when the file was removed.
-/// Approval records reuse the shape: `sha256` is the manifest's content,
-/// `also` carries the rest of the hashes blessed in the same act (the
-/// project-local code that manifest runs), and `path` is where the human
-/// approved it (empty when the caller only knew a hash).
+/// One record. In an approval, `sha256` is the manifest's content, `also`
+/// carries the rest of the hashes blessed in the same act (the project-local
+/// code that manifest runs), and `path` is where the human approved it (empty
+/// when the caller only knew a hash). In a change record an earlier build
+/// wrote, `sha256` is `None` when the file was removed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub v: u32,
@@ -126,15 +125,6 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// One entry of a sync's outcome, for the refreeze receipt.
-#[derive(Clone, Debug)]
-pub struct Change {
-    pub path: PathBuf,
-    pub actor: Actor,
-    /// `added`, `modified`, or `removed`.
-    pub kind: &'static str,
-}
-
 /// Bumped when approvals moved into the chain. Older lines still parse; the
 /// number only says which build's shape a record carries.
 const RECORD_VERSION: u32 = 2;
@@ -173,6 +163,27 @@ pub fn project_dir(data_dir: &Path, project_root: &Path) -> PathBuf {
 
 fn log_path(dir: &Path) -> PathBuf {
     dir.join("log.jsonl")
+}
+
+/// Reads of each ledger directory's log, so a test can prove a path never
+/// consults the chain. Keyed by directory: every test owns its data dir, and
+/// tests share this process.
+#[cfg(test)]
+static LOG_READS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn count_log_read(dir: &Path) {
+    let mut reads = LOG_READS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    *reads.entry(dir.to_path_buf()).or_default() += 1;
+}
+
+/// How many times this project's log has been read in this process.
+#[cfg(test)]
+pub(crate) fn log_reads(data_dir: &Path, project_root: &Path) -> usize {
+    let dir = project_dir(data_dir, project_root);
+    let reads = LOG_READS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    reads.get(&dir).copied().unwrap_or(0)
 }
 
 fn lock_path(dir: &Path) -> PathBuf {
@@ -230,9 +241,9 @@ struct Verified {
 }
 
 impl Verified {
-    /// Records past the pin that grant or retire authority. A crashed sync
-    /// leaves only observations behind; anything stronger in an unpinned
-    /// tail has to wait for a human.
+    /// Records past the pin that grant or retire authority. A crashed
+    /// append of change records (an earlier build's) leaves only observations
+    /// behind; anything stronger in an unpinned tail has to wait for a human.
     fn unpinned_authority(&self) -> impl Iterator<Item = &Record> {
         self.records[self.pinned..].iter().filter(|r| !r.kind.is_change())
     }
@@ -252,17 +263,6 @@ fn refuse_unpinned_authority(verified: &Verified) -> Result<(), String> {
     )))
 }
 
-/// The full history plus whether the last append's pin never landed.
-pub struct History {
-    pub records: Vec<Record>,
-    /// True when a crash left records past the pin; the next sync re-pins.
-    /// Nothing was removed, so this is a repairable state, not tampering.
-    pub interrupted_write: bool,
-    /// How many leading records the stored chain head vouches for. Records
-    /// past this index are the interrupted (unpinned) tail.
-    pub pinned: usize,
-}
-
 fn read_trimmed(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -272,6 +272,8 @@ fn read_trimmed(path: &Path) -> Option<String> {
 /// error, never silently skipped or displayed as authentic: a ledger that
 /// cannot be trusted must not be read around.
 fn read_verified(dir: &Path) -> Result<Verified, String> {
+    #[cfg(test)]
+    count_log_read(dir);
     let path = log_path(dir);
     let (text, log_present) = match std::fs::read_to_string(&path) {
         Ok(text) => (text, true),
@@ -466,44 +468,6 @@ fn approval_event_id(generation: u64, chain_index: usize, r: &Record) -> u64 {
     h.finish()
 }
 
-/// History plus the interrupted-write flag, for callers that report state.
-pub fn read(data_dir: &Path, project_root: &Path) -> Result<History, String> {
-    read_verified(&project_dir(data_dir, project_root)).map(|v| History {
-        records: v.records,
-        interrupted_write: v.pin == Pin::Interrupted,
-        pinned: v.pinned,
-    })
-}
-
-/// The last known hash per path (None = removed), from the full history.
-/// Only change records describe files; approvals carry a hash, not a state.
-fn head(records: &[Record]) -> HashMap<PathBuf, Option<String>> {
-    let mut map = HashMap::new();
-    for r in records.iter().filter(|r| r.kind.is_change()) {
-        map.insert(r.path.clone(), r.sha256.clone());
-    }
-    map
-}
-
-/// Record the difference between the ledger head and `files` (the exact
-/// generation a freeze read: path -> (sha256, bytes)). New and changed files
-/// get `actor` (or `Initial` when the ledger is empty), removed paths get a
-/// removal record, and changed content lands in `objects/<sha256>`. Returns
-/// what changed, for the refreeze receipt. Serialized by an exclusive flock;
-/// callers already hold the turn, so contention is a second harness process.
-pub fn sync(
-    data_dir: &Path,
-    project_root: &Path,
-    files: &[(PathBuf, String, Vec<u8>)],
-    actor: Actor,
-    session_id: Option<&str>,
-) -> Result<Vec<Change>, String> {
-    let dir = project_dir(data_dir, project_root);
-    std::fs::create_dir_all(dir.join("objects"))
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    with_lock(&dir, || sync_locked(&dir, files, actor, session_id))
-}
-
 /// Run `f` under the ledger's exclusive flock. Never call this from inside
 /// another `with_lock`: flock is per open file description, so a second lock
 /// in the same process would wait on itself forever.
@@ -566,7 +530,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
 ///   a record the log does not have;
 /// * the pin itself needs no barrier: losing it lands in exactly the state
 ///   the pending pin describes, which reads as an interrupted write and
-///   re-pins on the next sync.
+///   re-pins on the next append (or `openmax --ledger-repair`).
 fn append_chained(dir: &Path, lines: &str, new_head: &str) -> Result<(), String> {
     write_durable(&pending_head_path(dir), new_head.as_bytes())?;
     let mut file = std::fs::OpenOptions::new()
@@ -582,101 +546,6 @@ fn append_chained(dir: &Path, lines: &str, new_head: &str) -> Result<(), String>
     Ok(())
 }
 
-fn sync_locked(
-    dir: &Path,
-    files: &[(PathBuf, String, Vec<u8>)],
-    actor: Actor,
-    session_id: Option<&str>,
-) -> Result<Vec<Change>, String> {
-    let verified = read_verified(dir)?;
-    // A sync appends and re-pins, which must never quietly bless an unpinned
-    // authority tail; a change-only tail (a crashed sync) heals below.
-    refuse_unpinned_authority(&verified)?;
-    let known = head(&verified.records);
-    // Keyed on change records, not on the log: a ledger that so far holds
-    // only approvals has still never seen this project's files.
-    let effective_actor = if known.is_empty() { Actor::Initial } else { actor };
-    let mut prev = verified.head.clone();
-
-    let ts = unix_now();
-
-    let mut changes = Vec::new();
-    let mut lines = String::new();
-    let mut seen: Vec<&PathBuf> = Vec::new();
-    for (path, sha, bytes) in files {
-        seen.push(path);
-        let kind = match known.get(path) {
-            Some(Some(existing)) if existing == sha => continue,
-            Some(Some(_)) => "modified",
-            Some(None) => "modified", // re-added after removal
-            None => "added",
-        };
-        // Never trust a pre-existing object blindly: rollback follows these
-        // bytes, so an object that does not hash to its own name is replaced
-        // with the authentic content this generation actually read.
-        let object = dir.join("objects").join(sha);
-        let object_valid = std::fs::read(&object)
-            .map(|existing| sha256_hex(&existing) == *sha)
-            .unwrap_or(false);
-        if !object_valid {
-            crate::sessions::write_atomic(&object, bytes)?;
-        }
-        let record = Record {
-            v: RECORD_VERSION,
-            ts,
-            path: path.clone(),
-            sha256: Some(sha.clone()),
-            actor: effective_actor,
-            session_id: session_id.map(str::to_string),
-            kind: Kind::Change,
-            also: Vec::new(),
-            event: None,
-            code: Vec::new(),
-            blocking: false,
-            prev: prev.clone(),
-        };
-        let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
-        prev = sha256_hex(line.as_bytes());
-        lines.push_str(&line);
-        lines.push('\n');
-        changes.push(Change { path: path.clone(), actor: effective_actor, kind });
-    }
-    // Removals: paths the ledger knows as present that this generation lacks.
-    for (path, last) in &known {
-        if last.is_some() && !seen.contains(&path) {
-            let record = Record {
-                v: RECORD_VERSION,
-                ts,
-                path: path.clone(),
-                sha256: None,
-                actor: effective_actor,
-                session_id: session_id.map(str::to_string),
-                kind: Kind::Change,
-                also: Vec::new(),
-                event: None,
-                code: Vec::new(),
-                blocking: false,
-                prev: prev.clone(),
-            };
-            let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
-            prev = sha256_hex(line.as_bytes());
-            lines.push_str(&line);
-            lines.push('\n');
-            changes.push(Change { path: path.clone(), actor: effective_actor, kind: "removed" });
-        }
-    }
-
-    if !lines.is_empty() {
-        append_chained(dir, &lines, &prev)?;
-    } else if verified.pin == Pin::Interrupted {
-        // Heal a crash-interrupted append even when this generation changed
-        // nothing: the records are intact and chained, only the pin is stale.
-        crate::sessions::write_atomic(&chain_head_path(dir), &verified.head)?;
-        let _ = std::fs::remove_file(pending_head_path(dir));
-    }
-    Ok(changes)
-}
-
 // ---------- content-bound approvals ----------
 //
 // Approvals are ledger records, not a file beside the ledger. `approved.json`
@@ -686,7 +555,7 @@ fn sync_locked(
 // hook and have the next session run it. As records they inherit the chain,
 // the pin, and the audit trail: a forged approval has to forge the chain
 // (detectable, and the same ceiling trust already lives at), and every real
-// one shows up in `openmax --ledger` with its time, actor, and session.
+// one carries its time, actor, and session.
 
 /// One hook as a human approved it: the shape reconciliation must remember,
 /// because the file itself can no longer be trusted to describe it.
@@ -854,6 +723,8 @@ pub fn approvals(data_dir: &Path, project_root: &Path) -> Result<Approvals, Stri
     // is either unparseable, unpinned authority that refuses, or vouched by
     // a pending head, which bypasses the cache below), so a hit's bytes are
     // the bytes its cached answer was verified from.
+    #[cfg(test)]
+    count_log_read(&dir);
     let key = read_trimmed(&chain_head_path(&dir))
         .zip(std::fs::read(log_path(&dir)).ok().map(|bytes| sha256_hex(&bytes)));
     if let Some((pin, log_sha)) = &key {
@@ -998,53 +869,28 @@ fn approve(
                         p.display()
                     ));
                 }
-                // The ledger promises `cp objects/<sha> <path>` restores what
-                // an approval blessed; until now approvals stored no object
-                // at all, so an approved manifest deleted before any freeze
-                // saw it - and EVERY bound script, which no freeze ever
-                // reads - was unrestorable while --ledger said otherwise
-                // sending a reader hunting for an object that cannot exist.
-                // Store the vouched manifest bytes, and each bound
-                // file whose on-disk bytes hash to a sha the human vouched.
-                store_object(&dir, vouched, &bytes)?;
-                if let Ok(text) = std::str::from_utf8(&bytes) {
-                    for code in manifest_code_source(p, text, project_root) {
-                        let (Some(sha), Ok(code_bytes)) = (code.sha256.as_deref(), std::fs::read(&code.path)) else {
-                            continue;
-                        };
-                        if shas.iter().any(|s| s == sha) && sha256_hex(&code_bytes) == sha {
-                            store_object(&dir, sha, &code_bytes)?;
-                        }
-                    }
-                }
                 // Every code hash this act records in `also` (that is,
-                // `shas[1..]`) must now have a stored object, or a restore of
-                // that hash would fail. A bound file changed, deleted, or made
-                // unreadable since the card hashed it leaves its vouched sha
-                // unstored: reject the whole approval rather than record a hash
-                // with no restorable bytes. Code that was already
-                // missing AT card time never entered `shas`, so this does not
-                // fire for it - that tool is simply not covered and asks again.
-                // The manifest object already written is orphaned (no record
-                // references it), never a dangling approval.
-                for code_sha in shas.iter().skip(1) {
-                    // The object must exist AND hash to its own name: a mere
-                    // is_file() check would accept a pre-existing object at
-                    // objects/<sha> that holds unrelated bytes (a changed
-                    // script whose sha slot was pre-populated), so a restore
-                    // would produce bytes the reviewer never approved.
-                    // store_object only writes bytes that hash to
-                    // the sha, so a valid object here means we stored it this
-                    // act or an earlier act stored the identical bytes.
-                    let intact = std::fs::read(dir.join("objects").join(code_sha))
-                        .map(|b| sha256_hex(&b) == *code_sha)
-                        .unwrap_or(false);
-                    if !intact {
-                        return Err(format!(
-                            "a bound file changed, was removed, or could not be read since it was shown, so its approved bytes ({}) are not restorable; nothing was approved - review the files and approve them again",
-                            &code_sha[..code_sha.len().min(12)]
-                        ));
-                    }
+                // `shas[1..]`) must still be the bytes of a file these
+                // vouched manifest bytes name. A bound file changed, deleted,
+                // or made unreadable since the card hashed it would otherwise
+                // land a hash on record for bytes that no longer exist, next
+                // to a manifest the human believes is now covered: reject the
+                // whole approval instead. Code that was already missing AT
+                // card time never entered `shas`, so this does not fire for
+                // it - that tool is simply not covered and asks again.
+                let bound: Vec<String> = std::str::from_utf8(&bytes)
+                    .map(|text| {
+                        manifest_code_source(p, text, project_root)
+                            .into_iter()
+                            .filter_map(|code| code.sha256)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(code_sha) = shas.iter().skip(1).find(|sha| !bound.contains(sha)) {
+                    return Err(format!(
+                        "a bound file changed, was removed, or could not be read since it was shown, so its bytes no longer hash to the vouched {}; nothing was approved - review the files and approve them again",
+                        &code_sha[..code_sha.len().min(12)]
+                    ));
                 }
                 std::str::from_utf8(&bytes)
                     .ok()
@@ -1251,135 +1097,6 @@ fn quarantine_tail_locked(dir: &Path, verified: &Verified) -> Result<Repair, Str
     })
 }
 
-/// Whether an object still holds the exact bytes it is named for. Rollback is
-/// `cp objects/<sha> <path>`, so a rewritten object is a backdoor with a
-/// documented delivery route; the write path re-verifies, and this is the
-/// read path doing the same.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObjectState {
-    Intact,
-    Missing,
-    Corrupt,
-}
-
-/// Write `bytes` as `objects/<sha>` unless a valid object is already there.
-/// Never trusts a pre-existing object blindly: one that does not hash to its
-/// name is replaced with the authentic bytes.
-fn store_object(dir: &Path, sha: &str, bytes: &[u8]) -> Result<(), String> {
-    let object = dir.join("objects").join(sha);
-    let valid = std::fs::read(&object)
-        .map(|existing| sha256_hex(&existing) == sha)
-        .unwrap_or(false);
-    if valid {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dir.join("objects"))
-        .map_err(|e| format!("cannot create {}: {e}", dir.join("objects").display()))?;
-    crate::sessions::write_atomic(&object, bytes)
-}
-
-pub fn object_state(data_dir: &Path, project_root: &Path, sha: &str) -> ObjectState {
-    let path = project_dir(data_dir, project_root).join("objects").join(sha);
-    match std::fs::read(&path) {
-        Ok(bytes) if sha256_hex(&bytes) == sha => ObjectState::Intact,
-        Ok(_) => ObjectState::Corrupt,
-        Err(_) => ObjectState::Missing,
-    }
-}
-
-/// True when an approval's PRIMARY manifest bytes cannot be restored: the
-/// record approved a manifest sha but its object is missing or corrupt (never
-/// stored, removed, or rewritten since). `--ledger` surfaces this so
-/// a row with intact bound objects but an unrestorable manifest does not read
-/// as fully restorable. False for non-approvals and path-only
-/// approvals, which have no manifest object to restore.
-pub fn approval_manifest_missing(data_dir: &Path, project_root: &Path, record: &Record) -> bool {
-    record.kind == Kind::Approval
-        && record
-            .sha256
-            .as_deref()
-            .is_some_and(|sha| !matches!(object_state(data_dir, project_root, sha), ObjectState::Intact))
-}
-
-/// The `(sha, path)` pairs `--ledger`'s footer may offer as `cp` restore
-/// commands for one approval's bound code: each vouched hash in `also`,
-/// paired with the project file the approved bytes named for it, intact
-/// objects only.
-///
-/// The pairing is positional because it was recorded positionally: the
-/// approval hashed the manifest's bound files in `manifest_code_source`
-/// order and `approve()` wrote them to `also` in that order. A hook record
-/// carries the named paths in `code`; a tool record carries none (`code` is
-/// filled from the hook shape only), so its paths are re-derived by parsing
-/// the STORED manifest object - the bytes the hash pins, never the live
-/// file, which may be exactly what needs restoring. A bound file
-/// the card could not read never entered `also`, so a hash list shorter than
-/// the named-path list is ambiguous: nothing is offered then, because a
-/// guessed pairing prints a command that writes approved bytes over the
-/// wrong file.
-pub fn approval_restore_targets(
-    data_dir: &Path,
-    project_root: &Path,
-    record: &Record,
-) -> Vec<(String, PathBuf)> {
-    if record.kind != Kind::Approval || record.also.is_empty() {
-        return Vec::new();
-    }
-    let paths: Vec<PathBuf> = if !record.code.is_empty() && record.code.len() == record.also.len() {
-        record.code.iter().map(PathBuf::from).collect()
-    } else {
-        let named = approved_manifest_code_paths(data_dir, project_root, record);
-        if named.len() != record.also.len() {
-            return Vec::new();
-        }
-        named
-    };
-    record
-        .also
-        .iter()
-        .zip(paths)
-        .filter(|(sha, _)| matches!(object_state(data_dir, project_root, sha.as_str()), ObjectState::Intact))
-        .map(|(sha, path)| (sha.clone(), path))
-        .collect()
-}
-
-/// The bound-code paths the approved manifest bytes name. The record's sha is
-/// what authenticates the bytes, not where they live, so the stored object
-/// and the file at the record's path are both accepted sources when their
-/// bytes hash to it - a pruned object with the manifest still installed must
-/// not hide the script restore the footer exists to print. Empty
-/// when neither source hashes to the vouched sha (an edited manifest revokes,
-/// so its named paths are nobody's to offer), when nothing was ever stored
-/// (a hash-only approval), or when the record carries no path to parse
-/// against.
-fn approved_manifest_code_paths(
-    data_dir: &Path,
-    project_root: &Path,
-    record: &Record,
-) -> Vec<PathBuf> {
-    if record.path.as_os_str().is_empty() {
-        return Vec::new();
-    }
-    let Some(sha) = record.sha256.as_deref() else {
-        return Vec::new();
-    };
-    let object = project_dir(data_dir, project_root).join("objects").join(sha);
-    let Some(bytes) = [object, record.path.clone()]
-        .iter()
-        .filter_map(|p| std::fs::read(p).ok())
-        .find(|b| sha256_hex(b) == sha)
-    else {
-        return Vec::new();
-    };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Vec::new();
-    };
-    manifest_code_source(&record.path, text, project_root)
-        .into_iter()
-        .map(|c| c.path)
-        .collect()
-}
-
 /// Unix seconds as `YYYY-MM-DD HH:MM:SSZ`. Raw epoch seconds are unreadable
 /// in an audit trail, and a date crate is not worth pulling in for one line.
 pub fn format_ts(secs: u64) -> String {
@@ -1424,8 +1141,7 @@ fn hook_record_source(path: &Path, text: &str, project_root: &Path) -> Option<Ap
 /// dropped, never a content hash - approval binds bytes, and the same bytes
 /// arriving again at any path are still bytes a human read and blessed.
 /// Retirement is a chained record like the approval it ends: it removes
-/// enforcement, so it carries the same authentication and shows up in
-/// `openmax --ledger` with its time and actor.
+/// enforcement, so it carries the same authentication, time, and actor.
 pub fn forget_capability(
     data_dir: &Path,
     project_root: &Path,
@@ -1540,8 +1256,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
     // project path but is now MISSING must bind to a None entry, exactly as a
     // missing command-position script does. Otherwise deleting it leaves an
     // EMPTY binding that `covers_code` reads as "nothing to cover", so the
-    // deleted tool runs ungated and a removed-tool receipt calls it
-    // cardless-restorable. An existing script was already read by
+    // deleted tool runs ungated. An existing script was already read by
     // the arg loop above, so this only fires for a genuinely absent one.
     // For an interpreter command, a MISSING script-like positional argument
     // binds to None, even behind options (`python3 -O run.py`). This is
@@ -1549,7 +1264,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
     // soon as any option precedes the candidate, to avoid a --check false
     // positive over an option VALUE like `node -p x.js`): here, gating a
     // missing script-shaped argument is the safe direction - an empty binding
-    // would let the removed tool run ungated and read as cardless-restorable.
+    // would let the removed tool run ungated.
     // An existing argument was already read by the arg loop above.
     let stem = Path::new(command.trim()).file_name().and_then(|s| s.to_str());
     if stem.is_some_and(|s| INTERPRETERS.contains(&s)) {
@@ -1884,25 +1599,6 @@ pub fn record_usage(
     result
 }
 
-/// A short human line per change, for the refreeze receipt. The paths are
-/// project-relative where possible so the note reads like the tree.
-pub fn describe(changes: &[Change], project_root: &Path) -> Vec<String> {
-    changes
-        .iter()
-        .map(|c| {
-            let path = c.path.strip_prefix(project_root).unwrap_or(&c.path);
-            // The path is the agent's own filename and this line is the
-            // receipt's leading clause, so it flattens where it is built.
-            crate::text::one_line(&format!(
-                "{} {} ({})",
-                path.display(),
-                c.kind,
-                c.actor.as_str()
-            ))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1936,23 +1632,6 @@ mod tests {
             prev = sha256_hex(line.as_bytes());
         }
         Ok(records_text.lines().filter(|l| !l.trim().is_empty()).count())
-    }
-
-    /// `describe` builds the receipt's leading "what changed" clause out of the
-    /// agent's own filename, so a path carrying a line break forged a line
-    /// ahead of everything the harness had to say about the change.
-    #[test]
-    fn a_changed_path_cannot_forge_a_line_in_the_receipt_headline() {
-        let forged = "and the file was approved";
-        let changes = vec![Change {
-            path: std::path::PathBuf::from(format!("/p/.openmax/tools/a\n{forged}.toml")),
-            kind: "added",
-            actor: Actor::Initial,
-        }];
-        let lines = describe(&changes, Path::new("/p"));
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(!lines[0].contains('\n'), "{:?}", lines[0]);
-        assert!(lines[0].starts_with(".openmax/tools/a "), "{:?}", lines[0]);
     }
 
     /// A same-second approve/retire/re-approve of identical bytes at the same
@@ -2007,38 +1686,42 @@ mod tests {
         dir
     }
 
-    fn entry(root: &Path, rel: &str, content: &str) -> (PathBuf, String, Vec<u8>) {
-        (root.join(rel), sha256_hex(content.as_bytes()), content.as_bytes().to_vec())
+    /// Append change records the way earlier builds did on every refreeze,
+    /// so the chain, pin, and repair tests run against the logs those builds
+    /// left behind, and prove those logs still verify. A `None` content is a
+    /// removal.
+    fn legacy_changes(data: &Path, root: &Path, changes: &[(&str, Option<&str>)]) {
+        let dir = project_dir(data, root);
+        with_lock(&dir, || {
+            let verified = read_verified(&dir)?;
+            let records = changes
+                .iter()
+                .map(|(rel, content)| Record {
+                    v: RECORD_VERSION,
+                    ts: unix_now(),
+                    path: root.join(rel),
+                    sha256: content.map(|c| sha256_hex(c.as_bytes())),
+                    actor: Actor::External,
+                    session_id: None,
+                    kind: Kind::Change,
+                    also: Vec::new(),
+                    event: None,
+                    code: Vec::new(),
+                    blocking: false,
+                    prev: String::new(),
+                })
+                .collect();
+            let (lines, head) = chain(records, &verified.head)?;
+            append_chained(&dir, &lines, &head)
+        })
+        .unwrap();
     }
 
-    #[test]
-    fn first_sync_is_initial_then_changes_carry_the_caller_actor() {
-        let data = temp("data");
-        let root = temp("proj");
-        let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
-        let changes = sync(&data, &root, &files, Actor::Session, Some("s1")).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].actor, Actor::Initial, "an empty ledger seeds as initial");
-
-        // Unchanged content records nothing.
-        assert!(sync(&data, &root, &files, Actor::External, None).unwrap().is_empty());
-
-        let files = vec![entry(&root, ".openmax/tools/a.toml", "v2")];
-        let changes = sync(&data, &root, &files, Actor::Session, Some("s1")).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].actor, Actor::Session);
-        assert_eq!(changes[0].kind, "modified");
-
-        // Removal is a record, not silence.
-        let changes = sync(&data, &root, &[], Actor::External, None).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, "removed");
-
-        let records = history(&data, &root).unwrap();
-        assert_eq!(records.len(), 3);
-        assert!(records[2].sha256.is_none());
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
+    /// Three versions of one tool file, as an earlier build recorded them.
+    fn three_legacy_versions(data: &Path, root: &Path) {
+        for v in ["v1", "v2", "v3"] {
+            legacy_changes(data, root, &[(".openmax/tools/a.toml", Some(v))]);
+        }
     }
 
     /// ledger.lock speaks the same flock(2) protocol as the session locks:
@@ -2053,12 +1736,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let older = crate::sessions::raw_flock(&lock_path(&dir)).expect("ledger.lock is idle");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let syncer = {
+        let approver = {
             let (data, root, done_tx) = (data.clone(), root.clone(), done_tx.clone());
             std::thread::spawn(move || {
-                let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
-                sync(&data, &root, &files, Actor::External, None).unwrap();
-                done_tx.send("sync").unwrap();
+                approve_hash(&data, &root, &sha256_hex(b"v1")).unwrap();
+                done_tx.send("approve").unwrap();
             })
         };
         let usage = {
@@ -2072,24 +1754,10 @@ mod tests {
         let early = done_rx.recv_timeout(std::time::Duration::from_millis(300));
         assert!(early.is_err(), "{early:?} ran while an older binary held ledger.lock");
         drop(older);
-        syncer.join().unwrap();
+        approver.join().unwrap();
         usage.join().unwrap();
         assert_eq!(history(&data, &root).unwrap().len(), 1);
         assert_eq!(load_usage(&data, &root).unwrap().total_calls, 1);
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn objects_hold_the_exact_bytes_for_rollback() {
-        let data = temp("obj-data");
-        let root = temp("obj-proj");
-        let files = vec![entry(&root, ".openmax/tools/a.toml", "name = \"a\"")];
-        sync(&data, &root, &files, Actor::External, None).unwrap();
-        let records = history(&data, &root).unwrap();
-        let sha = records[0].sha256.clone().unwrap();
-        let object = project_dir(&data, &root).join("objects").join(&sha);
-        assert_eq!(std::fs::read_to_string(object).unwrap(), "name = \"a\"");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2229,12 +1897,11 @@ mod tests {
         assert_eq!(repair_generation(&dir), 2, "every variant counts toward the generation");
     }
 
-    /// An approval stores what it blessed: the manifest AND every bound
-    /// file, so `cp objects/<sha> <path>` restores exactly what a human
-    /// approved. Before, approvals stored nothing (only freezes did, and a
-    /// freeze never reads a bound script), while --ledger promised restore.
+    /// An approval records hashes, not bytes: capability-file history is no
+    /// longer kept, so nothing would ever read a copy, and the project's own
+    /// files are where the approved bytes live.
     #[test]
-    fn an_approval_stores_the_manifest_and_bound_code_as_objects() {
+    fn an_approval_copies_no_bytes_into_the_ledger() {
         let data = temp("appr-obj-data");
         let root = temp("appr-obj-proj");
         std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
@@ -2245,18 +1912,11 @@ mod tests {
         let manifest_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
         let script_sha = sha256_hex(&std::fs::read(&script).unwrap());
         approve_capability(&data, &root, &manifest, &[manifest_sha.clone(), script_sha.clone()]).unwrap();
-        let objects = project_dir(&data, &root).join("objects");
-        assert_eq!(
-            std::fs::read(objects.join(&manifest_sha)).unwrap(),
-            std::fs::read(&manifest).unwrap(),
-            "the approved manifest bytes are restorable"
+        assert!(is_approved(&data, &root, &manifest_sha) && is_approved(&data, &root, &script_sha));
+        assert!(
+            !project_dir(&data, &root).join("objects").exists(),
+            "an approval stores no copy of what it blessed"
         );
-        assert_eq!(
-            std::fs::read(objects.join(&script_sha)).unwrap(),
-            std::fs::read(&script).unwrap(),
-            "the approved bound script bytes are restorable"
-        );
-        assert!(matches!(object_state(&data, &root, &script_sha), ObjectState::Intact));
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2297,8 +1957,8 @@ mod tests {
 
     /// If a bound script changes after the card hashed it but before `approve`
     /// runs, the approval is REJECTED: recording the vouched sha in `also`
-    /// while its object cannot be stored would leave an approved hash with no
-    /// restorable bytes. Nothing is recorded.
+    /// would put a hash on record for bytes that no longer exist, beside a
+    /// manifest the human believes is now covered. Nothing is recorded.
     #[test]
     fn approve_rejects_a_bound_file_changed_after_the_card() {
         let data = temp("changed-data");
@@ -2315,7 +1975,7 @@ mod tests {
         std::fs::write(&script, "echo B\n").unwrap();
         let err = approve_capability(&data, &root, &manifest, &[manifest_sha, script_sha])
             .expect_err("a changed bound file must be rejected");
-        assert!(err.contains("changed") && err.contains("not restorable"), "{err}");
+        assert!(err.contains("changed") && err.contains("nothing was approved"), "{err}");
         assert!(
             history(&data, &root).unwrap().is_empty(),
             "a rejected approval appends no record"
@@ -2324,12 +1984,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The object check verifies CONTENT, not just existence: a changed bound
-    /// script whose sha slot in `objects/` was pre-populated with unrelated
-    /// bytes must still be rejected, or a restore would produce bytes the
-    /// reviewer never approved.
+    /// The bytes on disk decide, never a stored copy: an object an earlier
+    /// build kept for the vouched hash does not stand in for a bound script
+    /// that changed since the card.
     #[test]
-    fn approve_rejects_a_bound_file_whose_object_slot_is_corrupt() {
+    fn a_stored_object_does_not_stand_in_for_a_changed_bound_file() {
         let data = temp("corrupt-data");
         let root = temp("corrupt-proj");
         std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
@@ -2339,46 +1998,19 @@ mod tests {
         std::fs::write(&script, "echo A\n").unwrap();
         let manifest_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
         let script_sha = sha256_hex(&std::fs::read(&script).unwrap());
-        // An unrelated object is planted at objects/<script_sha>.
+        // The authentic old bytes, as an earlier build stored them.
         let objects = project_dir(&data, &root).join("objects");
         std::fs::create_dir_all(&objects).unwrap();
-        std::fs::write(objects.join(&script_sha), b"unrelated corrupt bytes").unwrap();
-        // The script changes, so the store loop will not overwrite the slot.
+        std::fs::write(objects.join(&script_sha), b"echo A\n").unwrap();
         std::fs::write(&script, "echo B\n").unwrap();
-        let err = approve_capability(&data, &root, &manifest, &[manifest_sha, script_sha])
-            .expect_err("a corrupt object slot must not pass as restorable");
-        assert!(err.contains("not restorable"), "{err}");
+        let err = approve_capability(&data, &root, &manifest, &[manifest_sha, script_sha.clone()])
+            .expect_err("a stored copy must not vouch for changed bytes");
+        assert!(err.contains("nothing was approved"), "{err}");
         assert!(history(&data, &root).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A hash-only approval stores no manifest object, so --ledger must read
-    /// its manifest as not restorable; a full (path-form) approval stores the
-    /// object and reads as restorable.
-    #[test]
-    fn a_hash_only_approval_reads_as_manifest_not_restorable() {
-        let data = temp("mrestore-data");
-        let root = temp("mestore-proj");
-        let sha = sha256_hex(b"name = \"t\"\n");
-        approve_hash(&data, &root, &sha).unwrap();
-        let hash_only = history(&data, &root).unwrap();
-        assert!(
-            approval_manifest_missing(&data, &root, &hash_only[0]),
-            "a hash-only approval stored no manifest object to restore from"
-        );
-
-        // A full approval stores the manifest object.
-        std::fs::create_dir_all(root.join(".openmax/tools")).unwrap();
-        let manifest = root.join(".openmax/tools/t.toml");
-        std::fs::write(&manifest, "name = \"full\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n").unwrap();
-        let full_sha = sha256_hex(&std::fs::read(&manifest).unwrap());
-        approve_capability(&data, &root, &manifest, std::slice::from_ref(&full_sha)).unwrap();
-        let recs = history(&data, &root).unwrap();
-        let full = recs.iter().find(|r| r.sha256.as_deref() == Some(full_sha.as_str())).unwrap();
-        assert!(
-            !approval_manifest_missing(&data, &root, full),
-            "a full approval stored the manifest bytes, so it is restorable"
+        assert_eq!(
+            std::fs::read(objects.join(&script_sha)).unwrap(),
+            b"echo A\n",
+            "a stored object is never deleted or rewritten"
         );
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
@@ -2388,10 +2020,7 @@ mod tests {
     fn the_chain_links_every_record_and_detects_tampering() {
         let data = temp("chain-data");
         let root = temp("chain-proj");
-        for v in ["v1", "v2", "v3"] {
-            let files = vec![entry(&root, ".openmax/tools/a.toml", v)];
-            sync(&data, &root, &files, Actor::External, None).unwrap();
-        }
+        three_legacy_versions(&data, &root);
         let log = log_path(&project_dir(&data, &root));
         let text = std::fs::read_to_string(&log).unwrap();
         assert_eq!(verify_chain(&text), Ok(3));
@@ -2410,30 +2039,13 @@ mod tests {
     fn removing_trailing_records_is_detected() {
         let data = temp("trunc-data");
         let root = temp("trunc-proj");
-        for v in ["v1", "v2", "v3"] {
-            let files = vec![entry(&root, ".openmax/tools/a.toml", v)];
-            sync(&data, &root, &files, Actor::External, None).unwrap();
-        }
+        three_legacy_versions(&data, &root);
         let log = log_path(&project_dir(&data, &root));
         let text = std::fs::read_to_string(&log).unwrap();
         let prefix: String = text.lines().take(2).map(|l| format!("{l}\n")).collect();
         std::fs::write(&log, prefix).unwrap();
         let err = history(&data, &root).unwrap_err();
         assert!(err.contains("chain head"), "{err}");
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_corrupted_object_is_replaced_with_authentic_bytes() {
-        let data = temp("objfix-data");
-        let root = temp("objfix-proj");
-        let (path, sha, bytes) = entry(&root, ".openmax/tools/a.toml", "authentic");
-        let object = project_dir(&data, &root).join("objects").join(&sha);
-        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
-        std::fs::write(&object, "forged").unwrap();
-        sync(&data, &root, &[(path, sha.clone(), bytes)], Actor::External, None).unwrap();
-        assert_eq!(std::fs::read_to_string(&object).unwrap(), "authentic");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2666,136 +2278,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An approved external tool records its bound script's hash in `also`
-    /// but no path list - `code` is filled from the hook shape only - so a
-    /// footer pairing `also` with `code` offered nothing: the one intact
-    /// object an operator needs after deleting the script had no cp line.
-    /// The path comes back from the stored manifest object, the
-    /// approved bytes, never the live file, which here is already gone.
-    #[test]
-    fn an_external_tools_bound_script_gets_a_restore_target() {
-        let data = temp("tool-restore-data");
-        let root = temp("tool-restore-proj");
-        let manifest = root.join("deploy.toml");
-        let body = "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n";
-        std::fs::write(&manifest, body).unwrap();
-        std::fs::write(root.join("deploy.sh"), "script").unwrap();
-        let bound = manifest_code(&manifest, &root);
-        assert_eq!(bound.len(), 1, "the fixture binds exactly the script");
-        let script_path = bound[0].path.clone();
-        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
-        approve_capability(&data, &root, &manifest, &shas).unwrap();
-        std::fs::remove_file(root.join("deploy.sh")).unwrap();
-
-        let records = history(&data, &root).unwrap();
-        assert!(records[0].code.is_empty(), "a tool record carries no path list");
-        assert_eq!(
-            approval_restore_targets(&data, &root, &records[0]),
-            vec![(sha256_hex(b"script"), script_path)],
-            "the intact script object is offered at the path the approved bytes name"
-        );
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The record's sha authenticates the manifest bytes wherever they live:
-    /// with the stored object pruned but the manifest file still hashing to
-    /// the vouched sha, a tool's intact script object keeps its restore line,
-    /// while an EDITED manifest file authenticates nothing.
-    #[test]
-    fn a_tools_restore_survives_a_pruned_manifest_object_via_the_authentic_file() {
-        let data = temp("tool-prune-data");
-        let root = temp("tool-prune-proj");
-        let manifest = root.join("deploy.toml");
-        let body = "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./deploy.sh\"\n";
-        std::fs::write(&manifest, body).unwrap();
-        std::fs::write(root.join("deploy.sh"), "script").unwrap();
-        let script_path = manifest_code(&manifest, &root)[0].path.clone();
-        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
-        approve_capability(&data, &root, &manifest, &shas).unwrap();
-        std::fs::remove_file(root.join("deploy.sh")).unwrap();
-        std::fs::remove_file(project_dir(&data, &root).join("objects").join(&shas[0])).unwrap();
-
-        let records = history(&data, &root).unwrap();
-        assert_eq!(
-            approval_restore_targets(&data, &root, &records[0]),
-            vec![(sha256_hex(b"script"), script_path)],
-            "the on-disk manifest still hashes to the vouched sha, so it names the path"
-        );
-
-        std::fs::write(&manifest, "name = \"deploy\"\ndescription = \"d\"\ncommand = \"./other.sh\"\n")
-            .unwrap();
-        assert_eq!(
-            approval_restore_targets(&data, &root, &records[0]),
-            Vec::<(String, PathBuf)>::new(),
-            "an edited manifest authenticates nothing and offers nothing"
-        );
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A bound file the card could not read never enters `also`, so its
-    /// record's hash and path lists disagree in length. Positional pairing
-    /// would then print a cp that writes one file's approved bytes over
-    /// another file's path - the helper refuses instead.
-    #[test]
-    fn an_unequal_hash_and_path_list_is_refused_not_guess_paired() {
-        let data = temp("gap-data");
-        let root = temp("gap-proj");
-        let manifest = root.join("gate.toml");
-        let body = "event = \"pre_tool_use\"\ncommand = \"./wrap.sh\"\nargs = [\"helper.py\"]\n";
-        std::fs::write(&manifest, body).unwrap();
-        std::fs::write(root.join("wrap.sh"), "wrap").unwrap();
-        std::fs::write(root.join("helper.py"), "helper").unwrap();
-        // The card skips a file it cannot read; only helper.py's hash rides.
-        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"helper")];
-        approve_capability(&data, &root, &manifest, &shas).unwrap();
-
-        let records = history(&data, &root).unwrap();
-        assert_eq!(records[0].code.len(), 2, "the approved bytes name two files");
-        assert_eq!(records[0].also.len(), 1, "only one hash was vouched");
-        assert_eq!(
-            approval_restore_targets(&data, &root, &records[0]),
-            Vec::<(String, PathBuf)>::new(),
-            "an ambiguous pairing offers nothing rather than the wrong path"
-        );
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A hook record carries its named paths, so its bound-code restore
-    /// survives a manifest object that is itself missing - the record is the
-    /// pairing, no parse needed - while a bound object that is not intact is
-    /// never offered.
-    #[test]
-    fn a_hooks_recorded_paths_pair_without_the_manifest_object() {
-        let data = temp("hook-restore-data");
-        let root = temp("hook-restore-proj");
-        let manifest = root.join("gate.toml");
-        let body = "event = \"pre_tool_use\"\ncommand = \"./gate.sh\"\n";
-        std::fs::write(&manifest, body).unwrap();
-        std::fs::write(root.join("gate.sh"), "script").unwrap();
-        let shas = vec![sha256_hex(body.as_bytes()), sha256_hex(b"script")];
-        approve_capability(&data, &root, &manifest, &shas).unwrap();
-        let records = history(&data, &root).unwrap();
-        let objects = project_dir(&data, &root).join("objects");
-        std::fs::remove_file(objects.join(&shas[0])).unwrap();
-
-        assert_eq!(
-            approval_restore_targets(&data, &root, &records[0]),
-            vec![(sha256_hex(b"script"), PathBuf::from(records[0].code[0].clone()))],
-            "the record's own path list pairs without the manifest object"
-        );
-        std::fs::remove_file(objects.join(&shas[1])).unwrap();
-        assert_eq!(
-            approval_restore_targets(&data, &root, &records[0]),
-            Vec::<(String, PathBuf)>::new(),
-            "a bound object that is not intact is never offered"
-        );
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     fn first_line(data: &Path, root: &Path) -> String {
         let text = std::fs::read_to_string(log_path(&project_dir(data, root))).unwrap();
         text.lines().next().unwrap().to_string()
@@ -2861,8 +2343,7 @@ mod tests {
     fn a_forged_approvals_file_approves_nothing() {
         let data = temp("forge-data");
         let root = temp("forge-proj");
-        let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
-        sync(&data, &root, &files, Actor::External, None).unwrap();
+        legacy_changes(&data, &root, &[(".openmax/tools/a.toml", Some("v1"))]);
 
         let payload = sha256_hex(b"event = \"session_start\"\ncommand = \"/bin/sh\"\n");
         let hook = root.join(".openmax/hooks/payload.toml");
@@ -3096,16 +2577,13 @@ mod tests {
         for (name, tamper) in cases {
             let data = temp("tamper-data");
             let root = temp("tamper-proj");
-            for v in ["v1", "v2", "v3"] {
-                let files = vec![entry(&root, ".openmax/tools/a.toml", v)];
-                sync(&data, &root, &files, Actor::External, None).unwrap();
-            }
+            three_legacy_versions(&data, &root);
             let dir = project_dir(&data, &root);
             tamper(&dir);
             let err = history(&data, &root).unwrap_err();
             assert!(err.contains("--ledger-repair"), "{name}: no repair path in: {err}");
             assert!(
-                sync(&data, &root, &[], Actor::External, None).is_err(),
+                approve_hash(&data, &root, &sha256_hex(b"v4")).is_err(),
                 "{name}: an unverifiable ledger must not append"
             );
             let _ = std::fs::remove_dir_all(&data);
@@ -3135,8 +2613,7 @@ mod tests {
     fn an_interrupted_append_reads_as_recoverable_and_heals() {
         let data = temp("crash-data");
         let root = temp("crash-proj");
-        let files = vec![entry(&root, ".openmax/tools/a.toml", "v1")];
-        sync(&data, &root, &files, Actor::External, None).unwrap();
+        legacy_changes(&data, &root, &[(".openmax/tools/a.toml", Some("v1"))]);
         let dir = project_dir(&data, &root);
 
         // Exactly what a SIGKILL after the log write leaves behind: the
@@ -3164,16 +2641,17 @@ mod tests {
         drop(log);
         std::fs::write(pending_head_path(&dir), &new_head).unwrap();
 
-        let state = read(&data, &root).unwrap();
+        let state = read_verified(&dir).unwrap();
         assert_eq!(state.records.len(), 2, "nothing was removed, so nothing is hidden");
-        assert!(state.interrupted_write, "the pin is behind the log, not the log behind the pin");
+        assert_eq!(state.pin, Pin::Interrupted, "the pin is behind the log, not the log behind the pin");
+        assert_eq!(state.head, new_head);
 
-        // The next sync re-pins, even with nothing new to record.
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v2")], Actor::External, None)
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(chain_head_path(&dir)).unwrap(), new_head);
+        // The next append chains onto the tail and re-pins past it.
+        approve_hash(&data, &root, &sha256_hex(b"v2")).unwrap();
+        let state = read_verified(&dir).unwrap();
+        assert_eq!(state.records.len(), 3);
+        assert_eq!(state.pin, Pin::Matches);
         assert!(!pending_head_path(&dir).exists());
-        assert!(!read(&data, &root).unwrap().interrupted_write);
 
         // The same tail without a pending pin is a forged append, not a
         // crash: tolerating one must not launder the other.
@@ -3198,10 +2676,12 @@ mod tests {
     fn repair_quarantines_the_damage_and_restores_writes() {
         let data = temp("repair-data");
         let root = temp("repair-proj");
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
-            .unwrap();
+        legacy_changes(&data, &root, &[(".openmax/tools/a.toml", Some("v1"))]);
         approve_hash(&data, &root, &sha256_hex(b"v1")).unwrap();
         let dir = project_dir(&data, &root);
+        // Objects an earlier build stored.
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::write(dir.join("objects").join(sha256_hex(b"v1")), "v1").unwrap();
         truncate_log(&dir, 1);
 
         let outcome = repair(&data, &root).unwrap();
@@ -3210,16 +2690,15 @@ mod tests {
         assert_eq!(outcome.records, 1);
         assert!(!log_path(&dir).exists());
         assert!(!chain_head_path(&dir).exists());
-        assert!(dir.join("objects").is_dir(), "rollback bytes survive a repair");
+        assert!(
+            dir.join("objects").join(sha256_hex(b"v1")).is_file(),
+            "stored objects survive a repair"
+        );
 
         // Writes work again, and the quarantined approvals really are gone.
         assert!(!is_approved(&data, &root, &sha256_hex(b"v1")));
-        let changes =
-            sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::Session, None)
-                .unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].actor, Actor::Initial, "a repaired ledger starts a new baseline");
-        assert!(history(&data, &root).is_ok());
+        approve_hash(&data, &root, &sha256_hex(b"v2")).unwrap();
+        assert_eq!(history(&data, &root).unwrap().len(), 1, "a repaired ledger starts a new chain");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3260,28 +2739,10 @@ mod tests {
     }
 
     #[test]
-    fn objects_are_verified_on_read_and_timestamps_are_readable() {
-        let data = temp("objstate-data");
-        let root = temp("objstate-proj");
-        let (path, sha, bytes) = entry(&root, ".openmax/tools/a.toml", "authentic");
-        sync(&data, &root, &[(path, sha.clone(), bytes)], Actor::External, None).unwrap();
-        assert_eq!(object_state(&data, &root, &sha), ObjectState::Intact);
-
-        let object = project_dir(&data, &root).join("objects").join(&sha);
-        std::fs::write(&object, "### backdoor ###").unwrap();
-        assert_eq!(
-            object_state(&data, &root, &sha),
-            ObjectState::Corrupt,
-            "an object that does not hash to its name must never be restored"
-        );
-        std::fs::remove_file(&object).unwrap();
-        assert_eq!(object_state(&data, &root, &sha), ObjectState::Missing);
-
+    fn timestamps_are_readable() {
         assert_eq!(format_ts(0), "1970-01-01 00:00:00Z");
         assert_eq!(format_ts(1_785_471_295), "2026-07-31 04:14:55Z");
         assert_eq!(format_ts(951_782_400), "2000-02-29 00:00:00Z", "leap day");
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3292,7 +2753,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(log_path(&dir), "not json\n").unwrap();
         assert!(history(&data, &root).is_err());
-        assert!(sync(&data, &root, &[], Actor::External, None).is_err());
+        assert!(approve_hash(&data, &root, &sha256_hex(b"v1")).is_err());
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3322,8 +2783,7 @@ mod tests {
     fn a_pending_tail_grants_no_authority() {
         let data = temp("tail-data");
         let root = temp("tail-proj");
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
-            .unwrap();
+        legacy_changes(&data, &root, &[(".openmax/tools/a.toml", Some("v1"))]);
         approve_hash(&data, &root, &sha256_hex(b"blessed")).unwrap();
         let dir = project_dir(&data, &root);
 
@@ -3348,9 +2808,6 @@ mod tests {
         assert!(!approved.contains(&sha256_hex(b"evil")), "an unpinned approval grants nothing");
 
         // Refused on write: nothing may move the pin past the forgery.
-        let next = [entry(&root, ".openmax/tools/a.toml", "v2")];
-        let err = sync(&data, &root, &next, Actor::External, None).unwrap_err();
-        assert!(err.contains("approval-grade"), "{err}");
         let err = approve_hash(&data, &root, &sha256_hex(b"more")).unwrap_err();
         assert!(err.contains("approval-grade"), "{err}");
 
@@ -3363,20 +2820,19 @@ mod tests {
         assert!(approved.contains(&sha256_hex(b"blessed")), "pinned history survives repair");
         assert!(!approved.contains(&sha256_hex(b"evil")));
         // And the ledger appends again.
-        sync(&data, &root, &next, Actor::External, None).unwrap();
+        approve_hash(&data, &root, &sha256_hex(b"more")).unwrap();
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A change-only pending tail is a crashed sync, and crash recovery must
-    /// keep working exactly as before: reads see the records, the next sync
-    /// re-pins, nothing needs a human.
+    /// A change-only pending tail is an earlier build's crashed append, and
+    /// crash recovery must keep working: reads see the records, the next
+    /// append re-pins past them, nothing needs a human.
     #[test]
     fn a_change_only_pending_tail_still_heals_itself() {
         let data = temp("healtail-data");
         let root = temp("healtail-proj");
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
-            .unwrap();
+        legacy_changes(&data, &root, &[(".openmax/tools/a.toml", Some("v1"))]);
         let dir = project_dir(&data, &root);
         let head = plant_pending_tail(&dir, Record {
             v: RECORD_VERSION,
@@ -3392,11 +2848,13 @@ mod tests {
             blocking: false,
             prev: String::new(),
         });
-        assert!(read(&data, &root).unwrap().interrupted_write);
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v2")], Actor::External, None)
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(chain_head_path(&dir)).unwrap(), head);
-        assert!(!read(&data, &root).unwrap().interrupted_write);
+        let state = read_verified(&dir).unwrap();
+        assert_eq!((state.pin, state.head.as_str()), (Pin::Interrupted, head.as_str()));
+        assert!(approved_hashes(&data, &root).unwrap().is_empty(), "observations grant nothing");
+        approve_hash(&data, &root, &sha256_hex(b"v2")).unwrap();
+        let state = read_verified(&dir).unwrap();
+        assert_eq!(state.pin, Pin::Matches);
+        assert_eq!(state.records.len(), 3, "the healed tail stays in the chain");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3409,8 +2867,7 @@ mod tests {
     fn a_rewritten_log_with_a_pending_receipt_reads_as_tamper() {
         let data = temp("rewrite-data");
         let root = temp("rewrite-proj");
-        sync(&data, &root, &[entry(&root, ".openmax/tools/a.toml", "v1")], Actor::External, None)
-            .unwrap();
+        legacy_changes(&data, &root, &[(".openmax/tools/a.toml", Some("v1"))]);
         let dir = project_dir(&data, &root);
 
         let record = Record {

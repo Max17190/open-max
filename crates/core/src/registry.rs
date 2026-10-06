@@ -104,7 +104,7 @@ pub struct Registry {
     /// write is never mistaken for a live capability.
     pub broken: Vec<(PathBuf, String)>,
     /// Every capability file path THIS freeze's capture actually read (tool
-    /// manifests and SKILL.mds). The refreeze classifier asks whether a path
+    /// manifests and SKILL.mds). The refreeze receipt asks whether a path
     /// still existed in this generation without a second disk probe, which
     /// would race the capture it claims to describe. Empty for a
     /// manifest-restored registry, which only ever sits on the outgoing side
@@ -112,8 +112,8 @@ pub struct Registry {
     pub(crate) read_paths: std::collections::HashSet<PathBuf>,
     /// Broken TOOL manifests with the name each occupies: the declared name,
     /// or the file stem when the document is too broken to yield one - the
-    /// same derivation the withhold pass uses. Lets the refreeze classifier
-    /// see that a broken file already explains an absent name. Empty for a
+    /// same derivation the withhold pass uses. Lets the unknown-tool error
+    /// name the broken file that occupies a called name. Empty for a
     /// manifest-restored registry.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
     /// Same-directory skill name collisions, one record per name (name,
@@ -166,16 +166,16 @@ pub(crate) struct ExtensionSnapshot {
     tools_omitted: usize,
     /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
     skills_omitted: usize,
-    /// Every capability file this generation read: (path, sha256, bytes).
-    /// The ledger records exactly this generation, so what it attests is what
-    /// the freeze actually used - never a second read that could differ.
-    pub(crate) files: Vec<(PathBuf, String, Vec<u8>)>,
+    /// Every capability file path this generation read. Paths only: the
+    /// bytes were parsed and fingerprinted where they were read, and nothing
+    /// downstream needs a copy or a second hash of them.
+    read_paths: Vec<PathBuf>,
     /// Files read but not loaded, with the reason. The bytes are already in
     /// the fingerprint (a broken write still triggers a refreeze); keeping
     /// the reason lets that refreeze's receipt say the tool is NOT live.
     pub(crate) broken: Vec<(PathBuf, String)>,
     /// The tool-tier subset of `broken` with the name each file occupies
-    /// (declared, or stem as the fallback), for the refreeze classifier.
+    /// (declared, or stem as the fallback), for the unknown-tool error.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
     /// Same-directory skill name collisions, one record per name: (name,
     /// displaced paths, winning path, winner indexed). The receipt names
@@ -187,8 +187,7 @@ pub(crate) struct ExtensionSnapshot {
     /// next refreeze or /reload. It is read at activation, not here: most
     /// captures match the frozen fingerprint and are discarded, and a memory
     /// scan in each would read every memory file and the whole access log
-    /// for nothing. Not ledger files (data, not capability), so not in
-    /// `files`.
+    /// for nothing. Data, not capability, so not in `read_paths`.
     project_root: PathBuf,
 }
 
@@ -206,7 +205,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+    let mut read_paths: Vec<PathBuf> = Vec::new();
     // (path, reason, dir precedence index, declared name if recoverable):
     // tools are keyed by DECLARED name, not file stem, so a collision between
     // a broken file and a loaded definition must be judged on the name the
@@ -246,7 +245,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             };
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
-            files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
+            read_paths.push(path.clone());
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 broken_at.push((path, "not valid UTF-8".into(), dir_index, None));
                 continue;
@@ -271,8 +270,8 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // under a valid project override: the override is legitimately active,
     // and the reason says so instead of claiming the name is not callable.
     let mut broken: Vec<(PathBuf, String)> = Vec::new();
-    // (path, occupied name) per broken tool file: the refreeze classifier
-    // tells "removed" from "explained by a broken file" with this, never by
+    // (path, occupied name) per broken tool file: the unknown-tool error
+    // names the broken file behind a called name with this, never by
     // re-probing disk after the capture.
     let mut broken_tools: Vec<(PathBuf, String)> = Vec::new();
     for (path, mut reason, broken_dir, declared) in broken_at {
@@ -325,7 +324,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let bytes = std::fs::read(&path).ok();
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
-            files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
+            read_paths.push(path.clone());
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 broken.push((path, "not valid UTF-8".into()));
                 continue;
@@ -371,7 +370,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // read when the generation activates (`Registry::from_snapshot`). The
     // directory path is still hashed so a project without memories keeps the
     // fingerprint its persisted sessions recorded and resumes without a
-    // refreeze. Never ledgered (data, not capability).
+    // refreeze.
     project_root.join(crate::memory::MEMORY_DIR).hash(&mut h);
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
@@ -409,7 +408,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         skills: discovered_skills,
         tools_omitted,
         skills_omitted,
-        files: files_read,
+        read_paths,
         broken,
         broken_tools,
         shadowed_skills,
@@ -446,7 +445,7 @@ impl Registry {
         registry.ext_fingerprint = snapshot.fingerprint;
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
-        registry.read_paths = snapshot.files.iter().map(|(p, _, _)| p.clone()).collect();
+        registry.read_paths = snapshot.read_paths.into_iter().collect();
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
         registry.shadowed_skills = snapshot.shadowed_skills;

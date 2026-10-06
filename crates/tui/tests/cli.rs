@@ -190,6 +190,17 @@ fn trust_in_ask(project: &Path, home: &Path) {
     assert_eq!(grant.unwrap().1, Some(ApprovalMode::Ask));
 }
 
+/// Approval records in this home's ledger logs, read from disk.
+fn approval_records(home: &Path) -> usize {
+    let Ok(dirs) = std::fs::read_dir(home.join(".openmax").join("ledger")) else {
+        return 0;
+    };
+    dirs.flatten()
+        .filter_map(|dir| std::fs::read_to_string(dir.path().join("log.jsonl")).ok())
+        .map(|log| log.lines().filter(|line| line.contains("\"kind\":\"approval\"")).count())
+        .sum()
+}
+
 fn cmd(project: &Path, home: &Path) -> Command {
     let mut c = Command::new(openmax_bin());
     c.current_dir(project);
@@ -801,14 +812,6 @@ fn approve_names_every_file_it_blesses() {
         "approving a turn_end observer must say exit status is ignored: {stdout}"
     );
 
-    // The ledger's restore promise is true for what an approval blessed:
-    // the bound script's bytes are stored at approval time, so the audit
-    // row reads as fully restorable, not "(+1 bound file, 1 not stored)".
-    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
-    let ledger = String::from_utf8_lossy(&ledger.stdout);
-    assert!(ledger.contains("(+1 bound file)"), "{ledger}");
-    assert!(!ledger.contains("not stored"), "an approval stores its bound bytes: {ledger}");
-
     // The pair is live, and rewriting the script alone revokes it.
     let out = cmd(&project, &home).arg("--check").output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
@@ -889,8 +892,8 @@ fn forget_refuses_without_a_human_at_a_terminal() {
     );
 }
 
-/// A ledger nobody can verify refuses to be read as history and names the
-/// way back - which is a human at an interactive terminal: agent sessions
+/// A ledger nobody can verify refuses to be extended and names the way
+/// back - which is a human at an interactive terminal: agent sessions
 /// and terminal-less runs are both refused, and the fail-closed state
 /// survives the refusal. The quarantine itself is proven at the unit level,
 /// where no confirmation prompt stands in the way.
@@ -922,7 +925,12 @@ fn an_unverifiable_ledger_is_refused_and_repairable() {
     // The easiest tamper there is: delete the pin.
     std::fs::remove_file(dir.join("chain-head")).unwrap();
 
-    let out = cmd(&project, &home).arg("--ledger").output().unwrap();
+    // Approving again cannot extend a chain nobody can verify, and the
+    // refusal names the way back.
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("--ledger-repair"), "the way back must be named: {stderr}");
@@ -958,6 +966,48 @@ fn an_unverifiable_ledger_is_refused_and_repairable() {
         }),
         "a refused repair must move nothing"
     );
+}
+
+/// Capability-file history is no longer recorded, so `--ledger` has nothing
+/// to print. It stays accepted so a script that calls it keeps working: one
+/// line says so and names where earlier records and objects stay, and
+/// nothing there is touched.
+#[test]
+fn ledger_is_deprecated_and_leaves_existing_records_in_place() {
+    let (project, home) = fresh_dirs("ledger-deprecated");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("gate.toml"), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(approval_records(&home), 1);
+    let dir = std::fs::read_dir(home.join(".openmax").join("ledger"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a ledger directory");
+    // An object an earlier build stored.
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    std::fs::write(dir.join("objects").join("a".repeat(64)), "earlier bytes").unwrap();
+    let log = std::fs::read(dir.join("log.jsonl")).unwrap();
+
+    let out = cmd(&project, &home).arg("--ledger").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.contains("no longer recorded"), "{stdout}");
+    assert!(stdout.contains(&dir.display().to_string()), "where the records stay: {stdout}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("objects").join("a".repeat(64))).unwrap(),
+        "earlier bytes",
+        "stored objects are kept"
+    );
+    assert_eq!(std::fs::read(dir.join("log.jsonl")).unwrap(), log, "the log is kept as it was");
 }
 
 /// Each early-exit operation runs and exits before the next one is
@@ -1801,11 +1851,7 @@ fn an_attested_parent_does_not_let_a_bash_child_approve() {
     let out = cmd(&project, &home).args(["--trust-project", "-p", "go"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("exit=3"), "the child's --approve must refuse: {stderr}");
-    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
-    assert!(
-        !String::from_utf8_lossy(&ledger.stdout).contains("approved"),
-        "no approval may land from an agent's bash child"
-    );
+    assert_eq!(approval_records(&home), 0, "no approval may land from an agent's bash child");
 }
 
 /// A process the harness itself spawned has no human on its client: an agent
@@ -1877,8 +1923,7 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
     assert!(decline.contains("no human is on this client"), "the refusal says why: {decline}");
     assert!(decline.contains("openmax --approve"), "{decline}");
     assert!(!marker.exists(), "the unapproved tool must not have run");
-    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
-    assert!(!String::from_utf8_lossy(&ledger.stdout).contains("approved"), "the ledger must record no grant");
+    assert_eq!(approval_records(&home), 0, "the ledger must record no grant");
 }
 
 /// A sandboxed probe cannot prove a tool that needs the network or a write
