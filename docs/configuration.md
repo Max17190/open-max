@@ -18,7 +18,16 @@ optional `~/.openmax/providers.json` for a catalog of named endpoints.
 
 `base_url` is the root of your model's HTTP API (the harness calls
 `chat/completions` on it). Set `model` to the id that server expects. Set
-`api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`.
+`api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. A key never
+crosses plain http to another machine: with a key (or `user:password` in the
+`base_url`) configured and an `http://` `base_url` that is not a loopback
+address (`127.0.0.1`, `::1`, or `localhost`), every request fails with an
+error instead of sending it. Use https, or a
+loopback address for a server on this machine; a server that needs no key works
+over http once none is configured. A redirect is followed only on the same
+scheme, host, and port as `base_url`: one to another server fails the request
+with an error naming that server, since following it would hand the request
+and its headers to a server you did not configure.
 `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and
 is clamped to 1 through 32 at runtime. Mutating, approval-gated, and
 non-batchable calls remain serial.
@@ -145,6 +154,24 @@ requests.
 Set `"provider"` in settings, use the provider CLI option, or use `/provider`
 when you only want to change the endpoint. Optional `compat` flags cover picky
 gateways (for example `max_completion_tokens` versus `max_tokens`).
+
+A provider takes its key from its own `api_key` or `api_key_env`. Without one,
+it uses the settings `api_key` (or `OPENMAX_API_KEY`) only when its `base_url`
+has the same scheme, host, and port as the settings `base_url`: that key was
+configured for that server. Any other provider gets no key, and a 401 from it
+says how to give that provider its own. A credential in a provider's `headers`
+(a header whose name contains `auth`, `key`, `token`, `secret`, `password`,
+`credential`, or `cookie`, such as `Authorization` or `X-API-Key`) follows the
+same plain-http rule as the key.
+
+A request has no overall deadline, since a local server can spend minutes on a
+long prompt, but an endpoint that sends nothing at all (no response headers, no
+reply bytes, not even an SSE keepalive comment) for 10 minutes ends the
+attempt. If no response arrives, or a stream goes silent before any reply
+text, the attempt is resent like a dropped connection; a stream that goes
+silent after reply text is reported truncated. A provider's
+`idle_timeout_secs` sets a different interval for that provider, in seconds
+(0 does not disable it, and `--check` rejects it).
 
 Open Max works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud
 gateways (OpenRouter and similar), and private proxies.

@@ -641,13 +641,31 @@ Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
   `chat/completions` on it.
 - `api_key` (optional): literal secret. Prefer `api_key_env`.
 - `api_key_env` (optional): env var name, or list of names (first non-empty
-  wins).
+  wins). With neither (or both resolving empty), the provider uses
+  settings.json's `api_key` / `OPENMAX_API_KEY` only when its `base_url` has
+  the same scheme, host, and port as settings `base_url`; any other server
+  gets no key, and a 401 from it names how to give the provider its own.
 - `headers` (optional): extra HTTP headers as a string map.
 - `models` (optional): list of `{"id", "name"?, "context_tokens"?,
   "max_tokens"?}`. Ids are sent unchanged; order is preserved in `/model`.
 - `compat` (optional): wire quirks for picky servers:
   `{"use_max_completion_tokens": false, "send_stream_options": true}` are the
   defaults.
+- `idle_timeout_secs` (optional, default 600): a positive number of seconds
+  (`--check` rejects 0; it never disables the timeout) the endpoint may send
+  nothing at all (no headers, no bytes, no SSE keepalive comment) before the
+  attempt ends. If no response has arrived, or a stream goes silent before
+  any reply text, it is resent; a stream silent after reply text is reported
+  truncated. Raise it for a local server that works through a long prompt
+  silently for longer.
+
+A key, a credential header (one whose name contains auth, key, token,
+secret, password, credential, or cookie, such as Authorization or
+X-API-Key), or user:password in `base_url` never goes over plain http to
+another machine: such a request fails with an error before anything is
+sent. Use https, or a loopback address (127.0.0.1, ::1, localhost) for a
+server on this machine. A redirect is followed only on the same scheme,
+host, and port as `base_url`; one to another server fails the request.
 
 Select a provider with `"provider"` in settings.json, the `--provider` CLI
 option, or `/provider`; `/model` picks provider and model as one pair. This
@@ -705,6 +723,9 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `base_url`: OpenAI-compatible endpoint root (the harness calls
   `chat/completions` on it). No default, never a localhost fallback.
 - `api_key`: literal, or `$ENV_VAR` indirection; `OPENMAX_API_KEY` also works.
+  Sent only to the server `base_url` names (a named provider without a key of
+  its own inherits it only on the same scheme, host, and port), and never over
+  plain http except to a loopback address.
 - `model`: model id sent with every request.
 - `approval_mode`: `auto` | `ask` | `readonly`; default ask. Used only when
   neither this project nor an enclosing one has a saved choice, such as a
@@ -924,9 +945,9 @@ here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
 model request is being resent after a transport failure, a 429 or transient
-5xx, or, before any reply text, a stream that died or a stream or reply the
-provider failed with a rate limit, an overload, or a server fault; thinking
-already streamed for that attempt is void), `diff` (call_id,
+5xx, or, before any reply text, a stream that died or went silent, or a
+stream or reply the provider failed with a rate limit, an overload, or a
+server fault; thinking already streamed for that attempt is void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
