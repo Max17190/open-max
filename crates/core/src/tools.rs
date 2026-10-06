@@ -936,23 +936,32 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
 /// it, such as a home directory kept in git that ignores `*`, cannot hide
 /// the project. Outside one nothing marks where to stop: told to read them
 /// anyway, the walker reads every .gitignore up to the filesystem root,
-/// ones git never applies there. So outside a repository it reads no ignore
-/// file above the walk root, and the filter applies the ones that count:
-/// the project's .gitignore files from its root down, and .ignore files
-/// from every ancestor, as the walker always has.
+/// ones git never applies there, and the user's global excludes, which git
+/// applies only inside a repository. So outside a repository it reads no
+/// global excludes and no ignore file above the walk root, and the filter
+/// applies the ones that count: the project's .gitignore files from its
+/// root down, and .ignore files from every ancestor, as the walker always
+/// has.
+///
+/// The walker ranks the files it reads nearest first, every .ignore ahead
+/// of every .gitignore, and the filter ranks the files above the walk root
+/// with them. It sees only what the walker passed, though: a .ignore above
+/// the walk root that whitelists what a .gitignore inside it ignores
+/// cannot bring that entry back.
 fn project_walker(root_canon: &Path, walk_root: &Path) -> ignore::WalkBuilder {
+    use ignore::gitignore::Gitignore;
     // The markers and the canonical ancestors the walker itself checks.
     let canon = walk_root.canonicalize().unwrap_or_else(|_| walk_root.to_path_buf());
     let in_repository = canon.ancestors().any(|dir| dir.join(".git").exists() || dir.join(".jj").exists());
-    // Nearest first, and .ignore ahead of .gitignore, as the walker ranks them.
-    let mut above: Vec<ignore::gitignore::Gitignore> = Vec::new();
+    let read = |dir: &Path, name: &str| Gitignore::new(dir.join(name)).0;
+    // The files above the walk root that count, nearest first.
+    let (mut above_ignore, mut above_gitignore): (Vec<Gitignore>, Vec<Gitignore>) = Default::default();
     if !in_repository {
         let ancestors = || canon.ancestors().skip(1);
-        let ignores = ancestors().map(|dir| dir.join(".ignore"));
-        let gitignores = ancestors().take_while(|dir| dir.starts_with(root_canon)).map(|dir| dir.join(".gitignore"));
-        above = ignores
-            .chain(gitignores)
-            .map(|file| ignore::gitignore::Gitignore::new(file).0)
+        above_ignore = ancestors().map(|dir| read(dir, ".ignore")).filter(|rules| !rules.is_empty()).collect();
+        above_gitignore = ancestors()
+            .take_while(|dir| dir.starts_with(root_canon))
+            .map(|dir| read(dir, ".gitignore"))
             .filter(|rules| !rules.is_empty())
             .collect();
     }
@@ -964,21 +973,47 @@ fn project_walker(root_canon: &Path, walk_root: &Path) -> ignore::WalkBuilder {
             if e.file_name() == std::ffi::OsStr::new(".git") {
                 return false;
             }
-            if above.is_empty() {
+            if above_ignore.is_empty() && above_gitignore.is_empty() {
                 return true;
             }
-            // The rules are rooted at canonical directories, as the walker's own are.
+            // Canonical, like the directories the rules above are rooted at.
             let path = canon.join(e.path().strip_prefix(&walk_from).unwrap_or(e.path()));
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
-            let verdict = above.iter().map(|rules| rules.matched(&path, is_dir)).find(|m| !m.is_none());
-            !verdict.is_some_and(|m| m.is_ignore())
+            let above = |files: &[Gitignore]| files.iter().find_map(|rules| ignore_verdict(rules, &path, is_dir));
+            if above(&above_ignore).or_else(|| above(&above_gitignore)) != Some(true) {
+                return true;
+            }
+            // The walker passed the entry, so no file it read ignores it, but
+            // one may whitelist it, and a nearer file outranks a farther one.
+            // Pruning on the rule above alone made a glob or grep scoped
+            // below the root miss a file the unscoped one found. Rank the
+            // files the walker read, from the entry's directory up to the
+            // walk root, with the ones above it. This runs only for an entry
+            // about to be pruned.
+            let below = |name: &str| {
+                let dirs = path.parent().into_iter().flat_map(Path::ancestors);
+                dirs.take_while(|dir| dir.starts_with(&canon))
+                    .find_map(|dir| ignore_verdict(&read(dir, name), &path, is_dir))
+            };
+            let ignored = below(".ignore")
+                .or_else(|| above(&above_ignore))
+                .or_else(|| below(".gitignore"))
+                .or_else(|| above(&above_gitignore));
+            ignored != Some(true)
         })
         .git_ignore(true)
-        .git_global(true)
+        .git_global(in_repository)
         .require_git(in_repository)
         .parents(in_repository)
         .max_depth(Some(24));
     walker
+}
+
+/// Whether `rules` ignore `path` (`Some(true)`), whitelist it
+/// (`Some(false)`), or say nothing about it (`None`).
+fn ignore_verdict(rules: &ignore::gitignore::Gitignore, path: &Path, is_dir: bool) -> Option<bool> {
+    let matched = rules.matched(path, is_dir);
+    (!matched.is_none()).then(|| matched.is_ignore())
 }
 
 /// The subtree a glob can possibly match: its literal prefix up to the last
@@ -1854,6 +1889,83 @@ mod tests {
             assert_eq!(out.output, "src/lib.rs:1: fn alpha() {}\n", "grep in {path}");
         }
         let _ = std::fs::remove_dir_all(outer);
+    }
+
+    /// The walker passes an entry when no ignore file it read ignores it,
+    /// though one may whitelist it, and a nearer file outranks a farther
+    /// one. A rule from above a scoped walk pruned such an entry on its own,
+    /// so a glob or grep scoped below the root answered "no matches" for a
+    /// file the unscoped one found.
+    #[test]
+    fn a_scoped_walk_ranks_ignore_files_as_a_whole_project_walk_does() {
+        let outer = outside_dir();
+        // Every .ignore outranks every .gitignore, however near.
+        std::fs::write(outer.join(".ignore"), "*.secret\n").unwrap();
+        let project = outer.join("project");
+        std::fs::create_dir_all(project.join("src/gen")).unwrap();
+        std::fs::write(project.join(".gitignore"), "*.gen\n").unwrap();
+        // drop.gen stays ignored: nothing nearer than the root's rule names it.
+        std::fs::write(project.join("src/.gitignore"), "!keep.gen\n!key.secret\n").unwrap();
+        for file in ["keep.gen", "drop.gen", "key.secret"] {
+            std::fs::write(project.join("src/gen").join(file), "needle\n").unwrap();
+        }
+
+        for pattern in ["**/*.{gen,secret}", "src/**/*.{gen,secret}", "src/gen/*.{gen,secret}"] {
+            let out = glob_tool(&project, &json!({"pattern": pattern}));
+            assert_eq!(out.output, "src/gen/keep.gen", "glob {pattern}");
+        }
+        for path in [".", "src", "src/gen"] {
+            let out = grep_tool(&project, &json!({"pattern": "needle", "path": path}));
+            assert_eq!(out.output, "src/gen/keep.gen:1: needle\n", "grep in {path}");
+        }
+        let _ = std::fs::remove_dir_all(outer);
+    }
+
+    /// git applies the user's global excludes only inside a repository. A
+    /// walker told to read .gitignore outside one applied them there too, so
+    /// a project without git lost every file they name (`*.log`, `.env`)
+    /// from glob and grep without a word.
+    #[cfg(unix)]
+    #[test]
+    fn global_git_excludes_apply_only_inside_a_repository() {
+        const CHILD: &str = "OPENMAX_TEST_GLOBAL_EXCLUDES";
+        if std::env::var_os(CHILD).is_none() {
+            // The excludes file is found through HOME and XDG_CONFIG_HOME,
+            // which every test in this process shares: run this test in a
+            // child whose HOME and XDG_CONFIG_HOME lead to one naming *.log.
+            let home = outside_dir();
+            std::fs::create_dir_all(home.join(".config/git")).unwrap();
+            std::fs::write(home.join(".config/git/ignore"), "*.log\n").unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::tests::global_git_excludes_apply_only_inside_a_repository"])
+                .env(CHILD, "1")
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&home);
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            // "1 passed" rules out a filter that matched nothing and exited 0.
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let project = outside_dir();
+        std::fs::write(project.join("notes.log"), "alpha\n").unwrap();
+        let out = glob_tool(&project, &json!({"pattern": "**/*.log"}));
+        assert_eq!(out.output, "notes.log", "glob outside a repository");
+        let out = grep_tool(&project, &json!({"pattern": "alpha"}));
+        assert_eq!(out.output, "notes.log:1: alpha\n", "grep outside a repository");
+        // Inside one they apply, as git applies them.
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let out = glob_tool(&project, &json!({"pattern": "**/*.log"}));
+        assert_eq!(out.output, "no files matched", "glob inside a repository");
+        let out = grep_tool(&project, &json!({"pattern": "alpha"}));
+        assert_eq!(out.output, "no matches", "grep inside a repository");
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[test]
