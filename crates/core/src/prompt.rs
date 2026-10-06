@@ -199,7 +199,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 /// the prefix carries the index and never the manual. Every line here is
 /// resent on every request for the life of the session.
 const SELF_EXTENSION: &str = "\n\nWhen the user asks for a reusable capability (tool, skill, prompt template, hook, permission rule, provider, or memory), read its contract first with bash: openmax --spec <surface>. It gives the file path, format, approval, and activation rules; verify with openmax --check.\n\
-Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
+Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp.\n\
 Past sessions and memories: openmax --recall \"<query>\"; capability-file history and restore: openmax --ledger. Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
@@ -734,13 +734,17 @@ mod tests {
         // authoring surfaces, and the moments that need them carry their own
         // pointer (--check settings rows print "openmax --spec settings"; the
         // guide's memory line names --recall). A new --spec surface must
-        // either join the pointer or this list, consciously.
+        // either join the pointer or this list, consciously. `mcp` adds no
+        // file kind of its own, but it is named: it is the recipe that turns
+        // an MCP server into a tool and a skill, and without it a request
+        // for a server leaves the agent writing its own protocol client.
         let pointer: Vec<&str> = SELF_EXTENSION.lines()
             .find_map(|line| line.strip_prefix("Surfaces: "))
             .expect("the guide lists its authoring contracts")
             .trim_end_matches('.')
             .split('|')
             .collect();
+        assert!(pointer.contains(&"mcp"), "the pointer names the MCP recipe: {pointer:?}");
         for s in &pointer {
             assert!(crate::spec::SURFACES.contains(s), "the pointer names a surface --spec lacks: {s}");
             assert!(crate::spec::render(s).is_some(), "the named contract must render: {s}");
@@ -762,7 +766,8 @@ mod tests {
 
     /// The path-free base rules, extension pointer, and builtin schemas must
     /// fit in 3,500 bytes (the payload measured 3,412 bytes, 770 tokens on a
-    /// current tokenizer, when the cap was set). Grounding sections have
+    /// current tokenizer, when the cap was set, and 3,416 bytes, 773 tokens,
+    /// once the pointer named `mcp`). Grounding sections have
     /// separate caps. Measure the payload with
     /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
     /// changing this budget; provider framing is not included.
