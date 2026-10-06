@@ -2950,11 +2950,15 @@ async fn run_loop(
             );
             // The server's reasoning rides this message on later requests to
             // the same endpoint, under the key it came in: DeepSeek refuses a
-            // request carrying tools whose earlier replies lack theirs. The
-            // stamp keeps it from an endpoint a `/model` switch moves to.
+            // request carrying tools whose earlier replies lack theirs. So do
+            // its `reasoning_details` and each call's `extra_content`, which
+            // carry the signatures OpenRouter and Gemini require back. The
+            // stamp keeps all of it from an endpoint a `/model` switch moves to.
             reply.reasoning_content = result.reasoning_content.clone();
             reply.reasoning = result.reasoning.clone();
-            if reply.reasoning_content.is_some() || reply.reasoning.is_some() {
+            reply.reasoning_details = result.reasoning_details.clone();
+            let signed_calls = tool_calls.iter().any(|c| c.extra_content.is_some());
+            if reply.reasoning_content.is_some() || reply.reasoning.is_some() || reply.reasoning_details.is_some() || signed_calls {
                 reply.reasoning_origin = Some(client.origin());
             }
             guard.messages().push(reply);
@@ -5079,7 +5083,7 @@ mod tests {
     }
 
     fn msg(role: &str, len: usize) -> ChatMessage {
-        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_origin: None }
+        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None }
     }
 
     fn assistant_with_tools(name: &str, args: &str) -> ChatMessage {
@@ -5092,6 +5096,7 @@ mod tests {
                     name: name.into(),
                     arguments: args.into(),
                 },
+                extra_content: None,
             }]),
         )
     }
@@ -5171,6 +5176,7 @@ mod tests {
                 name: name.into(),
                 arguments: args.into(),
             },
+            extra_content: None,
         }
     }
 
@@ -5189,6 +5195,7 @@ mod tests {
                             name: "read_file".into(),
                             arguments: r#"{"path":"a"}"#.into(),
                         },
+                        extra_content: None,
                     },
                     ToolCall {
                         id: "c2".into(),
@@ -5197,6 +5204,7 @@ mod tests {
                             name: "read_file".into(),
                             arguments: r#"{"path":"b"}"#.into(),
                         },
+                        extra_content: None,
                     },
                     ToolCall {
                         id: "c3".into(),
@@ -5205,6 +5213,7 @@ mod tests {
                             name: "grep".into(),
                             arguments: r#"{"pattern":"x"}"#.into(),
                         },
+                        extra_content: None,
                     },
                 ]),
             ),
@@ -5241,6 +5250,7 @@ mod tests {
                         name: "list_dir".into(),
                         arguments: r#"{"path":"."}"#.into(),
                     },
+                    extra_content: None,
                 }]),
             ),
             ChatMessage::tool("only", "files"),
@@ -5447,6 +5457,7 @@ mod tests {
                 id: "bad_json".into(),
                 kind: "function".into(),
                 function: ToolCallFunction { name: "read_file".into(), arguments: "not json".into() },
+                extra_content: None,
             },
             tool_call("nope", r#"{"x":1}"#),
         ];
@@ -6646,6 +6657,136 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A tool call as Gemini's OpenAI-compatible endpoint streams it: whole in
+    /// one chunk, with no `index`, its thought signature in `extra_content`,
+    /// and finish_reason `stop`.
+    const SIGNED_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"extra_content\":{\"google\":{\"thought_signature\":\"c2lnLUE+/w==\"}},\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\",\"name\":\"read_file\"},\"id\":\"function-call-1\",\"type\":\"function\"}]},\"index\":0}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Run one turn per `(endpoint, prompt)` in one session, each to its Done.
+    async fn turns_across(core: &Arc<Core>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>, id: &str, project: &Path, turns: &[(&String, &str)]) {
+        for (base_url, prompt) in turns {
+            core.settings.lock().unwrap().base_url = (*base_url).clone();
+            start_turn(core.clone(), id.into(), project.to_path_buf(), (*prompt).into()).unwrap();
+            let (stop, _) = drive_turn(rx).await;
+            assert_eq!(stop, "stop");
+        }
+    }
+
+    /// The bug this guards: Gemini 3 refuses the second request of every tool
+    /// loop unless each call it made comes back with the thought signature it
+    /// carried in `extra_content`, which the client dropped. The signature goes
+    /// back on that call, exactly as the server sent it, to that endpoint
+    /// only: after a `/model` switch it is withheld, and it returns with the
+    /// session.
+    #[tokio::test]
+    async fn a_tool_loop_sends_each_calls_thought_signature_back() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (signing, signing_bodies) = capturing_endpoint(SIGNED_TOOL_SSE).await;
+        let (other, other_bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        let id = "sess-signature";
+        turns_across(&core, &mut rx, id, &project, &[(&signing, "what is in a.txt"), (&other, "and now?"), (&signing, "and back?")]).await;
+
+        let signed = r#"{"id":"function-call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"},"extra_content":{"google":{"thought_signature":"c2lnLUE+/w=="}}}"#;
+        let signing_bodies = signing_bodies.lock().unwrap().clone();
+        assert_eq!(signing_bodies.len(), 3, "the tool step, its answer, and the turn after the switch back");
+        for body in [&signing_bodies[1], &signing_bodies[2]] {
+            assert!(body.contains(&format!(r#""tool_calls":[{signed}]"#)), "the call must go back with its signature: {body}");
+            assert!(!body.contains("reasoning_origin"), "the stamp stays in the session file: {body}");
+        }
+        let other_bodies = other_bodies.lock().unwrap().clone();
+        assert_eq!(other_bodies.len(), 1);
+        assert!(
+            !other_bodies[0].contains("extra_content") && !other_bodies[0].contains("thought_signature"),
+            "the switched-to endpoint got another endpoint's signature: {}",
+            other_bodies[0]
+        );
+        let replies = sent_replies(&other_bodies[0]);
+        assert_eq!(replies[0]["tool_calls"][0]["id"], "function-call-1", "the call itself still goes: {}", other_bodies[0]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reasoning as OpenRouter streams it for a model whose reasoning is
+    /// signed: the text in parts under one `index`, its signature in a later
+    /// part, an encrypted block beside it, then one read.
+    const DETAILED_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"read a.txt \",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"read a.txt \",\"signature\":null,\"id\":\"rs-1\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"first\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"first\",\"signature\":null,\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\",\"signature\":\"EqQBsig==\",\"format\":\"unknown\",\"index\":0},{\"type\":\"reasoning.encrypted\",\"data\":\"opaque==\",\"id\":\"enc-1\",\"format\":\"unknown\",\"index\":1}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The bug this guards: OpenRouter needs a signed model's
+    /// `reasoning_details` back on the next request of a tool loop, and the
+    /// client kept only the plain `reasoning` text, which carries no
+    /// signature. The parts streamed under one index come back as one entry,
+    /// beside the plain text, to that endpoint only.
+    #[tokio::test]
+    async fn a_tool_loop_sends_merged_reasoning_details_back() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (detailed, detailed_bodies) = capturing_endpoint(DETAILED_TOOL_SSE).await;
+        let (other, other_bodies) = capturing_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        let id = "sess-details";
+        turns_across(&core, &mut rx, id, &project, &[(&detailed, "what is in a.txt"), (&other, "and now?")]).await;
+
+        let detailed_bodies = detailed_bodies.lock().unwrap().clone();
+        assert_eq!(detailed_bodies.len(), 2, "one tool step, then the answer");
+        let replies = sent_replies(&detailed_bodies[1]);
+        assert_eq!(
+            replies[0]["reasoning_details"],
+            serde_json::json!([
+                {"type": "reasoning.text", "text": "read a.txt first", "signature": "EqQBsig==", "id": "rs-1", "format": "unknown", "index": 0},
+                {"type": "reasoning.encrypted", "data": "opaque==", "id": "enc-1", "format": "unknown", "index": 1},
+            ]),
+            "{}",
+            detailed_bodies[1]
+        );
+        assert_eq!(replies[0]["reasoning"], "read a.txt first", "{}", detailed_bodies[1]);
+        let other_bodies = other_bodies.lock().unwrap().clone();
+        assert_eq!(other_bodies.len(), 1);
+        assert!(
+            !other_bodies[0].contains("reasoning") && !other_bodies[0].contains("EqQBsig") && !other_bodies[0].contains("opaque=="),
+            "the switched-to endpoint got another endpoint's reasoning: {}",
+            other_bodies[0]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The unapproved-source card carries the probe evidence when a
     /// sandboxed example of exactly these bytes passed - prepended to the
     /// detail so clipping cannot hide it - and stays evidence-free for a
@@ -6781,6 +6922,7 @@ mod tests {
             tool_call_id: Some("call-1".into()),
             reasoning_content: None,
             reasoning: None,
+            reasoning_details: None,
             reasoning_origin: None,
         });
 
@@ -10712,6 +10854,7 @@ mod tests {
                             name: "read_file".into(),
                             arguments: format!(r#"{{"path":"src/file_{i}.rs","extra":"{}"}}"#, "y".repeat(200)),
                         },
+                        extra_content: None,
                     })
                     .collect(),
             ),
@@ -11250,6 +11393,7 @@ mod tests {
             tool_calls: Vec::new(),
             reasoning_content: None,
             reasoning: None,
+            reasoning_details: None,
             finish_reason: "stop".into(),
             usage,
         };
@@ -11684,6 +11828,7 @@ mod tests {
                     name: "read_file".into(),
                     arguments: "{}".into(),
                 },
+                extra_content: None,
             }])),
             ChatMessage::tool("call_1", "contents"),
         ];
