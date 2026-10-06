@@ -576,8 +576,9 @@ struct ServerFailure {
     /// The error to return, or the reason to give for a retry.
     message: String,
     /// A rate limit, an overloaded server, or a server fault: what a fresh
-    /// attempt can outlast. A refused request, an exhausted quota, or a
-    /// filtered reply would fail the same way again.
+    /// attempt can outlast, on the terms [`is_retryable_status`] resends a
+    /// refused status. A refused request, an exhausted quota, or a filtered
+    /// reply would fail the same way again.
     retryable: bool,
 }
 
@@ -589,10 +590,14 @@ fn server_failure(error: &Value, raw: &str) -> ServerFailure {
     let code = &error["code"];
     // A numeric code, sometimes sent as a string, is an HTTP status.
     let status = code.as_u64().or_else(|| code.as_str()?.parse().ok());
+    // Only the code and type tell an exhausted quota from a rate limit: a
+    // per-minute limit's message can say "quota" too, and is worth a retry.
     let kinds = || [code, &error["type"]].into_iter().filter_map(Value::as_str);
     let retryable = !kinds().any(|kind| kind.contains("quota"))
         && match status {
-            Some(status) => status == 429 || (500..600).contains(&status),
+            // Resent exactly when that status would be: a 501 inside a 200
+            // is no more worth a retry than a 501 status.
+            Some(status) => u16::try_from(status).is_ok_and(is_retryable_status),
             None => kinds().any(|kind| ["rate_limit", "overloaded", "server_error"].iter().any(|k| kind.contains(k))),
         };
     let code = match code {
@@ -1032,9 +1037,10 @@ const RETRY_AFTER_CAP_SECS: u64 = 60;
 /// already did, so a resend may pay for that work twice. The chat
 /// completions API has no idempotency key to collapse the two, and failing
 /// the turn saves nothing: it ends with no reply, and the only way to one
-/// is the same request sent again. A stream cut before any reply text is
-/// resent on the same terms. A 429 for an exhausted quota is excluded by
-/// [`quota_exhausted`].
+/// is the same request sent again. A stream cut before any reply text, and
+/// a failure a server reports inside a 200 before any reply text with one
+/// of these codes (see [`server_failure`]), are resent on the same terms. A
+/// 429 for an exhausted quota is excluded by [`quota_exhausted`].
 fn is_retryable_status(code: u16) -> bool {
     matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
 }
@@ -1816,8 +1822,9 @@ mod tests {
         assert_eq!(deltas, vec!["content:half an ans".to_string()]);
     }
 
-    /// A rate limit or an overloaded upstream reported before any reply text
-    /// is what a fresh attempt outlasts: the reply starts over under the same
+    /// A rate limit, an overloaded upstream, or a server fault reported
+    /// before any reply text is what a fresh attempt outlasts, as the same
+    /// failure sent as a status is: the reply starts over under the same
     /// rules as a dropped stream, and the retry names the provider's reason.
     #[tokio::test]
     async fn a_retryable_error_inside_the_stream_is_started_over_before_reply_text() {
@@ -1827,8 +1834,16 @@ mod tests {
                 "backend reported an error (429): rate limit reached upstream",
             ),
             (
+                "data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"too many requests upstream\"}}\n\n".to_string(),
+                "backend reported an error: too many requests upstream",
+            ),
+            (
                 "data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n".to_string(),
                 "backend reported an error: upstream overloaded",
+            ),
+            (
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"upstream reset\"}}]}\n\n".to_string(),
+                "backend reported an error (server_error): upstream reset",
             ),
             // The failure can ride the choice instead of the chunk. Read only
             // at the top level, this one was a failure with no code (never
@@ -1847,6 +1862,28 @@ mod tests {
                 deltas,
                 vec![format!("retry:2/{MAX_ATTEMPTS}:{reason}"), "content:all of it".to_string()]
             );
+        }
+    }
+
+    /// The bug this guards: a status code inside a 200 was resent whenever it
+    /// was a 5xx, so a 501 or 505, which no attempt can get past and which
+    /// the same refusal as a status reports at once, cost the whole retry
+    /// budget, about a minute, before its message was shown. A code inside a
+    /// 200 is resent exactly when that status would be.
+    #[tokio::test]
+    async fn a_status_inside_a_200_is_resent_on_the_terms_of_that_status() {
+        for code in [429, 500, 502, 503, 504, 529, 501, 505] {
+            let failure = gateway_error_chunk(json!(code), "upstream failed");
+            let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
+            if is_retryable_status(code) {
+                assert_eq!(result.expect("the second attempt finished").content, "all of it", "{code}");
+                assert_eq!(served, 2, "{code} is resent as its status is");
+                assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend reported an error ({code}): upstream failed"));
+            } else {
+                assert_eq!(result.err(), Some(format!("backend reported an error ({code}): upstream failed")));
+                assert_eq!(served, 1, "{code} is reported at once, as its status is");
+                assert!(deltas.is_empty(), "{code}: {deltas:?}");
+            }
         }
     }
 
@@ -2034,14 +2071,22 @@ mod tests {
     #[test]
     fn server_failures_a_retry_can_outlast() {
         let retryable = |error: Value| server_failure(&error, "").retryable;
-        for code in [json!(429), json!(500), json!(502), json!(503), json!(529), json!("503")] {
+        // A status code is retried exactly when that status would be.
+        for code in [json!(429), json!(500), json!(502), json!(503), json!(504), json!(529), json!("429"), json!("503")] {
             assert!(retryable(json!({"code": code, "message": "m"})), "{code}");
         }
-        for kind in ["rate_limit_exceeded", "server_error", "overloaded_error"] {
+        for kind in ["rate_limit_exceeded", "rate_limit_error", "server_error", "overloaded_error"] {
             assert!(retryable(json!({"code": kind})), "{kind}");
             assert!(retryable(json!({"type": kind})), "{kind}");
         }
+        // A per-minute limit can name its quota in the message; only the
+        // code and type mark one as exhausted.
+        assert!(retryable(json!({"code": 429, "message": "Quota exceeded for requests per minute"})));
         for error in [
+            // A refusal no attempt gets past, as a status or inside a 200.
+            json!({"code": 501}),
+            json!({"code": 505}),
+            json!({"code": "501"}),
             json!({"code": 400}),
             json!({"code": 401}),
             json!({"code": 402}),
