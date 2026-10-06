@@ -1088,6 +1088,10 @@ fn records_end(bytes: &[u8]) -> usize {
 /// through a symlink, or moved and linked back, would otherwise hide its
 /// sessions from `--continue`, `/resume`, and `--recall` under another
 /// spelling. Each distinct stored path resolves once, not once per session.
+/// Only an absolute stored path resolves: a relative one (the "." a frontend
+/// stores when it cannot read its working directory) named the writer's
+/// directory, and resolving it here would name the reader's, listing it
+/// under every project.
 pub fn list(core: &Core, project: &str) -> Result<Vec<SessionMeta>, String> {
     let wanted = crate::state::canonical_root(Path::new(project));
     let mut same_project: HashMap<String, bool> = HashMap::new();
@@ -1096,9 +1100,10 @@ pub fn list(core: &Core, project: &str) -> Result<Vec<SessionMeta>, String> {
         .enumerate()
         .filter(|(_, m)| {
             m.project == project
-                || *same_project
-                    .entry(m.project.clone())
-                    .or_insert_with(|| crate::state::canonical_root(Path::new(&m.project)) == wanted)
+                || *same_project.entry(m.project.clone()).or_insert_with(|| {
+                    let stored = Path::new(&m.project);
+                    stored.is_absolute() && crate::state::canonical_root(stored) == wanted
+                })
         })
         .collect();
     // updated_at is whole seconds and the index is append-ordered, so two
@@ -2865,6 +2870,29 @@ mod tests {
             1,
             "a lookup leaves every stored path as it was"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A frontend whose working directory cannot be read stores the project
+    /// as ".", which names whatever directory the process that wrote it was
+    /// in. Resolved by a later lookup it would name the lookup's own
+    /// directory, so one stray entry would be every project's history and
+    /// `--continue` anywhere would resume a stranger's session. Only an
+    /// absolute stored path resolves; a relative one still matches only its
+    /// own spelling.
+    #[test]
+    fn a_relative_project_path_is_no_other_projects_history() {
+        let dir = std::env::temp_dir().join(format!("openmax-relative-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let stray = create(&core, ".".into()).unwrap().id;
+        let here = std::env::current_dir().unwrap().display().to_string();
+
+        assert!(list(&core, &here).unwrap().is_empty());
+        assert!(latest(&core, &here).unwrap().is_none());
+        let own = create(&core, here.clone()).unwrap().id;
+        assert_eq!(latest(&core, &here).unwrap().unwrap().id, own);
+        let listed: Vec<String> = list(&core, ".").unwrap().into_iter().map(|m| m.id).collect();
+        assert!(listed.contains(&stray), "a relative path still matches its own spelling");
         let _ = std::fs::remove_dir_all(dir);
     }
 
