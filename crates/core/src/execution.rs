@@ -714,6 +714,8 @@ pub(crate) async fn run_process(
     // from `openmax --check --run-examples`, never from a session the TUI
     // draws.
     configure_process_group(&mut command, request.sandbox.is_none());
+    #[cfg(all(test, unix))]
+    hold_before_exec(&mut command);
 
     let mut child = command.spawn().map_err(ProcessError::Spawn)?;
     let pid = child.id();
@@ -1040,6 +1042,93 @@ fn configure_process_group(command: &mut Command, new_session: bool) {
 
 #[cfg(not(unix))]
 fn configure_process_group(_: &mut Command, _: bool) {}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Set by [`PausedSpawn`] for the next spawn on its thread: the pipe the
+    /// child reports its fork on, the pipe it waits on before exec, and that
+    /// pipe's write end.
+    static PAUSE_BEFORE_EXEC: std::cell::Cell<Option<[std::os::fd::RawFd; 3]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn hold_before_exec(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let Some([forked, resume, resume_writer]) = PAUSE_BEFORE_EXEC.take() else { return };
+    // SAFETY: close, write, and read are async-signal-safe, the only kind of
+    // call allowed between fork and exec.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            // The child's own copy of the write end would keep it waiting
+            // forever if the test let go without writing.
+            libc::close(resume_writer);
+            let mut byte = 0_u8;
+            libc::write(forked, (&raw const byte).cast(), 1);
+            libc::read(resume, (&raw mut byte).cast(), 1);
+            Ok(())
+        });
+    }
+}
+
+/// A command started through [`run_process`] and held between fork and exec,
+/// the window in which a spawning child holds a copy of every descriptor the
+/// harness has open. Dropping it lets the child exec and waits for the
+/// command to finish.
+#[cfg(all(test, unix))]
+pub(crate) struct PausedSpawn {
+    resume: Option<std::io::PipeWriter>,
+    spawner: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(test, unix))]
+impl PausedSpawn {
+    pub(crate) fn start() -> Self {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (mut forked, forked_writer) = std::io::pipe().unwrap();
+        let (resume_reader, resume) = std::io::pipe().unwrap();
+        let fds = [forked_writer.as_raw_fd(), resume_reader.as_raw_fd(), resume.as_raw_fd()];
+        let spawner = std::thread::spawn(move || {
+            PAUSE_BEFORE_EXEC.set(Some(fds));
+            let request = ProcessRequest {
+                program: "/bin/echo".into(),
+                args: Vec::new(),
+                cwd: std::env::temp_dir(),
+                stdin: StdinMode::Null,
+                timeout: Duration::from_secs(30),
+                capture: CaptureSpec { head_bytes: 64, tail_bytes: 64, spill_dir: None, spill_bytes_per_stream: 1024 },
+                sandbox: None,
+                env_allowlist: None,
+                self_link: false,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let output = runtime.block_on(run_process(request, Arc::new(CancelToken::default())));
+            // Held until the spawn returns, so a spawn that never forked
+            // reads as end of file instead of a wait that never ends.
+            drop((forked_writer, resume_reader));
+            assert!(output.is_ok(), "the held command failed once resumed");
+        });
+        assert_eq!(forked.read(&mut [0_u8]).unwrap(), 1, "the command never reached its fork");
+        Self { resume: Some(resume), spawner: Some(spawner) }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for PausedSpawn {
+    fn drop(&mut self) {
+        use std::io::Write;
+        if let Some(mut resume) = self.resume.take() {
+            let _ = resume.write_all(&[0]);
+        }
+        if let Some(spawner) = self.spawner.take() {
+            let finished = spawner.join();
+            if !std::thread::panicking() {
+                finished.unwrap();
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 fn send_termination(_: &mut Child, pid: Option<u32>) {
