@@ -214,9 +214,10 @@ pub enum AgentEvent {
     },
     /// The session's tools, skills, and system prompt were re-frozen from
     /// current config (extension files changed, or the user forced /reload).
-    /// `changes` is the refreeze receipt: one line per capability file the
-    /// ledger recorded, with who changed it ("tool.toml modified (external)"),
-    /// so the action space never mutates silently.
+    /// `changes` is the refreeze receipt: one line per tool or skill file
+    /// added, modified, or removed (".openmax/tools/deploy.toml modified"),
+    /// read from the outgoing and incoming registries, so the action space
+    /// never mutates silently.
     Refrozen { tools: usize, skills: usize, changes: Vec<String> },
     /// A forced compaction (`/compact`) finished. The automatic budget prune
     /// speaks through the digest note it leaves in the transcript; the forced
@@ -399,9 +400,9 @@ mod tests {
             env(AgentEvent::Refrozen {
                 tools: 7,
                 skills: 2,
-                changes: vec![".openmax/tools/deploy.toml added (session)".into()],
+                changes: vec![".openmax/tools/deploy.toml added".into()],
             }),
-            r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added (session)"]}"#
+            r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added"]}"#
         );
         assert_eq!(
             env(AgentEvent::SchemasOverBudget { schema_tokens: 6800, budget_tokens: 2150 }),

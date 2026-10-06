@@ -30,7 +30,10 @@ with an error naming that server, since following it would hand the request
 and its headers to a server you did not configure.
 `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and
 is clamped to 1 through 32 at runtime. Mutating, approval-gated, and
-non-batchable calls remain serial.
+non-batchable calls remain serial. In `auto`, read-only external tools batch
+whether or not a human approved their content; outside `auto`, an unapproved
+one is never batched: it takes the serial path, which asks for approval or,
+in `readonly`, refuses the call.
 
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails with an actionable error until you set
@@ -101,7 +104,8 @@ choice and needs its own.
 
 - `auto` runs authorized work without confirmation, including newly created
   or repaired tools, hooks, and project permission `allow` rules. It ignores
-  permission `ask` requests. It does not create content approval records.
+  permission `ask` requests. It neither reads nor creates content approval
+  records.
 - `ask` prompts for mutating calls unless a permission `allow` applies, and
   always prompts for unapproved external tool content. Hooks and project
   permission `allow` rules still require content approval.

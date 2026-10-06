@@ -244,9 +244,10 @@ async fn run_turn_events(
             }
             AgentEvent::Refrozen { tools, skills, changes } => {
                 if !json {
-                    // `changes` names capability files the ledger recorded; a
-                    // refreeze can record none, and the line must not end in
-                    // a colon with nothing after it.
+                    // `changes` names the capability files that changed; a
+                    // refreeze can name none (a manifest that turned
+                    // unreadable), and the line must not end in a colon with
+                    // nothing after it.
                     let what = match changes.is_empty() {
                         true => String::new(),
                         false => format!(": {}", changes.join(", ")),

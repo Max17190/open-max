@@ -271,8 +271,8 @@ content, never to a path: any edit produces a new hash and revokes itself.
 Living in the chain is the point: an approval store beside the log, with none
 of the log's protection, would be approvable by anything that can append a
 line of JSON - including the agent's own `bash`. Forging one now means forging
-the chain, which reads as tampering, and every real approval shows up in
-`openmax --ledger` with its time and actor.
+the chain, which reads as tampering, and every real approval is recorded with
+its time and actor.
 
 What gets hashed is the whole definition, not just the manifest. A tool or
 hook TOML is a pointer: the file its `command` names (or a path in its `args`)
@@ -321,6 +321,9 @@ restores these requirements; running under auto does not bless their hashes:
   runs makes the next call prompt again. Rewriting a blessed script is the same
   act as rewriting the manifest, and it is caught on every path a call can take
   - including the concurrent batch path, where read-only tools run unattended.
+  In `auto` none of this is consulted: every external tool runs without
+  content approval, read-only ones batch like any other read-only call, and
+  no turn reads the ledger.
 - Deleting an approved hook file fails closed too, and is found by reconciling
   the approved paths rather than the directory listing: a deleted file leaves
   nothing to parse and nothing to report against, and `rm gate.toml` is easier
@@ -381,15 +384,10 @@ are the gate.
 
 ## The capability ledger
 
-Every tool and skill file a freeze reads is recorded in a per-project,
-append-only, hash-chained ledger under `~/.openmax/ledger/`, together with a
-content-addressed copy of the bytes. Each record carries the actor at the
-strength the harness can prove: `session` (changed while an agent turn was
-running), `external` (changed while none was: a human, `git pull`, an
-installer), or `initial` (present when the ledger was first populated). The
-ledger lives outside the project, where the confined file tools never write,
-and each record chains the hash of the previous one, so tampering through the
-shell is detectable.
+Approvals live in a per-project, append-only, hash-chained ledger under
+`~/.openmax/ledger/`. The ledger lives outside the project, where the confined
+file tools never write, and each record chains the hash of the previous one,
+so tampering through the shell is detectable. Turns in `auto` never read it.
 
 Beside the log sits `chain-head`, the hash of its final record. The chain
 alone proves internal order but not completeness - lopping off trailing
@@ -398,23 +396,27 @@ detectable, and a log without one cannot be verified at all. Deleting either
 file therefore reads as tampering, not as a fresh project. An append writes a
 pending pin first, flushes the records, then moves the pin, so a crash
 mid-append leaves a state that reads as an interrupted write (nothing was
-removed) and re-pins itself on the next change, rather than an accusation.
+removed) and re-pins itself on the next append, rather than an accusation.
 
-Every re-freeze announces a receipt - the `refrozen` event lists what changed
-and who changed it - so the agent's action space never mutates silently.
-`openmax --ledger` prints the history with object paths, human times, the
-session that observed each change, and every approval; it verifies each object
-against its own hash, so a rewritten one is named instead of silently offered
-for restore. Restoring an earlier version is an ordinary `cp` from the objects
-directory. There is no rollback command: the core guarantees the history
-exists, using it stays file work.
+Earlier versions also recorded every change to a tool or skill file here,
+with a copy of its bytes under `objects/`. That history is no longer
+recorded. Records and objects already on disk are kept unchanged and never
+deleted, and their log still verifies, so an older binary can keep using it.
+`openmax --ledger` is deprecated: it prints one line saying so and where this
+project's records are kept, and exits 0.
+
+Every re-freeze announces a receipt - the `refrozen` event lists each tool or
+skill file added, modified, or removed - so the agent's action space never
+mutates silently. The first re-freeze after a session resumes compares against
+the session's saved manifest, which carries only the loaded tools and the skill
+index, so a skill body edited while the session was closed is not named there.
 
 A ledger that cannot be verified stops appending (a chain nobody can trust
-must not be extended) and revokes every approval it held, but never blocks a
-turn: the failure rides the refreeze receipt. `openmax --ledger-repair` is the
-way back - a human action, refused inside agent-spawned processes, that
-quarantines the damaged log as evidence, keeps the objects, and starts a new
-chain. Approvals in that log go with it and have to be granted again.
+must not be extended) and revokes every approval it held, so outside `auto`
+hooks fail closed until it is repaired. `openmax --ledger-repair` is the way
+back - a human action, refused inside agent-spawned processes, that
+quarantines the damaged log as evidence, keeps any stored objects, and starts
+a new chain. Approvals in that log go with it and have to be granted again.
 
 ## Self-measurement
 
