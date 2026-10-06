@@ -1498,7 +1498,11 @@ pub async fn reload_session(
             .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
     let files = std::mem::take(&mut snapshot.files);
-    let registry = Registry::from_snapshot(snapshot);
+    // Activation reads the memory store, so it stays off the runtime thread
+    // like the capture above.
+    let registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot))
+        .await
+        .map_err(|e| format!("reload discovery failed: {e}"))?;
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
 
     ensure_session_hydrated(core, session_id, project_root).await?;
@@ -1993,8 +1997,11 @@ fn refreeze_receipt_text(
             parts.push(format!("dropped: {}", removed_m.join(", ")));
         }
         if !parts.is_empty() {
+            // Only a refreeze some other change caused gets here: a memory
+            // write alone never refreezes, so the clause credits the rebuild,
+            // never the write.
             note.push_str(&format!(
-                " Memory index {} — live in your prompt from your next step.",
+                " Memory index rebuilt with this refreeze ({}).",
                 parts.join("; ")
             ));
         }
@@ -2026,8 +2033,9 @@ struct AddedTools {
     /// concluded revocation was broken.
     modified_unapproved: Vec<(String, String)>,
     /// Memory index delta (added, updated, removed stems), when both
-    /// generations know their memory files. A memory write is now what
-    /// refreezes; the receipt says the fact is indexed from the next step.
+    /// generations know their memory files. Memory is not in the fingerprint,
+    /// so this is what a refreeze caused by something else (a tool or skill
+    /// change) folds into the rebuilt index.
     memory: Option<(Vec<String>, Vec<String>, Vec<String>)>,
     /// External tools present before and gone now whose CURRENT bytes a human
     /// had approved (manifest sha approved AND the code on disk still matches).
@@ -3437,7 +3445,7 @@ async fn run_loop(
                 if executed && registry.is_mutating(name) {
                     // Any executed mutating call may have changed extension
                     // bytes, a FAILED one included: a bash command can persist
-                    // a tool, skill, or memory file and still exit nonzero,
+                    // a tool or skill file and still exit nonzero,
                     // the same reason the permissions reload just below is
                     // unconditional. The between-iterations refreeze is
                     // fingerprint-gated (a no-op when nothing on disk moved),
@@ -5763,6 +5771,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Activating a generation reads every memory file and the access log,
+    /// which grows with the memory store. /reload must do that read on a
+    /// blocking thread: on the runtime thread it stalls every other task
+    /// there, frontend work included, until the scan finishes. A FIFO in the
+    /// memory directory holds the scan open; while it is held, a task on this
+    /// single-threaded runtime must still answer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_reads_memory_off_the_runtime_thread() {
+        use crate::state::Core;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert(id.clone(), data);
+        }
+        let fifo = project.join(crate::memory::MEMORY_DIR).join("held.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        let (ping_tx, ping_rx) = oneshot::channel::<()>();
+        let (pong_tx, pong_rx) = std::sync::mpsc::channel::<()>();
+        // None: the scan never opened the FIFO. Some(answered): whether the
+        // runtime ran another task while the scan was held open.
+        let holder = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let held = loop {
+                // A non-blocking writer open succeeds only once a reader has it.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                {
+                    Ok(f) => break f,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(_) => return None,
+                }
+            };
+            let _ = ping_tx.send(());
+            let answered = pong_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            // Closing without a write is EOF for the reader and leaves the
+            // FIFO's mtime alone, so the scan finishes in one read.
+            drop(held);
+            Some(answered)
+        });
+
+        let (reloaded, ()) = tokio::join!(reload_session(&core, &id, &project), async {
+            if ping_rx.await.is_ok() {
+                let _ = pong_tx.send(());
+            }
+        });
+        reloaded.unwrap();
+        let answered = holder.join().unwrap().expect("the reload scanned the memory directory");
+        assert!(answered, "the memory scan behind /reload stalled the runtime thread");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The create-then-use loop closes inside one turn: after a mutating call
     /// writes a tool file, the between-iterations check swaps the turn's own
     /// registry and system prompt, installs the generation into the session,
@@ -7316,14 +7392,16 @@ mod tests {
     }
 
     /// A resumed session's prompt is the persisted one, and the manifest's
-    /// memory identities describe the index that prompt carries. The first
-    /// refreeze rebuilds the prompt from a fresh scan, so the delta from those
+    /// memory identities describe the index that prompt carries. Memory
+    /// edits between sittings do not refreeze it on their own (the persisted
+    /// prefix keeps its cache), but the first refreeze something else causes
+    /// rebuilds the prompt from a fresh scan, so the delta from those
     /// identities is exactly what the model's next prompt gains and loses,
     /// and the receipt has to name it. Without that baseline the receipt said
     /// only "extension files changed", and the model could not tell which
     /// fact had moved.
     #[tokio::test]
-    async fn a_resumed_session_names_the_memory_it_gained_on_its_first_turn() {
+    async fn a_resumed_session_names_the_memory_its_first_refreeze_gained() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -7352,13 +7430,31 @@ mod tests {
         std::fs::write(memory.join("ci-lane.md"), "# ci runs on the fast lane\n").unwrap();
 
         // Fresh process, exactly as after `-c`: the registry is restored from
-        // the manifest and the turn-start refreeze reports what moved.
+        // the manifest, and memory edits alone leave the persisted prompt in
+        // place.
         assert!(core.sessions.lock().await.is_empty());
         ensure_session_hydrated(&core, id, &project).await.unwrap();
+        let persisted = core.sessions.lock().await.get(id).unwrap().messages[0].content.clone();
+        assert!(
+            refreeze_if_extensions_changed(&core, id, &project).await.is_none(),
+            "a memory edit must not refreeze the persisted prompt"
+        );
+        let prompt = core.sessions.lock().await.get(id).unwrap().messages[0].content.clone();
+        assert_eq!(prompt, persisted, "the persisted prefix is byte-identical");
+        assert!(prompt.unwrap().contains("deploy port is 8080"));
+
+        // A tool written between sittings refreezes, and that receipt reports
+        // what the rebuilt memory index gained and changed.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
         let receipt = refreeze_if_extensions_changed(&core, id, &project)
             .await
-            .expect("a memory edit moves the fingerprint");
-        assert!(receipt.contains("Memory index"), "the receipt names the index: {receipt}");
+            .expect("a tool write moves the fingerprint");
+        assert!(receipt.contains("Memory index rebuilt"), "the receipt names the index: {receipt}");
         assert!(receipt.contains("indexed: ci-lane"), "{receipt}");
         assert!(receipt.contains("updated: deploy-port"), "{receipt}");
         let map = core.sessions.lock().await;

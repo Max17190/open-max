@@ -156,7 +156,8 @@ pub struct Registry {
 /// One immutable read generation of every file the registry can activate.
 /// Parsing and fingerprinting consume these same bytes, so a concurrent edit
 /// or atomic symlink swap cannot produce a registry whose content disagrees
-/// with its persisted fingerprint.
+/// with its persisted fingerprint. Memory is not part of the generation:
+/// activation reads it.
 pub(crate) struct ExtensionSnapshot {
     fingerprint: u64,
     external: Vec<ToolSpec>,
@@ -180,14 +181,15 @@ pub(crate) struct ExtensionSnapshot {
     /// displaced paths, winning path, winner indexed). The receipt names
     /// these; cross-tier precedence is not here.
     pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
-    /// Project memory files (stem, content hash). Memory rides the frozen
-    /// prompt's index, so a memory write moves the fingerprint and refreezes:
-    /// the fact is live from the next step, deterministically, instead of
-    /// whenever some unrelated extension file happens to change. Not ledger
-    /// files (data, not capability), so not in `files`.
-    pub(crate) memory_files: Vec<(String, u64)>,
-    /// The index section from the same scan as `memory_files`.
-    pub(crate) memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// The project whose memory index `Registry::from_snapshot` reads.
+    /// Memory rides the frozen prompt's index but not the fingerprint, so a
+    /// memory write never refreezes on its own; the index catches up at the
+    /// next refreeze or /reload. It is read at activation, not here: most
+    /// captures match the frozen fingerprint and are discarded, and a memory
+    /// scan in each would read every memory file and the whole access log
+    /// for nothing. Not ledger files (data, not capability), so not in
+    /// `files`.
+    project_root: PathBuf,
 }
 
 impl ExtensionSnapshot {
@@ -359,24 +361,18 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
-    // Memory: ONE read produces both the fingerprint bytes and the index, so
-    // the fingerprint (which decides refreeze) and the frozen index cannot be
-    // captured from two different file generations - an atomic replace between
-    // two scans could otherwise freeze the replacement's index under the
-    // original's fingerprint, and a restore-to-original would then skip the
-    // refreeze that would fix it. The fingerprint hashes every
-    // VALID-named memory byte (a write to one refreezes); the index is the
-    // indexed subset of the SAME bytes. Never ledgered (data, not capability).
-    let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
-    {
-        let dir = project_root.join(crate::memory::MEMORY_DIR);
-        dir.hash(&mut h);
-        for (path, bytes) in &mem.fingerprint_files {
-            path.hash(&mut h);
-            bytes.hash(&mut h);
-        }
-    }
-    let (memory_section, memory_files) = (mem.section, mem.identities);
+    // Memory rides the frozen prompt's index but stays OUT of the
+    // fingerprint. The fingerprint decides refreeze, and a refreeze replaces
+    // the system message and rewrites the transcript: hashing memory bytes
+    // turned every saved fact into a full prompt-cache miss and an
+    // O(transcript) rewrite, only to show the model a fact it had just
+    // written. The index is frozen with the prompt instead, so it changes
+    // only when a tool or skill change refreezes, or on /reload, and it is
+    // read when the generation activates (`Registry::from_snapshot`). The
+    // directory path is still hashed so a project without memories keeps the
+    // fingerprint its persisted sessions recorded and resumes without a
+    // refreeze. Never ledgered (data, not capability).
+    project_root.join(crate::memory::MEMORY_DIR).hash(&mut h);
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
@@ -417,8 +413,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         broken,
         broken_tools,
         shadowed_skills,
-        memory_files,
-        memory_section,
+        project_root: project_root.to_path_buf(),
     }
 }
 
@@ -455,11 +450,11 @@ impl Registry {
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
         registry.shadowed_skills = snapshot.shadowed_skills;
-        registry.frozen_memory_rows = Some(
-            snapshot.memory_section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default(),
-        );
-        registry.memory_files = Some(snapshot.memory_files);
-        registry.memory_section = snapshot.memory_section;
+        let mem = crate::memory::freeze_snapshot(&snapshot.project_root, crate::memory::unix_now());
+        registry.frozen_memory_rows =
+            Some(mem.section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default());
+        registry.memory_files = Some(mem.identities);
+        registry.memory_section = mem.section;
         registry.memory_scanned = true;
         registry
     }
@@ -2274,6 +2269,32 @@ mutatng = true
         let current = Registry::build(&project.join("data"), &project);
         assert_ne!(current.ext_fingerprint, first_fingerprint);
         assert_eq!(current.get("generation").unwrap().description, "later");
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// Memory is outside the fingerprint, so a capture that matches the
+    /// frozen registry (every turn start, and every iteration with an
+    /// executed mutating call) is discarded. A memory scan taken there read
+    /// every memory file and the whole access log for nothing; the scan
+    /// belongs to activation, so a memory written between capture and
+    /// activation is in the activated index.
+    #[test]
+    fn memory_is_read_when_a_generation_activates_not_when_it_is_captured() {
+        let project = temp_dir("memactivate");
+        let memory_dir = project.join(crate::memory::MEMORY_DIR);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let snapshot = capture_extensions(&project.join("data"), &project);
+        let fingerprint = snapshot.fingerprint();
+        std::fs::write(memory_dir.join("deploy-port.md"), "# The deploy port is 7443\n").unwrap();
+
+        let registry = Registry::from_snapshot(snapshot);
+        assert_eq!(registry.ext_fingerprint, fingerprint);
+        let (section, _) =
+            registry.memory_section.clone().expect("activation reads the memory directory");
+        assert!(section.contains("The deploy port is 7443"), "{section}");
+        let names: Vec<&str> =
+            registry.memory_files.iter().flatten().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["deploy-port"]);
         let _ = std::fs::remove_dir_all(project);
     }
 
