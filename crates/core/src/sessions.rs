@@ -415,12 +415,13 @@ pub fn index_diagnostic(core: &Core) -> Option<String> {
     load_index_checked(core).err()
 }
 
-/// A frontend's refusal to start, continue, or list sessions, pointing at
-/// `--check` when the refusal is the index's damage. Only frontends add the
-/// pointer, never the shared reason: `--check` gives the repair with the
-/// step that makes it safe (close every openmax), while a bare path acted
-/// on under a running session turns that session's later saves into silent
-/// no-ops. Any other refusal (a lock or write failure) passes through as is.
+/// A frontend's refusal to start, continue, list, discard, or delete a
+/// session, pointing at `--check` when the refusal is the index's damage.
+/// Only frontends add the pointer, never the shared reason: `--check` gives
+/// the repair with the step that makes it safe (close every openmax), while
+/// a bare path acted on under a running session turns that session's later
+/// saves into silent no-ops. Any other refusal (a lock or write failure)
+/// passes through as is.
 pub fn refusal_with_repair(core: &Core, reason: String) -> String {
     match read_index(core) {
         IndexRead::Damaged(damage) if damage == reason => {
@@ -1810,7 +1811,8 @@ mod tests {
     /// Readers that answer "what history is there" name a damaged index
     /// instead of answering "none": `--continue` would otherwise report no
     /// previous session over a file full of them. Every refusal names the
-    /// file, and `--check` sees the same damage without a Core. The shared
+    /// file, removals included (a frontend discards the empty session it
+    /// leaves), and `--check` sees the same damage without a Core. The shared
     /// reason carries no repair: it also reaches live sessions, where moving
     /// the index aside turns every later save into a silent no-op. A
     /// frontend's refusal points at `--check`, and only for the damage: a
@@ -1819,7 +1821,7 @@ mod tests {
     fn a_damaged_index_is_named_to_readers_not_reported_as_empty() {
         let dir = std::env::temp_dir().join(format!("openmax-damaged-read-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
-        create(&core, "/tmp/p".into()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
         std::fs::write(index_path(&core), "[{").unwrap();
         let path = index_path(&core).display().to_string();
 
@@ -1828,6 +1830,8 @@ mod tests {
             list(&core, "/tmp/p").unwrap_err(),
             create(&core, "/tmp/p".into()).unwrap_err(),
             index_diagnostic(&core).unwrap(),
+            discard_if_empty(&core, &id).unwrap_err(),
+            delete(&core, &id).unwrap_err(),
         ];
         for reason in refusals {
             assert!(reason.contains(&path), "{reason}");
@@ -2305,7 +2309,7 @@ mod tests {
         assert!(delete(&core, &id).unwrap_err().contains("another process"));
         assert!(discard_if_empty(&core, &id).unwrap_err().contains("another process"));
         assert!(session_lock.exists(), "a lock file an older binary holds was unlinked");
-        assert!(list(&core, "/tmp/p").iter().any(|m| m.id == id), "a held session was removed");
+        assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "a held session was removed");
         drop(older);
         assert_eq!(discard_if_empty(&core, &id), Ok(true));
         assert!(!session_lock.exists());
@@ -2452,7 +2456,7 @@ mod tests {
 
         assert_eq!(discard.join().unwrap(), Ok(false), "a session with a transcript is history");
         assert_eq!(load_messages(&core, &id).unwrap().map(|m| m.len()), Some(1));
-        assert!(list(&core, "/tmp/p").iter().any(|m| m.id == id), "and it stays indexed");
+        assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "and it stays indexed");
         let _ = std::fs::remove_dir_all(dir);
     }
 

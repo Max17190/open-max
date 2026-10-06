@@ -969,6 +969,7 @@ impl App {
     /// failure is reported: the entry it leaves is the one this prevents.
     fn discard_if_empty(&mut self, id: &str) {
         if let Err(e) = sessions::discard_if_empty(&self.core, id) {
+            let e = sessions::refusal_with_repair(&self.core, e);
             self.error(&format!("the empty session {id} stays indexed: {e}"));
         }
     }
@@ -984,6 +985,7 @@ impl App {
         ids.into_iter()
             .filter_map(|id| {
                 let e = sessions::discard_if_empty(&self.core, &id).err()?;
+                let e = sessions::refusal_with_repair(&self.core, e);
                 Some(format!("the empty session {id} stays indexed: {e}"))
             })
             .collect()
@@ -2154,7 +2156,7 @@ impl App {
                             self.note("no sessions left in this project");
                         }
                     }
-                    Err(e) => self.error(&e),
+                    Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
                 }
             }
             return;
@@ -4691,7 +4693,7 @@ mod tests {
         let mut app = App::new(core.clone(), dir.clone(), files_tx);
         let key = dir.display().to_string();
         let ids = |core: &std::sync::Arc<Core>| -> Vec<String> {
-            open_max_core::sessions::list(core, &key).into_iter().map(|m| m.id).collect()
+            open_max_core::sessions::list(core, &key).unwrap().into_iter().map(|m| m.id).collect()
         };
 
         // Settled before the user moves on.
@@ -5591,6 +5593,44 @@ mod tests {
         );
         assert!(app.sessions_panel.is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An empty session this app created is discarded when the user leaves
+    /// it, and that removal rewrites the index, so an index damaged since
+    /// the session began refuses it. The warning that the entry stays must
+    /// name the file and point at `--check` for the repair like every other
+    /// refusal over the damage, both in the transcript (/new) and among the
+    /// warnings printed once the terminal is restored (quitting).
+    #[tokio::test]
+    async fn an_empty_session_left_over_a_damaged_index_points_at_the_repair() {
+        let dir = crate::test_temp_dir("openmax-app-discard-damaged");
+        let (core, mut core_rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core.clone(), dir.clone(), files_tx);
+
+        // Nothing is configured, so the turn fails before its first save.
+        app.handle_submit("hello".into()).await.unwrap();
+        let id = app.session_id.clone().unwrap();
+        settle(&mut app, &mut core_rx, &id).await;
+        let index = damage_session_index(&dir);
+        let path = index.display().to_string();
+
+        let warnings = app.discard_created_sessions_on_exit();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("stays indexed") && warnings[0].contains(&path) && warnings[0].contains(REPAIR_POINTER),
+            "the exit warning must name the damaged index and the repair: {warnings:?}"
+        );
+
+        app.handle_submit("/new".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(
+            shown.contains("stays indexed") && shown.contains(&path) && shown.contains(REPAIR_POINTER),
+            "/new must name the damaged index and the repair: {shown}"
+        );
+        assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// Plain Tab keeps its own job.

@@ -96,7 +96,8 @@ pub async fn run(
         match sessions::create(&core, project_key.clone()) {
             Ok(meta) => (meta.id, false),
             Err(e) => {
-                eprintln!("openmax: failed to create session: {}", sessions::refusal_with_repair(&core, e));
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
                 return 1;
             }
         }
@@ -186,6 +187,7 @@ async fn drive<W: Write>(
     let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, out).await;
     if fresh {
         if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            let e = sessions::refusal_with_repair(&core, e);
             // One line, like every other harness line on stderr: the reason
             // quotes the index path, an authored byte string.
             eprintln!(
