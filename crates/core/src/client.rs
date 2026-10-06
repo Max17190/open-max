@@ -486,9 +486,14 @@ impl ChatClient {
             };
             unreached = 0;
             let status = resp.status();
+            // The server's wait governs a resend whether it refused the
+            // request by status or failed it inside a 200. An ask past the
+            // cap outlasts any wait this turn takes: resending would only
+            // meet the same refusal.
+            let asked = retry_after_secs(resp.headers());
+            let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
             if !status.is_success() {
                 let code = status.as_u16();
-                let asked = retry_after_secs(resp.headers());
                 let body = read_body(resp, &cancelled).await
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
@@ -498,19 +503,13 @@ impl ChatClient {
                 if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
                 }
-                // An ask past the cap outlasts any wait this turn takes:
-                // resending would only meet the same refusal.
-                let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
                 if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) && beyond_cap.is_none() {
                     if !resend_after(attempt, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
                     }
                     continue;
                 }
-                if let Some(secs) = beyond_cap {
-                    err.push_str(&format!(" (the server asks for a retry after {secs}s)"));
-                }
-                return Err(err);
+                return Err(naming_wait(err, beyond_cap));
             }
             let is_json = resp
                 .headers()
@@ -531,13 +530,13 @@ impl ChatClient {
                 let error = [&v["error"], &choice["error"]].into_iter().find(|e| !e.is_null());
                 if error.is_some() || choice["finish_reason"] == "error" {
                     let failure = server_failure(error.unwrap_or(&Value::Null), &String::from_utf8_lossy(&body));
-                    if failure.retryable && attempt < MAX_ATTEMPTS {
-                        if !retry_after(attempt, &failure.message, &cancelled, &mut on_delta).await {
+                    if failure.retryable && attempt < MAX_ATTEMPTS && beyond_cap.is_none() {
+                        if !resend_after(attempt, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
                     }
-                    return Err(failure.message);
+                    return Err(naming_wait(failure.message, beyond_cap));
                 }
                 return parse_complete_response(&v, &mut on_delta);
             }
@@ -546,15 +545,18 @@ impl ChatClient {
             // The restart rules: nothing the caller keeps has streamed yet,
             // and the budget has an attempt left.
             let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
-            let reason = match unfinished {
-                Some(Unfinished::Interrupted(reason)) if restartable => reason,
-                Some(Unfinished::Failed(failure)) if failure.retryable && restartable => failure.message,
+            let (reason, wait) = match unfinished {
+                // The network cut it: the server's headers never spoke to that.
+                Some(Unfinished::Interrupted(reason)) if restartable => (reason, backoff(attempt, None)),
+                Some(Unfinished::Failed(failure)) if failure.retryable && restartable && beyond_cap.is_none() => {
+                    (failure.message, backoff(attempt, asked))
+                }
                 // Never a truncated reply: the server said this one failed,
                 // and a tool call it carried must not run.
-                Some(Unfinished::Failed(failure)) => return Err(failure.message),
+                Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
                 _ => return Ok(reply),
             };
-            if !retry_after(attempt, &reason, &cancelled, &mut on_delta).await {
+            if !resend_after(attempt, &reason, wait, &cancelled, &mut on_delta).await {
                 return Ok(cancelled_response());
             }
         }
@@ -1087,10 +1089,19 @@ async fn retry_after(
     resend_after(attempt, reason, backoff(attempt, None), cancelled, on_delta).await
 }
 
-/// [`retry_after`] with the wait chosen by the caller: a refused status
-/// passes the server's Retry-After through [`backoff`]. Returns false when
-/// cancelled during the wait: one can reach [`RETRY_AFTER_CAP_SECS`], and a
-/// user who cancels must not sit through it.
+/// `err`, naming the server's wait when that is past
+/// [`RETRY_AFTER_CAP_SECS`]: why it was not resent, and when to try again.
+fn naming_wait(mut err: String, beyond_cap: Option<u64>) -> String {
+    if let Some(secs) = beyond_cap {
+        err.push_str(&format!(" (the server asks for a retry after {secs}s)"));
+    }
+    err
+}
+
+/// [`retry_after`] with the wait chosen by the caller: a refused status, or
+/// a failure inside a 200, passes the server's Retry-After through
+/// [`backoff`]. Returns false when cancelled during the wait: one can reach
+/// [`RETRY_AFTER_CAP_SECS`], and a user who cancels must not sit through it.
 async fn resend_after(
     attempt: u32,
     reason: &str,
@@ -1956,6 +1967,40 @@ mod tests {
             assert_eq!(err, format!("backend returned {status}: daily limit reached (the server asks for a retry after 3600s)"));
             assert_eq!(retries, 0, "{status}");
             assert_eq!(served, 1, "{status}");
+        }
+    }
+
+    /// A failure inside a 200 is resent on the terms of a refused status,
+    /// and those include the server's Retry-After. The bug this guards read
+    /// the header only on a refused status: a rate limit a gateway put
+    /// inside a 200 with `Retry-After: 3600` was resent on the bare backoff
+    /// into a limit the server said would hold for an hour, and the error
+    /// came only after the whole budget, without the server's wait.
+    #[tokio::test]
+    async fn a_failure_inside_a_200_waits_as_the_server_asks() {
+        let ok = |content_type: &str, retry_after: u64, body: &str| {
+            format!(
+                "RAW:HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nRetry-After: {retry_after}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let json_failure = r#"{"error":{"code":429,"message":"rate limit reached upstream"}}"#.to_string();
+        let sse_failure = gateway_error_chunk(json!(429), "rate limit reached upstream");
+        for (content_type, body) in [("application/json", json_failure), ("text/event-stream", sse_failure)] {
+            let (result, retries, served) = stream_after_refusal(ok(content_type, 3600, &body)).await;
+            assert_eq!(
+                result.err().as_deref(),
+                Some("backend reported an error (429): rate limit reached upstream (the server asks for a retry after 3600s)"),
+                "{content_type}"
+            );
+            assert_eq!((retries, served), (0, 1), "{content_type}");
+
+            let started = std::time::Instant::now();
+            let (result, retries, served) = stream_after_refusal(ok(content_type, 40, &body)).await;
+            let waited = started.elapsed();
+            assert_eq!(result.expect("the second attempt finished").content, "all of it", "{content_type}");
+            assert_eq!((retries, served), (1, 2), "{content_type}");
+            assert!(waited >= BACKOFF_UNIT * 40, "{content_type}: resent after {waited:?}, before the 40 units the server asked for");
         }
     }
 
