@@ -38,10 +38,26 @@ fn dist_targets() -> Vec<String> {
     targets
 }
 
+/// The lines of one job in ci.yml, from its key up to the next key at the
+/// jobs' indentation or less (the next job, or the end of `jobs:`).
+fn ci_job(name: &str) -> Vec<String> {
+    let ci = read(".github/workflows/ci.yml");
+    let key = format!("  {name}:");
+    let mut lines = ci.lines().skip_while(|line| line.trim_end() != key);
+    assert!(lines.next().is_some(), "ci.yml has no `{name}` job");
+    lines
+        .take_while(|line| {
+            let body = line.trim_start();
+            body.is_empty() || body.starts_with('#') || line.len() - body.len() > 2
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// `(target, runner)` for each entry of CI's release-build matrix.
 fn ci_release_matrix() -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
-    for line in read(".github/workflows/ci.yml").lines().map(str::trim) {
+    for line in ci_job("release-build").iter().map(|line| line.trim()) {
         if let Some(target) = line.strip_prefix("- target: ") {
             entries.push((target.to_string(), String::new()));
         } else if let Some(runner) = line.strip_prefix("runner: ") {
@@ -55,7 +71,7 @@ fn ci_release_matrix() -> Vec<(String, String)> {
 
 /// CI builds exactly the targets a tag publishes, on the runner the release
 /// builds each one on where the manifest chooses it, and gates every binary's
-/// size with the profile the published binaries are built with.
+/// size, on every run, with the profile the published binaries are built with.
 #[test]
 fn ci_builds_and_size_gates_every_release_target() {
     let matrix = ci_release_matrix();
@@ -74,13 +90,30 @@ fn ci_builds_and_size_gates_every_release_target() {
         assert_eq!(ci, Some(runner), "the release builds {target} on {runner}");
     }
 
-    let ci = read(".github/workflows/ci.yml");
+    let job = ci_job("release-build");
     let gate = "run: scripts/check-binary-size.sh ${{ matrix.target }} target/${{ matrix.target }}/release/openmax";
     assert!(
-        ci.lines().any(|line| line.trim() == gate),
+        job.iter().any(|line| line.trim() == gate),
         "the release-build job does not gate each binary's size: `{gate}`"
     );
+    // A condition on the job, its build step or its gate step skips the gate,
+    // so the pull request that broke the target passes. Only the musl-tools
+    // install is conditional.
+    let conditions: Vec<&str> = job
+        .iter()
+        .map(|line| line.trim().trim_start_matches("- "))
+        .filter(|line| {
+            let key = line.split_once(':').map_or("", |(key, _)| key.trim());
+            key.trim_matches(|c| c == '"' || c == '\'') == "if"
+        })
+        .collect();
+    assert_eq!(
+        conditions,
+        ["if: endsWith(matrix.target, '-musl')"],
+        "an `if:` on the release-build job or its build or gate step skips the gate, which passes the pull request that broke the target"
+    );
     // On the gate's step or its job, this lets an over-budget binary pass.
+    let ci = read(".github/workflows/ci.yml");
     let soft = ci.lines().map(str::trim).find(|line| !line.starts_with('#') && line.contains("continue-on-error"));
     assert_eq!(soft, None, "a continue-on-error step or job turns the size gate back into a warning");
     // The gate measures the release profile; dist publishes with its own

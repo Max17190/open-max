@@ -9,12 +9,14 @@
 # pull request that makes it, on the target it bloats. A warning would not:
 # nothing stops a binary drifting past a limit that only warns.
 #
-# Each budget is that target's measured size plus 10% headroom. The sizes are
-# the v2026.10.0 release binaries. The headroom absorbs ordinary growth and
-# the drift between compiler releases (neither CI nor the release pins one).
-# Past it, trim the binary or raise the budget deliberately: replace the
-# target's size below with the size this script reports for it, in the commit
-# that needs the room, and say there why the binary grew.
+# Each budget is that target's measured size plus 10% headroom. Every size
+# started as the target's v2026.10.0 release binary; a raise replaces it with
+# a CI measurement, so a size that changed since comes from the commit that
+# last changed it. The headroom absorbs ordinary growth and the drift between
+# compiler releases (neither CI nor the release pins one). Past it, trim the
+# binary or raise the budget deliberately: replace the target's size below
+# with the size this script reports for it in that target's CI job, in the
+# commit that needs the room, and say there why the binary grew.
 set -eu
 
 [ $# -eq 2 ] || { echo "usage: $0 <target-triple> <binary>" >&2; exit 2; }
