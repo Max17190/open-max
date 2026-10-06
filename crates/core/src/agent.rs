@@ -2978,7 +2978,11 @@ async fn run_loop(
                 break 'turns;
             }
 
-            if segment.concurrent {
+            // The segments were formed under `batch_mode`. A group formed in
+            // auto can hold unapproved tools, which outside auto only the
+            // serial path can ask about, so a group whose mode has changed
+            // since runs serially instead of being declined as a batch.
+            if segment.concurrent && policy_mode == batch_mode {
                 let mut batch_ctx = ReadonlyBatchCtx {
                     core,
                     session_id,
@@ -5874,7 +5878,7 @@ mod tests {
             modified_unapproved: Vec::new(),
             memory: None,
         };
-        let changes = vec![format!(".openmax/tools/c\n{forged}.toml added (initial)")];
+        let changes = vec![format!(".openmax/tools/c\n{forged}.toml added")];
         let note = refreeze_receipt_text(&changes, &added, &broken, &shadowed, Path::new("/p"), ApprovalMode::Ask);
         assert!(
             !note.contains('\n'),
@@ -7602,6 +7606,95 @@ mod tests {
             order[..4],
             ["start c1", "start c2", "end c1", "end c2"],
             "two read-only calls of an unapproved tool batch under auto: {order:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A reply is split into batches once, under the mode of that moment,
+    /// but each batch runs under the mode of its own moment. Auto groups two
+    /// calls of an unapproved read-only tool; if the user switches to ask
+    /// while an earlier call in the same reply runs, that group must take the
+    /// serial path and raise the card. Run as a batch, the content gate
+    /// declined both calls and the human was never asked.
+    #[tokio::test]
+    async fn a_batch_formed_in_auto_asks_when_the_mode_turns_to_ask_before_it_runs() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/peek.toml"),
+            "name = \"peek\"\ndescription = \"reads\"\ncommand = \"/bin/echo\"\nargs = [\"peeked\"]\n",
+        )
+        .unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
+
+        // The serial call says it is running, then waits for the test to
+        // switch the mode, so the switch lands between partition and batch.
+        let started = project.join("started");
+        let go = project.join("go");
+        let command = format!(
+            "touch '{}'; for i in $(seq 1 600); do [ -f '{}' ] && exit 0; sleep 0.05; done; exit 1",
+            started.display(),
+            go.display(),
+        );
+        let reply = tool_calls_sse(&[
+            ("c0", "bash", serde_json::json!({ "command": command })),
+            ("c1", "peek", serde_json::json!({})),
+            ("c2", "peek", serde_json::json!({})),
+        ]);
+        let (base_url, _requests) = scripted_endpoint(&[&reply, STOP_SSE]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_agent_iterations = 3;
+        }
+
+        start_turn(core.clone(), "sess-batch-mode".into(), project.clone(), "peek".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut switched = false;
+        let mut cards = 0;
+        let mut ends: Vec<(String, bool, String)> = Vec::new();
+        let mut stop = None;
+        while tokio::time::Instant::now() < deadline {
+            if !switched && started.exists() {
+                core.set_project_approval_mode(&project, ApprovalMode::Ask).unwrap();
+                std::fs::write(&go, "").unwrap();
+                switched = true;
+            }
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::ApprovalRequest { approval_id, .. } => {
+                        cards += 1;
+                        core.respond_approval(&approval_id, true);
+                    }
+                    AgentEvent::ToolEnd { call_id, ok, output } => ends.push((call_id, ok, output)),
+                    AgentEvent::Done { stop_reason } => {
+                        stop = Some(stop_reason);
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) => panic!("event stream closed before Done"),
+                Err(_) => {}
+            }
+        }
+        assert!(switched, "the serial call never started: {ends:?}");
+        assert_eq!(stop.as_deref(), Some("stop"), "{ends:?}");
+        assert!(
+            cards >= 1,
+            "the unapproved tool must raise a card once the mode is ask: {ends:?}"
+        );
+        assert_eq!(ends.len(), 3, "{ends:?}");
+        assert!(
+            ends.iter().all(|(_, ok, _)| *ok),
+            "no call may be declined without the human being asked: {ends:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

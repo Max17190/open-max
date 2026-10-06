@@ -1914,7 +1914,7 @@ mod tests {
     /// A missing interpreter-script argument (`/bin/sh run.sh`, run.sh gone)
     /// binds to a None entry, so the empty binding cannot read as covered.
     /// Otherwise deleting it left an empty `bound_code`, which `covers_code`
-    /// accepts, and the removed tool was wrongly called cardless-restorable.
+    /// accepts, so the removed tool ran ungated.
     #[test]
     fn a_missing_interpreter_script_arg_binds_to_none() {
         let root = temp("interp-proj");
