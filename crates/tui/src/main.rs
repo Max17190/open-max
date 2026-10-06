@@ -1647,6 +1647,57 @@ fn example_row(verdict: &open_max_core::doctor::ExampleVerdict) -> String {
     open_max_core::text::one_line(&row)
 }
 
+/// Heap allocations made by the calling thread, for tests that bound what a
+/// frame allocates. Per thread, so tests running in parallel do not count
+/// each other's work.
+#[cfg(test)]
+pub fn allocations() -> u64 {
+    alloc_count::ALLOCATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        // Const-initialized with no destructor: reading it never allocates,
+        // which the allocator itself depends on.
+        pub static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn count() {
+        let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+    }
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+
 #[cfg(test)]
 pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
