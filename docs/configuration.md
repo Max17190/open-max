@@ -106,11 +106,12 @@ If the mode changes during pre-tool checks, those calls are refused without
 replaying hooks. The agent can request them again under the new mode.
 Returning to `ask` restores content requirements for anything created in `auto`.
 
-Only a human-controlled frontend can select a saved mode. Agent-spawned
-processes can use an existing choice but cannot change it through the mode
-command. Trust and settings are read at process launch; editing either file
-from a tool does not change that process's chosen mode. These controls govern
-dispatch and are not OS isolation.
+Only a human can select a saved mode: at the trust grant, or with the
+selectors above in a human-controlled frontend. Agent-spawned processes can
+use an existing choice but can neither grant trust nor change the choice
+through the mode command. Trust and settings are read at process launch;
+editing either file from a tool does not change that process's chosen mode.
+These controls govern dispatch and are not OS isolation.
 
 ## Multiple providers
 
