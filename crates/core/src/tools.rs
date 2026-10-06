@@ -1504,46 +1504,39 @@ mod tests {
     /// The prompt, receipts, and --check rows tell the agent to run a bare
     /// `openmax` through bash, and bash inherits PATH: an older install
     /// earlier on it would answer with claims this build has retracted,
-    /// under the same version string. A decoy first on the inherited PATH
-    /// must lose to a link to the running executable.
+    /// under the same version string. A bare `openmax` must resolve to a
+    /// link to the running executable, from the first PATH entry, so no
+    /// inherited install can come before it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_bare_openmax_in_bash_runs_the_running_binary() {
-        use std::os::unix::fs::PermissionsExt;
+        // Read from inside the shell instead of moving this process's PATH:
+        // tests run in parallel and share one environment.
         let root = temp_project();
-        let decoy = root.join("decoy");
-        std::fs::create_dir_all(&decoy).unwrap();
-        let decoy_bin = decoy.join("openmax");
-        std::fs::write(&decoy_bin, "#!/bin/sh\necho decoy\n").unwrap();
-        std::fs::set_permissions(&decoy_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // The one test that moves PATH; restored before any assertion runs.
-        // The decoy holds only `openmax`, so a test reading PATH meanwhile
-        // resolves every other name exactly as before.
-        let inherited = std::env::var_os("PATH");
-        let mut entries = vec![decoy.clone()];
-        entries.extend(inherited.iter().flat_map(std::env::split_paths));
-        std::env::set_var("PATH", std::env::join_paths(entries).unwrap());
         let out = bash_tool(
             &root.join("data"),
             &root,
-            &json!({"command": "command -v openmax"}),
+            &json!({"command": "command -v openmax && printf '%s\\n' \"${PATH%%:*}\""}),
             OutputCaps::default(),
             Arc::new(CancelToken::default()),
         )
         .await;
-        match inherited {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "{}", out.output);
-        let found = PathBuf::from(out.output.trim());
+        let mut lines = out.output.lines().map(|line| PathBuf::from(line.trim()));
+        let found = lines.next().unwrap_or_default();
+        let first = lines.next().unwrap_or_default();
         let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
         assert_eq!(
             std::fs::read_link(&found).ok(),
             Some(exe),
             "`openmax` in bash resolved to {}, not a link to the running executable",
             found.display()
+        );
+        assert_eq!(
+            found.parent(),
+            Some(first.as_path()),
+            "the link's directory must be first on PATH, ahead of any inherited install"
         );
     }
 
