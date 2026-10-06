@@ -160,8 +160,9 @@ says how to give that provider its own.
 A request has no overall deadline, since a local server can spend minutes on a
 long prompt, but an endpoint that sends nothing at all (no response headers, no
 reply bytes, not even an SSE keepalive comment) for 10 minutes ends the
-attempt. Before any reply text has arrived it is resent like a dropped
-connection; after, the reply is reported truncated. A provider's
+attempt. If no response arrives, or a stream goes silent before any reply
+text, the attempt is resent like a dropped connection; a stream that goes
+silent after reply text is reported truncated. A provider's
 `idle_timeout_secs` sets a different interval for that provider.
 
 Open Max works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud

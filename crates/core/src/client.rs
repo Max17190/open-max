@@ -301,7 +301,7 @@ pub struct ChatClient {
     pub send_stream_options: bool,
     /// How long the endpoint may send nothing before an attempt ends.
     idle_timeout: std::time::Duration,
-    /// Why no key was sent though settings configure one, for a 401 to
+    /// Why the settings key was withheld from this endpoint, for a 401 to
     /// report (see `ActiveEndpoint::key_hint`).
     key_hint: Option<String>,
     http: reqwest::Client,
@@ -1763,8 +1763,8 @@ mod tests {
         let served = Arc::new(std::sync::Mutex::new(0usize));
         let count = served.clone();
         std::thread::spawn(move || {
-            // Connections a SILENT or STALL: body holds open, until the
-            // sequence ends.
+            // Connections that a SILENT or STALL: body leaves open, held
+            // until the sequence ends.
             let mut held = Vec::new();
             for sse in bodies {
                 let Ok((mut stream, _)) = listener.accept() else { return };

@@ -116,8 +116,9 @@ pub struct ActiveEndpoint {
     /// The provider's `idle_timeout_secs`, when it sets one.
     pub idle_timeout_secs: Option<u64>,
     /// Set when a key is configured in settings but withheld from this
-    /// endpoint because it is another server: why no key was sent and how to
-    /// give the provider its own, for the error a 401 from it reports.
+    /// endpoint because it is another server: that the settings key was not
+    /// sent and how to give the provider its own, for the error a 401 from
+    /// it reports.
     pub key_hint: Option<String>,
 }
 
@@ -641,14 +642,16 @@ fn same_server(a: &str, b: &str) -> bool {
 }
 
 /// What a 401 from provider `name` adds when the settings key was withheld
-/// from it: why no key went out, and how to give the provider its own.
+/// from it: that the settings key was not sent, and how to give the provider
+/// its own. It must hold however the provider authenticates, since one that
+/// sends a credential through its own `headers` gets this hint too.
 fn withheld_key_hint(name: &str, p: &ProviderConfig) -> String {
     let fix = match p.api_key_env.first() {
         Some(var) => format!("export {var}, which provider '{name}' reads its key from"),
         None => format!("give provider '{name}' its own key with api_key_env in ~/.openmax/providers.json"),
     };
     format!(
-        " (no key was sent: the key in settings.json or OPENMAX_API_KEY goes only to the server settings.base_url names, by scheme, host, and port; {fix})"
+        " (the key in settings.json or OPENMAX_API_KEY was not sent: it goes only to the server settings.base_url names, by scheme, host, and port; {fix})"
     )
 }
 
