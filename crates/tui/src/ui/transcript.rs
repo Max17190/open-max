@@ -4,7 +4,16 @@
 //! per-block wrap caches. Tools fold by default; selection and sticky user
 //! headers support dual-focus navigation. Scroll offset is in wrapped lines
 //! from the bottom; 0 follows the latest output.
+//!
+//! Blocks wrap lazily. A width change, a first paint, or a replay sizes
+//! every block from its source lines' measured widths (an estimate that is
+//! exact unless a line wraps, and never more than the wrap produces) and
+//! wraps only the blocks the viewport shows; the rest are wrapped when they
+//! scroll into view. Wrapping the whole history on each of those made them
+//! linear in the session's length.
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,7 +22,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::theme;
-use crate::ui::text::{cell_width, strip_escapes, TAB_WIDTH};
+use crate::ui::text::{cell_width, paint_line, strip_escapes, TAB_WIDTH};
 
 /// Frames go through one large buffer per flush: bare `Stdout` is
 /// line-buffered at 1 KiB, which turns a busy streaming frame into dozens of
@@ -31,6 +40,9 @@ pub enum BlockKind {
 
 struct Block {
     kind: BlockKind,
+    /// Push order, never reused, so ids rise along `Transcript::blocks`.
+    /// Names the block for rows painted before a removal shifted its index.
+    id: u64,
     /// Full content when expanded (or the only content when not foldable).
     raw: Vec<Line<'static>>,
     /// Compact body when foldable; shown while `folded`.
@@ -44,22 +56,100 @@ struct Block {
     /// allocation per key. Fold-independent (it reads compact/full_output/
     /// raw, never the folded view), so no invalidation path exists.
     search_lower: String,
+    /// Cell widths of `raw` and `compact`, measured once at push: what
+    /// sizes the block at a width it has not been wrapped at.
+    raw_cells: LineCells,
+    compact_cells: LineCells,
+    /// Rows the block takes in the index at the transcript's width: the
+    /// length of `cache` once it is wrapped there, the estimate until then.
+    height: usize,
     cache_width: u16,
     cache_folded: bool,
     cache: Vec<Line<'static>>,
     cache_maps: Vec<Option<CachedLineMap>>,
+    /// Plain text of the source lines shown (`compact` while folded), which
+    /// selection offsets and every wrapped row's map point into.
     selectable: String,
     selectable_chars: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CachedLineMap {
-    /// Character offsets into `Block::selectable_text`.
+    /// Character offsets into `Block::selectable`.
     start: usize,
     end: usize,
+    /// The same range in bytes, so a row's text is a slice of `selectable`
+    /// rather than a third copy of the block's text.
+    byte_start: usize,
+    byte_end: usize,
     /// Terminal column where selectable content starts after UI gutters.
     x_offset: usize,
-    text: String,
+}
+
+/// Painted width of each source line, measured the way the wrapper measures
+/// it, so a block can be sized at any width without wrapping it.
+#[derive(Default)]
+struct LineCells {
+    cells: Box<[u32]>,
+    widest: u32,
+}
+
+impl LineCells {
+    fn measure(lines: &[Line<'static>]) -> Self {
+        let cells: Box<[u32]> = lines
+            .iter()
+            .map(|line| u32::try_from(line_cells(line)).unwrap_or(u32::MAX))
+            .collect();
+        let widest = cells.iter().copied().max().unwrap_or(0);
+        Self { cells, widest }
+    }
+
+    /// Rows these lines wrap to at `width` columns, never more than
+    /// `wrap_lines_mapped` produces: a row holds at most `width` measured
+    /// cells and a line takes at least one row. Exact when every line fits,
+    /// which is the common case and costs no per-line work.
+    fn rows(&self, width: usize) -> usize {
+        if self.widest as usize <= width {
+            return self.cells.len();
+        }
+        self.cells
+            .iter()
+            .map(|&cells| (cells as usize).div_ceil(width).max(1))
+            .sum()
+    }
+}
+
+/// Cells `wrap_lines_mapped` counts for one line: a tab as [`TAB_WIDTH`],
+/// each other character (ASCII) or grapheme (otherwise) as it paints. A
+/// grapheme counts at most a tab's width. Every row has room for that much,
+/// so only a malformed wider cluster can overflow a row, and it gets a row
+/// to itself: counting it whole could size the block above what the wrap
+/// produces.
+fn line_cells(line: &Line<'_>) -> usize {
+    if line.spans.iter().all(|span| span.content.is_ascii()) {
+        return line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .map(|ch| if ch == '\t' { TAB_WIDTH } else { ch.width().unwrap_or(0) })
+            .sum();
+    }
+    // Graphemes can join across span boundaries, so measure the joined line
+    // exactly as the wrapper splits it.
+    let plain: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+    plain
+        .graphemes(true)
+        .map(|grapheme| cell_width(grapheme).min(TAB_WIDTH))
+        .sum()
+}
+
+/// Columns a block's source lines wrap to at transcript width `width`.
+fn content_width(kind: BlockKind, width: u16) -> u16 {
+    let gutter = match kind {
+        BlockKind::User => 2,
+        BlockKind::Assistant | BlockKind::Tool | BlockKind::System => 0,
+    };
+    width.saturating_sub(gutter).max(8)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,6 +195,14 @@ fn lower_for_search(text: &str) -> String {
 #[cfg(test)]
 thread_local! {
     static SEARCH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOCK_WRAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Blocks wrapped on this thread so far: the oracle for the promise that a
+/// resize, a first paint, or a replay wraps only what the viewport shows.
+#[cfg(test)]
+pub(crate) fn block_wraps() -> usize {
+    BLOCK_WRAPS.with(std::cell::Cell::get)
 }
 
 impl Block {
@@ -114,11 +212,15 @@ impl Block {
         let search_lower = lower_for_search(&selectable);
         Self {
             kind,
+            id: 0,
+            raw_cells: LineCells::measure(&raw),
+            compact_cells: LineCells::default(),
             raw,
             compact: None,
             folded: false,
             full_output: None,
             search_lower,
+            height: 0,
             cache_width: 0,
             cache_folded: false,
             cache: Vec::new(),
@@ -133,8 +235,7 @@ impl Block {
     /// keystroke (the card's one clipped diagnostic line rarely is the
     /// reason). The user can fold either state back by hand.
     fn tool(compact: Vec<Line<'static>>, full_output: String, ok: bool) -> Self {
-        let selectable = lines_to_plain(&compact);
-        let selectable_chars = selectable.chars().count();
+        let header_text = lines_to_plain(&compact);
         // Search covers the compact header plus the whole output, matching
         // what `search_text_line` reads back out; the folded view is not
         // part of it. The output is searched as the screen shows it, or a
@@ -142,10 +243,10 @@ impl Block {
         // for the hidden code matched. Stripping never removes a newline, so
         // line slots still agree with the raw output.
         let visible = strip_escapes(&full_output);
-        let search_lower = if selectable.is_empty() {
+        let search_lower = if header_text.is_empty() {
             lower_for_search(&visible)
         } else {
-            lower_for_search(&format!("{selectable}\n{visible}"))
+            lower_for_search(&format!("{header_text}\n{visible}"))
         };
         let header = compact
             .first()
@@ -169,13 +270,25 @@ impl Block {
                     .add_modifier(Modifier::ITALIC),
             )));
         }
+        // The copy text is whichever view is on screen: the card while
+        // folded, the output while open.
+        let selectable = if ok {
+            header_text
+        } else {
+            lines_to_plain(&full_lines)
+        };
+        let selectable_chars = selectable.chars().count();
         Self {
             kind: BlockKind::Tool,
+            id: 0,
+            raw_cells: LineCells::measure(&full_lines),
+            compact_cells: LineCells::measure(&compact),
             raw: full_lines,
             compact: Some(compact),
             folded: ok,
             full_output: Some(full_output),
             search_lower,
+            height: 0,
             cache_width: 0,
             cache_folded: ok,
             cache: Vec::new(),
@@ -194,19 +307,48 @@ impl Block {
         &self.raw
     }
 
-    fn ensure_cache(&mut self, width: u16) {
-        if self.cache_width == width && self.cache_folded == self.folded && !self.cache.is_empty() {
-            return;
+    /// Whether `cache` holds this block wrapped at `width` as it is now
+    /// folded.
+    fn is_wrapped_at(&self, width: u16) -> bool {
+        self.cache_width == width && self.cache_folded == self.folded && !self.cache.is_empty()
+    }
+
+    /// Rows the block takes at transcript width `width`: exact once
+    /// wrapped there, otherwise the estimate from its measured line widths
+    /// (plus the spacer row), which never exceeds what the wrap produces.
+    fn measure(&self, width: u16) -> usize {
+        if width == 0 {
+            return 0;
         }
-        self.cache_width = width;
-        self.cache_folded = self.folded;
+        if self.is_wrapped_at(width) {
+            return self.cache.len();
+        }
+        let cells = if self.folded && self.compact.is_some() {
+            &self.compact_cells
+        } else {
+            &self.raw_cells
+        };
+        cells.rows(usize::from(content_width(self.kind, width))) + 1
+    }
+
+    /// Show the block folded or open. The copy text follows the view; the
+    /// wrap does too, at the next `ensure_cache`.
+    fn set_folded(&mut self, folded: bool) {
+        self.folded = folded;
         self.selectable = lines_to_plain(self.source_lines());
         self.selectable_chars = self.selectable.chars().count();
-        let gutter = match self.kind {
-            BlockKind::User => 2,
-            BlockKind::Assistant | BlockKind::Tool | BlockKind::System => 0,
-        };
-        let content_width = width.saturating_sub(gutter).max(8);
+        self.invalidate();
+    }
+
+    fn ensure_cache(&mut self, width: u16) {
+        if self.is_wrapped_at(width) {
+            return;
+        }
+        #[cfg(test)]
+        BLOCK_WRAPS.with(|counter| counter.set(counter.get() + 1));
+        self.cache_width = width;
+        self.cache_folded = self.folded;
+        let content_width = content_width(self.kind, width);
         let (wrapped, maps) = wrap_lines_mapped(self.source_lines(), content_width);
         self.cache.clear();
         self.cache_maps.clear();
@@ -239,15 +381,40 @@ pub struct WrapAnchor {
     lines_into_block: usize,
 }
 
+/// A painted history row by its content: the block and the row in that
+/// block's wrap. An absolute row index names other text once a block above
+/// it changes height, and wrapping does that between any two frames (a
+/// scroll wraps the blocks it crosses), so a pointer event resolved through
+/// the last frame's indices would land rows above the text under the
+/// pointer. A block index shifts as well, when a rejected prompt is removed
+/// from above the row, so the block is named by its id; the index it had
+/// when painted only saves the search while nothing was removed. This
+/// names the painted text until its own block changes. See
+/// [`Transcript::paint_rows`] and [`Transcript::line_of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRef {
+    block: usize,
+    id: u64,
+    row: usize,
+}
+
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
+    /// Id of the next block pushed.
+    next_id: u64,
     /// First wrapped line of each block; `total` closes the last range. The
     /// per-block caches own the only copy of every wrapped line, so
-    /// rebuilding after a fold toggle or width change is index arithmetic,
-    /// never a clone of the session's lines.
+    /// re-measuring after a fold toggle or width change is index
+    /// arithmetic, never a clone of the session's lines. A block not yet
+    /// wrapped at the current width counts its estimated height.
     block_starts: Vec<usize>,
-    /// Wrapped lines across all block caches.
+    /// Entries of `block_starts` from this block on are stale. A height
+    /// change marks only its own suffix, so wrapping the blocks at the
+    /// bottom of history never walks the whole index.
+    stale_from: usize,
+    /// Rows across all blocks (sum of their heights), kept current by every
+    /// height change.
     total: usize,
     width: u16,
     offset: usize,
@@ -258,12 +425,16 @@ pub struct Transcript {
     unread: usize,
     selected: Option<usize>,
     text_selection: Option<TextSelection>,
-    dirty: bool,
-    /// Full re-wraps performed (every block invalidated by a width change).
-    /// Oracle for the draw path's promise that steady-state frames never
-    /// re-wrap history.
+    /// Rows and live-tail rows of the viewport the last frame settled.
+    view: (usize, usize),
+    /// Width changes, each of which re-measures every block. Oracle for the
+    /// draw path's promise that steady-state frames never change the width.
     #[cfg(test)]
     pub(crate) rewraps: u64,
+    /// Wrap every block as soon as it is pushed or the width changes: the
+    /// eager shape, which tests hold the lazy one against.
+    #[cfg(test)]
+    pub(crate) eager: bool,
 }
 
 impl Transcript {
@@ -286,21 +457,31 @@ impl Transcript {
         if lines.is_empty() {
             return;
         }
-        if self.width == 0 {
-            self.blocks.push(Block::new(kind, lines));
-            self.dirty = true;
-            return;
+        self.push_block(Block::new(kind, lines));
+    }
+
+    /// Index a new last block by its estimated height; it is wrapped when a
+    /// frame shows it. While scrolled up the view holds still, so the offset
+    /// grows by the rows the block adds below it. With the view's bottom
+    /// edge inside the live tail, those rows move the tail under the edge,
+    /// so they are counted exactly.
+    fn push_block(&mut self, mut block: Block) {
+        block.id = self.next_id;
+        self.next_id += 1;
+        let bi = self.blocks.len();
+        let wrap_now = self.offset > 0 && self.offset < self.view.1;
+        #[cfg(test)]
+        let wrap_now = wrap_now || self.eager;
+        self.blocks.push(block);
+        if wrap_now && self.width > 0 {
+            self.blocks[bi].ensure_cache(self.width);
         }
-        if self.dirty {
-            self.ensure_index();
-        }
-        let prev_len = self.total;
-        self.blocks.push(Block::new(kind, lines));
-        let bi = self.blocks.len() - 1;
-        self.append_block_index(bi);
-        if self.offset > 0 {
-            let added = self.total.saturating_sub(prev_len);
-            self.offset = self.offset.saturating_add(added);
+        let height = self.blocks[bi].measure(self.width);
+        self.blocks[bi].height = height;
+        self.total += height;
+        self.mark_stale(bi);
+        if self.width > 0 && self.offset > 0 {
+            self.offset = self.offset.saturating_add(height);
             self.unread += 1;
         }
     }
@@ -316,7 +497,14 @@ impl Transcript {
         let Some(i) = self.blocks.iter().rposition(|b| b.kind == BlockKind::User) else {
             return false;
         };
-        self.blocks.remove(i);
+        // The view keeps its offset (the draw path clamps it once the view
+        // is measured), so it moves by the rows removed.
+        let held = self.held_block();
+        self.wrap_held(i, held);
+        self.wrap_across(i, held, -(self.blocks[i].height as isize));
+        let removed = self.blocks.remove(i);
+        self.total -= removed.height;
+        self.mark_stale(i);
         // Selection / sticky indices past the removed block must retreat.
         if let Some(sel) = self.selected {
             if sel == i {
@@ -343,9 +531,6 @@ impl Transcript {
                 });
             }
         }
-        self.dirty = true;
-        self.ensure_index();
-        self.offset = self.offset.min(self.total);
         true
     }
 
@@ -355,25 +540,12 @@ impl Transcript {
 
     /// `ok` picks the initial fold state; see [`Block::tool`].
     pub fn push_tool(&mut self, compact: Vec<Line<'static>>, full_output: String, ok: bool) {
-        if self.width == 0 {
-            self.blocks.push(Block::tool(compact, full_output, ok));
-            self.dirty = true;
-            return;
-        }
-        if self.dirty {
-            self.ensure_index();
-        }
-        let prev_len = self.total;
-        self.blocks.push(Block::tool(compact, full_output, ok));
-        let bi = self.blocks.len() - 1;
-        self.append_block_index(bi);
-        if self.offset > 0 {
-            let added = self.total.saturating_sub(prev_len);
-            self.offset = self.offset.saturating_add(added);
-            self.unread += 1;
-        }
+        self.push_block(Block::tool(compact, full_output, ok));
     }
 
+    /// Re-measure every block for a new width. Blocks keep whatever they
+    /// last wrapped (a block wrapped at this width before needs no work);
+    /// the rest count their estimates until a frame shows them.
     pub fn set_width(&mut self, width: u16) {
         if width != self.width {
             #[cfg(test)]
@@ -381,12 +553,23 @@ impl Transcript {
                 self.rewraps += 1;
             }
             self.width = width;
-            for b in &mut self.blocks {
-                b.invalidate();
+            #[cfg(test)]
+            if self.eager && width > 0 {
+                for block in &mut self.blocks {
+                    block.ensure_cache(width);
+                }
             }
-            self.dirty = true;
-            self.ensure_index();
-            self.offset = self.offset.min(self.total);
+            // The offset is left for the draw path to clamp against the
+            // total once the view is measured: clamping to an estimate here
+            // would move a view whose edge is in the live tail by however
+            // far the estimate is off.
+            let mut total = 0;
+            for block in &mut self.blocks {
+                block.height = block.measure(width);
+                total += block.height;
+            }
+            self.total = total;
+            self.mark_stale(0);
         }
     }
 
@@ -412,17 +595,17 @@ impl Transcript {
     }
 
     /// Wrapped-line distance from the bottom of history to the anchored
-    /// content, after any re-wraps since capture.
+    /// content, after any re-wraps since capture. The anchored block is
+    /// wrapped first, so the distance into it is measured on the rows the
+    /// frame will paint.
     pub fn resolve_anchor(&mut self, anchor: WrapAnchor) -> usize {
-        self.ensure_index();
-        let Some(&start) = self.block_starts.get(anchor.block) else {
+        if anchor.block >= self.blocks.len() {
             return 0;
-        };
-        let end = self
-            .block_starts
-            .get(anchor.block + 1)
-            .copied()
-            .unwrap_or(self.total);
+        }
+        self.wrap_block(anchor.block);
+        self.ensure_index();
+        let start = self.block_starts[anchor.block];
+        let end = start + self.blocks[anchor.block].height;
         let index = (start + anchor.lines_into_block).min(end.saturating_sub(1));
         self.total - index
     }
@@ -433,36 +616,188 @@ impl Transcript {
         self.offset = lines_from_bottom;
     }
 
-    fn rebuild_index(&mut self) {
-        self.block_starts.clear();
-        self.total = 0;
-        if self.width == 0 {
-            self.dirty = false;
+    fn mark_stale(&mut self, bi: usize) {
+        self.stale_from = self.stale_from.min(bi);
+    }
+
+    /// Bring `block_starts` up to date from the first stale block on.
+    fn ensure_index(&mut self) {
+        if self.stale_from >= self.blocks.len() && self.block_starts.len() == self.blocks.len() {
             return;
         }
-        for bi in 0..self.blocks.len() {
-            self.block_starts.push(self.total);
-            self.blocks[bi].ensure_cache(self.width);
-            self.total += self.blocks[bi].cache.len();
+        let from = self.stale_from.min(self.block_starts.len()).min(self.blocks.len());
+        self.block_starts.truncate(from);
+        let mut row = match from.checked_sub(1) {
+            Some(prev) => self.block_starts[prev] + self.blocks[prev].height,
+            None => 0,
+        };
+        for block in &self.blocks[from..] {
+            self.block_starts.push(row);
+            row += block.height;
         }
-        self.dirty = false;
+        debug_assert_eq!(row, self.total, "block heights and the row total disagree");
+        self.stale_from = self.blocks.len();
     }
 
-    /// Incrementally append one newly pushed block to the index.
-    /// `bi` must be the last block; width is unchanged and the index is
-    /// current.
-    fn append_block_index(&mut self, bi: usize) {
+    /// Wrap block `bi` at the current width unless it already is, and
+    /// return the rows that added: never negative, since an estimate never
+    /// exceeds the wrap.
+    fn wrap_block(&mut self, bi: usize) -> isize {
+        if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
+            return 0;
+        }
         self.blocks[bi].ensure_cache(self.width);
-        self.block_starts.push(self.total);
-        self.total += self.blocks[bi].cache.len();
+        let before = self.blocks[bi].height;
+        let height = self.blocks[bi].cache.len();
+        self.set_height(bi, height);
+        height as isize - before as isize
     }
 
-    fn ensure_index(&mut self) {
-        if self.dirty
-            || (self.block_starts.is_empty() && !self.blocks.is_empty() && self.width > 0)
+    fn set_height(&mut self, bi: usize, height: usize) {
+        self.total = self.total - self.blocks[bi].height + height;
+        self.blocks[bi].height = height;
+        self.mark_stale(bi);
+    }
+
+    /// Fold or open block `bi`. It is wrapped at once: a fold is toggled on
+    /// the block in view, and the view keeps its offset across the change,
+    /// as it does for any content change, so it moves by the rows the fold
+    /// adds or removes.
+    fn refold(&mut self, bi: usize, folded: bool) {
+        let held = self.held_block();
+        self.wrap_held(bi, held);
+        let before = self.blocks[bi].height;
+        self.blocks[bi].set_folded(folded);
+        if self
+            .text_selection
+            .is_some_and(|selection| selection_contains_block(selection, bi))
         {
-            self.rebuild_index();
+            self.text_selection = None;
         }
+        if self.width > 0 {
+            self.blocks[bi].ensure_cache(self.width);
+        }
+        let height = self.blocks[bi].measure(self.width);
+        // Still indexed at its old height: the crossing is measured in the
+        // layout the view moves from.
+        self.wrap_across(bi, held, height as isize - before as isize);
+        self.set_height(bi, height);
+    }
+
+    /// Wrap the rows the view is about to move across when block `bi`
+    /// changes height by `delta` under an unchanged offset. Only a block at
+    /// or below the `held` edge moves the view; it then moves by `delta`
+    /// rows, which must be wrapped to land where wrapped rows would.
+    fn wrap_across(&mut self, bi: usize, held: Option<usize>, delta: isize) {
+        if !held.is_some_and(|held| bi >= held) {
+            return;
+        }
+        if delta < 0 {
+            self.settle(delta.unsigned_abs(), 0);
+        } else {
+            self.settle(0, delta.unsigned_abs());
+        }
+    }
+
+    /// Wrap exactly the blocks a `rows`-row viewport shows over a live tail
+    /// of `tail_len` rows, holding the content on screen still while their
+    /// estimates turn exact. Remembers the geometry, so a scroll before the
+    /// next frame knows which rows it crosses.
+    pub fn settle_view(&mut self, rows: usize, tail_len: usize) {
+        self.view = (rows, tail_len);
+        self.settle(0, 0);
+    }
+
+    /// Wrap the blocks covering the last settled viewport extended by
+    /// `above` rows over it and `below` rows under it, holding the view
+    /// still while their estimates turn exact. The offset names an edge,
+    /// that many rows above the bottom: the bottom of the view, or, scrolled
+    /// past the top, a row above it. A block that grows at or below that
+    /// edge must grow the offset with it, and one that ends above it must
+    /// not; a block straddling it keeps its rows above it, as a resize
+    /// anchor counts them. So the view leaves the top only once the rows
+    /// above the edge, all of them in the window by then, are exact.
+    /// Following needs nothing (the bottom is held by construction), and
+    /// neither does an edge in the live tail, which history above it cannot
+    /// move.
+    ///
+    /// Estimates never exceed the wrap, so a growing block only pushes
+    /// others out of the range: the loop wraps at most the blocks the first
+    /// range covered, never the history beyond it.
+    fn settle(&mut self, above: usize, below: usize) {
+        let (rows, tail_len) = self.view;
+        if self.width == 0 || rows == 0 {
+            return;
+        }
+        loop {
+            self.ensure_index();
+            let total = self.total + tail_len;
+            let top_offset = total.saturating_sub(rows);
+            let end = total - self.offset.min(top_offset);
+            let start = end.saturating_sub(rows);
+            let from = start.saturating_sub(above);
+            let to = end.saturating_add(below).min(self.total);
+            if from >= to {
+                return;
+            }
+            let (Some((first, _)), Some((last, _))) = (self.locate(from), self.locate(to - 1))
+            else {
+                return;
+            };
+            let held = self.held_block();
+            let mut wrapped = false;
+            for bi in first..=last {
+                wrapped |= self.wrap_held(bi, held);
+            }
+            if !wrapped {
+                return;
+            }
+        }
+    }
+
+    /// The first block at or below the edge the offset names (see
+    /// [`Self::settle`]); none while following or with the edge in the live
+    /// tail.
+    fn held_block(&mut self) -> Option<usize> {
+        if self.offset == 0 {
+            return None;
+        }
+        self.ensure_index();
+        let edge = (self.total + self.view.1).saturating_sub(self.offset);
+        self.locate(edge).map(|(bi, _)| bi)
+    }
+
+    /// Wrap block `bi` unless it already is, growing the offset with it when
+    /// it sits at or below the `held` block, so the view holds still.
+    /// Returns whether it wrapped.
+    fn wrap_held(&mut self, bi: usize, held: Option<usize>) -> bool {
+        if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
+            return false;
+        }
+        let added = self.wrap_block(bi);
+        if held.is_some_and(|held| bi >= held) {
+            self.offset = self.offset.saturating_add_signed(added);
+        }
+        true
+    }
+
+    /// Rows in the whole transcript, exact whenever there are at most
+    /// `limit` of them: the draw path asks whether history fits on screen.
+    /// Estimates never exceed the wrap, so a total above `limit` is above
+    /// it once wrapped too; at or below it, blocks are wrapped from the
+    /// newest until the count is exact or passes `limit`. Every block is at
+    /// least one row, so that wraps at most `limit + 1` blocks.
+    pub fn len_exact_up_to(&mut self, limit: usize) -> usize {
+        if self.total > limit {
+            return self.total;
+        }
+        let held = self.held_block();
+        let mut bi = self.blocks.len();
+        while self.total <= limit && bi > 0 {
+            bi -= 1;
+            self.wrap_held(bi, held);
+        }
+        self.total
     }
 
     /// Block owning wrapped line `idx`, and the line's offset into that
@@ -471,15 +806,29 @@ impl Transcript {
         if idx >= self.total {
             return None;
         }
+        debug_assert!(
+            self.stale_from >= self.blocks.len() && self.block_starts.len() == self.blocks.len(),
+            "located a line in a stale index"
+        );
         let bi = self.block_starts.partition_point(|&start| start <= idx) - 1;
         Some((bi, idx - self.block_starts[bi]))
     }
 
-    /// Test-support oracle access: `draw_chat` paints via `fill_viewport`.
+    /// Wrap every block at the current width. Test-support only: the draw
+    /// path wraps what the viewport shows.
+    #[cfg(test)]
+    pub fn wrap_all(&mut self) {
+        for bi in 0..self.blocks.len() {
+            self.wrap_block(bi);
+        }
+        self.ensure_index();
+    }
+
+    /// Test-support oracle access: `draw_chat` paints via `paint_rows`.
     #[cfg(test)]
     pub fn lines(&mut self) -> Vec<Line<'static>> {
-        self.ensure_index();
         let mut out = Vec::new();
+        self.wrap_all();
         let total = self.total;
         self.fill_viewport(&mut out, 0, total, None);
         out
@@ -491,14 +840,17 @@ impl Transcript {
     pub fn line_at(&mut self, idx: usize) -> Option<&Line<'static>> {
         self.ensure_index();
         let (bi, li) = self.locate(idx)?;
+        self.wrap_block(bi);
         self.blocks[bi].cache.get(li)
     }
 
     /// Clone history lines `[start, end)` into `out` once each, straight
-    /// from the per-block caches.
+    /// from the per-block caches, after wrapping every block. Test-support
+    /// oracle for what `paint_rows` paints.
     ///
     /// When `selected_bi` is `Some`, lines belonging to that block receive a
     /// quiet background. Text selection is painted later as a buffer overlay.
+    #[cfg(test)]
     pub fn fill_viewport(
         &mut self,
         out: &mut Vec<Line<'static>>,
@@ -506,9 +858,9 @@ impl Transcript {
         end: usize,
         selected_bi: Option<usize>,
     ) {
-        self.ensure_index();
+        self.wrap_all();
         // Prove the index covers every cache mutation instead of trusting
-        // the dirty flag's call sites: a cache edited without marking dirty
+        // the call sites: a cache edited without re-measuring its block
         // would walk the loop below out of bounds.
         debug_assert!(
             self.total == self.blocks.iter().map(|b| b.cache.len()).sum::<usize>(),
@@ -532,6 +884,70 @@ impl Transcript {
             out.push(line);
             li += 1;
         }
+    }
+
+    /// Paint history lines `[start, end)` into the rows of `area` from its
+    /// top, straight from the per-block caches: nothing is cloned except
+    /// the rows of `selected_bi`, which receive a quiet background. Text
+    /// selection is painted later as a buffer overlay. Every block in the
+    /// range must be wrapped, which [`Self::settle_view`] does for the
+    /// viewport. Appends to `painted` what each row shows, in order, for
+    /// pointer events to find it again.
+    pub fn paint_rows(
+        &mut self,
+        buf: &mut Buffer,
+        area: Rect,
+        start: usize,
+        end: usize,
+        selected_bi: Option<usize>,
+        painted: &mut Vec<Option<RowRef>>,
+    ) {
+        self.ensure_index();
+        let end = end.min(self.total).min(start.saturating_add(usize::from(area.height)));
+        let Some((mut bi, mut li)) = self.locate(start) else {
+            return;
+        };
+        for (y, _) in (area.y..).zip(start..end) {
+            while li >= self.blocks[bi].height {
+                bi += 1;
+                li = 0;
+            }
+            let block = &self.blocks[bi];
+            debug_assert!(block.is_wrapped_at(self.width), "painted an unwrapped block");
+            let line = block.cache.get(li).filter(|_| block.is_wrapped_at(self.width));
+            if let Some(line) = line {
+                let row = Rect { y, height: 1, ..area };
+                if selected_bi == Some(bi) {
+                    let line = surface_line(line.clone(), self.width, theme::BORDER());
+                    paint_line(buf, row, None, &line);
+                } else {
+                    paint_line(buf, row, None, line);
+                }
+            }
+            painted.push(line.map(|_| RowRef {
+                block: bi,
+                id: block.id,
+                row: li,
+            }));
+            li += 1;
+        }
+    }
+
+    /// The current index of a row a frame painted, or None once its block
+    /// is gone or no longer wraps to that row. Pointer events address rows
+    /// this way, so wrapping or a removal between the paint and the event
+    /// cannot move what they hit.
+    pub fn line_of(&mut self, at: RowRef) -> Option<usize> {
+        let bi = match self.blocks.get(at.block) {
+            Some(block) if block.id == at.id => at.block,
+            _ => self.blocks.binary_search_by_key(&at.id, |block| block.id).ok()?,
+        };
+        let block = &self.blocks[bi];
+        if !block.is_wrapped_at(self.width) || at.row >= block.cache.len() {
+            return None;
+        }
+        self.ensure_index();
+        Some(self.block_starts[bi] + at.row)
     }
 
     pub fn len(&mut self) -> usize {
@@ -594,11 +1010,19 @@ impl Transcript {
         self.offset
     }
 
+    /// Scroll toward older output by exactly `n` wrapped rows. The rows
+    /// crossed are wrapped first: counted by estimate, a scroll past history
+    /// no frame has shown would land on different content than the rows it
+    /// claims to move.
     pub fn scroll_up(&mut self, n: usize) {
+        self.settle(n, 0);
         self.offset = self.offset.saturating_add(n);
     }
 
+    /// Scroll toward newer output by exactly `n` wrapped rows; see
+    /// [`Self::scroll_up`].
     pub fn scroll_down(&mut self, n: usize) {
+        self.settle(0, n);
         self.offset = self.offset.saturating_sub(n);
         if self.offset == 0 {
             self.unread = 0;
@@ -722,7 +1146,10 @@ impl Transcript {
             return;
         }
         self.selected = Some(0);
-        self.ensure_index();
+        // With a live tail taller than the view, this offset puts the
+        // bottom edge a tail's height below the top of history: wrap the
+        // rows it counts through.
+        self.wrap_rows_from(0, self.view.1);
         self.offset = self.total;
     }
 
@@ -731,17 +1158,30 @@ impl Transcript {
         self.follow();
     }
 
+    /// Put the end of block `bi` a live tail's height above the bottom of
+    /// the view. The block and the history rows that height reaches below
+    /// it are wrapped first, so the frame paints the rows the offset counts.
     fn scroll_to_block(&mut self, bi: usize) {
-        self.ensure_index();
-        if bi >= self.block_starts.len() {
+        if bi >= self.blocks.len() {
             return;
         }
-        let end = self
-            .block_starts
-            .get(bi + 1)
-            .copied()
-            .unwrap_or(self.total);
+        self.wrap_block(bi);
+        self.wrap_rows_from(bi + 1, self.view.1);
+        self.ensure_index();
+        let end = self.block_starts[bi] + self.blocks[bi].height;
         self.offset = self.total.saturating_sub(end);
+    }
+
+    /// Wrap blocks from `first` on until they cover `rows` rows.
+    fn wrap_rows_from(&mut self, first: usize, rows: usize) {
+        let mut covered = 0;
+        for bi in first..self.blocks.len() {
+            if covered >= rows {
+                break;
+            }
+            self.wrap_block(bi);
+            covered += self.blocks[bi].height;
+        }
     }
 
     pub fn toggle_fold_selected(&mut self) -> bool {
@@ -762,16 +1202,7 @@ impl Transcript {
         };
         self.selected = Some(i);
         if self.blocks[i].folded {
-            self.blocks[i].folded = false;
-            self.blocks[i].invalidate();
-            if self
-                .text_selection
-                .is_some_and(|selection| selection_contains_block(selection, i))
-            {
-                self.text_selection = None;
-            }
-            self.dirty = true;
-            self.ensure_index();
+            self.refold(i, false);
             true
         } else {
             self.toggle_fold_at(i)
@@ -779,22 +1210,14 @@ impl Transcript {
     }
 
     fn toggle_fold_at(&mut self, i: usize) -> bool {
-        let Some(block) = self.blocks.get_mut(i) else {
+        let Some(block) = self.blocks.get(i) else {
             return false;
         };
         if block.compact.is_none() {
             return false;
         }
-        block.folded = !block.folded;
-        block.invalidate();
-        if self
-            .text_selection
-            .is_some_and(|selection| selection_contains_block(selection, i))
-        {
-            self.text_selection = None;
-        }
-        self.dirty = true;
-        self.ensure_index();
+        let folded = !block.folded;
+        self.refold(i, folded);
         true
     }
 
@@ -846,16 +1269,7 @@ impl Transcript {
             && self.blocks[bi].folded
             && self.blocks[bi].compact.is_some()
         {
-            self.blocks[bi].folded = false;
-            self.blocks[bi].invalidate();
-            if self
-                .text_selection
-                .is_some_and(|selection| selection_contains_block(selection, bi))
-            {
-                self.text_selection = None;
-            }
-            self.dirty = true;
-            self.ensure_index();
+            self.refold(bi, false);
         }
         self.selected = Some(bi);
         self.scroll_to_block(bi);
@@ -1026,12 +1440,29 @@ impl Transcript {
         }
     }
 
-    fn hit_test(&mut self, line_idx: usize, x: usize) -> Option<TextPoint> {
+    /// Block and column map of wrapped history line `line_idx`. Rows reach
+    /// here from a painted frame, whose blocks are wrapped; the wrap below
+    /// serves only callers that address a row no frame has shown.
+    fn row(&mut self, line_idx: usize) -> Option<(usize, CachedLineMap)> {
         self.ensure_index();
         let (block, li) = self.locate(line_idx)?;
-        let map = self.blocks[block].cache_maps.get(li)?.as_ref()?;
+        if !self.blocks[block].is_wrapped_at(self.width) {
+            let held = self.held_block();
+            self.wrap_held(block, held);
+        }
+        Some((block, (*self.blocks[block].cache_maps.get(li)?)?))
+    }
+
+    /// A row's text: its slice of the block's selectable text.
+    fn row_text(&self, block: usize, map: CachedLineMap) -> Option<&str> {
+        self.blocks[block].selectable.get(map.byte_start..map.byte_end)
+    }
+
+    fn hit_test(&mut self, line_idx: usize, x: usize) -> Option<TextPoint> {
+        let (block, map) = self.row(line_idx)?;
+        let text = self.row_text(block, map)?;
         let relative = x.saturating_sub(map.x_offset);
-        let offset = map.start + display_column_to_char_offset(&map.text, relative);
+        let offset = map.start + display_column_to_char_offset(text, relative);
         Some(TextPoint {
             block,
             offset: offset.min(map.end),
@@ -1040,17 +1471,16 @@ impl Transcript {
 
     /// Highlight columns for an absolute wrapped history line.
     pub fn selection_columns(&mut self, line_idx: usize) -> Option<(usize, usize)> {
-        self.ensure_index();
         let selection = self.text_selection?;
         if selection.is_empty() {
             return None;
         }
         let (start, end) = normalized_selection(selection);
-        let (block, li) = self.locate(line_idx)?;
+        let (block, map) = self.row(line_idx)?;
         if block < start.block || block > end.block {
             return None;
         }
-        let map = self.blocks[block].cache_maps.get(li)?.as_ref()?;
+        let text = self.row_text(block, map)?;
         let block_len = self.blocks.get(block)?.selectable_chars;
         let range_start = if block == start.block {
             start.offset
@@ -1070,9 +1500,9 @@ impl Transcript {
             return None;
         }
         let start_col =
-            map.x_offset + char_offset_to_display_column(&map.text, local_start - map.start);
+            map.x_offset + char_offset_to_display_column(text, local_start - map.start);
         let end_col =
-            map.x_offset + char_offset_to_display_column(&map.text, local_end - map.start);
+            map.x_offset + char_offset_to_display_column(text, local_end - map.start);
         Some((start_col, end_col.max(start_col + 1)))
     }
 
@@ -1123,18 +1553,20 @@ impl Transcript {
         self.sticky_user_block_idx(view_start_line).is_some()
     }
 
-    /// First line of the nearest user block above the viewport.
-    pub fn sticky_user_line(&mut self, view_start_line: usize) -> Option<Line<'static>> {
+    /// First line of the nearest user block above the viewport, borrowed:
+    /// the frame paints it in place.
+    pub fn sticky_user_line(&mut self, view_start_line: usize) -> Option<&Line<'static>> {
         let i = self.sticky_user_block_idx(view_start_line)?;
-        self.blocks[i].source_lines().first().cloned()
+        self.blocks[i].source_lines().first()
     }
 
-    /// Test-support oracle for the selection marker `fill_viewport` paints.
+    /// Test-support oracle for the selection marker `paint_rows` paints.
     #[cfg(test)]
-    pub fn is_selected_block_for_line(&self, line_idx: usize) -> bool {
+    pub fn is_selected_block_for_line(&mut self, line_idx: usize) -> bool {
         let Some(sel) = self.selected else {
             return false;
         };
+        self.ensure_index();
         self.locate(line_idx).map(|(bi, _)| bi) == Some(sel)
     }
 
@@ -1280,22 +1712,27 @@ fn wrap_lines_mapped(
     let width = width.max(8) as usize;
     let mut out = Vec::new();
     let mut maps = Vec::new();
+    // Where this line starts in the joined plain text, in chars and bytes.
     let mut logical_start = 0usize;
+    let mut logical_byte = 0usize;
     for line in lines {
         let chars: Vec<(char, Style)> = line
             .spans
             .iter()
             .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
             .collect();
+        let line_bytes: usize = line.spans.iter().map(|s| s.content.len()).sum();
         if chars.is_empty() {
             out.push(Line::default());
             maps.push(Some(CachedLineMap {
                 start: logical_start,
                 end: logical_start,
+                byte_start: logical_byte,
+                byte_end: logical_byte,
                 x_offset: 0,
-                text: String::new(),
             }));
             logical_start += 1;
+            logical_byte += 1;
             continue;
         }
         let indent = hanging_indent(&chars, width);
@@ -1348,11 +1785,13 @@ fn wrap_lines_mapped(
                     row.spans.insert(0, Span::raw(" ".repeat(indent)));
                 }
                 out.push(row);
+                // ASCII: a char is a byte.
                 maps.push(Some(CachedLineMap {
                     start: logical_start + start,
                     end: logical_start + cut,
+                    byte_start: logical_byte + start,
+                    byte_end: logical_byte + cut,
                     x_offset: if first_row { 0 } else { indent },
-                    text: chars[start..cut].iter().map(|(ch, _)| ch).collect(),
                 }));
                 start = cut;
                 first_row = false;
@@ -1361,12 +1800,13 @@ fn wrap_lines_mapped(
             let plain: String = chars.iter().map(|(ch, _)| ch).collect();
             let mut graphemes = Vec::new();
             let mut char_start = 0usize;
-            for grapheme in plain.graphemes(true) {
+            for (byte_start, grapheme) in plain.grapheme_indices(true) {
                 let char_end = char_start + grapheme.chars().count();
                 graphemes.push((
                     char_start,
                     cell_width(grapheme),
                     grapheme.chars().all(char::is_whitespace),
+                    byte_start,
                 ));
                 char_start = char_end;
             }
@@ -1379,7 +1819,7 @@ fn wrap_lines_mapped(
                 let mut end = start;
                 let mut last_space: Option<usize> = None;
                 while end < graphemes.len() {
-                    let (_, width_here, is_space) = graphemes[end];
+                    let (_, width_here, is_space, _) = graphemes[end];
                     if used + width_here > avail {
                         break;
                     }
@@ -1397,11 +1837,11 @@ fn wrap_lines_mapped(
                         _ => end.max(start + 1),
                     }
                 };
-                let from_char = graphemes[start].0;
-                let to_char = if cut == graphemes.len() {
-                    chars.len()
+                let (from_char, from_byte) = (graphemes[start].0, graphemes[start].3);
+                let (to_char, to_byte) = if cut == graphemes.len() {
+                    (chars.len(), plain.len())
                 } else {
-                    graphemes[cut].0
+                    (graphemes[cut].0, graphemes[cut].3)
                 };
                 let mut row = rebuild(&chars[from_char..to_char]);
                 if !first_row && indent > 0 {
@@ -1415,17 +1855,16 @@ fn wrap_lines_mapped(
                 maps.push(Some(CachedLineMap {
                     start: logical_start + from_char,
                     end: logical_start + to_char,
+                    byte_start: logical_byte + from_byte,
+                    byte_end: logical_byte + to_byte,
                     x_offset: if first_row { 0 } else { indent },
-                    text: chars[from_char..to_char]
-                        .iter()
-                        .map(|(ch, _)| ch)
-                        .collect(),
                 }));
                 start = cut;
                 first_row = false;
             }
         }
         logical_start += chars.len() + 1;
+        logical_byte += line_bytes + 1;
     }
     (out, maps)
 }
@@ -2157,6 +2596,139 @@ mod tests {
         assert_eq!(text(&t.lines())[0], "hello ");
     }
 
+    /// Lines that wrap, fit, hang under a marker, carry tabs, wide and
+    /// combining graphemes, a cluster split across spans, controls, and
+    /// nothing at all.
+    fn awkward_lines() -> Vec<Line<'static>> {
+        vec![
+            Line::from("plain prose that runs well past any narrow width you could pick"),
+            Line::from("short"),
+            Line::from(""),
+            Line::from("• a bullet whose continuation rows hang under the marker text"),
+            Line::from("12. a numbered item that also hangs once it wraps around"),
+            Line::from("\tindented\twith\ttabs between words that wrap"),
+            Line::from("漢字テキストと english mixed 漢字テキスト wraps on wide cells"),
+            Line::from(vec![Span::raw("joined e"), Span::raw("\u{301} across spans é é é")]),
+            Line::from("e\u{301}e\u{301} 👩\u{200d}💻👩\u{200d}💻 emoji 👩\u{200d}💻 and marks"),
+            Line::from("a_single_unbroken_token_far_longer_than_the_row_it_lands_in"),
+            Line::from("bell\u{7} and esc\u{1b} controls"),
+        ]
+    }
+
+    /// A block's estimate never exceeds the rows its wrap produces (the
+    /// draw path relies on it to wrap only the blocks in view), and equals
+    /// them whenever every line fits.
+    #[test]
+    fn estimates_never_exceed_the_wrap_and_are_exact_when_lines_fit() {
+        for kind in [BlockKind::User, BlockKind::Assistant] {
+            for width in 1..=90 {
+                let mut block = Block::new(kind, awkward_lines());
+                let estimate = block.measure(width);
+                block.ensure_cache(width);
+                let exact = block.cache.len();
+                assert!(estimate <= exact, "{kind:?} at {width}: {estimate} > {exact}");
+                if block.raw_cells.widest as usize <= usize::from(content_width(kind, width)) {
+                    assert_eq!(estimate, exact, "{kind:?} at {width}");
+                }
+            }
+        }
+        // Wide enough for every line: the estimate is the wrap.
+        let mut block = Block::new(BlockKind::Assistant, awkward_lines());
+        let estimate = block.measure(200);
+        block.ensure_cache(200);
+        assert_eq!(estimate, block.cache.len());
+    }
+
+    /// Each wrapped row's map names its text as a byte range of the block's
+    /// selectable text instead of carrying a copy; that range must hold
+    /// exactly the characters its char range counts.
+    #[test]
+    fn row_maps_slice_exactly_the_text_they_count() {
+        for width in [9u16, 13, 24, 40, 200] {
+            let mut t = Transcript::new();
+            t.set_width(width);
+            t.push_user(awkward_lines());
+            t.push_assistant(awkward_lines());
+            t.push_tool(vec![Line::from("✓ cat notes")], "first\n\tsecond 漢字\n".into(), false);
+            t.wrap_all();
+            for block in &t.blocks {
+                let chars: Vec<char> = block.selectable.chars().collect();
+                for map in block.cache_maps.iter().flatten() {
+                    let sliced = &block.selectable[map.byte_start..map.byte_end];
+                    let counted: String = chars[map.start..map.end].iter().collect();
+                    assert_eq!(sliced, counted, "width {width}");
+                }
+            }
+        }
+    }
+
+    /// `paint_rows` paints, row for row, what the cloned viewport lines
+    /// paint through a paragraph, the selected block's surface included.
+    #[test]
+    fn paint_rows_paints_what_the_cloned_lines_paint() {
+        use ratatui::widgets::{Paragraph, Widget};
+        let mut t = Transcript::new();
+        t.set_width(30);
+        t.push_user(awkward_lines());
+        t.push_assistant(crate::ui::markdown::render("A reply.\n\n```rust\nfn a() {}\n```"));
+        t.push_tool(vec![Line::from("✗ bash cargo test")], "error: one\nnote: two".into(), false);
+        t.push(vec![Line::from("a notice")]);
+        let total = t.lines().len();
+        for selected in [None, Some(1), Some(2)] {
+            for (start, end) in [(0, total), (3, 17), (total - 4, total)] {
+                let area = Rect::new(1, 2, 30, (end - start) as u16);
+                let mut expected = Buffer::empty(Rect::new(0, 0, 32, area.bottom() + 1));
+                let mut painted = expected.clone();
+                let mut lines = Vec::new();
+                t.fill_viewport(&mut lines, start, end, selected);
+                Paragraph::new(lines).render(area, &mut expected);
+                let mut rows = Vec::new();
+                t.paint_rows(&mut painted, area, start, end, selected, &mut rows);
+                assert_eq!(painted, expected, "rows {start}..{end}, selected {selected:?}");
+                // Each painted row is found again at the line it painted.
+                let found: Vec<_> =
+                    rows.iter().map(|at| at.and_then(|at| t.line_of(at))).collect();
+                assert_eq!(found, (start..end).map(Some).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// A prompt rejected by a hook is removed from above the notices the
+    /// hook already put on screen. Rows painted before the removal must
+    /// still name those notices: a row named by the block's index would
+    /// name the block that slid into it, so a selection before the next
+    /// paint would copy a different notice than the one under the pointer.
+    #[test]
+    fn painted_rows_keep_their_text_when_a_block_above_is_removed() {
+        let mut t = Transcript::new();
+        t.set_width(30);
+        t.push_assistant(vec![Line::from("an earlier reply")]);
+        t.push_user(vec![Line::from("a prompt a hook rejects")]);
+        t.push(vec![Line::from("first hook notice")]);
+        t.push(vec![Line::from("second hook notice")]);
+        t.push(vec![Line::from("third hook notice")]);
+        let total = t.lines().len();
+        let area = Rect::new(0, 0, 30, total as u16);
+        let mut rows = Vec::new();
+        t.paint_rows(&mut Buffer::empty(area), area, 0, total, None, &mut rows);
+        let text_of = |t: &mut Transcript, at: Option<RowRef>| {
+            let line = at.and_then(|at| t.line_of(at))?;
+            t.line_at(line).map(|line| lines_to_plain(std::slice::from_ref(line)))
+        };
+        let painted: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
+        let prompt = t.block_starts[1]..t.block_starts[2];
+        assert!(t.pop_last_user());
+        let found: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
+        // The removed prompt's rows name nothing; every other row still
+        // names the text it painted.
+        let expected: Vec<_> = painted
+            .into_iter()
+            .enumerate()
+            .map(|(row, text)| text.filter(|_| !prompt.contains(&row)))
+            .collect();
+        assert_eq!(found, expected);
+    }
+
     #[test]
     fn transcript_rewraps_on_width_change() {
         let mut t = Transcript::new();
@@ -2167,7 +2739,8 @@ mod tests {
         assert!(t.len() >= wide);
     }
 
-    // Release-only diagnostic for the synchronous resize path. It is ignored
+    // Release-only diagnostic for the synchronous resize path: re-measuring
+    // every block and wrapping the ones a 40-row view shows. It is ignored
     // in normal CI because elapsed-time assertions are machine-dependent.
     // Run with:
     //   cargo test -p openmax --release -- --ignored --nocapture measure_transcript_resize
@@ -2193,6 +2766,7 @@ mod tests {
         for width in [72, 120, 88, 100] {
             let started = Instant::now();
             transcript.set_width(width);
+            transcript.settle_view(40, 0);
             std::hint::black_box(transcript.len());
             eprintln!(
                 "MEASURE transcript_resize source_lines={source_lines} width={width} elapsed_ms={:.3}",
@@ -2607,6 +3181,7 @@ mod tests {
         assert!(t.has_sticky_user(view_start));
         let sticky = t
             .sticky_user_line(view_start)
+            .cloned()
             .expect("sticky above mid viewport");
         let plain: String = sticky.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -2623,6 +3198,7 @@ mod tests {
         assert!(t.has_sticky_user(view_start));
         let sticky2 = t
             .sticky_user_line(view_start)
+            .cloned()
             .expect("sticky after appends");
         assert_eq!(text(&[sticky]), text(&[sticky2]));
         // Absolute line maps for earlier history stay valid after appends.
@@ -2814,7 +3390,7 @@ mod tests {
             "stable prose that stays where it was put",
         ))]);
         t.push_tool(vec![Line::from("✓ bash")], "line one\nline two".into(), true);
-        t.ensure_index();
+        t.wrap_all();
         let cached = t.blocks[0].cache[0].spans[0].content.as_ptr();
         assert_eq!(
             t.line_at(0).unwrap().spans[0].content.as_ptr(),
@@ -2847,6 +3423,7 @@ mod tests {
                 ))]);
                 t.push_tool(vec![Line::from("✓ bash")], output.clone(), true);
             }
+            t.wrap_all();
             let lines = t.len();
 
             // Each call alternates unfold/fold on the last tool block; only
@@ -2858,10 +3435,12 @@ mod tests {
             }
             let fold_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
 
-            // A settled resize: every block re-wraps and the tables rebuild.
+            // A settled resize: every block is re-measured, the view's
+            // blocks re-wrap, and the tables rebuild.
             let t0 = Instant::now();
             for w in [110u16, 120, 110, 120] {
                 t.set_width(w);
+                t.settle_view(40, 0);
             }
             let resize_ms = t0.elapsed().as_secs_f64() * 1e3 / 4.0;
 

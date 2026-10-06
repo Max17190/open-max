@@ -2,6 +2,10 @@
 
 use std::borrow::Cow;
 
+use ratatui::buffer::{Buffer, CellWidth};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, StyledGrapheme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -85,6 +89,68 @@ fn escape_len(seq: &[u8]) -> Option<usize> {
             None
         }
         _ => None,
+    }
+}
+
+/// Paint `line` into the one-row `area` exactly as an unwrapped
+/// `Paragraph` holding it paints it, from a borrowed line. A paragraph
+/// takes owned text, so painting a frame's rows through one cloned each row
+/// on every frame. `prefix` is painted as though it led the line, as a
+/// gutter inserted into a clone of it would be.
+pub fn paint_line(buf: &mut Buffer, area: Rect, prefix: Option<&Span<'_>>, line: &Line<'_>) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    // A span inside a line is styled over the line's own style.
+    let line_style = Style::default().patch(line.style);
+    let graphemes = || {
+        prefix
+            .into_iter()
+            .flat_map(move |span| span.styled_graphemes(line_style))
+            .chain(line.styled_graphemes(Style::default()))
+    };
+    let max = usize::from(area.width);
+    // The paragraph keeps graphemes up to the first one that would overflow
+    // the row, skipping any wider than the whole row, then aligns what it
+    // kept.
+    let mut x = match line.alignment.unwrap_or(Alignment::Left) {
+        Alignment::Left => 0,
+        alignment => {
+            let mut used = 0usize;
+            for grapheme in graphemes() {
+                let width = usize::from(grapheme.symbol.cell_width());
+                if width > max {
+                    continue;
+                }
+                if used + width > max {
+                    break;
+                }
+                used += width;
+            }
+            let used = used as u16;
+            match alignment {
+                Alignment::Center => (area.width / 2).saturating_sub(used / 2),
+                _ => area.width.saturating_sub(used),
+            }
+        }
+    };
+    let mut used = 0usize;
+    for StyledGrapheme { symbol, style } in graphemes() {
+        let width = usize::from(symbol.cell_width());
+        if width > max {
+            continue;
+        }
+        if used + width > max {
+            break;
+        }
+        used += width;
+        if width == 0 {
+            continue;
+        }
+        let symbol = if symbol.is_empty() { " " } else { symbol };
+        buf[(area.x + x, area.y)].set_symbol(symbol).set_style(style);
+        x += width as u16;
     }
 }
 
@@ -194,6 +260,50 @@ pub fn line_bounds(text: &str, offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `paint_line` must paint every cell exactly as the paragraph it
+    /// replaced: wide and zero-width graphemes, controls the renderer drops,
+    /// overflow, a wide grapheme straddling the edge, line and span styles,
+    /// alignment, and a gutter prefix.
+    #[test]
+    fn paint_line_paints_exactly_what_a_paragraph_paints() {
+        use ratatui::style::{Color, Modifier};
+        use ratatui::widgets::{Paragraph, Widget};
+
+        let red = Style::default().fg(Color::Red);
+        let on_blue = Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD);
+        let lines = vec![
+            Line::from("plain ascii text"),
+            Line::from("a line far wider than the narrowest row it is painted into"),
+            Line::from(vec![Span::styled("漢字", red), Span::raw("ab漢"), Span::styled("字z", on_blue)]),
+            Line::from("e\u{301}x 👩\u{200d}💻 tab\there esc\u{1b}[31mred\u{7}bell"),
+            Line::from(vec![Span::raw("joined e"), Span::styled("\u{301} across spans", red)]),
+            Line::from(vec![Span::raw("styled line"), Span::raw(" two")]).style(on_blue),
+            Line::from("centered 漢字").alignment(Alignment::Center),
+            Line::from("right 字").alignment(Alignment::Right),
+            Line::from("too wide to center at all here").alignment(Alignment::Center),
+            Line::from(""),
+            Line::default().style(on_blue),
+        ];
+        let gutter = Span::styled("❯ ", Style::default().fg(Color::DarkGray));
+        for line in &lines {
+            for width in [1u16, 2, 3, 7, 12, 40, 80] {
+                for prefix in [None, Some(&gutter)] {
+                    let area = Rect::new(2, 1, width, 1);
+                    let canvas = Rect::new(0, 0, width + 4, 3);
+                    let mut expected = Buffer::empty(canvas);
+                    let mut owned = line.clone();
+                    if let Some(prefix) = prefix {
+                        owned.spans.insert(0, prefix.clone());
+                    }
+                    Paragraph::new(vec![owned]).render(area, &mut expected);
+                    let mut painted = Buffer::empty(canvas);
+                    paint_line(&mut painted, area, prefix, line);
+                    assert_eq!(painted, expected, "{line:?} at {width} columns, prefix {prefix:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn clip_obeys_cell_width_and_grapheme_boundaries() {
