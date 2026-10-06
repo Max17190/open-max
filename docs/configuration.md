@@ -24,7 +24,10 @@ crosses plain http to another machine: with a key (or `user:password` in the
 address (`127.0.0.1`, `::1`, or `localhost`), every request fails with an
 error instead of sending it. Use https, or a
 loopback address for a server on this machine; a server that needs no key works
-over http once none is configured.
+over http once none is configured. A redirect is followed only on the same
+scheme, host, and port as `base_url`: one to another server fails the request
+with an error naming that server, since following it would hand the request
+and its headers to a server you did not configure.
 `max_parallel_tools` bounds concurrent read-only tool calls, defaults to 4, and
 is clamped to 1 through 32 at runtime. Mutating, approval-gated, and
 non-batchable calls remain serial.
@@ -156,7 +159,10 @@ A provider takes its key from its own `api_key` or `api_key_env`. Without one,
 it uses the settings `api_key` (or `OPENMAX_API_KEY`) only when its `base_url`
 has the same scheme, host, and port as the settings `base_url`: that key was
 configured for that server. Any other provider gets no key, and a 401 from it
-says how to give that provider its own.
+says how to give that provider its own. A credential in a provider's `headers`
+(a header whose name contains `auth`, `key`, `token`, `secret`, `password`,
+`credential`, or `cookie`, such as `Authorization` or `X-API-Key`) follows the
+same plain-http rule as the key.
 
 A request has no overall deadline, since a local server can spend minutes on a
 long prompt, but an endpoint that sends nothing at all (no response headers, no

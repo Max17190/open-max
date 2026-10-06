@@ -657,10 +657,13 @@ Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
   truncated. Raise it for a local server that works through a long prompt
   silently for longer.
 
-A key, Authorization header, or user:password in `base_url` never goes over
-plain http to another machine: such a request fails with an error before
-anything is sent. Use https, or a loopback address (127.0.0.1, ::1,
-localhost) for a server on this machine.
+A key, a credential header (one whose name contains auth, key, token,
+secret, password, credential, or cookie, such as Authorization or
+X-API-Key), or user:password in `base_url` never goes over plain http to
+another machine: such a request fails with an error before anything is
+sent. Use https, or a loopback address (127.0.0.1, ::1, localhost) for a
+server on this machine. A redirect is followed only on the same scheme,
+host, and port as `base_url`; one to another server fails the request.
 
 Select a provider with `"provider"` in settings.json, the `--provider` CLI
 option, or `/provider`; `/model` picks provider and model as one pair. This

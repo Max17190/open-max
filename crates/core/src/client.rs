@@ -41,8 +41,11 @@
 //! reported as truncated rather than treated as a complete reply.
 //!
 //! A credential never crosses plain http to another machine: a request that
-//! would carry the key, an Authorization header, or user:password from the
-//! base_url that way is refused before it is sent.
+//! would carry the key, a credential header (Authorization, X-API-Key, or any
+//! header named as one, see `is_credential_header`), or user:password from
+//! the base_url that way is refused before it is sent. Nor does a request
+//! leave the server the base_url names: a redirect is followed only on the
+//! same scheme, host, and port, and one anywhere else fails the request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -448,6 +451,7 @@ impl ChatClient {
                     .connect_timeout(std::time::Duration::from_secs(10))
                     // No overall timeout: local generations can legitimately
                     // take minutes. `stream_chat` ends an attempt on silence.
+                    .redirect(reqwest::redirect::Policy::custom(same_server_redirect))
                     .build()
                     .expect("failed to build http client")
             })
@@ -471,13 +475,13 @@ impl ChatClient {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 
-    /// Whether a request carries a credential: the key, an Authorization
-    /// header among the provider's headers, or user:password in the
-    /// base_url, which the HTTP client turns into a Basic Authorization
-    /// header.
+    /// Whether a request carries a credential: the key, a credential header
+    /// among the provider's headers (see [`is_credential_header`]), or
+    /// user:password in the base_url, which the HTTP client turns into a
+    /// Basic Authorization header.
     fn sends_credential(&self) -> bool {
         self.api_key.as_deref().is_some_and(|key| !key.is_empty())
-            || self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            || self.headers.iter().any(|(name, _)| is_credential_header(name))
             || reqwest::Url::parse(self.base_url.trim())
                 .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
     }
@@ -1308,9 +1312,45 @@ fn plain_http_refusal(base_url: &str) -> Option<String> {
         });
     (!this_machine).then(|| {
         format!(
-            "refusing to send credentials over plain http to {host}, where anyone on the network path can read them: use an https base_url, or a loopback address (127.0.0.1, ::1, or localhost) for a server on this machine. A server that needs no key works over http once none is configured for it (api_key, api_key_env, OPENMAX_API_KEY, an Authorization header, or user:password in the base_url)"
+            "refusing to send credentials over plain http to {host}, where anyone on the network path can read them: use an https base_url, or a loopback address (127.0.0.1, ::1, or localhost) for a server on this machine. A server that needs no key works over http once none is configured for it (api_key, api_key_env, OPENMAX_API_KEY, a credential header such as Authorization or X-API-Key, or user:password in the base_url)"
         )
     })
+}
+
+/// Whether a configured header carries a credential, judged by its name:
+/// Authorization and Proxy-Authorization, a cookie, or a key, token, secret,
+/// password, or credential under whatever name the server picked (X-API-Key,
+/// api-key, X-Auth-Token). Such a header is read off plain http as easily as
+/// a bearer key, so a check for Authorization alone would let a key in
+/// X-API-Key cross it.
+fn is_credential_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["auth", "key", "token", "secret", "password", "credential", "cookie"]
+        .iter()
+        .any(|word| name.contains(word))
+}
+
+/// The redirect policy of the shared HTTP client: follow a redirect only
+/// within the server the request was sent to (scheme, host, and port). The
+/// HTTP client drops Authorization and cookies on a move to another host but
+/// keeps every other header and, on a 307 or 308, the body, so following one
+/// would hand a key in X-API-Key, and the transcript, to a server nobody
+/// configured, or move them onto plain http.
+fn same_server_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    let server = |url: &reqwest::Url| (url.scheme().to_string(), url.host_str().map(str::to_string), url.port_or_known_default());
+    let next = server(attempt.url());
+    let to = attempt.url().origin().ascii_serialization();
+    if attempt.previous().len() > 10 {
+        // The default policy's limit, for a server that redirects to itself.
+        attempt.error("too many redirects")
+    } else if attempt.previous().first().map(server) == Some(next) {
+        // The first previous URL is the one the request was sent to.
+        attempt.follow()
+    } else {
+        attempt.error(format!(
+            "refusing to follow a redirect to {to}, a server other than the one base_url names: a request and its credentials go only to that server, by scheme, host, and port. If {to} is the endpoint, point base_url at it"
+        ))
+    }
 }
 
 fn is_transient_transport(err: &reqwest::Error) -> bool {
@@ -2617,15 +2657,17 @@ mod tests {
 
     /// The bug this guards: the key went out as a bearer header over plain
     /// http to any host, readable anywhere on the path. A request that would
-    /// carry a credential (the key, an Authorization header, or user:password
-    /// in the base_url, which the HTTP client sends as Basic auth) over http
-    /// to another machine is refused before anything is sent, naming the
-    /// fix; over loopback, to a server on this machine, it goes out.
+    /// carry a credential (the key, a credential header such as Authorization
+    /// or X-API-Key, or user:password in the base_url, which the HTTP client
+    /// sends as Basic auth) over http to another machine is refused before
+    /// anything is sent, naming the fix; over loopback, to a server on this
+    /// machine, it goes out.
     #[tokio::test]
     async fn a_key_never_crosses_plain_http_to_another_machine() {
         for (base_url, key, headers) in [
             ("http://models.example.invalid/v1", Some("sk-test".to_string()), Vec::new()),
             ("http://models.example.invalid/v1", None, vec![("Authorization".to_string(), "Bearer sk-test".to_string())]),
+            ("http://models.example.invalid/v1", None, vec![("X-API-Key".to_string(), "sk-test".to_string())]),
             ("http://user:secret@models.example.invalid/v1", None, Vec::new()),
             ("http://:secret@models.example.invalid/v1", None, Vec::new()),
         ] {
@@ -2678,6 +2720,69 @@ mod tests {
         ] {
             assert!(plain_http_refusal(url).is_some(), "{url}");
         }
+    }
+
+    /// A header is a credential by its name, whatever name the server picked
+    /// for its key or token; routing and attribution headers are not, so a
+    /// keyless server that wants one still works over http.
+    #[test]
+    fn a_credential_header_is_known_by_its_name() {
+        let sends = |name: &str| {
+            let mut client = ChatClient::new("http://models.example.invalid/v1".into(), None, "m".into(), None, 64);
+            client.headers = vec![(name.to_string(), "value".to_string())];
+            client.sends_credential()
+        };
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "X-API-Key",
+            "api-key",
+            "X-Auth-Token",
+            "X-Access-Token",
+            "Cookie",
+            "X-Client-Secret",
+            "X-Upstream-Password",
+        ] {
+            assert!(sends(name), "{name}");
+        }
+        for name in ["X-Route", "HTTP-Referer", "X-Title", "User-Agent", "Accept"] {
+            assert!(!sends(name), "{name}");
+        }
+    }
+
+    /// The bug this guards: the HTTP client followed any redirect, and on a
+    /// move to another host it drops only Authorization and cookies, so an
+    /// endpoint that redirected sent the request on, with a key in X-API-Key
+    /// or any other header, to a server nobody configured. A redirect is
+    /// followed only within the server the base_url names (scheme, host, and
+    /// port); one anywhere else fails the request, and nothing reaches that
+    /// server.
+    #[tokio::test]
+    async fn a_redirect_never_carries_a_request_to_another_server() {
+        let (elsewhere, heads) = spawn_recording_once(finished_response());
+        let elsewhere = elsewhere.trim_end_matches("/v1").to_string();
+        let moved = |location: &str| status_response("307 Temporary Redirect", &format!("Location: {location}\r\n"), "");
+        let (url, served) = spawn_sse_sequence(vec![moved(&format!("{elsewhere}/v1/chat/completions"))]);
+        let mut client = ChatClient::new(url, None, "m".into(), None, 64);
+        client.headers = vec![("X-API-Key".into(), "sk-test".into())];
+        let mut deltas = 0;
+        let err = client
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| deltas += 1)
+            .await
+            .err()
+            .expect("a redirect to another server fails the request");
+        assert!(err.contains("redirect") && err.contains(&elsewhere) && !err.contains("sk-test"), "{err}");
+        assert!(heads.try_recv().is_err(), "the other server was sent nothing");
+        assert_eq!((*served.lock().unwrap(), deltas), (1, 0), "the refusal is not resent");
+
+        // Within the same server, a moved path is followed.
+        let (url, served) = spawn_sse_sequence(vec![moved("/v2/chat/completions"), FINISHED.into()]);
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .expect("a redirect within the server is followed");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(*served.lock().unwrap(), 2);
     }
 
     /// A provider's `idle_timeout_secs` replaces the default interval for
