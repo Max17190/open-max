@@ -1060,7 +1060,7 @@ async fn main() -> std::io::Result<()> {
     // Focus reports gate the turn-done ring on the user being away.
     enable_mode(MODE_FOCUS, crossterm::event::EnableFocusChange);
 
-    let result = app::run(
+    let (result, warnings) = app::run(
         terminal,
         core,
         core_rx,
@@ -1069,6 +1069,21 @@ async fn main() -> std::io::Result<()> {
     .await;
 
     restore_terminal();
+    finish_tui(result, warnings, &mut std::io::stderr())
+}
+
+/// Print the TUI's exit warnings on the restored terminal, then hand back how
+/// its loop ended. They print on a terminal error too: the exit discard ran
+/// either way, and a failed one leaves an empty session indexed that only
+/// this line names.
+fn finish_tui(
+    result: std::io::Result<()>,
+    warnings: Vec<String>,
+    err: &mut impl Write,
+) -> std::io::Result<()> {
+    for warning in warnings {
+        let _ = writeln!(err, "openmax: warning: {}", open_max_core::text::one_line(&warning));
+    }
     result
 }
 
@@ -1770,6 +1785,23 @@ pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// A terminal that fails mid-session still leaves through the exit
+    /// discard, and a discard that failed there leaves an empty session
+    /// indexed. Its warning must reach the shell beside the terminal error
+    /// instead of vanishing with the loop's result.
+    #[test]
+    fn exit_warnings_print_even_when_the_terminal_failed() {
+        let warning = "the empty session s1 stays indexed: denied";
+        let expected = format!("openmax: warning: {warning}\n");
+        for result in [Err(std::io::Error::other("terminal gone")), Ok(())] {
+            let failed = result.is_err();
+            let mut err = Vec::new();
+            let out = super::finish_tui(result, vec![warning.to_string()], &mut err);
+            assert_eq!(out.is_err(), failed, "the loop's own result must pass through");
+            assert_eq!(String::from_utf8(err).unwrap(), expected, "failed terminal: {failed}");
+        }
+    }
+
     #[test]
     fn approve_commands_quote_metacharacter_paths() {
         // The path is agent-chosen; the printed command is pastable.
