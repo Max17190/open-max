@@ -10,9 +10,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::theme;
+use crate::ui::text::{cell_width, strip_escapes, TAB_WIDTH};
 
 /// Frames go through one large buffer per flush: bare `Stdout` is
 /// line-buffered at 1 KiB, which turns a busy streaming frame into dozens of
@@ -136,20 +137,26 @@ impl Block {
         let selectable_chars = selectable.chars().count();
         // Search covers the compact header plus the whole output, matching
         // what `search_text_line` reads back out; the folded view is not
-        // part of it.
+        // part of it. The output is searched as the screen shows it, or a
+        // color code inside a phrase would hide it from find while a query
+        // for the hidden code matched. Stripping never removes a newline, so
+        // line slots still agree with the raw output.
+        let visible = strip_escapes(&full_output);
         let search_lower = if selectable.is_empty() {
-            lower_for_search(&full_output)
+            lower_for_search(&visible)
         } else {
-            lower_for_search(&format!("{selectable}\n{full_output}"))
+            lower_for_search(&format!("{selectable}\n{visible}"))
         };
         let header = compact
             .first()
             .cloned()
             .unwrap_or_else(|| Line::from("tool"));
         let mut full_lines = vec![header];
+        // The screen shows output without its escape sequences; the exact
+        // bytes stay in `full_output` for copy and export.
         for line in full_output.lines().take(80) {
             full_lines.push(Line::from(Span::styled(
-                format!("  {line}"),
+                format!("  {}", strip_escapes(line)),
                 Style::default().fg(theme::DIM()),
             )));
         }
@@ -868,7 +875,7 @@ impl Transcript {
                 let line_idx =
                     b.search_lower[..pos].bytes().filter(|&c| c == b'\n').count();
                 if let Some(line) = search_text_line(b, line_idx) {
-                    return Some(line.trim().to_string());
+                    return Some(preview_text(&line));
                 }
             }
         }
@@ -878,7 +885,7 @@ impl Transcript {
             .position(|l| !l.trim().is_empty());
         let line = first_content
             .and_then(|idx| search_text_line(b, idx))
-            .map(|l| l.trim().to_string())
+            .map(|l| preview_text(&l))
             .unwrap_or_default();
         Some(line)
     }
@@ -1219,7 +1226,9 @@ fn lines_to_plain(lines: &[Line<'static>]) -> String {
 /// rebuilding the whole text: the compact header is at most a couple of
 /// lines and the full output is read by reference. Composed exactly like
 /// the lowercase cache in `Block::new` / `Block::tool`, which is what
-/// keeps line indices between the two in agreement.
+/// keeps line indices between the two in agreement. An output line comes
+/// back with the escape sequences the cache left out; `preview_text`
+/// drops them.
 fn search_text_line(b: &Block, line_idx: usize) -> Option<String> {
     // `split('\n')`, not `.lines()`: indices come from counting `\n` bytes
     // in the cache, and `.lines()` would drop a trailing empty slot.
@@ -1249,8 +1258,17 @@ fn search_text_line(b: &Block, line_idx: usize) -> Option<String> {
     }
 }
 
+/// A find preview is one clipped line painted without the wrapper (which is
+/// what expands tabs): escape sequences go, and a tab reads as one space
+/// instead of vanishing between the words it separates.
+fn preview_text(line: &str) -> String {
+    strip_escapes(line).replace('\t', " ").trim().to_string()
+}
+
 /// Span-preserving word wrap. Greedy, breaking at the last space that fits;
-/// hard-breaks tokens longer than the width.
+/// hard-breaks tokens longer than the width. A tab is drawn as
+/// [`TAB_WIDTH`] spaces, since the renderer would drop the tab itself; the
+/// column maps still point at the tab, so a copy carries it.
 pub fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
     wrap_lines_mapped(lines, width).0
 }
@@ -1302,11 +1320,16 @@ fn wrap_lines_mapped(
                 let mut end = start;
                 let mut last_space: Option<usize> = None;
                 while end < chars.len() {
-                    let width_here = chars[end].0.width().unwrap_or(0);
+                    let ch = chars[end].0;
+                    let width_here = if ch == '\t' {
+                        TAB_WIDTH
+                    } else {
+                        ch.width().unwrap_or(0)
+                    };
                     if used + width_here > avail {
                         break;
                     }
-                    if chars[end].0 == ' ' {
+                    if ch == ' ' || ch == '\t' {
                         last_space = Some(end);
                     }
                     used += width_here;
@@ -1342,7 +1365,7 @@ fn wrap_lines_mapped(
                 let char_end = char_start + grapheme.chars().count();
                 graphemes.push((
                     char_start,
-                    grapheme.width(),
+                    cell_width(grapheme),
                     grapheme.chars().all(char::is_whitespace),
                 ));
                 char_start = char_end;
@@ -1409,10 +1432,13 @@ fn wrap_lines_mapped(
 
 /// Continuation indent for a wrapped line: its leading whitespace plus any
 /// list marker. Without it the second row of a long bullet starts in the
-/// marker column and reads as a separate item.
+/// marker column and reads as a separate item. Measured in cells, so a
+/// tab-indented line hangs as deep as it is drawn.
 fn hanging_indent(chars: &[(char, Style)], width: usize) -> usize {
     let mut i = 0;
-    while i < chars.len() && chars[i].0 == ' ' {
+    let mut leading = 0;
+    while i < chars.len() && matches!(chars[i].0, ' ' | '\t') {
+        leading += if chars[i].0 == '\t' { TAB_WIDTH } else { 1 };
         i += 1;
     }
     let marker = match chars.get(i).map(|c| c.0) {
@@ -1431,7 +1457,7 @@ fn hanging_indent(chars: &[(char, Style)], width: usize) -> usize {
         }
         _ => 0,
     };
-    let indent = i + marker;
+    let indent = leading + marker;
     // An indent that swallows half the line would wrap worse than none.
     if indent >= width / 2 {
         0
@@ -1499,11 +1525,13 @@ fn selection_contains_block(selection: TextSelection, block: usize) -> bool {
     block >= start.block && block <= end.block
 }
 
+// Both directions measure a row the way the wrapper drew it (`cell_width`),
+// so a tab maps to the cells its spaces fill.
 fn display_column_to_char_offset(text: &str, column: usize) -> usize {
     let mut used = 0usize;
     let mut chars = 0usize;
     for grapheme in text.graphemes(true) {
-        let width = grapheme.width();
+        let width = cell_width(grapheme);
         if used + width > column {
             return chars;
         }
@@ -1519,23 +1547,31 @@ fn char_offset_to_display_column(text: &str, offset: usize) -> usize {
         .nth(offset)
         .map(|(byte, _)| byte)
         .unwrap_or(text.len());
-    text[..byte].width()
+    text[..byte].graphemes(true).map(cell_width).sum()
 }
 
 fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
     let mut style: Option<Style> = None;
+    // A tab becomes the spaces it occupies; the renderer would drop it.
+    let push = |buf: &mut String, c: char| {
+        if c == '\t' {
+            buf.extend(std::iter::repeat_n(' ', TAB_WIDTH));
+        } else {
+            buf.push(c);
+        }
+    };
     for (c, s) in chars {
         match style {
-            Some(current) if current == *s => buf.push(*c),
+            Some(current) if current == *s => push(&mut buf, *c),
             Some(current) => {
                 spans.push(Span::styled(std::mem::take(&mut buf), current));
-                buf.push(*c);
+                push(&mut buf, *c);
                 style = Some(*s);
             }
             None => {
-                buf.push(*c);
+                push(&mut buf, *c);
                 style = Some(*s);
             }
         }
@@ -1957,6 +1993,159 @@ mod tests {
     fn empty_line_survives() {
         let wrapped = wrap_lines(&[Line::default()], 10);
         assert_eq!(wrapped.len(), 1);
+    }
+
+    /// What the terminal shows for one wrapped row: the line painted into a
+    /// real buffer, trailing blanks trimmed. The renderer drops every control
+    /// character it is handed, so this is the oracle for what a span's raw
+    /// text cannot tell.
+    fn painted(line: &Line<'static>, width: u16) -> String {
+        let area = ratatui::layout::Rect::new(0, 0, width, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_line(0, 0, line, width);
+        let row: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+        row.trim_end().to_string()
+    }
+
+    /// Tab-indented code in tool output (a Makefile, Go, a `cat` of any
+    /// tab-indented file) must keep its indentation on screen, while every
+    /// copy path still carries the tab the file holds.
+    #[test]
+    fn tab_indented_tool_output_renders_indented_and_copies_with_its_tab() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        let output = "build:\n\tcargo build --release\n";
+        t.push_tool(vec![Line::from("✓ Read Makefile")], output.to_string(), true);
+        assert!(t.expand_last_tool());
+        let lines = t.lines();
+        let row = text(&lines)
+            .iter()
+            .position(|r| r.contains("cargo build"))
+            .expect("the recipe line");
+        // The two-cell output gutter, then one tab of four cells.
+        assert_eq!(painted(&lines[row], 60), "      cargo build --release");
+
+        // A drag from the first cell of the tab (column 2) through the "o"
+        // of "cargo" (column 10) copies the tab itself, not the spaces that
+        // drew it.
+        assert!(t.begin_text_selection_at(row, 2));
+        assert!(t.update_text_selection_at(row, 10));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("\tcargo"));
+        // And the highlight sits on exactly the cells that were painted.
+        assert_eq!(t.selection_columns(row), Some((2, 11)));
+        // A press anywhere inside the tab's cells lands on the tab.
+        assert!(t.begin_text_selection_at(row, 5));
+        assert!(t.update_text_selection_at(row, 6));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("\tc"));
+
+        // The block copy is the exact bytes.
+        t.select_block(0);
+        assert_eq!(t.selected_copy_text().as_deref(), Some(output));
+    }
+
+    #[test]
+    fn tab_indented_code_fence_renders_indented_and_copies_with_its_tab() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        t.push_assistant(crate::ui::markdown::render(
+            "```go\nfunc main() {\n\tfmt.Println(1)\n}\n```",
+        ));
+        let lines = t.lines();
+        let row = text(&lines)
+            .iter()
+            .position(|r| r.contains("Println"))
+            .expect("the fenced line");
+        assert_eq!(painted(&lines[row], 60), "│     fmt.Println(1)");
+
+        t.select_block(0);
+        let copied = t.selected_copy_text().unwrap();
+        assert!(copied.contains("\n\tfmt.Println(1)\n"), "{copied:?}");
+    }
+
+    /// A tab-indented line that wraps hangs its continuation under the
+    /// code, exactly as a space-indented one does.
+    #[test]
+    fn a_wrapped_tab_indented_line_hangs_under_its_code() {
+        let tabbed = wrap_lines(&[Line::from("\tlet value = first + second + third")], 24);
+        let spaced = wrap_lines(&[Line::from("    let value = first + second + third")], 24);
+        let painted_rows =
+            |rows: &[Line<'static>]| rows.iter().map(|r| painted(r, 24)).collect::<Vec<_>>();
+        assert!(tabbed.len() > 1, "expected a wrap");
+        assert_eq!(painted_rows(&tabbed), painted_rows(&spaced));
+    }
+
+    /// Program output colored for a terminal arrives with its escape
+    /// sequences. The renderer drops the ESC byte but paints the rest, so a
+    /// red `error` read `[31merror[0m` on screen; the screen shows the text,
+    /// and the exact bytes stay available to copy.
+    #[test]
+    fn colored_tool_output_renders_without_escape_fragments() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        let output = "\u{1b}[1m\u{1b}[31merror\u{1b}[0m: mismatched types\n\
+                      see \u{1b}]8;;https://example.com/e0308\u{7}E0308\u{1b}]8;;\u{1b}\\ for more";
+        let compact = crate::ui::tool_card::tool_block("bash", "cargo build", false, output, None);
+        // A failure opens on its output.
+        t.push_tool(compact, output.to_string(), false);
+        let no_fragments = |rows: &[String]| {
+            for row in rows {
+                assert!(
+                    !row.contains("[31m") && !row.contains("[0m") && !row.contains("]8;;"),
+                    "an escape fragment reached the screen: {row:?}"
+                );
+            }
+        };
+        let rows: Vec<String> = t.lines().iter().map(|l| painted(l, 60)).collect();
+        assert_eq!(rows[1..3], ["  error: mismatched types", "  see E0308 for more"]);
+        no_fragments(&rows);
+
+        // Folded, the card keeps the same line as its diagnostic.
+        t.select_block(0);
+        assert!(t.toggle_fold_selected());
+        let rows: Vec<String> = t.lines().iter().map(|l| painted(l, 60)).collect();
+        assert_eq!(rows[1], "  error: mismatched types", "{rows:#?}");
+        no_fragments(&rows);
+
+        // The find preview paints a line of the output too.
+        assert_eq!(
+            t.block_preview(0, "for more").as_deref(),
+            Some("see E0308 for more")
+        );
+
+        // The bytes themselves are untouched: the block copy is exact.
+        assert_eq!(t.selected_copy_text().as_deref(), Some(output));
+    }
+
+    /// Find matches tool output as the screen shows it. A color code inside
+    /// a phrase hid that phrase from find, a query for the hidden `[31m`
+    /// matched a block whose preview did not hold it, and an output opening
+    /// on a bare color reset previewed as a blank row.
+    #[test]
+    fn find_matches_colored_tool_output_as_shown() {
+        let mut t = Transcript::new();
+        t.set_width(60);
+        let output = "\u{1b}[0m\n\
+                      \u{1b}[1m\u{1b}[31merror\u{1b}[0m\u{1b}[1m: mismatched types\u{1b}[0m\n\
+                      a fat\u{1b}[33mal\u{1b}[0m warning";
+        t.push_tool(vec![Line::from("✗ bash cargo build")], output.into(), false);
+        assert_eq!(t.filter_matches("error: mismatched"), vec![0]);
+        assert_eq!(t.filter_matches("fatal"), vec![0]);
+        assert_eq!(t.filter_matches("[31m"), Vec::<usize>::new());
+        assert_eq!(t.filter_matches("[0m"), Vec::<usize>::new());
+        assert_eq!(
+            t.block_preview(0, "error: mismatched").as_deref(),
+            Some("error: mismatched types")
+        );
+        assert_eq!(t.block_preview(0, "fatal").as_deref(), Some("a fatal warning"));
+
+        // Without a header the output's first visible line is the preview.
+        let mut bare = Transcript::new();
+        bare.set_width(60);
+        bare.push_tool(Vec::new(), output.into(), false);
+        assert_eq!(bare.block_preview(0, "").as_deref(), Some("error: mismatched types"));
+        assert_eq!(bare.filter_matches("error: mismatched"), vec![0]);
     }
 
     #[test]

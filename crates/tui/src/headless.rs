@@ -320,8 +320,10 @@ fn call_line(name: &str, summary: &str) -> String {
 fn truncate_line(s: &str, max: usize) -> String {
     // The same rule as every other authored line in the workspace: this
     // preview is raw tool output on a terminal, so an ESC or a U+2028 must not
-    // survive it either (the old inline map flattened only \n and \r).
-    let flattened = one_line(s);
+    // survive it either (the old inline map flattened only \n and \r). Complete
+    // escape sequences go first, or flattening the ESC alone would print the
+    // rest of a color code as text.
+    let flattened = one_line(&crate::ui::text::strip_escapes(s));
     let trimmed = flattened.trim();
     if trimmed.chars().count() <= max {
         return trimmed.to_string();
@@ -415,8 +417,12 @@ mod tests {
         // The preview is raw tool output on a terminal. The old inline rule
         // flattened only \n and \r, so an ESC could restyle the rest of the
         // line and a Unicode line separator could break it; both go through
-        // the workspace's one sanitizer now.
-        assert_eq!(truncate_line("a\u{1b}[31mb", 20), "a [31mb");
+        // the workspace's one sanitizer now. A complete color sequence goes
+        // whole, or its `[31m` tail would print; an incomplete one still has
+        // its ESC flattened.
+        assert_eq!(truncate_line("a\u{1b}[31mb", 20), "ab");
+        assert_eq!(truncate_line("\u{1b}[1m\u{1b}[31merror\u{1b}(B\u{1b}[m: x", 20), "error: x");
+        assert_eq!(truncate_line("a\u{1b}[31", 20), "a [31");
         assert_eq!(truncate_line("a\u{2028}b\u{2029}c", 20), "a b c");
         assert_eq!(truncate_line("  padded  ", 10), "padded");
         let long = "é".repeat(200);
