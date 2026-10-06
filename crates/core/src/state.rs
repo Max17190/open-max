@@ -193,15 +193,27 @@ fn settings_file_fingerprint(data_dir: &std::path::Path) -> SettingsFingerprint 
     }
 }
 
+/// The form a project's approval mode is keyed by: the canonical path, or the
+/// path as given when it cannot be resolved.
+pub fn canonical_root(project_root: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf())
+}
+
 impl Core {
     /// The choice for this canonical project or its nearest enclosing one
     /// (see `trust::nearest_approval_mode`), or the settings default.
     /// Never call while holding the settings lock.
     pub fn approval_mode(&self, project_root: &std::path::Path) -> crate::config::ApprovalMode {
-        let canonical = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        self.approval_mode_canonical(&canonical_root(project_root))
+    }
+
+    /// `approval_mode` for a root already passed through `canonical_root`.
+    /// It touches no filesystem, so a frontend can read it on every frame.
+    /// Never call while holding the settings lock.
+    pub fn approval_mode_canonical(&self, canonical_root: &std::path::Path) -> crate::config::ApprovalMode {
         let saved = crate::trust::nearest_approval_mode(
             &self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner()),
-            &canonical,
+            canonical_root,
         );
         saved.unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
     }
