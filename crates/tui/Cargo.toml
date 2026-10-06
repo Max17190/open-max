@@ -34,8 +34,14 @@ lexopt = "0.3"
 unicode-width = "0.2"
 unicode-segmentation = "1.13"
 ignore.workspace = true
-
-[dev-dependencies]
-# The CLI tests give a child a pseudo-terminal on stdin, which is how an
-# interactive shell runs openmax.
+# SIGTERM for an MCP server still running after `--mcp-call` or `--mcp-list`
+# closed its stdin. The CLI tests also use it to give a child a
+# pseudo-terminal on stdin, which is how an interactive shell runs openmax.
 libc.workspace = true
+
+# The MCP bridge tests run their own binary again as a fixture MCP server. A
+# libtest binary prints its banner on stdout before any test runs, and stdout
+# is that server's protocol channel, so this target supplies its own main.
+[[test]]
+name = "mcp_bridge"
+harness = false

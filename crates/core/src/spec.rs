@@ -10,7 +10,7 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 11] = [
+pub const SURFACES: [&str; 12] = [
     "tools",
     "skills",
     "prompts",
@@ -21,6 +21,7 @@ pub const SURFACES: [&str; 11] = [
     "memory",
     "recall",
     "stdio",
+    "mcp",
     "usage",
 ];
 
@@ -37,6 +38,7 @@ pub fn render(surface: &str) -> Option<&'static str> {
         "memory" => Some(MEMORY),
         "recall" => Some(RECALL),
         "stdio" => Some(STDIO),
+        "mcp" => Some(MCP),
         _ => None,
     }
 }
@@ -989,6 +991,83 @@ Validate a stream against the contract: `openmax --check --stdio` reads JSONL
 on stdin, reports each line, and exits nonzero on any violation.
 "#;
 
+const MCP: &str = r#"# MCP servers
+
+The agent loop hosts no MCP client. A server joins through two files the loop
+already loads: one proxy tool, and one skill whose body lists the server's
+tools. Every request pays only for the proxy's small schema and the skill's
+index line; the server's own tool schemas are read when the skill is. This
+binary is the bridge between them, so the host needs nothing installed
+besides the server itself.
+
+Each call starts the server, makes one request, and stops it, so the bridge
+serves stateless use. A server that needs a persistent session (state kept
+between calls, a login done once per process) is not supported yet.
+
+## Commands
+
+- `openmax --mcp-list -- <server command...>` prints the server's tools as a
+  skill body: a header, then one line per tool,
+  `- name(arg: type, opt?: type): description`, required arguments first and
+  `?` marking an optional one. With `--json` it prints the full tool
+  definitions instead.
+- `openmax --mcp-call -- <server command...>` reads
+  {"tool": "<name>", "arguments": {...}} on stdin, calls that tool, and prints
+  the result's text. A result the tool marks as an error, an error reply, a
+  malformed reply, and a server that exits or stops answering all exit 1 with
+  the reason on stderr. Input it cannot read exits 2 before the server starts.
+
+Everything after `--` is the server's argv, run without a shell. Each wait for
+a reply is bounded by `--mcp-timeout <secs>` (default 30, at most 3600); raise
+it for a server that is slow to start, such as a first `npx` download. The
+server's stderr passes through. When the run ends, the server's stdin is
+closed; a server still running 2 seconds later gets SIGTERM, then SIGKILL.
+The wire is JSON-RPC 2.0 over stdio with the initialize handshake, protocol
+revisions 2024-11-05 through 2025-11-25. A server that speaks only a later,
+handshake-free revision refuses initialize, and its error is reported.
+
+## Recipe
+
+For a server started as `notes-server --stdio` that reads `NOTES_TOKEN`:
+
+1. Generate the skill with bash, so its tool list costs no tokens to write:
+
+```sh
+tools=$(openmax --mcp-list -- notes-server --stdio) && mkdir -p .agents/skills/notes &&
+printf '%s\n' '---' 'name: notes' 'description: Tools of the notes MCP server; call them with the notes tool' '---' "$tools" > .agents/skills/notes/SKILL.md
+```
+
+2. Write the proxy tool, `.openmax/tools/notes.toml`:
+
+```toml
+name = "notes"
+description = "Call a notes MCP server tool; the notes skill lists names and arguments"
+command = "sh"
+args = ["-c", "exec \"$OPENMAX_BIN\" --mcp-call -- \"$@\"", "mcp", "notes-server", "--stdio"]
+env = ["NOTES_TOKEN"]
+timeout_secs = 120
+mutating = true
+
+[params]
+type = "object"
+required = ["tool", "arguments"]
+[params.properties.tool]
+type = "string"
+[params.properties.arguments]
+type = "object"
+```
+
+The words after `"mcp"` are the server command. `$OPENMAX_BIN` names the
+binary hosting the session (see `openmax --spec tools`), and the call's JSON
+reaches it on stdin. A tool's environment is scrubbed and the server inherits
+exactly what the tool receives, so name every credential the server reads in
+`env`. Keep `mutating = true` unless every tool the server offers is
+read-only. `timeout_secs` must cover starting the server and the call.
+
+3. Verify both files with `openmax --check`. They activate like any other tool
+and skill (`openmax --spec tools`, `openmax --spec skills`).
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,11 +1336,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The MCP recipe's proxy tool is a tool manifest like any other, so it
+    /// must load through the real parser, and its schema must be the
+    /// documented `{tool, arguments}` pair: the model sees nothing else of
+    /// the server until it reads the skill. The pass-through is the binary
+    /// itself, named by `$OPENMAX_BIN`, and credentials reach the server only
+    /// through the manifest's `env` grant.
+    #[test]
+    fn the_mcp_recipe_tool_loads_as_a_tool_and_arguments_proxy() {
+        let text = render("mcp").expect("--spec mcp renders");
+        let start = text.find("```toml\n").expect("the recipe shows the proxy tool") + "```toml\n".len();
+        let end = text[start..].find("```").expect("the block closes") + start;
+        let spec = crate::registry::parse_tool_file_from_text_for_tests(&text[start..end])
+            .expect("the recipe's proxy tool parses");
+        assert_eq!(
+            spec.parameters,
+            serde_json::json!({
+                "type": "object",
+                "required": ["tool", "arguments"],
+                "properties": {"tool": {"type": "string"}, "arguments": {"type": "object"}},
+            })
+        );
+        assert!(spec.mutating, "a server's tools may write, so the proxy is gated as mutating");
+        let crate::registry::ToolKind::External(tool) = spec.kind else { panic!("external") };
+        assert_eq!(tool.env, ["NOTES_TOKEN"], "the server's credential is granted through env");
+        assert_eq!(tool.command, "sh");
+        assert_eq!(tool.args[1], "exec \"$OPENMAX_BIN\" --mcp-call -- \"$@\"");
+        // The words after $0 are the server command, run as its own argv.
+        assert_eq!(tool.args[3..], ["notes-server", "--stdio"]);
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("Each call starts the server"), "the spec says calls are stateless");
+        assert!(flat.contains("needs a persistent session"), "the spec names what is unsupported");
+        assert!(flat.contains("is not supported yet"), "the spec names what is unsupported");
+    }
+
     /// Every file surface tells the agent how to verify what it wrote, and
     /// every spec states when the file takes effect.
     #[test]
     fn specs_name_verification_and_activation() {
-        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory"] {
+        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory", "mcp"] {
             let text = render(name).unwrap();
             assert!(text.contains("openmax --check"), "{name} spec must point at --check");
         }
