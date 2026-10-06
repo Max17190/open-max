@@ -2243,6 +2243,63 @@ mod tests {
         assert!(start.elapsed() < sleep);
     }
 
+    /// Default features are opt-out, so declaring a dependency without
+    /// `default-features = false` quietly compiles code the binary never
+    /// runs: ratatui's defaults build the calendar widget (the `time` crate
+    /// family), a macro crate, and a layout cache the TUI never calls, and
+    /// its `underline-color` feature names the termwiz and termina backends,
+    /// which puts dozens of never-built crates into Cargo.lock for every
+    /// dependency scanner to report. The lockfile cannot show the calendar
+    /// (ratatui-widgets' `std` feature names `time` weakly, so Cargo.lock is
+    /// identical whether `time` is built or not), so the manifest line that
+    /// would turn it back on is checked instead. File locks come from std,
+    /// which takes the same flock(2) lock fs2 did on Linux and macOS.
+    #[test]
+    fn the_lockfile_resolves_no_unused_dependency_features() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        let dependencies = |package: &str| -> Vec<String> {
+            let header = format!("name = \"{package}\"\n");
+            let block = lock
+                .split("[[package]]")
+                .find(|block| block.trim_start().starts_with(&header))
+                .unwrap_or_else(|| panic!("{package} is not in Cargo.lock"));
+            block
+                .lines()
+                .filter_map(|line| line.strip_prefix(" \""))
+                .map(|dep| dep.split([' ', '"']).next().unwrap_or_default().to_string())
+                .collect()
+        };
+        for (package, unused) in [
+            ("ratatui", "ratatui-macros"),
+            ("ratatui", "ratatui-termwiz"),
+            ("ratatui", "ratatui-termina"),
+            ("ratatui-core", "critical-section"),
+            ("open-max-core", "fs2"),
+        ] {
+            assert!(
+                !dependencies(package).iter().any(|dep| dep == unused),
+                "{package} still resolves {unused}"
+            );
+        }
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .unwrap();
+        let ratatui = manifest
+            .lines()
+            .find(|line| line.starts_with("ratatui ="))
+            .expect("Cargo.toml declares ratatui on one line");
+        assert!(
+            ratatui.contains("default-features = false")
+                && !ratatui.contains("\"all-widgets\"")
+                && !ratatui.contains("\"widget-calendar\""),
+            "ratatui builds its calendar widget: {ratatui}"
+        );
+    }
+
     #[test]
     fn single_print_prompt_is_one_turn() {
         let cli = parse_args_from(["-p", "summarize this repo"]).unwrap();
