@@ -489,8 +489,9 @@ async fn main() -> std::io::Result<()> {
     if let Some(query) = &cli.recall {
         // Read-only introspection, like --ledger: no session, no endpoint,
         // no trust gate. Recall only ever surfaces this project's own history
-        // (the session index is keyed by project), and the project key is the
-        // same raw current_dir form session creation stores.
+        // (the session index is keyed by project), and the index matches
+        // this path, as given or resolved, against the resolved path each
+        // session was recorded in.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // Settings are how a turn reaches a provider and what it may spend;
         // recall reads neither, so a settings file this process will never act

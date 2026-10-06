@@ -10038,6 +10038,9 @@ mod tests {
             assert!(sessions::save_messages(&core, &id, &messages, &mut persisted, true));
         }
 
+        // Released first, so the hydration below claims the session over the
+        // damaged index: a claim that saw it indexed saves without asking.
+        sessions::detach(&core, &id).unwrap();
         let index = core.data_dir.join("sessions").join("index.json");
         let intact = std::fs::read(&index).unwrap();
         std::fs::write(&index, "{ not json").unwrap();
@@ -10118,6 +10121,9 @@ mod tests {
         sessions::record_resume_point(&core, &id, 3);
         sessions::record_resume_point(&core, &id, 4);
 
+        // Released first, so the hydration below claims the session over the
+        // damaged index: a claim that saw it indexed saves without asking.
+        sessions::detach(&core, &id).unwrap();
         let index = core.data_dir.join("sessions").join("index.json");
         let intact = std::fs::read(&index).unwrap();
         std::fs::write(&index, "{ not json").unwrap();
@@ -10192,6 +10198,9 @@ mod tests {
         // This sitting begins after everything on file.
         sessions::record_resume_point(&core, &id, messages.len() as u64);
 
+        // Released first, so the hydration below claims the session over the
+        // damaged index: a claim that saw it indexed saves without asking.
+        sessions::detach(&core, &id).unwrap();
         let index = core.data_dir.join("sessions").join("index.json");
         let intact = std::fs::read(&index).unwrap();
         std::fs::write(&index, "{ not json").unwrap();
@@ -10250,6 +10259,9 @@ mod tests {
         sessions::record_resume_point(&core, &id, 3);
         sessions::record_resume_point(&core, &id, 4);
 
+        // Released first, so the hydration below claims the session over the
+        // damaged index: a claim that saw it indexed saves without asking.
+        sessions::detach(&core, &id).unwrap();
         let index = core.data_dir.join("sessions").join("index.json");
         let intact = std::fs::read(&index).unwrap();
         std::fs::write(&index, "{ not json").unwrap();
