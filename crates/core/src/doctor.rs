@@ -779,13 +779,16 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     // `--continue`, in every project, until it is moved aside. Only damage
     // is a finding: a healthy index is state, not configuration. Moving it
     // is the whole repair (a missing index is an empty store), but only
-    // with openmax closed: a running session whose entry leaves with the
-    // file reads as deleted, and its later saves are dropped silently. The
-    // target is a name not yet taken, so a second incident never overwrites
-    // the copy an earlier one moved aside. That name is only free when this
-    // prints; `-n` keeps it so when the command runs later (rerun from shell
-    // history, or copied from an older `--check`), and a skipped move leaves
-    // the index damaged, so the next `--check` names a free target again.
+    // with openmax closed: a running session's entry leaves with the file.
+    // One claimed while the index was healthy keeps saving, so its later
+    // history is written but listed nowhere (invisible to `--continue`,
+    // `/resume`, and `--recall`); one claimed over the damage, or claimed
+    // again later, has its saves dropped. The target is a name not yet
+    // taken, so a second incident never overwrites the copy an earlier one
+    // moved aside. That name is only free when this prints; `-n` keeps it
+    // so when the command runs later (rerun from shell history, or copied
+    // from an older `--check`), and a skipped move leaves the index
+    // damaged, so the next `--check` names a free target again.
     // `-n` skips without a word and exits 0, so the command checks that the
     // index left and, when it did not, says so and exits nonzero: a silent
     // skip, or a zero status a script checks, reads as a done repair while

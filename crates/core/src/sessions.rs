@@ -29,8 +29,9 @@
 //! dir, and parallel openmax processes are normal usage. Its read-modify-write
 //! therefore also holds an exclusive flock (`index.lock`), and a damaged index
 //! is refused rather than defaulted to empty - either failure mode would end
-//! with sessions silently dropped from the index, which the still-indexed gate
-//! then converts into silently dropping their transcripts.
+//! with sessions silently dropped from the index. No lookup finds such a
+//! session again, and the still-indexed gate silently drops the transcript
+//! writes of any claim that did not see it indexed.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -500,9 +501,10 @@ pub fn index_diagnostic(core: &Core) -> Option<String> {
 /// session, pointing at `--check` when the refusal is the index's damage.
 /// Only frontends add the pointer, never the shared reason: `--check` gives
 /// the repair with the step that makes it safe (close every openmax), while
-/// a bare path acted on under a running session turns that session's later
-/// saves into silent no-ops. Any other refusal (a lock or write failure)
-/// passes through as is.
+/// a bare path acted on under a running session leaves that session listed
+/// nowhere: its later saves land in history no lookup finds, or are dropped
+/// without a word. Any other refusal (a lock or write failure) passes
+/// through as is.
 pub fn refusal_with_repair(core: &Core, reason: String) -> String {
     match read_index(core) {
         IndexRead::Damaged(damage) if damage == reason => {
@@ -539,10 +541,13 @@ fn read_index(core: &Core) -> IndexRead {
 }
 
 /// The reason names the file and the problem, never a repair. It also
-/// reaches live sessions (the save warning, the compaction refusal, recall),
-/// and moving the index aside under one makes the still-indexed gate read
-/// its session as deleted, so every later save is dropped without a word.
-/// The repair is `--check`'s to give (see `doctor::check_at`).
+/// reaches live sessions (the save warning of one claimed over the damage,
+/// the compaction refusal, recall), and moving the index aside under one
+/// leaves its session listed nowhere. A session claimed while the index was
+/// healthy keeps saving history that `--continue`, `/resume`, and `--recall`
+/// never find; one claimed over the damage, or claimed again later, has
+/// every later save dropped without a word. The repair is `--check`'s to
+/// give (see `doctor::check_at`).
 fn read_index_at(path: &Path) -> IndexRead {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -627,12 +632,13 @@ fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
 /// covers turns within one process; the index is one file per data dir, and
 /// two openmax processes are normal usage. Without this, their load -> save
 /// cycles interleave, the loser's `create` entry vanishes from the index, and
-/// the still-indexed gate then silently drops every write that session makes
-/// for the rest of its life - transcript included. Same flock discipline as
-/// the ledger and trust stores. std's `File::lock` and `try_lock` are flock(2)
-/// on Linux and macOS, the lock every released binary takes; where std has no
-/// file lock (Android, DragonFly) they return Unsupported, so every store
-/// refuses to write rather than write unlocked.
+/// with it the session: no lookup finds it again, and the still-indexed gate
+/// silently drops the writes, transcript included, of any claim that did not
+/// see it indexed. Same flock discipline as the ledger and trust stores.
+/// std's `File::lock` and `try_lock` are flock(2) on Linux and macOS, the
+/// lock every released binary takes; where std has no file lock (Android,
+/// DragonFly) they return Unsupported, so every store refuses to write rather
+/// than write unlocked.
 ///
 /// Callers must already hold `sessions_lock`: flock is per open file
 /// description, so that is what keeps one process from contending with
@@ -704,8 +710,9 @@ pub(crate) fn raw_flock(path: &std::path::Path) -> Option<FileLock> {
 /// Read-modify-write the index under the state lock (concurrent turns in
 /// this process) and the index flock (concurrent processes). A damaged index
 /// is refused, not defaulted: saving the empty fallback over it would erase
-/// every session's metadata and turn the still-indexed gate off for all of
-/// them, converting one bad read into permanent, silent data loss.
+/// every session's metadata, hiding all of them from every lookup and closing
+/// the still-indexed gate to every later claim of one, converting one bad
+/// read into permanent, silent data loss.
 fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Result<R, String> {
     let _store = lock_store(core)?;
     let mut metas = match read_index(core) {
@@ -1987,7 +1994,8 @@ mod tests {
     /// file, removals included (a frontend discards the empty session it
     /// leaves), and `--check` sees the same damage without a Core. The shared
     /// reason carries no repair: it also reaches live sessions, where moving
-    /// the index aside turns every later save into a silent no-op. A
+    /// the index aside leaves the session listed nowhere, its later saves
+    /// landing where no lookup finds them or dropped without a word. A
     /// frontend's refusal points at `--check`, and only for the damage: a
     /// lock or write failure is not something `--check` repairs.
     #[test]
@@ -2793,6 +2801,35 @@ mod tests {
         attach(&core, &id).unwrap();
         attach(&core, &id).unwrap();
         assert_eq!(reads(), 1, "a repaired transcript is read once, then trusted again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An append does not read the history it extends, so it vouches for the
+    /// file it leaves only when nothing else wrote it since this process last
+    /// did. Damage written from outside during a turn, then appended past by
+    /// that turn's own save, would otherwise be trusted by the next turn
+    /// start and go unreported until a later sitting failed to load it.
+    #[test]
+    fn a_turn_start_rereads_a_transcript_written_from_outside_before_an_append() {
+        let dir = std::env::temp_dir().join(format!("openmax-append-over-outside-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        let path = messages_path(&core, &id);
+        let intact = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [intact.as_slice(), b"{damaged}\n"].concat()).unwrap();
+        let reads = || TRANSCRIPT_READS.with(|reads| reads.replace(0));
+        reads();
+
+        messages.push(ChatMessage::user("third"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        assert_eq!(reads(), 0, "the save appended rather than rewrote");
+        let reason = attach(&core, &id).unwrap_err();
+        assert!(reason.contains("damaged at line 4"), "{reason}");
+        assert_eq!(reads(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
