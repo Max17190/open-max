@@ -1289,13 +1289,11 @@ async fn spawn_external(
                     truncated,
                 )
             }
+            // A helper the tool backgrounded (a server it means to talk to
+            // later) is killed with the group, and the exit is still 0. The
+            // shared rendering carries the note that says so.
             Termination::Exited(status) => {
-                let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
-                let (ok, text) = match status.success() {
-                    true => (true, text),
-                    false => (false, format!("{}\n{text}", tools::describe_exit(status))),
-                };
-                ToolOutcome::from_process(ok, text, &output, truncated)
+                tools::exited_outcome(&output, status, caps.command_bytes)
             }
         },
     }
@@ -2345,6 +2343,66 @@ mutatng = true
         let produced = out.process_bytes.expect("a successful external tool reports its size");
         assert!(produced > out.output.len() as u64, "the result is a bounded rendering");
         assert!(out.process_truncated);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// An external tool runs in its own process group like bash, and the
+    /// group is cleaned up when the tool exits. A tool that starts a helper in
+    /// the background (a long-lived server it means to talk to later) still
+    /// exits 0, so without the note the model is handed success and a helper
+    /// that is already gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_external_tools_stopped_background_process_is_reported() {
+        let project = temp_dir("bgtool");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let padding = "for i in $(seq 1 500); do echo padding-line-$i; done";
+        for (name, script) in [
+            ("serve", "sleep 30 & echo ok".to_string()),
+            ("tight_bg", format!("{padding}; sleep 30 &")),
+            ("tight_plain", padding.to_string()),
+        ] {
+            write_tool(
+                &tools_dir,
+                &format!("{name}.toml"),
+                &format!(
+                    "name = \"{name}\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"{script}\"]\n"
+                ),
+            );
+        }
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let data = Path::new("/nonexistent-openmax-data");
+        let args = serde_json::json!({});
+        let run = |name: &'static str, caps| {
+            registry.execute(name, &args, data, &project, caps, no_cancel())
+        };
+
+        let out = run("serve", tools::OutputCaps::default()).await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("ok"), "{}", out.output);
+        assert!(
+            out.output.contains(tools::BACKGROUND_TERMINATED_NOTE),
+            "a stopped background process must be reported: {}",
+            out.output
+        );
+
+        // The note is reserved out of the cap, not appended past it. The same
+        // output without a background process is the baseline: a reserved
+        // note keeps the result within a line of it, an appended one adds
+        // the whole note on top.
+        let tight = tools::OutputCaps { command_bytes: 1_000 };
+        let plain = run("tight_plain", tight).await;
+        assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
+        assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);
+        let noted = run("tight_bg", tight).await;
+        assert!(noted.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", noted.output);
+        assert!(
+            noted.output.len() < plain.output.len() + tools::BACKGROUND_TERMINATED_NOTE.len() / 2,
+            "note must be reserved from the cap: {} bytes against {} without it",
+            noted.output.len(),
+            plain.output.len()
+        );
         let _ = std::fs::remove_dir_all(project);
     }
 
