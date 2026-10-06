@@ -7,13 +7,13 @@
 //!
 //! Retries cover what can end one request before the reply exists: a
 //! transport failure on send, a rate limit or transient server error (429,
-//! 500, 502, 503, 504, 529), and a stream that died, or a stream or reply
-//! the server failed with a rate limit, an overload, or a server fault,
-//! before any reply text arrived. Each attempt resends the same bytes after
-//! an exponential backoff, stretched to a server's Retry-After, and tells
-//! the caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota,
-//! and a Retry-After longer than a minute, are reported at once: no wait the
-//! turn would take lets the request succeed.
+//! 500, 502, 503, 504, 529), and a stream that died or went silent, or a
+//! stream or reply the server failed with a rate limit, an overload, or a
+//! server fault, before any reply text arrived. Each attempt resends the
+//! same bytes after an exponential backoff, stretched to a server's
+//! Retry-After, and tells the caller through [`StreamDelta::Retry`]. A 429
+//! for an exhausted quota, and a Retry-After longer than a minute, are
+//! reported at once: no wait the turn would take lets the request succeed.
 //! Once reply text has streamed, a retry would duplicate what the caller
 //! already showed, so a cut after that point is reported as a truncation
 //! instead. A failure the server reports inside a 200 response (an `error`
@@ -29,11 +29,23 @@
 //! signal costs the whole budget on such a reply before its truncation is
 //! reported.
 //!
-//! There is no overall request timeout, only a connect timeout. A local or
-//! slow endpoint can legitimately take minutes to generate, and a deadline
-//! here would look like a bug in the model rather than a policy in the client.
+//! There is no overall request timeout. A local or slow endpoint can
+//! legitimately take minutes to generate, and a deadline here would look like
+//! a bug in the model rather than a policy in the client. Silence ends an
+//! attempt instead: an endpoint that sends nothing at all (no response
+//! headers, no reply bytes, not even an SSE keepalive comment) for
+//! [`IDLE_TIMEOUT`], or its provider's `idle_timeout_secs`, is a connection
+//! that failed, under the rules above. A one-shot JSON reply or a refusal
+//! whose body goes silent is an error, as a cut there is.
 //! A stream that ends without `[DONE]` and without a `finish_reason` is
 //! reported as truncated rather than treated as a complete reply.
+//!
+//! A credential never crosses plain http to another machine: a request that
+//! would carry the key, a credential header (Authorization, X-API-Key, or any
+//! header named as one, see `is_credential_header`), or user:password from
+//! the base_url that way is refused before it is sent. Nor does a request
+//! leave the server the base_url names: a redirect is followed only on the
+//! same scheme, host, and port, and one anywhere else fails the request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -237,6 +249,13 @@ pub const TRUNCATED: &str = "truncated";
 // Bound wire input, including reasoning, unterminated lines, and tool arguments.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
+/// How long an endpoint may send nothing at all (no response headers, no
+/// reply bytes, no keepalive comment) before the attempt ends as a transport
+/// fault. Generous, because a local server can spend minutes on a long
+/// prompt before its first byte; a provider's `idle_timeout_secs` sets
+/// another. Without one, an endpoint that took the request and went quiet
+/// held the turn forever.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct CompletionResult {
     pub content: String,
@@ -283,6 +302,11 @@ pub struct ChatClient {
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
     pub send_stream_options: bool,
+    /// How long the endpoint may send nothing before an attempt ends.
+    idle_timeout: std::time::Duration,
+    /// Why the settings key was withheld from this endpoint, for a 401 to
+    /// report (see `ActiveEndpoint::key_hint`).
+    key_hint: Option<String>,
     http: reqwest::Client,
 }
 
@@ -388,16 +412,20 @@ impl ChatClient {
 
     /// Build a client from a resolved multi-provider endpoint.
     pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
-        Self::with_options(
-            ep.base_url.clone(),
-            ep.api_key.clone(),
-            ep.model.clone(),
-            ep.temperature,
-            ep.max_tokens,
-            ep.headers.clone(),
-            ep.compat.use_max_completion_tokens,
-            ep.compat.send_stream_options,
-        )
+        Self {
+            idle_timeout: ep.idle_timeout_secs.map_or(IDLE_TIMEOUT, |secs| std::time::Duration::from_secs(secs.max(1))),
+            key_hint: ep.key_hint.clone(),
+            ..Self::with_options(
+                ep.base_url.clone(),
+                ep.api_key.clone(),
+                ep.model.clone(),
+                ep.temperature,
+                ep.max_tokens,
+                ep.headers.clone(),
+                ep.compat.use_max_completion_tokens,
+                ep.compat.send_stream_options,
+            )
+        }
     }
 
     // One argument per endpoint option; the call sites build it straight from
@@ -421,7 +449,9 @@ impl ChatClient {
             .get_or_init(|| {
                 reqwest::Client::builder()
                     .connect_timeout(std::time::Duration::from_secs(10))
-                    // No overall timeout: local generations can legitimately take minutes.
+                    // No overall timeout: local generations can legitimately
+                    // take minutes. `stream_chat` ends an attempt on silence.
+                    .redirect(reqwest::redirect::Policy::custom(same_server_redirect))
                     .build()
                     .expect("failed to build http client")
             })
@@ -435,12 +465,25 @@ impl ChatClient {
             headers,
             use_max_completion_tokens,
             send_stream_options,
+            idle_timeout: IDLE_TIMEOUT,
+            key_hint: None,
             http,
         }
     }
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Whether a request carries a credential: the key, a credential header
+    /// among the provider's headers (see [`is_credential_header`]), or
+    /// user:password in the base_url, which the HTTP client turns into a
+    /// Basic Authorization header.
+    fn sends_credential(&self) -> bool {
+        self.api_key.as_deref().is_some_and(|key| !key.is_empty())
+            || self.headers.iter().any(|(name, _)| is_credential_header(name))
+            || reqwest::Url::parse(self.base_url.trim())
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
     }
 
     /// The stamp for reasoning this endpoint produces: the first 16 hex chars
@@ -477,6 +520,11 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
+        if self.sends_credential() {
+            if let Some(refusal) = plain_http_refusal(&self.base_url) {
+                return Err(refusal);
+            }
+        }
         // Serialize once before retries: cloning bytes is cheap; re-walking a
         // long transcript into Value (and re-serializing) on every attempt is not.
         // Tools ride as RawValue from the frozen registry wire form.
@@ -513,14 +561,31 @@ impl ChatClient {
             }
             // An endpoint can spend a long time in prompt processing before the
             // first byte arrives, and a large prompt makes that worse wherever
-            // it runs; keep cancellation responsive throughout.
+            // it runs; keep cancellation responsive throughout. Only silence
+            // for the whole idle interval ends the wait.
             let send_result = tokio::select! {
-                r = req.send() => r,
+                r = tokio::time::timeout(self.idle_timeout, req.send()) => r,
                 _ = cancelled.cancelled() => return Ok(cancelled_response()),
             };
             let resp = match send_result {
-                Ok(r) => r,
-                Err(e) => {
+                Ok(Ok(r)) => r,
+                // The endpoint took the request and sent nothing back, not
+                // even a status line (a wedged server, a proxy holding a dead
+                // upstream). Waiting on would hold the turn for good. Nothing
+                // has reached the caller, so it is resent like any transport
+                // fault after the connection existed.
+                Err(_) => {
+                    unreached = 0;
+                    let msg = format!("request failed: {}", silence(self.idle_timeout));
+                    if attempt < MAX_ATTEMPTS {
+                        if !retry_after(attempt, &msg, &cancelled, &mut on_delta).await {
+                            return Ok(cancelled_response());
+                        }
+                        continue;
+                    }
+                    return Err(msg);
+                }
+                Ok(Err(e)) => {
                     let msg = format!("request failed: {}", describe_transport(&e));
                     unreached = if e.is_connect() || e.is_timeout() { unreached + 1 } else { 0 };
                     if attempt < MAX_ATTEMPTS && unreached < UNREACHED_ATTEMPTS && is_transient_transport(&e) {
@@ -542,7 +607,7 @@ impl ChatClient {
             let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
             if !status.is_success() {
                 let code = status.as_u16();
-                let body = read_body(resp, &cancelled).await
+                let body = read_body(resp, &cancelled, self.idle_timeout).await
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
                 let text = String::from_utf8_lossy(&body);
@@ -550,6 +615,11 @@ impl ChatClient {
                 let mut err = format!("backend returned {status}: {message}");
                 if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
+                }
+                if code == 401 {
+                    if let Some(hint) = &self.key_hint {
+                        err.push_str(hint);
+                    }
                 }
                 if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) && beyond_cap.is_none() {
                     if !resend_after(attempt, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
@@ -567,7 +637,7 @@ impl ChatClient {
 
             // Some servers ignore `stream` and return a complete JSON body.
             if is_json {
-                let Some(body) = read_body(resp, &cancelled).await? else { return Ok(cancelled_response()); };
+                let Some(body) = read_body(resp, &cancelled, self.idle_timeout).await? else { return Ok(cancelled_response()); };
                 let v: Value = serde_json::from_slice(&body).map_err(|e| format!("bad JSON response: {e}"))?;
                 // A 200 can still carry a failure in place of the reply: an
                 // error at the top level, or one on the choice beside
@@ -589,7 +659,7 @@ impl ChatClient {
                 return parse_complete_response(&v, &mut on_delta);
             }
 
-            let (reply, unfinished) = read_sse(resp, &cancelled, &mut on_delta).await;
+            let (reply, unfinished) = read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await;
             // The restart rules: nothing the caller keeps has streamed yet,
             // and the budget has an attempt left.
             let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
@@ -667,6 +737,7 @@ fn server_failure(error: &Value, raw: &str) -> ServerFailure {
 async fn read_sse(
     resp: reqwest::Response,
     cancelled: &crate::state::CancelToken,
+    idle: std::time::Duration,
     on_delta: &mut impl FnMut(StreamDelta),
 ) -> (CompletionResult, Option<Unfinished>) {
     let mut content = String::new();
@@ -697,11 +768,21 @@ async fn read_sse(
 
     'outer: loop {
         let next = tokio::select! {
-            c = stream.next() => c,
+            c = tokio::time::timeout(idle, stream.next()) => c,
             _ = cancelled.cancelled() => {
                 finish_reason = "cancelled".into();
                 break;
             }
+        };
+        // Not a byte, not even a keepalive comment, for the whole idle
+        // interval: the connection failed as surely as a cut, and ends the
+        // same way. After the server finished, the reply stands.
+        let Ok(next) = next else {
+            if !saw_terminator {
+                finish_reason = TRUNCATED.into();
+                unfinished = Some(Unfinished::Interrupted(silence(idle)));
+            }
+            break;
         };
         let Some(chunk) = next else {
             if !saw_terminator {
@@ -939,14 +1020,16 @@ fn cancelled_response() -> CompletionResult {
 async fn read_body(
     resp: reqwest::Response,
     cancelled: &crate::state::CancelToken,
+    idle: std::time::Duration,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut body = Vec::new();
     let mut stream = resp.bytes_stream();
     loop {
         let next = tokio::select! {
             _ = cancelled.cancelled() => return Ok(None),
-            next = stream.next() => next,
+            next = tokio::time::timeout(idle, stream.next()) => next,
         };
+        let Ok(next) = next else { return Err(format!("response body failed: {}", silence(idle))) };
         let Some(chunk) = next else { return Ok(Some(body)); };
         let chunk = chunk.map_err(|e| format!("response body failed: {e}"))?;
         if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
@@ -1204,6 +1287,72 @@ fn backoff(attempt: u32, asked: Option<u64>) -> std::time::Duration {
     floor.max(asked)
 }
 
+/// Why an attempt ended when the endpoint sent nothing for `idle`.
+fn silence(idle: std::time::Duration) -> String {
+    format!("the endpoint sent nothing for {}s", idle.as_secs_f64())
+}
+
+/// Why a request to `base_url` must not carry a credential, or None when it
+/// may. Plain http to another machine puts the key on the network
+/// unencrypted, readable anywhere along the path. Loopback never leaves this
+/// machine, and neither does the unspecified address (0.0.0.0 or ::), which
+/// a local server often prints as its own and which connects here. A
+/// base_url that does not parse is left to the request to fail.
+fn plain_http_refusal(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url.trim()).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let this_machine = bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+            let ip = ip.to_canonical();
+            ip.is_loopback() || ip.is_unspecified()
+        });
+    (!this_machine).then(|| {
+        format!(
+            "refusing to send credentials over plain http to {host}, where anyone on the network path can read them: use an https base_url, or a loopback address (127.0.0.1, ::1, or localhost) for a server on this machine. A server that needs no key works over http once none is configured for it (api_key, api_key_env, OPENMAX_API_KEY, a credential header such as Authorization or X-API-Key, or user:password in the base_url)"
+        )
+    })
+}
+
+/// Whether a configured header carries a credential, judged by its name:
+/// Authorization and Proxy-Authorization, a cookie, or a key, token, secret,
+/// password, or credential under whatever name the server picked (X-API-Key,
+/// api-key, X-Auth-Token). Such a header is read off plain http as easily as
+/// a bearer key, so a check for Authorization alone would let a key in
+/// X-API-Key cross it.
+fn is_credential_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["auth", "key", "token", "secret", "password", "credential", "cookie"]
+        .iter()
+        .any(|word| name.contains(word))
+}
+
+/// The redirect policy of the shared HTTP client: follow a redirect only
+/// within the server the request was sent to (scheme, host, and port). The
+/// HTTP client drops Authorization and cookies on a move to another host but
+/// keeps every other header and, on a 307 or 308, the body, so following one
+/// would hand a key in X-API-Key, and the transcript, to a server nobody
+/// configured, or move them onto plain http.
+fn same_server_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    let server = |url: &reqwest::Url| (url.scheme().to_string(), url.host_str().map(str::to_string), url.port_or_known_default());
+    let next = server(attempt.url());
+    let to = attempt.url().origin().ascii_serialization();
+    if attempt.previous().len() > 10 {
+        // The default policy's limit, for a server that redirects to itself.
+        attempt.error("too many redirects")
+    } else if attempt.previous().first().map(server) == Some(next) {
+        // The first previous URL is the one the request was sent to.
+        attempt.follow()
+    } else {
+        attempt.error(format!(
+            "refusing to follow a redirect to {to}, a server other than the one base_url names: a request and its credentials go only to that server, by scheme, host, and port. If {to} is the endpoint, point base_url at it"
+        ))
+    }
+}
+
 fn is_transient_transport(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request()
 }
@@ -1360,6 +1509,21 @@ mod tests {
     }
 
     fn spawn_response_once(response: String, hold: Option<std::sync::mpsc::Receiver<()>>) -> String {
+        serve_once(response, hold, None)
+    }
+
+    /// [`spawn_response_once`] that also hands back the request head it read
+    /// (request line and headers), to show what the client sent.
+    fn spawn_recording_once(response: String) -> (String, std::sync::mpsc::Receiver<String>) {
+        let (head, heads) = std::sync::mpsc::channel();
+        (serve_once(response, None, Some(head)), heads)
+    }
+
+    fn serve_once(
+        response: String,
+        hold: Option<std::sync::mpsc::Receiver<()>>,
+        head: Option<std::sync::mpsc::Sender<String>>,
+    ) -> String {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1376,6 +1540,9 @@ mod tests {
                 }
             }
             let headers = String::from_utf8_lossy(&buf).to_string();
+            if let Some(head) = head {
+                let _ = head.send(headers.clone());
+            }
             let content_length: usize = headers
                 .lines()
                 .find_map(|l| {
@@ -1640,6 +1807,9 @@ mod tests {
         let served = Arc::new(std::sync::Mutex::new(0usize));
         let count = served.clone();
         std::thread::spawn(move || {
+            // Connections that a SILENT or STALL: body leaves open, held
+            // until the sequence ends.
+            let mut held = Vec::new();
             for sse in bodies {
                 let Ok((mut stream, _)) = listener.accept() else { return };
                 let mut buf = Vec::new();
@@ -1664,6 +1834,38 @@ mod tests {
                 }
                 *count.lock().unwrap() += 1;
                 if sse.is_empty() {
+                    continue;
+                }
+                // SILENT takes the request and answers nothing, not even a
+                // status line, while keeping the connection open.
+                if sse == "SILENT" {
+                    held.push(stream);
+                    continue;
+                }
+                // A body prefixed with STALL: is sent as one chunk of a
+                // chunked stream, which then neither continues nor ends.
+                if let Some(payload) = sse.strip_prefix("STALL:") {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    );
+                    held.push(stream);
+                    continue;
+                }
+                // A body prefixed with KEEPALIVE: is preceded by SSE comments,
+                // each sent well inside [`SILENT_FOR`] and all of them well
+                // past it: a server holding its stream open through a long
+                // prompt.
+                if let Some(payload) = sse.strip_prefix("KEEPALIVE:") {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+                    for _ in 0..12 {
+                        std::thread::sleep(SILENT_FOR / 5);
+                        let _ = stream.write_all(b": keepalive\n\n");
+                    }
+                    let _ = stream.write_all(payload.as_bytes());
                     continue;
                 }
                 // A body prefixed with RAW: is the whole response, status
@@ -1712,9 +1914,20 @@ mod tests {
     }
 
     async fn try_stream_sequence(bodies: Vec<String>) -> (Result<CompletionResult, String>, Vec<String>, usize) {
+        try_stream_sequence_idle(bodies, IDLE_TIMEOUT).await
+    }
+
+    /// [`try_stream_sequence`] with the client giving up on an endpoint
+    /// after `idle` of silence.
+    async fn try_stream_sequence_idle(
+        bodies: Vec<String>,
+        idle: std::time::Duration,
+    ) -> (Result<CompletionResult, String>, Vec<String>, usize) {
         let (url, served) = spawn_sse_sequence(bodies);
         let mut deltas: Vec<String> = Vec::new();
-        let result = ChatClient::new(url, None, "m".into(), None, 64)
+        let mut client = ChatClient::new(url, None, "m".into(), None, 64);
+        client.idle_timeout = idle;
+        let result = client
             .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
                 deltas.push(match d {
                     StreamDelta::Content(t) => format!("content:{t}"),
@@ -2314,6 +2527,282 @@ mod tests {
         assert!(deltas.is_empty(), "{deltas:?}");
         assert_eq!(result.finish_reason, "tool_calls");
         assert_eq!(result.tool_calls.len(), 1);
+    }
+
+    /// How long a test endpoint stays quiet before the client gives up on
+    /// it: the idle interval, injected in place of the minutes a real
+    /// endpoint gets.
+    const SILENT_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// [`try_stream_sequence_idle`] at [`SILENT_FOR`], under a deadline that
+    /// turns a hang into a failure.
+    async fn stream_with_silence(bodies: Vec<String>) -> (Result<CompletionResult, String>, Vec<String>, usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), try_stream_sequence_idle(bodies, SILENT_FOR))
+            .await
+            .expect("a silent endpoint must not hold the request forever")
+    }
+
+    /// The bug this guards: only connecting had a deadline, so an endpoint
+    /// that took the request and then sent nothing (a wedged server, a proxy
+    /// holding a dead upstream) held the turn forever, and a headless run
+    /// never exited. Silence for the whole idle interval ends the attempt as
+    /// a transport fault: before any reply text it is resent, whether the
+    /// endpoint never answered or its stream stopped part way.
+    #[tokio::test]
+    async fn a_silent_endpoint_is_resent_before_reply_text() {
+        let silent = format!("the endpoint sent nothing for {}s", SILENT_FOR.as_secs_f64());
+        let (result, deltas, served) = stream_with_silence(vec!["SILENT".into(), FINISHED.into()]).await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(deltas, vec![format!("retry:2/{MAX_ATTEMPTS}:request failed: {silent}"), "content:all of it".to_string()]);
+
+        let thinking = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me\"},\"finish_reason\":null}]}\n\n";
+        let (result, deltas, served) = stream_with_silence(vec![format!("STALL:{thinking}"), FINISHED.into()]).await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(
+            deltas,
+            vec!["reasoning:let me".to_string(), format!("retry:2/{MAX_ATTEMPTS}:{silent}"), "content:all of it".to_string()]
+        );
+    }
+
+    /// Silence after reply text is a truncation, as a cut there is: the
+    /// caller has already shown that text. Silence after the server finished
+    /// leaves the reply finished.
+    #[tokio::test]
+    async fn a_stream_silent_after_reply_text_or_its_finish_is_not_resent() {
+        let half = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+        let (result, deltas, served) = stream_with_silence(vec![format!("STALL:{half}"), FINISHED.into()]).await;
+        let result = result.expect("a truncated reply is still a reply");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("half an ans", TRUNCATED));
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let (result, _, served) = stream_with_silence(vec![format!("STALL:{done}"), FINISHED.into()]).await;
+        let result = result.expect("a finished reply");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert_eq!(served, 1);
+    }
+
+    /// Any byte is activity, an SSE comment too: a server that keeps its
+    /// stream alive with comments through a long prompt is waited for, however
+    /// long that takes in all.
+    #[tokio::test]
+    async fn keepalive_comments_hold_off_the_idle_timeout() {
+        let started = std::time::Instant::now();
+        let (result, deltas, served) = stream_with_silence(vec![format!("KEEPALIVE:{FINISHED}")]).await;
+        assert_eq!(result.expect("a kept-alive stream finishes").content, "all of it");
+        assert_eq!((served, deltas), (1, vec!["content:all of it".to_string()]));
+        assert!(started.elapsed() > SILENT_FOR * 2, "the stream outlasted the idle interval");
+    }
+
+    /// A reply for [`spawn_recording_once`]: the finished stream.
+    fn finished_response() -> String {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{FINISHED}")
+    }
+
+    /// The bug this guards: a provider without a key of its own was sent the
+    /// key settings.json holds for settings.base_url, whatever host the
+    /// provider named. It inherits that key only when it is the same server
+    /// (scheme, host, and port); any other gets no key, and the 401 that
+    /// follows says how to give it its own.
+    #[tokio::test]
+    async fn a_settings_key_reaches_only_its_own_host() {
+        let dir = std::env::temp_dir().join(format!("openmax-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider_at = |url: &str| {
+            let catalog = json!({"providers": {"local": {"base_url": url, "models": [{"id": "m", "context_tokens": 8192}]}}});
+            std::fs::write(crate::providers::providers_path(&dir), catalog.to_string()).unwrap();
+        };
+        let mut settings = crate::config::Settings {
+            provider: Some("local".into()),
+            model: "m".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: Some("sk-settings".into()),
+            ..Default::default()
+        };
+        let request = |endpoint: &crate::providers::ActiveEndpoint| {
+            let client = ChatClient::from_endpoint(endpoint);
+            async move {
+                client
+                    .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+                    .await
+            }
+        };
+
+        let refusal = r#"{"error":{"message":"missing credentials"}}"#;
+        let (url, heads) = spawn_recording_once(format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{refusal}",
+            refusal.len()
+        ));
+        provider_at(&url);
+        let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
+        let err = request(&endpoint).await.err().expect("a 401 is an error");
+        let head = heads.recv().unwrap().to_ascii_lowercase();
+        assert!(!head.contains("authorization") && !head.contains("sk-settings"), "{head}");
+        assert!(err.starts_with("backend returned 401 Unauthorized: missing credentials"), "{err}");
+        assert!(err.contains("provider 'local'") && err.contains("api_key_env"), "{err}");
+
+        // The same scheme, host, and port is the same server, whatever the path.
+        let (url, heads) = spawn_recording_once(finished_response());
+        provider_at(&url);
+        settings.base_url = url.trim_end_matches("/v1").into();
+        let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
+        assert_eq!(request(&endpoint).await.unwrap().content, "all of it");
+        let head = heads.recv().unwrap().to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-settings"), "{head}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The bug this guards: the key went out as a bearer header over plain
+    /// http to any host, readable anywhere on the path. A request that would
+    /// carry a credential (the key, a credential header such as Authorization
+    /// or X-API-Key, or user:password in the base_url, which the HTTP client
+    /// sends as Basic auth) over http to another machine is refused before
+    /// anything is sent, naming the fix; over loopback, to a server on this
+    /// machine, it goes out.
+    #[tokio::test]
+    async fn a_key_never_crosses_plain_http_to_another_machine() {
+        for (base_url, key, headers) in [
+            ("http://models.example.invalid/v1", Some("sk-test".to_string()), Vec::new()),
+            ("http://models.example.invalid/v1", None, vec![("Authorization".to_string(), "Bearer sk-test".to_string())]),
+            ("http://models.example.invalid/v1", None, vec![("X-API-Key".to_string(), "sk-test".to_string())]),
+            ("http://user:secret@models.example.invalid/v1", None, Vec::new()),
+            ("http://:secret@models.example.invalid/v1", None, Vec::new()),
+        ] {
+            let mut client = ChatClient::new(base_url.into(), key, "m".into(), None, 64);
+            client.headers = headers;
+            let mut retries = 0;
+            let err = client
+                .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| retries += 1)
+                .await
+                .err()
+                .expect("a key over plain http to another machine is refused");
+            assert!(err.starts_with("refusing to send"), "{err}");
+            assert!(err.contains("models.example.invalid") && err.contains("https") && err.contains("127.0.0.1"), "{err}");
+            assert!(err.contains("user:password in the base_url") && !err.contains("secret"), "{err}");
+            assert_eq!(retries, 0, "nothing was sent, so nothing was resent");
+        }
+
+        let (url, heads) = spawn_recording_once(finished_response());
+        let result = ChatClient::new(url, Some("sk-local".into()), "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .expect("loopback http carries a key");
+        assert_eq!(result.content, "all of it");
+        let head = heads.recv().unwrap().to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-local"), "{head}");
+    }
+
+    /// https goes anywhere; plain http only to this machine, however its
+    /// address is spelled.
+    #[test]
+    fn only_https_or_this_machine_may_carry_a_key() {
+        for url in [
+            "https://api.example.com/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://127.8.9.10/v1",
+            "http://localhost:1234/v1",
+            "http://LOCALHOST/v1",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]/v1",
+            "http://0.0.0.0:8000/v1",
+        ] {
+            assert_eq!(plain_http_refusal(url), None, "{url}");
+        }
+        for url in [
+            "http://api.example.com/v1",
+            "http://192.168.1.5:8000/v1",
+            "http://10.0.0.2/v1",
+            "http://[2001:db8::1]/v1",
+            "http://localhost.example.com/v1",
+        ] {
+            assert!(plain_http_refusal(url).is_some(), "{url}");
+        }
+    }
+
+    /// A header is a credential by its name, whatever name the server picked
+    /// for its key or token; routing and attribution headers are not, so a
+    /// keyless server that wants one still works over http.
+    #[test]
+    fn a_credential_header_is_known_by_its_name() {
+        let sends = |name: &str| {
+            let mut client = ChatClient::new("http://models.example.invalid/v1".into(), None, "m".into(), None, 64);
+            client.headers = vec![(name.to_string(), "value".to_string())];
+            client.sends_credential()
+        };
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "X-API-Key",
+            "api-key",
+            "X-Auth-Token",
+            "X-Access-Token",
+            "Cookie",
+            "X-Client-Secret",
+            "X-Upstream-Password",
+        ] {
+            assert!(sends(name), "{name}");
+        }
+        for name in ["X-Route", "HTTP-Referer", "X-Title", "User-Agent", "Accept"] {
+            assert!(!sends(name), "{name}");
+        }
+    }
+
+    /// The bug this guards: the HTTP client followed any redirect, and on a
+    /// move to another host it drops only Authorization and cookies, so an
+    /// endpoint that redirected sent the request on, with a key in X-API-Key
+    /// or any other header, to a server nobody configured. A redirect is
+    /// followed only within the server the base_url names (scheme, host, and
+    /// port); one anywhere else fails the request, and nothing reaches that
+    /// server.
+    #[tokio::test]
+    async fn a_redirect_never_carries_a_request_to_another_server() {
+        let (elsewhere, heads) = spawn_recording_once(finished_response());
+        let elsewhere = elsewhere.trim_end_matches("/v1").to_string();
+        let moved = |location: &str| status_response("307 Temporary Redirect", &format!("Location: {location}\r\n"), "");
+        let (url, served) = spawn_sse_sequence(vec![moved(&format!("{elsewhere}/v1/chat/completions"))]);
+        let mut client = ChatClient::new(url, None, "m".into(), None, 64);
+        client.headers = vec![("X-API-Key".into(), "sk-test".into())];
+        let mut deltas = 0;
+        let err = client
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| deltas += 1)
+            .await
+            .err()
+            .expect("a redirect to another server fails the request");
+        assert!(err.contains("redirect") && err.contains(&elsewhere) && !err.contains("sk-test"), "{err}");
+        assert!(heads.try_recv().is_err(), "the other server was sent nothing");
+        assert_eq!((*served.lock().unwrap(), deltas), (1, 0), "the refusal is not resent");
+
+        // Within the same server, a moved path is followed.
+        let (url, served) = spawn_sse_sequence(vec![moved("/v2/chat/completions"), FINISHED.into()]);
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .expect("a redirect within the server is followed");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(*served.lock().unwrap(), 2);
+    }
+
+    /// A provider's `idle_timeout_secs` replaces the default interval for
+    /// its requests; a provider without one keeps the default.
+    #[test]
+    fn a_providers_idle_timeout_secs_sets_its_interval() {
+        let dir = std::env::temp_dir().join(format!("openmax-idle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = json!({"providers": {
+            "slow": {"base_url": "http://127.0.0.1:8080/v1", "idle_timeout_secs": 1800, "models": [{"id": "m", "context_tokens": 8192}]},
+            "plain": {"base_url": "http://127.0.0.1:8081/v1", "models": [{"id": "m", "context_tokens": 8192}]},
+        }});
+        std::fs::write(crate::providers::providers_path(&dir), catalog.to_string()).unwrap();
+        let idle = |provider: &str| {
+            let settings = crate::config::Settings { provider: Some(provider.into()), model: "m".into(), ..Default::default() };
+            ChatClient::from_endpoint(&crate::providers::resolve(&settings, &dir).unwrap()).idle_timeout
+        };
+        assert_eq!(idle("slow"), std::time::Duration::from_secs(1800));
+        assert_eq!(idle("plain"), IDLE_TIMEOUT);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
