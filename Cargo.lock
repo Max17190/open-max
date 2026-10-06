@@ -1157,6 +1157,7 @@ dependencies = [
  "futures-util",
  "ignore",
  "lexopt",
+ "libc",
  "open-max-core",
  "ratatui",
  "serde",
