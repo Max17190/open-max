@@ -706,11 +706,24 @@ fn closest_line_hint_until(content: &str, old_string: &str, deadline: Instant) -
     )
 }
 
+/// `text` with every bare LF written as CRLF; existing CRLFs are kept.
+fn to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let rel = args["path"].as_str().unwrap_or_default();
     let (Some(old_string), Some(new_string)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
         return ToolOutcome::err("missing required arguments: old_string and new_string");
     };
+    // An empty old_string matches between every pair of characters, so the
+    // ambiguity error would steer the model to replace_all, which splices
+    // new_string between every character of the file.
+    if old_string.is_empty() {
+        return ToolOutcome::err(
+            "old_string is empty; give the exact text to replace, or use write_file to create or replace a whole file",
+        );
+    }
     if old_string == new_string {
         return ToolOutcome::err("old_string and new_string are identical");
     }
@@ -724,20 +737,47 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         Err(e) => return ToolOutcome::err(format!("cannot read {rel}: {e}")),
     };
 
-    let new = if old.contains(old_string) {
-        let count = old.matches(old_string).count();
+    // read_file and grep show lines without their \r, so text copied from
+    // either has bare LF breaks and can never match a CRLF file. When every
+    // line break in the file is CRLF, read both strings as written with CRLF:
+    // the match is otherwise exact, and the edit keeps the file's endings
+    // instead of splicing LF lines into it. A mixed file has no single ending
+    // to assume, so it stays exact.
+    let crlf = old.matches("\r\n").count();
+    let lf = old.matches('\n').count();
+    let (old_string, new_string) = if crlf > 0 && crlf == lf {
+        (to_crlf(old_string), to_crlf(new_string))
+    } else {
+        (old_string.to_string(), new_string.to_string())
+    };
+    // Strings that differ only in line endings are the same edit once read
+    // as CRLF; writing it would report a change that never reached the file.
+    if old_string == new_string {
+        return ToolOutcome::err(format!(
+            "old_string and new_string differ only in line endings; {rel} uses CRLF throughout and edit_file keeps it, so use write_file to change line endings"
+        ));
+    }
+
+    let new = if old.contains(&old_string) {
+        let count = old.matches(&old_string).count();
         if count > 1 && !replace_all {
             return ToolOutcome::err(format!(
                 "old_string matches {count} times; provide a longer unique string or set replace_all to true"
             ));
         }
         if replace_all {
-            old.replace(old_string, new_string)
+            old.replace(&old_string, &new_string)
         } else {
-            old.replacen(old_string, new_string, 1)
+            old.replacen(&old_string, &new_string, 1)
         }
     } else {
-        return ToolOutcome::err(closest_line_hint(&old, old_string));
+        let mut hint = closest_line_hint(&old, &old_string);
+        if crlf > 0 && crlf < lf && old_string.contains('\n') {
+            hint.push_str(&format!(
+                " Note: {rel} mixes CRLF and LF line endings, which read_file does not show, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with write_file."
+            ));
+        }
+        return ToolOutcome::err(hint);
     };
 
     if let Err(e) = std::fs::write(&path, &new) {
@@ -1287,7 +1327,10 @@ mod tests {
             ("if ready:\n    run()\n", "if ready:\nrun()"),
             ("items:\n  - first\n", "items:\n- first"),
             ("\tfirst\n\tsecond\n", "first\nsecond"),
-            ("first\r\nsecond\r\n", "first\nsecond"),
+            // CRLF files read LF needles as CRLF, but that never stacks with
+            // indentation fuzzing, and a mixed-ending file stays exact.
+            ("\tfirst\r\n\tsecond\r\n", "first\nsecond"),
+            ("first\r\nsecond\nthird\r\n", "first\nsecond\nthird"),
             (" a\n a\n a\n a\n", "a\na\na"),
         ] {
             std::fs::write(root.join("exact.txt"), content).unwrap();
@@ -1297,6 +1340,108 @@ mod tests {
             assert!(!out.ok, "non-exact edit unexpectedly succeeded: {content:?}");
             assert_eq!(std::fs::read_to_string(root.join("exact.txt")).unwrap(), content);
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An empty old_string matches between every pair of characters. The
+    /// ambiguity error then steers the model to replace_all, which splices
+    /// new_string between every character and corrupts the whole file.
+    #[test]
+    fn an_empty_old_string_is_refused_and_leaves_the_file_untouched() {
+        let root = temp_project();
+        let original = "abc\r\ndef\n";
+        std::fs::write(root.join("keep.txt"), original).unwrap();
+        for replace_all in [true, false] {
+            let out = edit_file(&root, &json!({
+                "path": "keep.txt", "old_string": "", "new_string": "X", "replace_all": replace_all
+            }));
+            assert!(!out.ok, "an empty old_string must be refused (replace_all={replace_all}): {}", out.output);
+            assert!(out.output.contains("old_string is empty"), "{}", out.output);
+            assert!(out.output.contains("write_file"), "the refusal names the whole-file tool: {}", out.output);
+            assert!(!out.output.contains("replace_all"), "the refusal must not steer to replace_all: {}", out.output);
+            assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(), original.as_bytes());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// read_file shows lines without their \r, so text copied from it has
+    /// bare LF breaks. On a CRLF file that copy must still match, and the
+    /// replacement must keep the file's CRLF endings rather than splice LF
+    /// lines into it.
+    #[test]
+    fn an_edit_copied_from_read_file_matches_a_crlf_file_and_keeps_crlf() {
+        let root = temp_project();
+        std::fs::write(root.join("win.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let read = read_file(&root, &json!({"path": "win.txt"}));
+        assert!(read.ok, "{}", read.output);
+        let shown: Vec<&str> = read
+            .output
+            .lines()
+            .map(|l| l.trim_start().split_once(' ').unwrap().1)
+            .collect();
+        let old_string = shown[..2].join("\n");
+        assert_eq!(old_string, "alpha\nbeta", "read_file hides the \\r: {:?}", read.output);
+        let out = edit_file(&root, &json!({
+            "path": "win.txt", "old_string": old_string, "new_string": "alpha\nBETA\nbeta two"
+        }));
+        assert!(out.ok, "a two-line edit copied from read_file must match a CRLF file: {}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(root.join("win.txt")).unwrap(),
+            "alpha\r\nBETA\r\nbeta two\r\ngamma\r\n"
+        );
+
+        // A single-line match whose replacement adds lines keeps CRLF too.
+        let out = edit_file(&root, &json!({
+            "path": "win.txt", "old_string": "gamma", "new_string": "gamma\ndelta"
+        }));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(root.join("win.txt")).unwrap(),
+            "alpha\r\nBETA\r\nbeta two\r\ngamma\r\ndelta\r\n"
+        );
+
+        // Uniqueness is judged on the CRLF form, exactly as before.
+        std::fs::write(root.join("dup.txt"), "x\r\ny\r\nx\r\ny\r\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "dup.txt", "old_string": "x\ny", "new_string": "z"}));
+        assert!(!out.ok && out.output.contains("matches 2 times"), "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("dup.txt")).unwrap(), "x\r\ny\r\nx\r\ny\r\n");
+        let out = edit_file(&root, &json!({
+            "path": "dup.txt", "old_string": "x\ny", "new_string": "z\nw", "replace_all": true
+        }));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("dup.txt")).unwrap(), "z\r\nw\r\nz\r\nw\r\n");
+
+        // Strings that differ only in line endings become the same edit once
+        // read as CRLF, so they are refused like identical strings instead of
+        // reporting a line-ending change that was never written.
+        std::fs::write(root.join("ends.txt"), "a\r\nb\r\n").unwrap();
+        for (old_string, new_string) in [("a\r\nb", "a\nb"), ("a\nb", "a\r\nb")] {
+            let out = edit_file(&root, &json!({
+                "path": "ends.txt", "old_string": old_string, "new_string": new_string
+            }));
+            assert!(!out.ok, "a line-ending-only edit must not report success: {}", out.output);
+            assert!(out.output.contains("differ only in line endings"), "{}", out.output);
+            assert_eq!(std::fs::read(root.join("ends.txt")).unwrap(), b"a\r\nb\r\n");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file mixing CRLF and LF has no single ending to assume, and
+    /// read_file shows neither, so a multi-line edit stays exact and the
+    /// failure says why instead of pointing at a line that looks identical.
+    #[test]
+    fn a_mixed_ending_file_stays_exact_and_the_miss_says_why() {
+        let root = temp_project();
+        let original = "one\r\ntwo\nthree\r\n";
+        std::fs::write(root.join("mixed.txt"), original).unwrap();
+        let out = edit_file(&root, &json!({"path": "mixed.txt", "old_string": "one\ntwo", "new_string": "1\n2"}));
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("mixes CRLF and LF line endings"), "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("mixed.txt")).unwrap(), original);
+        // The text that does match exactly still edits, untouched otherwise.
+        let out = edit_file(&root, &json!({"path": "mixed.txt", "old_string": "two\nthree", "new_string": "2\n3"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("mixed.txt")).unwrap(), "one\r\n2\n3\r\n");
         let _ = std::fs::remove_dir_all(root);
     }
 
