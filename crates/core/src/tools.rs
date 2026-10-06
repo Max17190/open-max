@@ -367,6 +367,14 @@ fn rel_display(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
+/// The argument `key` read by `native`, or parsed from a string. Models often
+/// write a number or a boolean as a string (`"5"`, `"true"`), and reading the
+/// JSON type alone dropped it without a word and ran the default instead.
+fn arg<T: std::str::FromStr>(args: &Value, key: &str, native: fn(&Value) -> Option<T>) -> Option<T> {
+    let value = &args[key];
+    native(value).or_else(|| value.as_str()?.trim().to_ascii_lowercase().parse().ok())
+}
+
 pub async fn execute(
     name: &str,
     args: &Value,
@@ -460,68 +468,181 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
 }
 
 fn read_file(root: &Path, args: &Value) -> ToolOutcome {
-    let rel = args["path"].as_str().unwrap_or_default();
+    let Some(rel) = args["path"].as_str() else {
+        return ToolOutcome::err("missing required argument: path");
+    };
     let path = match resolve(root, rel) {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
     };
-    match std::fs::metadata(&path) {
-        Ok(m) if m.len() > MAX_FILE_BYTES => {
+    let offset = arg(args, "offset", Value::as_u64);
+    let limit = arg(args, "limit", Value::as_u64);
+    let asked_for_window = offset.is_some() || limit.is_some();
+    let mut window = ReadWindow {
+        offset: offset.unwrap_or(1).max(1) as usize,
+        limit: limit.unwrap_or(MAX_READ_LINES as u64).min(MAX_READ_LINES as u64) as usize,
+        out: String::new(),
+        cut_at: None,
+    };
+    let read_error = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::InvalidData => ToolOutcome::err(format!("{rel} is not a UTF-8 text file")),
+        _ => ToolOutcome::err(format!("cannot read {rel}: {e}")),
+    };
+    let total = match std::fs::metadata(&path) {
+        // A directory fails to read like any unreadable path; calling it a
+        // file that is not UTF-8 sends the model after an encoding problem.
+        Ok(m) if m.is_dir() => {
+            return ToolOutcome::err(format!("{rel} is a directory; use list_dir to see its entries"))
+        }
+        // The cap keeps a whole-file read of a huge file out of memory. A
+        // window of one streams instead: this refusal tells the model to
+        // ask for one, and refusing that too leaves it nothing to retry.
+        Ok(m) if m.len() > MAX_FILE_BYTES && !asked_for_window => {
             return ToolOutcome::err(format!("file too large ({} bytes); use grep or read with offset/limit", m.len()))
         }
+        Ok(m) if m.len() > MAX_FILE_BYTES => match stream_window(&path, &mut window) {
+            Ok(total) => total,
+            Err(e) => return read_error(e),
+        },
+        Ok(_) => {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => return read_error(e),
+            };
+            for (i, line) in text.lines().enumerate().skip(window.offset - 1).take(window.limit) {
+                if !window.push(i + 1, line, line.len()) {
+                    break;
+                }
+            }
+            text.lines().count()
+        }
         Err(e) => return ToolOutcome::err(format!("cannot read {rel}: {e}")),
-        _ => {}
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return ToolOutcome::err(format!("{rel} is not a UTF-8 text file")),
     };
-    let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(MAX_READ_LINES as u64) as usize;
-    let limit = limit.min(MAX_READ_LINES);
-    let total = text.lines().count();
-    // An offset past the end must not read like an empty file: the model
-    // would conclude the content is gone rather than that its offset is
-    // stale.
-    if offset > total && total > 0 {
-        return ToolOutcome::err(format!(
-            "offset {offset} is past the end of {rel} ({total} lines); retry with a smaller offset"
-        ));
+    window.finish(rel, total)
+}
+
+/// The numbered lines one read_file call returns.
+struct ReadWindow {
+    /// First line to show, 1-based.
+    offset: usize,
+    /// Most lines to show.
+    limit: usize,
+    out: String,
+    /// The first line that did not fit under `MAX_READ_BYTES`, if one did not.
+    cut_at: Option<usize>,
+}
+
+impl ReadWindow {
+    /// Whether line `n` (1-based) is still to be shown.
+    fn wants(&self, n: usize) -> bool {
+        self.cut_at.is_none() && n >= self.offset && n - self.offset < self.limit
     }
-    let mut out = String::new();
-    let mut stopped_by_bytes = false;
-    let mut byte_cap_line = 0usize;
-    for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+
+    /// Show line `n`, whose full length is `len` bytes; `line` may hold only
+    /// the first `MAX_LINE_CHARS` bytes of a longer one. False once the byte
+    /// cap is reached and the read should stop.
+    fn push(&mut self, n: usize, line: &str, len: usize) -> bool {
         // A clipped line must say so: silently dropping its tail sends the
         // model into edit_file with an old_string that can never match.
-        let formatted = if line.len() > MAX_LINE_CHARS {
+        let formatted = if len > MAX_LINE_CHARS {
             let end = floor_char(line, MAX_LINE_CHARS);
-            format!("{:>5} {}… [line clipped; {} more bytes]\n", i + 1, &line[..end], line.len() - end)
+            format!("{n:>5} {}… [line clipped; {} more bytes]\n", &line[..end], len - end)
         } else {
-            format!("{:>5} {}\n", i + 1, line)
+            format!("{n:>5} {line}\n")
         };
-        if out.len() + formatted.len() > MAX_READ_BYTES {
-            stopped_by_bytes = true;
-            byte_cap_line = i + 1;
-            break;
+        if self.out.len() + formatted.len() > MAX_READ_BYTES {
+            self.cut_at = Some(n);
+            return false;
         }
-        out.push_str(&formatted);
+        self.out.push_str(&formatted);
+        true
     }
-    if stopped_by_bytes {
-        // `byte_cap_line` is the first line that did NOT fit, so the
-        // continuation resumes exactly there. The former `+ 1` skipped one
-        // line per capped read, and pointed past EOF when the cap landed on
-        // the final line.
-        out.push_str(&format!(
-            "… output limit reached at line {byte_cap_line} (file has {total} lines; continue with offset={byte_cap_line})\n"
-        ));
-    } else if total > offset - 1 + limit {
-        out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - (offset - 1 + limit), offset + limit));
+
+    /// The result for a file of `total` lines.
+    fn finish(self, rel: &str, total: usize) -> ToolOutcome {
+        let Self { offset, limit, mut out, cut_at } = self;
+        // An offset past the end must not read like an empty file: the model
+        // would conclude the content is gone rather than that its offset is
+        // stale.
+        if offset > total && total > 0 {
+            return ToolOutcome::err(format!(
+                "offset {offset} is past the end of {rel} ({total} lines); retry with a smaller offset"
+            ));
+        }
+        if let Some(cut_at) = cut_at {
+            // `cut_at` is the first line that did NOT fit, so the
+            // continuation resumes exactly there. The former `+ 1` skipped
+            // one line per capped read, and pointed past EOF when the cap
+            // landed on the final line.
+            out.push_str(&format!(
+                "… output limit reached at line {cut_at} (file has {total} lines; continue with offset={cut_at})\n"
+            ));
+        } else if total > offset - 1 + limit {
+            out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - (offset - 1 + limit), offset + limit));
+        }
+        if out.is_empty() {
+            out = "(empty file)".into();
+        }
+        ToolOutcome::ok(out)
     }
-    if out.is_empty() {
-        out = "(empty file)".into();
+}
+
+/// Fill `window` from a file too large to load whole, and return its line
+/// count. Lines are read one at a time and only those in the window are
+/// decoded, each held to the prefix that `ReadWindow::push` can show, so
+/// memory stays bounded however long the file or any of its lines runs.
+fn stream_window(path: &Path, window: &mut ReadWindow) -> std::io::Result<usize> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut kept = Vec::new();
+    let mut n = 0;
+    loop {
+        let keep = if window.wants(n + 1) { MAX_LINE_CHARS } else { 0 };
+        let Some(len) = next_line(&mut reader, &mut kept, keep)? else {
+            return Ok(n);
+        };
+        n += 1;
+        if keep == 0 {
+            continue;
+        }
+        let line = match std::str::from_utf8(&kept) {
+            Ok(line) => line,
+            // The kept prefix of a clipped line can end inside a character.
+            Err(e) if e.error_len().is_none() && len > kept.len() => {
+                std::str::from_utf8(&kept[..e.valid_up_to()]).unwrap_or_default()
+            }
+            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        };
+        window.push(n, line, len);
     }
-    ToolOutcome::ok(out)
+}
+
+/// Read the next line into `kept`, keeping at most its first `keep` bytes,
+/// and return its full length; None at the end of the file. Lines end as
+/// `str::lines` ends them: at `\n`, with one `\r` before it dropped.
+fn next_line(reader: &mut impl std::io::BufRead, kept: &mut Vec<u8>, keep: usize) -> std::io::Result<Option<usize>> {
+    kept.clear();
+    let mut len = 0;
+    let mut last = None;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok((len > 0).then_some(len));
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let body = &chunk[..newline.unwrap_or(chunk.len())];
+        kept.extend_from_slice(&body[..body.len().min(keep.saturating_sub(kept.len()))]);
+        len += body.len();
+        last = body.last().copied().or(last);
+        let used = newline.map_or(chunk.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            if last == Some(b'\r') {
+                len -= 1;
+                kept.truncate(len);
+            }
+            return Ok(Some(len));
+        }
+    }
 }
 
 fn floor_char(s: &str, mut idx: usize) -> usize {
@@ -586,7 +707,9 @@ fn diff_strings(rel: &str, old: &str, new: &str) -> (DiffInfo, bool) {
 }
 
 fn write_file(root: &Path, args: &Value) -> ToolOutcome {
-    let rel = args["path"].as_str().unwrap_or_default();
+    let Some(rel) = args["path"].as_str() else {
+        return ToolOutcome::err("missing required argument: path");
+    };
     let Some(content) = args["content"].as_str() else {
         return ToolOutcome::err("missing required argument: content");
     };
@@ -712,7 +835,9 @@ fn to_crlf(text: &str) -> String {
 }
 
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
-    let rel = args["path"].as_str().unwrap_or_default();
+    let Some(rel) = args["path"].as_str() else {
+        return ToolOutcome::err("missing required argument: path");
+    };
     let (Some(old_string), Some(new_string)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
         return ToolOutcome::err("missing required arguments: old_string and new_string");
     };
@@ -727,7 +852,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     if old_string == new_string {
         return ToolOutcome::err("old_string and new_string are identical");
     }
-    let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+    let replace_all = arg(args, "replace_all", Value::as_bool).unwrap_or(false);
     let path = match resolve(root, rel) {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
@@ -786,18 +911,32 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     changed_file("edited", root, &path, &old, &new)
 }
 
+/// The walk glob and grep share, from `walk_root`.
+///
 /// Hidden files are searchable: the agent's own extension surface lives in
 /// dot-directories (`.openmax/tools`, `.agents`, `.github`), and a walker
 /// that skips them makes the agent blind to the capabilities it wrote.
 /// `.git` alone is excluded by name; gitignore rules still apply.
-fn project_walk(root: &Path) -> ignore::Walk {
-    ignore::WalkBuilder::new(root)
+///
+/// The walker reads .gitignore only inside a repository by default, which in
+/// a project without one sent glob and grep through the node_modules and
+/// build output it ignores. Outside a repository the rules apply regardless.
+/// Inside one the default stays, because only the default stops reading them
+/// at the repository's root: without it a .gitignore above the root, such as
+/// a home directory kept in git that ignores `*`, would hide the project.
+fn project_walker(walk_root: &Path) -> ignore::WalkBuilder {
+    // The markers and the canonical ancestors the walker itself checks.
+    let canon = walk_root.canonicalize().unwrap_or_else(|_| walk_root.to_path_buf());
+    let in_repository = canon.ancestors().any(|dir| dir.join(".git").exists() || dir.join(".jj").exists());
+    let mut walker = ignore::WalkBuilder::new(walk_root);
+    walker
         .hidden(false)
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
         .git_ignore(true)
         .git_global(true)
-        .max_depth(Some(24))
-        .build()
+        .require_git(in_repository)
+        .max_depth(Some(24));
+    walker
 }
 
 /// The subtree a glob can possibly match: its literal prefix up to the last
@@ -901,7 +1040,7 @@ fn glob_tool(root: &Path, args: &Value) -> ToolOutcome {
         }
     }
     let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for entry in project_walk(&walk_root).flatten() {
+    for entry in project_walker(&walk_root).build().flatten() {
         let path = entry.path();
         if !path.is_file() || !link_stays_in_root(&entry, &root_canon) {
             continue;
@@ -965,18 +1104,16 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
     // Full-corpus scans (rare or no matches) dominate this tool's latency, so
     // walk and scan in parallel. Hits are collected per file and sorted before
     // the cap so the output order is deterministic across runs.
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let hits: std::sync::Mutex<Vec<(String, usize, String)>> = std::sync::Mutex::new(Vec::new());
     let enough = AtomicBool::new(false);
+    // Files passed over, by reason: a skipped file can hold the match, so a
+    // search that skips any must say so rather than answer "no matches".
+    let too_large = AtomicUsize::new(0);
+    let not_text = AtomicUsize::new(0);
+    let unreadable = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(12);
-    ignore::WalkBuilder::new(&search_root)
-        // Same visibility contract as `project_walk`: hidden files are
-        // searchable, `.git` alone is excluded by name.
-        .hidden(false)
-        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
-        .git_ignore(true)
-        .git_global(true)
-        .max_depth(Some(24))
+    project_walker(&search_root)
         .threads(threads)
         .build_parallel()
         .run(|| {
@@ -997,11 +1134,22 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
                         return WalkState::Continue;
                     }
                 }
-                if entry.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
-                    return WalkState::Continue;
-                }
-                let Ok(text) = std::fs::read_to_string(path) else {
-                    return WalkState::Continue;
+                // The size of what the read below gets: through a link, its
+                // target, not the link itself.
+                let text = match std::fs::metadata(path) {
+                    Ok(m) if m.len() > MAX_FILE_BYTES => Err(&too_large),
+                    Ok(_) => std::fs::read_to_string(path).map_err(|e| match e.kind() {
+                        std::io::ErrorKind::InvalidData => &not_text,
+                        _ => &unreadable,
+                    }),
+                    Err(_) => Err(&unreadable),
+                };
+                let text = match text {
+                    Ok(text) => text,
+                    Err(skipped) => {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        return WalkState::Continue;
+                    }
                 };
                 let rel = rel_display(root, path);
                 let mut file_hits = Vec::new();
@@ -1021,9 +1169,13 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
             })
         });
 
+    let skipped = skipped_note(too_large.into_inner(), not_text.into_inner(), unreadable.into_inner());
     let mut hits = hits.into_inner().unwrap();
     if hits.is_empty() {
-        return ToolOutcome::ok("no matches".into());
+        return ToolOutcome::ok(match skipped {
+            Some(note) => format!("no matches\n{note}"),
+            None => "no matches".into(),
+        });
     }
     hits.sort();
     let capped = hits.len() >= MAX_GREP_RESULTS;
@@ -1035,7 +1187,28 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
     if capped {
         out.push_str("… result limit reached; refine the pattern\n");
     }
+    if let Some(note) = skipped {
+        out.push_str(&note);
+        out.push('\n');
+    }
     ToolOutcome::ok(out)
+}
+
+/// One line counting the files grep passed over, by reason, or None when it
+/// searched every file it walked.
+fn skipped_note(too_large: usize, not_text: usize, unreadable: usize) -> Option<String> {
+    let files = |n: usize| if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+    let mut reasons = Vec::new();
+    if too_large > 0 {
+        reasons.push(format!("{} over {} MB", files(too_large), MAX_FILE_BYTES as f64 / 1e6));
+    }
+    if not_text > 0 {
+        reasons.push(format!("{} not UTF-8 text", files(not_text)));
+    }
+    if unreadable > 0 {
+        reasons.push(format!("{} unreadable", files(unreadable)));
+    }
+    (!reasons.is_empty()).then(|| format!("… not searched: {}", reasons.join(", ")))
 }
 
 /// The tail of `text` within `max_bytes`, starting at a line boundary when
@@ -1158,7 +1331,7 @@ async fn bash_tool(
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
     };
-    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60).clamp(1, 300);
+    let timeout_secs = arg(args, "timeout_secs", Value::as_u64).unwrap_or(60).clamp(1, 300);
     let request = ProcessRequest {
         program: bash_shell().into(),
         args: vec!["-c".into(), command.into()],
@@ -1531,6 +1704,76 @@ mod tests {
         assert_eq!(lines, sorted, "results must be deterministic (path, line) order");
         assert!(lines[0].starts_with("docs/c.md:1:"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file grep passes over can hold the match, so a search that skipped
+    /// it must say so instead of answering "no matches".
+    #[test]
+    fn grep_counts_the_files_it_could_not_search() {
+        let root = temp_project();
+        let filler = "padding line without the word\n";
+        let big = filler.repeat(MAX_FILE_BYTES as usize / filler.len() + 1) + "needle\n";
+        std::fs::write(root.join("docs/huge.log"), big).unwrap();
+        std::fs::write(root.join("docs/latin1.txt"), b"needle caf\xe9\n").unwrap();
+
+        let out = grep_tool(&root, &json!({"pattern": "needle"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            out.output,
+            "no matches\n… not searched: 1 file over 1.5 MB, 1 file not UTF-8 text",
+            "skipped files are counted by reason"
+        );
+
+        // The note follows the hits, and counts every file of a reason.
+        std::fs::write(root.join("docs/latin1-2.txt"), b"caf\xe9\n").unwrap();
+        std::fs::write(root.join("src/needle.rs"), "// needle\n").unwrap();
+        let out = grep_tool(&root, &json!({"pattern": "needle"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            out.output,
+            "src/needle.rs:1: // needle\n… not searched: 1 file over 1.5 MB, 2 files not UTF-8 text\n"
+        );
+
+        // A search that read every candidate carries no note.
+        let out = grep_tool(&root, &json!({"pattern": "needle", "path": "src"}));
+        assert_eq!(out.output, "src/needle.rs:1: // needle\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The ignore crate reads .gitignore only inside a git repository by
+    /// default, so in a project without one grep and glob walked
+    /// node_modules and build output the project had ignored.
+    #[test]
+    fn grep_and_glob_honor_gitignore_without_a_git_repository() {
+        let root = temp_project();
+        std::fs::write(root.join(".gitignore"), "node_modules/\nbuild/\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "alpha_vendored\n").unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/out.js"), "alpha_vendored\n").unwrap();
+        std::fs::write(root.join("src/app.js"), "alpha_vendored\n").unwrap();
+
+        let out = glob_tool(&root, &json!({"pattern": "**/*.js"}));
+        assert_eq!(out.output, "src/app.js", "ignored directories are not listed");
+        let out = grep_tool(&root, &json!({"pattern": "alpha_vendored"}));
+        assert_eq!(out.output, "src/app.js:1: alpha_vendored\n", "ignored directories are not searched");
+
+        // Inside a repository the rules stop at its root as before: a
+        // .gitignore above it, such as a home directory's "*", must not hide
+        // the project.
+        let outer = outside_dir();
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::write(outer.join(".gitignore"), "*\n").unwrap();
+        let project = outer.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/lib.rs"), "fn alpha() {}\n").unwrap();
+        let out = glob_tool(&project, &json!({"pattern": "**/*.rs"}));
+        assert_eq!(out.output, "src/lib.rs");
+        let out = grep_tool(&project, &json!({"pattern": "alpha"}));
+        assert_eq!(out.output, "src/lib.rs:1: fn alpha() {}\n");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outer);
     }
 
     #[test]
@@ -2298,6 +2541,146 @@ mod tests {
         std::fs::write(root.join("empty.txt"), "").unwrap();
         let out = read_file(&root, &json!({"path": "empty.txt", "offset": 5}));
         assert!(out.ok && out.output.contains("(empty file)"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file over the size cap was refused before offset and limit were
+    /// read, while the refusal told the model to retry with offset and
+    /// limit: a retry that could never work. A window of it streams, and
+    /// shows exactly what the same lines show in a file read whole.
+    #[test]
+    fn read_file_reads_a_window_of_a_file_too_large_to_load_whole() {
+        let root = temp_project();
+        let mut lines: Vec<String> = Vec::new();
+        let mut bytes = 0;
+        while bytes <= MAX_FILE_BYTES as usize {
+            let line = format!("row {} of a large log\n", lines.len() + 1);
+            bytes += line.len();
+            lines.push(line);
+        }
+        let total = lines.len();
+        let offset = total / 2;
+        // In the window: a long line whose clip point falls inside a
+        // three-byte character, and a CRLF line.
+        lines[offset] = format!("{}\n", "€".repeat(400));
+        lines[offset + 1] = "carriage return\r\n".into();
+        std::fs::write(root.join("big.log"), lines.concat()).unwrap();
+        assert!(std::fs::metadata(root.join("big.log")).unwrap().len() > MAX_FILE_BYTES);
+
+        let out = read_file(&root, &json!({"path": "big.log", "offset": offset, "limit": 4}));
+        assert!(out.ok, "a window of a large file must be readable: {}", out.output);
+        let shown: Vec<&str> = out.output.lines().collect();
+        assert_eq!(shown.len(), 5, "{}", out.output);
+        assert_eq!(
+            shown[4],
+            format!("… {} more lines (file has {total} lines; continue with offset={})", total - (offset + 3), offset + 4)
+        );
+        // The same lines in a file small enough to read whole render the same.
+        std::fs::write(root.join("small.log"), lines[..offset + 3].concat()).unwrap();
+        let small = read_file(&root, &json!({"path": "small.log", "offset": offset, "limit": 4}));
+        assert!(small.ok, "{}", small.output);
+        assert_eq!(shown[..4], small.output.lines().collect::<Vec<_>>()[..], "{}", out.output);
+        assert!(shown[1].contains("[line clipped; 702 more bytes]"), "{}", shown[1]);
+        assert!(shown[2].ends_with(" carriage return"), "{:?}", shown[2]);
+
+        // The final line is reachable, and an offset past it says so.
+        let out = read_file(&root, &json!({"path": "big.log", "offset": total}));
+        assert_eq!(out.output, format!("{total:>5} row {total} of a large log\n"));
+        let out = read_file(&root, &json!({"path": "big.log", "offset": total + 1}));
+        assert!(!out.ok && out.output.contains(&format!("past the end of big.log ({total} lines)")), "{}", out.output);
+        // A whole-file read is still refused, with advice that now works.
+        let out = read_file(&root, &json!({"path": "big.log"}));
+        assert!(!out.ok && out.output.contains("file too large"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A streamed window must number and split lines exactly as a file read
+    /// whole does, wherever the reader's buffer boundaries fall.
+    #[test]
+    fn streamed_lines_split_like_str_lines() {
+        for text in ["", "a", "a\n", "a\n\n", "a\r\nb", "a\r", "a\r\r\nb\n", "\r\n", "a\rb\n", "héllo\r\nwörld\n"] {
+            for capacity in [1, 2, 3, 64] {
+                let mut reader = std::io::BufReader::with_capacity(capacity, text.as_bytes());
+                let mut kept = Vec::new();
+                let mut lines = Vec::new();
+                while let Some(len) = next_line(&mut reader, &mut kept, usize::MAX).unwrap() {
+                    assert_eq!(len, kept.len(), "{text:?} at capacity {capacity}");
+                    lines.push(String::from_utf8(kept.clone()).unwrap());
+                }
+                assert_eq!(lines, text.lines().collect::<Vec<_>>(), "{text:?} at capacity {capacity}");
+            }
+        }
+        // A long line keeps only its prefix but reports its whole length.
+        let mut reader = std::io::BufReader::with_capacity(2, "abcdef\r\nxy".as_bytes());
+        let mut kept = Vec::new();
+        assert_eq!(next_line(&mut reader, &mut kept, 2).unwrap(), Some(6));
+        assert_eq!(kept, b"ab");
+        assert_eq!(next_line(&mut reader, &mut kept, 0).unwrap(), Some(2));
+        assert!(kept.is_empty());
+        assert_eq!(next_line(&mut reader, &mut kept, 2).unwrap(), None);
+    }
+
+    /// read_file discarded the read error and called every failure "not a
+    /// UTF-8 text file", so a directory or a call with no path sent the
+    /// model looking for an encoding problem.
+    #[test]
+    fn file_tools_name_a_directory_and_a_missing_path() {
+        let root = temp_project();
+        let out = read_file(&root, &json!({"path": "src"}));
+        assert!(!out.ok, "{}", out.output);
+        assert_eq!(out.output, "src is a directory; use list_dir to see its entries");
+        let out = read_file(&root, &json!({"path": "."}));
+        assert!(!out.ok && out.output.starts_with(". is a directory"), "{}", out.output);
+
+        let out = read_file(&root, &json!({}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
+        let out = write_file(&root, &json!({"content": "x\n"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
+        let out = edit_file(&root, &json!({"old_string": "a", "new_string": "b"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
+
+        // A file that is not UTF-8 keeps its own message.
+        std::fs::write(root.join("latin1.txt"), b"caf\xe9\n").unwrap();
+        let out = read_file(&root, &json!({"path": "latin1.txt"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "latin1.txt is not a UTF-8 text file"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Models often write a number or a boolean as a string. Those
+    /// arguments were read as JSON numbers and booleans only, so `"5"` and
+    /// `"true"` were dropped without a word and the defaults ran instead.
+    #[tokio::test]
+    async fn numeric_and_boolean_arguments_written_as_strings_are_honored() {
+        let root = temp_project();
+        std::fs::write(root.join("three.txt"), "one\ntwo\nthree\n").unwrap();
+        let out = read_file(&root, &json!({"path": "three.txt", "offset": "2", "limit": " 1 "}));
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.starts_with("    2 two\n"), "offset as a string: {}", out.output);
+        assert!(!out.output.contains("three\n"), "limit as a string: {}", out.output);
+
+        std::fs::write(root.join("twice.txt"), "x\nx\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "twice.txt", "old_string": "x", "new_string": "y", "replace_all": "false"}));
+        assert!(!out.ok && out.output.contains("matches 2 times"), "{}", out.output);
+        let out = edit_file(&root, &json!({"path": "twice.txt", "old_string": "x", "new_string": "y", "replace_all": "true"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("twice.txt")).unwrap(), "y\ny\n");
+
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": "sleep 30", "timeout_secs": "2"}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(!out.ok && out.output.contains("timed out after 2s"), "{}", out.output);
+
+        // The helper's own shape: anything else still falls back.
+        assert_eq!(arg(&json!({"n": 7}), "n", Value::as_u64), Some(7));
+        assert_eq!(arg(&json!({"n": "True"}), "n", Value::as_bool), Some(true));
+        for unusable in [json!({"n": "-1"}), json!({"n": "five"}), json!({"n": null}), json!({})] {
+            assert_eq!(arg(&unusable, "n", Value::as_u64), None, "{unusable}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
