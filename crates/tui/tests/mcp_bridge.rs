@@ -96,7 +96,8 @@ fn select(args: &[String]) -> Vec<(&'static str, fn())> {
 
 /// One fixture MCP server. Modes: `basic` (two tools, `echo` and `fail`),
 /// `paged` (four tools over three tools/list pages), `malformed` (answers
-/// initialize with a line that is not JSON-RPC), `unsupported` (answers with
+/// initialize with a line that is not JSON-RPC), `numeric-content` (answers
+/// every tools/call with a number for content), `unsupported` (answers with
 /// a protocol version no client knows), `silent <pidfile>` (never reads or
 /// writes, and ignores its closed stdin), and `stalled <pidfile>` (answers
 /// initialize, then never reads again).
@@ -192,6 +193,7 @@ fn serve(args: &[String]) {
                 let arguments = &msg["params"]["arguments"];
                 let env = |name: &str| std::env::var(name).unwrap_or_else(|_| "unset".into());
                 match msg["params"]["name"].as_str().unwrap_or_default() {
+                    _ if mode == "numeric-content" => result(json!({"content": 123})),
                     "echo" => result(json!({"content": [
                         {"type": "text", "text": format!(
                             "echo: {}; NOTES_TOKEN={}; NOT_GRANTED={}",
@@ -517,6 +519,17 @@ fn is_error_result() {
     assert!(run.stderr.contains("'args'"), "the unknown key is named: {}", run.stderr);
     assert!(!run.stderr.contains("serving"), "no server starts for unreadable input: {}", run.stderr);
 
+    // Input past the 64 MiB bound: the bound falls just after a whole call
+    // padded with whitespace, so the part read parses. The byte after it is
+    // part of the input too, and it makes the input invalid JSON, so nothing
+    // may run.
+    let call = r#"{"tool":"echo","arguments":{"text":"cut"}}"#;
+    let input = format!("{call}{}}}", " ".repeat((64 << 20) - call.len()));
+    let run = bridge(&["--mcp-call"], &["basic"], &input);
+    assert_eq!(run.code, Some(2), "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("64 MiB"), "the bound is named: {}", run.stderr);
+    assert!(!run.stderr.contains("serving"), "no server starts for oversized input: {}", run.stderr);
+
     let run = bridge(&["--mcp-call"], &["basic"], r#"{"tool":"echo","arguments":{"text":"plain"}}"#);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.starts_with("echo: plain; "), "{}", run.stdout);
@@ -537,6 +550,13 @@ fn malformed_reply() {
         "both sides' versions are named: {}",
         run.stderr
     );
+
+    // A result's content is a list of items; anything else is not an empty
+    // result to report as a completed call.
+    let run = bridge(&["--mcp-call"], &["numeric-content"], r#"{"tool":"echo","arguments":{"text":"x"}}"#);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(run.stderr.contains("content is a number, not an array: 123"), "{}", run.stderr);
+    assert!(run.stdout.is_empty(), "{}", run.stdout);
 }
 
 /// A server that never answers costs one bounded wait, and is stopped even

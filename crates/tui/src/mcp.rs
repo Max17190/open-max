@@ -69,11 +69,24 @@ pub fn call(server: &[OsString], timeout: Duration) -> i32 {
         eprintln!(r#"openmax: --mcp-call reads the call on stdin, as {{"tool": "<name>", "arguments": {{...}}}}"#);
         return 2;
     }
-    let mut input = String::new();
-    if let Err(e) = stdin.lock().take(MAX_MESSAGE_BYTES).read_to_string(&mut input) {
+    // One byte past the bound tells a call that was cut from one that fits:
+    // a cut call can still parse, and would run without its tail.
+    let mut input = Vec::new();
+    if let Err(e) = stdin.lock().take(MAX_MESSAGE_BYTES + 1).read_to_end(&mut input) {
         eprintln!("openmax: --mcp-call could not read stdin: {e}");
         return 2;
     }
+    if input.len() as u64 > MAX_MESSAGE_BYTES {
+        eprintln!("openmax: --mcp-call reads at most {} MiB on stdin", MAX_MESSAGE_BYTES >> 20);
+        return 2;
+    }
+    let input = match String::from_utf8(input) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("openmax: --mcp-call could not read stdin: {e}");
+            return 2;
+        }
+    };
     let (tool, arguments) = match parse_call(&input) {
         Ok(call) => call,
         Err(reason) => {
@@ -88,7 +101,13 @@ pub fn call(server: &[OsString], timeout: Duration) -> i32 {
     };
     match run() {
         Ok(result) => {
-            let text = render_content(&result);
+            let text = match render_content(&result) {
+                Ok(text) => text,
+                Err(reason) => {
+                    eprintln!("openmax: {reason}");
+                    return 1;
+                }
+            };
             if result.get("isError").and_then(Value::as_bool) == Some(true) {
                 eprintln!(
                     "openmax: the server's {} tool reported an error: {text}",
@@ -180,12 +199,11 @@ impl Session {
             })?;
         let stdout = child.stdout.take().expect("stdout is piped");
         let stdin = child.stdin.take().expect("stdin is piped");
-        let (tx, lines) = mpsc::channel();
         let (writes, rx) = mpsc::channel();
         // Both detached: a server can leave a descendant holding its stdout
         // open, or stop reading its stdin, and the run must not wait on
         // either to end.
-        std::thread::spawn(move || read_lines(stdout, tx));
+        let lines = spawn_reader(stdout);
         std::thread::spawn(move || write_lines(stdin, rx));
         Ok(Self { child, writes: Some(writes), lines, timeout, next_id: 1 })
     }
@@ -422,9 +440,21 @@ fn write_lines(mut stdin: ChildStdin, rx: mpsc::Receiver<Vec<u8>>) {
     }
 }
 
+/// Start the thread that reads the server's stdout, and return its lines.
+/// The queue holds nothing: the reader hands over one line and reads the
+/// next only once that one is taken. Each line is capped but their number is
+/// not, so a queue that buffered ahead would let a server that floods its
+/// output (a notification loop) grow this process while the session is busy
+/// or stopping it; held back, the server blocks on its own stdout instead.
+fn spawn_reader(stdout: impl Read + Send + 'static) -> mpsc::Receiver<Result<Vec<u8>, String>> {
+    let (tx, lines) = mpsc::sync_channel(0);
+    std::thread::spawn(move || read_lines(stdout, tx));
+    lines
+}
+
 /// Forward the server's stdout one line at a time, ending at EOF, at a read
 /// error, or at a line longer than any message may be.
-fn read_lines(stdout: impl Read, tx: mpsc::Sender<Result<Vec<u8>, String>>) {
+fn read_lines(stdout: impl Read, tx: mpsc::SyncSender<Result<Vec<u8>, String>>) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut line = Vec::new();
@@ -593,16 +623,26 @@ fn truncated(text: &str, max_chars: usize) -> String {
 
 /// A tools/call result as text: each content item on its own line, text as
 /// written, and binary items described rather than dumped. A result with no
-/// content falls back to its structured content.
-fn render_content(result: &Value) -> String {
-    let items = result.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+/// content falls back to its structured content; beside content it is not
+/// repeated, because the protocol asks a tool that returns structured content
+/// to return it as text too, and printing both would double such a result.
+/// Content that is not a list is a malformed reply, not an empty result.
+fn render_content(result: &Value) -> Result<String, String> {
+    let items = match result.get("content") {
+        None => &[][..],
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(other) => {
+            let what = format!("content is {}, not an array", kind(other));
+            return Err(malformed("tools/call", &other.to_string(), &what));
+        }
+    };
     if items.is_empty() {
-        return match result.get("structuredContent") {
+        return Ok(match result.get("structuredContent") {
             Some(structured) if !structured.is_null() => structured.to_string(),
             _ => String::new(),
-        };
+        });
     }
-    items
+    Ok(items
         .iter()
         .map(|item| {
             let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
@@ -629,7 +669,7 @@ fn render_content(result: &Value) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
 }
 
 /// The decoded size of base64 text, without decoding it.
@@ -730,6 +770,48 @@ mod tests {
         }
     }
 
+    /// Each line is capped, but a server can write any number of them: a
+    /// notification loop must stall the server on its own stdout, not queue
+    /// up in this process while the session is busy or stopping it.
+    #[test]
+    fn the_reader_reads_no_further_than_one_line_ahead() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// A server stdout that yields one notification per read, counting.
+        struct Flood {
+            left: usize,
+            read: Arc<AtomicUsize>,
+        }
+        impl Read for Flood {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                const LINE: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n";
+                if self.left == 0 {
+                    return Ok(0);
+                }
+                buf[..LINE.len()].copy_from_slice(LINE);
+                self.left -= 1;
+                self.read.fetch_add(1, Ordering::SeqCst);
+                Ok(LINE.len())
+            }
+        }
+
+        const TOTAL: usize = 10_000;
+        let read = Arc::new(AtomicUsize::new(0));
+        let lines = spawn_reader(Flood { left: TOTAL, read: read.clone() });
+        std::thread::sleep(Duration::from_millis(200));
+        let ahead = read.load(Ordering::SeqCst);
+        assert!(ahead <= 1, "the reader ran {ahead} lines ahead of a session that took none");
+        for taken in 1..=3 {
+            lines.recv().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let ahead = read.load(Ordering::SeqCst);
+            assert!(ahead <= taken + 1, "the reader ran {ahead} lines ahead of a session that took {taken}");
+        }
+        // Holding back loses nothing: every line still arrives.
+        assert_eq!(lines.iter().filter(Result::is_ok).count() + 3, TOTAL);
+    }
+
     #[test]
     fn content_items_render_as_text() {
         let result = json!({"content": [
@@ -739,10 +821,10 @@ mod tests {
             {"type": "resource_link", "uri": "file:///b", "name": "b"},
         ]});
         assert_eq!(
-            render_content(&result),
+            render_content(&result).unwrap(),
             "one\n[image image/png, 5 bytes]\n[resource file:///a.txt]\nbody\n[resource link file:///b b]"
         );
-        assert_eq!(render_content(&json!({"content": [], "structuredContent": {"n": 1}})), r#"{"n":1}"#);
-        assert_eq!(render_content(&json!({})), "");
+        assert_eq!(render_content(&json!({"content": [], "structuredContent": {"n": 1}})).unwrap(), r#"{"n":1}"#);
+        assert_eq!(render_content(&json!({})).unwrap(), "");
     }
 }
