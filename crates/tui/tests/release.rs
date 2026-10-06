@@ -14,26 +14,31 @@ fn read(path: &str) -> String {
     std::fs::read_to_string(repo().join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-/// The body of one `[header]` table in the workspace Cargo.toml, up to the
-/// next table.
-fn manifest_table(header: &str) -> String {
-    let manifest = read("Cargo.toml");
-    let start = manifest
-        .find(&format!("\n[{header}]\n"))
-        .unwrap_or_else(|| panic!("Cargo.toml has no [{header}]"));
-    let body = &manifest[start + header.len() + 4..];
-    body[..body.find("\n[").unwrap_or(body.len())].to_string()
+/// One table of the workspace Cargo.toml, by its dotted path. Parsed as TOML
+/// rather than matched as text: cargo-dist reads every valid spelling of an
+/// entry (any spacing, quoting or comment), and one this test failed to match
+/// would be skipped without a failure.
+fn manifest_table(path: &str) -> toml::Table {
+    let mut table: toml::Table = read("Cargo.toml").parse().unwrap_or_else(|e| panic!("Cargo.toml: {e}"));
+    for key in path.split('.') {
+        table = match table.remove(key) {
+            Some(toml::Value::Table(inner)) => inner,
+            _ => panic!("Cargo.toml has no [{path}]"),
+        };
+    }
+    table
 }
 
 /// Every target a release tag builds and publishes.
 fn dist_targets() -> Vec<String> {
     let dist = manifest_table("workspace.metadata.dist");
-    let list = dist
-        .split_once("\ntargets = [")
-        .and_then(|(_, rest)| rest.split_once(']'))
+    let targets: Vec<String> = dist
+        .get("targets")
+        .and_then(toml::Value::as_array)
         .expect("[workspace.metadata.dist] lists its targets")
-        .0;
-    let targets: Vec<String> = list.split('"').skip(1).step_by(2).map(str::to_string).collect();
+        .iter()
+        .map(|target| target.as_str().expect("each dist target is a string").to_string())
+        .collect();
     assert!(!targets.is_empty(), "no targets in [workspace.metadata.dist]");
     targets
 }
@@ -100,29 +105,27 @@ fn ci_builds_and_size_gates_every_release_target() {
     assert_eq!(built, published, "CI's release-build matrix is not the set of targets a tag publishes");
 
     let dist = manifest_table("workspace.metadata.dist");
-    let dist_version = dist
-        .lines()
-        .find_map(|line| line.strip_prefix("cargo-dist-version = "))
-        .map(|version| version.trim_matches('"'));
     assert_eq!(
-        dist_version,
+        dist.get("cargo-dist-version").and_then(toml::Value::as_str),
         Some(DIST_VERSION),
         "cargo-dist changed, and with it maybe the runner a target is released from: re-read DIST_DEFAULT_RUNNERS from `dist plan --output-format=json` and re-sync ci.yml's release-build matrix"
     );
-    let custom_runners = manifest_table("workspace.metadata.dist.github-custom-runners");
-    let custom: Vec<(&str, &str)> = custom_runners
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once(" = "))
-        .map(|(target, runner)| (target, runner.trim_matches('"')))
-        .collect();
+    let custom = dist
+        .get("github-custom-runners")
+        .map(|runners| runners.as_table().expect("github-custom-runners is a table of target = runner"));
     for (target, runner) in &matrix {
-        let released = custom
-            .iter()
-            .chain(DIST_DEFAULT_RUNNERS)
-            .find(|(t, _)| t == target)
-            .map(|(_, r)| *r)
-            .unwrap_or_else(|| panic!("no release runner recorded for {target}: add the one `dist plan` assigns it to DIST_DEFAULT_RUNNERS"));
+        let released = match custom.and_then(|runners| runners.get(target)) {
+            // A table here also sets a host or container, which ci.yml does
+            // not mirror, so it fails rather than passing on the runner alone.
+            Some(custom) => custom
+                .as_str()
+                .unwrap_or_else(|| panic!("{target}'s custom runner is not a runner name, which ci.yml cannot mirror: {custom:?}")),
+            None => DIST_DEFAULT_RUNNERS
+                .iter()
+                .find(|(t, _)| t == target)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("no release runner recorded for {target}: add the one `dist plan` assigns it to DIST_DEFAULT_RUNNERS")),
+        };
         assert_eq!(runner, released, "the release builds {target} on {released}, but CI builds it on {runner}");
     }
 
@@ -154,13 +157,12 @@ fn ci_builds_and_size_gates_every_release_target() {
     assert_eq!(soft, None, "a continue-on-error step or job turns the size gate back into a warning");
     // The gate measures the release profile; dist publishes with its own
     // `dist` profile, so that profile must be release, unchanged.
-    let dist_profile: Vec<String> = manifest_table("profile.dist")
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-        .collect();
-    assert_eq!(dist_profile, ["inherits = \"release\""], "[profile.dist] overrides the release profile the gate measures");
+    let release = toml::Table::from_iter([("inherits".to_string(), toml::Value::from("release"))]);
+    assert_eq!(
+        manifest_table("profile.dist"),
+        release,
+        "[profile.dist] overrides the release profile the gate measures"
+    );
 }
 
 /// The gate passes a binary exactly at its target's budget and fails one a
