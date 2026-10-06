@@ -68,7 +68,8 @@ options:
       --spec <surface>   print the authoring contract for one surface and
                          exit (tools, skills, prompts, hooks, permissions,
                          providers, settings, memory, recall, stdio, usage)
-      --trust-project    persist trust for this exact project root, then run
+      --trust-project    trust this exact project root in auto mode (a project
+                         already trusted keeps its mode), then run
   -V, --version          print the version
   -h, --help             this help
 
@@ -1679,8 +1680,22 @@ fn ensure_project_trust(
         // printed as one command to paste, so it carries the directory as a
         // quoted `cd`: a parenthesized note is a shell syntax error.
         require_human("a trust grant", &open_max_core::doctor::trust_command(project));
-        let trusted = open_max_core::trust::trust_project(data_dir, project)?;
-        eprintln!("openmax: trusted project {}", trusted.display());
+        let (trusted, recorded) = open_max_core::trust::grant_trust(
+            data_dir,
+            project,
+            open_max_core::config::ApprovalMode::Auto,
+        )?;
+        match recorded {
+            Some(mode) => eprintln!(
+                "openmax: trusted project {} in {} mode (change it with /approvals or Shift+Tab)",
+                trusted.display(),
+                mode.as_str()
+            ),
+            None => eprintln!(
+                "openmax: project {} was already trusted; its approval mode is unchanged (change it with /approvals or Shift+Tab)",
+                trusted.display()
+            ),
+        }
         return Ok(());
     }
     if open_max_core::trust::is_trusted(data_dir, project)? {
@@ -1699,19 +1714,43 @@ fn ensure_project_trust(
         ));
     }
 
-    eprint!(
-        "Open Max can execute repository code with your user authority.\nTrust project {}? [y/N] ",
+    prompt_trust(&mut std::io::stdin().lock(), &mut std::io::stderr(), data_dir, project)
+}
+
+/// The interactive trust prompt. The answer is the whole grant: it trusts the
+/// project and picks the approval mode recorded with it, auto unless the
+/// human picks another mode in the same keystroke. Any other answer, a bare
+/// Enter included, leaves the project untrusted.
+fn prompt_trust(
+    input: &mut impl std::io::BufRead,
+    prompt: &mut impl Write,
+    data_dir: &std::path::Path,
+    project: &std::path::Path,
+) -> Result<(), String> {
+    use open_max_core::config::ApprovalMode;
+    write!(
+        prompt,
+        "Open Max can execute repository code with your user authority.\n\
+         Trust project {}?\n  \
+         y  yes, in auto mode: tools and extensions run without asking (deny rules and hooks still apply)\n  \
+         a  yes, in ask mode: mutating calls wait for your approval\n  \
+         r  yes, in readonly mode: mutating calls are refused\n  \
+         N  no\n\
+         The mode is saved for this project; change it later with /approvals or Shift+Tab.\n\
+         [y/a/r/N] ",
         project.display()
-    );
-    std::io::stderr().flush().map_err(|e| e.to_string())?;
+    )
+    .and_then(|()| prompt.flush())
+    .map_err(|e| e.to_string())?;
     let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| e.to_string())?;
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        return Err("project remains untrusted".into());
-    }
-    open_max_core::trust::trust_project(data_dir, project)?;
+    input.read_line(&mut answer).map_err(|e| e.to_string())?;
+    let mode = match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ApprovalMode::Auto,
+        "a" | "ask" => ApprovalMode::Ask,
+        "r" | "readonly" => ApprovalMode::Readonly,
+        _ => return Err("project remains untrusted".into()),
+    };
+    open_max_core::trust::grant_trust(data_dir, project, mode)?;
     Ok(())
 }
 
@@ -2002,6 +2041,50 @@ mod tests {
             "no trust may be recorded"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The trust prompt's answer is the whole grant: trust and the project's
+    /// approval mode land in one trust.json write. `y` trusts in auto, and
+    /// `a` (ask) and `r` (readonly) are one keystroke away; any other answer,
+    /// a bare Enter included, trusts nothing. The settings default here is
+    /// ask, so a grant that recorded no mode would resolve to ask, not auto.
+    /// The prompt names the mode `y` records and where to change it later.
+    #[test]
+    fn the_trust_prompt_records_the_mode_the_answer_picks() {
+        use open_max_core::config::ApprovalMode;
+        let cases = [
+            ("y\n", Some(ApprovalMode::Auto)),
+            ("Yes\n", Some(ApprovalMode::Auto)),
+            ("a\n", Some(ApprovalMode::Ask)),
+            ("ask\n", Some(ApprovalMode::Ask)),
+            ("r\n", Some(ApprovalMode::Readonly)),
+            ("\n", None),
+            ("n\n", None),
+            ("", None),
+        ];
+        for (answer, expected) in cases {
+            let dir = test_temp_dir("openmax-trustprompt");
+            let (data, project) = (dir.join("data"), dir.join("project"));
+            std::fs::create_dir_all(&project).unwrap();
+            let mut shown = Vec::new();
+            let result = prompt_trust(&mut answer.as_bytes(), &mut shown, &data, &project);
+            let shown = String::from_utf8(shown).unwrap();
+            assert!(
+                shown.contains("auto") && shown.contains("/approvals"),
+                "the prompt must name the mode it records and how to change it: {shown}"
+            );
+            let trusted = open_max_core::trust::is_trusted(&data, &project).unwrap();
+            match expected {
+                Some(mode) => {
+                    assert_eq!(result, Ok(()), "{answer:?} must trust");
+                    assert!(trusted, "{answer:?} must trust");
+                    let core = open_max_core::state::Core::new(data.clone()).unwrap().0;
+                    assert_eq!(core.approval_mode(&project), mode, "{answer:?}");
+                }
+                None => assert!(result.is_err() && !trusted, "{answer:?} must not trust"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
