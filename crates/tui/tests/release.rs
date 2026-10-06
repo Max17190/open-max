@@ -74,11 +74,15 @@ fn ci_builds_and_size_gates_every_release_target() {
         assert_eq!(ci, Some(runner), "the release builds {target} on {runner}");
     }
 
+    let ci = read(".github/workflows/ci.yml");
     let gate = "run: scripts/check-binary-size.sh ${{ matrix.target }} target/${{ matrix.target }}/release/openmax";
     assert!(
-        read(".github/workflows/ci.yml").lines().any(|line| line.trim() == gate),
+        ci.lines().any(|line| line.trim() == gate),
         "the release-build job does not gate each binary's size: `{gate}`"
     );
+    // On the gate's step or its job, this lets an over-budget binary pass.
+    let soft = ci.lines().map(str::trim).find(|line| !line.starts_with('#') && line.contains("continue-on-error"));
+    assert_eq!(soft, None, "a continue-on-error step or job turns the size gate back into a warning");
     // The gate measures the release profile; dist publishes with its own
     // `dist` profile, so that profile must be release, unchanged.
     let dist_profile: Vec<String> = manifest_table("profile.dist")

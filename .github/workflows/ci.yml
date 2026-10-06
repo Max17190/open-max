@@ -11,8 +11,9 @@ env:
 # Every action is pinned to a full commit SHA, with its release in a trailing
 # comment: a tag can be moved to other code after review, and these jobs run
 # with this repository's token, while a commit cannot change under its SHA.
-# Bump an action by replacing both. rust-toolchain publishes no releases, so it
-# is pinned to a dated master commit and given its toolchain as an input.
+# Bump an action by replacing both. rust-toolchain is versioned by branch
+# (stable, 1.97.0, ...), not by release, and its v1 tag follows master, so it is
+# pinned to a dated master commit and given its toolchain as an input.
 jobs:
   test:
     name: Test (${{ matrix.os }})
