@@ -64,7 +64,9 @@ provider's per-model entries override the first two.
   versions wrote `"temperature": 0.2` on every settings save; if you never
   chose it, delete the key.
 - `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
-  keeps the tail and spills the full log to `~/.openmax/cmd-logs`.
+  keeps up to a quarter of each stream's share of the cap from its start and
+  the rest from its end, marks the cut with the bytes it dropped, and spills
+  the full log to `~/.openmax/cmd-logs`.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
 Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
