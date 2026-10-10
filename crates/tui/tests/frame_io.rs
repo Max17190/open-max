@@ -1,6 +1,9 @@
-//! Measures the frame write path: bare `Stdout` is a 1 KiB line buffer, so a
-//! frame's escape stream leaves the process as many small write(2) calls; the
-//! TUI's 256 KiB `BufWriter` turns the same frame into one flush.
+//! Measures the buffer under the frame write path: bare `Stdout` is a 1 KiB
+//! line buffer, so a frame's escape stream leaves the process as many small
+//! write(2) calls; the TUI's 256 KiB `FrameWriter` buffer turns the same frame
+//! into one flush. That the real draw path then writes each frame once, with
+//! ratatui's own mid-frame flushes held, is checked in `app.rs` by
+//! `each_frame_reaches_the_terminal_in_one_write`.
 //!
 //! The fast check asserts the call-count contract against a counting sink.
 //! The ignored run prints timings for realistic frame sizes:
