@@ -80,7 +80,7 @@ one).
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
-| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed, or a hook file on disk is not loaded; the turn proceeded) |
+| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
 | `done` | `stop_reason` |
 | `error` | `message` |
@@ -144,7 +144,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, or on the last retry), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
-| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), or its refusal could not be persisted; the reply stands unverified |
+| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), its refusal could not be persisted, or in auto it could not start; the reply stands unverified |
 | `blocked` | A `user_prompt_submit` hook refused the prompt |
 | `cancelled` | A `cancel` command or shutdown stopped the turn |
 | `error` | The turn failed; an `error` line precedes it |

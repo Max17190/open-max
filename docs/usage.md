@@ -72,7 +72,7 @@ the prompts after it.
 | 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
 | 2 | A usage or configuration error before any turn, or `--continue` found no prior session here |
 | 3 | The project is not trusted, or trust cannot be granted from this process |
-| 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue |
+| 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue, though an `unverified` from a gate that could not start repeats until the hook is repaired |
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in

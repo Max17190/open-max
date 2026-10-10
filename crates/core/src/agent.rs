@@ -2609,10 +2609,13 @@ async fn run_loop(
     // policy the user wrote down and is not getting, so it must not be
     // something they only discover by running `openmax --check`.
     report_hook_failures(core, session_id, hooks.notices());
-    match hooks
+    let (submitted, unchecked) = hooks
         .user_prompt_submit(session_id, &user_text, project_root, &cancelled)
-        .await
-    {
+        .await;
+    // Gates that could not start let the prompt through unchecked: the
+    // frontend hears it on every prompt, the model in a policy note below.
+    report_hook_failures(core, session_id, unchecked.clone());
+    match submitted {
         PreToolResult::Block { reason } => {
             core.send_agent(session_id, AgentEvent::Error {
                 message: format!("input blocked: {reason}"),
@@ -2689,6 +2692,14 @@ async fn run_loop(
         // close the note, so both are flattened to one line.
         format!(
             "hook '{}' on {} did not load: {}",
+            crate::text::one_line(&f.hook),
+            f.event,
+            crate::text::one_line(&f.detail)
+        )
+    }));
+    startup_notices.extend(unchecked.iter().map(|f| {
+        format!(
+            "hook '{}' on {}: {}",
             crate::text::one_line(&f.hook),
             f.event,
             crate::text::one_line(&f.detail)
@@ -3043,6 +3054,13 @@ async fn run_loop(
                 // already said blockable false and continuations_left 0 - so
                 // the late site stays quiet here too: overriding the verdict
                 // is not a second end.
+                turn_end_fired = true;
+                stop_reason = "unverified".into();
+                break 'turns;
+            }
+            if outcome.unverified {
+                // A gate that could not start was reported above. It refused
+                // nothing, and the end it could not judge is not verified.
                 turn_end_fired = true;
                 stop_reason = "unverified".into();
                 break 'turns;
@@ -3624,10 +3642,20 @@ async fn run_loop(
                         // call from the next turn until restored or
                         // re-approved. Say that, not "applies next turn".
                         let note = if core.approval_mode(project_root) == ApprovalMode::Auto {
-                            match discovered.fail_closed_reason() {
-                                Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}]"),
-                                None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.]".into(),
+                            let mut note = match discovered.fail_closed_reason() {
+                                Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
+                                None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
+                            };
+                            // Named on this write, while this turn can fix
+                            // it, not at the hook's first run next turn.
+                            let unstartable = discovered.cannot_start(project_root);
+                            if !unstartable.is_empty() {
+                                if !note.ends_with('.') {
+                                    note.push('.');
+                                }
+                                note.push_str(&format!(" These cannot start as written: {}", unstartable.join(" | ")));
                             }
+                            note + "]"
                         } else if let Some(blocked) = discovered.fail_closed_reason() {
                             format!(
                                 "[hook files changed. A live gate is now failing closed: \
