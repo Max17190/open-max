@@ -89,7 +89,7 @@ pub struct Settings {
     /// value the user did not choose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// Byte cap for bash/external tool output before tail-truncation with
+    /// Byte cap for bash/external tool output before truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
     /// Compact when the estimated request (transcript plus frozen tool

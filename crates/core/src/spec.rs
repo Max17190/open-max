@@ -746,7 +746,7 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   providers.json overrides.
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
-- `max_output_bytes`: tool-output byte cap before tail-truncation with spill.
+- `max_output_bytes`: tool-output byte cap before truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction summaries. An unaffordable summary uses the deterministic digest.
