@@ -48,6 +48,28 @@ project's approval mode, and a print run declines every approval request, so
 unattended runs need `auto`: the mode a trust grant records unless you pick
 another. For a project in `ask`, select `/approvals auto` once.
 
+A print run has no overall deadline, like a TUI or stdio session. A turn keeps
+going while the endpoint sends anything, keepalives and tool call arguments
+included. An attempt that gets no reply text before the endpoint goes silent
+for the provider's idle timeout is resent, and the turn fails once the
+client's resends are spent: about 80 minutes for a dead endpoint at the
+default interval, sooner with a lower `idle_timeout_secs` (see
+[configuration](configuration.md#multiple-providers)). Silence partway through
+a reply fails the turn at once, as truncated. A tool that runs past its own
+timeout is stopped and the turn goes on. A caller that needs a deadline sets
+one, for example the `timeout_secs` of the bash call that runs a child
+`openmax -p`. A run stopped by a signal ends with that signal's status (a
+shell reports 128 plus its number); otherwise the exit code says how the run
+ended, and a turn that ends with any code but 0 skips the prompts after it.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Every turn finished |
+| 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
+| 2 | A usage or configuration error before any turn, or `--continue` found no prior session here |
+| 3 | The project is not trusted, or trust cannot be granted from this process |
+| 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue |
+
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
 [stdio protocol](stdio-protocol.md).
