@@ -1154,6 +1154,13 @@ fn parse_complete_response(
         .as_str()
         .unwrap_or(if tool_calls.is_empty() { "stop" } else { "tool_calls" })
         .to_string();
+    // The same empty reply the stream parser refuses above: a server that
+    // ignores `stream` and answers in one JSON body can end it as a tool call
+    // with nothing usable as one and no text, and returned as it came that
+    // reply ended the turn as if the model had answered.
+    if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" {
+        return Err("backend ended the reply with finish_reason tool_calls but sent no tool call".into());
+    }
     let usage = parse_usage(&v["usage"]);
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
@@ -1868,6 +1875,29 @@ mod tests {
         let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap().tool_calls;
         let calls: Vec<_> = calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect();
         assert_eq!(calls, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#), call("c2", "ping", "{}")]);
+    }
+
+    /// The one-shot mirror of the stream rule: a server that ignores `stream`
+    /// and ends a JSON reply as a tool call with nothing usable as one (a call
+    /// without a name) and no text used to parse as an empty success, so the
+    /// turn ended as if the model had answered. The same reply with text, or
+    /// with a usable call, still parses.
+    #[test]
+    fn a_one_shot_tool_calls_finish_with_no_call_and_no_text_is_an_error() {
+        let nameless = json!({"choices": [{"message": {"content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"arguments": "{}"}},
+        ]}, "finish_reason": "tool_calls"}]});
+        let err = match parse_complete_response(&nameless, &mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty tool_calls reply parsed as a success"),
+        };
+        assert!(err.contains("finish_reason tool_calls but sent no tool call"), "{err}");
+        let with_text = json!({"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "tool_calls"}]});
+        assert_eq!(parse_complete_response(&with_text, &mut |_| {}).unwrap().content, "done");
+        let with_call = json!({"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
+        ]}, "finish_reason": "tool_calls"}]});
+        assert_eq!(parse_complete_response(&with_call, &mut |_| {}).unwrap().tool_calls.len(), 1);
     }
 
     /// The bug this guards: a server that dies mid-answer sends neither
