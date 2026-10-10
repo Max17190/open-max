@@ -7,27 +7,29 @@
 //!
 //! Retries cover what can end one request before the reply exists: a
 //! transport failure on send, a rate limit or transient server error (429,
-//! 500, 502, 503, 504, 529), and a stream that died or went silent, or a
-//! stream or reply the server failed with a rate limit, an overload, or a
-//! server fault, before any reply text arrived. Each attempt resends the
-//! same bytes after an exponential backoff, stretched to a server's
-//! Retry-After, and tells the caller through [`StreamDelta::Retry`]. A 429
-//! for an exhausted quota, and a Retry-After longer than a minute, are
-//! reported at once: no wait the turn would take lets the request succeed.
-//! Once reply text has streamed, a retry would duplicate what the caller
-//! already showed, so a cut after that point is reported as a truncation
-//! instead. A failure the server reports inside a 200 response (an `error`
-//! object on the chunk or reply or on its choice, or finish_reason `error`)
-//! is never a reply, whatever partial output came with it: unless it is
-//! retried, it is an error carrying the server's own message. A cut after
-//! the server finished its reply leaves the reply finished. Reasoning deltas
-//! do not count: a retried attempt's reasoning is void, and the result
-//! carries only the final attempt's. A stream this client ends on purpose
-//! (the size cap, an out-of-range tool index, cancellation) is never
-//! retried: the next attempt would end the same way. A reply carrying only
-//! tool calls has no reply text, so a server that never sends a completion
-//! signal costs the whole budget on such a reply before its truncation is
-//! reported.
+//! 500, 502, 503, 504, 529), and a stream that died, went silent, or
+//! carried a data line this client cannot read, or a stream or reply the
+//! server failed with a rate limit, an overload, or a server fault, before
+//! any reply text arrived. Each attempt resends the same bytes after an
+//! exponential backoff, stretched to a server's Retry-After, and tells the
+//! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
+//! a Retry-After longer than a minute, are reported at once: no wait the
+//! turn would take lets the request succeed. Once reply text has streamed,
+//! a retry would duplicate what the caller already showed, so a cut after
+//! that point is reported as a truncation instead. A failure the server
+//! reports inside a 200 response (an `error` object on the chunk or reply
+//! or on its choice, or finish_reason `error`) is never a reply, whatever
+//! partial output came with it: unless it is retried, it is an error
+//! carrying the server's own message. So is a reply the server finished as
+//! `tool_calls` with no call in it and no text: returned, it would end the
+//! turn with nothing done and nothing said. A cut after the server finished
+//! its reply leaves the reply finished. Reasoning deltas do not count: a
+//! retried attempt's reasoning is void, and the result carries only the
+//! final attempt's. A stream this client ends on purpose (the size cap, an
+//! out-of-range tool index, cancellation) is never retried: the next attempt
+//! would end the same way. A reply carrying only tool calls has no reply
+//! text, so a server that never sends a completion signal costs the whole
+//! budget on such a reply before its truncation is reported.
 //!
 //! There is no overall request timeout. A local or slow endpoint can
 //! legitimately take minutes to generate, and a deadline here would look like
@@ -325,52 +327,42 @@ struct PartialToolCall {
 
 #[derive(Deserialize)]
 struct StreamChunk {
-    // A failure line may carry no choices at all.
-    #[serde(default)]
-    choices: Vec<StreamChoice>,
+    // A failure line may carry no choices at all, or `choices: null`.
+    choices: Option<Vec<StreamChoice>>,
     // Sent on the final chunk when the request asks for it via stream_options.
-    usage: Option<UsageJson>,
+    // Kept untyped and read by [`parse_usage`]: a count typed as a float
+    // (`12.0`) failed the whole chunk, and the reply text beside it.
+    usage: Option<Value>,
     // A failure the server reports after its 200 has gone out: alone on its
     // line, or beside a choice that ends with finish_reason `error`.
     error: Option<Value>,
 }
 
-#[derive(Deserialize)]
-struct UsageJson {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    prompt_tokens_details: Option<PromptTokensDetails>,
-    // Some servers report cache hits here instead of (or beside)
-    // `prompt_tokens_details.cached_tokens`. Kept untyped so a value of the
-    // wrong type in this fallback cannot fail the whole usage object, or a
-    // streamed chunk's content with it.
-    prompt_cache_hit_tokens: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct PromptTokensDetails {
-    cached_tokens: Option<u64>,
-}
-
-impl UsageJson {
-    fn into_usage(self) -> Usage {
-        Usage {
-            prompt_tokens: self.prompt_tokens.unwrap_or(0),
-            completion_tokens: self.completion_tokens.unwrap_or(0),
-            cached_tokens: self
-                .prompt_tokens_details
-                .and_then(|d| d.cached_tokens)
-                .or(self.prompt_cache_hit_tokens.and_then(|v| v.as_u64())),
-        }
+/// The usage a reply reports, or None without a usage object. Each count is
+/// read on its own, so a value of a shape this client does not expect under
+/// one key costs nothing under the others: a count that is not a whole
+/// number (a string, a fraction, a negative) reads as not reported, and a
+/// whole number typed as a float is the count.
+fn parse_usage(usage: &Value) -> Option<Usage> {
+    if !usage.is_object() {
+        return None;
     }
+    let count = |v: &Value| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64));
+    Some(Usage {
+        prompt_tokens: count(&usage["prompt_tokens"]).unwrap_or(0),
+        completion_tokens: count(&usage["completion_tokens"]).unwrap_or(0),
+        // Some servers report cache hits as a top-level
+        // `prompt_cache_hit_tokens` instead of (or beside) the details field.
+        cached_tokens: count(&usage["prompt_tokens_details"]["cached_tokens"]).or_else(|| count(&usage["prompt_cache_hit_tokens"])),
+    })
 }
 
 #[derive(Deserialize)]
 struct StreamChoice {
     finish_reason: Option<String>,
-    // Some servers omit `delta` entirely on the final finish_reason chunk.
-    #[serde(default)]
-    delta: StreamDeltaJson,
+    // Some servers omit `delta` entirely on the final finish_reason chunk,
+    // and some send it as null.
+    delta: Option<StreamDeltaJson>,
     // A failure can ride the choice instead of the chunk.
     error: Option<Value>,
 }
@@ -831,16 +823,32 @@ async fn read_sse(
             if line.is_empty() || line.first() == Some(&b':') {
                 continue;
             }
-            let data = strip_data_prefix(line);
+            let Some(data) = data_line(line) else { continue };
             if data == b"[DONE]" {
                 saw_terminator = true;
                 break 'outer;
             }
-            let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
-            if let Some(u) = chunk.usage {
-                usage = Some(u.into_usage());
+            let chunk = match serde_json::from_slice::<StreamChunk>(data) {
+                Ok(chunk) => chunk,
+                // After the server finished, only the usage or `[DONE]` was
+                // still due: the reply stands.
+                Err(_) if saw_terminator => break 'outer,
+                // A data line this client cannot read is a chunk lost. Skipped,
+                // the lines around it joined into a reply the model never
+                // sent: a tool call's arguments streamed in pieces, less the
+                // piece a proxy corrupted, named a different command and ran.
+                // So the attempt ends here, like a connection cut: started
+                // over while nothing has streamed, a truncation otherwise.
+                Err(e) => {
+                    finish_reason = TRUNCATED.into();
+                    unfinished = Some(Unfinished::Interrupted(format!("the stream carried a line this client cannot read: {e}")));
+                    break 'outer;
+                }
+            };
+            if let Some(u) = chunk.usage.as_ref().and_then(parse_usage) {
+                usage = Some(u);
             }
-            let mut choice = chunk.choices.into_iter().next();
+            let mut choice = chunk.choices.unwrap_or_default().into_iter().next();
             let error = chunk.error.or_else(|| choice.as_mut()?.error.take());
             // finish_reason `error` ends the stream, but not as a reply: it
             // is a failure even when the server sends no error to go with it.
@@ -858,7 +866,7 @@ async fn read_sse(
                 saw_terminator = true;
                 finish_reason = reason;
             }
-            let delta = choice.delta;
+            let delta = choice.delta.unwrap_or_default();
             if let Some(text) = delta.content {
                 if !text.is_empty() {
                     content.push_str(&text);
@@ -940,6 +948,16 @@ async fn read_sse(
     let tool_calls = finalize_tool_calls(partials);
     if !tool_calls.is_empty() && finish_reason == "stop" {
         finish_reason = "tool_calls".into();
+    }
+    // The server ended the reply as a tool call and sent nothing usable as
+    // one (a call without a name, say), and no text either. Returned as it
+    // came, that reply ended the turn as if the model had answered: nothing
+    // ran, nothing was said, and nothing reported it.
+    if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" && unfinished.is_none() {
+        unfinished = Some(Unfinished::Failed(ServerFailure {
+            message: "backend ended the reply with finish_reason tool_calls but sent no tool call".into(),
+            retryable: false,
+        }));
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
     let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
@@ -1089,12 +1107,14 @@ fn trim_bytes(mut s: &[u8]) -> &[u8] {
     s
 }
 
-fn strip_data_prefix(line: &[u8]) -> &[u8] {
-    const PREFIX: &[u8] = b"data:";
-    if line.starts_with(PREFIX) {
-        trim_bytes(&line[PREFIX.len()..])
-    } else {
-        line
+/// The payload of one SSE line, or None for a line that carries none: an
+/// empty `data:` line, or another field (`event:`, `id:`, `retry:`), which
+/// is passed over as the format asks. A line with no field name that opens
+/// like JSON is taken as data too, for servers that send it bare.
+fn data_line(line: &[u8]) -> Option<&[u8]> {
+    match line.strip_prefix(b"data:") {
+        Some(data) => Some(trim_bytes(data)).filter(|data| !data.is_empty()),
+        None => matches!(line.first(), Some(b'{' | b'[')).then_some(line),
     }
 }
 
@@ -1134,9 +1154,14 @@ fn parse_complete_response(
         .as_str()
         .unwrap_or(if tool_calls.is_empty() { "stop" } else { "tool_calls" })
         .to_string();
-    let usage = serde_json::from_value::<UsageJson>(v["usage"].clone())
-        .ok()
-        .map(UsageJson::into_usage);
+    // The same empty reply the stream parser refuses above: a server that
+    // ignores `stream` and answers in one JSON body can end it as a tool call
+    // with nothing usable as one and no text, and returned as it came that
+    // reply ended the turn as if the model had answered.
+    if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" {
+        return Err("backend ended the reply with finish_reason tool_calls but sent no tool call".into());
+    }
+    let usage = parse_usage(&v["usage"]);
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
     let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
@@ -1574,17 +1599,24 @@ mod tests {
     }
 
     #[test]
-    fn strip_data_prefix_bytes() {
-        assert_eq!(super::strip_data_prefix(b"data: {\"x\":1}"), b"{\"x\":1}");
-        assert_eq!(super::strip_data_prefix(b"{\"x\":1}"), b"{\"x\":1}");
+    fn data_lines_are_told_from_the_other_fields() {
+        let json = &b"{\"x\":1}"[..];
+        assert_eq!(data_line(b"data: {\"x\":1}"), Some(json));
+        assert_eq!(data_line(b"data:{\"x\":1}"), Some(json));
+        assert_eq!(data_line(b"{\"x\":1}"), Some(json));
+        assert_eq!(data_line(b"[DONE]"), Some(&b"[DONE]"[..]));
+        for field in [&b"data:"[..], b"event: message", b"id: 1", b"retry: 3000", b"tool_calls\": [{\"index\": 0}]}"] {
+            assert_eq!(data_line(field), None, "{}", String::from_utf8_lossy(field));
+        }
     }
 
     #[test]
     fn parse_sse_line_extracts_content() {
         let line = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
-        let data = super::strip_data_prefix(trim_bytes(line));
+        let data = data_line(trim_bytes(line)).unwrap();
         let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
-        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+        let delta = chunk.choices.unwrap().remove(0).delta.unwrap();
+        assert_eq!(delta.content.as_deref(), Some("hi"));
     }
 
     /// One-shot endpoint that answers with a close-delimited SSE body (no
@@ -1845,6 +1877,29 @@ mod tests {
         assert_eq!(calls, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#), call("c2", "ping", "{}")]);
     }
 
+    /// The one-shot mirror of the stream rule: a server that ignores `stream`
+    /// and ends a JSON reply as a tool call with nothing usable as one (a call
+    /// without a name) and no text used to parse as an empty success, so the
+    /// turn ended as if the model had answered. The same reply with text, or
+    /// with a usable call, still parses.
+    #[test]
+    fn a_one_shot_tool_calls_finish_with_no_call_and_no_text_is_an_error() {
+        let nameless = json!({"choices": [{"message": {"content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"arguments": "{}"}},
+        ]}, "finish_reason": "tool_calls"}]});
+        let err = match parse_complete_response(&nameless, &mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty tool_calls reply parsed as a success"),
+        };
+        assert!(err.contains("finish_reason tool_calls but sent no tool call"), "{err}");
+        let with_text = json!({"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "tool_calls"}]});
+        assert_eq!(parse_complete_response(&with_text, &mut |_| {}).unwrap().content, "done");
+        let with_call = json!({"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
+        ]}, "finish_reason": "tool_calls"}]});
+        assert_eq!(parse_complete_response(&with_call, &mut |_| {}).unwrap().tool_calls.len(), 1);
+    }
+
     /// The bug this guards: a server that dies mid-answer sends neither
     /// `[DONE]` nor a finish_reason, and the partial reply used to come back
     /// as a normal "stop": a cut-off answer no client could tell from a
@@ -2023,6 +2078,40 @@ mod tests {
             let usage = usage_of(json!({"prompt_tokens":100,"prompt_cache_hit_tokens":bad}));
             assert_eq!((usage.prompt_tokens, usage.cached_tokens), (100, None));
         }
+    }
+
+    /// A chunk with one field of a shape this client did not expect (`delta:
+    /// null` on the finish chunk, token counts typed `12.0`, `choices: null`
+    /// on the usage chunk) failed as a whole and vanished with everything it
+    /// carried: a reply whose finish chunk was the one lost came back
+    /// truncated, and one whose usage chunk was lost its last words.
+    #[tokio::test]
+    async fn a_null_delta_or_a_float_count_keeps_the_chunk() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":null,\"finish_reason\":\"length\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("the answer", "length"));
+
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":12.0,\"completion_tokens\":3.0,\"prompt_tokens_details\":{\"cached_tokens\":8.0}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("the answer", "stop"));
+        let usage = result.usage.expect("whole counts typed as floats are counts");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens), (12, 3, Some(8)));
+
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":null,\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!(result.usage.map(|u| (u.prompt_tokens, u.completion_tokens)), Some((12, 3)));
     }
 
     /// An endpoint that answers successive connections with successive
@@ -2324,6 +2413,78 @@ mod tests {
         assert_eq!(served, 2);
         assert_eq!(result.content, "all of it");
         assert_eq!(result.reasoning_content.as_deref(), Some("fresh"));
+    }
+
+    /// A data line a proxy split in two with a stray newline is one this
+    /// client cannot read. Skipped, the lines around it joined: a call whose
+    /// arguments streamed as `{"command": "rm -rf ./build`, `/cache`, `"}`
+    /// came back without the middle piece as `rm -rf ./build`, finished as
+    /// `tool_calls`, and ran. The attempt ends at that line instead: a reply
+    /// nothing of which has streamed starts over, and one that has comes
+    /// back truncated, which the agent loop never dispatches.
+    #[tokio::test]
+    async fn an_unreadable_stream_line_ends_the_attempt() {
+        let piece = |call: Value| format!("data: {}\n\n", json!({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": null}]}));
+        let opening = piece(json!({"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{\"command\": \"rm -rf ./build"}}));
+        let middle = piece(json!({"index": 0, "function": {"arguments": "/cache"}}));
+        let (head, tail) = middle.split_at(40);
+        let closing = piece(json!({"index": 0, "function": {"arguments": "\"}"}}));
+        let corrupted = format!("{opening}{head}\n{tail}{closing}data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+        let good = "data: {\"choices\":[{\"delta\":{\"content\":\"cleaned\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+        let (result, deltas, served) = stream_sequence(vec![corrupted.clone(), good.into()]).await;
+        assert_eq!(served, 2, "the attempt was started over");
+        assert!(result.tool_calls.is_empty(), "{:?}", result.tool_calls.iter().map(|c| &c.function.arguments).collect::<Vec<_>>());
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("cleaned", "stop"));
+        assert_eq!(deltas.len(), 2, "{deltas:?}");
+        assert!(deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:the stream carried a line this client cannot read")), "{}", deltas[0]);
+
+        let shown = "data: {\"choices\":[{\"delta\":{\"content\":\"Clearing.\"},\"finish_reason\":null}]}\n\n";
+        let (result, _, served) = stream_sequence(vec![format!("{shown}{corrupted}"), good.into()]).await;
+        assert_eq!(served, 1, "reply text already shown is never generated twice");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("Clearing.", TRUNCATED));
+
+        // After the finish chunk, nothing of the reply was still due: an
+        // unreadable usage line costs the usage alone.
+        let finished = "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let result = stream_once(&format!("{finished}data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\"\n\ndata: [DONE]\n\n")).await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert!(result.usage.is_none());
+    }
+
+    /// The other SSE fields and comments are passed over, never read as data:
+    /// ending the attempt on them would fail every server that sends
+    /// `event:` or `id:` lines, or keepalive comments, beside its chunks.
+    #[tokio::test]
+    async fn field_lines_and_comments_between_chunks_are_passed_over() {
+        let result = stream_once(concat!(
+            "event: message\nid: 1\nretry: 3000\ndata:{\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":null}]}\n\n",
+            ": keepalive\n\n",
+            "data:\n\n",
+            "event: message\ndata:{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data:[DONE]\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+    }
+
+    /// The server ended the reply as a tool call (finish_reason `tool_calls`)
+    /// and the one call it streamed has no name, so there is nothing to run,
+    /// and no text, so nothing to show. Returned as it came, that reply ended
+    /// the turn as if the model had answered, with nothing done and nothing
+    /// reported. It is a failure of the server's, not one a resend outlasts.
+    #[tokio::test]
+    async fn a_tool_calls_finish_with_no_call_and_no_text_is_an_error() {
+        let nameless = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n";
+        let finish = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        let (result, _, served) = try_stream_sequence(vec![format!("{nameless}{finish}")]).await;
+        assert_eq!(served, 1);
+        let Err(err) = result else { panic!("nothing to run and nothing to show is not a reply") };
+        assert!(err.contains("finish_reason tool_calls but sent no tool call"), "{err}");
+        // With text, the model answered, whatever it called the finish.
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":null}]}\n\n";
+        let result = stream_once(&format!("{text}{nameless}{finish}")).await;
+        assert_eq!((result.content.as_str(), result.tool_calls.len()), ("Done.", 0));
     }
 
     /// A refusal for [`spawn_sse_sequence`] to send verbatim: `status`, any
