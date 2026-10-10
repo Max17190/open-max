@@ -190,8 +190,18 @@ Optional rules under `.openmax/permissions.toml` or
 `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty
 discovery is free. First match wins. In `auto`, valid `allow` rules need no
 content approval and `ask` rules do not prompt; `deny` still blocks. In `ask`,
-project `allow` rules require content approval. Order: hooks pre → permissions →
-`approval_mode` → execute → hooks post.
+`allow` rules in either file are inert until a human approves that exact
+content with `openmax --approve <path>`, run in the directory the session
+starts in (`openmax --check` prints the command with that `cd`). The global
+file is no exception: `bash` can append to it from any session, and an
+unapproved global `allow` would otherwise skip the prompt in every `ask`
+project. The approval is per directory and per content. Unlike trust and the
+approval mode, it is not inherited, so a session started in a subdirectory, or
+a delegated `-p` child in a worktree under the project, needs its own. Any edit
+to the global file makes its `allow` rules inert again everywhere until it is
+approved again from each directory, and headless `-p` runs in `ask` decline
+those calls meanwhile. Order: hooks pre → permissions → `approval_mode` →
+execute → hooks post.
 
 ```toml
 # .openmax/permissions.toml

@@ -105,12 +105,13 @@ not the Git repository: a worktree outside the root, such as one made with
 choice and needs its own.
 
 - `auto` runs authorized work without confirmation, including newly created
-  or repaired tools, hooks, and project permission `allow` rules. It ignores
+  or repaired tools, hooks, and permission `allow` rules. It ignores
   permission `ask` requests. It neither reads nor creates content approval
   records.
 - `ask` prompts for mutating calls unless a permission `allow` applies, and
-  always prompts for unapproved external tool content. Hooks and project
-  permission `allow` rules still require content approval.
+  always prompts for unapproved external tool content. Hooks and permission
+  `allow` rules, project or global, still require content approval for the
+  directory the session starts in; unlike the mode, it is not inherited.
 - `readonly` blocks mutating calls and calls that would require confirmation.
 
 Deny rules, hook gates, parsing, output limits, and execution reports remain
