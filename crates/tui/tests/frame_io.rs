@@ -294,6 +294,16 @@ mod first_frame {
     impl Drop for Session {
         fn drop(&mut self) {
             let _ = self.child.kill();
+            // A killed child cannot finish exiting while output it wrote sits
+            // unread in its terminal, so a test that panics before reading
+            // everything would hang in `wait` instead of failing. Drain until
+            // it is reaped or the terminal closes, bounded.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                if !self.pump(Duration::from_millis(20)) {
+                    break;
+                }
+            }
             let _ = self.child.wait();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
