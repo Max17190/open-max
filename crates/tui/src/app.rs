@@ -504,16 +504,6 @@ async fn event_loop(
     // can be gated on `input_rx.is_empty()` — a token firehose must never
     // starve a keypress (crossterm's EventStream itself is not peekable).
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut term_events = crossterm::event::EventStream::new();
-        while let Some(ev) = term_events.next().await {
-            let Ok(e) = ev else { break };
-            if input_tx.send(e).is_err() {
-                break;
-            }
-        }
-        // Dropping input_tx closes the channel; the loop reads that as quit.
-    });
 
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -536,12 +526,35 @@ async fn event_loop(
     // State the initial presence in the title; transitions are edge-driven.
     app.emit_presence_title();
 
+    // The keyboard protocol probe goes out behind the first frame, so that
+    // frame never waits on the terminal's answer, and input starts after it,
+    // since the event stream would read that answer itself. Keys pressed
+    // meanwhile wait in crossterm's queue.
+    let (probed_tx, mut probed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(crate::enable_keyboard_enhancement).await;
+        let _ = probed_tx.send(());
+        let mut term_events = crossterm::event::EventStream::new();
+        while let Some(ev) = term_events.next().await {
+            let Ok(e) = ev else { break };
+            if input_tx.send(e).is_err() {
+                break;
+            }
+        }
+        // Dropping input_tx closes the channel; the loop reads that as quit.
+    });
+    // No frame is written while the probe waits, so none can cut into its
+    // query or the flags pushed on its answer. Input has not started, so no
+    // keypress waits on this.
+    let mut probing = true;
+
     loop {
         let mut wake = Wake::Other;
         tokio::select! {
             biased;
             // First, so a signal cannot wait behind a token stream.
             _ = &mut quit => app.should_quit = true,
+            _ = &mut probed, if probing => probing = false,
             // Streaming sits above input but is gated on the input queue
             // being empty: input-first would let held keys starve redraws,
             // while the gate keeps cancel/quit ahead of the firehose.
@@ -598,7 +611,7 @@ async fn event_loop(
             tick = tokio::time::interval(desired_tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
-        if app.dirty.any() {
+        if app.dirty.any() && !probing {
             let now = Instant::now();
             match paint_pacing(now, last_draw, last_drew_input, resize_hold, wake) {
                 Paint::Now => {
@@ -612,6 +625,12 @@ async fn event_loop(
                 Paint::At(when) => draw_deadline = Some(when),
             }
         }
+    }
+    // Only a signal ends the loop this early. The terminal stays raw until
+    // the probe has its answer: restored first, the answer would reach the
+    // shell as typed text.
+    if probing {
+        let _ = probed.await;
     }
     Ok(())
 }
