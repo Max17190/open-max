@@ -42,6 +42,9 @@ libc.workspace = true
 [dev-dependencies]
 # The release test reads Cargo.toml the way cargo-dist does, as TOML.
 toml.workspace = true
+# Paused time: print mode's wait on a quiet turn is checked across an hour
+# that passes in no real time.
+tokio = { workspace = true, features = ["test-util"] }
 
 # The MCP bridge tests run their own binary again as a fixture MCP server. A
 # libtest binary prints its banner on stdout before any test runs, and stdout
