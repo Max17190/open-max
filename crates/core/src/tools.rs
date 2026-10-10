@@ -504,42 +504,155 @@ fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
         std::io::ErrorKind::InvalidData => ToolOutcome::err(format!("{rel} is not a UTF-8 text file")),
         _ => ToolOutcome::err(format!("cannot read {rel}: {e}")),
     };
-    let total = match std::fs::metadata(&path) {
+    let (file, meta) = match open_regular(&path) {
+        Ok(opened) => opened,
         // A directory fails to read like any unreadable path; calling it a
         // file that is not UTF-8 sends the model after an encoding problem.
-        Ok(m) if m.is_dir() => {
+        Err(NotRegular::Directory) => {
             return ToolOutcome::err(format!("{rel} is a directory; use list_dir to see its entries"))
         }
-        // The cap keeps a whole-file read of a huge file out of memory. A
-        // window of one streams instead: this refusal tells the model to
-        // ask for one, and refusing that too leaves it nothing to retry. It
-        // names nothing else, because grep skips a file this large.
-        Ok(m) if m.len() > MAX_FILE_BYTES && !asked_for_window => {
-            return ToolOutcome::err(format!(
-                "file too large ({} bytes); read a range of lines with offset and limit",
-                m.len()
-            ))
-        }
-        Ok(m) if m.len() > MAX_FILE_BYTES => match stream_window(&path, &mut window, cancel) {
+        Err(e) => return ToolOutcome::err(e.message(rel)),
+    };
+    // The cap keeps a whole-file read of a huge file out of memory. A
+    // window of one streams instead: this refusal tells the model to
+    // ask for one, and refusing that too leaves it nothing to retry. It
+    // names nothing else, because grep skips a file this large.
+    if meta.len() > MAX_FILE_BYTES && !asked_for_window {
+        return ToolOutcome::err(format!(
+            "file too large ({} bytes); read a range of lines with offset and limit",
+            meta.len()
+        ));
+    }
+    let total = if meta.len() > MAX_FILE_BYTES {
+        match stream_window(file, &mut window, cancel) {
             Ok(total) => total,
             Err(_) if cancel.is_cancelled() => return ToolOutcome::err("tool cancelled by user"),
             Err(e) => return read_error(e),
-        },
-        Ok(_) => {
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => return read_error(e),
-            };
-            for (i, line) in text.lines().enumerate().skip(window.offset - 1).take(window.limit) {
-                if !window.push(i + 1, line, line.len()) {
-                    break;
-                }
-            }
-            text.lines().count()
         }
-        Err(e) => return ToolOutcome::err(format!("cannot read {rel}: {e}")),
+    } else {
+        let text = match read_all(file) {
+            Ok(t) => t,
+            Err(e) => return read_error(e),
+        };
+        for (i, line) in text.lines().enumerate().skip(window.offset - 1).take(window.limit) {
+            if !window.push(i + 1, line, line.len()) {
+                break;
+            }
+        }
+        text.lines().count()
     };
     window.finish(rel, total)
+}
+
+/// Why `open_regular` or `write_regular` found no regular file to read or
+/// write.
+enum NotRegular {
+    Directory,
+    /// What stands at the path instead: a named pipe, a socket or a device.
+    Special(&'static str),
+    Io(std::io::Error),
+}
+
+impl NotRegular {
+    /// The reason to give the model for `rel`.
+    fn message(&self, rel: &str) -> String {
+        match self {
+            Self::Directory => format!("{rel} is a directory, not a regular file"),
+            Self::Special(kind) => format!("{rel} is a {kind}, not a regular file"),
+            Self::Io(e) => format!("cannot read {rel}: {e}"),
+        }
+    }
+}
+
+/// Open the regular file at `path` for reading, with its metadata.
+///
+/// Opening a named pipe waits for a writer, and reading a pipe or a device
+/// takes whatever arrives for as long as it keeps coming, so a file tool
+/// sent to one could wait indefinitely: a started mutation is waited for,
+/// so Esc could not end the turn, and the process waits on the blocked
+/// thread at exit, so neither could /quit. Opening one at all is not free
+/// either: a writer blocked on a pipe wakes, then loses its reader at the
+/// close. So the kind is looked up before the open, and read again from
+/// the descriptor the open returns, which does not wait, so a path swapped
+/// in between cannot slip into the read.
+fn open_regular(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), NotRegular> {
+    if let Some(kind) = std::fs::metadata(path).ok().as_ref().and_then(not_regular) {
+        return Err(kind);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(NotRegular::Io)?;
+    let meta = file.metadata().map_err(NotRegular::Io)?;
+    match not_regular(&meta) {
+        None => Ok((file, meta)),
+        Some(kind) => Err(kind),
+    }
+}
+
+/// What a file that is not a regular file is, or None for one that is.
+fn not_regular(meta: &std::fs::Metadata) -> Option<NotRegular> {
+    let kind = meta.file_type();
+    if kind.is_file() {
+        return None;
+    }
+    if kind.is_dir() {
+        return Some(NotRegular::Directory);
+    }
+    #[cfg(unix)]
+    let name = {
+        use std::os::unix::fs::FileTypeExt;
+        if kind.is_fifo() {
+            "named pipe"
+        } else if kind.is_socket() {
+            "socket"
+        } else if kind.is_block_device() || kind.is_char_device() {
+            "device"
+        } else {
+            "special file"
+        }
+    };
+    #[cfg(not(unix))]
+    let name = "special file";
+    Some(NotRegular::Special(name))
+}
+
+/// The whole of an opened file as text.
+fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text)?;
+    Ok(text)
+}
+
+/// Replace the contents of the regular file at `path`, creating it if absent.
+///
+/// The file tools read a path before they write it, and a named pipe
+/// swapped in between would hold a plain write's open waiting for a reader,
+/// in a mutation Esc cannot cancel. So the open neither waits nor
+/// truncates, and nothing is written until the descriptor shows a regular
+/// file.
+fn write_regular(path: &Path, content: &str) -> Result<(), NotRegular> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        // A pipe with no reader refuses an open that does not wait.
+        Err(e) => return Err(std::fs::metadata(path).ok().as_ref().and_then(not_regular).unwrap_or(NotRegular::Io(e))),
+    };
+    if let Some(kind) = not_regular(&file.metadata().map_err(NotRegular::Io)?) {
+        return Err(kind);
+    }
+    file.set_len(0).map_err(NotRegular::Io)?;
+    std::io::Write::write_all(&mut file, content.as_bytes()).map_err(NotRegular::Io)
 }
 
 /// The numbered lines one read_file call returns.
@@ -615,8 +728,8 @@ impl ReadWindow {
 ///
 /// The count reads to the end of a file of any size, so the read stops once
 /// the call is cancelled: the caller has stopped waiting for it by then.
-fn stream_window(path: &Path, window: &mut ReadWindow, cancel: &CancelToken) -> std::io::Result<usize> {
-    let file = Cancellable { file: std::fs::File::open(path)?, cancel };
+fn stream_window(file: std::fs::File, window: &mut ReadWindow, cancel: &CancelToken) -> std::io::Result<usize> {
+    let file = Cancellable { file, cancel };
     let mut reader = std::io::BufReader::new(file);
     let mut kept = Vec::new();
     let mut n = 0;
@@ -757,14 +870,21 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
     };
-    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let old = match open_regular(&path) {
+        Ok((file, _)) => read_all(file).unwrap_or_default(),
+        // Nothing there yet, or nothing readable: the write decides.
+        Err(NotRegular::Io(_)) => String::new(),
+        Err(e) => return ToolOutcome::err(e.message(rel)),
+    };
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return ToolOutcome::err(format!("cannot create directories: {e}"));
         }
     }
-    if let Err(e) = std::fs::write(&path, content) {
-        return ToolOutcome::err(format!("cannot write {rel}: {e}"));
+    match write_regular(&path, content) {
+        Ok(()) => {}
+        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
+        Err(e) => return ToolOutcome::err(e.message(rel)),
     }
     changed_file("wrote", root, &path, &old, content)
 }
@@ -897,9 +1017,9 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
     };
-    let old = match std::fs::read_to_string(&path) {
+    let old = match open_regular(&path).and_then(|(file, _)| read_all(file).map_err(NotRegular::Io)) {
         Ok(t) => t,
-        Err(e) => return ToolOutcome::err(format!("cannot read {rel}: {e}")),
+        Err(e) => return ToolOutcome::err(e.message(rel)),
     };
 
     // read_file and grep show lines without their \r, so text copied from
@@ -945,8 +1065,10 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(hint);
     };
 
-    if let Err(e) = std::fs::write(&path, &new) {
-        return ToolOutcome::err(format!("cannot write {rel}: {e}"));
+    match write_regular(&path, &new) {
+        Ok(()) => {}
+        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
+        Err(e) => return ToolOutcome::err(e.message(rel)),
     }
     changed_file("edited", root, &path, &old, &new)
 }
@@ -1721,6 +1843,62 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.output);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "settled");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The file tools read a path before they write it. A named pipe
+    /// swapped in between held a plain write's open waiting for a reader,
+    /// in a mutation Esc cannot cancel. The write itself refuses a pipe at
+    /// once, with a reader attached or none, and leaves it a pipe.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_refuses_a_pipe_without_waiting_on_it() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        let root = temp_project();
+        let pipe = root.join("pipe");
+        // On a failure, let a write still waiting on the pipe through, so its
+        // thread ends, and take the project away.
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&self.1);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone(), pipe.clone());
+        let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let target = pipe.clone();
+        std::thread::spawn(move || {
+            let alone = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&target).unwrap();
+            let attached = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            drop(reader);
+            let _ = done_tx.send((alone, attached));
+        });
+        let (alone, attached) =
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the write must not wait on the pipe");
+        let refusal = Some("pipe is a named pipe, not a regular file".to_string());
+        assert_eq!(alone, refusal, "no reader attached");
+        assert_eq!(attached, refusal, "a reader attached");
+        assert!(std::fs::symlink_metadata(&pipe).unwrap().file_type().is_fifo());
+    }
+
+    /// Reading a device takes whatever it hands out for as long as it keeps
+    /// coming, and a write to one is not a file edit. With the project at
+    /// /dev, each file tool names the device and leaves it alone.
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_name_a_device() {
+        let root = Path::new("/dev");
+        let refusal = (false, "null is a device, not a regular file");
+        let out = read_file(root, &json!({"path": "null"}));
+        assert_eq!((out.ok, out.output.as_str()), refusal);
+        let out = write_file(root, &json!({"path": "null", "content": "x\n"}));
+        assert_eq!((out.ok, out.output.as_str()), refusal);
+        let out = edit_file(root, &json!({"path": "null", "old_string": "a", "new_string": "b"}));
+        assert_eq!((out.ok, out.output.as_str()), refusal);
     }
 
     #[test]
@@ -3172,6 +3350,11 @@ mod tests {
         assert_eq!(out.output, "src is a directory; use list_dir to see its entries");
         let out = read_file(&root, &json!({"path": "."}));
         assert!(!out.ok && out.output.starts_with(". is a directory"), "{}", out.output);
+        let out = write_file(&root, &json!({"path": "src", "content": "x\n"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "src is a directory, not a regular file"));
+        let out = edit_file(&root, &json!({"path": "src", "old_string": "a", "new_string": "b"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "src is a directory, not a regular file"));
+        assert!(root.join("src/a.rs").is_file(), "the directory is left as it was");
 
         let out = read_file(&root, &json!({}));
         assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
