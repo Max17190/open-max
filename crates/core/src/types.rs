@@ -164,7 +164,7 @@ pub enum AgentEvent {
     /// The model request is being resent: `attempt` goes out after a
     /// backoff, and `max_attempts` is the attempt the request ends on if it
     /// keeps failing the same way (the budget, or sooner while the latest
-    /// attempts in a row have not reached the endpoint), `reason` having
+    /// attempts in a row failed to connect or timed out), `reason` having
     /// ended the previous one (a transport failure, a 429 or transient 5xx,
     /// or, before any reply text, a stream that died or went silent, or a
     /// stream or reply the provider failed with a rate limit, an overload,

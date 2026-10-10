@@ -235,13 +235,13 @@ pub enum StreamDelta {
     /// The request is being resent: `attempt` is the one about to go out,
     /// after `reason` ended the previous one, and `max_attempts` the one the
     /// request ends on if it keeps failing that way. That is the budget, or,
-    /// while the latest attempts in a row have not reached the endpoint, the
+    /// while the latest attempts in a row failed to connect or timed out, the
     /// one that makes [`UNREACHED_ATTEMPTS`] of them if that comes first, so
-    /// it rises again when one does. It is announced before the backoff
-    /// wait, which is what the caller is waiting through; a cancellation
-    /// during the wait ends the request instead, and the attempt never goes
-    /// out. Any reasoning streamed for the failed attempt is void; no
-    /// content was.
+    /// it rises again when an attempt ends any other way. It is announced
+    /// before the backoff wait, which is what the caller is waiting through;
+    /// a cancellation during the wait ends the request instead, and the
+    /// attempt never goes out. Any reasoning streamed for the failed attempt
+    /// is void; no content was.
     Retry { attempt: u32, max_attempts: u32, reason: String },
 }
 
@@ -453,7 +453,7 @@ impl ChatClient {
                     // take minutes. `stream_chat` ends an attempt on silence.
                     .redirect(reqwest::redirect::Policy::custom(same_server_redirect));
                 // Tests talk to stub servers on loopback, which a developer's
-                // proxy variables must not reroute (see [`env_proxy`]).
+                // proxy variables must not reroute (see [`through_proxy`]).
                 #[cfg(test)]
                 let builder = builder.no_proxy();
                 builder.build().expect("failed to build http client")
@@ -592,7 +592,7 @@ impl ChatClient {
                     unreached = if e.is_connect() || e.is_timeout() { unreached + 1 } else { 0 };
                     // The attempt this request ends on if it keeps failing
                     // this way: the budget, or, while the latest attempts
-                    // have not reached the endpoint, the one that makes
+                    // failed to connect or timed out, the one that makes
                     // UNREACHED_ATTEMPTS of them in a row, if that comes
                     // first. The retry line counts to it, not to a budget a
                     // dead address never spends.
@@ -600,7 +600,7 @@ impl ChatClient {
                         0 => MAX_ATTEMPTS,
                         n => MAX_ATTEMPTS.min(attempt + UNREACHED_ATTEMPTS - n),
                     };
-                    let (msg, repair) = never_connected(&e, e.url().is_some_and(env_proxy))
+                    let (msg, repair) = never_connected(&e, e.url().is_some_and(through_proxy))
                         .unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
                     if attempt < last && is_transient_transport(&e) {
                         if !retry_after(attempt, last, &msg, &cancelled, &mut on_delta).await {
@@ -1301,8 +1301,7 @@ fn describe_transport(e: &reqwest::Error) -> String {
 /// chain: there the details are the diagnosis. That includes a timeout
 /// outside the connect phase, such as TCP keepalive giving up on a server
 /// that took the request and then went away. None as well when the client
-/// that sent it may have gone through a proxy (`proxied`, see
-/// [`env_proxy`]).
+/// that sent it went through a proxy (`proxied`, see [`through_proxy`]).
 fn never_connected(e: &reqwest::Error, proxied: bool) -> Option<(String, &'static str)> {
     use std::error::Error;
     if !e.is_connect() || proxied {
@@ -1342,19 +1341,22 @@ fn never_connected(e: &reqwest::Error, proxied: bool) -> Option<(String, &'stati
     Some((format!("cannot connect to {server} ({cause})"), repair))
 }
 
-/// Whether the shared HTTP client may have sent a request to `url` through
-/// a proxy named in the environment, which it reads as curl does. A failure
-/// to reach that proxy carries the same causes as one to reach the
-/// endpoint, and naming the endpoint (with advice to start it or fix
-/// base_url) would send the user the wrong way, so such a failure keeps the
-/// chain. The test build's client reads no proxy variables, so neither does
-/// this.
-fn env_proxy(url: &reqwest::Url) -> bool {
+/// Whether the shared HTTP client sent a request to `url` through a proxy.
+/// It asks the matcher the client itself decides with (the proxy variables
+/// as curl reads them, NO_PROXY included), so the answer is the one the
+/// request got. A failure to reach that proxy carries the same causes as
+/// one to reach the endpoint, and naming the endpoint (with advice to start
+/// it or fix base_url) would send the user the wrong way, so such a failure
+/// keeps the chain, as does a URL the matcher cannot read. The test build's
+/// client reads no proxy settings, so neither does this.
+fn through_proxy(url: &reqwest::Url) -> bool {
     if cfg!(test) {
         return false;
     }
-    let scheme = if url.scheme() == "https" { ["HTTPS_PROXY", "https_proxy"] } else { ["HTTP_PROXY", "http_proxy"] };
-    scheme.into_iter().chain(["ALL_PROXY", "all_proxy"]).any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
+    match url.as_str().parse() {
+        Ok(uri) => hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&uri).is_some(),
+        Err(_) => true,
+    }
 }
 
 /// OpenAI-compatible servers wrap failures in `{"error": {"message": ...}}`.

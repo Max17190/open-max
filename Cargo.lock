@@ -930,6 +930,7 @@ version = "2026.10.0"
 dependencies = [
  "futures-util",
  "globset",
+ "hyper-util",
  "ignore",
  "libc",
  "regex",

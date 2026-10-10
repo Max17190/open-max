@@ -1383,14 +1383,12 @@ fn refused_connection_names_the_host_and_the_cause() {
     let (project, home) = fresh_dirs("refused");
     let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     write_settings(&home, &format!("http://{addr}/v1"));
-    let run = |proxy: Option<String>| {
+    let run = |env: &[(&str, &str)]| {
         let mut command = cmd(&project, &home);
         for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
             command.env_remove(var);
         }
-        if let Some(proxy) = proxy {
-            command.env("HTTP_PROXY", proxy);
-        }
+        command.envs(env.iter().copied());
         let out = finish_with_deadline(
             command.args(["--trust-project", "-p", "say hi"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
         );
@@ -1398,26 +1396,30 @@ fn refused_connection_names_the_host_and_the_cause() {
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
 
-    let stderr = run(None);
     let reason = format!("cannot connect to {addr} (connection refused)");
-    let failure: Vec<&str> = stderr.lines().skip_while(|line| !line.contains(&reason)).collect();
-    assert_eq!(
-        failure,
-        [
-            format!("openmax: {reason}; retrying (2 of 3)"),
-            format!("openmax: {reason}; retrying (3 of 3)"),
-            format!("openmax: error: {reason}: nothing is listening there; start the server or fix base_url (openmax --spec settings)"),
-        ],
-        "stderr: {stderr}"
-    );
+    let expected = [
+        format!("openmax: {reason}; retrying (2 of 3)"),
+        format!("openmax: {reason}; retrying (3 of 3)"),
+        format!("openmax: error: {reason}: nothing is listening there; start the server or fix base_url (openmax --spec settings)"),
+    ];
+    let failure = |stderr: &str| -> Vec<String> {
+        stderr.lines().skip_while(|line| !line.contains(&reason)).map(str::to_string).collect()
+    };
+    let stderr = run(&[]);
+    assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
 
     // Through a proxy that refuses, the refusal is the proxy's: naming the
     // endpoint and advising to start it would send the user the wrong way,
     // so the error keeps the client's own account.
-    let proxy = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-    let stderr = run(Some(format!("http://{proxy}")));
+    let proxy = format!("http://{}", TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let stderr = run(&[("HTTP_PROXY", &proxy)]);
     assert!(!stderr.contains("cannot connect to") && !stderr.contains("start the server"), "stderr: {stderr}");
     assert!(stderr.contains("openmax: error: request failed: error sending request"), "stderr: {stderr}");
+
+    // A proxy that NO_PROXY exempts the endpoint from never saw the request,
+    // which is the common setup for a local server behind a proxy.
+    let stderr = run(&[("HTTP_PROXY", &proxy), ("NO_PROXY", "127.0.0.1")]);
+    assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
