@@ -319,7 +319,11 @@ Full instructions, checklists, and commands, read on demand.
 Activation: automatic when extension bytes change, checked between
 iterations after every executed mutating call (a failed call that wrote
 the file still activates it) and at turn start; `/reload`
-forces it now. Verify with `openmax --check`.
+forces it now. A skill change leaves the system prompt as it is, so the
+prompt cache survives: the refreeze receipt carries each new or changed
+index line, and the prompt's own index catches up when a change to the
+tool set rebuilds it, on `/reload`, or when a resumed session finds its
+extensions changed. Verify with `openmax --check`.
 "#;
 
 const PROMPTS: &str = r#"# Prompt templates
@@ -815,7 +819,9 @@ Fields (the file IS the contract):
   no describable first line is ignored.
 - body: free-form markdown, any length, read on demand with read_file.
 
-Index: at session creation (and /reload or a re-freeze) live memories are
+Index: whenever the prompt is built (session creation, /reload, a resumed
+session's first turn when its extensions changed, or a re-freeze that
+changes the tool set) live memories are
 ranked and injected as one line each - `- name: description — path` - under a
 1500-byte budget, strongest first, with a trailer counting what did not fit.
 No memories, no section, zero prompt cost.
@@ -847,10 +853,11 @@ history that keeps a fact alive.
 
 Activation: a memory write does not re-freeze. The index is frozen with the
 prompt, and rewriting the prompt would discard the provider's prompt cache to
-show you a fact your own write already put in context. The index rebuilds at
-session creation, /reload, and any re-freeze a tool or skill change causes
-(that receipt then says "Memory index rebuilt with this refreeze (indexed:
-<name>)"). Verify what you wrote with `openmax --check` (it names every
+show you a fact your own write already put in context. The index rebuilds
+with the prompt: at session creation, /reload, a resumed session's first
+turn when its extensions changed, and any re-freeze that changes the tool
+set (that receipt then says "Memory index rebuilt with this refreeze
+(indexed: <name>)"). Verify what you wrote with `openmax --check` (it names every
 ignored file and why; `--all` adds what the index will show).
 
 ## Searching what was kept

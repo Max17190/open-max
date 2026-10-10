@@ -2044,6 +2044,16 @@ fn refreeze_receipt_text(
             delta.capped_tools.join(", ")
         ));
     }
+    if !delta.index_lines.is_empty() || !delta.index_removed.is_empty() {
+        let mut listed = delta.index_lines.clone();
+        if !delta.index_removed.is_empty() {
+            listed.push(format!("removed: {}", delta.index_removed.join(", ")));
+        }
+        note.push_str(&format!(
+            " Skills index changes (your system prompt keeps its earlier index): {}.",
+            listed.join("; ")
+        ));
+    }
     if !delta.unindexed.is_empty() {
         let listed: Vec<String> = delta
             .unindexed
@@ -2124,6 +2134,11 @@ struct RefreezeDelta {
     /// (name, why): skills whose file this generation added or modified, or
     /// that the outgoing index carried, that the index now leaves out.
     unindexed: Vec<(String, String)>,
+    /// When the refreeze kept the system prompt: the index lines this
+    /// generation gained or changed, and the names it lost because the skill
+    /// is gone. A rebuilt prompt shows its own index, so both stay empty.
+    index_lines: Vec<String>,
+    index_removed: Vec<String>,
     /// Memory index delta (added, updated, removed stems), when both
     /// generations know their memory files. Memory is not in the fingerprint,
     /// so this is what a refreeze caused by something else (a tool or skill
@@ -2137,6 +2152,7 @@ fn refreeze_delta(
     mode: ApprovalMode,
     data_dir: &Path,
     project_root: &Path,
+    kept_prefix: bool,
 ) -> RefreezeDelta {
     use crate::registry::ToolKind;
     let memory = match (&old_registry.memory_files, &new_registry.memory_files) {
@@ -2225,23 +2241,47 @@ fn refreeze_delta(
             out.capped_tools.push(name.clone());
         }
     }
-    let indexed = |registry: &Registry| -> std::collections::HashSet<String> {
-        crate::prompt::skill_index_costs(project_root, &registry.skills)
+    // Each skill's index line, for the skills the index carries.
+    let indexed = |registry: &Registry| -> std::collections::HashMap<String, String> {
+        crate::prompt::skill_index_lines(project_root, &registry.skills)
             .into_iter()
-            .filter(|(_, cost)| *cost > 0)
-            .map(|(name, _)| name)
+            .zip(&registry.skills)
+            .filter(|((_, included), _)| *included)
+            .map(|((line, _), skill)| (skill.name.clone(), line.trim_end().to_string()))
             .collect()
     };
     let (was_indexed, now_indexed) = (indexed(old_registry), indexed(new_registry));
+    if kept_prefix {
+        // The system prompt still shows the outgoing index, so the receipt
+        // carries every line it gained or changed and every name it lost.
+        for skill in &new_registry.skills {
+            let Some(line) = now_indexed.get(&skill.name) else { continue };
+            if was_indexed.get(&skill.name) != Some(line) {
+                out.index_lines.push(line.clone());
+            }
+        }
+        let discovered: std::collections::HashSet<&str> = new_registry
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .chain(new_registry.capped_skills.iter().map(|(name, _)| name.as_str()))
+            .collect();
+        out.index_removed = was_indexed
+            .keys()
+            .filter(|name| !discovered.contains(name.as_str()))
+            .cloned()
+            .collect();
+        out.index_removed.sort();
+    }
     let listed = new_registry.skills.iter().map(|skill| (&skill.name, &skill.path, false));
     let capped = new_registry.capped_skills.iter().map(|(name, path)| (name, path, true));
     for (name, path, over_count) in listed.chain(capped) {
         // A same-directory collision's winner is settled by its own clause.
         let collided = new_registry.shadowed_skills.iter().any(|(n, ..)| n == name);
-        if now_indexed.contains(name) || collided {
+        if now_indexed.contains_key(name) || collided {
             continue;
         }
-        if touched.contains(path.as_path()) || was_indexed.contains(name) {
+        if touched.contains(path.as_path()) || was_indexed.contains_key(name) {
             let why = if over_count {
                 format!("{}-skill cap", crate::skills::MAX_SKILLS)
             } else {
@@ -2332,9 +2372,13 @@ fn changed_files<'a>(old: &'a Registry, new: &'a Registry) -> Vec<(&'a Path, &'s
 
 /// The self-modification loop closes here: at turn start, capture one immutable
 /// generation of extension bytes. If its fingerprint no longer matches the
-/// session's registry, activate that exact generation and rebuild the prompt in
-/// place. An unchanged generation preserves the prompt cache; a tool the agent
-/// wrote last turn is callable on this one without /new or /reload.
+/// session's registry, activate that exact generation in place. The prompt is
+/// rebuilt only when the generation changes the tool array, or when no turn in
+/// this process has sent the session's prompt yet (a resumed or new session,
+/// whose prompt cache is cold either way). Any other change, a skill above
+/// all, keeps the prompt and its cache, and the receipt carries the index
+/// lines instead. An unchanged generation is a no-op; a tool the agent wrote
+/// last turn is callable on this one without /new or /reload.
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
@@ -2350,19 +2394,30 @@ async fn refreeze_if_extensions_changed(
         }
     };
     let disk_fp = snapshot.fingerprint();
-    let stale = {
+    // `take_seq` stays 0 until a turn first takes the transcript in this
+    // process, so a 0 means nothing has been sent with this prompt yet and
+    // rebuilding it costs no cache. That is also how a resume reconciles: a
+    // refreeze that kept the prompt left the manifest describing the
+    // generation the prompt renders, so the resumed session finds the
+    // fingerprint stale and rebuilds here, once.
+    let live = {
         let sessions_map = core.sessions.lock().await;
         sessions_map
             .get(session_id)
-            .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+            .filter(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+            .map(|d| (d.registry.clone(), d.take_seq == 0))
     };
-    if !stale {
-        return None;
-    }
-    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
+    let (live, cold) = live?;
+    let Ok(mut registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
         return None;
     };
-    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+    let rebuild = cold || registry.tool_schemas_wire() != live.tool_schemas_wire();
+    let frozen = if rebuild {
+        Some(system_prompt_with_breakdown(project_root, &registry))
+    } else {
+        registry.keep_memory_of(&live);
+        None
+    };
     let counts = (registry.tools.len(), registry.skills.len());
     let broken = registry.broken.clone();
     let shadowed = registry.shadowed_skills.clone();
@@ -2374,9 +2429,18 @@ async fn refreeze_if_extensions_changed(
             // else mutates the session, but stay defensive about empty
             // (taken) state.
             Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
-                let delta = refreeze_delta(&data.registry, &registry, mode, &core.data_dir, project_root);
+                let delta =
+                    refreeze_delta(&data.registry, &registry, mode, &core.data_dir, project_root, !rebuild);
                 let changes = generation_changes(&data.registry, &registry, project_root);
-                apply_freeze(core, session_id, data, registry, prompt, breakdown);
+                match frozen {
+                    Some((prompt, breakdown)) => {
+                        apply_freeze(core, session_id, data, registry, prompt, breakdown)
+                    }
+                    // The prompt, its /context breakdown, and the persisted
+                    // manifest keep describing the generation the prompt
+                    // renders.
+                    None => data.registry = Arc::new(registry),
+                }
                 Some((delta, changes))
             }
             _ => None,
@@ -2402,57 +2466,72 @@ async fn refreeze_if_extensions_changed(
 /// closes create-then-use across turns; this closes it within one turn:
 /// called between iterations after a mutating call succeeded, it captures one
 /// immutable extension generation, and if the fingerprint moved it swaps the
-/// turn's registry and the transcript's system prompt in place, installs the
-/// new generation into the session (the next turn-start check must compare
-/// against it), and persists the manifest. The caller updates its own wire
-/// state and rewrites the transcript. The session's `data.messages` is empty
-/// while the turn owns the transcript, so unlike `apply_freeze` this never
-/// touches it; this turn holds `running`, so nothing else mutates the session.
+/// turn's registry in place and installs the new generation into the session
+/// (the next turn-start check must compare against it). Only a generation
+/// that changes the tool array also rebuilds the transcript's system prompt,
+/// its /context breakdown, and the persisted manifest: the request after it
+/// re-sends every token uncached anyway. Any other generation (a skill, a
+/// broken write, a tool edit that leaves its schema alone) keeps all three
+/// describing the generation the prompt renders, so the prompt cache
+/// survives and a resume rebuilds from that manifest. The session's
+/// `data.messages` is empty while the turn owns the transcript, so unlike
+/// `apply_freeze` this never touches it; this turn holds `running`, so
+/// nothing else mutates the session.
 ///
-/// Returns true when a new generation was activated.
+/// Returns None when no new generation was activated, else whether the
+/// system prompt was rebuilt (the caller then rewrites the transcript).
 async fn refreeze_between_iterations(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
     registry: &mut Arc<Registry>,
     messages: &mut Vec<ChatMessage>,
-) -> bool {
+) -> Option<bool> {
     let snapshot = {
         let root = project_root.to_path_buf();
         let dd = core.data_dir.clone();
         match tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&dd, &root)).await
         {
             Ok(snapshot) => snapshot,
-            Err(_) => return false,
+            Err(_) => return None,
         }
     };
     if snapshot.fingerprint() == registry.ext_fingerprint {
-        return false;
+        return None;
     }
-    let Ok(new_registry) =
+    let Ok(mut new_registry) =
         tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await
     else {
-        return false;
+        return None;
     };
-    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
+    let rebuild = new_registry.tool_schemas_wire() != registry.tool_schemas_wire();
+    if !rebuild {
+        new_registry.keep_memory_of(registry);
+    }
     let counts = (new_registry.tools.len(), new_registry.skills.len());
     let mode = core.approval_mode(project_root);
-    let delta = refreeze_delta(registry, &new_registry, mode, &core.data_dir, project_root);
+    let delta = refreeze_delta(registry, &new_registry, mode, &core.data_dir, project_root, !rebuild);
     let changes = generation_changes(registry, &new_registry, project_root);
     let broken = new_registry.broken.clone();
     let shadowed = new_registry.shadowed_skills.clone();
     let new_registry = Arc::new(new_registry);
-    if messages.first().is_some_and(|m| m.role == "system") {
-        messages[0] = ChatMessage::system(prompt);
-    } else {
-        messages.insert(0, ChatMessage::system(prompt));
-    }
+    let breakdown = rebuild.then(|| {
+        let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
+        if messages.first().is_some_and(|m| m.role == "system") {
+            messages[0] = ChatMessage::system(prompt);
+        } else {
+            messages.insert(0, ChatMessage::system(prompt));
+        }
+        breakdown
+    });
     {
         let mut sessions_map = core.sessions.lock().await;
         if let Some(data) = sessions_map.get_mut(session_id) {
             data.registry = new_registry.clone();
-            data.prompt_breakdown = Arc::new(breakdown);
-            sessions::save_manifest(core, session_id, &data.registry.to_manifest());
+            if let Some(breakdown) = breakdown {
+                data.prompt_breakdown = Arc::new(breakdown);
+                sessions::save_manifest(core, session_id, &data.registry.to_manifest());
+            }
         }
     }
     *registry = new_registry;
@@ -2469,7 +2548,7 @@ async fn refreeze_between_iterations(
         skills: counts.1,
         changes,
     });
-    true
+    Some(rebuild)
 }
 
 /// Buffers streamed deltas and flushes them as batched events. Flushes on
@@ -3779,22 +3858,26 @@ async fn run_loop(
         // The mid-turn half of the self-modification loop: an extension file
         // written by this iteration's mutating calls activates before the
         // next model request, so a tool the agent writes in iteration N is
-        // callable in iteration N+1 without ending the turn. One deliberate
-        // prompt-cache re-prefill, and only when extension bytes actually
-        // changed; hook file edits keep their per-turn discovery timing
-        // (permissions reload per mutating call, above).
-        let refrozen = extensions_touched
-            && refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
-                .await;
-        if refrozen {
+        // callable in iteration N+1 without ending the turn. It runs only
+        // when extension bytes actually changed, and re-prefills the prompt
+        // cache only when the tool array changed; hook file edits keep their
+        // per-turn discovery timing (permissions reload per mutating call,
+        // above).
+        let refrozen = if extensions_touched {
+            refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
+                .await
+        } else {
+            None
+        };
+        if refrozen.is_some() {
             schemas_wire = registry.schemas_wire_arc();
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
             approval_seen = approval_state(core, &registry, project_root);
         }
-        // The system prompt at index 0 changed on refreeze, so the transcript
-        // prefix on disk is stale: rewrite instead of append.
-        save_messages(core, session_id, guard.messages(), refrozen).await;
+        // A refreeze that rebuilt the system prompt at index 0 left the
+        // transcript prefix on disk stale: rewrite instead of append.
+        save_messages(core, session_id, guard.messages(), refrozen == Some(true)).await;
     }
 
     // A turn can end with the last assistant's tool_calls persisted but never
@@ -5979,7 +6062,7 @@ mod tests {
 
         // Unchanged disk between iterations: no-op, same registry Arc.
         let before = registry.clone();
-        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert_eq!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await, None);
         assert!(Arc::ptr_eq(&registry, &before), "no-op must not rebuild");
 
         // Iteration N writes a tool file; the check activates it for N+1.
@@ -5989,7 +6072,7 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
-        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert_eq!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await, Some(true));
         assert!(registry.is_mutating("deploy"), "turn-local registry must carry the new tool");
         assert_eq!(messages[0].role, "system", "system prompt swapped in place");
         assert_eq!(messages.len(), 2, "conversation must survive the refreeze");
@@ -6004,7 +6087,7 @@ mod tests {
 
         // Same generation again: idempotent, so the next model request keeps
         // its (already re-prefilled) cache.
-        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert_eq!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await, None);
 
         // The wire event carried a receipt naming the file, and the refreeze
         // wrote nothing to the ledger: no change record, no copy of the bytes.
@@ -6079,7 +6162,7 @@ mod tests {
         )
         .unwrap();
         let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
-        let delta = refreeze_delta(&old, &new, ApprovalMode::Auto, &data, &project);
+        let delta = refreeze_delta(&old, &new, ApprovalMode::Auto, &data, &project, false);
         let mut lost = delta.no_longer_callable.clone();
         lost.sort();
         assert_eq!(
@@ -6110,7 +6193,7 @@ mod tests {
         )
         .unwrap();
         let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
-        let delta = refreeze_delta(&old, &new, ApprovalMode::Readonly, &data, &project);
+        let delta = refreeze_delta(&old, &new, ApprovalMode::Readonly, &data, &project, false);
         assert!(delta.callable.is_empty(), "{:?}", delta.callable);
         assert_eq!(delta.readonly_disabled, ["deploy"]);
         let note = refreeze_receipt_text(&[], &delta, &[], &[], &project, ApprovalMode::Readonly);
@@ -7194,7 +7277,7 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships it\"\n",
         )
         .unwrap();
-        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert_eq!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await, Some(false), "a broken write leaves the tool array, and so the prompt, alone");
         assert!(registry.get("deploy").is_none(), "a broken file must not load");
         let tool_msg = messages.iter().rev().find(|m| m.role == "tool").unwrap();
         let content = tool_msg.content.as_deref().unwrap();
@@ -7412,6 +7495,80 @@ mod tests {
         let prompt = map.get(id).unwrap().messages[0].content.clone().unwrap();
         assert!(prompt.contains("deploy port is 9090") && prompt.contains("ci-lane"), "{prompt}");
         drop(map);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A skill change keeps the prompt while the session is warm, mid-turn or
+    /// at a turn start, and leaves the persisted manifest describing the
+    /// generation the prompt renders. A resume, whose cache is cold anyway,
+    /// finds that manifest stale and rebuilds the prompt once, so the index
+    /// catches up there instead of never.
+    #[tokio::test]
+    async fn a_skill_change_keeps_the_prompt_until_a_resume_rebuilds_it() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let write_skill = |name: &str, description: &str| {
+            let skill = project.join(".agents/skills").join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {description}\n---\nbody\n"),
+            )
+            .unwrap();
+        };
+        {
+            let mut data = build_session_data(&core, id, &project).unwrap();
+            data.messages.push(ChatMessage::user("go"));
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        let prompt = messages[0].content.clone().unwrap();
+        let rendered_fp = registry.ext_fingerprint;
+
+        // Mid-turn: the skill is live, the prompt and the manifest are not touched.
+        write_skill("notes", "Take notes");
+        assert_eq!(
+            refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await,
+            Some(false)
+        );
+        assert_eq!(messages[0].content.as_deref(), Some(prompt.as_str()));
+        assert!(registry.skills.iter().any(|s| s.name == "notes"), "the skill is live");
+        let manifest = sessions::load_manifest(&core, id).unwrap();
+        assert_eq!(manifest.ext_fingerprint, rendered_fp, "the manifest keeps the rendered generation");
+
+        // The turn ends; between turns a human adds another skill. The session
+        // is warm, so the turn-start refreeze keeps the prompt too.
+        let mut persisted = 0usize;
+        assert!(sessions::save_messages(&core, id, &messages, &mut persisted, true));
+        core.sessions.lock().await.get_mut(id).unwrap().messages = messages;
+        write_skill("review", "Review a diff");
+        let receipt = refreeze_if_extensions_changed(&core, id, &project).await.expect("a skill was added");
+        assert!(receipt.contains("- review: Review a diff \u{2014} .agents/skills/review/SKILL.md"), "{receipt}");
+        let live = core.sessions.lock().await.get(id).unwrap().messages[0].content.clone();
+        assert_eq!(live.as_deref(), Some(prompt.as_str()));
+
+        // A fresh process resumes: the manifest's generation is stale, the
+        // cache is cold, and the first turn start rebuilds the prompt.
+        core.sessions.lock().await.remove(id);
+        ensure_session_hydrated(&core, id, &project).await.unwrap();
+        let receipt = refreeze_if_extensions_changed(&core, id, &project).await.expect("stale manifest");
+        assert!(receipt.contains(".agents/skills/notes/SKILL.md added"), "{receipt}");
+        assert!(!receipt.contains("Skills index changes"), "the rebuilt prompt shows the index: {receipt}");
+        let rebuilt = core.sessions.lock().await.get(id).unwrap().messages[0].content.clone().unwrap();
+        assert!(rebuilt.contains("- notes: Take notes") && rebuilt.contains("- review: Review a diff"), "{rebuilt}");
+        let manifest = sessions::load_manifest(&core, id).unwrap();
+        assert_eq!(manifest.skills.len(), 2, "the rebuild persists the generation it renders");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -12234,7 +12391,7 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships the current branch to production\"\ncommand = \"/bin/true\"\n",
         )
         .unwrap();
-        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert_eq!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await, Some(true));
         let after = registry.schema_tokens();
         assert!(after > before, "a new tool must grow the overhead: {before} -> {after}");
 

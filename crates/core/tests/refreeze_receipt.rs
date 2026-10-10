@@ -1098,3 +1098,114 @@ async fn a_skill_the_index_budget_leaves_out_is_named_not_indexed() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Writing a skill must not rewrite the session's prompt. The skills index
+/// lives in the system message, so a skill write used to replace it, and the
+/// next request re-sent the whole transcript uncached. The tool array is what
+/// decides: unchanged, the prompt stays byte-identical and the receipt carries
+/// the index line the prompt does not show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_write_keeps_the_frozen_prompt_and_carries_its_index_line() {
+    let (dir, data, project) = scratch();
+    let skill = "---\nname: notes\ndescription: Take notes\n---\nAppend to NOTES.md.\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".agents/skills/notes/SKILL.md", "content": skill }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    let events = drive_turn(&core, &mut rx, "skill-cache", &project, "add a notes skill").await;
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let (first, second) = (request(&bodies, 0), request(&bodies, 1));
+    assert_eq!(
+        first["messages"][0], second["messages"][0],
+        "a skill write must leave the frozen prompt byte-identical"
+    );
+    assert_eq!(first["tools"], second["tools"]);
+    let receipt = tool_results(&bodies, 1).pop().unwrap();
+    assert!(receipt.contains(".agents/skills/notes/SKILL.md added."), "{receipt}");
+    assert!(
+        receipt.contains("- notes: Take notes \u{2014} .agents/skills/notes/SKILL.md"),
+        "the receipt carries the index line: {receipt}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Refrozen { skills: 1, .. })),
+        "the new generation is live: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A write that leaves the tool array alone keeps the prompt even when it
+/// also adds a top-level directory: a rebuild used to re-render the layout
+/// map, so a broken manifest written next to its new script changed the
+/// prompt and cost the cache while no tool became callable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_tool_write_keeps_the_frozen_prompt() {
+    let (dir, data, project) = scratch();
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": "scripts/hello.sh", "content": "#!/bin/sh\necho hello\n" }),
+        ),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({
+                "path": ".openmax/tools/hello.toml",
+                "content": "name = \"hello\"\ndescription = \"greet\"\n"
+            }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "broken-cache", &project, "make a tool").await;
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(request(&bodies, 1)["messages"][0], request(&bodies, 2)["messages"][0]);
+    let receipt = tool_results(&bodies, 2).pop().unwrap();
+    assert!(receipt.contains("NOT loaded"), "{receipt}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A tool write still rebuilds: the tool array changes, so the request after
+/// it re-sends the prefix regardless, and the new tool is callable on the
+/// very next step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_write_still_changes_the_tool_array_on_the_next_step() {
+    let (dir, data, project) = scratch();
+    let manifest = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wordfreq.toml", "content": manifest }),
+        ),
+        completion_with_tool_call("wordfreq", serde_json::json!({})),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "tool-rebuild", &project, "make a tool").await;
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    let names = |i: usize| -> Vec<String> {
+        request(&bodies, i)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(!names(0).contains(&"wordfreq".to_string()));
+    assert!(names(1).contains(&"wordfreq".to_string()), "{:?}", names(1));
+    assert!(tool_results(&bodies, 1).pop().unwrap().contains("Callable now: wordfreq."));
+    let call = tool_results(&bodies, 2).pop().unwrap();
+    assert!(!call.starts_with("Error"), "the new tool ran: {call}");
+    let _ = std::fs::remove_dir_all(dir);
+}

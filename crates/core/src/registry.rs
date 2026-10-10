@@ -485,6 +485,17 @@ impl Registry {
         registry
     }
 
+    /// Take `rendered`'s memory index as this generation's own. A generation
+    /// that activates without rebuilding the prompt leaves the prompt's
+    /// memory section in place, so that selection stays what /context prices
+    /// and the baseline the next rebuild's receipt narrates from.
+    pub(crate) fn keep_memory_of(&mut self, rendered: &Registry) {
+        self.memory_files = rendered.memory_files.clone();
+        self.memory_section = rendered.memory_section.clone();
+        self.frozen_memory_rows = rendered.frozen_memory_rows.clone();
+        self.memory_scanned = rendered.memory_scanned;
+    }
+
     /// A registry with built-ins only: the shape a session without a
     /// manifest resolves to until its first turn re-freezes from disk, and
     /// the baseline tests build on.

@@ -104,10 +104,12 @@ impl PromptBreakdown {
 /// model performance, and the degradation starts well below the context limit,
 /// so brevity here is a quality decision before it is a token one.
 ///
-/// Grounding context (AGENTS.md, a shallow layout map) is appended here, once,
-/// at session creation: the prompt is persisted with the session, so the token
-/// prefix stays byte-stable across every turn, which is what keeps the
-/// server-side prompt cache warm. Without the map, a session typically opens
+/// Grounding context (AGENTS.md, a shallow layout map) is appended here when
+/// the prompt is built: at session creation, on /reload, and when a refreeze
+/// changes the tool array or reconciles a resumed session. The prompt is
+/// persisted with the session, so the token prefix stays byte-stable across
+/// every turn in between, which is what keeps the server-side prompt cache
+/// warm. Without the map, a session typically opens
 /// with two or three list_dir/glob calls just to learn the layout, and each
 /// of those is a full prefill+decode round trip.
 pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
@@ -233,9 +235,10 @@ fn skills_section(project_root: &Path, skills: &[SkillSpec], beyond_cap: usize) 
 }
 
 /// One index line per indexed skill, with the byte cap applied exactly as the
-/// section applies it: (line, carried). The single source for both the prompt
-/// text and every cost display, so what is billed is what is spent.
-fn skill_index_lines(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, bool)> {
+/// section applies it: (line, carried). The single source for the prompt
+/// text, every cost display, and the refreeze receipt, so what is billed is
+/// what is spent and what a receipt quotes is what a rebuild would show.
+pub(crate) fn skill_index_lines(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, bool)> {
     let mut spent = 0usize;
     let mut out = Vec::with_capacity(skills.len());
     for skill in skills {

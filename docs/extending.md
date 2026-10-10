@@ -96,8 +96,9 @@ base-level activation (each past access at age `t` hours contributes
 `t^-0.5`; activation is the log of the sum, so one recall revives an old
 memory) and injected as one index line each under a 1500-byte budget. The
 index is frozen with the prompt: writing a memory mid-session does not
-re-freeze, so the prompt cache survives the write, and the new line appears at
-the next session, `/reload`, or a re-freeze a tool or skill change causes. The
+re-freeze, so the prompt cache survives the write, and the new line appears
+whenever the prompt is next rebuilt: the next session, `/reload`, a resumed
+session whose extensions changed, or a re-freeze that changes the tool set. The
 harness logs accesses through `read_file`, `write_file`, and `edit_file` to
 `.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
 over 21 days old leaves the index but stays searchable on disk. The harness
@@ -433,7 +434,9 @@ on PATH, with the repair); a tool that stopped being callable is named with
 the reason (the 64-tool cap, its file removed or broken, or its file now
 declaring another name); a new tool past the cap is named as not loaded; and
 a skill the index leaves out (the 50-skill cap or the 3000-byte budget) is
-named as not indexed. The first re-freeze after a session resumes compares
+named as not indexed. When the re-freeze keeps the system prompt (see below),
+the receipt also carries each skill index line the generation gained or
+changed, and the skills it removed. The first re-freeze after a session resumes compares
 against the session's saved manifest, which records a hash of every tool and
 skill file the freeze read, so a file edited while the session was closed is
 named too.
@@ -509,12 +512,23 @@ Tools and skills freeze per freeze window for prompt-cache stability, and the
 harness re-freezes them automatically. At each turn start, and again between
 iterations after a mutating tool call succeeded, it captures one immutable
 generation of extension bytes, fingerprints that snapshot, and parses those
-same bytes. If the generation changed, it rebuilds the registry and prompt in
-place (one deliberate cache re-prefill, conversation kept, a `refrozen` event
-for clients), so a tool the agent writes is callable on its very next step,
-inside the same turn, with no human action. Atomic replacement and symlink
-swaps cannot make the activated registry disagree with its fingerprint. An
-unchanged generation does not rebuild or invalidate the prompt cache.
-`/reload` forces a new capture immediately; `/new` starts clean. Hooks,
+same bytes. If the generation changed, it activates it in place (conversation
+kept, a `refrozen` event for clients), so a tool the agent writes is callable
+on its very next step, inside the same turn, with no human action. Atomic
+replacement and symlink swaps cannot make the activated registry disagree with
+its fingerprint.
+
+The system prompt is rebuilt only when the tool schemas the next request sends
+change: that request re-sends every token uncached anyway, so that rebuild is
+the one deliberate cache re-prefill, and it refreshes the skills index, the
+memory index, `AGENTS.md`, and the layout map with it. A generation that
+leaves the tool schemas byte-identical (a skill added, edited, or removed, a
+broken tool file, a tool edit that changes no schema) keeps the system prompt
+and the provider's prompt cache: the receipt carries the new or changed skill
+index lines instead, and the session's saved manifest keeps describing the
+generation the prompt shows. A resumed session finds that manifest stale and
+rebuilds the prompt at its first turn, when no request has used the cache
+yet. An unchanged generation does nothing. `/reload` forces a new capture and
+a rebuild immediately; `/new` starts clean. Hooks,
 permissions, and templates re-discover on every turn or invocation. Use
 `/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
