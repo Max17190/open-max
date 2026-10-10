@@ -2419,7 +2419,7 @@ fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::Jo
 fn execution_policy_note(mode: ApprovalMode) -> String {
     let detail = match mode {
         ApprovalMode::Auto => "carry out authorized work, including extension creation and repair, without asking for confirmation. Valid tools, hooks, and permission allows need no content approval. Deny rules and validation still apply",
-        ApprovalMode::Ask => "mutating calls and unapproved tool content require confirmation unless the applicable gate permits them. Hooks and project permission allows require content approval",
+        ApprovalMode::Ask => "mutating calls and unapproved tool content require confirmation unless the applicable gate permits them. Hooks and permission allows require content approval",
         ApprovalMode::Readonly => "mutating calls and calls requiring approval are disabled",
     };
     format!("[execution policy: {} for this trusted project; {detail}.]", mode.as_str())
