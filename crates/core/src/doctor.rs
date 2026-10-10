@@ -58,6 +58,83 @@ pub fn has_warnings(findings: &[Finding]) -> bool {
     findings.iter().any(|f| matches!(f.status, Status::Warn(_)))
 }
 
+/// The default `--check` text report: the findings it prints as rows, in
+/// report order, and one line counting the rest. The report is read by the
+/// agent that just wrote an extension and stays in that session's transcript,
+/// re-sent with every later request, so a row that only confirms a file
+/// loaded is counted instead of printed. A file with any warn or err row keeps
+/// all of its rows: its ok row finishes its story ("3 rules, 1 inert until
+/// approved" after the inert warning). A hook's row prints even when ok: in
+/// auto mode, where no approval receipt is printed, it is the only report of
+/// what the hook enforces (its event, and whether it gates), and a turn_end
+/// observer written as a completion gate reads as healthy everywhere else.
+pub fn default_report(findings: &[Finding]) -> (Vec<&Finding>, Option<String>) {
+    let flagged: Vec<&Path> = findings
+        .iter()
+        .filter(|f| !matches!(f.status, Status::Ok(_)))
+        .map(|f| f.path.as_path())
+        .collect();
+    let mut rows = Vec::new();
+    let mut counted: Vec<(&str, Vec<&Path>)> = Vec::new();
+    for finding in findings {
+        if !matches!(finding.status, Status::Ok(_))
+            || finding.kind == "hook"
+            || flagged.contains(&finding.path.as_path())
+        {
+            rows.push(finding);
+            continue;
+        }
+        match counted.iter_mut().find(|(kind, _)| *kind == finding.kind) {
+            Some((_, paths)) if paths.contains(&finding.path.as_path()) => {}
+            Some((_, paths)) => paths.push(&finding.path),
+            None => counted.push((finding.kind, vec![&finding.path])),
+        }
+    }
+    if counted.is_empty() {
+        return (rows, None);
+    }
+    let counts: Vec<String> = counted
+        .into_iter()
+        .map(|(kind, paths)| match (kind, paths.len()) {
+            ("memory", 1) => "1 memory".to_string(),
+            ("memory", n) => format!("{n} memories"),
+            // Surfaces named after their file: settings, providers, permissions.
+            (kind, 1) if kind.ends_with('s') => format!("1 {kind} file"),
+            (kind, n) if kind.ends_with('s') => format!("{n} {kind} files"),
+            (kind, 1) => format!("1 {kind}"),
+            (kind, n) => format!("{n} {kind}s"),
+        })
+        .collect();
+    (rows, Some(format!("ok: {} (openmax --check --all lists them)", counts.join(", "))))
+}
+
+/// How the `--check` text report names `path` and writes `message`, a row
+/// about that file: the path relative to `root`, the directory the report
+/// checks and runs in, and in the message, every repair command naming the
+/// file (`openmax --approve '<path>'`, always shell-quoted) with that same
+/// relative path. The commands still work there: `--approve` and `--forget`
+/// resolve a relative path against the directory they run in, which has to be
+/// the project anyway (approvals are recorded per directory). Nothing else in
+/// the message changes, because a message also quotes author bytes verbatim (a
+/// manifest line in a parse error, a command literal, an example's captured
+/// output) and those must read as written. A path outside `root`, or any path
+/// when `root` is the filesystem root, is left absolute: `~` would not expand
+/// inside the single quotes a printed command wraps a path in. A relative path
+/// that would start with `-` gets a `./`, so no command reads it as an option.
+pub fn project_relative(path: &Path, message: &str, root: &Path) -> (PathBuf, String) {
+    let relative = match path.strip_prefix(root) {
+        Ok(rest) if root.parent().is_some() && !rest.as_os_str().is_empty() => rest,
+        _ => return (path.to_path_buf(), message.to_string()),
+    };
+    let relative = if relative.to_string_lossy().starts_with('-') {
+        Path::new(".").join(relative)
+    } else {
+        relative.to_path_buf()
+    };
+    let message = message.replace(&shell_quote(path), &shell_quote(&relative));
+    (relative, message)
+}
+
 /// Validate all extension files for a project (global + project dirs).
 /// Missing dirs and files contribute nothing; an empty report means an empty
 /// (and healthy) configuration.
@@ -4852,5 +4929,54 @@ mod tests {
         );
         assert!(!has_errors(&findings), "memory findings never fail a check");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Only the file's own path and the repair commands quoting it become
+    /// relative: the rest of a message is often author bytes (a parse error
+    /// quoting the manifest line), which must read as written.
+    #[test]
+    fn project_relative_rewrites_only_the_files_own_path() {
+        let root = Path::new("/w/app");
+        let message = "line 1 | command = '/w/app/x.sh' | openmax --approve '/w/app/.openmax/tools/a.toml'";
+        let (path, message) = project_relative(Path::new("/w/app/.openmax/tools/a.toml"), message, root);
+        assert_eq!(path, Path::new(".openmax/tools/a.toml"));
+        assert_eq!(message, "line 1 | command = '/w/app/x.sh' | openmax --approve '.openmax/tools/a.toml'");
+        let (path, _) = project_relative(Path::new("/w/app/-x.toml"), "", root);
+        assert_eq!(path, Path::new("./-x.toml"));
+        for (path, root) in [("/w/app-old/a.toml", "/w/app"), ("/home/.openmax/tools/a.toml", "/w/app"), ("/w/a.toml", "/")] {
+            let message = format!("openmax --approve {}", shell_quote(Path::new(path)));
+            assert_eq!(
+                project_relative(Path::new(path), &message, Path::new(root)),
+                (PathBuf::from(path), message.clone()),
+                "{path} under {root} stays as found"
+            );
+        }
+    }
+
+    /// Ok rows of files with nothing to report fold into one count of files
+    /// per surface, in report order; a file with a warn or err row keeps its ok
+    /// row, and a hook's row always prints.
+    #[test]
+    fn the_default_report_counts_files_with_nothing_to_report() {
+        let finding = |kind: &'static str, path: &str, status: Status| Finding { kind, path: PathBuf::from(path), status };
+        let findings = [
+            finding("tool", "/p/a.toml", Status::Ok("tool 'a'".into())),
+            finding("tool", "/p/b.toml", Status::Ok("tool 'b'".into())),
+            finding("tool", "/p/c.toml", Status::Ok("tool 'c'".into())),
+            finding("tool", "/p/c.toml", Status::Warn("timeout clamped".into())),
+            finding("skill", "/p/s/SKILL.md", Status::Ok("skill 's'".into())),
+            finding("hook", "/p/h.toml", Status::Ok("hook on turn_end".into())),
+            finding("settings", "/h/settings.json", Status::Ok("model m".into())),
+            finding("memory", "/p/m/d.md", Status::Ok("memory 'd'".into())),
+            finding("memory", "/p/m/e.md", Status::Ok("memory 'e'".into())),
+        ];
+        let (rows, summary) = default_report(&findings);
+        let rows: Vec<(&str, &str)> = rows.iter().map(|f| (f.kind, f.status.summary())).collect();
+        assert_eq!(rows, [("tool", "tool 'c'"), ("tool", "timeout clamped"), ("hook", "hook on turn_end")]);
+        assert_eq!(
+            summary.as_deref(),
+            Some("ok: 2 tools, 1 skill, 1 settings file, 2 memories (openmax --check --all lists them)")
+        );
+        assert_eq!(default_report(&findings[2..4]).1, None);
     }
 }

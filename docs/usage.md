@@ -30,9 +30,16 @@ openmax --mcp-list -- <server>        # list an MCP server's tools
 client, used by the proxy tool an MCP server is adopted through; see
 [extending](extending.md#mcp-servers) and `openmax --spec mcp`.
 
-`openmax --check --json` prints the same findings as one JSON array of
+`openmax --check` prints the rows of each file that needs attention (`warn` or
+`err`) and of each hook, then one line counting, per surface, the files that
+loaded with nothing to report. A file under the current directory is named
+relative to it, in its repair command too (`openmax --approve
+'.openmax/tools/x.toml'`). `openmax --check --all` prints every row.
+
+`openmax --check --json` prints every finding as one JSON array of
 `{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
-with the same exit code, so the agent can parse its own verification.
+with absolute paths and the same exit code, so the agent can parse its own
+verification.
 
 `openmax --check --run-examples` adds one `example` surface row per declared
 `[example]`, in text and in JSON, and fails the check when one fails. It is

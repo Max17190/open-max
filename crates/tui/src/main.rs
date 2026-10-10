@@ -29,7 +29,7 @@ options:
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
       --json             with --print, emit AgentEvent envelopes as JSONL;
-                         with --check, emit findings as one JSON array
+                         with --check, emit every finding as one JSON array
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
                          \"reload\"|\"cancel\"|\"quit\"}), AgentEvent envelopes
@@ -62,6 +62,8 @@ options:
                          one is probed in a sandbox (no network, writes
                          confined to a scratch dir); a passing probe
                          approves nothing
+      --all              with --check, print every row; by default an ok
+                         file is counted on one line (a hook still prints)
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers, memory) and the
                          session index, then exit; nonzero if any is broken.
@@ -108,6 +110,8 @@ struct CliArgs {
     stdio: bool,
     check: bool,
     run_examples: bool,
+    /// `--check --all`: print every finding's row, ok rows included.
+    all: bool,
     approve: Option<String>,
     forget: Option<String>,
     ledger: bool,
@@ -152,6 +156,7 @@ where
         stdio: false,
         check: false,
         run_examples: false,
+        all: false,
         approve: None,
         forget: None,
         ledger: false,
@@ -195,6 +200,7 @@ where
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
             Long("run-examples") => out.run_examples = true,
+            Long("all") => out.all = true,
             Long("approve") => set_once(&mut out.approve, "--approve", &mut parser)?,
             Long("forget") => set_once(&mut out.forget, "--forget", &mut parser)?,
             Long("ledger") => out.ledger = true,
@@ -333,6 +339,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         stdio,
         check,
         run_examples,
+        all,
         approve,
         forget,
         ledger,
@@ -372,13 +379,14 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     // Each option and the operations that read it.
     const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 7] = [
+    let options: [(bool, &str, &[Option<&str>]); 8] = [
         (*trust_project, "--trust-project", SESSIONS),
         (*continue_session, "--continue", SESSIONS),
         (model.is_some(), "--model", SESSIONS),
         (provider.is_some(), "--provider", SESSIONS),
         (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
+        (*all, "--all", &[Some("--check")]),
         (mcp_timeout.is_some(), "--mcp-timeout", MCP),
     ];
     for (on, flag, readers) in options {
@@ -802,7 +810,8 @@ async fn main() -> std::io::Result<()> {
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let findings = open_max_core::doctor::check(&project);
         if cli.json {
-            // Machine face of the same report: the agent parses this in-turn.
+            // Machine face of the full report (every finding, as --all
+            // prints it): the agent parses this in-turn.
             let mut array: Vec<serde_json::Value> = findings
                 .iter()
                 .map(|f| {
@@ -834,8 +843,15 @@ async fn main() -> std::io::Result<()> {
             );
             std::process::exit(0);
         }
-        for f in &findings {
-            println!("{}", check_row(f));
+        let (rows, summary) = match cli.all {
+            true => (findings.iter().collect(), None),
+            false => open_max_core::doctor::default_report(&findings),
+        };
+        for f in rows {
+            println!("{}", check_row(f, &project));
+        }
+        if let Some(summary) = summary {
+            println!("{summary}");
         }
         let mut example_failures = 0usize;
         if cli.run_examples {
@@ -1278,7 +1294,7 @@ async fn run_tool_examples(
         if !verdict.sandboxed && verdict.result.is_err() {
             failures += 1;
         }
-        println!("{}", example_row(verdict));
+        println!("{}", example_row(verdict, project));
         let _ = std::io::stdout().flush();
     })
     .await;
@@ -1620,33 +1636,38 @@ fn prompt_trust(
 /// advances in microsecond steps on macOS, and parallel test threads routinely
 /// read the same value. The counter is what actually guarantees uniqueness;
 /// pid and clock only keep leftovers from earlier runs out of the way.
-/// One row of the `--check` human report. The whole row rides one terminal
-/// line: a file's own name is author-controlled bytes (write_file only trims
-/// the ends of a path), so a control character in it could forge a second,
-/// clean-looking row. One space per control byte, the same rule hook-authored
-/// stderr text gets. The `--json` face serializes through serde and needs no
-/// counterpart.
-fn check_row(f: &open_max_core::doctor::Finding) -> String {
+/// One row of the `--check` human report, naming the file relative to
+/// `project` when it is under it (see doctor::project_relative). The whole row
+/// rides one terminal line: a file's own name is author-controlled bytes
+/// (write_file only trims the ends of a path), so a control character in it
+/// could forge a second, clean-looking row. One space per control byte, the
+/// same rule hook-authored stderr text gets. The `--json` face serializes
+/// through serde and needs no counterpart.
+fn check_row(f: &open_max_core::doctor::Finding, project: &std::path::Path) -> String {
     use open_max_core::doctor::Status;
-    let path = f.path.display();
+    let (path, message) = open_max_core::doctor::project_relative(&f.path, f.status.summary(), project);
+    let path = path.display();
     let row = match &f.status {
-        Status::Ok(summary) => format!("ok   {:<11} {}  ({summary})", f.kind, path),
-        Status::Warn(reason) => format!("warn {:<11} {}  {reason}", f.kind, path),
-        Status::Err(reason) => format!("err  {:<11} {}  {reason}", f.kind, path),
+        Status::Ok(_) => format!("ok   {:<11} {}  ({message})", f.kind, path),
+        Status::Warn(_) => format!("warn {:<11} {}  {message}", f.kind, path),
+        Status::Err(_) => format!("err  {:<11} {}  {message}", f.kind, path),
     };
     open_max_core::text::one_line(&row)
 }
 
-/// One verdict row of `--check --run-examples`, one-lined by the same rule:
-/// the tool name is the manifest's own declaration and a failure reason often
-/// carries the example's captured stderr, both author-controlled bytes.
-fn example_row(verdict: &open_max_core::doctor::ExampleVerdict) -> String {
+/// One verdict row of `--check --run-examples`, one-lined and naming the
+/// manifest by the same rules as a finding row: the tool name is the
+/// manifest's own declaration and a failure reason often carries the
+/// example's captured stderr, both author-controlled bytes.
+fn example_row(verdict: &open_max_core::doctor::ExampleVerdict, project: &std::path::Path) -> String {
+    let failure = verdict.result.as_ref().err().map_or("", String::as_str);
+    let (path, reason) = open_max_core::doctor::project_relative(&verdict.path, failure, project);
     let badge = match verdict.sandboxed {
         // Loud by design: the probe ran UNAPPROVED content with zero
         // host authority; nothing was blessed by it running.
         true => format!(
             "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: {}]",
-            approve_command(&verdict.path)
+            approve_command(&path)
         ),
         false => String::new(),
     };
@@ -1660,12 +1681,12 @@ fn example_row(verdict: &open_max_core::doctor::ExampleVerdict) -> String {
         // run after approval be the honest signal, rather than failing the
         // check on the largest tool family (anything that reaches the
         // network).
-        Err(reason) if verdict.sandboxed => format!(
+        Err(_) if verdict.sandboxed => format!(
             "warn example     {}  could not be proven in the sandbox (a tool that needs the network or a write outside its scratch dir cannot): {reason}{badge}",
             verdict.tool
         ),
         // Approved content ran with the host's authority: a failure is real.
-        Err(reason) => format!("err  example     {}  {reason}{badge}", verdict.tool),
+        Err(_) => format!("err  example     {}  {reason}{badge}", verdict.tool),
     };
     open_max_core::text::one_line(&row)
 }
@@ -1774,7 +1795,7 @@ mod tests {
             ),
             status: Status::Err("reason with\r\ncontrol bytes".into()),
         };
-        let row = super::check_row(&forged);
+        let row = super::check_row(&forged, std::path::Path::new("/p"));
         assert!(
             row.chars().all(|c| !c.is_control()),
             "a control byte survived into the row: {row:?}"
@@ -1793,7 +1814,7 @@ mod tests {
             ),
             status: Status::Err("reason".into()),
         };
-        let row = super::check_row(&separators);
+        let row = super::check_row(&separators, std::path::Path::new("/p"));
         assert!(
             !row.contains('\u{2028}') && !row.contains('\u{2029}'),
             "a Unicode line separator survived into the row: {row:?}"
@@ -1801,11 +1822,11 @@ mod tests {
 
         let ok = Finding {
             kind: "skill",
-            path: std::path::PathBuf::from(".agents/skills/deploy/SKILL.md"),
+            path: std::path::PathBuf::from("/p/.agents/skills/deploy/SKILL.md"),
             status: Status::Ok("deploy: ship the current branch".into()),
         };
         assert_eq!(
-            super::check_row(&ok),
+            super::check_row(&ok, std::path::Path::new("/p")),
             "ok   skill       .agents/skills/deploy/SKILL.md  (deploy: ship the current branch)"
         );
     }
@@ -1821,7 +1842,7 @@ mod tests {
             result: Err("exit 1\n\u{1b}[31mboom\r\nsecond line".into()),
             sandboxed: false,
         };
-        let row = super::example_row(&forged);
+        let row = super::example_row(&forged, std::path::Path::new("/p"));
         assert!(
             row.chars().all(|c| !c.is_control()),
             "a control byte survived into the row: {row:?}"
@@ -1834,7 +1855,7 @@ mod tests {
             result: Ok(()),
             sandboxed: false,
         };
-        assert_eq!(super::example_row(&clean), "ok   example     docsearch");
+        assert_eq!(super::example_row(&clean, std::path::Path::new("/p")), "ok   example     docsearch");
     }
 
     /// --help's --spec list names every surface the binary accepts: --check
@@ -2470,13 +2491,14 @@ mod tests {
     #[test]
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
-        let options: [(&[&str], &str, &[&str]); 8] = [
+        let options: [(&[&str], &str, &[&str]); 9] = [
             (&["--trust-project"], "--trust-project", sessions),
             (&["--continue"], "--continue", sessions),
             (&["-m", "m"], "--model", sessions),
             (&["--provider", "p"], "--provider", sessions),
             (&["--json"], "--json", &["--print", "--check", "--recall", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
+            (&["--all"], "--all", &["--check"]),
             (&["--mcp-timeout", "5"], "--mcp-timeout", &["--mcp-list", "--mcp-call"]),
             // A bare word is a prompt, which only --print reads.
             (&["extra"], "", &["--print"]),

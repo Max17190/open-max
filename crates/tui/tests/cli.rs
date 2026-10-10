@@ -662,6 +662,113 @@ fn check_exit_codes_follow_findings() {
     assert!(stdout.contains("broken.toml"), "{stdout}");
 }
 
+/// An agent runs `--check` after every extension file it writes, and the
+/// report stays in its transcript, re-sent with every later request. So the
+/// default report prints only rows to act on (warn and err, plus a hook's row,
+/// the one place its shape is reported), names files relative to the project,
+/// and counts the files with nothing to report on one line. `--all` lists every
+/// row; the JSON face and the exit codes are unchanged.
+#[test]
+fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
+    let (project, home) = fresh_dirs("check-diet");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto);
+    assert_eq!(grant.unwrap().1, Some(ApprovalMode::Auto));
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.toml"), "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let skill = project.join(".agents").join("skills").join("notes");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: notes\ndescription: Take notes\n---\nBody.\n").unwrap();
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("watch.toml"), "event = \"turn_end\"\ncommand = \"/bin/echo\"\n").unwrap();
+    let root = std::fs::canonicalize(&project).unwrap().display().to_string();
+    let roots = [project.display().to_string(), root.clone()];
+    let check = |project: &Path, args: &[&str]| {
+        let out = cmd(project, &home).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(!report.lines().any(|l| l.starts_with("ok   tool") || l.starts_with("ok   skill")), "{report}");
+    assert!(roots.iter().all(|root| !report.contains(root.as_str())), "absolute path printed:\n{report}");
+    let summary: Vec<&str> = report.lines().filter(|l| l.starts_with("ok: ")).collect();
+    assert_eq!(summary.len(), 1, "{report}");
+    assert!(summary[0].contains("1 tool,") && summary[0].contains("1 skill"), "{report}");
+    assert!(summary[0].contains("openmax --check --all"), "{report}");
+    // A turn_end hook without `blocking` observes only, and in auto mode its
+    // row is the only report of that: it is not folded into the count.
+    assert!(
+        report.lines().any(|l| l.starts_with("ok   hook        .openmax/hooks/watch.toml") && l.contains("observer")),
+        "{report}"
+    );
+
+    let (code, all) = check(&project, &["--check", "--all"]);
+    assert_eq!(code, Some(0), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   tool        .openmax/tools/probe.toml  (tool 'probe'")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   skill       .agents/skills/notes/SKILL.md  (skill 'notes')")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   settings    ")), "{all}");
+    assert!(!all.lines().any(|l| l.starts_with("ok: ")), "{all}");
+
+    // A message is reprinted as written: the parse error quotes the broken
+    // line, absolute path and all, and only the row's own path is relative.
+    std::fs::write(tools.join("broken.toml"), format!("name = \"broken\"\ncommand = \"{root}/run.sh\" oops\n")).unwrap();
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(1), "{report}");
+    let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    // The machine face still carries every finding, at its absolute path.
+    assert!(rows.iter().any(|r| r["status"] == "ok" && r["surface"] == "tool"), "{rows:?}");
+    assert!(rows.iter().all(|r| Path::new(r["path"].as_str().unwrap()).is_absolute()), "{rows:?}");
+    let reason = rows
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with("broken.toml"))
+        .and_then(|r| r["message"].as_str())
+        .unwrap();
+    assert!(reason.contains(&format!("{root}/run.sh")), "the parse error quotes the line: {reason}");
+    let row = report
+        .lines()
+        .find(|l| l.starts_with("err  tool        .openmax/tools/broken.toml  "))
+        .unwrap_or_else(|| panic!("the broken manifest's row:\n{report}"));
+    assert!(row.ends_with(reason), "the row carries the reason as written {reason:?}: {row}");
+
+    // In ask, an unapproved tool's row carries the approval command, naming
+    // the file relative to the project; pasted there, it approves the tool,
+    // which then has nothing to report.
+    let (project, _) = fresh_dirs("check-diet-ask");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.toml"), "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    let command = report
+        .split("(openmax --approve ")
+        .nth(1)
+        .and_then(|rest| rest.split(", or").next())
+        .unwrap_or_else(|| panic!("no approval command:\n{report}"));
+    assert_eq!(command, "'.openmax/tools/probe.toml'", "{report}");
+    let approve = Command::new("/bin/sh")
+        .args(["-c", &format!("\"$0\" --approve {command}"), openmax_bin()])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env_remove("OPENMAX_SESSION")
+        .env("OPENMAX_HUMAN_ATTEST", "1")
+        .output()
+        .unwrap();
+    assert_eq!(approve.status.code(), Some(0), "{}", String::from_utf8_lossy(&approve.stderr));
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.starts_with("ok: 1 tool"), "{report}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}
+
 /// `--check --run-examples` is the one path that executes project code, so it
 /// carries a session's gates: trust, then content approval. The JSON face
 /// reports the same verdicts, because the consumer most likely to parse it is
