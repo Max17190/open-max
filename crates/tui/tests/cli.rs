@@ -2537,7 +2537,14 @@ fn a_second_signal_exits_while_output_is_stuck_on_a_full_pipe() {
     let _ = stdout.read_to_end(&mut written);
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
     assert!(steady >= 3, "the output never stalled on the full pipe");
-    assert!(stuck, "the first signal ended a run whose writer was blocked");
+    // A precondition, not the behavior under test: while the writer is
+    // blocked, the run cannot act on the first signal. A change that lets it
+    // must stall this run another way to keep covering the second signal.
+    assert!(
+        stuck,
+        "precondition: the first signal ended a run whose writer was blocked, so this \
+         test no longer reaches the second signal's exit; stall the run another way"
+    );
     let status = status.expect("the second signal did not end a run stuck writing its output");
     assert_eq!(status.code(), Some(143), "{status:?}");
     let written = String::from_utf8_lossy(&written);
@@ -2596,12 +2603,12 @@ fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
     assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("stop")), "{done}");
 }
 
-/// A supervisor stopping a session, or a terminal closing under it, ends the
-/// TUI with a signal. The session ends through its normal exit path, which
-/// hands the terminal back, and then exits 128 plus the signal's number: a
-/// wrapper that read 0 took the stop for a /quit. Exiting there runs no
-/// destructor, so a tool tree the turn left running must be killed on the
-/// way out, or it outlives the session as it would under a plain exit.
+/// A supervisor stops a TUI session with a signal. The session ends through
+/// its normal exit path, which hands the terminal back, and then exits 128
+/// plus the signal's number: a wrapper that read 0 took the stop for a
+/// /quit. It returns through main, so the runtime's shutdown drops the
+/// command still running, and the command's group guard kills the tool tree
+/// it left behind, which `kill_on_drop` alone would leave running.
 #[test]
 fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
     let (project, home) = fresh_dirs("sigterm-tui");

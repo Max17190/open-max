@@ -981,7 +981,9 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
     // finishes, and each dropped command kills its group.
     if signalled() {
         if let Err(e) = &result {
-            eprintln!("openmax: {e}");
+            // A terminal that went away fails this write, and must not turn
+            // the stop into a panic.
+            let _ = writeln!(std::io::stderr(), "openmax: {e}");
         }
         return Ok(std::process::ExitCode::from(quit_status() as u8));
     }

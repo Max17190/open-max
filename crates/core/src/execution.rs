@@ -11,7 +11,10 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::ExitStatus,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -1055,28 +1058,41 @@ fn configure_process_group(_: &mut Command, _: bool) {}
 /// Nothing else stops such a group once the harness is going away:
 /// `kill_on_drop` reaches only the leader, and `std::process::exit` runs no
 /// destructor at all.
-static LIVE_GROUPS: Mutex<LiveGroups> =
-    Mutex::new(LiveGroups { leaders: Vec::new(), exiting: false });
+static LIVE_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-struct LiveGroups {
-    leaders: Vec<u32>,
-    /// Set by [`kill_process_groups`]: the process is about to exit, so no
-    /// command starts from here on.
-    exiting: bool,
-}
+/// Held by a command from just before its spawn until its group is
+/// registered, so the exit's kill can wait for a spawn in flight instead of
+/// missing the group it is about to start.
+static SPAWNING: Mutex<()> = Mutex::new(());
 
-fn live_groups() -> std::sync::MutexGuard<'static, LiveGroups> {
+/// Set by [`kill_process_groups`]: the process is about to exit, so no
+/// command starts from here on, and one already spawning kills its own group
+/// as it registers.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// How long the exit's kill waits for a command caught between fork and exec.
+/// A child can stall there (exec on a hung mount, a slow exec check), and a
+/// second signal must still end the process.
+const EXIT_SPAWN_WAIT: Duration = TERMINATION_GRACE;
+
+fn live_groups() -> std::sync::MutexGuard<'static, Vec<u32>> {
     LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Kill every process group a running command started, and refuse to start
 /// another, right before the process exits. This is for an exit that cannot
 /// wait out the cancel path's grace, a second signal or a turn that never
-/// settled; once the harness has exited, nothing would stop them.
+/// settled; once the harness has exited, nothing would stop them. A spawn in
+/// flight is waited for at most `EXIT_SPAWN_WAIT`.
 pub fn kill_process_groups() {
-    let mut live = live_groups();
-    live.exiting = true;
-    for pid in &live.leaders {
+    EXITING.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + EXIT_SPAWN_WAIT;
+    while !matches!(SPAWNING.try_lock(), Ok(_) | Err(std::sync::TryLockError::Poisoned(_)))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for pid in live_groups().iter() {
         send_kill_group(Some(*pid));
     }
 }
@@ -1089,18 +1105,23 @@ pub fn kill_process_groups() {
 struct GroupGuard(Option<u32>);
 
 impl GroupGuard {
-    /// Start `command` and register its group under one hold of the lock the
-    /// exit's kill takes, so that kill either finds the group or comes first
-    /// and the command never starts. A thread paused between the two steps
-    /// would otherwise leave a group the kill never saw.
+    /// Start `command` and register its group while holding `SPAWNING`, so
+    /// the exit's kill waits for this spawn and finds the group, or comes
+    /// first and the command never starts. A thread paused between the two
+    /// steps would otherwise leave a group the kill never saw. A kill that
+    /// gave up waiting is answered here: the group kills itself.
     fn spawn(command: &mut Command) -> Result<(Child, Self), ProcessError> {
-        let mut live = live_groups();
-        if live.exiting {
+        let _spawning = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        if EXITING.load(Ordering::SeqCst) {
             return Err(ProcessError::Spawn(io::Error::other("openmax is exiting")));
         }
         let child = command.spawn().map_err(ProcessError::Spawn)?;
         let pid = child.id();
-        live.leaders.extend(pid);
+        let mut live = live_groups();
+        live.extend(pid);
+        if EXITING.load(Ordering::SeqCst) {
+            send_kill_group(pid);
+        }
         Ok((child, Self(pid)))
     }
 
@@ -1108,16 +1129,14 @@ impl GroupGuard {
     /// again: once its last member is gone, the id can name another group.
     fn settled(mut self) {
         if let Some(pid) = self.0.take() {
-            live_groups().forget(pid);
+            forget(&mut live_groups(), pid);
         }
     }
 }
 
-impl LiveGroups {
-    fn forget(&mut self, pid: u32) {
-        if let Some(at) = self.leaders.iter().position(|leader| *leader == pid) {
-            self.leaders.swap_remove(at);
-        }
+fn forget(live: &mut Vec<u32>, pid: u32) {
+    if let Some(at) = live.iter().position(|leader| *leader == pid) {
+        live.swap_remove(at);
     }
 }
 
@@ -1128,7 +1147,7 @@ impl Drop for GroupGuard {
             // the two would find the group gone from the list and still
             // running.
             let mut live = live_groups();
-            live.forget(pid);
+            forget(&mut live, pid);
             send_kill_group(Some(pid));
         }
     }
@@ -1910,29 +1929,32 @@ mod tests {
         assert!(!survived, "a background child outlived the command that started it");
     }
 
-    /// The kill an exit makes must reach a command caught between its spawn
-    /// and its registration: a thread paused there would otherwise start a
-    /// group the kill never saw, left running once the process is gone. The
-    /// kill waits for the spawn instead, and nothing starts after it. It
-    /// marks the process as exiting, so the probe runs in a child.
+    /// The kill an exit makes waits for a command caught between its spawn
+    /// and its registration, so it finds the group instead of leaving it
+    /// running once the process is gone, but only for `EXIT_SPAWN_WAIT`: a
+    /// child stalled before exec (a hung mount, a slow exec check) must not
+    /// hold a second signal's exit. Nothing starts after the kill, and the
+    /// stalled command kills its own group once it registers. The kill marks
+    /// the process as exiting, so the probe runs in a child.
     #[cfg(unix)]
     #[test]
-    fn the_exit_kill_waits_for_a_command_caught_mid_spawn() {
+    fn the_exit_kill_waits_a_bounded_time_for_a_command_caught_mid_spawn() {
         const CHILD: &str = "OPENMAX_TEST_KILL_MID_SPAWN";
         if std::env::var_os(CHILD).is_some() {
             let spawning = PausedSpawn::start();
-            let kill = std::thread::spawn(kill_process_groups);
-            std::thread::sleep(Duration::from_millis(200));
-            assert!(!kill.is_finished(), "the kill ran while a command was mid-spawn");
+            let started = std::time::Instant::now();
+            kill_process_groups();
+            let waited = started.elapsed();
+            assert!(waited >= EXIT_SPAWN_WAIT, "the kill did not wait for the spawn ({waited:?})");
+            assert!(waited < EXIT_SPAWN_WAIT * 8, "the kill waited on a stalled spawn ({waited:?})");
             drop(spawning);
-            kill.join().unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let late = runtime.block_on(run_process(request("/bin/echo", &[]), Arc::new(CancelToken::default())));
             assert!(matches!(late, Err(ProcessError::Spawn(_))), "a command started after the kill");
             return;
         }
         let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "execution::tests::the_exit_kill_waits_for_a_command_caught_mid_spawn"])
+            .args(["--exact", "execution::tests::the_exit_kill_waits_a_bounded_time_for_a_command_caught_mid_spawn"])
             .env(CHILD, "1")
             .output()
             .unwrap();
