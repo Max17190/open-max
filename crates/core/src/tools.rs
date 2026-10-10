@@ -700,7 +700,7 @@ fn write_regular(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
             Err(e) => return Err(unchanged(e)),
         }
     }
-    write_in_place(path, file, rel, bytes)
+    write_in_place(path, file, &meta, rel, bytes)
 }
 
 /// Unix only: elsewhere the standard library does not give the link count.
@@ -731,17 +731,32 @@ fn take_identity(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Resu
     tmp.set_permissions(mode)
 }
 
-/// Write `bytes` over the regular `file` open at `path`. It is truncated
-/// first, so if the write then fails its old contents are written back, and
-/// the result says whether they were.
-fn write_in_place(path: &Path, mut file: std::fs::File, rel: &str, bytes: &[u8]) -> Result<(), String> {
+/// Write `bytes` over the regular `file`, open at `path` with metadata
+/// `meta`. It is truncated first, so if the write then fails its old
+/// contents are written back, and the result says whether they were. A file
+/// whose old contents cannot be read first is left alone: truncated, it
+/// would have nothing to put back.
+fn write_in_place(
+    path: &Path,
+    mut file: std::fs::File,
+    meta: &std::fs::Metadata,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
     use std::io::{Read, Seek, Write};
     // The bytes to put back come from the file, not from the text the
-    // caller read: a file that is not UTF-8 reads as empty there.
-    let old = open_regular(path).ok().and_then(|(mut readable, _)| {
+    // caller read: a file that is not UTF-8 reads as empty there. The open
+    // that reads them looks the path up again, so it must have reached the
+    // file being written, not one renamed over it since.
+    let old = open_regular(path).ok().filter(|(_, seen)| same_file(seen, meta)).and_then(|(mut readable, _)| {
         let mut old = Vec::new();
         readable.read_to_end(&mut old).ok().map(|_| old)
     });
+    let Some(old) = old else {
+        return Err(format!(
+            "cannot write {rel} in place: its contents could not be read to put back if the write failed; {rel} is unchanged"
+        ));
+    };
     let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
         file.set_len(0)?;
         file.rewind()?;
@@ -750,13 +765,28 @@ fn write_in_place(path: &Path, mut file: std::fs::File, rel: &str, bytes: &[u8])
     let Err(e) = overwrite(&mut file, bytes) else {
         return Ok(());
     };
-    Err(match old.map(|old| overwrite(&mut file, &old)) {
-        Some(Ok(())) => format!("cannot write {rel}: {e}; its old contents were written back"),
-        Some(Err(again)) => format!(
+    Err(match overwrite(&mut file, &old) {
+        Ok(()) => format!("cannot write {rel}: {e}; its old contents were written back"),
+        Err(again) => format!(
             "cannot write {rel}: {e}, and writing its old contents back failed too ({again}), so it may be partly written"
         ),
-        None => format!("cannot write {rel}: {e}; it may be partly written"),
     })
+}
+
+/// Whether `a` and `b` describe the same file. Unix only: elsewhere the
+/// standard library gives no file identity, so any two count as the same.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    };
+    #[cfg(not(unix))]
+    let same = {
+        let _ = (a, b);
+        true
+    };
+    same
 }
 
 /// The numbered lines one read_file call returns.
@@ -1983,6 +2013,29 @@ mod tests {
         assert_eq!(alone, refusal, "no reader attached");
         assert_eq!(attached, refusal, "a reader attached");
         assert!(std::fs::symlink_metadata(&pipe).unwrap().file_type().is_fifo());
+    }
+
+    /// A write in place truncates the file it has open, but reads the old
+    /// contents it would put back through a second open of the path. A file
+    /// renamed over the path in between must not lend its bytes, or a failed
+    /// write would fill the first file with the second's contents and call
+    /// them its own. The write is refused before anything is truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_in_place_puts_back_only_the_file_it_writes() {
+        let root = temp_project();
+        let path = root.join("linked.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::hard_link(&path, root.join("alias.txt")).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        std::fs::rename(root.join("other.txt"), &path).unwrap();
+        let refused = "cannot write linked.txt in place: its contents could not be read to put back if the write failed; linked.txt is unchanged";
+        assert_eq!(write_in_place(&path, file, &meta, "linked.txt", b"new\n"), Err(refused.to_string()));
+        assert_eq!(std::fs::read_to_string(root.join("alias.txt")).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "other\n");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Reading a device takes whatever it hands out for as long as it keeps

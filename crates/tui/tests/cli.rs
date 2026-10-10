@@ -2018,6 +2018,13 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
     std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).unwrap();
     // The superuser may write it anyway, in place or not.
     let refused = std::fs::OpenOptions::new().write(true).open(&readonly).is_err();
+    // Written in place for its second name, with nothing to put back if
+    // that write failed, since it cannot be read: left alone instead.
+    let writeonly = project.join("writeonly.txt");
+    std::fs::write(&writeonly, "old\n").unwrap();
+    std::fs::hard_link(&writeonly, project.join("writeonly-alias.txt")).unwrap();
+    std::fs::set_permissions(&writeonly, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let unreadable = std::fs::File::open(&writeonly).is_err();
     let locked = project.join("locked");
     std::fs::create_dir(&locked).unwrap();
     std::fs::write(locked.join("inside.txt"), "old\n").unwrap();
@@ -2033,6 +2040,7 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
         ("edit_file", edit(&long)),
         ("write_file", serde_json::json!({"path": long_new, "content": "new\n"})),
         ("edit_file", edit("grouped.txt")),
+        ("write_file", serde_json::json!({"path": "writeonly.txt", "content": "new\n"})),
     ];
     let (base_url, _requests, _server) = spawn_scripted_server(vec![
         (sse_tool_calls(&calls), true),
@@ -2043,6 +2051,7 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
     // Writable again before any assertion, so a failure leaves nothing that
     // cannot be deleted.
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&writeonly, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(code, Some(0), "{stdout}");
     assert_eq!(lines.iter().filter(|l| l["type"] == "tool_end").count(), calls.len(), "{stdout}");
 
@@ -2061,6 +2070,11 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
     }
     if refused {
         assert_eq!(std::fs::read_to_string(&readonly).unwrap(), "old\n", "a file it may not write is not replaced");
+    }
+    if unreadable {
+        assert_eq!(std::fs::read_to_string(&writeonly).unwrap(), "old\n", "{stdout}");
+        let said = lines.iter().rfind(|l| l["type"] == "tool_end").unwrap()["output"].clone();
+        assert!(said.as_str().is_some_and(|s| s.ends_with("writeonly.txt is unchanged")), "{said}");
     }
     let names: Vec<_> = std::fs::read_dir(&project).unwrap().flatten().map(|e| e.file_name()).collect();
     assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left behind: {names:?}");
