@@ -56,7 +56,10 @@ provider's per-model entries override the first two.
   naming this field until it is set. Set it to what the server actually
   serves for the model. `openmax --check` warns while it is missing.
 - `max_tokens` (default 4096): the completion reserve, clamped so it never
-  eats the window (at most `context_tokens - 2048`).
+  eats the window (at most `context_tokens - 2048`), and sent as the reply's
+  length limit. When the server reports the cut (finish_reason `length`, or
+  a usage count at the limit), a tool call cut off at that limit does not
+  run; the model is told why and to send large content in parts.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's

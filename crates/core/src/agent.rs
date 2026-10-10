@@ -152,6 +152,33 @@ fn batchable_call(
 /// result was. Nothing that runs later knows whether the call ran.
 const INTERRUPTED_TOOL_CALL: &str = "This call was interrupted before its result was recorded, so whether it ran and what it changed are unknown. Check before repeating it.";
 
+/// Whether the provider stopped this reply at the output cap. Most servers say
+/// so with finish_reason `length`. Some report every reply that carries calls
+/// as `tool_calls`, and then the cut shows only in the usage, as a reply of
+/// exactly `max_tokens`. A provider that ignores the cap can return more than
+/// that, so only the exact count reads as a cut.
+fn reply_hit_output_cap(result: &CompletionResult, max_tokens: usize) -> bool {
+    result.finish_reason == "length"
+        || result.usage.is_some_and(|u| u.completion_tokens == max_tokens as u64)
+}
+
+/// The reply for a call the output cap cut off partway through its
+/// arguments. A bare parse error ("EOF while parsing") reads as a typo to
+/// fix, and the model sends the same oversized call again, which the cap
+/// cuts at the same place. The advice is an example, since any tool can be
+/// the one cut (a bash heredoc as easily as a write_file), and it spells out
+/// how edit_file appends, because its old_string has to be unique and the
+/// last line alone of a large file is often a brace or blank.
+fn cut_off_call_error(max_tokens: usize) -> String {
+    format!(
+        "Not run: your reply reached the output limit (max_tokens = {max_tokens}) while \
+         writing this call, so its arguments were cut off. Send large content in parts: \
+         for a file, write_file the first part, then append the rest with edit_file \
+         (old_string is the last few lines you wrote, enough to be unique; new_string \
+         is those lines followed by the next part)."
+    )
+}
+
 /// Answer every tool call in the transcript that has no reply with a tool
 /// message carrying `note`. Returns the index of each reply inserted, in
 /// ascending order, for a caller that has to move replay boundaries with it.
@@ -2901,6 +2928,14 @@ async fn run_loop(
             stop_reason = TRUNCATED.into();
             break 'turns;
         }
+        // The output cap is different: the reply is the model's own, and the
+        // calls it finished before the cut run as usual. Only the last call,
+        // the one it was still writing, is refused with the cause, so the
+        // model can split the work. A cut that lands before the first
+        // argument byte is not caught: the client reads no arguments as `{}`,
+        // so that call runs and gets the tool's own missing-argument error
+        // instead.
+        let capped = reply_hit_output_cap(&result, max_tokens);
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
@@ -3077,7 +3112,18 @@ async fn run_loop(
                         if sent.len() < call.function.arguments.len() {
                             sent.push_str("...");
                         }
-                        let msg = format!("invalid JSON in tool arguments: {e}. The call did not run. Arguments sent: {sent}");
+                        // Only the last call can be the one the cap cut: the
+                        // model had finished every call before it when it
+                        // moved on, so an earlier one that fails to parse
+                        // made its own slip, and the parse error is what
+                        // fixes it.
+                        let cut = capped && tool_calls.last().is_some_and(|last| std::ptr::eq(call, last));
+                        let cause = if cut {
+                            cut_off_call_error(max_tokens)
+                        } else {
+                            format!("invalid JSON in tool arguments: {e}. The call did not run.")
+                        };
+                        let msg = format!("{cause} Arguments sent: {sent}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
                         core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
                         guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
@@ -7671,6 +7717,125 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One finished reply of calls given as (id, tool, raw arguments), ending
+    /// with `finish` and, when given, the server's completion count.
+    fn raw_calls_sse(calls: &[(&str, &str, &str)], finish: &str, completion_tokens: Option<u64>) -> String {
+        let calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (id, name, args))| {
+                serde_json::json!({
+                    "index": index,
+                    "id": id,
+                    "function": { "name": name, "arguments": args },
+                })
+            })
+            .collect();
+        let mut sse = String::new();
+        for chunk in [
+            serde_json::json!({ "choices": [{ "delta": { "tool_calls": calls }, "finish_reason": null }] }),
+            serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": finish }] }),
+        ] {
+            sse.push_str(&format!("data: {chunk}\n\n"));
+        }
+        if let Some(n) = completion_tokens {
+            let usage = serde_json::json!({ "choices": [], "usage": { "prompt_tokens": 100, "completion_tokens": n } });
+            sse.push_str(&format!("data: {usage}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        sse
+    }
+
+    /// The bug this guards: a reply the provider cut at max_tokens ends
+    /// inside the call the model was writing, and that call's tool message
+    /// said only "invalid JSON ... EOF while parsing", which reads as a typo.
+    /// The model sent the same oversized call again, the cap cut it in the
+    /// same place, and the turn looped until its iteration cap. The cut call
+    /// is refused with the cause and the limit; the calls before it keep the
+    /// replies they earned on their own: a finished write runs, a write with
+    /// a JSON slip gets the parse error that fixes it, a batch of reads runs
+    /// as one. Servers that report such a reply as `tool_calls` show the cut
+    /// only as a reply of exactly max_tokens, and a server that ignores the
+    /// cap (a longer reply) keeps the plain parse error.
+    #[tokio::test]
+    async fn a_call_cut_off_at_max_tokens_is_refused_with_the_cause() {
+        use crate::state::Core;
+
+        // A call before the cut: id, tool, arguments, and a word of the reply
+        // it earns on its own.
+        type Call = (&'static str, &'static str, &'static str, &'static str);
+        const DONE: Call = ("c1", "write_file", r#"{"path":"done.txt","content":"whole\n"}"#, "done.txt (+1 −0)");
+        const SLIP: Call = ("c1", "write_file", r#"{"path":"done.txt",}"#, "invalid JSON");
+        const PEEK: Call = ("r1", "read_file", r#"{"path":"note.txt"}"#, "noted");
+        const PEEK_AGAIN: Call = ("r2", "read_file", r#"{"path":"note.txt"}"#, "noted");
+        const CUT: (&str, &str, &str) = ("c2", "write_file", r#"{"path":"big.txt","content":"Big\nlorem ips"#);
+        // A case: name, the calls before the cut, finish_reason, the
+        // completion count when the server sends one, and whether the
+        // reply reads as a cut.
+        type Case = (&'static str, &'static [Call], &'static str, Option<u64>, bool);
+        let cases: [Case; 5] = [
+            ("length", &[DONE], "length", None, true),
+            ("tool_calls at the cap", &[DONE], "tool_calls", Some(1024), true),
+            ("tool_calls past the cap", &[DONE], "tool_calls", Some(1500), false),
+            ("a slip before the cut", &[SLIP], "length", None, true),
+            ("a read-only batch before the cut", &[PEEK, PEEK_AGAIN], "length", None, true),
+        ];
+        for (case, before, finish, completion_tokens, capped) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("note.txt"), "noted\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+            let calls: Vec<(&str, &str, &str)> =
+                before.iter().map(|&(id, tool, args, _)| (id, tool, args)).chain([CUT]).collect();
+            let sse = raw_calls_sse(&calls, finish, completion_tokens);
+            let (base_url, requests) = scripted_endpoint(&[&sse, STOP_SSE]).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                s.base_url = base_url;
+                s.model = "stub".into();
+                s.context_tokens = Some(16384);
+                s.max_tokens = 1024;
+                s.approval_mode = ApprovalMode::Auto;
+                s.max_agent_iterations = 5;
+            }
+
+            let id = "sess-cut";
+            start_turn(core.clone(), id.into(), project.clone(), "write big.txt".into()).unwrap();
+            let (stop, _) = drive_turn(&mut rx).await;
+            assert_eq!(stop, "stop", "{case}");
+            assert_eq!(*requests.lock().unwrap(), 2, "{case}: one request after the cut, then done");
+            assert!(!project.join("big.txt").exists(), "{case}: the cut call never runs");
+            assert_eq!(
+                std::fs::read_to_string(project.join("done.txt")).ok().as_deref(),
+                before.contains(&DONE).then_some("whole\n"),
+                "{case}: a write finished before the cut runs, a slipped one does not"
+            );
+            let messages = transcript(&core, id).await;
+            let reply = |id: &str| {
+                messages
+                    .iter()
+                    .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(id))
+                    .and_then(|m| m.content.clone())
+                    .unwrap()
+            };
+            let cut = reply("c2");
+            assert_eq!(cut.contains("max_tokens = 1024") && cut.contains("in parts"), capped, "{case}: {cut}");
+            assert_eq!(cut.contains("invalid JSON"), !capped, "{case}: {cut}");
+            // The cause belongs to the cut call alone: the model had finished
+            // every call before it when it moved on, so each keeps the reply
+            // it earned, a JSON slip's parse error included.
+            for (id, _, _, earned) in before {
+                let earlier = reply(id);
+                assert!(earlier.contains(earned) && !earlier.contains("max_tokens"), "{case}: {id}: {earlier}");
+            }
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// One reply carrying `calls` as (id, tool, arguments), in order.
