@@ -12,9 +12,10 @@
 //! measurably help smaller models, and every character is prompt cost.
 //!
 //! Output is bounded rather than trusted: a command that prints a gigabyte is
-//! captured to a cap, tail-first, and the remainder spills to a file under the
-//! session's data dir with a breadcrumb in the result. Truncation always says
-//! so, so the model can tell a short answer from a clipped one.
+//! captured to a cap, its start and its end, and the remainder spills to a
+//! file under the session's data dir with a breadcrumb in the result.
+//! Truncation always says so, so the model can tell a short answer from a
+//! clipped one.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -37,6 +38,12 @@ const MAX_RESULTS: usize = 200;
 /// re-prefilled on every subsequent turn. 50 is plenty to act on.
 const MAX_GREP_RESULTS: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 30_000;
+/// bash keeps one part in this many of each stream's share from its start,
+/// and the rest from its end. A compiler prints the error that broke the
+/// build first and the errors that follow from it after, so a tail alone
+/// shows the consequences and not the cause; test runners print their
+/// summary last, so the tail keeps the larger share.
+const HEAD_SHARE_DIVISOR: usize = 4;
 const MAX_READ_LINES: usize = 1500;
 const MAX_READ_BYTES: usize = 24_000;
 const MAX_DIR_ENTRIES: usize = 200;
@@ -1353,24 +1360,88 @@ fn kept_tail(text: &str, max_bytes: usize) -> &str {
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    if let Some(nl) = text[start..].find('\n') {
-        if nl < 200 {
-            start += nl + 1;
-        }
+    from_a_line_start(&text[start..])
+}
+
+/// The head of `text` within `max_bytes`, ending at a line boundary when one
+/// is close by.
+fn kept_head(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
     }
-    &text[start..]
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    to_a_line_end(&text[..end])
+}
+
+/// `text` after its first line break, when one is close by.
+fn from_a_line_start(text: &str) -> &str {
+    match text.find('\n') {
+        Some(nl) if nl < 200 => &text[nl + 1..],
+        _ => text,
+    }
+}
+
+/// `text` through its last line break, when one is close by.
+fn to_a_line_end(text: &str) -> &str {
+    match text.rfind('\n') {
+        Some(nl) if text.len() - nl <= 200 => &text[..nl + 1],
+        _ => text,
+    }
 }
 
 /// Heads the result when any part of the output was dropped. The process
 /// supervisor owns any bounded spill log; rendering never writes files.
-fn truncation_notice(log_path: Option<&PathBuf>) -> String {
+fn truncation_notice(log_path: Option<&PathBuf>, head_kept: bool) -> String {
+    let cut = if head_kept { "middle" } else { "start" };
     match log_path {
         Some(path) => format!(
-            "[start of output truncated; bounded output log saved to {}; tail or grep it with bash]",
+            "[{cut} of output truncated; bounded output log saved to {}; tail or grep it with bash]",
             path.display()
         ),
-        None => "[start of output truncated]".to_string(),
+        None => format!("[{cut} of output truncated]"),
     }
+}
+
+fn omission_marker(omitted: u64) -> String {
+    format!("[… {omitted} bytes omitted …]\n")
+}
+
+/// One stream within `share` bytes, and whether its head survived the cut.
+/// A stream over its share keeps its tail, plus a head of up to
+/// `1/HEAD_SHARE_DIVISOR` of the share when its capture kept one (bash
+/// does; external tools capture no head). The cut between them names the
+/// bytes it dropped and is counted inside the share.
+fn kept_stream(stream: &execution::CapturedStream, text: &str, share: usize) -> (String, bool) {
+    let whole = !stream_was_truncated(stream);
+    if whole && text.len() <= share {
+        return (text.to_string(), false);
+    }
+    let head_budget = stream.head.len().min(share / HEAD_SHARE_DIVISOR);
+    if head_budget == 0 {
+        return (format!("…{}", kept_tail(text, share)), false);
+    }
+    // A truncated capture renders a supervisor marker between its head and
+    // tail, and the capture cut both mid-line: take the two apart and trim
+    // each to whole lines.
+    let (head_text, tail_text);
+    let (head, tail) = match whole {
+        true => (text, text),
+        false => {
+            head_text = String::from_utf8_lossy(&stream.head);
+            tail_text = String::from_utf8_lossy(&stream.tail);
+            (to_a_line_end(&head_text), from_a_line_start(&tail_text))
+        }
+    };
+    let head = kept_head(head, head_budget);
+    let separator = if head.ends_with('\n') { "" } else { "\n" };
+    // The count cannot exceed the stream's total, so this bounds the marker.
+    let reserved = head.len() + separator.len() + omission_marker(stream.total_bytes).len();
+    let tail = kept_tail(tail, share.saturating_sub(reserved));
+    let omitted = stream.total_bytes.saturating_sub((head.len() + tail.len()) as u64);
+    (format!("{head}{separator}{}{tail}", omission_marker(omitted)), true)
 }
 
 fn captured_text(stream: &execution::CapturedStream) -> String {
@@ -1384,11 +1455,12 @@ fn stream_was_truncated(stream: &execution::CapturedStream) -> bool {
 /// Format native-process output identically for bash and external tools.
 /// The supervisor has already bounded each stream and owns any spill log.
 ///
-/// Over the cap, each stream keeps its own tail, so a flood of warnings on
-/// stderr cannot evict all of stdout, which is usually the result the command
-/// ran for. A stream that needs less than half of the cap keeps all of it and
-/// leaves the rest to the other, and a `…` marks each stream whose start was
-/// dropped.
+/// Over the cap, each stream is cut within its own share, so a flood of
+/// warnings on stderr cannot evict all of stdout, which is usually the result
+/// the command ran for. A stream that needs less than half of the cap keeps
+/// all of it and leaves the rest to the other. A stream whose capture kept a
+/// head keeps its start and its end around a counted cut; one that did not
+/// keeps its tail behind a `…`.
 pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) -> (String, bool) {
     let stdout = captured_text(&output.stdout);
     let stderr = captured_text(&output.stderr);
@@ -1405,24 +1477,15 @@ pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) ->
 
     let budget = max_bytes.saturating_sub(label.len());
     let stdout_share = stdout.len().min((budget / 2).max(budget.saturating_sub(stderr.len())));
-    let elide = |text: &str, share: usize, captured_whole: bool| {
-        let kept = kept_tail(text, share);
-        match captured_whole && kept.len() == text.len() {
-            true => kept.to_string(),
-            false => format!("…{kept}"),
-        }
-    };
-    let mut text = elide(&stdout, stdout_share, !stream_was_truncated(&output.stdout));
+    let (mut text, mut head_kept) = kept_stream(&output.stdout, &stdout, stdout_share);
     if !label.is_empty() {
+        let (kept, stderr_head_kept) = kept_stream(&output.stderr, stderr, budget - stdout_share);
         text.push_str(label);
-        text.push_str(&elide(
-            stderr,
-            budget - stdout_share,
-            !stream_was_truncated(&output.stderr),
-        ));
+        text.push_str(&kept);
+        head_kept |= stderr_head_kept;
     }
     if needs_notice {
-        text = format!("{}\n{text}", truncation_notice(output.log_path.as_ref()));
+        text = format!("{}\n{text}", truncation_notice(output.log_path.as_ref(), head_kept));
     }
     if text.trim().is_empty() {
         ("(no output)".into(), needs_notice)
@@ -1471,8 +1534,8 @@ async fn bash_tool(
         stdin: StdinMode::Null,
         timeout: std::time::Duration::from_secs(timeout_secs),
         capture: CaptureSpec {
-            head_bytes: 0,
-            tail_bytes: caps.command_bytes,
+            head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR,
+            tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
             spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
         },
@@ -2281,6 +2344,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Pins a capture that kept no head, as external tools' captures do:
+    /// only its tail can survive. bash captures a head too and keeps both.
     #[test]
     fn command_truncation_keeps_the_tail() {
         let mut text = String::new();
@@ -2686,23 +2751,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A compiler prints the error that broke the build first, then the
+    /// errors that follow from it, then a summary. Keeping only the tail of a
+    /// long build showed the consequences and the summary but not the cause,
+    /// so the next step fixed a symptom or spent a call reading the log.
     #[tokio::test]
-    async fn bash_failure_preserves_tail_of_output() {
+    async fn a_long_failing_build_keeps_its_first_error_and_its_summary() {
         let root = temp_project();
-        // 40k+ bytes of output with the failure marker at the very end.
-        let cmd = "for i in $(seq 1 2000); do echo \"noise line $i padded out a bit\"; done; echo THE_REAL_FAILURE; exit 3";
+        let caps = OutputCaps::default();
+        let cmd = "echo 'error[E0560]: FIRST-ERROR struct has no field named host' >&2; \
+                   for i in $(seq 1 3000); do \
+                   echo \"error[E0308]: mismatched types, consequence $i\" >&2; done; \
+                   echo 'error: could not compile due to 3001 previous errors' >&2; exit 101";
         let out = bash_tool(
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps::default(),
+            caps,
             Arc::new(CancelToken::default()),
         )
         .await;
         assert!(!out.ok);
-        assert!(out.output.starts_with("exit code 3"), "{}", &out.output[..60]);
-        assert!(out.output.contains("THE_REAL_FAILURE"), "tail must survive truncation");
-        assert!(!out.output.contains("noise line 1 "), "head should be dropped");
+        let produced = out.process_bytes.unwrap();
+        assert!(produced > 3 * caps.command_bytes as u64, "the build must overflow: {produced}");
+        assert!(out.output.starts_with("exit code 101"), "{}", &out.output[..60]);
+        let start: String = out.output.chars().take(400).collect();
+        assert!(out.output.contains("FIRST-ERROR"), "the first error survives: {start}");
+        assert!(out.output.contains("due to 3001 previous errors"), "the summary must survive");
+        assert!(out.output.contains("bounded output log saved to"), "{start}");
+
+        // The cut names exactly the bytes it dropped, and the text around it
+        // stays within the cap. The tail keeps the larger share, because test
+        // runners print their summary last.
+        let (_, body) = out.output.split_once("[stderr]\n").expect(&start);
+        let (head, rest) = body.split_once("[… ").expect("the cut is marked");
+        let (omitted, tail) = rest.split_once(" bytes omitted …]\n").expect("the cut is counted");
+        let omitted: u64 = omitted.parse().unwrap();
+        assert_eq!(head.len() as u64 + omitted + tail.len() as u64, produced);
+        let edges = (head.lines().last(), tail.lines().next());
+        assert!(head.ends_with('\n') && tail.starts_with("error["), "cut mid-line: {edges:?}");
+        assert!(body.len() <= caps.command_bytes, "{} bytes over the cap", body.len());
+        assert!(tail.len() > 2 * head.len(), "head {} tail {}", head.len(), tail.len());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2728,16 +2817,49 @@ mod tests {
         assert!(out.output.contains("RESULT"), "stdout must survive a stderr flood: {}", out.output);
         assert!(out.output.contains("\n[stderr]\n"), "{}", out.output);
         assert!(out.output.ends_with("warn-3000\n"), "stderr keeps its tail: {}", out.output);
-        assert!(!out.output.contains("warn-1\n"), "and drops its head: {}", out.output);
-        // The notice and the elision marks sit outside the cap, as they always
-        // have; the captured text they frame stays within it.
+        assert!(out.output.contains("[stderr]\nwarn-1\n"), "and its head: {}", out.output);
+        // The notice sits outside the cap, as it always has; the text it
+        // heads, cut marker included, stays within it.
         let (notice, body) = out.output.split_once('\n').unwrap();
         assert!(notice.contains("bounded output log saved to"), "{notice}");
-        assert!(
-            body.replace('…', "").len() <= cap,
-            "both streams share one cap: {} bytes",
-            body.len()
-        );
+        assert!(body.len() <= cap, "both streams share one cap: {} bytes", body.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two streams that each fit the capture but not the cap together are cut
+    /// from text held whole, so the kept head and tail must not overlap and
+    /// the count between them must still be exact.
+    #[tokio::test]
+    async fn streams_over_their_shares_keep_their_own_heads_and_tails() {
+        let root = temp_project();
+        let cap = 2_000;
+        let cmd = "for i in $(seq 1000 1149); do echo out-$i; echo err-$i >&2; done";
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps { command_bytes: cap },
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        let per_stream = "out-1000\n".len() as u64 * 150;
+        assert_eq!(out.process_bytes, Some(2 * per_stream));
+        let (notice, body) = out.output.split_once('\n').unwrap();
+        assert!(notice.starts_with("[middle of output truncated"), "{notice}");
+        assert!(body.len() <= cap, "{} bytes over a {cap} cap", body.len());
+        let (kept_out, kept_err) = body.split_once("\n[stderr]\n").expect(body);
+        for (tag, kept) in [("out", kept_out), ("err", kept_err)] {
+            assert!(kept.starts_with(&format!("{tag}-1000\n")), "{kept}");
+            assert!(kept.ends_with(&format!("{tag}-1149\n")), "{kept}");
+            let (head, rest) = kept.split_once("[… ").expect(kept);
+            let (omitted, tail) = rest.split_once(" bytes omitted …]\n").expect(kept);
+            let omitted: u64 = omitted.parse().unwrap();
+            assert_eq!(head.len() as u64 + omitted + tail.len() as u64, per_stream, "{kept}");
+            let last_head = head.lines().last().unwrap();
+            let first_tail = tail.lines().next().unwrap();
+            assert!(last_head < first_tail, "head and tail overlap: {last_head} {first_tail}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

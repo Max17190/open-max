@@ -149,10 +149,10 @@ what an eval, audit, or telemetry hook needs to be written as a file instead of
 a core feature.
 
 Output is bounded twice and the payload reports both cuts. A tool result is
-itself a bounded rendering of what a process printed: `bash` keeps the tail up
-to its output cap and names a log file holding the bounded capture. So
-`process_bytes` is how many bytes the command actually produced (null when the
-tool ran no process, such as the file and search built-ins) and
+itself a bounded rendering of what a process printed: `bash` keeps the start
+and the end within its output cap and names a log file holding the bounded
+capture. So `process_bytes` is how many bytes the command actually produced
+(null when the tool ran no process, such as the file and search built-ins) and
 `process_truncated` says whether the result dropped part of it. A call killed
 by timeout or cancel reports the bytes it printed before it died, even though
 its result carries none of them. An audit hook can therefore tell a quiet

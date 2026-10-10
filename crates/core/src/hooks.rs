@@ -1051,9 +1051,10 @@ fn tool_payload(
 /// the same shape hook block reasons already take.
 ///
 /// This is the second of two bounds. The tool layer has already rendered the
-/// process output down to a result, keeping its tail and saying so inline when
-/// it dropped anything, and that result is what the model reasoned about. It
-/// is therefore what a hook is shown, and what `output_bytes` measures.
+/// process output down to a result, keeping its tail (for bash, its start and
+/// its end) and saying so inline when it dropped anything, and that result is
+/// what the model reasoned about. It is therefore what a hook is shown, and
+/// what `output_bytes` measures.
 fn head_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
