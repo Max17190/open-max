@@ -126,6 +126,8 @@ async fn run_turn_events(
     stderr: &mut io::Stderr,
 ) -> i32 {
     let mut exit_code = 0i32;
+    // Whether this turn's error line is already on stderr.
+    let mut error_printed = false;
 
     loop {
         // No clock of its own: a live turn can go quiet here for longer than
@@ -211,13 +213,17 @@ async fn run_turn_events(
             AgentEvent::Error { message } => {
                 if !json {
                     let _ = writeln!(stderr, "openmax: error: {message}");
+                    error_printed = true;
                 }
                 exit_code = 1;
             }
             AgentEvent::Done { stop_reason } => {
                 if !json {
                     let _ = writeln!(stdout);
-                    if stop_reason != "stop" && stop_reason != "tool_calls" {
+                    // A failed turn already printed its error line; a
+                    // "stopped (error)" after it would only repeat it.
+                    let reported = stop_reason == "error" && error_printed;
+                    if stop_reason != "stop" && stop_reason != "tool_calls" && !reported {
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
                     }
                 }

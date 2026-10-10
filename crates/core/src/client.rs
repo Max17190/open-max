@@ -232,14 +232,16 @@ fn serialize_chat_request_body(
 pub enum StreamDelta {
     Content(String),
     Reasoning(String),
-    /// The request is being resent: `attempt` is the one about to go out of
-    /// the `max_attempts` budget, after `reason` ended the previous one. It
-    /// is announced before the backoff wait, which is what the caller is
-    /// waiting through; a cancellation during the wait ends the request
-    /// instead, and the attempt never goes out. Any reasoning streamed for
-    /// the failed attempt is void; no content was. A request gives up before
-    /// the budget when [`UNREACHED_ATTEMPTS`] in a row never reached the
-    /// endpoint.
+    /// The request is being resent: `attempt` is the one about to go out,
+    /// after `reason` ended the previous one, and `max_attempts` the one the
+    /// request ends on if it keeps failing that way. That is the budget, or,
+    /// while the latest attempts in a row have not reached the endpoint, the
+    /// one that makes [`UNREACHED_ATTEMPTS`] of them if that comes first, so
+    /// it rises again when one does. It is announced before the backoff
+    /// wait, which is what the caller is waiting through; a cancellation
+    /// during the wait ends the request instead, and the attempt never goes
+    /// out. Any reasoning streamed for the failed attempt is void; no
+    /// content was.
     Retry { attempt: u32, max_attempts: u32, reason: String },
 }
 
@@ -576,7 +578,7 @@ impl ChatClient {
                     unreached = 0;
                     let msg = format!("request failed: {}", silence(self.idle_timeout));
                     if attempt < MAX_ATTEMPTS {
-                        if !retry_after(attempt, &msg, &cancelled, &mut on_delta).await {
+                        if !retry_after(attempt, MAX_ATTEMPTS, &msg, &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
@@ -584,15 +586,26 @@ impl ChatClient {
                     return Err(msg);
                 }
                 Ok(Err(e)) => {
-                    let msg = format!("request failed: {}", describe_transport(&e));
                     unreached = if e.is_connect() || e.is_timeout() { unreached + 1 } else { 0 };
-                    if attempt < MAX_ATTEMPTS && unreached < UNREACHED_ATTEMPTS && is_transient_transport(&e) {
-                        if !retry_after(attempt, &msg, &cancelled, &mut on_delta).await {
+                    // The attempt this request ends on if it keeps failing
+                    // this way: the budget, or, while the latest attempts
+                    // have not reached the endpoint, the one that makes
+                    // UNREACHED_ATTEMPTS of them in a row, if that comes
+                    // first. The retry line counts to it, not to a budget a
+                    // dead address never spends.
+                    let last = match unreached {
+                        0 => MAX_ATTEMPTS,
+                        n => MAX_ATTEMPTS.min(attempt + UNREACHED_ATTEMPTS - n),
+                    };
+                    let (msg, repair) =
+                        never_connected(&e).unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
+                    if attempt < last && is_transient_transport(&e) {
+                        if !retry_after(attempt, last, &msg, &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
                     }
-                    return Err(msg);
+                    return Err(if repair.is_empty() { msg } else { format!("{msg}: {repair}") });
                 }
             };
             unreached = 0;
@@ -620,7 +633,7 @@ impl ChatClient {
                     }
                 }
                 if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) && beyond_cap.is_none() {
-                    if !resend_after(attempt, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
+                    if !resend_after(attempt, MAX_ATTEMPTS, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
                     }
                     continue;
@@ -647,7 +660,7 @@ impl ChatClient {
                 if error.is_some() || choice["finish_reason"] == "error" {
                     let failure = server_failure(error.unwrap_or(&Value::Null), &String::from_utf8_lossy(&body));
                     if failure.retryable && attempt < MAX_ATTEMPTS && beyond_cap.is_none() {
-                        if !resend_after(attempt, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
+                        if !resend_after(attempt, MAX_ATTEMPTS, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
@@ -672,7 +685,7 @@ impl ChatClient {
                 Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
                 _ => return Ok(reply),
             };
-            if !resend_after(attempt, &reason, wait, &cancelled, &mut on_delta).await {
+            if !resend_after(attempt, MAX_ATTEMPTS, &reason, wait, &cancelled, &mut on_delta).await {
                 return Ok(cancelled_response());
             }
         }
@@ -1255,10 +1268,11 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
         .collect()
 }
 
-/// reqwest's `Display` stops at "error sending request for url (...)" and
-/// hides the cause underneath, which is the only part a user can act on:
-/// "connection refused" means nothing is listening at base_url. Walk the
-/// source chain so that line survives into the transcript.
+/// A fault after a connection existed (a reset on send, a stream cut
+/// mid-reply), or one [`never_connected`] cannot name. reqwest's `Display`
+/// stops at "error sending request for url (...)" and hides the cause
+/// underneath, which is the only part a user can act on, so walk the source
+/// chain.
 fn describe_transport(e: &reqwest::Error) -> String {
     use std::error::Error;
     let mut out = e.to_string();
@@ -1273,6 +1287,65 @@ fn describe_transport(e: &reqwest::Error) -> String {
         source = cause.source();
     }
     truncate(&out, 600)
+}
+
+/// A request that never reached its endpoint, as the one line a user acts
+/// on: the server, the cause, and the repair the final error adds.
+/// reqwest's chain ("error sending request for url (...): client error
+/// (Connect): tcp connect error: Connection refused (os error 61)") buries
+/// that under a URL path no request got to and the layers that wrapped the
+/// cause. None for a fault after a connection existed, which keeps the
+/// chain: there the details are the diagnosis. That includes a timeout
+/// outside the connect phase, such as TCP keepalive giving up on a server
+/// that took the request and then went away. None as well while a proxy may
+/// be in play (see [`env_proxy`]).
+fn never_connected(e: &reqwest::Error) -> Option<(String, &'static str)> {
+    use std::error::Error;
+    if !e.is_connect() || e.url().is_some_and(env_proxy) {
+        return None;
+    }
+    let chain = || std::iter::successors(e.source(), |&cause| cause.source());
+    // An io::Error's source() skips the error it wraps, and the kind can sit
+    // on one wrapped inside another (the TLS connector wraps the
+    // handshake's InvalidData as Other), so look through the wrapping.
+    let io_kind = |kind| {
+        chain().any(|c| {
+            std::iter::successors(c.downcast_ref::<std::io::Error>(), |io| io.get_ref()?.downcast_ref())
+                .any(|io| io.kind() == kind)
+        })
+    };
+    // The innermost cause, which names what failed in its own words.
+    let innermost = || truncate(&chain().last().map_or_else(|| e.to_string(), |c| c.to_string()), 600);
+    let (cause, repair) = if e.is_timeout() {
+        ("timed out".to_string(), "nothing answered; check that the host is up and that base_url names it (openmax --spec settings)")
+    } else if io_kind(std::io::ErrorKind::ConnectionRefused) {
+        ("connection refused".to_string(), "nothing is listening there; start the server or fix base_url (openmax --spec settings)")
+    } else if chain().any(|c| c.to_string() == "dns error") {
+        // The connector's own label for a failed lookup; the resolver's
+        // message under it differs by platform.
+        ("host not found".to_string(), "fix the host in base_url or check the network (openmax --spec settings)")
+    } else if io_kind(std::io::ErrorKind::InvalidData) {
+        // How the TLS layer reports a handshake it could not complete: a
+        // certificate it does not trust, or a server not speaking TLS.
+        (format!("TLS handshake failed: {}", innermost()), "")
+    } else {
+        (innermost(), "")
+    };
+    let server = e
+        .url()
+        .and_then(|url| Some(format!("{}:{}", url.host_str()?, url.port_or_known_default()?)))
+        .unwrap_or_else(|| "base_url".to_string());
+    Some((format!("cannot connect to {server} ({cause})"), repair))
+}
+
+/// Whether the HTTP client may have sent a request to `url` through a proxy
+/// named in the environment, which it reads as curl does. A failure to
+/// reach that proxy carries the same causes as one to reach the endpoint,
+/// and naming the endpoint (with advice to start it or fix base_url) would
+/// send the user the wrong way, so such a failure keeps the chain.
+fn env_proxy(url: &reqwest::Url) -> bool {
+    let scheme = if url.scheme() == "https" { ["HTTPS_PROXY", "https_proxy"] } else { ["HTTP_PROXY", "http_proxy"] };
+    scheme.into_iter().chain(["ALL_PROXY", "all_proxy"]).any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
 }
 
 /// OpenAI-compatible servers wrap failures in `{"error": {"message": ...}}`.
@@ -1473,11 +1546,12 @@ fn is_transient_transport(err: &reqwest::Error) -> bool {
 /// one that just failed). Returns false when cancelled during the wait.
 async fn retry_after(
     attempt: u32,
+    last: u32,
     reason: &str,
     cancelled: &crate::state::CancelToken,
     on_delta: &mut impl FnMut(StreamDelta),
 ) -> bool {
-    resend_after(attempt, reason, backoff(attempt, None), cancelled, on_delta).await
+    resend_after(attempt, last, reason, backoff(attempt, None), cancelled, on_delta).await
 }
 
 /// `err`, naming the server's wait when that is past
@@ -1491,16 +1565,19 @@ fn naming_wait(mut err: String, beyond_cap: Option<u64>) -> String {
 
 /// [`retry_after`] with the wait chosen by the caller: a refused status, or
 /// a failure inside a 200, passes the server's Retry-After through
-/// [`backoff`]. Returns false when cancelled during the wait: one can reach
-/// [`RETRY_AFTER_CAP_SECS`], and a user who cancels must not sit through it.
+/// [`backoff`]. `last` is the attempt the request ends on if this keeps
+/// failing, which the announcement counts to. Returns false when cancelled
+/// during the wait: one can reach [`RETRY_AFTER_CAP_SECS`], and a user who
+/// cancels must not sit through it.
 async fn resend_after(
     attempt: u32,
+    last: u32,
     reason: &str,
     wait: std::time::Duration,
     cancelled: &crate::state::CancelToken,
     on_delta: &mut impl FnMut(StreamDelta),
 ) -> bool {
-    on_delta(StreamDelta::Retry { attempt: attempt + 1, max_attempts: MAX_ATTEMPTS, reason: reason.to_string() });
+    on_delta(StreamDelta::Retry { attempt: attempt + 1, max_attempts: last, reason: reason.to_string() });
     tokio::select! {
         _ = tokio::time::sleep(wait) => true,
         _ = cancelled.cancelled() => false,
@@ -2340,29 +2417,162 @@ mod tests {
     }
 
     /// Nothing listening is not a fault worth a minute of backoff: after
-    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early. The port
-    /// was bound and released by this test, so nothing answers on it; the
-    /// deadline keeps a stray listener from turning that into a hang.
+    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early, and the
+    /// retry line counts to that attempt rather than to a budget it never
+    /// spends. The port was bound and released by this test, so nothing
+    /// answers on it; the deadline keeps a stray listener from turning that
+    /// into a hang.
     #[tokio::test]
     async fn an_address_that_never_answers_gives_up_before_the_budget() {
-        let url = {
-            let released = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://{}/v1", released.local_addr().unwrap())
-        };
-        let mut deltas: Vec<String> = Vec::new();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
+        let reason = format!("cannot connect to {addr} (connection refused)");
+        assert_eq!(deltas, [2, 3].map(|n| format!("{n}/{UNREACHED_ATTEMPTS}:{reason}")));
+        assert_eq!(err, format!("{reason}: nothing is listening there; start the server or fix base_url (openmax --spec settings)"));
+    }
+
+    /// The bug this guards: an address with nothing listening was announced
+    /// as "retrying (2 of 8)" although the request ends on the third attempt
+    /// that cannot connect. The count follows the attempts that can still
+    /// happen: here the first attempt reaches a server that answers 503 and
+    /// then stops listening, so the streak, and the count to its end, starts
+    /// at the second.
+    #[tokio::test]
+    async fn unreached_retry_line_counts_unreached_attempts() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Gone before it answers, so every later attempt is refused.
+            drop(listener);
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                match line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    Some(n) => length = n.trim().parse().unwrap(),
+                    None if line.trim().is_empty() => break,
+                    None => {}
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let _ = reader.get_mut().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy");
+        });
+        let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
+        let refused = format!("cannot connect to {addr} (connection refused)");
+        assert_eq!(
+            deltas,
+            [
+                format!("2/{MAX_ATTEMPTS}:backend returned 503 Service Unavailable: busy"),
+                format!("3/4:{refused}"),
+                format!("4/4:{refused}"),
+            ]
+        );
+        assert!(err.starts_with(&format!("{refused}: nothing is listening there")), "{err}");
+    }
+
+    /// The error a request to `url` ends with and its retry announcements,
+    /// as "attempt/max_attempts:reason", bounded so a stray listener on a
+    /// released port cannot hang the test.
+    async fn unreached_request(url: String) -> (String, Vec<String>) {
+        let mut deltas = Vec::new();
         let client = ChatClient::new(url, None, "m".into(), None, 64);
         let messages = [ChatMessage::user("hi")];
         let request = client.stream_chat(&messages, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
-            if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
-                deltas.push(format!("{attempt}/{max_attempts}"));
+            if let StreamDelta::Retry { attempt, max_attempts, reason } = d {
+                deltas.push(format!("{attempt}/{max_attempts}:{reason}"));
             }
         });
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), request)
             .await
             .expect("a released port answers with a refusal, not silence");
         let Err(err) = result else { panic!("no listener is a failed request") };
-        assert!(err.starts_with("request failed: "), "{err}");
-        assert_eq!(deltas, vec![format!("2/{MAX_ATTEMPTS}"), format!("3/{MAX_ATTEMPTS}")]);
+        (err, deltas)
+    }
+
+    /// A failure before any connection names the server and the cause: a
+    /// name that does not resolve and a connect that never completes (from
+    /// resolvers that fail every lookup or never answer, so the test asks no
+    /// real one), and a TLS handshake with a server that does not speak TLS,
+    /// which says what failed and offers no repair it cannot know.
+    #[tokio::test]
+    async fn a_connect_failure_names_the_server_and_its_cause() {
+        struct NoSuchHost;
+        impl reqwest::dns::Resolve for NoSuchHost {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async { Err(std::io::Error::other("no such host").into()) })
+            }
+        }
+        let http = reqwest::Client::builder().no_proxy().dns_resolver(Arc::new(NoSuchHost)).build().unwrap();
+        let err = http.get("http://models.example:8080/v1").send().await.unwrap_err();
+        assert_eq!(
+            never_connected(&err),
+            Some((
+                "cannot connect to models.example:8080 (host not found)".to_string(),
+                "fix the host in base_url or check the network (openmax --spec settings)"
+            ))
+        );
+
+        struct NoAnswer;
+        impl reqwest::dns::Resolve for NoAnswer {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(std::future::pending())
+            }
+        }
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(NoAnswer))
+            .connect_timeout(std::time::Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let err = http.get("http://models.example:8080/v1").send().await.unwrap_err();
+        assert_eq!(
+            never_connected(&err),
+            Some((
+                "cannot connect to models.example:8080 (timed out)".to_string(),
+                "nothing answered; check that the host is up and that base_url names it (openmax --spec settings)"
+            ))
+        );
+
+        // Plain http where the handshake expects TLS; the connection stays
+        // open until the client hangs up, so the cause is the handshake's.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let err = http.get(format!("https://{addr}/v1")).send().await.unwrap_err();
+        let (line, repair) = never_connected(&err).expect("a failed handshake never reached the endpoint");
+        assert!(line.starts_with(&format!("cannot connect to {addr} (TLS handshake failed: ")), "{line}");
+        assert!(!line.contains("error sending request"), "{line}");
+        assert_eq!(repair, "");
+    }
+
+    /// A timeout after the connection existed is not a failure to connect:
+    /// TCP keepalive giving up on a server that took the request and then
+    /// went away reads as a timeout too, and telling the user nothing
+    /// answered there would be false. It keeps the chain.
+    #[tokio::test]
+    async fn a_timeout_after_connecting_is_not_named_a_connect_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let accepted = listener.accept();
+            let _ = hold.recv();
+            drop(accepted);
+        });
+        let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_millis(50)).build().unwrap();
+        let err = http.get(format!("http://{addr}/v1")).send().await.unwrap_err();
+        assert!(err.is_timeout() && !err.is_connect(), "{err:?}");
+        assert_eq!(never_connected(&err), None);
+        let _ = release.send(());
     }
 
     /// The client reports what arrived without hiding it: once the retry
