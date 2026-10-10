@@ -447,13 +447,16 @@ impl ChatClient {
         static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
         let http = HTTP
             .get_or_init(|| {
-                reqwest::Client::builder()
+                let builder = reqwest::Client::builder()
                     .connect_timeout(std::time::Duration::from_secs(10))
                     // No overall timeout: local generations can legitimately
                     // take minutes. `stream_chat` ends an attempt on silence.
-                    .redirect(reqwest::redirect::Policy::custom(same_server_redirect))
-                    .build()
-                    .expect("failed to build http client")
+                    .redirect(reqwest::redirect::Policy::custom(same_server_redirect));
+                // Tests talk to stub servers on loopback, which a developer's
+                // proxy variables must not reroute (see [`env_proxy`]).
+                #[cfg(test)]
+                let builder = builder.no_proxy();
+                builder.build().expect("failed to build http client")
             })
             .clone();
         Self {
@@ -597,8 +600,8 @@ impl ChatClient {
                         0 => MAX_ATTEMPTS,
                         n => MAX_ATTEMPTS.min(attempt + UNREACHED_ATTEMPTS - n),
                     };
-                    let (msg, repair) =
-                        never_connected(&e).unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
+                    let (msg, repair) = never_connected(&e, e.url().is_some_and(env_proxy))
+                        .unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
                     if attempt < last && is_transient_transport(&e) {
                         if !retry_after(attempt, last, &msg, &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
@@ -1297,11 +1300,12 @@ fn describe_transport(e: &reqwest::Error) -> String {
 /// cause. None for a fault after a connection existed, which keeps the
 /// chain: there the details are the diagnosis. That includes a timeout
 /// outside the connect phase, such as TCP keepalive giving up on a server
-/// that took the request and then went away. None as well while a proxy may
-/// be in play (see [`env_proxy`]).
-fn never_connected(e: &reqwest::Error) -> Option<(String, &'static str)> {
+/// that took the request and then went away. None as well when the client
+/// that sent it may have gone through a proxy (`proxied`, see
+/// [`env_proxy`]).
+fn never_connected(e: &reqwest::Error, proxied: bool) -> Option<(String, &'static str)> {
     use std::error::Error;
-    if !e.is_connect() || e.url().is_some_and(env_proxy) {
+    if !e.is_connect() || proxied {
         return None;
     }
     let chain = || std::iter::successors(e.source(), |&cause| cause.source());
@@ -1338,12 +1342,17 @@ fn never_connected(e: &reqwest::Error) -> Option<(String, &'static str)> {
     Some((format!("cannot connect to {server} ({cause})"), repair))
 }
 
-/// Whether the HTTP client may have sent a request to `url` through a proxy
-/// named in the environment, which it reads as curl does. A failure to
-/// reach that proxy carries the same causes as one to reach the endpoint,
-/// and naming the endpoint (with advice to start it or fix base_url) would
-/// send the user the wrong way, so such a failure keeps the chain.
+/// Whether the shared HTTP client may have sent a request to `url` through
+/// a proxy named in the environment, which it reads as curl does. A failure
+/// to reach that proxy carries the same causes as one to reach the
+/// endpoint, and naming the endpoint (with advice to start it or fix
+/// base_url) would send the user the wrong way, so such a failure keeps the
+/// chain. The test build's client reads no proxy variables, so neither does
+/// this.
 fn env_proxy(url: &reqwest::Url) -> bool {
+    if cfg!(test) {
+        return false;
+    }
     let scheme = if url.scheme() == "https" { ["HTTPS_PROXY", "https_proxy"] } else { ["HTTP_PROXY", "http_proxy"] };
     scheme.into_iter().chain(["ALL_PROXY", "all_proxy"]).any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
 }
@@ -2508,12 +2517,14 @@ mod tests {
         let http = reqwest::Client::builder().no_proxy().dns_resolver(Arc::new(NoSuchHost)).build().unwrap();
         let err = http.get("http://models.example:8080/v1").send().await.unwrap_err();
         assert_eq!(
-            never_connected(&err),
+            never_connected(&err, false),
             Some((
                 "cannot connect to models.example:8080 (host not found)".to_string(),
                 "fix the host in base_url or check the network (openmax --spec settings)"
             ))
         );
+        // Through a proxy the same causes can be the proxy's own.
+        assert_eq!(never_connected(&err, true), None);
 
         struct NoAnswer;
         impl reqwest::dns::Resolve for NoAnswer {
@@ -2529,7 +2540,7 @@ mod tests {
             .unwrap();
         let err = http.get("http://models.example:8080/v1").send().await.unwrap_err();
         assert_eq!(
-            never_connected(&err),
+            never_connected(&err, false),
             Some((
                 "cannot connect to models.example:8080 (timed out)".to_string(),
                 "nothing answered; check that the host is up and that base_url names it (openmax --spec settings)"
@@ -2548,7 +2559,7 @@ mod tests {
         });
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let err = http.get(format!("https://{addr}/v1")).send().await.unwrap_err();
-        let (line, repair) = never_connected(&err).expect("a failed handshake never reached the endpoint");
+        let (line, repair) = never_connected(&err, false).expect("a failed handshake never reached the endpoint");
         assert!(line.starts_with(&format!("cannot connect to {addr} (TLS handshake failed: ")), "{line}");
         assert!(!line.contains("error sending request"), "{line}");
         assert_eq!(repair, "");
@@ -2571,7 +2582,7 @@ mod tests {
         let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_millis(50)).build().unwrap();
         let err = http.get(format!("http://{addr}/v1")).send().await.unwrap_err();
         assert!(err.is_timeout() && !err.is_connect(), "{err:?}");
-        assert_eq!(never_connected(&err), None);
+        assert_eq!(never_connected(&err, false), None);
         let _ = release.send(());
     }
 
