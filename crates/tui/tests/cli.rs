@@ -665,9 +665,9 @@ fn check_exit_codes_follow_findings() {
 /// An agent runs `--check` after every extension file it writes, and the
 /// report stays in its transcript, re-sent with every later request. So the
 /// default report prints only rows to act on (warn and err, plus a hook's row,
-/// the one place its shape is reported), names files relative to the project,
-/// and counts the files with nothing to report on one line. `--all` lists every
-/// row; the JSON face and the exit codes are unchanged.
+/// in auto mode the one place its shape is reported), names files relative to
+/// the project, and counts the files with nothing to report on one line.
+/// `--all` lists every row; the JSON face and the exit codes are unchanged.
 #[test]
 fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
     let (project, home) = fresh_dirs("check-diet");

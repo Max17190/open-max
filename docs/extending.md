@@ -472,9 +472,10 @@ The agent rereads the report with every later request of its session, so by
 default it prints only the rows of files with a `warn` or `err` and of hooks
 (a hook's `ok` row says what it enforces: its event, and whether it gates).
 Files that loaded with nothing to report are counted, per surface, on one
-line, and `openmax --check --all` prints their rows. A row names a file under
-the current directory relative to it, in its path and in the repair command it
-gives.
+line (a memory not in the index is noted in its count), and
+`openmax --check --all` prints their rows. The report names files under the
+current directory relative to it, in each row's path and in the paths and
+repair commands it writes into a message.
 
 Warnings cover the ways a file goes missing without being broken. A directory
 at `.openmax/tool/` or `.openmax/skills/`, a `.yaml` where a `.toml` is read,

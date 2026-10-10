@@ -1293,7 +1293,7 @@ async fn run_tool_examples(
     let mut ran = 0usize;
     // Each verdict prints as it lands: examples run serially with per-tool
     // timeouts, so batching the report would look like a hang.
-    let result = open_max_core::doctor::run_examples(project, |verdict| {
+    let result = open_max_core::doctor::run_examples(project, true, |verdict| {
         ran += 1;
         if !verdict.sandboxed && verdict.result.is_err() {
             failures += 1;
@@ -1335,7 +1335,7 @@ async fn run_tool_examples(
 async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>, usize) {
     let mut rows = Vec::new();
     let mut failures = 0usize;
-    match open_max_core::doctor::run_examples(project, |_| {}).await {
+    match open_max_core::doctor::run_examples(project, false, |_| {}).await {
         Ok(verdicts) => {
             for verdict in verdicts {
                 let (status, message) = match &verdict.result {
