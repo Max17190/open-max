@@ -1107,7 +1107,6 @@ fn parse_complete_response(
         }
         for tc in calls {
             partials.push(PartialToolCall {
-                index: None,
                 id: tc["id"].as_str().unwrap_or("").to_string(),
                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                 arguments: match &tc["function"]["arguments"] {
@@ -1116,6 +1115,7 @@ fn parse_complete_response(
                     args => args.to_string(),
                 },
                 extra_content: opaque(&tc["extra_content"]),
+                ..PartialToolCall::default()
             });
         }
     }
@@ -1145,7 +1145,9 @@ fn opaque(value: &Value) -> Option<Box<RawValue>> {
 /// Which call in `partials` a streamed tool-call delta adds to, opening a new
 /// one when the delta starts a call; None past [`MAX_TOOL_CALLS`]. A delta
 /// continues the latest call its `index` opened, or without an index the
-/// latest call, unless [`starts_call`] says it begins the next one.
+/// latest call, unless [`starts_call`] says it begins the next one. A call
+/// opened without an index counts as index 0, since servers that drop zero
+/// values can still mark its later pieces index 0.
 fn tool_slot(
     partials: &mut Vec<PartialToolCall>,
     index: Option<u64>,
@@ -1157,7 +1159,7 @@ fn tool_slot(
         return None;
     }
     let latest = match index {
-        Some(_) => partials.iter().rposition(|call| call.index == index),
+        Some(index) => partials.iter().rposition(|call| call.index.unwrap_or(0) == index),
         None => partials.len().checked_sub(1),
     };
     if let Some(at) = latest.filter(|&at| !starts_call(&partials[at], index.is_some(), id, name, args)) {
@@ -1746,6 +1748,15 @@ mod tests {
         ])
         .await;
         assert_eq!(continued, vec![call("c1", "bash", r#"{"command":{"x":{"y":1}}}"#)]);
+        // Servers that drop zero values send call 0 without an index, yet may
+        // still mark its later pieces index 0; those pieces stay on it.
+        let zero_dropped = calls_of(vec![
+            json!([{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":"}}]),
+            json!([{"index": 0, "function": {"arguments": "\"a.txt\"}"}}]),
+            json!([{"index": 1, "function": {"name": "read_file", "arguments": b}}]),
+        ])
+        .await;
+        assert_eq!(zero_dropped, vec![call("c1", "read_file", a), call("call_1", "read_file", b)]);
         // The count stays bounded without an index too.
         let whole = |i: usize| json!([{"id": format!("c{i}"), "function": {"name": "bash", "arguments": "{}"}}]);
         assert_eq!(stream_calls((0..MAX_TOOL_CALLS).map(whole).collect()).await.tool_calls.len(), MAX_TOOL_CALLS);
@@ -1755,7 +1766,7 @@ mod tests {
     /// Some servers repeat the id and name on every delta of a call, some
     /// reuse index 0 for every call, and some mint a new id for every delta.
     /// Appended, the first came out as a call to `bashbashbash` and the
-    /// second as one call merging both. Each call stays whole, and a name
+    /// second as one call merging them all. Each call stays whole, and a name
     /// streamed in pieces is still joined.
     #[tokio::test]
     async fn repeated_ids_and_reused_indexes_keep_calls_whole() {
