@@ -921,9 +921,10 @@ fn dropped_text_cap(budget: usize) -> usize {
     budget.saturating_mul(4).clamp(DROPPED_TEXT_CAP_FLOOR, DROPPED_TEXT_CAP_CEIL)
 }
 
-/// Byte-capped take on a char boundary. Every note field and the summarizer
-/// input are budgeted in bytes (the estimator is bytes/4), and a plain byte
-/// slice could split a multibyte char; this is the one cut both use.
+/// Byte-capped take on a char boundary. Every note field, the summarizer
+/// input, and the arguments a tool error quotes are budgeted in bytes (the
+/// estimator is bytes/4), and a plain byte slice could split a multibyte
+/// char; this is the one cut they all use.
 fn take_note_bytes(s: &str, max_bytes: usize) -> String {
     let mut end = 0;
     for (i, c) in s.char_indices() {
@@ -2836,9 +2837,25 @@ async fn run_loop(
         // Never persist a fully empty assistant message (e.g. a turn cancelled
         // before the first token): chat templates can reject it on replay.
         if !content.is_empty() || !tool_calls.is_empty() {
+            // A call whose arguments are not JSON (a model's slip, or a call a
+            // cancel or a cut stream left unfinished) is recorded with `{}`:
+            // servers that re-parse the history refuse every later request
+            // that carries it, which would fail the rest of the session. Such
+            // a call never runs; a dispatched one's tool reply names the error
+            // and quotes what was sent.
+            let recorded: Vec<ToolCall> = tool_calls
+                .iter()
+                .map(|call| {
+                    let mut call = call.clone();
+                    if serde_json::from_str::<Value>(&call.function.arguments).is_err() {
+                        call.function.arguments = "{}".into();
+                    }
+                    call
+                })
+                .collect();
             let mut reply = ChatMessage::assistant(
                 if content.is_empty() { None } else { Some(content.clone()) },
-                if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
+                if recorded.is_empty() { None } else { Some(recorded) },
             );
             // The server's reasoning rides this message on later requests to
             // the same endpoint, under the key it came in: DeepSeek refuses a
@@ -3054,7 +3071,13 @@ async fn run_loop(
                 let args: Value = match serde_json::from_str(&call.function.arguments) {
                     Ok(v) => v,
                     Err(e) => {
-                        let msg = format!("invalid JSON in tool arguments: {e}");
+                        // The transcript holds this call with `{}`, so the
+                        // reply is the model's only view of what it sent.
+                        let mut sent = take_note_bytes(&call.function.arguments, 120);
+                        if sent.len() < call.function.arguments.len() {
+                            sent.push_str("...");
+                        }
+                        let msg = format!("invalid JSON in tool arguments: {e}. The call did not run. Arguments sent: {sent}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
                         core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
                         guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
@@ -6519,6 +6542,91 @@ mod tests {
         assert!(!thinking_bodies[2].contains("reasoning_origin"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A finished reply whose one call has arguments that stop partway
+    /// through the path string.
+    const UNTERMINATED_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"a.t\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The same call in a stream the connection cuts mid-arguments. Text
+    /// streamed first, so the client reports a truncation instead of retrying.
+    const CUT_TOOL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"reading\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"a.t\"}}]},\"finish_reason\":null}]}\n\n",
+    );
+
+    /// One turn per prompt in one session against `capturing_endpoint(first)`:
+    /// each turn's stop reason, and every request body the provider was sent.
+    async fn capture_turns(first: &'static str, prompts: &[&str]) -> (Vec<String>, Vec<String>) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, bodies) = capturing_endpoint(first).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        let mut stops = Vec::new();
+        for prompt in prompts {
+            start_turn(core.clone(), "sess-args".into(), project.clone(), (*prompt).into()).unwrap();
+            stops.push(drive_turn(&mut rx).await.0);
+        }
+        let bodies = bodies.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(dir);
+        (stops, bodies)
+    }
+
+    /// The `arguments` of every tool call in one request body's history.
+    fn sent_arguments(body: &str) -> Vec<String> {
+        sent_replies(body)
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .flatten()
+            .map(|c| c["function"]["arguments"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The bug this guards: servers that re-parse the history (llama-server,
+    /// and vLLM releases before it coerced bad arguments) refuse every request
+    /// that carries a call whose arguments are not JSON, and a model's JSON
+    /// slip was recorded verbatim, so one bad call failed every later request
+    /// of the session, new prompts included. The call is recorded with `{}`,
+    /// and its tool reply names the parse error and quotes what was sent.
+    #[tokio::test]
+    async fn invalid_json_arguments_are_never_sent_back() {
+        let (stops, bodies) = capture_turns(UNTERMINATED_TOOL_SSE, &["what is in a.txt", "and now?"]).await;
+        assert_eq!(stops, ["stop", "stop"]);
+        assert_eq!(bodies.len(), 3, "the failed call, its answer, and the next turn");
+        for body in &bodies[1..] {
+            assert_eq!(sent_arguments(body), ["{}"], "{body}");
+        }
+        let body: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let reply = body["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
+        let reply = reply["content"].as_str().unwrap();
+        assert!(reply.contains("invalid JSON in tool arguments") && reply.contains(r#"{"path": "a.t"#), "{reply}");
+    }
+
+    /// The same for a call a cut stream left unfinished: it never ran, and the
+    /// next turn sends it back with `{}` beside its stub.
+    #[tokio::test]
+    async fn arguments_cut_off_midway_are_never_sent_back() {
+        let (stops, bodies) = capture_turns(CUT_TOOL_SSE, &["what is in a.txt", "and now?"]).await;
+        assert_eq!(stops, [TRUNCATED, "stop"]);
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert_eq!(sent_arguments(&bodies[1]), ["{}"], "{}", bodies[1]);
     }
 
     /// A tool call as Gemini's OpenAI-compatible endpoint streams it: whole in
