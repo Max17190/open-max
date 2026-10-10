@@ -3,15 +3,15 @@
 
 use std::io::Write;
 
-/// Best-effort copy using OSC 52. Returns true if the sequence was written.
-pub fn copy_text(text: &str) -> bool {
+/// Best-effort copy using OSC 52, written to `out` (the terminal's stdout in
+/// the TUI). Returns true if the sequence was written.
+pub fn copy_text(out: &mut impl Write, text: &str) -> bool {
     let b64 = base64_encode(text.as_bytes());
     // Cap payload: many terminals drop huge OSC 52 sequences.
     if b64.len() > 100_000 {
         return false;
     }
     let seq = format!("\x1b]52;c;{b64}\x07");
-    let mut out = std::io::stdout();
     out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok()
 }
 
