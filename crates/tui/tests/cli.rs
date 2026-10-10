@@ -2551,6 +2551,69 @@ fn a_second_signal_exits_while_output_is_stuck_on_a_full_pipe() {
     assert!(!written.contains(r#""type":"done""#), "the stuck run still finished its stream");
 }
 
+/// A reload reads every extension manifest, and a read can stall: here the
+/// manifest is a pipe nobody writes. No turn runs during a reload, so a
+/// signal must end the session at once; waiting the read out held the stop
+/// until a second signal.
+#[test]
+fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
+    use std::os::unix::ffi::OsStrExt;
+    let (project, home) = fresh_dirs("sigterm-reload");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let mut child = cmd(&project, &home)
+        .args(["--trust-project", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut hello = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut hello).unwrap();
+    assert!(hello.contains(r#""type":"hello""#), "{hello}");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let pipe = tools.join("stalled.toml");
+    let path = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    // SAFETY: mkfifo reads one NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{}", std::io::Error::last_os_error());
+    writeln!(stdin, r#"{{"cmd":"reload"}}"#).unwrap();
+    // A write end opens without blocking only once the reload is reading the
+    // pipe. Held open and never written, it keeps that read waiting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let _writer = loop {
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened =
+            std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&pipe);
+        if let Ok(writer) = opened {
+            break writer;
+        }
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the reload never read the manifest: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    drop(stdin);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let status = status.expect("SIGTERM did not end a session stalled in a reload");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
 /// A signal the run inherited as ignored stays ignored: `nohup` keeps a run
 /// alive past its terminal's SIGHUP, and a shell starts a script's
 /// background job with SIGINT ignored so Ctrl+C stops only the foreground.

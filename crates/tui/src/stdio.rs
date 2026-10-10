@@ -304,7 +304,15 @@ async fn drive_loop<W: Write>(
                             protocol_error(out, "a turn is in flight; wait for done");
                             continue;
                         }
-                        match agent::reload_session(&core, &session_id, &project).await {
+                        // A reload reads every extension manifest, and a read
+                        // can stall (a slow disk, a manifest that is a pipe).
+                        // No turn runs during one, so a signal ends the
+                        // session at once instead of waiting it out.
+                        let reloaded = tokio::select! {
+                            reloaded = agent::reload_session(&core, &session_id, &project) => reloaded,
+                            _ = &mut quit, if stopping.is_none() => return crate::quit_status(),
+                        };
+                        match reloaded {
                             Ok((tools, skills, changes)) => {
                                 let env = AgentEventEnvelope {
                                     session_id: session_id.clone(),
