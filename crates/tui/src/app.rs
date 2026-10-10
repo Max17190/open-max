@@ -3379,15 +3379,12 @@ impl App {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .style(Style::default().bg(theme::COMPOSER_BG()));
+                .border_style(Style::default().fg(border_color));
             let inner = block.inner(layout.input);
             block.render(layout.input, frame.buffer_mut());
             let (composer_lines, cx, cy) = self.composer.render(inner.width, inner.height);
             self.composer_draw_area = inner;
-            Paragraph::new(composer_lines)
-                .style(Style::default().bg(theme::COMPOSER_BG()))
-                .render(inner, frame.buffer_mut());
+            Paragraph::new(composer_lines).render(inner, frame.buffer_mut());
             if self.focus == Focus::Composer
                 && self.history_search.is_none()
                 && self.scroll_search.is_none()
@@ -3406,9 +3403,7 @@ impl App {
                 ..layout.input
             };
             self.composer_draw_area = composer_area;
-            Paragraph::new(composer_lines)
-                .style(Style::default().bg(theme::COMPOSER_BG()))
-                .render(composer_area, frame.buffer_mut());
+            Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
             if self.focus == Focus::Composer
                 && self.history_search.is_none()
                 && self.scroll_search.is_none()
@@ -3437,9 +3432,7 @@ impl App {
                 height,
                 ..area
             };
-            Paragraph::new(lines)
-                .style(Style::default().bg(theme::SURFACE()))
-                .render(draw_area, frame.buffer_mut());
+            Paragraph::new(lines).render(draw_area, frame.buffer_mut());
             if height > 0 {
                 self.approval_hits = approval_choice_hit_regions(Rect {
                     x: draw_area.x,
@@ -3463,8 +3456,7 @@ impl App {
                 Style::default()
                     .fg(theme::WARN())
                     .add_modifier(Modifier::BOLD),
-            ))
-            .style(Style::default().bg(theme::SURFACE()));
+            ));
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
         let lines = approval_card_lines(name, summary, detail, env, inner.width);
@@ -3475,9 +3467,7 @@ impl App {
         // clipped off - then there are no click targets, which is the safe
         // outcome: you cannot Allow what the card could not fully show.
         let row_count = lines.len() as u16;
-        Paragraph::new(lines)
-            .style(Style::default().bg(theme::SURFACE()))
-            .render(inner, frame.buffer_mut());
+        Paragraph::new(lines).render(inner, frame.buffer_mut());
 
         let fully_shown = row_count <= inner.height;
         if row_count >= 3 && fully_shown {
@@ -4312,8 +4302,8 @@ fn paint_text_selection(
     line_map: &[Option<RowRef>],
     area: Rect,
 ) {
-    // One palette read for the whole overlay: the accessor takes the theme
-    // lock, and the inner loop touches every selected cell per frame.
+    // One palette read for the whole overlay: the inner loop touches every
+    // selected cell per frame.
     let select_bg = theme::SELECT();
     for (row, painted) in line_map.iter().copied().enumerate() {
         let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
@@ -5194,10 +5184,10 @@ mod tests {
         transcript.paint_rows(&mut buffer, area, 0, 1, None, &mut rows);
         paint_text_selection(&mut buffer, &mut transcript, &rows, area);
 
-        assert_eq!(buffer[(1, 0)].bg, theme::USER_BG());
+        assert_eq!(buffer[(1, 0)].bg, ratatui::style::Color::Reset);
         assert_eq!(buffer[(2, 0)].bg, theme::SELECT());
         assert_eq!(buffer[(6, 0)].bg, theme::SELECT());
-        assert_eq!(buffer[(7, 0)].bg, theme::USER_BG());
+        assert_eq!(buffer[(7, 0)].bg, ratatui::style::Color::Reset);
     }
 
     /// What is highlighted is exactly what a copy carries, on the real buffer
@@ -6808,7 +6798,8 @@ mod tests {
             .iter()
             .position(|row| row.contains("❯ please test this"))
             .unwrap() as u16;
-        assert_eq!(running[(0, user_y)].bg, theme::USER_BG());
+        assert_eq!(running[(0, user_y)].symbol(), "❯");
+        assert!(running[(0, user_y)].modifier.contains(Modifier::BOLD));
 
         app.on_agent_event(AgentEvent::ToolEnd {
             call_id: "call-1".into(),
@@ -6823,6 +6814,91 @@ mod tests {
             app.last_tool_output.as_deref(),
             Some("test one ok\ntest two ok\ntest three ok\ntest four ok")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An absolute palette slot is the background of some terminal theme:
+    /// slot 15 text vanishes on a light terminal, and a slot 0 fill is a dark
+    /// box there and a black bar on a dark gray one. Every surface the
+    /// conversation shows (user row, heading, inline and fenced code,
+    /// finished and failed tool cards, the focused composer, the completion
+    /// menu, the approval card) uses the terminal's own colors, plus the
+    /// palette's gray for secondary text, borders and selection.
+    #[test]
+    fn every_cell_uses_the_terminals_own_colors_or_the_chrome_gray() {
+        use ratatui::style::Color;
+        fn assert_terminal_colors(buffer: &Buffer, frame: &str) {
+            let area = buffer.area;
+            let own = |color| matches!(color, Color::Reset | Color::DarkGray);
+            let hits: Vec<(u16, u16, &str, Color, Color)> = (area.y..area.bottom())
+                .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+                .map(|(x, y)| (x, y, &buffer[(x, y)]))
+                .filter(|(_, _, cell)| !own(cell.fg) || !own(cell.bg))
+                .map(|(x, y, cell)| (x, y, cell.symbol(), cell.fg, cell.bg))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "{frame}: {} cells paint another color, first {:?}",
+                hits.len(),
+                &hits[..hits.len().min(4)],
+            );
+        }
+
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("why does the cache miss?");
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: "## Cause\nThe key is `normalized` twice.\n```rust\nfn key() {}\n```\n- one\n".into(),
+        });
+        for (call_id, ok) in [("call-1", true), ("call-2", false)] {
+            app.on_agent_event(AgentEvent::ToolStart {
+                call_id: call_id.into(),
+                name: "bash".into(),
+                args: json!({"command": "cargo test"}),
+            });
+            app.on_agent_event(AgentEvent::ToolEnd {
+                call_id: call_id.into(),
+                ok,
+                output: "exit 1\nerror: linking failed".into(),
+            });
+        }
+        app.composer.load("a draft");
+        let conversation = render_app(&mut app, 96, 30);
+        let text = buffer_text(&conversation);
+        for shown in ["❯ why does", "Cause", "normalized", "│ fn key", "✓ Shell", "✗ Shell", "a draft"] {
+            assert!(text.contains(shown), "{shown} not rendered:\n{text}");
+        }
+        assert_terminal_colors(&conversation, "conversation");
+
+        app.composer.load("/");
+        app.sync_completion();
+        let menu = render_app(&mut app, 96, 30);
+        assert!(buffer_text(&menu).contains("/help"));
+        assert_terminal_colors(&menu, "completion menu");
+
+        // Below three rows the composer draws without its border.
+        app.composer.load("a draft");
+        app.sync_completion();
+        let short = render_app(&mut app, 96, 2);
+        assert!(buffer_text(&short).contains("a draft"));
+        assert_terminal_colors(&short, "borderless composer");
+
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            reason: "gate".into(),
+            approval_id: "approval-1".into(),
+            name: "bash".into(),
+            summary: "install dependencies".into(),
+            detail: "cargo fetch".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
+            env: vec![],
+        });
+        // The full card has a border; below five rows the card is compact
+        // and has none.
+        for height in [30, 4] {
+            let approval = render_app(&mut app, 96, height);
+            assert!(buffer_text(&approval).contains("[y] Allow once"));
+            assert_terminal_colors(&approval, &format!("approval card, {height} rows"));
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -7777,7 +7853,7 @@ mod tests {
             .iter()
             .position(|row| row.contains("/help"))
             .unwrap() as u16;
-        assert_eq!(wide[(0, selected_y)].bg, theme::SURFACE());
+        assert!(wide_rows[selected_y as usize].contains("▸ /help"));
 
         app.composer.load("/co");
         app.sync_completion();

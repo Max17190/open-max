@@ -11,6 +11,10 @@ Change the mode later with `/approvals` or **Shift+Tab**. See
 [configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
+The interface uses your terminal's own foreground and background colors,
+with the palette's gray (color 8) for secondary text, borders and selection.
+There is no color setting.
+
 ## Command line
 
 ```sh
