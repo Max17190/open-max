@@ -169,13 +169,17 @@ async fn the_request_after_a_refreeze_carries_the_receipt_and_the_new_tool_name(
 }
 
 fn write_config(data: &std::path::Path, base_url: &str, project: &std::path::Path) {
+    write_config_in(data, base_url, project, "ask");
+}
+
+fn write_config_in(data: &std::path::Path, base_url: &str, project: &std::path::Path, mode: &str) {
     std::fs::create_dir_all(data).unwrap();
     std::fs::write(
         data.join("settings.json"),
         serde_json::json!({
             "base_url": base_url,
             "model": "scripted",
-            "approval_mode": "ask",
+            "approval_mode": mode,
             "context_tokens": 16384,
         })
         .to_string(),
@@ -360,7 +364,7 @@ async fn the_receipt_distinguishes_callable_from_registered_pending_approval() {
         .unwrap()
         .to_string();
     assert!(
-        !content.contains("callable from your next step: wordfreq"),
+        !content.contains("Callable now: wordfreq"),
         "an unapproved tool must not be called callable: {content}"
     );
     assert!(content.contains("registered"), "{content}");
@@ -780,6 +784,7 @@ async fn removing_an_approved_tool_names_the_file_as_removed() {
         content.contains("[extension refreeze: .openmax/tools/echoer.toml removed."),
         "{content}"
     );
+    assert!(content.contains("No longer callable: echoer (its file was removed)."), "{content}");
     assert!(!content.contains("Removed approved"), "{content}");
     assert!(!content.contains("--ledger"), "{content}");
     let _ = std::fs::remove_dir_all(dir);
@@ -879,5 +884,217 @@ async fn a_turn_start_approval_note_reaches_the_wire_as_a_harness_note() {
     }
     let note = note.expect("the out-of-session approval note reaches the wire as a harness_note");
     assert!(note.contains("x.toml"), "{note}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The text of every tool message in request `i`, in order.
+fn tool_results(bodies: &[String], i: usize) -> Vec<String> {
+    request(bodies, i)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A fresh project under a temp dir, canonicalized: (dir, data, project).
+fn scratch() -> (PathBuf, PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    (dir, data, project)
+}
+
+/// A tool whose command is a script written without its execute bit loads,
+/// and its first call fails at spawn. The receipt used to announce it
+/// callable from the next step, and that call then failed with a bare
+/// "Permission denied". The receipt now says it cannot start and how to make
+/// it start, and the spawn error carries the same repair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_whose_script_cannot_start_is_not_announced_callable() {
+    let (dir, data, project) = scratch();
+    let manifest = "name = \"hello\"\ndescription = \"Greet someone\"\ncommand = \"./scripts/hello.sh\"\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-script",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": serde_json::json!({
+                                    "path": "scripts/hello.sh",
+                                    "content": "#!/bin/sh\nread line\necho \"hello $line\"\n"
+                                }).to_string()
+                            }
+                        },
+                        {
+                            "id": "call-manifest",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": serde_json::json!({
+                                    "path": ".openmax/tools/hello.toml",
+                                    "content": manifest
+                                }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        completion_with_tool_call("hello", serde_json::json!({ "name": "world" })),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "cannot-start", &project, "make a greeting tool").await;
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    let receipt = tool_results(&bodies, 1).pop().unwrap();
+    assert!(receipt.contains("[extension refreeze:"), "{receipt}");
+    assert!(
+        receipt.contains("Loaded but cannot start yet: hello (command './scripts/hello.sh' exists but is not executable: chmod +x './scripts/hello.sh'"),
+        "{receipt}"
+    );
+    assert!(!receipt.contains("Callable now"), "{receipt}");
+    let call = tool_results(&bodies, 2).pop().unwrap();
+    assert!(call.contains("Permission denied"), "{call}");
+    assert!(call.contains("chmod +x './scripts/hello.sh'"), "the spawn error names the repair: {call}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Editing a loaded tool's manifest restates that the tool is callable. The
+/// receipt used to say only "modified", and a model that cannot tell whether
+/// its edit broke the tool spends calls probing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modified_tool_is_restated_callable() {
+    let (dir, data, project) = scratch();
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    std::fs::write(
+        project.join(".openmax/tools/wordfreq.toml"),
+        "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    let edited = "name = \"wordfreq\"\ndescription = \"top-n words, case-folded\"\ncommand = \"/bin/echo\"\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wordfreq.toml", "content": edited }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "modified-callable", &project, "fold case").await;
+    let bodies = bodies.lock().unwrap();
+    let receipt = tool_results(&bodies, 1).pop().unwrap();
+    assert!(receipt.contains(".openmax/tools/wordfreq.toml modified."), "{receipt}");
+    assert!(receipt.contains("Callable now: wordfreq."), "{receipt}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// At the tool cap, a new tool that sorts early pushes the last loaded one
+/// out. No file of that tool changed, so the changed-file list never named
+/// it and it vanished from the tool array silently. The receipt names it, and
+/// a later tool the cap keeps out entirely is named as not loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_the_cap_pushes_out_or_keeps_out_are_named() {
+    let (dir, data, project) = scratch();
+    let tools = project.join(".openmax/tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let cap = open_max_core::registry::MAX_EXTERNAL_TOOLS;
+    for i in 0..cap {
+        std::fs::write(
+            tools.join(format!("t{i:02}.toml")),
+            format!("name = \"t{i:02}\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n"),
+        )
+        .unwrap();
+    }
+    let manifest = |name: &str| format!("name = \"{name}\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n");
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/aaa_new.toml", "content": manifest("aaa_new") }),
+        ),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/zzz_new.toml", "content": manifest("zzz_new") }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "tool-cap", &project, "add tools").await;
+    let bodies = bodies.lock().unwrap();
+    let last = format!("t{:02}", cap - 1);
+    let pushed = tool_results(&bodies, 1).pop().unwrap();
+    assert!(
+        pushed.contains(&format!("No longer callable: {last} ({cap}-tool cap).")),
+        "{pushed}"
+    );
+    assert!(pushed.contains("Callable now: aaa_new."), "{pushed}");
+    let kept_out = tool_results(&bodies, 2).pop().unwrap();
+    assert!(
+        kept_out.contains(&format!("Past the {cap}-tool cap, so NOT loaded: zzz_new")),
+        "{kept_out}"
+    );
+    assert!(!kept_out.contains("Callable now"), "{kept_out}");
+    assert!(!kept_out.contains("No longer callable"), "nothing else moved: {kept_out}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A skill whose index line does not fit the byte budget is on disk and
+/// loaded, but the prompt's index does not list it. The receipt used to say
+/// only "added", so the author believed the index carried it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_the_index_budget_leaves_out_is_named_not_indexed() {
+    let (dir, data, project) = scratch();
+    // Twenty index lines of 145 bytes: 2,900 of the 3,000-byte budget.
+    for i in 0..20 {
+        let skill = project.join(format!(".agents/skills/s{i:02}"));
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: skill-{i:02}\ndescription: {}\n---\nbody\n", "d".repeat(100)),
+        )
+        .unwrap();
+    }
+    let release = format!("---\nname: zz-release\ndescription: {}\n---\nSteps\n", "r".repeat(100));
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".agents/skills/zz-release/SKILL.md", "content": release }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config_in(&data, &base_url, &project, "auto");
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "skill-budget", &project, "add a release skill").await;
+    let bodies = bodies.lock().unwrap();
+    let system = request(&bodies, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("- skill-19: "), "the fixture fills the index: {system}");
+    let receipt = tool_results(&bodies, 1).pop().unwrap();
+    assert!(receipt.contains(".agents/skills/zz-release/SKILL.md added."), "{receipt}");
+    assert!(
+        receipt.contains(&format!(
+            "NOT indexed: zz-release ({}-byte index budget; .agents/skills/zz-release/SKILL.md)",
+            open_max_core::prompt::MAX_SKILLS_BYTES
+        )),
+        "{receipt}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

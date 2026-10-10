@@ -1902,19 +1902,19 @@ fn append_and_emit_note(
 
 /// One receipt body for both refreeze sites: what changed, what did NOT
 /// load (with the parse reason, so a broken write is never mistaken for a
-/// live capability), and which tool names became callable.
+/// live capability), and how the action space moved: which tools a call
+/// runs now, which load but cannot start, which stopped being callable,
+/// and which skills the index leaves out.
 fn refreeze_receipt_text(
-    changes: &[String],
-    added: &AddedTools,
+    delta: &RefreezeDelta,
     broken: &[(std::path::PathBuf, String)],
     shadowed_skills: &[(String, Vec<std::path::PathBuf>, std::path::PathBuf, bool)],
     project_root: &Path,
-    mode: ApprovalMode,
 ) -> String {
-    let what = if changes.is_empty() {
+    let what = if delta.changes.is_empty() {
         "extension files changed".to_string()
     } else {
-        changes.join("; ")
+        delta.changes.join("; ")
     };
     let mut note = format!("[extension refreeze: {what}.");
     if !broken.is_empty() {
@@ -1966,17 +1966,27 @@ fn refreeze_receipt_text(
             listed.join("; ")
         ));
     }
-    if !added.approved.is_empty() {
+    if !delta.callable.is_empty() {
+        note.push_str(&format!(" Callable now: {}.", delta.callable.join(", ")));
+    }
+    if !delta.cannot_start.is_empty() {
+        // The tool registers either way; saying "callable" here was followed
+        // by a first call that failed with a bare "Permission denied".
+        let listed: Vec<String> = delta
+            .cannot_start
+            .iter()
+            .map(|(name, problem)| format!("{name} ({problem})"))
+            .collect();
+        note.push_str(&format!(" Loaded but cannot start yet: {}.", listed.join("; ")));
+    }
+    if !delta.readonly_disabled.is_empty() {
         note.push_str(&format!(
-            " New tools callable from your next step: {}.",
-            added.approved.join(", ")
+            " Disabled in readonly mode (mutating, or content no human has approved): {}.",
+            delta.readonly_disabled.join(", ")
         ));
     }
-    if mode == ApprovalMode::Readonly && (!added.unapproved.is_empty() || !added.modified_unapproved.is_empty()) {
-        note.push_str(" Unapproved tool content is disabled in readonly mode.");
-    }
-    if mode == ApprovalMode::Ask && !added.modified_unapproved.is_empty() {
-        let listed: Vec<String> = added
+    if !delta.modified_unapproved.is_empty() {
+        let listed: Vec<String> = delta
             .modified_unapproved
             .iter()
             .map(|(name, path)| {
@@ -1992,7 +2002,7 @@ fn refreeze_receipt_text(
             listed.join(", ")
         ));
     }
-    if mode == ApprovalMode::Ask && !added.unapproved.is_empty() {
+    if !delta.unapproved.is_empty() {
         // This line used to say "callable" for these
         // too, and the very next step was an approval card - the model
         // called the receipt out as overselling. Registered is not callable
@@ -2000,7 +2010,7 @@ fn refreeze_receipt_text(
         // Quoted like doctor's repair lines: the path is a copyable shell
         // command, and a valid manifest filename may carry spaces or
         // metacharacters.
-        let listed: Vec<String> = added
+        let listed: Vec<String> = delta
             .unapproved
             .iter()
             .map(|(name, path)| {
@@ -2017,7 +2027,37 @@ fn refreeze_receipt_text(
             listed.join(", ")
         ));
     }
-    if let Some((added_m, updated_m, removed_m)) = &added.memory {
+    if !delta.no_longer_callable.is_empty() {
+        let listed: Vec<String> = delta
+            .no_longer_callable
+            .iter()
+            .map(|(name, why)| format!("{name} ({why})"))
+            .collect();
+        note.push_str(&format!(" No longer callable: {}.", listed.join(", ")));
+    }
+    if !delta.capped_new.is_empty() {
+        note.push_str(&format!(
+            " Past the {}-tool cap, so NOT loaded: {} (openmax --check names every capped file).",
+            crate::registry::MAX_EXTERNAL_TOOLS,
+            delta.capped_new.join(", ")
+        ));
+    }
+    if !delta.unindexed.is_empty() {
+        let listed: Vec<String> = delta
+            .unindexed
+            .iter()
+            .map(|(name, path, why)| {
+                let shown = path.strip_prefix(project_root).unwrap_or(path);
+                format!("{name} ({why}; {})", shown.display())
+            })
+            .collect();
+        note.push_str(&format!(
+            " NOT indexed: {}; read the SKILL.md directly, and openmax --check names every \
+             skill the index leaves out.",
+            listed.join(", ")
+        ));
+    }
+    if let Some((added_m, updated_m, removed_m)) = &delta.memory {
         let mut parts = Vec::new();
         if !added_m.is_empty() {
             parts.push(format!("indexed: {}", added_m.join(", ")));
@@ -2050,14 +2090,30 @@ fn refreeze_receipt_text(
     crate::text::one_line(&note)
 }
 
-/// Names the incoming generation adds, split by whether a human has already
-/// approved the exact bytes: approved names are callable now; unapproved
-/// names are registered and their first call prompts. Computed against the
-/// incoming registry (which carries the tools) and, outside auto, the
-/// ledger. Under auto every added name is callable, and nothing is read.
-struct AddedTools {
-    approved: Vec<String>,
-    /// (name, project-relative manifest path for the --approve command)
+/// How one refreeze moves the action space, computed against the outgoing
+/// registry while it is still current. Each added or manifest-modified tool
+/// lands in exactly one verdict, judged in the order its first call meets
+/// them: disabled by readonly, cannot start, registered behind an approval
+/// card (ask), or callable now. Approval reads the ledger outside auto; the
+/// start check reads the command's file (or its PATH entry) and the script an
+/// interpreter command runs.
+#[derive(Default)]
+struct RefreezeDelta {
+    /// One line per capability file: `<path> added|modified|removed`.
+    changes: Vec<String>,
+    /// Tools whose call runs now: the command resolves and neither readonly
+    /// nor unapproved content stands in the way. Ask's per-call gate on
+    /// mutating calls and permission rules apply as they do to every tool.
+    callable: Vec<String>,
+    /// (name, why its command will not spawn and the repair). Judged like
+    /// --check judges it, so a script written without its execute bit is
+    /// named here instead of announced callable. In ask, an unapproved one
+    /// also says its first call then stops for approval.
+    cannot_start: Vec<(String, String)>,
+    /// Tools readonly refuses: mutating, or carrying unapproved content.
+    readonly_disabled: Vec<String>,
+    /// (name, project-relative manifest path for the --approve command).
+    /// Filled in ask only, like `modified_unapproved`.
     unapproved: Vec<(String, String)>,
     /// Tools present before and after whose MANIFEST bytes changed and whose
     /// current bytes no human has approved: the edit revoked (or never had)
@@ -2065,6 +2121,17 @@ struct AddedTools {
     /// the receipt said only "modified", and a model that then saw the card
     /// concluded revocation was broken.
     modified_unapproved: Vec<(String, String)>,
+    /// (name, why): tools the outgoing generation loaded and this one does
+    /// not. A tool the cap pushes out has no file change of its own, so the
+    /// changed-file list alone never names it.
+    no_longer_callable: Vec<(String, String)>,
+    /// Tools whose file this generation added or modified that the tool cap
+    /// keeps out.
+    capped_new: Vec<String>,
+    /// (name, SKILL.md, why): skills whose file this generation added or
+    /// modified, or that the outgoing index carried, that the index now
+    /// leaves out.
+    unindexed: Vec<(String, std::path::PathBuf, String)>,
     /// Memory index delta (added, updated, removed stems), when both
     /// generations know their memory files. Memory is not in the fingerprint,
     /// so this is what a refreeze caused by something else (a tool or skill
@@ -2072,13 +2139,14 @@ struct AddedTools {
     memory: Option<(Vec<String>, Vec<String>, Vec<String>)>,
 }
 
-fn classify_added_tools(
+fn refreeze_delta(
     old_registry: &Registry,
     new_registry: &Registry,
     mode: ApprovalMode,
     data_dir: &Path,
     project_root: &Path,
-) -> AddedTools {
+) -> RefreezeDelta {
+    use crate::registry::ToolKind;
     let memory = match (&old_registry.memory_files, &new_registry.memory_files) {
         (Some(old), Some(new)) => {
             let old_map: std::collections::HashMap<&str, u64> =
@@ -2107,48 +2175,95 @@ fn classify_added_tools(
         }
         _ => None,
     };
-    let mut out = AddedTools {
-        approved: Vec::new(),
-        unapproved: Vec::new(),
-        modified_unapproved: Vec::new(),
-        memory,
-    };
-    if mode == ApprovalMode::Auto {
-        out.approved = added_tool_names(old_registry, new_registry);
-        return out;
-    }
-    for name in added_tool_names(old_registry, new_registry) {
-        match unapproved_capability(new_registry, data_dir, project_root, &name) {
-            Some(source) => out.unapproved.push((name, source.path)),
-            None => out.approved.push(name),
-        }
-    }
+    let changed = changed_files(old_registry, new_registry);
+    let mut out = RefreezeDelta { changes: change_lines(&changed, project_root), memory, ..Default::default() };
     for spec in &new_registry.tools {
-        let crate::registry::ToolKind::External(new_ext) = &spec.kind else { continue };
-        let Some(old_spec) = old_registry.get(&spec.name) else { continue };
-        let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
-        if old_ext.source_sha256 == new_ext.source_sha256 {
+        let ToolKind::External(ext) = &spec.kind else { continue };
+        let modified = match old_registry.get(&spec.name).map(|old| &old.kind) {
+            None => false,
+            Some(ToolKind::External(old_ext)) if old_ext.source_sha256 != ext.source_sha256 => true,
+            Some(_) => continue,
+        };
+        let name = spec.name.clone();
+        let unapproved = (mode != ApprovalMode::Auto)
+            .then(|| unapproved_capability(new_registry, data_dir, project_root, &spec.name))
+            .flatten();
+        // Readonly refuses before anything spawns, so a repair it would
+        // also refuse is not the answer to give there.
+        if mode == ApprovalMode::Readonly && (spec.mutating || unapproved.is_some()) {
+            out.readonly_disabled.push(name);
             continue;
         }
-        if let Some(source) = unapproved_capability(new_registry, data_dir, project_root, &spec.name) {
-            out.modified_unapproved.push((spec.name.clone(), source.path));
+        if let Some(problem) = crate::doctor::tool_start_problem(&ext.command, &ext.args, project_root) {
+            let then = if unapproved.is_some() { "; its first call then stops for human approval" } else { "" };
+            out.cannot_start.push((name, format!("{problem}{then}")));
+            continue;
+        }
+        match unapproved {
+            None => out.callable.push(name),
+            Some(source) if modified => out.modified_unapproved.push((name, source.path)),
+            Some(source) => out.unapproved.push((name, source.path)),
+        }
+    }
+    let loaded: std::collections::HashSet<&str> =
+        new_registry.tools.iter().map(|spec| spec.name.as_str()).collect();
+    for spec in &old_registry.tools {
+        let ToolKind::External(ext) = &spec.kind else { continue };
+        if loaded.contains(spec.name.as_str()) {
+            continue;
+        }
+        // Its own file first: a broken override elsewhere that withholds it
+        // is a different fact from its file breaking.
+        let why = if new_registry.capped_tools.iter().any(|(name, _)| *name == spec.name) {
+            format!("{}-tool cap", crate::registry::MAX_EXTERNAL_TOOLS)
+        } else if new_registry.broken.iter().any(|(path, _)| *path == ext.source_path) {
+            "its file is broken".to_string()
+        } else if new_registry.broken_tools.iter().any(|(_, name)| *name == spec.name) {
+            "a broken file now claims its name".to_string()
+        } else if new_registry.read_paths.as_ref().is_some_and(|read| read.contains_key(&ext.source_path)) {
+            "its file now declares another name".to_string()
+        } else {
+            "its file was removed".to_string()
+        };
+        out.no_longer_callable.push((spec.name.clone(), why));
+    }
+    let touched: std::collections::HashSet<&Path> = changed
+        .iter()
+        .filter(|(_, kind)| *kind != "removed")
+        .map(|(path, _)| *path)
+        .collect();
+    for (name, path) in &new_registry.capped_tools {
+        let evicted = out.no_longer_callable.iter().any(|(gone, _)| gone == name);
+        if touched.contains(path.as_path()) && !evicted {
+            out.capped_new.push(name.clone());
+        }
+    }
+    let indexed = |registry: &Registry| -> std::collections::HashSet<String> {
+        crate::prompt::skill_index_costs(project_root, &registry.skills)
+            .into_iter()
+            .filter(|(_, cost)| *cost > 0)
+            .map(|(name, _)| name)
+            .collect()
+    };
+    let (was_indexed, now_indexed) = (indexed(old_registry), indexed(new_registry));
+    let listed = new_registry.skills.iter().map(|skill| (&skill.name, &skill.path, false));
+    let capped = new_registry.capped_skills.iter().map(|(name, path)| (name, path, true));
+    for (name, path, over_count) in listed.chain(capped) {
+        // A same-directory collision's winner is settled by its own clause.
+        let collided = new_registry.shadowed_skills.iter().any(|(n, ..)| n == name);
+        if now_indexed.contains(name) || collided {
+            continue;
+        }
+        if touched.contains(path.as_path()) || was_indexed.contains(name) {
+            let why = if over_count {
+                format!("{}-skill cap", crate::skills::MAX_SKILLS)
+            } else {
+                format!("{}-byte index budget", crate::prompt::MAX_SKILLS_BYTES)
+            };
+            out.unindexed.push((name.clone(), path.clone(), why));
         }
     }
     out
-}
-
-/// Names the incoming generation adds, computed against the outgoing
-/// registry while it is still current: the tools the model does not know
-/// it has.
-fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
-    let old_names: std::collections::HashSet<&str> =
-        old.tools.iter().map(|s| s.name.as_str()).collect();
-    new.tools
-        .iter()
-        .map(|s| s.name.as_str())
-        .filter(|name| !old_names.contains(name))
-        .map(str::to_string)
-        .collect()
 }
 
 /// What the incoming generation changes against the outgoing one, a line per
@@ -2165,6 +2280,24 @@ fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
 /// capture read or failed to read is still on disk, so it is never called
 /// removed: the receipt's NOT-loaded clause names one it could not read.
 fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Vec<String> {
+    change_lines(&changed_files(old, new), project_root)
+}
+
+fn change_lines(changed: &[(&Path, &str)], project_root: &Path) -> Vec<String> {
+    changed
+        .iter()
+        .map(|(path, kind)| {
+            let shown = path.strip_prefix(project_root).unwrap_or(path);
+            // The path is the agent's own filename and this line leads the
+            // receipt, so it flattens where it is built.
+            crate::text::one_line(&format!("{} {kind}", shown.display()))
+        })
+        .collect()
+}
+
+/// The capability files behind [`generation_changes`], sorted, with how each
+/// changed: the receipt's clauses key on these paths too.
+fn changed_files<'a>(old: &'a Registry, new: &'a Registry) -> Vec<(&'a Path, &'static str)> {
     use std::collections::BTreeMap;
     #[derive(PartialEq)]
     enum Identity<'a> {
@@ -2195,7 +2328,7 @@ fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Ve
         (Some(old_read), Some(new_read)) => (read(old_read), read(new_read)),
         _ => (loaded(old), loaded(new)),
     };
-    let mut changes: Vec<(&Path, &str)> = Vec::new();
+    let mut changes: Vec<(&Path, &'static str)> = Vec::new();
     for (&path, identity) in &after {
         match before.get(path) {
             None => changes.push((path, "added")),
@@ -2212,14 +2345,6 @@ fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Ve
     }
     changes.sort();
     changes
-        .into_iter()
-        .map(|(path, kind)| {
-            let shown = path.strip_prefix(project_root).unwrap_or(path);
-            // The path is the agent's own filename and this line leads the
-            // receipt, so it flattens where it is built.
-            crate::text::one_line(&format!("{} {kind}", shown.display()))
-        })
-        .collect()
 }
 
 /// The self-modification loop closes here: at turn start, capture one immutable
@@ -2242,15 +2367,14 @@ async fn refreeze_if_extensions_changed(
         }
     };
     let disk_fp = snapshot.fingerprint();
-    let stale = {
+    let live = {
         let sessions_map = core.sessions.lock().await;
         sessions_map
             .get(session_id)
-            .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+            .filter(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+            .map(|d| d.registry.clone())
     };
-    if !stale {
-        return None;
-    }
+    let live = live?;
     let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
         return None;
     };
@@ -2258,29 +2382,28 @@ async fn refreeze_if_extensions_changed(
     let counts = (registry.tools.len(), registry.skills.len());
     let broken = registry.broken.clone();
     let shadowed = registry.shadowed_skills.clone();
-    let mode = core.approval_mode(project_root);
+    // Outside the lock: the start checks stat files and the approval check
+    // reads the ledger.
+    let delta = refreeze_delta(&live, &registry, core.approval_mode(project_root), &core.data_dir, project_root);
     let applied = {
         let mut sessions_map = core.sessions.lock().await;
         match sessions_map.get_mut(session_id) {
             // Re-check under the lock: this turn owns `running`, so nothing
             // else mutates the session, but stay defensive about empty
-            // (taken) state.
-            Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
-                let added = classify_added_tools(&data.registry, &registry, mode, &core.data_dir, project_root);
-                let changes = generation_changes(&data.registry, &registry, project_root);
+            // (taken) state and about the generation the delta describes.
+            Some(data) if !data.messages.is_empty() && Arc::ptr_eq(&data.registry, &live) => {
                 apply_freeze(core, session_id, data, registry, prompt, breakdown);
-                Some((added, changes))
+                true
             }
-            _ => None,
+            _ => false,
         }
     };
-    if let Some((added_tools, changes)) = applied {
-        let receipt =
-            refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root, mode);
+    if applied {
+        let receipt = refreeze_receipt_text(&delta, &broken, &shadowed, project_root);
         core.send_agent(session_id, AgentEvent::Refrozen {
             tools: counts.0,
             skills: counts.1,
-            changes,
+            changes: delta.changes,
         });
         // The Refrozen event reaches the UI; the returned receipt is for the
         // MODEL. The caller appends it to the turn's transcript, closing the
@@ -2330,8 +2453,7 @@ async fn refreeze_between_iterations(
     let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
     let counts = (new_registry.tools.len(), new_registry.skills.len());
     let mode = core.approval_mode(project_root);
-    let added_tools = classify_added_tools(registry, &new_registry, mode, &core.data_dir, project_root);
-    let changes = generation_changes(registry, &new_registry, project_root);
+    let delta = refreeze_delta(registry, &new_registry, mode, &core.data_dir, project_root);
     let broken = new_registry.broken.clone();
     let shadowed = new_registry.shadowed_skills.clone();
     let new_registry = Arc::new(new_registry);
@@ -2355,12 +2477,12 @@ async fn refreeze_between_iterations(
     // in its transcript said the tool was callable. Ride the receipt on this
     // iteration's last tool result, where the model reads next. One line,
     // only when extension bytes actually changed.
-    let receipt = refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root, mode);
+    let receipt = refreeze_receipt_text(&delta, &broken, &shadowed, project_root);
     append_and_emit_note(core, session_id, messages, &receipt);
     core.send_agent(session_id, AgentEvent::Refrozen {
         tools: counts.0,
         skills: counts.1,
-        changes,
+        changes: delta.changes,
     });
     true
 }
@@ -5929,13 +6051,8 @@ mod tests {
             std::path::PathBuf::from("/p/.agents/skills/zz-review/SKILL.md"),
             true,
         )];
-        let added = AddedTools {
-            approved: Vec::new(),
-            unapproved: Vec::new(),
-            modified_unapproved: Vec::new(),
-            memory: None,
-        };
-        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"), ApprovalMode::Ask);
+        let added = RefreezeDelta::default();
+        let note = refreeze_receipt_text(&added, &[], &shadowed, Path::new("/p"));
         assert!(note.contains("Skill name collision"), "{note}");
         assert!(
             note.contains(
@@ -5951,6 +6068,84 @@ mod tests {
         assert!(note.contains("openmax --check"), "{note}");
     }
 
+    /// Each tool the outgoing generation loaded and the incoming one does not
+    /// is named with the reason that is true of it: its file went away, its
+    /// file broke, or its file now declares another name. Before, nothing
+    /// named the tool: the file line said only "modified" or "removed", and
+    /// a rename dropped the old name without a word.
+    #[test]
+    fn every_tool_that_stops_being_callable_is_named_with_its_reason() {
+        let dir = std::env::temp_dir().join(format!("openmax-lost-{}", uuid::Uuid::new_v4()));
+        let (data, project) = (dir.join("data"), dir.join("project"));
+        let tools = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        for name in ["gone", "broke", "renamed", "kept"] {
+            std::fs::write(
+                tools.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n"),
+            )
+            .unwrap();
+        }
+        let global = data.join("tools");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(
+            global.join("shared.toml"),
+            "name = \"shared\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        std::fs::remove_file(tools.join("gone.toml")).unwrap();
+        std::fs::write(tools.join("broke.toml"), "name = \"broke\"\n").unwrap();
+        // A broken project override withholds the global definition, whose
+        // own file is fine.
+        std::fs::write(tools.join("shared.toml"), "name = \"shared\"\n").unwrap();
+        std::fs::write(
+            tools.join("renamed.toml"),
+            "name = \"fresh\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        let delta = refreeze_delta(&old, &new, ApprovalMode::Auto, &data, &project);
+        let mut lost = delta.no_longer_callable.clone();
+        lost.sort();
+        assert_eq!(
+            lost,
+            [
+                ("broke".to_string(), "its file is broken".to_string()),
+                ("gone".to_string(), "its file was removed".to_string()),
+                ("renamed".to_string(), "its file now declares another name".to_string()),
+                ("shared".to_string(), "a broken file now claims its name".to_string()),
+            ]
+        );
+        assert_eq!(delta.callable, ["fresh"], "the new name is callable, nothing else moved");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Readonly refuses mutating calls and calls that would need approval, so
+    /// a tool the human adds between turns of a readonly session is named as
+    /// disabled there, never as callable.
+    #[test]
+    fn readonly_names_new_tools_it_refuses_instead_of_calling_them_callable() {
+        let dir = std::env::temp_dir().join(format!("openmax-ro-{}", uuid::Uuid::new_v4()));
+        let (data, project) = (dir.join("data"), dir.join("project"));
+        let tools = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let old = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        std::fs::write(
+            tools.join("deploy.toml"),
+            "name = \"deploy\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nmutating = true\n",
+        )
+        .unwrap();
+        let new = Registry::from_snapshot(crate::registry::capture_extensions(&data, &project));
+        let delta = refreeze_delta(&old, &new, ApprovalMode::Readonly, &data, &project);
+        assert!(delta.callable.is_empty(), "{:?}", delta.callable);
+        assert_eq!(delta.readonly_disabled, ["deploy"]);
+        let note = refreeze_receipt_text(&delta, &[], &[], &project);
+        assert!(note.contains("Disabled in readonly mode"), "{note}");
+        assert!(!note.contains("Callable now"), "{note}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A collision whose winner fell past the skill cap says so instead of
     /// claiming an index line that does not exist.
     #[test]
@@ -5961,13 +6156,8 @@ mod tests {
             std::path::PathBuf::from("/p/.agents/skills/zz-b/SKILL.md"),
             false,
         )];
-        let added = AddedTools {
-            approved: Vec::new(),
-            unapproved: Vec::new(),
-            modified_unapproved: Vec::new(),
-            memory: None,
-        };
-        let note = refreeze_receipt_text(&[], &added, &[], &shadowed, Path::new("/p"), ApprovalMode::Ask);
+        let added = RefreezeDelta::default();
+        let note = refreeze_receipt_text(&added, &[], &shadowed, Path::new("/p"));
         assert!(
             note.contains("the index has no room for its line"),
             "{note}"
@@ -5996,17 +6186,15 @@ mod tests {
             std::path::PathBuf::from("/p/.agents/skills/y/SKILL.md"),
             true,
         )];
-        let added = AddedTools {
-            approved: Vec::new(),
+        let added = RefreezeDelta {
+            changes: vec![format!(".openmax/tools/c\n{forged}.toml added")],
             unapproved: vec![(
                 "t".to_string(),
                 format!("/p/.openmax/tools/b\n{forged}.toml"),
             )],
-            modified_unapproved: Vec::new(),
-            memory: None,
+            ..Default::default()
         };
-        let changes = vec![format!(".openmax/tools/c\n{forged}.toml added")];
-        let note = refreeze_receipt_text(&changes, &added, &broken, &shadowed, Path::new("/p"), ApprovalMode::Ask);
+        let note = refreeze_receipt_text(&added, &broken, &shadowed, Path::new("/p"));
         assert!(
             !note.contains('\n'),
             "a clause forged a second receipt line: {note:?}"
