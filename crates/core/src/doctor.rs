@@ -150,12 +150,13 @@ pub fn check(project_root: &Path) -> Vec<Finding> {
     check_at(project_root, &crate::state::default_data_dir())
 }
 
-/// The same findings for the `--check` text report: where the harness writes
+/// The same findings for the `--check` text report: where this module writes
 /// a file's path into a message (a repair command's argument, the file that
 /// shadows this one, the script whose bytes changed), it names the file by
 /// [`report_path`]. Nothing a message quotes changes, because that can be
 /// author bytes (a manifest line in a parse error) that must read exactly as
-/// they are in the file.
+/// they are in the file, and a reason relayed whole from a loader (the hook
+/// loader's fail-closed summary) prints as the loader wrote it.
 pub fn check_for_report(project_root: &Path) -> Vec<Finding> {
     check_with(project_root, &crate::state::default_data_dir(), true)
 }
@@ -5030,11 +5031,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Every place the harness writes a project file's path into a message
-    /// names it relative to the project in the text report: each repair
-    /// command, the file that shadows another, and the script whose bytes
-    /// changed. One project triggers them all, in ask (the untrusted default),
-    /// and the full face, which keeps absolute paths, shows each one fired.
+    /// Each path this module writes into a message names a project file
+    /// relative to the project in the text report: every repair command, the
+    /// file that shadows another, and the script whose bytes changed. One
+    /// project triggers them all, in ask (the untrusted default), and the full
+    /// face, which keeps absolute paths, shows each one fired.
     /// The root is canonical, as the current directory the CLI checks is.
     #[test]
     fn the_report_writes_no_absolute_project_path() {
