@@ -177,7 +177,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
         let base = if selected {
             Style::default()
                 .fg(theme::ACCENT())
-                .bg(theme::SURFACE())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -198,7 +197,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
             8
         };
         let id_width = row_width.saturating_sub(4 + name_width + provider_width);
-        let mut line = Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(format!("{marker} {active} "), base),
             Span::styled(
                 super::text::pad_right(&clip(&item.name, name_width.saturating_sub(1)), name_width),
@@ -212,18 +211,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
                 base.fg(theme::DIM()),
             ),
             Span::styled(clip(&item.id, id_width), base.fg(theme::DIM())),
-        ]);
-        if selected {
-            line.style = Style::default().bg(theme::SURFACE());
-            let used = line.width();
-            if used < inner.width as usize {
-                line.spans.push(Span::styled(
-                    " ".repeat(inner.width as usize - used),
-                    Style::default().bg(theme::SURFACE()),
-                ));
-            }
-        }
-        lines.push(line);
+        ]));
     }
     if state.filtered.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -358,7 +346,8 @@ mod tests {
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Model"));
         assert!(text.contains("Model One"));
-        assert_eq!(buffer[(1, 2)].bg, theme::SURFACE());
+        assert_eq!(buffer[(1, 2)].symbol(), "▸");
+        assert!(buffer[(1, 2)].modifier.contains(Modifier::BOLD));
         let _ = fs::remove_dir_all(dir);
     }
 }
