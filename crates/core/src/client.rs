@@ -1324,9 +1324,13 @@ fn never_connected(e: &reqwest::Error, proxied: bool) -> Option<(String, &'stati
     } else if io_kind(std::io::ErrorKind::ConnectionRefused) {
         ("connection refused".to_string(), "nothing is listening there; start the server or fix base_url (openmax --spec settings)")
     } else if chain().any(|c| c.to_string() == "dns error") {
-        // The connector's own label for a failed lookup; the resolver's
-        // message under it differs by platform.
-        ("host not found".to_string(), "fix the host in base_url or check the network (openmax --spec settings)")
+        // The connector's own label for a failed lookup. The resolver's
+        // message under it says why (no such name, or a resolver that could
+        // not answer just now), so it stays, without the prefix the system
+        // lookup puts on every one of them.
+        let why = innermost();
+        let why = why.strip_prefix("failed to lookup address information: ").unwrap_or(&why);
+        (format!("DNS lookup failed: {why}"), "fix the host in base_url or check the network (openmax --spec settings)")
     } else if io_kind(std::io::ErrorKind::InvalidData) {
         // How the TLS layer reports a handshake it could not complete: a
         // certificate it does not trust, or a server not speaking TLS.
@@ -2521,7 +2525,7 @@ mod tests {
         assert_eq!(
             never_connected(&err, false),
             Some((
-                "cannot connect to models.example:8080 (host not found)".to_string(),
+                "cannot connect to models.example:8080 (DNS lookup failed: no such host)".to_string(),
                 "fix the host in base_url or check the network (openmax --spec settings)"
             ))
         );
