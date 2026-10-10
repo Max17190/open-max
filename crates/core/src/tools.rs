@@ -763,10 +763,112 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
             return ToolOutcome::err(format!("cannot create directories: {e}"));
         }
     }
-    if let Err(e) = std::fs::write(&path, content) {
-        return ToolOutcome::err(format!("cannot write {rel}: {e}"));
+    if let Err(e) = write_contents(&path, rel, content.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("wrote", root, &path, &old, content)
+}
+
+/// Make `bytes` the contents of the resolved file at `path`.
+///
+/// A write in place truncates first, so one that failed partway (a full
+/// disk, a quota, a file size limit) left a prefix of the new contents under
+/// the old name while the tool reported only that it could not write. The
+/// bytes go to a temp file beside it instead, which takes its place once
+/// they are all on disk, so a failure leaves the file as it was.
+///
+/// The replacement must be the same file to everything else. It gets the
+/// file's mode and owner (extended attributes and ACLs stay with the old
+/// file), and a file that a new one cannot stand in for is written in place,
+/// with its old contents written back if that fails: one with other hard
+/// links, which a new file would split from; one whose owner or group this
+/// user cannot give a file; one in a directory that takes no new file; and
+/// anything that is not a regular file.
+fn write_contents(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let unchanged = |e: std::io::Error| format!("cannot write {rel}: {e}; {rel} is unchanged");
+    // The check a write in place makes. A rename needs only the directory's
+    // permission, so without it a file this user may not write is replaced.
+    let existing = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => {
+            let meta = file.metadata().map_err(unchanged)?;
+            Some((file, meta))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(unchanged(e)),
+    };
+    let meta = existing.as_ref().map(|(_, meta)| meta);
+    if meta.is_none_or(|meta| meta.is_file() && !has_other_links(meta)) {
+        let mut ready = false;
+        let replaced = crate::sessions::replace_atomic(path, bytes, |tmp| {
+            meta.map_or(Ok(()), |meta| take_identity(tmp, meta))?;
+            ready = true;
+            Ok(())
+        });
+        match replaced {
+            Ok(()) => return Ok(()),
+            Err(e) if ready && meta.is_some() => return Err(unchanged(e)),
+            Err(e) if ready => return Err(format!("cannot write {rel}: {e}; {rel} was not created")),
+            // No temp file could be made here, or given the file's owner.
+            Err(_) => {}
+        }
+    }
+    match existing {
+        Some((file, meta)) => write_in_place(path, file, meta.is_file(), rel, bytes),
+        None => std::fs::write(path, bytes).map_err(|e| format!("cannot write {rel}: {e}")),
+    }
+}
+
+fn has_other_links(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(meta) > 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    linked
+}
+
+/// Give the temp file that replaces a file that file's owner and mode. Only
+/// the superuser can give a file to another user, or to a group it is not
+/// in, so for anyone else such a file fails here. Setuid and setgid stay
+/// off, as a write in place clears them.
+fn take_identity(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fresh = tmp.metadata()?;
+        if (fresh.uid(), fresh.gid()) != (meta.uid(), meta.gid()) {
+            std::os::unix::fs::fchown(tmp, Some(meta.uid()), Some(meta.gid()))?;
+        }
+        std::fs::Permissions::from_mode(meta.mode() & 0o1777)
+    };
+    #[cfg(not(unix))]
+    let mode = meta.permissions();
+    tmp.set_permissions(mode)
+}
+
+/// Write `bytes` over the open `file`. A regular file is truncated first, so
+/// if the write then fails its old contents are written back, and the result
+/// says whether they were. A FIFO or a device takes bytes as they come and
+/// has nothing to put back.
+fn write_in_place(path: &Path, mut file: std::fs::File, regular: bool, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::{Seek, Write};
+    let old = if regular { std::fs::read(path).ok() } else { None };
+    let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
+        if regular {
+            file.set_len(0)?;
+            file.rewind()?;
+        }
+        file.write_all(bytes)
+    };
+    let Err(e) = overwrite(&mut file, bytes) else {
+        return Ok(());
+    };
+    Err(match old.map(|old| overwrite(&mut file, &old)) {
+        Some(Ok(())) => format!("cannot write {rel}: {e}; its old contents were written back"),
+        Some(Err(again)) => format!(
+            "cannot write {rel}: {e}, and writing its old contents back failed too ({again}), so it may be partly written"
+        ),
+        None => format!("cannot write {rel}: {e}; it may be partly written"),
+    })
 }
 
 /// The part of a line the closest-match hint compares: trimmed, and no more
@@ -945,8 +1047,8 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(hint);
     };
 
-    if let Err(e) = std::fs::write(&path, &new) {
-        return ToolOutcome::err(format!("cannot write {rel}: {e}"));
+    if let Err(e) = write_contents(&path, rel, new.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("edited", root, &path, &old, &new)
 }

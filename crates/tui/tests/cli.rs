@@ -1739,6 +1739,141 @@ fn a_finished_stream_still_runs_the_same_write_call() {
     );
 }
 
+/// A write that fails partway, as on a full disk, over a quota or past a file
+/// size limit, must leave the file as it was. Writing in place truncated the
+/// file first, so the failure left a prefix of the new contents under the old
+/// name while the tool said only that it could not write. A file with other
+/// hard links is still written in place, so its old contents are written
+/// back. A file that did not exist is not created, and the result says which.
+#[cfg(unix)]
+#[test]
+fn a_write_that_fails_partway_leaves_the_file_as_it_was() {
+    use std::os::unix::process::CommandExt;
+    let (project, home) = fresh_dirs("failed-write");
+    let original: String = (0..1000).map(|i| format!("record {i:06} value=ORIGINAL\n")).collect();
+    let longer = "ORIGINAL_BUT_MUCH_LONGER_VALUE";
+    let grown = original.replace("ORIGINAL", longer);
+    std::fs::write(project.join("data.txt"), &original).unwrap();
+    std::fs::write(project.join("linked.txt"), &original).unwrap();
+    std::fs::hard_link(project.join("linked.txt"), project.join("alias.txt")).unwrap();
+    let grow = |path: &str| {
+        serde_json::json!({"path": path, "old_string": "ORIGINAL", "new_string": longer, "replace_all": true})
+    };
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (
+            sse_tool_calls(&[
+                ("edit_file", grow("data.txt")),
+                ("edit_file", grow("linked.txt")),
+                ("write_file", serde_json::json!({"path": "fresh.txt", "content": grown})),
+            ]),
+            true,
+        ),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    // Halfway between the two sizes: the old contents fit under the limit
+    // and the new ones cannot.
+    let limit = ((original.len() + grown.len()) / 2) as libc::rlim_t;
+    let mut command = cmd(&project, &home);
+    command.args(["--trust-project", "--json", "-p", "grow the values"]);
+    // SAFETY: signal and setrlimit are async-signal-safe and change only the
+    // child. With SIGXFSZ ignored, a write past the limit fails with EFBIG
+    // instead of killing the process.
+    unsafe {
+        command.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let cap = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &cap) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let out = finish_with_deadline(command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let ends: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["type"] == "tool_end")
+        .collect();
+    assert_eq!(ends.len(), 3, "every write must run: {stdout}");
+    for name in ["data.txt", "linked.txt", "alias.txt"] {
+        let after = std::fs::read_to_string(project.join(name)).unwrap();
+        assert!(after == original, "a failed write must leave {name} as it was, not {} bytes", after.len());
+    }
+    assert!(!project.join("fresh.txt").exists(), "a failed write must not leave a partial new file");
+    let said: Vec<&str> = ends.iter().map(|end| end["output"].as_str().unwrap_or_default()).collect();
+    assert!(ends.iter().all(|end| end["ok"] == false), "{stdout}");
+    assert!(said[0].starts_with("cannot write data.txt") && said[0].ends_with("data.txt is unchanged"), "{said:?}");
+    assert!(said[1].starts_with("cannot write linked.txt") && said[1].ends_with("old contents were written back"), "{said:?}");
+    assert!(said[2].starts_with("cannot write fresh.txt") && said[2].ends_with("fresh.txt was not created"), "{said:?}");
+    let names: Vec<_> = std::fs::read_dir(&project).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left behind: {names:?}");
+}
+
+/// Replacing a file with a new one must not change what makes it the same
+/// file to everything else: its mode, the other names a hard link gives it,
+/// the symlink that points at it, and whether it can be written at all. A
+/// file in a directory that does not let a new file be created next to it is
+/// still writable in place.
+#[cfg(unix)]
+#[test]
+fn a_write_keeps_the_files_mode_links_and_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (project, home) = fresh_dirs("write-identity");
+    let script = project.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+    std::fs::write(project.join("shared.txt"), "old\n").unwrap();
+    std::fs::hard_link(project.join("shared.txt"), project.join("alias.txt")).unwrap();
+    std::fs::write(project.join("real.txt"), "old\n").unwrap();
+    std::os::unix::fs::symlink("real.txt", project.join("link.txt")).unwrap();
+    let readonly = project.join("readonly.txt");
+    std::fs::write(&readonly, "old\n").unwrap();
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // The superuser may write it anyway, in place or not.
+    let refused = std::fs::OpenOptions::new().write(true).open(&readonly).is_err();
+    let locked = project.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("inside.txt"), "old\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let edit = |path: &str| serde_json::json!({"path": path, "old_string": "old", "new_string": "new"});
+    let calls = [
+        ("write_file", serde_json::json!({"path": "run.sh", "content": "#!/bin/sh\necho new\n"})),
+        ("edit_file", edit("shared.txt")),
+        ("edit_file", edit("link.txt")),
+        ("edit_file", edit("readonly.txt")),
+        ("edit_file", edit("locked/inside.txt")),
+    ];
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_calls(&calls), true),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let (code, lines, stdout) = json_turn(&project, &home, "update the files");
+    // Writable again before any assertion, so a failure leaves nothing that
+    // cannot be deleted.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(lines.iter().filter(|l| l["type"] == "tool_end").count(), calls.len(), "{stdout}");
+
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\necho new\n");
+    assert_eq!(std::fs::metadata(&script).unwrap().mode() & 0o7777, 0o750, "the mode must survive");
+    assert_eq!(std::fs::read_to_string(project.join("alias.txt")).unwrap(), "new\n", "both names must see the edit");
+    assert_eq!(std::fs::metadata(project.join("shared.txt")).unwrap().nlink(), 2, "the link must survive");
+    assert_eq!(std::fs::read_to_string(project.join("real.txt")).unwrap(), "new\n");
+    assert!(project.join("link.txt").is_symlink(), "the symlink must stay a symlink");
+    assert_eq!(std::fs::read_to_string(locked.join("inside.txt")).unwrap(), "new\n", "{stdout}");
+    if refused {
+        assert_eq!(std::fs::read_to_string(&readonly).unwrap(), "old\n", "a file it may not write is not replaced");
+    }
+    let names: Vec<_> = std::fs::read_dir(&project).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left behind: {names:?}");
+}
+
 #[test]
 fn assistant_text_never_dispatches_a_tool() {
     let call = r#"<tool_call>{"name":"write_file","arguments":{"path":"side-effect.txt","content":"written"}}</tool_call>"#;

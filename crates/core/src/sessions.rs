@@ -852,7 +852,18 @@ pub(crate) fn commit_compaction(
 /// between the two leaves an empty or partial file under the final name with
 /// the old contents already gone. Synced, the bytes land first, so a power
 /// cut leaves the old file or the new one, never a mix.
-pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+    replace_atomic(path, bytes.as_ref(), |_| Ok(())).map_err(|e| e.to_string())
+}
+
+/// `write_atomic`, with `prepare` run on the temp file before any byte is
+/// written to it, so a caller can give it the mode and owner of the file it
+/// replaces. The error keeps its kind.
+pub(crate) fn replace_atomic(
+    path: &Path,
+    bytes: &[u8],
+    prepare: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -860,22 +871,23 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         .unwrap_or_else(|| PathBuf::from("."));
     let base = path
         .file_name()
-        .ok_or_else(|| "path has no file name".to_string())?
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
         .to_string_lossy();
     let id = uuid::Uuid::new_v4().simple();
     let tmp = parent.join(format!("{base}.{id}.tmp"));
     let written = std::fs::File::create(&tmp).and_then(|mut file| {
-        file.write_all(bytes.as_ref())?;
+        prepare(&file)?;
+        file.write_all(bytes)?;
         sync(&file, &tmp)
     });
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.to_string());
+        return Err(e);
     }
     // Reject directories, including symlinks to directories.
     if path.is_dir() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{} is a directory", path.display()));
+        return Err(std::io::Error::other(format!("{} is a directory", path.display())));
     }
     match std::fs::rename(&tmp, path) {
         Ok(()) => {
@@ -889,7 +901,7 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
-            Err(e.to_string())
+            Err(e)
         }
     }
 }
@@ -964,7 +976,7 @@ fn dir_sync_unsupported(e: &std::io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| unsupported.contains(&code))
 }
 
-fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+fn write_jsonl(path: &Path, messages: &[ChatMessage]) -> Result<(), String> {
     let mut out = String::new();
     for msg in messages {
         out.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
