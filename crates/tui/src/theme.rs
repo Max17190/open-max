@@ -1,12 +1,12 @@
 //! Tokens for the TUI: one monochrome palette, the terminal's own foreground
 //! and background (`Color::Reset`) with the palette's gray (slot 8) for
-//! secondary text, borders and selection. Nothing names White or Black, and
+//! secondary text, selection, and every border except the focused
+//! composer's and the approval card's. Nothing names White or Black, and
 //! nothing fills a surface: slots 15 and 0 are the backgrounds of common
 //! light and dark themes, where text in them vanishes and a fill in them
 //! reads as a box. Rows, cards and the composer are told apart by weight,
 //! glyphs and borders instead. There is nothing to switch and nothing to
-//! persist, and `NO_COLOR` is honored by construction because nothing here
-//! carries a hue.
+//! persist, and nothing here carries a hue.
 
 use ratatui::style::Color;
 

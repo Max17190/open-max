@@ -4310,8 +4310,6 @@ fn paint_text_selection(
     line_map: &[Option<RowRef>],
     area: Rect,
 ) {
-    // One palette read for the whole overlay: the inner loop touches every
-    // selected cell per frame.
     let select_bg = theme::SELECT();
     for (row, painted) in line_map.iter().copied().enumerate() {
         let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
