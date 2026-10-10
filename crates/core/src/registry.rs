@@ -96,6 +96,11 @@ pub struct Registry {
     /// External tools discovered on disk but not loaded because of the
     /// `MAX_EXTERNAL_TOOLS` cap; the prompt trailer reports the count.
     pub tools_omitted: usize,
+    /// The tools and skills behind those two counts, (name, file), so a
+    /// refreeze receipt can name what the cap keeps out instead of counting
+    /// it. Empty for a manifest-restored registry.
+    pub(crate) capped_tools: Vec<(String, PathBuf)>,
+    pub(crate) capped_skills: Vec<(String, PathBuf)>,
     /// Content hash of the extension files this registry was built from;
     /// compared against disk at turn start to detect extension changes.
     pub ext_fingerprint: u64,
@@ -165,9 +170,9 @@ pub(crate) struct ExtensionSnapshot {
     external: Vec<ToolSpec>,
     skills: Vec<SkillSpec>,
     /// External tools discovered but dropped by the `MAX_EXTERNAL_TOOLS` cap.
-    tools_omitted: usize,
+    capped_tools: Vec<(String, PathBuf)>,
     /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
-    skills_omitted: usize,
+    capped_skills: Vec<(String, PathBuf)>,
     /// Every capability file this generation read, with a hash of its bytes
     /// taken where they were read: the receipt names a changed file from
     /// this, so nothing downstream needs a copy of the bytes.
@@ -389,14 +394,24 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     external.retain(|t| !tools::TOOL_NAMES.contains(&t.name.as_str()));
     external.sort_by(|a, b| a.name.cmp(&b.name));
     // Caps bound the frozen prompt, but a tool or skill dropped here must not
-    // vanish silently: the counts survive so the prompt trailer can say what
-    // is not loaded and --check can name the files.
-    let tools_omitted = external.len().saturating_sub(MAX_EXTERNAL_TOOLS);
-    external.truncate(MAX_EXTERNAL_TOOLS);
+    // vanish silently: the names survive so the prompt trailer can count
+    // them, the refreeze receipt can name the ones a write pushed out, and
+    // --check can name the files.
+    let capped_tools: Vec<(String, PathBuf)> = external
+        .split_off(external.len().min(MAX_EXTERNAL_TOOLS))
+        .into_iter()
+        .filter_map(|spec| match spec.kind {
+            ToolKind::External(ext) => Some((spec.name, ext.source_path)),
+            ToolKind::Builtin => None,
+        })
+        .collect();
     let mut discovered_skills: Vec<SkillSpec> = skills_by_name.into_values().collect();
     discovered_skills.sort_by(|a, b| a.name.cmp(&b.name));
-    let skills_omitted = discovered_skills.len().saturating_sub(skills::MAX_SKILLS);
-    discovered_skills.truncate(skills::MAX_SKILLS);
+    let capped_skills: Vec<(String, PathBuf)> = discovered_skills
+        .split_off(discovered_skills.len().min(skills::MAX_SKILLS))
+        .into_iter()
+        .map(|skill| (skill.name, skill.path))
+        .collect();
     // Settle the collision winners' indexed state against the RENDER's own
     // inclusion decision, not list membership: the 50-skill cap and the
     // 3000-byte index budget (first-fit, applied at prompt render) both
@@ -416,8 +431,8 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         fingerprint: h.finish(),
         external,
         skills: discovered_skills,
-        tools_omitted,
-        skills_omitted,
+        capped_tools,
+        capped_skills,
         read_paths,
         broken,
         broken_tools,
@@ -453,8 +468,10 @@ impl Registry {
     pub(crate) fn from_snapshot(snapshot: ExtensionSnapshot) -> Self {
         let mut registry = Self::assemble(snapshot.external, snapshot.skills);
         registry.ext_fingerprint = snapshot.fingerprint;
-        registry.tools_omitted = snapshot.tools_omitted;
-        registry.skills_omitted = snapshot.skills_omitted;
+        registry.tools_omitted = snapshot.capped_tools.len();
+        registry.skills_omitted = snapshot.capped_skills.len();
+        registry.capped_tools = snapshot.capped_tools;
+        registry.capped_skills = snapshot.capped_skills;
         registry.read_paths = Some(snapshot.read_paths.into_iter().collect());
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
@@ -510,6 +527,8 @@ impl Registry {
             skills,
             skills_omitted: 0,
             tools_omitted: 0,
+            capped_tools: Vec::new(),
+            capped_skills: Vec::new(),
             ext_fingerprint: 0,
             broken: Vec::new(),
             read_paths: None,
@@ -1277,11 +1296,23 @@ async fn spawn_external(
     };
 
     match execution::run_process(request, cancel).await {
-        Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!(
-                "failed to start external tool '{name}' (command '{}', defined in {}): {e}",
+        Err(ProcessError::Spawn(e)) => {
+            // A script written without its execute bit is the common cause,
+            // and the bare OS error names no way out of it.
+            let repair = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                format!(
+                    "; {}",
+                    crate::doctor::CommandProblem::NotExecutable.tool_repair(&tool.command)
+                )
+            } else {
+                String::new()
+            };
+            ToolOutcome::err(format!(
+                "failed to start external tool '{name}' (command '{}', defined in {}): {e}{repair}",
                 tool.command,
                 tool.source_path.display()
-        )),
+            ))
+        }
         Err(ProcessError::Wait(e)) => {
             ToolOutcome::err(format!("external tool '{name}' failed: {e}"))
         }
@@ -1482,7 +1513,7 @@ mod tests {
         }
         let snapshot = capture_extensions(&project.join("data"), &project);
         assert!(snapshot.external.len() <= MAX_EXTERNAL_TOOLS);
-        assert!(snapshot.tools_omitted >= 2, "{}", snapshot.tools_omitted);
+        assert!(snapshot.capped_tools.len() >= 2, "{:?}", snapshot.capped_tools);
         // The sorted head loads: the lexicographically first names survive.
         assert!(snapshot.external.iter().any(|t| t.name == "tool-000"));
         assert!(!snapshot.external.iter().any(|t| t.name == format!(

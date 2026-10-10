@@ -1645,7 +1645,7 @@ fn stale_code_reason(
 /// resolves to no file binds nothing it can read, while an unexecutable script
 /// approves fine and still cannot spawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CommandProblem {
+pub(crate) enum CommandProblem {
     Absent,
     NotExecutable,
     NotOnPath,
@@ -1668,6 +1668,35 @@ impl CommandProblem {
             ),
         }
     }
+
+    /// What repairs it for a tool, which a call spawns directly: the
+    /// refreeze receipt and the spawn error both carry this, so a tool that
+    /// cannot start says how to make it start wherever the agent meets it.
+    pub(crate) fn tool_repair(self, command: &str) -> String {
+        let command_q = shell_quote(Path::new(command));
+        match self {
+            Self::Absent => "create it before the first call".to_string(),
+            Self::NotExecutable => format!(
+                "chmod +x {command_q}, or run it with command = \"sh\" and {command:?} as the first entry in args"
+            ),
+            Self::NotOnPath => {
+                "install it or point command at a script inside the project".to_string()
+            }
+        }
+    }
+}
+
+/// Why an external tool will not start from this checkout, with the repair,
+/// judged exactly as `--check` judges it: the command, then the script an
+/// interpreter-style command runs.
+pub(crate) fn tool_start_problem(
+    command: &str,
+    args: &[String],
+    project_root: &Path,
+) -> Option<String> {
+    let (problem, reason) = missing_command_reason(command, project_root)
+        .or_else(|| missing_script_reason(command, args, project_root))?;
+    Some(format!("{reason}: {}", problem.tool_repair(command.trim())))
 }
 
 /// Why `command` will not spawn from this checkout, if it will not. A path

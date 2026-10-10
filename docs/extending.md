@@ -424,11 +424,19 @@ deleted, and their log still verifies, so an older binary can keep using it.
 `openmax --ledger` is deprecated: it prints one line saying so and where this
 project's records are kept, and exits 0.
 
-Every re-freeze announces a receipt - the `refrozen` event lists each tool or
-skill file added, modified, or removed - so the agent's action space never
-mutates silently. The first re-freeze after a session resumes compares against
-the session's saved manifest, which carries only the loaded tools and the skill
-index, so a skill body edited while the session was closed is not named there.
+Every re-freeze announces a receipt, so the agent's action space never
+mutates silently. The `refrozen` event lists each tool or skill file added,
+modified, or removed. The model reads the same list in its transcript, and
+with it what the change did: each added or edited tool is either callable now
+or loads but cannot start yet (its command is missing, not executable, or not
+on PATH, with the repair); a tool that stopped being callable is named with
+the reason (the 64-tool cap, its file removed or broken, or its file now
+declaring another name); a new tool past the cap is named as not loaded; and
+a skill the index leaves out (the 50-skill cap or the 3000-byte budget) is
+named as not indexed. The first re-freeze after a session resumes compares
+against the session's saved manifest, which records a hash of every tool and
+skill file the freeze read, so a file edited while the session was closed is
+named too.
 
 A ledger that cannot be verified stops appending (a chain nobody can trust
 must not be extended) and revokes every approval it held, so outside `auto`

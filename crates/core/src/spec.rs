@@ -208,8 +208,10 @@ description = "Directory to scan"
 Activation: automatic when extension bytes change, checked between
 iterations after every executed mutating call (a failed call that wrote
 the file still activates it) and at turn start; `/reload`
-forces it now. Verify the file parses with `openmax --check`. Test the
-script itself before first use:
+forces it now. The refreeze receipt says whether each new or edited tool
+is callable now or cannot start yet (a missing or non-executable command),
+and names any tool that stopped being callable. Verify the file parses with
+`openmax --check`. Test the script itself before first use:
 `echo '{"path":"src"}' | sh ./scripts/todo-scan.sh`.
 
 ## Proof of life
@@ -300,7 +302,8 @@ budget is omitted (and counted by a trailer), while a later, shorter line may
 still land. Shortening descriptions (this skill's or an earlier one's) frees
 budget for the lines after them, and renaming changes who competes for the
 budget first. More skills or longer descriptions can push a skill out of the
-prompt entirely (`openmax --check` names each one it drops). The prompt
+prompt entirely (`openmax --check` names each one it drops, and the refreeze
+receipt names each one a write leaves out or pushes out). The prompt
 shows each indexed skill as `- name: description — path/to/SKILL.md`.
 
 Example (`.agents/skills/release/SKILL.md`):
