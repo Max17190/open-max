@@ -932,14 +932,12 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    // Kitty keyboard protocol makes Shift+Enter distinct; Alt+Enter stays as
-    // the fallback everywhere else. Bracketed paste for sane multiline paste.
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        enable_mode(
-            MODE_KEYBOARD,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        );
-    }
+    // Start crossterm's input reader before the first frame reads the size:
+    // creating it installs the SIGWINCH handler, and a resize before that is
+    // ignored. Nothing reads input yet: the keyboard protocol probe and the
+    // event stream start behind the first frame (see `app::event_loop`).
+    let _ = crossterm::event::poll(std::time::Duration::ZERO);
+    // Bracketed paste for sane multiline paste.
     enable_mode(MODE_PASTE, crossterm::event::EnableBracketedPaste);
     // Mouse capture for wheel scrolling of the transcript. Terminals still
     // allow text selection with the usual modifier (Option on macOS).
@@ -997,6 +995,31 @@ const POP_TITLE: &[u8] = b"\x1b[23;0t";
 fn enable_mode(mode: u8, command: impl crossterm::Command) {
     TERM_MODES.fetch_or(mode, Ordering::SeqCst);
     let _ = execute!(std::io::stdout(), command);
+}
+
+/// Kitty keyboard protocol makes Shift+Enter distinct; Alt+Enter stays as
+/// the fallback everywhere else. Asking whether the terminal speaks it waits
+/// on the terminal's answer: a network round trip over ssh, and crossterm's
+/// full 2 s timeout on a terminal that never answers. So the event loop runs
+/// this on the blocking pool once its first frame is out, and before it
+/// starts reading input, which would otherwise take the answer itself.
+fn enable_keyboard_enhancement() {
+    if !crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        return;
+    }
+    // Under the stdout lock, which `restore_terminal` holds while it claims
+    // the modes: a restore that ran while the probe waited (a panic, a forced
+    // exit) has handed the shell back, and flags pushed there would never be
+    // popped.
+    let mut out = std::io::stdout().lock();
+    if TERM_MODES.load(Ordering::SeqCst) & MODE_ALT_SCREEN == 0 {
+        return;
+    }
+    TERM_MODES.fetch_or(MODE_KEYBOARD, Ordering::SeqCst);
+    let _ = execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 }
 
 /// Hand the terminal back to the shell. Every exit path calls it, and only
