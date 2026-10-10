@@ -29,7 +29,7 @@ options:
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
       --json             with --print, emit AgentEvent envelopes as JSONL;
-                         with --check, emit findings as one JSON array
+                         with --check, emit every finding as one JSON array
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
                          \"reload\"|\"cancel\"|\"quit\"}), AgentEvent envelopes
@@ -62,6 +62,8 @@ options:
                          one is probed in a sandbox (no network, writes
                          confined to a scratch dir); a passing probe
                          approves nothing
+      --all              with --check, print every row; by default an ok
+                         file is counted on one line (a hook still prints)
       --check            validate extension files (tools, skills, templates,
                          hooks, permissions, providers, memory) and the
                          session index, then exit; nonzero if any is broken.
@@ -108,6 +110,8 @@ struct CliArgs {
     stdio: bool,
     check: bool,
     run_examples: bool,
+    /// `--check --all`: print every finding's row, ok rows included.
+    all: bool,
     approve: Option<String>,
     forget: Option<String>,
     ledger: bool,
@@ -152,6 +156,7 @@ where
         stdio: false,
         check: false,
         run_examples: false,
+        all: false,
         approve: None,
         forget: None,
         ledger: false,
@@ -195,6 +200,7 @@ where
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
             Long("run-examples") => out.run_examples = true,
+            Long("all") => out.all = true,
             Long("approve") => set_once(&mut out.approve, "--approve", &mut parser)?,
             Long("forget") => set_once(&mut out.forget, "--forget", &mut parser)?,
             Long("ledger") => out.ledger = true,
@@ -333,6 +339,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         stdio,
         check,
         run_examples,
+        all,
         approve,
         forget,
         ledger,
@@ -372,13 +379,14 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     // Each option and the operations that read it.
     const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 7] = [
+    let options: [(bool, &str, &[Option<&str>]); 8] = [
         (*trust_project, "--trust-project", SESSIONS),
         (*continue_session, "--continue", SESSIONS),
         (model.is_some(), "--model", SESSIONS),
         (provider.is_some(), "--provider", SESSIONS),
         (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
+        (*all, "--all", &[Some("--check")]),
         (mcp_timeout.is_some(), "--mcp-timeout", MCP),
     ];
     for (on, flag, readers) in options {
@@ -800,9 +808,14 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
         }
         // Pure filesystem validation: no session, no endpoint, no state dir.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let findings = open_max_core::doctor::check(&project);
+        // The text face's repair commands name files relative to the project.
+        let findings = match cli.json {
+            true => open_max_core::doctor::check(&project),
+            false => open_max_core::doctor::check_for_report(&project),
+        };
         if cli.json {
-            // Machine face of the same report: the agent parses this in-turn.
+            // Machine face of the full report (every finding, as --all
+            // prints it): the agent parses this in-turn.
             let mut array: Vec<serde_json::Value> = findings
                 .iter()
                 .map(|f| {
@@ -834,8 +847,15 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
             );
             std::process::exit(0);
         }
-        for f in &findings {
-            println!("{}", check_row(f));
+        let (rows, summary) = match cli.all {
+            true => (findings.iter().collect(), None),
+            false => open_max_core::doctor::default_report(&findings),
+        };
+        for f in rows {
+            println!("{}", check_row(f, &project));
+        }
+        if let Some(summary) = summary {
+            println!("{summary}");
         }
         let mut example_failures = 0usize;
         if cli.run_examples {
@@ -1227,8 +1247,9 @@ fn push_title() {
 }
 
 /// `ratatui::init` with one change: frame output goes through a 256 KiB
-/// buffer so each flush is one write(2) instead of the dozens that `Stdout`'s
-/// built-in 1 KiB line buffer produces on token-streaming frames.
+/// `FrameWriter` so each frame within it is one write(2) instead of the
+/// dozens that `Stdout`'s built-in 1 KiB line buffer produces on
+/// token-streaming frames.
 /// `restore_terminal` is the counterpart on every exit path; it writes to the
 /// shared stdout fd, and every completed frame ends fully flushed.
 fn init_terminal() -> std::io::Result<ui::transcript::Term> {
@@ -1270,12 +1291,23 @@ fn enter_raw_mode(
     Ok(())
 }
 
-/// A frame-sized `BufWriter` that discards, rather than writes, its bytes
-/// while the thread is panicking. The panic hook has already restored the
-/// normal screen by the time unwinding drops the terminal, and that drop
-/// still flushes (ratatui shows the cursor on the way out), so writing then
-/// would land a partial frame, with its synchronized update still open, on
-/// the user's shell.
+/// A frame-sized `BufWriter` that sends each frame within its capacity in
+/// one write(2), and discards, rather than writes, its bytes while the thread
+/// is panicking.
+///
+/// A flush while the buffer holds a synchronized update that is still open
+/// is held until the update closes. ratatui's cursor commands flush inside
+/// every draw (the cursor show or hide carries the cell diff), so unheld a
+/// frame with the composer's cursor left in three writes, the last carrying
+/// only the close: the terminal, or an ssh hop on the way, could read a
+/// frame whose end the process had not sent yet. A frame larger than the
+/// buffer spills as `BufWriter` fills, and the rest of it then flushes
+/// unheld.
+///
+/// The panic hook has already restored the normal screen by the time
+/// unwinding drops the terminal, and that drop still flushes (ratatui shows
+/// the cursor on the way out), so writing then would land a partial frame,
+/// with its synchronized update still open, on the user's shell.
 pub struct FrameWriter<W: Write>(Option<std::io::BufWriter<W>>);
 
 impl<W: Write> FrameWriter<W> {
@@ -1306,6 +1338,13 @@ impl<W: Write> Write for FrameWriter<W> {
             }
             return Ok(());
         }
+        // A frame opens its synchronized update in an empty buffer, the last
+        // frame having left whole, and is complete once its close ends the
+        // buffer. A flush in between, one of ratatui's, would split it.
+        let pending = self.buf().buffer();
+        if pending.starts_with(b"\x1b[?2026h") && !pending.ends_with(b"\x1b[?2026l") {
+            return Ok(());
+        }
         self.buf().flush()
     }
 }
@@ -1333,12 +1372,12 @@ async fn run_tool_examples(
     let mut ran = 0usize;
     // Each verdict prints as it lands: examples run serially with per-tool
     // timeouts, so batching the report would look like a hang.
-    let result = open_max_core::doctor::run_examples(project, |verdict| {
+    let result = open_max_core::doctor::run_examples(project, true, |verdict| {
         ran += 1;
         if !verdict.sandboxed && verdict.result.is_err() {
             failures += 1;
         }
-        println!("{}", example_row(verdict));
+        println!("{}", example_row(verdict, project));
         let _ = std::io::stdout().flush();
     })
     .await;
@@ -1375,7 +1414,7 @@ async fn run_tool_examples(
 async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>, usize) {
     let mut rows = Vec::new();
     let mut failures = 0usize;
-    match open_max_core::doctor::run_examples(project, |_| {}).await {
+    match open_max_core::doctor::run_examples(project, false, |_| {}).await {
         Ok(verdicts) => {
             for verdict in verdicts {
                 let (status, message) = match &verdict.result {
@@ -1680,15 +1719,17 @@ fn prompt_trust(
 /// advances in microsecond steps on macOS, and parallel test threads routinely
 /// read the same value. The counter is what actually guarantees uniqueness;
 /// pid and clock only keep leftovers from earlier runs out of the way.
-/// One row of the `--check` human report. The whole row rides one terminal
-/// line: a file's own name is author-controlled bytes (write_file only trims
-/// the ends of a path), so a control character in it could forge a second,
-/// clean-looking row. One space per control byte, the same rule hook-authored
-/// stderr text gets. The `--json` face serializes through serde and needs no
-/// counterpart.
-fn check_row(f: &open_max_core::doctor::Finding) -> String {
+/// One row of the `--check` human report, naming the file relative to
+/// `project` when it is under it (see doctor::report_path). The whole row
+/// rides one terminal line: a file's own name is author-controlled bytes
+/// (write_file only trims the ends of a path), so a control character in it
+/// could forge a second, clean-looking row. One space per control byte, the
+/// same rule hook-authored stderr text gets. The `--json` face serializes
+/// through serde and needs no counterpart.
+fn check_row(f: &open_max_core::doctor::Finding, project: &std::path::Path) -> String {
     use open_max_core::doctor::Status;
-    let path = f.path.display();
+    let path = open_max_core::doctor::report_path(&f.path, project);
+    let path = path.display();
     let row = match &f.status {
         Status::Ok(summary) => format!("ok   {:<11} {}  ({summary})", f.kind, path),
         Status::Warn(reason) => format!("warn {:<11} {}  {reason}", f.kind, path),
@@ -1699,14 +1740,16 @@ fn check_row(f: &open_max_core::doctor::Finding) -> String {
 
 /// One verdict row of `--check --run-examples`, one-lined by the same rule:
 /// the tool name is the manifest's own declaration and a failure reason often
-/// carries the example's captured stderr, both author-controlled bytes.
-fn example_row(verdict: &open_max_core::doctor::ExampleVerdict) -> String {
+/// carries the example's captured stderr, both author-controlled bytes. The
+/// approval command in the badge names the manifest as a finding row does.
+fn example_row(verdict: &open_max_core::doctor::ExampleVerdict, project: &std::path::Path) -> String {
+    let path = open_max_core::doctor::report_path(&verdict.path, project);
     let badge = match verdict.sandboxed {
         // Loud by design: the probe ran UNAPPROVED content with zero
         // host authority; nothing was blessed by it running.
         true => format!(
             "  [sandboxed probe: unapproved content ran with no network, writes confined; in-session calls still prompt until: {}]",
-            approve_command(&verdict.path)
+            approve_command(&path)
         ),
         false => String::new(),
     };
@@ -1834,7 +1877,7 @@ mod tests {
             ),
             status: Status::Err("reason with\r\ncontrol bytes".into()),
         };
-        let row = super::check_row(&forged);
+        let row = super::check_row(&forged, std::path::Path::new("/p"));
         assert!(
             row.chars().all(|c| !c.is_control()),
             "a control byte survived into the row: {row:?}"
@@ -1853,7 +1896,7 @@ mod tests {
             ),
             status: Status::Err("reason".into()),
         };
-        let row = super::check_row(&separators);
+        let row = super::check_row(&separators, std::path::Path::new("/p"));
         assert!(
             !row.contains('\u{2028}') && !row.contains('\u{2029}'),
             "a Unicode line separator survived into the row: {row:?}"
@@ -1861,11 +1904,11 @@ mod tests {
 
         let ok = Finding {
             kind: "skill",
-            path: std::path::PathBuf::from(".agents/skills/deploy/SKILL.md"),
+            path: std::path::PathBuf::from("/p/.agents/skills/deploy/SKILL.md"),
             status: Status::Ok("deploy: ship the current branch".into()),
         };
         assert_eq!(
-            super::check_row(&ok),
+            super::check_row(&ok, std::path::Path::new("/p")),
             "ok   skill       .agents/skills/deploy/SKILL.md  (deploy: ship the current branch)"
         );
     }
@@ -1881,7 +1924,7 @@ mod tests {
             result: Err("exit 1\n\u{1b}[31mboom\r\nsecond line".into()),
             sandboxed: false,
         };
-        let row = super::example_row(&forged);
+        let row = super::example_row(&forged, std::path::Path::new("/p"));
         assert!(
             row.chars().all(|c| !c.is_control()),
             "a control byte survived into the row: {row:?}"
@@ -1894,7 +1937,7 @@ mod tests {
             result: Ok(()),
             sandboxed: false,
         };
-        assert_eq!(super::example_row(&clean), "ok   example     docsearch");
+        assert_eq!(super::example_row(&clean, std::path::Path::new("/p")), "ok   example     docsearch");
     }
 
     /// --help's --spec list names every surface the binary accepts: --check
@@ -2054,17 +2097,24 @@ mod tests {
                 let _ = execute!(self.0, crossterm::cursor::Show);
             }
         }
-        let sink = Sink::default();
-        let inner = sink.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let mut term = ShowCursorOnDrop(FrameWriter::new(inner, 1024));
-            crossterm::queue!(term.0, crossterm::terminal::BeginSynchronizedUpdate).unwrap();
-            term.0.write_all(b"half a frame").unwrap();
-            panic!("draw failed");
-        }));
-        assert!(result.is_err());
-        let written = sink.0.lock().unwrap();
-        assert!(written.is_empty(), "flushed mid-panic: {:?}", String::from_utf8_lossy(&written));
+        // The tail of a frame that outgrew the buffer no longer starts with
+        // its synchronized update, so only the panic check keeps it back.
+        for opened in [true, false] {
+            let sink = Sink::default();
+            let inner = sink.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let mut term = ShowCursorOnDrop(FrameWriter::new(inner, 1024));
+                if opened {
+                    crossterm::queue!(term.0, crossterm::terminal::BeginSynchronizedUpdate)
+                        .unwrap();
+                }
+                term.0.write_all(b"half a frame").unwrap();
+                panic!("draw failed");
+            }));
+            assert!(result.is_err());
+            let written = sink.0.lock().unwrap();
+            assert!(written.is_empty(), "flushed mid-panic: {:?}", String::from_utf8_lossy(&written));
+        }
     }
 
     fn ansi(command: impl crossterm::Command) -> String {
@@ -2530,13 +2580,14 @@ mod tests {
     #[test]
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
-        let options: [(&[&str], &str, &[&str]); 8] = [
+        let options: [(&[&str], &str, &[&str]); 9] = [
             (&["--trust-project"], "--trust-project", sessions),
             (&["--continue"], "--continue", sessions),
             (&["-m", "m"], "--model", sessions),
             (&["--provider", "p"], "--provider", sessions),
             (&["--json"], "--json", &["--print", "--check", "--recall", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
+            (&["--all"], "--all", &["--check"]),
             (&["--mcp-timeout", "5"], "--mcp-timeout", &["--mcp-list", "--mcp-call"]),
             // A bare word is a prompt, which only --print reads.
             (&["extra"], "", &["--print"]),

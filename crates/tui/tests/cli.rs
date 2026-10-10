@@ -662,6 +662,115 @@ fn check_exit_codes_follow_findings() {
     assert!(stdout.contains("broken.toml"), "{stdout}");
 }
 
+/// An agent runs `--check` after every extension file it writes, and the
+/// report stays in its transcript, re-sent with every later request. So the
+/// default report prints only rows to act on (warn and err, plus a hook's row,
+/// in auto mode the one place its shape is reported), names files relative to
+/// the project, and counts the files with nothing to report on one line.
+/// `--all` lists every row; the JSON face and the exit codes are unchanged.
+#[test]
+fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
+    let (project, home) = fresh_dirs("check-diet");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto);
+    assert_eq!(grant.unwrap().1, Some(ApprovalMode::Auto));
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.toml"), "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let skill = project.join(".agents").join("skills").join("notes");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: notes\ndescription: Take notes\n---\nBody.\n").unwrap();
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("watch.toml"), "event = \"turn_end\"\ncommand = \"/bin/echo\"\n").unwrap();
+    let root = std::fs::canonicalize(&project).unwrap().display().to_string();
+    let roots = [project.display().to_string(), root.clone()];
+    let check = |project: &Path, args: &[&str]| {
+        let out = cmd(project, &home).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(!report.lines().any(|l| l.starts_with("ok   tool") || l.starts_with("ok   skill")), "{report}");
+    assert!(roots.iter().all(|root| !report.contains(root.as_str())), "absolute path printed:\n{report}");
+    let summary: Vec<&str> = report.lines().filter(|l| l.starts_with("ok: ")).collect();
+    assert_eq!(summary.len(), 1, "{report}");
+    assert!(summary[0].contains("1 tool,") && summary[0].contains("1 skill"), "{report}");
+    assert!(summary[0].contains("openmax --check --all"), "{report}");
+    // A turn_end hook without `blocking` observes only, and in auto mode its
+    // row is the only report of that: it is not folded into the count.
+    assert!(
+        report.lines().any(|l| l.starts_with("ok   hook        .openmax/hooks/watch.toml") && l.contains("observer")),
+        "{report}"
+    );
+
+    let (code, all) = check(&project, &["--check", "--all"]);
+    assert_eq!(code, Some(0), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   tool        .openmax/tools/probe.toml  (tool 'probe'")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   skill       .agents/skills/notes/SKILL.md  (skill 'notes')")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   settings    ")), "{all}");
+    assert!(!all.lines().any(|l| l.starts_with("ok: ")), "{all}");
+
+    // A message prints as written: the parse error quotes the broken line,
+    // which names this very file by its quoted absolute path, and only the
+    // row's path column is relative.
+    let quoted = format!("'{root}/.openmax/tools/broken.toml'");
+    std::fs::write(tools.join("broken.toml"), format!("name = \"broken\"\ncommand = \"cat {quoted}\" oops\n")).unwrap();
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(1), "{report}");
+    let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    // The machine face still carries every finding, at its absolute path.
+    assert!(rows.iter().any(|r| r["status"] == "ok" && r["surface"] == "tool"), "{rows:?}");
+    assert!(rows.iter().all(|r| Path::new(r["path"].as_str().unwrap()).is_absolute()), "{rows:?}");
+    let reason = rows
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with("broken.toml"))
+        .and_then(|r| r["message"].as_str())
+        .unwrap();
+    assert!(reason.contains(&quoted), "the parse error quotes the line: {reason}");
+    let row = report
+        .lines()
+        .find(|l| l.starts_with("err  tool        .openmax/tools/broken.toml  "))
+        .unwrap_or_else(|| panic!("the broken manifest's row:\n{report}"));
+    assert!(row.ends_with(reason), "the row carries the reason as written {reason:?}: {row}");
+
+    // In ask, an unapproved tool's row carries the approval command, naming
+    // the file relative to the project; pasted there, it approves the tool,
+    // which then has nothing to report.
+    let (project, _) = fresh_dirs("check-diet-ask");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.toml"), "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    let command = report
+        .split("(openmax --approve ")
+        .nth(1)
+        .and_then(|rest| rest.split(", or").next())
+        .unwrap_or_else(|| panic!("no approval command:\n{report}"));
+    assert_eq!(command, "'.openmax/tools/probe.toml'", "{report}");
+    let approve = Command::new("/bin/sh")
+        .args(["-c", &format!("\"$0\" --approve {command}"), openmax_bin()])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env_remove("OPENMAX_SESSION")
+        .env("OPENMAX_HUMAN_ATTEST", "1")
+        .output()
+        .unwrap();
+    assert_eq!(approve.status.code(), Some(0), "{}", String::from_utf8_lossy(&approve.stderr));
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.starts_with("ok: 1 tool"), "{report}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}
+
 /// `--check --run-examples` is the one path that executes project code, so it
 /// carries a session's gates: trust, then content approval. The JSON face
 /// reports the same verdicts, because the consumer most likely to parse it is
@@ -1758,6 +1867,95 @@ fn assistant_text_never_dispatches_a_tool() {
         assert!(lines.iter().any(|l| l["type"] == "message_done" && l["text"] == text), "{stdout}");
         assert!(!session_dump(&home).contains("\"role\":\"tool\""));
     }
+}
+
+/// Opening a named pipe waits for a writer, and reading a pipe takes
+/// whatever arrives for as long as it keeps coming, so a file tool sent to
+/// one could wait indefinitely: Esc could not end the turn, because a
+/// started mutation is waited for, and /quit could not end the process,
+/// which waits on the blocked thread at exit. Each file tool names what the
+/// path is and leaves it unopened: a writer waiting on the pipe would wake
+/// to an open and lose its reader at the close.
+#[cfg(unix)]
+#[test]
+fn file_tools_name_a_pipe_or_socket_and_leave_it_unopened() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    // A socket's path is capped at about a hundred bytes, so the directory
+    // name is kept short.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("om-{:x}-{nonce:x}", std::process::id()));
+    // Take the pipe and socket away even when an assertion fails.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveOnDrop(base.clone());
+    let (project, home) = (base.join("project"), base.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pipe = std::ffi::CString::new(project.join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+    let _socket = std::os::unix::net::UnixListener::bind(project.join("sock")).unwrap();
+    // Opening a pipe to write waits for a reader to open it, so a tool that
+    // opened this one would let the writer through.
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let writer = {
+        let pipe = project.join("pipe");
+        std::thread::spawn(move || {
+            let _ = writer_tx.send("waiting");
+            let file = std::fs::OpenOptions::new().write(true).open(pipe);
+            let _ = writer_tx.send(if file.is_ok() { "opened" } else { "failed" });
+        })
+    };
+    assert_eq!(writer_rx.recv(), Ok("waiting"));
+    let script = vec![
+        (sse_tool_call("read_file", serde_json::json!({"path": "pipe"})), true),
+        (sse_tool_call("edit_file", serde_json::json!({"path": "pipe", "old_string": "a", "new_string": "b"})), true),
+        (sse_tool_call("write_file", serde_json::json!({"path": "pipe", "content": "x"})), true),
+        (sse_tool_call("read_file", serde_json::json!({"path": "sock"})), true),
+        (sse_text("done"), true),
+    ];
+    let (base_url, _requests, _server) = spawn_scripted_server(script);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "use the pipe"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let ends: Vec<(bool, String)> = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("every stdout line is JSON"))
+        .filter(|l| l["type"] == "tool_end")
+        .map(|l| (l["ok"] == true, l["output"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    let expected = [
+        "pipe is a named pipe, not a regular file",
+        "pipe is a named pipe, not a regular file",
+        "pipe is a named pipe, not a regular file",
+        "sock is a socket, not a regular file",
+    ];
+    assert_eq!(ends.len(), expected.len(), "every call must end: {stdout}");
+    for ((ok, output), expected) in ends.iter().zip(expected) {
+        assert!(!ok && output == expected, "{output:?} should be {expected:?}: {stdout}");
+    }
+    assert!(
+        std::fs::symlink_metadata(project.join("pipe")).unwrap().file_type().is_fifo(),
+        "write_file must not replace the pipe"
+    );
+    // An open by any tool let the writer through well before the run ended.
+    let early = writer_rx.recv_timeout(std::time::Duration::from_millis(200));
+    assert_eq!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout), "no file tool may open the pipe");
+    let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(project.join("pipe"));
+    assert_eq!(writer_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok("opened"), "the writer was waiting");
+    writer.join().unwrap();
 }
 
 /// A settings file this process will never act on must not be able to hide

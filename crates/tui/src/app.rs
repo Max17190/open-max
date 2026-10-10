@@ -15,11 +15,12 @@ use futures_util::StreamExt;
 use open_max_core::state::Core;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use open_max_core::{agent, config, prompt, registry, sessions};
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
-use ratatui::Frame;
+use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use crate::clipboard;
@@ -642,9 +643,12 @@ async fn event_loop(
 }
 
 /// One frame, wrapped in a synchronized update so the terminal applies it
-/// atomically — no half-painted frames under tmux or slow connections.
-fn draw_frame(
-    terminal: &mut Term,
+/// atomically: no half-painted frames under tmux or slow connections. The
+/// writer holds ratatui's own flushes until the update is closed, so a frame
+/// within its 256 KiB buffer reaches the terminal in one write(2), the one
+/// `flush_ms` times.
+fn draw_frame<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<crate::FrameWriter<W>>>,
     app: &mut App,
     frame_interval: Duration,
 ) -> std::io::Result<()> {
@@ -662,10 +666,14 @@ fn draw_frame(
         let flush_ms = t_flush.elapsed().as_secs_f64() * 1000.0;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let interval_ms = frame_interval.as_secs_f64() * 1000.0;
-        eprintln!(
-            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} flush_ms={flush_ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
+        // One write: stderr is unbuffered, and `eprintln!` writes each
+        // formatted piece on its own, about twenty syscalls per frame inside
+        // the loop being measured.
+        let line = format!(
+            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} flush_ms={flush_ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}\n",
             app.perf_layout_ms, app.perf_selection_ms
         );
+        let _ = std::io::stderr().write_all(line.as_bytes());
     }
     Ok(())
 }
@@ -4594,7 +4602,8 @@ mod tests {
         compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
         wide_status_right,
         model_selection, paint_pacing, presence_title, rect_contains, turn_end_rings,
-        App, Dirty, Focus, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
+        draw_frame, App, Dirty, Focus, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK,
+        WAIT_TICK,
     };
     use std::time::Duration;
     use crossterm::event::{
@@ -4817,6 +4826,68 @@ mod tests {
                 frames.len()
             );
         }
+    }
+
+    /// Each frame reaches the terminal in one write(2), opening and closing
+    /// its synchronized update. ratatui's cursor commands flush inside every
+    /// draw (the cursor show or hide carries the cell diff), which sent a
+    /// composer frame in three writes and a scrollback frame in two, the last
+    /// of each carrying only the close. A frame larger than the buffer still
+    /// leaves whole by the time the draw returns: the hold never strands one.
+    #[test]
+    fn each_frame_reaches_the_terminal_in_one_write() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{TerminalOptions, Viewport};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Writes(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut app, dir) = app_fixture();
+        let writes = Writes::default();
+        let terminal_over = |capacity| {
+            let backend = CrosstermBackend::new(crate::FrameWriter::new(writes.clone(), capacity));
+            // A fixed viewport: a fullscreen one asks the real terminal its size.
+            let viewport = Viewport::Fixed(Rect::new(0, 0, 80, 24));
+            Terminal::with_options(backend, TerminalOptions { viewport }).unwrap()
+        };
+        let mut terminal = terminal_over(256 * 1024);
+        // The composer shows the cursor and places it; scrollback hides it.
+        for (focus, cursor) in [(Focus::Composer, "\x1b[?25h"), (Focus::Scrollback, "\x1b[?25l")] {
+            app.focus = focus;
+            writes.0.lock().unwrap().clear();
+            draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL).unwrap();
+            let lossy = |w: &Vec<u8>| String::from_utf8_lossy(w).into_owned();
+            let sent: Vec<String> = writes.0.lock().unwrap().iter().map(lossy).collect();
+            assert_eq!(sent.len(), 1, "a frame left in {} writes: {sent:?}", sent.len());
+            let frame = &sent[0];
+            assert!(frame.contains(cursor), "the frame sets the cursor: {frame:?}");
+            assert!(
+                frame.starts_with("\x1b[?2026h") && frame.ends_with("\x1b[?2026l"),
+                "one synchronized update per write: {frame:?}"
+            );
+        }
+
+        let mut terminal = terminal_over(64);
+        writes.0.lock().unwrap().clear();
+        draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL).unwrap();
+        let sent = writes.0.lock().unwrap().concat();
+        assert!(writes.0.lock().unwrap().len() > 1, "the frame must outgrow a 64-byte buffer");
+        assert!(
+            sent.starts_with(b"\x1b[?2026h") && sent.ends_with(b"\x1b[?2026l"),
+            "a spilled frame must still leave whole: {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Input that changes nothing on screen is not input a frame shows. A

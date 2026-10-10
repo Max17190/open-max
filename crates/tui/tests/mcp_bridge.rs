@@ -443,10 +443,13 @@ fn proxy_tool_from_the_spec() {
     std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
     std::fs::write(project.join(".openmax/tools/notes.toml"), rewritten).unwrap();
 
+    // The recipe's verification step, as the agent reads it: the skill has
+    // nothing to report, so it is counted rather than printed.
     let check = openmax(&project, &home).arg("--check").output().unwrap();
     let report = String::from_utf8_lossy(&check.stdout);
     assert!(check.status.success(), "{report}");
-    assert!(report.lines().any(|l| l.starts_with("ok   skill") && l.contains("notes")), "{report}");
+    assert!(report.lines().any(|l| l.starts_with("ok: 1 skill")), "{report}");
+    assert!(!report.contains("skills/notes"), "{report}");
     assert!(!report.lines().any(|l| l.starts_with("err")), "{report}");
 
     let record = project.parent().unwrap().join("requests.jsonl");
