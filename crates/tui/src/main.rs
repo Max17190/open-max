@@ -1167,8 +1167,9 @@ fn push_title() {
 }
 
 /// `ratatui::init` with one change: frame output goes through a 256 KiB
-/// buffer so each flush is one write(2) instead of the dozens that `Stdout`'s
-/// built-in 1 KiB line buffer produces on token-streaming frames.
+/// `FrameWriter` so each frame within it is one write(2) instead of the
+/// dozens that `Stdout`'s built-in 1 KiB line buffer produces on
+/// token-streaming frames.
 /// `restore_terminal` is the counterpart on every exit path; it writes to the
 /// shared stdout fd, and every completed frame ends fully flushed.
 fn init_terminal() -> std::io::Result<ui::transcript::Term> {
@@ -1210,12 +1211,23 @@ fn enter_raw_mode(
     Ok(())
 }
 
-/// A frame-sized `BufWriter` that discards, rather than writes, its bytes
-/// while the thread is panicking. The panic hook has already restored the
-/// normal screen by the time unwinding drops the terminal, and that drop
-/// still flushes (ratatui shows the cursor on the way out), so writing then
-/// would land a partial frame, with its synchronized update still open, on
-/// the user's shell.
+/// A frame-sized `BufWriter` that sends each frame within its capacity in
+/// one write(2), and discards, rather than writes, its bytes while the thread
+/// is panicking.
+///
+/// A flush while the buffer holds a synchronized update that is still open
+/// is held until the update closes. ratatui's cursor commands flush inside
+/// every draw (the cursor show or hide carries the cell diff), so unheld a
+/// frame with the composer's cursor left in three writes, the last carrying
+/// only the close: the terminal, or an ssh hop on the way, could read a
+/// frame whose end the process had not sent yet. A frame larger than the
+/// buffer spills as `BufWriter` fills, and the rest of it then flushes
+/// unheld.
+///
+/// The panic hook has already restored the normal screen by the time
+/// unwinding drops the terminal, and that drop still flushes (ratatui shows
+/// the cursor on the way out), so writing then would land a partial frame,
+/// with its synchronized update still open, on the user's shell.
 pub struct FrameWriter<W: Write>(Option<std::io::BufWriter<W>>);
 
 impl<W: Write> FrameWriter<W> {
@@ -1244,6 +1256,13 @@ impl<W: Write> Write for FrameWriter<W> {
                 let (inner, _) = w.into_parts();
                 self.0 = Some(std::io::BufWriter::with_capacity(capacity, inner));
             }
+            return Ok(());
+        }
+        // A frame opens its synchronized update in an empty buffer, the last
+        // frame having left whole, and is complete once its close ends the
+        // buffer. A flush in between, one of ratatui's, would split it.
+        let pending = self.buf().buffer();
+        if pending.starts_with(b"\x1b[?2026h") && !pending.ends_with(b"\x1b[?2026l") {
             return Ok(());
         }
         self.buf().flush()
@@ -1994,17 +2013,24 @@ mod tests {
                 let _ = execute!(self.0, crossterm::cursor::Show);
             }
         }
-        let sink = Sink::default();
-        let inner = sink.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let mut term = ShowCursorOnDrop(FrameWriter::new(inner, 1024));
-            crossterm::queue!(term.0, crossterm::terminal::BeginSynchronizedUpdate).unwrap();
-            term.0.write_all(b"half a frame").unwrap();
-            panic!("draw failed");
-        }));
-        assert!(result.is_err());
-        let written = sink.0.lock().unwrap();
-        assert!(written.is_empty(), "flushed mid-panic: {:?}", String::from_utf8_lossy(&written));
+        // The tail of a frame that outgrew the buffer no longer starts with
+        // its synchronized update, so only the panic check keeps it back.
+        for opened in [true, false] {
+            let sink = Sink::default();
+            let inner = sink.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let mut term = ShowCursorOnDrop(FrameWriter::new(inner, 1024));
+                if opened {
+                    crossterm::queue!(term.0, crossterm::terminal::BeginSynchronizedUpdate)
+                        .unwrap();
+                }
+                term.0.write_all(b"half a frame").unwrap();
+                panic!("draw failed");
+            }));
+            assert!(result.is_err());
+            let written = sink.0.lock().unwrap();
+            assert!(written.is_empty(), "flushed mid-panic: {:?}", String::from_utf8_lossy(&written));
+        }
     }
 
     fn ansi(command: impl crossterm::Command) -> String {
