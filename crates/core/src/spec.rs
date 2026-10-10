@@ -848,7 +848,7 @@ show you a fact your own write already put in context. The index rebuilds at
 session creation, /reload, and any re-freeze a tool or skill change causes
 (that receipt then says "Memory index rebuilt with this refreeze (indexed:
 <name>)"). Verify what you wrote with `openmax --check` (it names every
-ignored file and why, and what the index will show).
+ignored file and why; `--all` adds what the index will show).
 
 ## Searching what was kept
 
