@@ -290,7 +290,7 @@ pub fn tool_schemas() -> &'static Value {
 /// decides the path is allowed: absolute paths under the root resolve to
 /// themselves, and one outside is refused as an escape instead of being
 /// silently rewritten into the project.
-fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel = rel.trim();
     let joined = if rel.is_empty() || rel == "." { root.to_path_buf() } else { root.join(rel) };
     let (canon, names_dir) = canonical_target(joined.clone())?;

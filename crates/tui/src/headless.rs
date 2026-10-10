@@ -231,7 +231,9 @@ async fn run_turn_events(
                     // script that reads exit 0 as "the work is done" would be
                     // wrong. Its own code: 1 is an operational failure and
                     // nothing failed, 3 is a human boundary and no human was
-                    // asked. Resubmitting continues the work.
+                    // asked. Resubmitting continues the work, except after an
+                    // `unverified` from a completion gate that could not
+                    // start, which repeats until the hook is repaired.
                     exit_code = 4;
                 }
                 return exit_code;
