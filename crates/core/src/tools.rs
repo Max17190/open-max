@@ -544,7 +544,8 @@ fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
     window.finish(rel, total)
 }
 
-/// Why `open_regular` found no regular file to read.
+/// Why `open_regular` or `write_regular` found no regular file to read or
+/// write.
 enum NotRegular {
     Directory,
     /// What stands at the path instead: a named pipe, a socket or a device.
@@ -1855,6 +1856,16 @@ mod tests {
         use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
         let root = temp_project();
         let pipe = root.join("pipe");
+        // On a failure, let a write still waiting on the pipe through, so its
+        // thread ends, and take the project away.
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&self.1);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone(), pipe.clone());
         let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1872,7 +1883,22 @@ mod tests {
         assert_eq!(alone, refusal, "no reader attached");
         assert_eq!(attached, refusal, "a reader attached");
         assert!(std::fs::symlink_metadata(&pipe).unwrap().file_type().is_fifo());
-        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Reading a device takes whatever it hands out for as long as it keeps
+    /// coming, and a write to one is not a file edit. With the project at
+    /// /dev, each file tool names the device and leaves it alone.
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_name_a_device() {
+        let root = Path::new("/dev");
+        let refusal = (false, "null is a device, not a regular file");
+        let out = read_file(root, &json!({"path": "null"}));
+        assert_eq!((out.ok, out.output.as_str()), refusal);
+        let out = write_file(root, &json!({"path": "null", "content": "x\n"}));
+        assert_eq!((out.ok, out.output.as_str()), refusal);
+        let out = edit_file(root, &json!({"path": "null", "old_string": "a", "new_string": "b"}));
+        assert_eq!((out.ok, out.output.as_str()), refusal);
     }
 
     #[test]
@@ -3324,6 +3350,11 @@ mod tests {
         assert_eq!(out.output, "src is a directory; use list_dir to see its entries");
         let out = read_file(&root, &json!({"path": "."}));
         assert!(!out.ok && out.output.starts_with(". is a directory"), "{}", out.output);
+        let out = write_file(&root, &json!({"path": "src", "content": "x\n"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "src is a directory, not a regular file"));
+        let out = edit_file(&root, &json!({"path": "src", "old_string": "a", "new_string": "b"}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "src is a directory, not a regular file"));
+        assert!(root.join("src/a.rs").is_file(), "the directory is left as it was");
 
         let out = read_file(&root, &json!({}));
         assert_eq!((out.ok, out.output.as_str()), (false, "missing required argument: path"));
