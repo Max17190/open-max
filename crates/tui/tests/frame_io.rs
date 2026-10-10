@@ -368,7 +368,8 @@ mod first_frame {
                         i += 4;
                         true
                     }
-                    (30..=37 | 40..=47 | 90..=97 | 100..=107, _) => true,
+                    // 90 and 100 are slot 8 in its 16-color form.
+                    (30..=37 | 40..=47 | 91..=97 | 101..=107, _) => true,
                     _ => false,
                 };
                 if foreign {
@@ -378,6 +379,18 @@ mod first_frame {
             }
         }
         hits
+    }
+
+    #[test]
+    fn foreign_colors_allow_only_the_terminals_own_colors_and_slot_8() {
+        for own in ["39;49", "38;5;8;48;5;8", "90", "100", "0;1;22"] {
+            let sgr = format!("\x1b[{own}m");
+            assert!(foreign_colors(sgr.as_bytes()).is_empty(), "{own}");
+        }
+        for foreign in ["38;5;15", "1;48;5;0", "97", "40", "31", "38;2;8;8;8"] {
+            let sgr = format!("\x1b[{foreign}m");
+            assert_eq!(foreign_colors(sgr.as_bytes()), vec![foreign], "{foreign}");
+        }
     }
 
     fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
