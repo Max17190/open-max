@@ -863,6 +863,50 @@ fn approve_names_every_file_it_blesses() {
     assert!(stdout.contains("gate.sh"), "{stdout}");
 }
 
+/// An inert allow names the command that approves it, and `--approve` records
+/// the approval for the directory it runs in. The global file's path names no
+/// project, so a bare `openmax --approve ~/.openmax/permissions.toml` pasted
+/// into a terminal opened elsewhere (often $HOME) printed "approved" for that
+/// directory and left the project prompting. The printed command has to work
+/// from wherever it is pasted.
+#[test]
+fn the_printed_global_allow_approval_works_from_another_directory() {
+    let (project, home) = fresh_dirs("global-allow");
+    trust_in_ask(&project, &home);
+    std::fs::write(
+        home.join(".openmax").join("permissions.toml"),
+        "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n",
+    )
+    .unwrap();
+    let inert = || -> Option<String> {
+        let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["message"].as_str())
+            .find(|message| message.contains("are inert"))
+            .map(str::to_string)
+    };
+
+    let notice = inert().expect("an unapproved global allow is inert in ask");
+    let command = notice.rsplit('`').nth(1).unwrap_or_else(|| panic!("no command in {notice}"));
+    let bin_dir = Path::new(openmax_bin()).parent().unwrap();
+    let out = Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(&home)
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env_remove("OPENMAX_SESSION")
+        .env("OPENMAX_HUMAN_ATTEST", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{command}: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(inert(), None, "`{command}` run from {} must approve it for the project", home.display());
+}
+
 /// Deleting an approved hook fails every tool call closed, so a human who
 /// meant the removal needs a way to say so. `--forget` is that way, and it is
 /// guarded harder than `--approve` because it removes a policy instead of

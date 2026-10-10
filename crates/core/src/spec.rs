@@ -582,15 +582,17 @@ and deny rules still block. First-match order still applies; an earlier allow
 can shadow a later deny. Mode changes do not erase earlier deny snapshots.
 
 In ask, `allow` skips the ordinary approval prompt but never an unapproved
-tool's content gate. A project `allow` is inert
-until a human approves that exact content with
-`openmax --approve .openmax/permissions.toml`; until then those calls fall
-through to `approval_mode` and the human is asked. Editing the file revokes
-the approval, as with any other capability content. `deny` and `ask` only add
-friction outside auto. Deny applies in every mode. The global file is outside the project root, where
-your file tools cannot write, so its `allow` rules need no approval. Writing
-yourself an `allow` rule in ask therefore grants nothing; ask the user to
-approve the file when they want those prompts gone.
+tool's content gate. An `allow` in either file is inert
+until a human approves that exact content for this directory with
+`openmax --approve .openmax/permissions.toml` (or the global file's path)
+run here; until then those calls fall through to `approval_mode` and the
+human is asked. The approval is not inherited: a subdirectory or a worktree
+under the project needs its own. Editing the file revokes the approval, as
+with any other capability content.
+`deny` and `ask` only add friction outside auto. Deny applies in every mode.
+Writing yourself an `allow` rule in ask therefore grants nothing, in the
+project file or the global one; ask the user to approve the file when they
+want those prompts gone.
 
 Rules never enter the prompt and are re-read every turn; an empty or missing
 file changes nothing. Fail closed: an unreadable or malformed file denies

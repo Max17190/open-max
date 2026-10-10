@@ -2213,7 +2213,12 @@ mod tests {
             assert!(matches!(Permissions::discover_for_mode(&project, &first, mode).evaluate("bash", &args), PermissionDecision::Deny { .. }));
         }
         assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Auto).evaluate("bash", &args), PermissionDecision::Allow));
-        assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Ask).evaluate("bash", &args), PermissionDecision::Allow));
+        // Default is also what an unread data dir gives, so the notice is what
+        // shows this one was read: its allow is found, and inert in ask.
+        let ask = Permissions::discover_for_mode(&project, &second, ApprovalMode::Ask);
+        assert!(matches!(ask.evaluate("bash", &args), PermissionDecision::Default));
+        let global = second.join("permissions.toml").display().to_string();
+        assert!(matches!(ask.notices(), [notice] if notice.starts_with(&global)), "{:?}", ask.notices());
         assert!(!crate::hooks::Hooks::discover_for_mode(&project, &first, ApprovalMode::Auto).is_empty());
         assert!(crate::hooks::Hooks::discover_for_mode(&project, &second, ApprovalMode::Auto).is_empty());
         let fingerprint = crate::hooks::hooks_fingerprint(&first, &project);

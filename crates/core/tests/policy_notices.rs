@@ -1,9 +1,9 @@
 //! Policy notices reach the model, not just the UI.
 //!
-//! Two silences this guards against: an agent writes itself a project
-//! `allow` rule, the rule is inert until a human approves the file (#180),
-//! and nothing ever tells the model why it keeps being prompted; and a hook
-//! or permission problem present at turn start is announced as a UI event
+//! Two silences this guards against: an agent writes itself a project or
+//! global `allow` rule, the rule is inert until a human approves the file
+//! (#180), and nothing ever tells the model why it keeps being prompted; and a
+//! hook or permission problem present at turn start is announced as a UI event
 //! the model never sees. Each distinct notice lands in the transcript once
 //! per session - repetition there is token spend, and the condition holds
 //! every turn once it holds at all.
@@ -240,6 +240,98 @@ async fn a_turn_start_policy_notice_lands_once_per_session() {
         count_notices(&bodies[1]),
         1,
         "turn two inherits the transcript's one note and adds no second copy"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The global permissions file is one `bash` redirect away from any session,
+/// and in auto that redirect runs with no card. An allow rule written there
+/// from an auto project must not remove the confirmation every ask project
+/// relies on: the ask project's call still prompts, and the model is told
+/// why the rule grants nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_global_allow_written_from_an_auto_project_does_not_unlock_an_ask_project() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let auto_project = dir.join("auto-project");
+    let ask_project = dir.join("ask-project");
+    std::fs::create_dir_all(&auto_project).unwrap();
+    std::fs::create_dir_all(&ask_project).unwrap();
+    let auto_project = auto_project.canonicalize().unwrap();
+    let ask_project = ask_project.canonicalize().unwrap();
+    let global = data.join("permissions.toml");
+
+    let grant = format!(
+        "printf '[[rules]]\\neffect = \"allow\"\\ntool = \"bash\"\\n' >> '{}'",
+        global.display()
+    );
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call("bash", serde_json::json!({ "command": grant })),
+        completion_with_text("granted"),
+        completion_with_tool_call("bash", serde_json::json!({ "command": "touch ran-unprompted" })),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &auto_project);
+    open_max_core::trust::trust_project(&data, &ask_project).unwrap();
+
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    core.set_project_approval_mode(&auto_project, open_max_core::config::ApprovalMode::Auto).unwrap();
+    core.set_project_approval_mode(&ask_project, open_max_core::config::ApprovalMode::Ask).unwrap();
+
+    // Declines every card and returns the tools that raised one.
+    async fn run_declining(
+        core: &Arc<Core>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<open_max_core::types::AgentEventEnvelope>,
+        session: &str,
+        project: &std::path::Path,
+    ) -> Vec<String> {
+        start_turn(Arc::clone(core), session.into(), project.to_path_buf(), "go".into()).unwrap();
+        let mut asked = Vec::new();
+        loop {
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("turn finishes within 30s")
+                .expect("event channel stays open");
+            match envelope.event {
+                AgentEvent::ApprovalRequest { approval_id, name, .. } => {
+                    asked.push(name);
+                    core.respond_approval(&approval_id, false);
+                }
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        asked
+    }
+
+    let asked = run_declining(&core, &mut rx, "auto-session", &auto_project).await;
+    assert!(asked.is_empty(), "auto runs the write without a card: {asked:?}");
+    assert!(
+        std::fs::read_to_string(&global).unwrap().contains("effect = \"allow\""),
+        "the auto session wrote the global allow"
+    );
+
+    let asked = run_declining(&core, &mut rx, "ask-session", &ask_project).await;
+    assert_eq!(asked, ["bash"], "the ask project still confirms bash");
+    assert!(
+        !ask_project.join("ran-unprompted").exists(),
+        "a declined call must not run"
+    );
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 4);
+    let ask_turn: serde_json::Value = serde_json::from_str(&bodies[2]).unwrap();
+    let note = ask_turn["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.starts_with("[policy notice:"))
+        .expect("the ask session is told about the inert global allow");
+    assert!(
+        note.contains(&global.display().to_string()) && note.contains("inert"),
+        "{note}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
