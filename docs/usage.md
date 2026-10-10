@@ -74,6 +74,16 @@ the prompts after it.
 | 3 | The project is not trusted, or trust cannot be granted from this process |
 | 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue |
 
+Tools run in a session of their own, so Ctrl+C at the shell reaches openmax
+and not them. SIGINT, SIGTERM, or SIGHUP to a print or stdio run cancels the
+running turn, which stops each tool's process group (SIGTERM, then SIGKILL),
+and exits 128 plus the signal number (130, 143, 129) once the turn has ended,
+waiting at most 3 seconds; a `turn_end` hook still running then is killed. A
+second signal exits at once and kills the tools outright. A signal the run
+inherited as ignored, as under `nohup`, stays ignored. The TUI, where Ctrl+C
+is a key, ends the session on one of these signals as `/quit` does, then
+exits with the same status.
+
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
 [stdio protocol](stdio-protocol.md).

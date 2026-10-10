@@ -10,7 +10,7 @@ mod ui;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -432,7 +432,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
 }
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> std::io::Result<std::process::ExitCode> {
     let cli = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -889,37 +889,37 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    if cli.stdio {
-        let code = stdio::run(
-            core,
-            core_rx,
-            stdio::StdioArgs { continue_session: cli.continue_session },
-        )
-        .await;
-        std::process::exit(code);
+    if cli.print && (cli.prompts.is_empty() || cli.prompts.iter().all(|p| p.trim().is_empty())) {
+        eprintln!("openmax: --print requires a prompt\n\n{HELP}");
+        std::process::exit(2);
     }
 
-    if cli.print {
-        if cli.prompts.is_empty() || cli.prompts.iter().all(|p| p.trim().is_empty()) {
-            eprintln!("openmax: --print requires a prompt\n\n{HELP}");
-            std::process::exit(2);
-        }
-        let code = headless::run(
-            core,
-            core_rx,
-            headless::HeadlessArgs {
+    // Signals are routed before the first turn can start a tool and before
+    // the terminal changes, so none of them can fall back to its default
+    // action: exiting with every mode left on, or with a tool still running
+    // in a session of its own that no signal from the terminal reaches.
+    let quit = watch_quit_signals(!(cli.stdio || cli.print));
+
+    if cli.stdio || cli.print {
+        let code = if cli.stdio {
+            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit };
+            stdio::run(core, core_rx, args).await
+        } else {
+            let args = headless::HeadlessArgs {
                 prompts: cli.prompts,
                 continue_session: cli.continue_session,
                 json: cli.json,
-            },
-        )
-        .await;
+                quit,
+            };
+            headless::run(core, core_rx, args).await
+        };
+        // A signal that landed as the last turn ended still stops the run.
+        let code = if signalled() { quit_status() } else { code };
+        // A turn that did not settle in time still owns its tool groups, and
+        // exit runs no destructor that would stop them.
+        open_max_core::execution::kill_process_groups();
         std::process::exit(code);
     }
-
-    // Signals are routed before the terminal changes, so none of them can
-    // fall back to its default action and exit with every mode left on.
-    let quit = watch_quit_signals();
 
     // Fullscreen session on the alternate screen: openmax owns the whole
     // terminal while it runs, and your shell (prompt, history, scrollback)
@@ -954,7 +954,18 @@ async fn main() -> std::io::Result<()> {
     .await;
 
     restore_terminal();
-    finish_tui(result, warnings, &mut std::io::stderr())
+    let result = finish_tui(result, warnings, &mut std::io::stderr());
+    // A signal ended the session: exit with its status, so a supervisor or a
+    // wrapper script can tell the stop from a /quit. Returned rather than
+    // exited, so the runtime's shutdown still runs: a file write in flight
+    // finishes, and each dropped command kills its group.
+    if signalled() {
+        if let Err(e) = &result {
+            eprintln!("openmax: {e}");
+        }
+        return Ok(std::process::ExitCode::from(quit_status() as u8));
+    }
+    result.map(|()| std::process::ExitCode::SUCCESS)
 }
 
 /// Print the TUI's exit warnings on the restored terminal, then hand back how
@@ -1092,12 +1103,14 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
     }));
 }
 
-/// SIGTERM, SIGHUP (the terminal went away), and SIGINT sent from outside
-/// (raw mode makes Ctrl+C a key) each end the process on the spot by
-/// default, with every terminal mode still on. While the event loop runs,
-/// the first one reaches it as a quit, so the session ends through the
-/// normal exit path; a second means that path is stuck, so the terminal is
-/// restored here and the process exits. Once the loop has ended, nothing
+/// SIGTERM, SIGHUP (the terminal went away), and SIGINT (Ctrl+C at a shell
+/// in print and stdio mode; sent from outside in the TUI, where raw mode
+/// makes it a key) each end the process on the spot by default, with every
+/// terminal mode still on and every tool still running. While the frontend
+/// runs, the first one reaches it as a quit, so the session ends through
+/// its normal exit path; a second means that path is stuck, so the tool
+/// groups are killed here, the terminal is restored when `tui` says the TUI
+/// owns it, and the process exits. Once the frontend has ended, nothing
 /// reads a quit again, so the first signal takes that exit itself.
 ///
 /// The watcher runs on its own thread and runtime. When main returns, the
@@ -1105,12 +1118,12 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
 /// running (a grep, a scan), while the handlers stay installed; a watcher
 /// on that runtime would leave every signal through that wait swallowed.
 #[cfg(unix)]
-fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
+fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
     use futures_util::future::select_all;
     use tokio::signal::unix::{signal, SignalKind};
     let quit = std::sync::Arc::new(tokio::sync::Notify::new());
-    // Weak: main and then the event loop own the quit, so it is gone once
-    // the loop has ended, and a signal from then on exits at once instead
+    // Weak: main and then the frontend own the quit, so it is gone once the
+    // frontend has ended, and a signal from then on exits at once instead
     // of waiting on a loop that will never read it.
     let event_loop = std::sync::Arc::downgrade(&quit);
     let (registered, ready) = std::sync::mpsc::channel();
@@ -1122,6 +1135,7 @@ fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
             let mut signals: Vec<_> =
                 [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()]
                     .into_iter()
+                    .filter(|kind| !ignored(kind.as_raw_value()))
                     .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
                     .collect();
             let _ = registered.send(());
@@ -1132,16 +1146,24 @@ fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
                 select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
             let last = match event_loop.upgrade() {
                 Some(quit) => {
+                    QUIT_SIGNAL.store(signals[first].0, Ordering::SeqCst);
                     quit.notify_one();
                     drop(quit);
                     select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await.1
                 }
                 None => first,
             };
+            open_max_core::execution::kill_process_groups();
             // Held until exit (the lock is reentrant, so the restore still
             // writes): the event loop must not paint over the restored shell.
-            let _stdout = std::io::stdout().lock();
-            restore_terminal();
+            // A print or stdio run has no screen to restore, and its writer
+            // can be blocked on a pipe nobody reads, holding stdout; waiting
+            // for it there would hold this exit for as long.
+            let _stdout = tui.then(|| {
+                let stdout = std::io::stdout().lock();
+                restore_terminal();
+                stdout
+            });
             std::process::exit(128 + signals[last].0);
         });
     });
@@ -1152,9 +1174,47 @@ fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
     quit
 }
 
+/// Whether this process inherited `signal` as ignored. That is a choice
+/// made for it: `nohup` keeps a run alive past its terminal's SIGHUP, and a
+/// shell starts a script's background job with SIGINT ignored, so Ctrl+C
+/// stops only the foreground job. A handler would replace the disposition
+/// and undo that choice.
+#[cfg(unix)]
+fn ignored(signal: libc::c_int) -> bool {
+    // SAFETY: a null new action only reads the current one into `current`.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 #[cfg(not(unix))]
-fn watch_quit_signals() -> std::sync::Arc<tokio::sync::Notify> {
+fn watch_quit_signals(_: bool) -> std::sync::Arc<tokio::sync::Notify> {
     std::sync::Arc::new(tokio::sync::Notify::new())
+}
+
+/// The signal behind the last quit, recorded before the quit is notified.
+static QUIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// How long a stopping print or stdio run waits for its cancelled turn: the
+/// longest a cancelled command takes to settle, then a second for the rest
+/// of the turn (its transcript save and its `turn_end` hooks). A turn still
+/// running after that is abandoned, and its tool groups, a slow hook's
+/// included, are killed on the way out.
+pub(crate) const STOP_SETTLE: std::time::Duration =
+    open_max_core::execution::CANCEL_SETTLE.saturating_add(std::time::Duration::from_secs(1));
+
+/// How a session that a signal stopped exits: 128 plus the signal's number,
+/// the status a shell reports for a job the signal ended, so a script or a
+/// supervisor can tell a stop from a finished run.
+pub(crate) fn quit_status() -> i32 {
+    128 + QUIT_SIGNAL.load(Ordering::SeqCst)
+}
+
+/// Whether a signal has asked the session to end.
+pub(crate) fn signalled() -> bool {
+    QUIT_SIGNAL.load(Ordering::SeqCst) != 0
 }
 
 /// XTWINOPS title stack: save the shell's tab title on entry, restore it on
@@ -2162,7 +2222,7 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let runtime =
                 || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            let quit = runtime().block_on(async { watch_quit_signals() });
+            let quit = runtime().block_on(async { watch_quit_signals(true) });
             let status = std::process::Command::new("kill")
                 .args(["-TERM", &std::process::id().to_string()])
                 .status()
@@ -2203,7 +2263,7 @@ mod tests {
         const CHILD: &str = "OPENMAX_TEST_SIGNAL_AFTER_LOOP";
         let sleep = std::time::Duration::from_secs(10);
         if std::env::var_os(CHILD).is_some() {
-            drop(watch_quit_signals());
+            drop(watch_quit_signals(true));
             let status = std::process::Command::new("kill")
                 .args(["-TERM", &std::process::id().to_string()])
                 .status()
