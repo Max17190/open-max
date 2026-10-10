@@ -161,14 +161,16 @@ pub enum AgentEvent {
     /// links it to the tool result it rides when it rode one, else empty (a
     /// note inserted before the next prompt, e.g. a turn-start receipt).
     HarnessNote { call_id: String, text: String },
-    /// The model request is being resent: `attempt` of `max_attempts` goes
-    /// out after a backoff, `reason` having ended the previous one (a
-    /// transport failure, a 429 or transient 5xx, or, before any reply text,
-    /// a stream that died or went silent, or a stream or reply the provider
-    /// failed with a rate limit, an overload, or a server fault). Emitted
-    /// before the wait; a cancel during it ends the turn and the attempt
-    /// never goes out. Thinking streamed for the failed attempt is void; no
-    /// Token preceded it.
+    /// The model request is being resent: `attempt` goes out after a
+    /// backoff, and `max_attempts` is the attempt the request ends on if it
+    /// keeps failing the same way (the budget, or sooner while the latest
+    /// attempts in a row have not reached the endpoint), `reason` having
+    /// ended the previous one (a transport failure, a 429 or transient 5xx,
+    /// or, before any reply text, a stream that died or went silent, or a
+    /// stream or reply the provider failed with a rate limit, an overload,
+    /// or a server fault). Emitted before the wait; a cancel during it ends
+    /// the turn and the attempt never goes out. Thinking streamed for the
+    /// failed attempt is void; no Token preceded it.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
