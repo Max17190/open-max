@@ -17,6 +17,7 @@
 //! Truncation always says so, so the model can tell a short answer from a
 //! clipped one.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -1410,10 +1411,10 @@ fn omission_marker(omitted: u64) -> String {
 }
 
 /// One stream within `share` bytes, and whether its head survived the cut.
-/// A stream over its share keeps its tail, plus a head of up to
-/// `1/HEAD_SHARE_DIVISOR` of the share when its capture kept one (bash
-/// does; external tools capture no head). The cut between them names the
-/// bytes it dropped and is counted inside the share.
+/// `text` is the stream's rendering. A stream over its share keeps its tail,
+/// plus a head of up to `1/HEAD_SHARE_DIVISOR` of the share when its capture
+/// kept one (bash does; external tools capture no head). The cut between
+/// them names the bytes it dropped and is counted inside the share.
 fn kept_stream(stream: &execution::CapturedStream, text: &str, share: usize) -> (String, bool) {
     let whole = !stream_was_truncated(stream);
     if whole && text.len() <= share {
@@ -1426,22 +1427,55 @@ fn kept_stream(stream: &execution::CapturedStream, text: &str, share: usize) -> 
     // A truncated capture renders a supervisor marker between its head and
     // tail, and the capture cut both mid-line: take the two apart and trim
     // each to whole lines.
-    let (head_text, tail_text);
+    let rendered;
+    let (head_bytes, head_text, tail_bytes, tail_text) = match whole {
+        true => {
+            rendered = stream.rendered_bytes();
+            (&rendered[..], Cow::Borrowed(text), &rendered[..], Cow::Borrowed(text))
+        }
+        false => (
+            &stream.head[..],
+            String::from_utf8_lossy(&stream.head),
+            &stream.tail[..],
+            String::from_utf8_lossy(&stream.tail),
+        ),
+    };
     let (head, tail) = match whole {
         true => (text, text),
-        false => {
-            head_text = String::from_utf8_lossy(&stream.head);
-            tail_text = String::from_utf8_lossy(&stream.tail);
-            (to_a_line_end(&head_text), from_a_line_start(&tail_text))
-        }
+        false => (to_a_line_end(&head_text), from_a_line_start(&tail_text)),
     };
     let head = kept_head(head, head_budget);
     let separator = if head.ends_with('\n') { "" } else { "\n" };
     // The count cannot exceed the stream's total, so this bounds the marker.
     let reserved = head.len() + separator.len() + omission_marker(stream.total_bytes).len();
     let tail = kept_tail(tail, share.saturating_sub(reserved));
-    let omitted = stream.total_bytes.saturating_sub((head.len() + tail.len()) as u64);
+    // `head` starts its decoding and `tail` ends its own, so each maps back
+    // to the bytes the command printed.
+    let kept = printed_len(head_bytes, head.len()) + tail_bytes.len()
+        - printed_len(tail_bytes, tail_text.len() - tail.len());
+    let omitted = stream.total_bytes.saturating_sub(kept as u64);
     (format!("{head}{separator}{}{tail}", omission_marker(omitted)), true)
+}
+
+/// How many of `printed` decode to the first `shown` bytes of its lossy
+/// decoding. Each invalid sequence shows as one three-byte U+FFFD, so a
+/// count taken from the decoding understates what output that is not UTF-8
+/// dropped.
+fn printed_len(printed: &[u8], shown: usize) -> usize {
+    let (mut printed_len, mut shown_len) = (0, 0);
+    for chunk in printed.utf8_chunks() {
+        let valid = chunk.valid().len();
+        if shown_len + valid >= shown {
+            return printed_len + (shown - shown_len);
+        }
+        printed_len += valid;
+        shown_len += valid;
+        if !chunk.invalid().is_empty() {
+            printed_len += chunk.invalid().len();
+            shown_len += char::REPLACEMENT_CHARACTER.len_utf8();
+        }
+    }
+    printed_len
 }
 
 fn captured_text(stream: &execution::CapturedStream) -> String {
@@ -2859,6 +2893,43 @@ mod tests {
             let last_head = head.lines().last().unwrap();
             let first_tail = tail.lines().next().unwrap();
             assert!(last_head < first_tail, "head and tail overlap: {last_head} {first_tail}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Output that is not UTF-8 is shown with each bad byte decoded to a
+    /// three-byte U+FFFD. Counting the cut from that decoding understated the
+    /// bytes it dropped, so the count is taken from what the command printed,
+    /// both for a stream held whole and for one the capture cut.
+    #[tokio::test]
+    async fn the_cut_counts_the_bytes_printed_when_output_is_not_utf8() {
+        let root = temp_project();
+        let cap = 2_000;
+        let cmd = "for i in $(seq 1000 1149); do printf 'out-\\xff\\xfe-%s\\n' $i; done; \
+                   for i in $(seq 1000 1999); do printf 'err-\\xff\\xfe-%s\\n' $i >&2; done";
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps { command_bytes: cap },
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        let line = b"out-\xff\xfe-1000\n".len() as u64;
+        let (out_bytes, err_bytes) = (150 * line, 1000 * line);
+        assert_eq!(out.process_bytes, Some(out_bytes + err_bytes));
+        assert!(out_bytes <= cap as u64 && err_bytes > cap as u64, "one whole, one cut");
+        let (_, body) = out.output.split_once('\n').unwrap();
+        assert!(body.len() <= cap, "{} bytes over a {cap} cap", body.len());
+        let (kept_out, kept_err) = body.split_once("\n[stderr]\n").expect(body);
+        // Each 0xff and 0xfe is one byte printed and three bytes shown.
+        let printed = |kept: &str| (kept.len() - 2 * kept.matches('\u{FFFD}').count()) as u64;
+        for (kept, produced) in [(kept_out, out_bytes), (kept_err, err_bytes)] {
+            let (head, rest) = kept.split_once("[… ").expect(kept);
+            let (omitted, tail) = rest.split_once(" bytes omitted …]\n").expect(kept);
+            let omitted: u64 = omitted.parse().unwrap();
+            assert_eq!(printed(head) + omitted + printed(tail), produced, "{kept}");
         }
         let _ = std::fs::remove_dir_all(root);
     }
