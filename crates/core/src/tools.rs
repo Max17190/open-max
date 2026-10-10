@@ -628,31 +628,135 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// Replace the contents of the regular file at `path`, creating it if absent.
+/// Make `bytes` the contents of the regular file at `path`, creating it if
+/// absent.
+///
+/// A write in place truncates first, so one that failed partway (a full
+/// disk, a quota, a file size limit) left a prefix of the new contents under
+/// the old name while the tool reported only that it could not write. The
+/// bytes go to a temp file beside it instead, which takes its place once
+/// they are all written, so a failure leaves the file as it was.
+///
+/// The replacement gets the file's permissions, owner and group, but not its
+/// ACLs, extended attributes or file flags. A file is written in place
+/// instead, with its old contents written back if that fails, when it has
+/// other hard links, which a new file would split from, or when no temp
+/// file can be made beside it, given its owner, group and permissions, and
+/// renamed over it: in a directory that takes no new file from this user, in
+/// a sticky directory, or for a file mounted on its own.
 ///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
-/// in a mutation Esc cannot cancel. So the open neither waits nor
+/// in a mutation Esc cannot cancel. So the open here neither waits nor
 /// truncates, and nothing is written until the descriptor shows a regular
 /// file.
-fn write_regular(path: &Path, content: &str) -> Result<(), NotRegular> {
+fn write_regular(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let unchanged = |e: std::io::Error| format!("cannot write {rel}: {e}; {rel} is unchanged");
+    // Also the check a write in place makes: a rename needs only the
+    // directory's permission, so without it a file this user may not write
+    // would be replaced.
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return crate::sessions::replace_atomic(path, bytes, |_| Ok(()))
+                .map_err(|e| format!("cannot write {rel}: {e}; {rel} was not created"));
+        }
         // A pipe with no reader refuses an open that does not wait.
-        Err(e) => return Err(std::fs::metadata(path).ok().as_ref().and_then(not_regular).unwrap_or(NotRegular::Io(e))),
+        Err(e) => {
+            return Err(match std::fs::metadata(path).ok().as_ref().and_then(not_regular) {
+                Some(kind) => kind.message(rel),
+                None => unchanged(e),
+            })
+        }
     };
-    if let Some(kind) = not_regular(&file.metadata().map_err(NotRegular::Io)?) {
-        return Err(kind);
+    let meta = file.metadata().map_err(unchanged)?;
+    if let Some(kind) = not_regular(&meta) {
+        return Err(kind.message(rel));
     }
-    file.set_len(0).map_err(NotRegular::Io)?;
-    std::io::Write::write_all(&mut file, content.as_bytes()).map_err(NotRegular::Io)
+    if !has_other_links(&meta) {
+        let mut ready = false;
+        let replaced = crate::sessions::replace_atomic(path, bytes, |tmp| {
+            take_identity(tmp, &meta)?;
+            ready = true;
+            Ok(())
+        });
+        match replaced {
+            Ok(()) => return Ok(()),
+            // No temp file could be made and given the file's identity, or
+            // the rename over the file was refused: the file itself may
+            // still be writable in place.
+            Err(_) if !ready => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ResourceBusy) => {}
+            // The bytes could not be stored (a full disk, a quota, a size
+            // limit, an I/O error). Written in place they would have
+            // truncated the file first, so it stays as it was.
+            Err(e) => return Err(unchanged(e)),
+        }
+    }
+    write_in_place(path, file, rel, bytes)
+}
+
+/// Unix only: elsewhere the standard library does not give the link count.
+fn has_other_links(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(meta) > 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    linked
+}
+
+/// Give the temp file that replaces a file that file's owner and mode. Only
+/// the superuser can give a file to another user, or to a group it is not
+/// in, so for anyone else such a file fails here. Setuid and setgid stay
+/// off, as a write in place by anyone but the superuser clears them.
+fn take_identity(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fresh = tmp.metadata()?;
+        if (fresh.uid(), fresh.gid()) != (meta.uid(), meta.gid()) {
+            std::os::unix::fs::fchown(tmp, Some(meta.uid()), Some(meta.gid()))?;
+        }
+        std::fs::Permissions::from_mode(meta.mode() & 0o1777)
+    };
+    #[cfg(not(unix))]
+    let mode = meta.permissions();
+    tmp.set_permissions(mode)
+}
+
+/// Write `bytes` over the regular `file` open at `path`. It is truncated
+/// first, so if the write then fails its old contents are written back, and
+/// the result says whether they were.
+fn write_in_place(path: &Path, mut file: std::fs::File, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::{Read, Seek, Write};
+    // The bytes to put back come from the file, not from the text the
+    // caller read: a file that is not UTF-8 reads as empty there.
+    let old = open_regular(path).ok().and_then(|(mut readable, _)| {
+        let mut old = Vec::new();
+        readable.read_to_end(&mut old).ok().map(|_| old)
+    });
+    let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(bytes)
+    };
+    let Err(e) = overwrite(&mut file, bytes) else {
+        return Ok(());
+    };
+    Err(match old.map(|old| overwrite(&mut file, &old)) {
+        Some(Ok(())) => format!("cannot write {rel}: {e}; its old contents were written back"),
+        Some(Err(again)) => format!(
+            "cannot write {rel}: {e}, and writing its old contents back failed too ({again}), so it may be partly written"
+        ),
+        None => format!("cannot write {rel}: {e}; it may be partly written"),
+    })
 }
 
 /// The numbered lines one read_file call returns.
@@ -881,10 +985,8 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
             return ToolOutcome::err(format!("cannot create directories: {e}"));
         }
     }
-    match write_regular(&path, content) {
-        Ok(()) => {}
-        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
-        Err(e) => return ToolOutcome::err(e.message(rel)),
+    if let Err(e) = write_regular(&path, rel, content.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("wrote", root, &path, &old, content)
 }
@@ -1065,10 +1167,8 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(hint);
     };
 
-    match write_regular(&path, &new) {
-        Ok(()) => {}
-        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
-        Err(e) => return ToolOutcome::err(e.message(rel)),
+    if let Err(e) = write_regular(&path, rel, new.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("edited", root, &path, &old, &new)
 }
@@ -1871,9 +1971,9 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let target = pipe.clone();
         std::thread::spawn(move || {
-            let alone = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let alone = write_regular(&target, "pipe", b"x").err();
             let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&target).unwrap();
-            let attached = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let attached = write_regular(&target, "pipe", b"x").err();
             drop(reader);
             let _ = done_tx.send((alone, attached));
         });
