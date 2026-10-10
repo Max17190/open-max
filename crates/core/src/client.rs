@@ -316,6 +316,9 @@ struct PartialToolCall {
     index: Option<u64>,
     id: String,
     name: String,
+    // Pieces equal to `name` held back since it last grew: a repeat of the
+    // whole name unless a different piece follows them.
+    name_repeats: usize,
     arguments: String,
     extra_content: Option<Box<RawValue>>,
 }
@@ -895,14 +898,21 @@ async fn read_sse(
                     };
                     let call = &mut partials[at];
                     // The first id is the call's: some servers repeat it on
-                    // every delta, others mint a new one per delta. A name
-                    // equal to the call's is a repeat too; any other is the
-                    // next piece of it.
+                    // every delta, others mint a new one per delta. Some also
+                    // repeat the whole name, so a piece equal to the name so
+                    // far waits: a different piece after it means it was part
+                    // of the name (`re`, `re`, `nder`), and none means a repeat.
                     if let Some(id) = id.filter(|_| call.id.is_empty()) {
                         call.id = id;
                     }
-                    if let Some(name) = name.filter(|name| *name != call.name) {
-                        call.name.push_str(&name);
+                    match name {
+                        Some(name) if name == call.name => call.name_repeats += 1,
+                        Some(name) => {
+                            let held = call.name.repeat(std::mem::take(&mut call.name_repeats));
+                            call.name.push_str(&held);
+                            call.name.push_str(&name);
+                        }
+                        None => {}
                     }
                     match args {
                         Some(Value::String(args)) => call.arguments.push_str(&args),
@@ -1767,7 +1777,8 @@ mod tests {
     /// reuse index 0 for every call, and some mint a new id for every delta.
     /// Appended, the first came out as a call to `bashbashbash` and the
     /// second as one call merging them all. Each call stays whole, and a name
-    /// streamed in pieces is still joined.
+    /// streamed in pieces is still joined, even when a piece repeats the name
+    /// so far.
     #[tokio::test]
     async fn repeated_ids_and_reused_indexes_keep_calls_whole() {
         let repeated = calls_of(vec![
@@ -1802,6 +1813,16 @@ mod tests {
         ])
         .await;
         assert_eq!(pieces, vec![call("c1", "read_file", "{}")]);
+        // A piece equal to the name so far is part of it when another piece
+        // follows, and a repeat of the whole name when none does.
+        let stutter = calls_of(vec![
+            json!([{"index": 0, "id": "c1", "function": {"name": "re", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"name": "re"}}]),
+            json!([{"index": 0, "function": {"name": "nder", "arguments": "{}"}}]),
+            json!([{"index": 0, "function": {"name": "rerender"}}]),
+        ])
+        .await;
+        assert_eq!(stutter, vec![call("c1", "rerender", "{}")]);
     }
 
     /// A call to a tool without parameters can come with blank arguments or
