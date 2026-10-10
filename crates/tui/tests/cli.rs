@@ -1263,6 +1263,55 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
     assert!(stdout.contains("stub says hi"), "stdout: {stdout}\nstderr: {stderr}");
 }
 
+/// The first error a local-model user meets is a server not started yet.
+/// Print mode says so in lines a human acts on: each retry names the server
+/// and the cause and counts to the attempt the request really ends on, and
+/// the error says what to do, once. It used to print reqwest's whole source
+/// chain three times, count retries to a budget of 8 that a refused address
+/// never reaches, and repeat the failure as "stopped (error)".
+#[test]
+fn refused_connection_names_the_host_and_the_cause() {
+    let (project, home) = fresh_dirs("refused");
+    let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    write_settings(&home, &format!("http://{addr}/v1"));
+    let run = |proxy: Option<String>| {
+        let mut command = cmd(&project, &home);
+        for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
+            command.env_remove(var);
+        }
+        if let Some(proxy) = proxy {
+            command.env("HTTP_PROXY", proxy);
+        }
+        let out = finish_with_deadline(
+            command.args(["--trust-project", "-p", "say hi"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
+        );
+        assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let stderr = run(None);
+    let reason = format!("cannot connect to {addr} (connection refused)");
+    let failure: Vec<&str> = stderr.lines().skip_while(|line| !line.contains(&reason)).collect();
+    assert_eq!(
+        failure,
+        [
+            format!("openmax: {reason}; retrying (2 of 3)"),
+            format!("openmax: {reason}; retrying (3 of 3)"),
+            format!("openmax: error: {reason}: nothing is listening there; start the server or fix base_url (openmax --spec settings)"),
+        ],
+        "stderr: {stderr}"
+    );
+
+    // Through a proxy that refuses, the refusal is the proxy's: naming the
+    // endpoint and advising to start it would send the user the wrong way,
+    // so the error keeps the client's own account.
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let stderr = run(Some(format!("http://{proxy}")));
+    assert!(!stderr.contains("cannot connect to") && !stderr.contains("start the server"), "stderr: {stderr}");
+    assert!(stderr.contains("openmax: error: request failed: error sending request"), "stderr: {stderr}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Prompt templates are a harness feature, not a TUI one: the delegate
 /// pattern (`openmax -p` in a child process) must send the model the template
 /// body, never the literal slash line.
