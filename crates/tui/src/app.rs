@@ -451,6 +451,12 @@ pub struct App {
     /// turn-done ring silent instead of ringing at a user who is already
     /// watching every turn end.
     term_focus: Option<bool>,
+    /// Where the out-of-band terminal writes go: the presence title and its
+    /// bell, the turn-done notification, OSC 52 copies. Stdout, except in
+    /// unit tests, which discard them: libtest captures `print!` but not raw
+    /// writes, so a test driving a turn or a copy would retitle and ring the
+    /// terminal running it, and set its clipboard where it honors OSC 52.
+    term_out: Box<dyn std::io::Write + Send>,
     approval_hits: [Option<Rect>; 3],
     /// Whether the last draw showed the pending approval's full credential
     /// grant. When a grant is too large for the card (a tiny terminal clamps
@@ -720,6 +726,11 @@ impl App {
             last_content_w: 0,
             presence: Presence::Idle,
             term_focus: None,
+            term_out: if cfg!(test) {
+                Box::new(std::io::sink())
+            } else {
+                Box::new(std::io::stdout())
+            },
             approval_hits: [None; 3],
             approval_grant_fully_shown: true,
             perf_layout_ms: 0.0,
@@ -1461,7 +1472,7 @@ impl App {
                         self.transcript.select_prev();
                     }
                     if let Some(text) = self.transcript.selected_copy_text() {
-                        if clipboard::copy_text(&text) {
+                        if clipboard::copy_text(&mut self.term_out, &text) {
                             self.note("copied block");
                         } else {
                             self.note("copy failed (terminal may block OSC 52)");
@@ -1621,7 +1632,7 @@ impl App {
     }
 
     fn note_copied(&mut self, text: &str) {
-        if clipboard::copy_text(text) {
+        if clipboard::copy_text(&mut self.term_out, text) {
             self.note("copied selection");
         } else {
             self.note("copy failed (terminal may block OSC 52)");
@@ -2378,7 +2389,7 @@ impl App {
                     .clone()
                     .or_else(|| self.transcript.last_assistant_text())
                 {
-                    if clipboard::copy_text(&text) {
+                    if clipboard::copy_text(&mut self.term_out, &text) {
                         self.note("copied latest assistant response");
                     } else {
                         self.note("copy failed (terminal may block OSC 52)");
@@ -3113,8 +3124,8 @@ impl App {
     }
 
     /// Announce a presence change in the terminal title (edge-triggered),
-    /// with a bell on the needs-you edge. Best-effort raw writes, same as
-    /// the OSC 52 clipboard path; never part of a frame.
+    /// with a bell on the needs-you edge. Best-effort raw writes to
+    /// `term_out`, same as the OSC 52 clipboard path; never part of a frame.
     fn set_presence(&mut self, presence: Presence) {
         if self.presence == presence {
             return;
@@ -3127,14 +3138,14 @@ impl App {
         }
     }
 
-    fn emit_presence_title(&self) {
+    fn emit_presence_title(&mut self) {
         use std::io::Write;
         let title = presence_title(self.presence, &self.project);
         let mut seq = format!("\x1b]0;{title}\x07");
         if self.presence == Presence::NeedsApproval {
             seq.push('\x07');
         }
-        let mut out = std::io::stdout();
+        let out = &mut self.term_out;
         let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
     }
 
@@ -3143,10 +3154,10 @@ impl App {
     /// so the pair only fires while the user is away; terminals that support
     /// neither consume the OSC unrendered and never reach here at all, since
     /// `term_focus` stays None without focus reports.
-    fn emit_turn_done_notification(&self) {
+    fn emit_turn_done_notification(&mut self) {
         use std::io::Write;
         let seq = format!("\x1b]9;{} · turn complete\x07\x07", project_label(&self.project));
-        let mut out = std::io::stdout();
+        let out = &mut self.term_out;
         let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
     }
 
@@ -6257,6 +6268,74 @@ mod tests {
         assert_eq!(app.term_focus, Some(false));
         app.on_focus_change(true);
         assert_eq!(app.term_focus, Some(true));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The presence title, its bells, the turn-done notification, and OSC 52
+    /// copies are raw writes, which libtest does not capture: an App that sent
+    /// them to the real stdout retitled and rang the terminal running
+    /// `cargo test`, set its clipboard where it honors OSC 52, and spliced
+    /// control bytes into its output. The child drives each kind of write;
+    /// none may reach its stdout.
+    #[tokio::test]
+    async fn titles_bells_and_copies_stay_out_of_test_output() {
+        const CHILD: &str = "OPENMAX_TEST_OUT_OF_BAND_WRITES";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::titles_bells_and_copies_stay_out_of_test_output",
+                    "--color",
+                    "never",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            // "1 passed" rules out a filter that matched nothing and exited 0.
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                !child.stdout.iter().any(|b| matches!(b, 0x1b | 0x07)),
+                "terminal control bytes reached stdout: {stdout:?}"
+            );
+            return;
+        }
+        let (mut app, dir) = app_fixture();
+        // Unfocused, so the turn's end also rings the notification.
+        app.on_focus_change(false);
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "a1".into(),
+            name: "write_file".into(),
+            summary: "write x".into(),
+            detail: String::new(),
+            reason: "gate".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
+            env: vec![],
+        });
+        assert_eq!(app.presence, Presence::NeedsApproval);
+        app.on_agent_event(AgentEvent::ApprovalSettled {
+            approval_id: "a1".into(),
+            outcome: "allowed".into(),
+        });
+        assert_eq!(app.presence, Presence::Working);
+        app.on_agent_event(AgentEvent::Done {
+            stop_reason: "stop".into(),
+        });
+        assert_eq!(app.presence, Presence::Idle);
+
+        app.transcript.set_width(40);
+        app.transcript.push_assistant(vec![Line::from("the final answer")]);
+        app.focus = Focus::Scrollback;
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let rendered = buffer_text(&render_app(&mut app, 60, 14));
+        assert!(rendered.contains("copied block"), "{rendered}");
         fs::remove_dir_all(dir).unwrap();
     }
 
