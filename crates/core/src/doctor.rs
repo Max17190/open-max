@@ -1514,7 +1514,7 @@ fn stale_code_reason(
 /// resolves to no file binds nothing it can read, while an unexecutable script
 /// approves fine and still cannot spawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CommandProblem {
+pub(crate) enum CommandProblem {
     Absent,
     NotExecutable,
     NotOnPath,
@@ -1545,7 +1545,7 @@ impl CommandProblem {
 /// spawns it; a bare name resolves on PATH. This warns rather than errors:
 /// check-time and run-time environments legitimately differ (CI without the
 /// tool installed, a script the agent writes next).
-fn missing_command_reason(
+pub(crate) fn missing_command_reason(
     command: &str,
     project_root: &Path,
 ) -> Option<(CommandProblem, String)> {

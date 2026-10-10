@@ -387,7 +387,8 @@ Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
 call or the prompt. The block reason is the hook's stdout (or stderr if stdout
 is empty), capped at 500 chars. A blocked tool call returns to the model as a
 failed tool result carrying the reason; a blocked prompt never reaches the
-model. A gate that times out or fails to start blocks.
+model. A gate that times out or cannot start blocks; auto relaxes the second
+case (below).
 
 Observe events (`post_tool_use`, `session_start`, `compaction`, and `turn_end`
 without `blocking`): exit status is ignored. `session_start` fires on a
@@ -409,8 +410,9 @@ hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
 that, and on `max_iterations` and `budget_exhausted`. A refusal whose injected
 user message cannot be persisted is reported and ends the turn `unverified`
 the same way: a continuation only the running process remembers would diverge
-from every replay of the session. A blocking hook that
-times out or fails to start refuses, like any other gate.
+from every replay of the session. A blocking hook that times out refuses,
+like any other gate, and so does one that cannot start, except in auto
+(below).
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
@@ -442,7 +444,31 @@ Each run receives one JSON payload on stdin, as one newline-terminated line:
 In auto, valid hooks run without content approval, including new and repaired
 hooks. Malformed hook files and over-cap gates block tools until fixed;
 write_file/edit_file on the offending manifest remain available for repair.
-Hook edits apply from the next turn. Explicit mode changes refresh policy
+A gate never gates the repair of its own files: write_file and edit_file on
+its manifest, or on the script it runs, skip that gate when the file is
+inside the project. The script is a `command` written as a path, or the first
+`args` entry of an interpreter `command` (`sh`, `bash`, `zsh`, `dash`, `ksh`,
+`python`, `python3`, `node`, `ruby`, `perl`, `deno`, `bun`) when no option
+precedes it and it ends in `.sh`, `.bash`, `.py`, `.js`, `.mjs`, `.ts`, `.rb`
+or `.pl`. Every other gate and permission rule still judges the write, so in
+auto a gate cannot protect its own files: guard them with a deny rule or
+another gate.
+A hook cannot start when its command cannot be spawned for a reason its files
+explain (not found, no executable bit, as on every file write_file creates, or
+a file the system cannot execute), or when the script its interpreter gets
+does not exist (a shell also looks for a bare script name on PATH). A
+`pre_tool_use` gate that cannot start blocks the calls it matches, except
+writes to any hook's files, and the block names the repair. A project
+`user_prompt_submit` gate that cannot start judged nothing: the prompt goes on
+and the gate is reported as not having checked it, to the frontend on each
+prompt and to the model once per session for each distinct failure; a global
+one still blocks. A blocking `turn_end` gate that cannot start refuses
+nothing: it is reported and the turn ends `unverified`. A write to a hook
+file, or to the script one runs, is answered with each hook whose command
+path is missing or has no executable bit, whose command is not on PATH, or
+whose interpreter's script does not exist.
+Manifest edits apply from the next turn; a script runs from disk, so an edit
+to it applies at the hook's next run. Explicit mode changes refresh policy
 before subsequent calls. Execution failures are reported and no hashes are
 automatically granted. Removing a hook in auto removes that policy.
 
@@ -973,7 +999,10 @@ tokens_after, compacted_messages: the receipt of a forced compaction;
 compacted_messages of 0 means the transcript was already at or under the
 prune target and nothing changed),
 `hook_failed` (hook, event, detail: a hook did not run - an observe-only hook
-failed, or a hook file on disk is not loaded - and the turn proceeded),
+failed or a hook file on disk is not loaded, and the turn proceeded; or, in
+auto, a `user_prompt_submit` gate could not start and did not check the
+prompt, or a blocking `turn_end` gate could not start and the turn ends
+`unverified`),
 `turn_refused` (hook, reason, continuation, continuations_left: a blocking
 `turn_end` hook refused the model's completion and the harness honored it;
 `reason` is already in the transcript as a user message - on disk before this

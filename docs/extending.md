@@ -177,7 +177,30 @@ filesystem, environment, credentials, and network access.
 
 In `auto`, valid hooks run without content approval, including after edits.
 Malformed hooks block tools until repaired or removed; rewriting the broken
-manifest remains available. File changes activate at the next turn.
+manifest remains available. A gate never gates the repair of its own files:
+`write_file` and `edit_file` on its manifest, or on the script it runs, skip
+that gate when the file is inside the project. The script is a `command`
+written as a path, or the first `args` entry of an interpreter `command` such
+as `sh` or `python3` when no option precedes it and it has a script extension
+(`openmax --spec hooks` lists both). Every other gate and permission rule still
+judges the write, so in `auto` a gate cannot protect its own files: guard them
+with a deny rule or another gate.
+
+A hook cannot start when its command cannot be spawned for a reason its files
+explain (not found, no executable bit, as on every file `write_file` creates,
+or a file the system cannot execute), or when the script its interpreter gets
+does not exist (a shell also looks for a bare script name on PATH). In `auto`, a
+`pre_tool_use` gate that cannot start blocks the calls it matches, except
+writes to any hook's files, and names the repair; a project
+`user_prompt_submit` gate that cannot start lets the prompt go on and is
+reported as not having checked it (to the frontend on each prompt, to the
+model once per session for each distinct failure), while a global one still
+blocks; a blocking `turn_end` gate that cannot start is reported instead of
+refusing, and the turn ends `unverified`. A write to a hook file, or to the
+script one runs, is answered with each hook whose command path is missing or
+has no executable bit, whose command is not on PATH, or whose interpreter's
+script does not exist. Manifest changes activate at the next turn; a script runs
+from disk, so an edit to it applies at the hook's next run.
 
 In `ask` and `readonly`, unknown keys in a hook file are rejected, and a hook file that a human approved
 and that no longer parses blocks every tool call until it is fixed or removed
