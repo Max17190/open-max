@@ -312,6 +312,8 @@ pub struct ChatClient {
 
 #[derive(Default)]
 struct PartialToolCall {
+    // The streamed `index` that opened this call, if the server sent one.
+    index: Option<u64>,
     id: String,
     name: String,
     arguments: String,
@@ -393,7 +395,8 @@ struct ToolCallDelta {
 #[derive(Deserialize)]
 struct ToolCallFnDelta {
     name: Option<String>,
-    arguments: Option<String>,
+    // A string on the wire, but some gateways send the object itself.
+    arguments: Option<Value>,
 }
 
 impl ChatClient {
@@ -882,28 +885,34 @@ async fn read_sse(
             }
             if let Some(calls) = delta.tool_calls {
                 for tc in calls {
-                    let idx = tc.index.unwrap_or(0) as usize;
-                    if idx >= MAX_TOOL_CALLS {
+                    let (name, args) = tc.function.map_or((None, None), |f| (f.name, f.arguments));
+                    let id = tc.id.filter(|id| !id.is_empty());
+                    let name = name.filter(|name| !name.is_empty());
+                    let Some(at) = tool_slot(&mut partials, tc.index, id.as_deref(), name.as_deref(), args.as_ref()) else {
                         saw_terminator = false;
                         finish_reason = TRUNCATED.into();
                         break 'outer;
+                    };
+                    let call = &mut partials[at];
+                    // The first id is the call's: some servers repeat it on
+                    // every delta, others mint a new one per delta. A name
+                    // equal to the call's is a repeat too; any other is the
+                    // next piece of it.
+                    if let Some(id) = id.filter(|_| call.id.is_empty()) {
+                        call.id = id;
                     }
-                    while partials.len() <= idx {
-                        partials.push(PartialToolCall::default());
+                    if let Some(name) = name.filter(|name| *name != call.name) {
+                        call.name.push_str(&name);
                     }
-                    if let Some(id) = tc.id {
-                        partials[idx].id.push_str(&id);
-                    }
-                    if let Some(function) = tc.function {
-                        if let Some(name) = function.name {
-                            partials[idx].name.push_str(&name);
-                        }
-                        if let Some(args) = function.arguments {
-                            partials[idx].arguments.push_str(&args);
-                        }
+                    match args {
+                        Some(Value::String(args)) => call.arguments.push_str(&args),
+                        // Sent as a JSON value rather than its text, the
+                        // arguments come whole.
+                        Some(args) => call.arguments = args.to_string(),
+                        None => {}
                     }
                     if let Some(extra) = tc.extra_content {
-                        partials[idx].extra_content = Some(extra);
+                        call.extra_content = Some(extra);
                     }
                 }
             }
@@ -1098,9 +1107,14 @@ fn parse_complete_response(
         }
         for tc in calls {
             partials.push(PartialToolCall {
+                index: None,
                 id: tc["id"].as_str().unwrap_or("").to_string(),
                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                arguments: tc["function"]["arguments"].as_str().unwrap_or("").to_string(),
+                arguments: match &tc["function"]["arguments"] {
+                    Value::String(args) => args.clone(),
+                    Value::Null => String::new(),
+                    args => args.to_string(),
+                },
                 extra_content: opaque(&tc["extra_content"]),
             });
         }
@@ -1128,6 +1142,62 @@ fn opaque(value: &Value) -> Option<Box<RawValue>> {
     serde_json::value::to_raw_value(value).ok()
 }
 
+/// Which call in `partials` a streamed tool-call delta adds to, opening a new
+/// one when the delta starts a call; None past [`MAX_TOOL_CALLS`]. A delta
+/// continues the latest call its `index` opened, or without an index the
+/// latest call, unless [`starts_call`] says it begins the next one.
+fn tool_slot(
+    partials: &mut Vec<PartialToolCall>,
+    index: Option<u64>,
+    id: Option<&str>,
+    name: Option<&str>,
+    args: Option<&Value>,
+) -> Option<usize> {
+    if index.is_some_and(|index| index >= MAX_TOOL_CALLS as u64) {
+        return None;
+    }
+    let latest = match index {
+        Some(_) => partials.iter().rposition(|call| call.index == index),
+        None => partials.len().checked_sub(1),
+    };
+    if let Some(at) = latest.filter(|&at| !starts_call(&partials[at], index.is_some(), id, name, args)) {
+        return Some(at);
+    }
+    if partials.len() >= MAX_TOOL_CALLS {
+        return None;
+    }
+    partials.push(PartialToolCall { index, ..PartialToolCall::default() });
+    Some(partials.len() - 1)
+}
+
+/// Does a delta that would continue `call` begin the next call instead?
+/// Servers mark calls differently: some reuse one index for every call, some
+/// send no index and each call whole in one delta, some repeat the id and
+/// name on every delta, and some mint a new id for every delta. Only a delta
+/// that names a function can begin a call, and only once `call` has a name.
+/// It does when it carries an id other than `call`'s. With no two ids to
+/// compare and no index, it does when its own arguments are a whole object
+/// and `call`'s are complete. Its own are checked first, so a stream of
+/// argument pieces does not re-read everything gathered so far at each piece.
+fn starts_call(call: &PartialToolCall, indexed: bool, id: Option<&str>, name: Option<&str>, args: Option<&Value>) -> bool {
+    if name.is_none() || call.name.is_empty() {
+        return false;
+    }
+    let complete = |args: &str| serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok();
+    match id {
+        Some(id) if !call.id.is_empty() => id != call.id,
+        _ if indexed => false,
+        _ => {
+            let whole = match args {
+                Some(Value::String(args)) => args.trim_start().starts_with('{') && complete(args),
+                Some(args) => args.is_object(),
+                None => false,
+            };
+            whole && complete(&call.arguments)
+        }
+    }
+}
+
 fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
     partials
         .into_iter()
@@ -1137,7 +1207,12 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
             // Some local servers omit ids; synthesize one so tool replies can refer back.
             id: if p.id.is_empty() { format!("call_{i}") } else { p.id },
             kind: "function".into(),
-            function: ToolCallFunction { name: p.name, arguments: p.arguments },
+            function: ToolCallFunction {
+                name: p.name,
+                // A call to a tool without parameters can come with no
+                // arguments at all, which means the empty object.
+                arguments: if p.arguments.trim().is_empty() { "{}".into() } else { p.arguments },
+            },
             extra_content: p.extra_content,
         })
         .collect()
@@ -1613,6 +1688,129 @@ mod tests {
     async fn an_out_of_bounds_tool_index_is_refused() {
         let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":128,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
         assert_eq!(stream_once(body).await.finish_reason, TRUNCATED);
+    }
+
+    fn tool_call_line(calls: Value) -> String {
+        format!("data: {}\n\n", json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}]}))
+    }
+
+    async fn stream_calls(lines: Vec<Value>) -> CompletionResult {
+        let mut body: String = lines.into_iter().map(tool_call_line).collect();
+        body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+        stream_once(&body).await
+    }
+
+    async fn calls_of(lines: Vec<Value>) -> Vec<(String, String, String)> {
+        let calls = stream_calls(lines).await.tool_calls;
+        calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect()
+    }
+
+    fn call(id: &str, name: &str, args: &str) -> (String, String, String) {
+        (id.into(), name.into(), args.into())
+    }
+
+    /// Gemini's OpenAI-compatible endpoint streams parallel calls whole and
+    /// without an `index`, in one chunk or one per chunk, with a thought
+    /// signature on the first. Read as index 0, they merged into one call
+    /// named `read_fileread_file` with unparseable arguments, so every
+    /// parallel batch failed.
+    #[tokio::test]
+    async fn parallel_calls_without_an_index_stay_separate() {
+        let (a, b) = (r#"{"path":"a.txt"}"#, r#"{"path":"b.txt"}"#);
+        let signature = json!({"google": {"thought_signature": "sigA=="}});
+        let first = json!({"id": "function-call-111", "type": "function", "function": {"name": "read_file", "arguments": a}, "extra_content": signature});
+        let second = json!({"id": "function-call-222", "type": "function", "function": {"name": "read_file", "arguments": b}});
+        let expected = vec![call("function-call-111", "read_file", a), call("function-call-222", "read_file", b)];
+        for lines in [vec![json!([first, second])], vec![json!([first]), json!([second])]] {
+            let result = stream_calls(lines).await;
+            let signatures: Vec<_> = result.tool_calls.iter().map(|c| c.extra_content.as_ref().map(|e| e.get().to_string())).collect();
+            let calls: Vec<_> = result.tool_calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect();
+            assert_eq!(calls, expected);
+            assert_eq!(signatures, vec![Some(signature.to_string()), None], "the signature stays on its own call");
+        }
+        // Without an id either, a call that arrives whole after a complete
+        // one is the next call.
+        let anonymous = calls_of(vec![json!([
+            {"function": {"name": "read_file", "arguments": a}},
+            {"function": {"name": "read_file", "arguments": b}},
+        ])])
+        .await;
+        assert_eq!(anonymous, vec![call("call_0", "read_file", a), call("call_1", "read_file", b)]);
+        // Pieces without an index still join the call they follow, even one
+        // that repeats the name and looks whole on its own.
+        let continued = calls_of(vec![
+            json!([{"id": "c1", "function": {"name": "bash", "arguments": "{\"command\":"}}]),
+            json!([{"function": {"arguments": "{\"x\":"}}]),
+            json!([{"function": {"name": "bash", "arguments": "{\"y\":1}"}}]),
+            json!([{"function": {"name": "bash", "arguments": "}}"}}]),
+        ])
+        .await;
+        assert_eq!(continued, vec![call("c1", "bash", r#"{"command":{"x":{"y":1}}}"#)]);
+        // The count stays bounded without an index too.
+        let whole = |i: usize| json!([{"id": format!("c{i}"), "function": {"name": "bash", "arguments": "{}"}}]);
+        assert_eq!(stream_calls((0..MAX_TOOL_CALLS).map(whole).collect()).await.tool_calls.len(), MAX_TOOL_CALLS);
+        assert_eq!(stream_calls((0..=MAX_TOOL_CALLS).map(whole).collect()).await.finish_reason, TRUNCATED);
+    }
+
+    /// Some servers repeat the id and name on every delta of a call, some
+    /// reuse index 0 for every call, and some mint a new id for every delta.
+    /// Appended, the first came out as a call to `bashbashbash` and the
+    /// second as one call merging both. Each call stays whole, and a name
+    /// streamed in pieces is still joined.
+    #[tokio::test]
+    async fn repeated_ids_and_reused_indexes_keep_calls_whole() {
+        let repeated = calls_of(vec![
+            json!([{"index": 0, "id": "chatcmpl-tool-aa62", "type": "function", "function": {"name": "bash", "arguments": ""}}]),
+            json!([{"index": 0, "id": "chatcmpl-tool-aa62", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": "}}]),
+            json!([{"index": 0, "id": "chatcmpl-tool-aa62", "type": "function", "function": {"name": "bash", "arguments": "\"ls\"}"}}]),
+        ])
+        .await;
+        assert_eq!(repeated, vec![call("chatcmpl-tool-aa62", "bash", r#"{"command": "ls"}"#)]);
+        let reused = calls_of(vec![
+            json!([{"index": 0, "id": "call_1", "type": "function", "function": {"name": "list_dir", "arguments": ""}}]),
+            json!([{"index": 0, "id": "call_2", "type": "function", "function": {"name": "grep", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"arguments": "{\"pattern\":\"x\"}"}}]),
+            json!([{"index": 0, "id": "call_3", "type": "function", "function": {"name": "grep", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"arguments": "{\"pattern\":\"y\"}"}}]),
+        ])
+        .await;
+        assert_eq!(
+            reused,
+            vec![call("call_1", "list_dir", "{}"), call("call_2", "grep", r#"{"pattern":"x"}"#), call("call_3", "grep", r#"{"pattern":"y"}"#)]
+        );
+        let minted = calls_of(vec![
+            json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "read_file"}}]),
+            json!([{"index": 0, "id": "call_b", "type": "function", "function": {"arguments": "{\"path\":"}}]),
+            json!([{"index": 0, "id": "call_c", "type": "function", "function": {"arguments": "\"a.txt\"}"}}]),
+        ])
+        .await;
+        assert_eq!(minted, vec![call("call_a", "read_file", r#"{"path":"a.txt"}"#)]);
+        let pieces = calls_of(vec![
+            json!([{"index": 0, "id": "c1", "function": {"name": "read_", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"name": "file", "arguments": "{}"}}]),
+        ])
+        .await;
+        assert_eq!(pieces, vec![call("c1", "read_file", "{}")]);
+    }
+
+    /// A call to a tool without parameters can come with blank arguments or
+    /// none, which failed as invalid JSON; and arguments sent as an object
+    /// rather than a string failed the whole chunk, so the call vanished.
+    #[tokio::test]
+    async fn empty_or_object_arguments_are_the_arguments() {
+        let blank = calls_of(vec![json!([{"index": 0, "id": "c1", "function": {"name": "ping", "arguments": ""}}])]).await;
+        assert_eq!(blank, vec![call("c1", "ping", "{}")]);
+        let absent = calls_of(vec![json!([{"index": 0, "id": "c1", "function": {"name": "ping", "arguments": null}}])]).await;
+        assert_eq!(absent, vec![call("c1", "ping", "{}")]);
+        let object = calls_of(vec![json!([{"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": {"path": "a.txt"}}}])]).await;
+        assert_eq!(object, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#)]);
+        let one_shot = json!({"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
+            {"id": "c2", "type": "function", "function": {"name": "ping", "arguments": ""}},
+        ]}, "finish_reason": "tool_calls"}]});
+        let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap().tool_calls;
+        let calls: Vec<_> = calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect();
+        assert_eq!(calls, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#), call("c2", "ping", "{}")]);
     }
 
     /// The bug this guards: a server that dies mid-answer sends neither
