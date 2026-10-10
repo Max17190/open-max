@@ -109,10 +109,15 @@ Fields:
   chars in the schema. Rides in every request, so keep it short and put long
   usage docs in a README the description points at.
 - `params` (optional): a JSON-schema object, written as TOML tables;
-  `params.type = "object"` is required. Omitted means "no parameters". The
+  `params.type = "object"` is required. Omitted means "no parameters". List
+  required properties as `required = [...]` directly under `[params]`: after
+  a `[params.properties.*]` header the line belongs to that property. The
   serialized schema is capped at 4096 bytes (every request pays for these
   bytes); an oversized schema is rejected, not truncated.
 - `command` (required): executable path or name, spawned in the project root.
+  `write_file` creates files without the execute bit, so run a script you
+  write through its interpreter: `command = "sh"` (or `"python3"`) with the
+  script path in `args`, as the example does.
 - `args` (optional): fixed argv strings appended to `command`.
 - `timeout_secs` (optional): default 60, clamped between 1 and 300, inclusive.
 - `mutating` (optional, default false): routes calls through the ordinary
@@ -187,12 +192,14 @@ Example (`.openmax/tools/todo_scan.toml`):
 ```toml
 name = "todo_scan"
 description = "List TODO/FIXME comments with file and line"
-command = "./scripts/todo-scan.sh"
+command = "sh"
+args = ["./scripts/todo-scan.sh"]
 timeout_secs = 30
 mutating = false
 
 [params]
 type = "object"
+required = ["path"]
 [params.properties.path]
 type = "string"
 description = "Directory to scan"
@@ -203,7 +210,7 @@ iterations after every executed mutating call (a failed call that wrote
 the file still activates it) and at turn start; `/reload`
 forces it now. Verify the file parses with `openmax --check`. Test the
 script itself before first use:
-`echo '{"path":"src"}' | ./scripts/todo-scan.sh`.
+`echo '{"path":"src"}' | sh ./scripts/todo-scan.sh`.
 
 ## Proof of life
 
@@ -221,6 +228,8 @@ real spawn path (stdin JSON, timeout, output caps): the call must exit 0 and
 match `expect_regex` when present. `expect_regex` is matched against the same
 capped rendering a tool call returns (the tail, once output exceeds the cap),
 so a token printed early by a noisy command can scroll out of the window.
+Trailing whitespace, the final newline included, is removed before matching:
+`^[0-9]+$` matches a command that runs `echo 63`.
 Plain `--check` never executes anything.
 
 In auto, examples run the real host command without content approval, behind
@@ -359,7 +368,9 @@ with the same stem. Unknown keys are rejected.
 Fields:
 - `event` (required): one of `pre_tool_use`, `post_tool_use`,
   `user_prompt_submit`, `session_start`, `compaction`, `turn_end`.
-- `command` (required): executable, spawned in the project root.
+- `command` (required): executable, spawned in the project root. A script
+  written with `write_file` is not executable: run it through its interpreter
+  (`command = "sh"`, script path in `args`), as the example does.
 - `args` (optional): fixed argv strings.
 - `timeout_secs` (optional): default 10, clamped between 1 and 60, inclusive.
 - `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
@@ -502,13 +513,14 @@ Example (`.openmax/hooks/deny-rm.toml`):
 
 ```toml
 event = "pre_tool_use"
-command = "./scripts/deny-rm.sh"
+command = "sh"
+args = ["./scripts/deny-rm.sh"]
 tool = "bash"
 timeout_secs = 5
 ```
 
 Verify with `openmax --check`. Test the script directly:
-`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | ./scripts/deny-rm.sh`.
+`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
 "#;
 
 const PERMISSIONS: &str = r#"# Permission rules
@@ -1267,18 +1279,13 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, body).unwrap();
         };
-        // The example tools reference scripts relative to the project root;
-        // create them so the command-existence check sees what a real user
-        // following the spec would have.
+        // The examples run scripts relative to the project root; create them
+        // the way `write_file` does (a plain write, so no execute bit) so the
+        // command check sees what an agent following the spec would have. An
+        // example whose `command` is the script itself fails here until a
+        // chmod nobody told the agent to run.
         for script in ["scripts/todo-scan.sh", "scripts/deny-rm.sh"] {
-            let path = root.join(script);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            write(script, "#!/bin/sh\nexit 0\n");
         }
         write(".openmax/tools/todo_scan.toml", &example(TOOLS));
         write(".agents/skills/release/SKILL.md", &example(SKILLS));
@@ -1331,6 +1338,17 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The tool example is what a first manifest copies. Without `required`
+    /// in it, authors invent `[params.required]` (a table, which the parser
+    /// rejects) or append the line after the property tables, where TOML
+    /// assigns it to the last property.
+    #[test]
+    fn the_tools_example_declares_required_at_the_schema_root() {
+        let spec = crate::registry::parse_tool_file_from_text_for_tests(&example(TOOLS))
+            .expect("the tools example parses");
+        assert_eq!(spec.parameters["required"], serde_json::json!(["path"]));
     }
 
     /// The settings example must survive the strict, fail-closed parser: a

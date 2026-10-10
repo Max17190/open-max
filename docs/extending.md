@@ -14,12 +14,14 @@ access of Open Max.
 # .openmax/tools/todo_scan.toml
 name = "todo_scan"
 description = "List TODO/FIXME comments with file and line"
-command = "./scripts/todo-scan.sh"
+command = "sh"
+args = ["./scripts/todo-scan.sh"]
 timeout_secs = 30
 mutating = false
 
 [params]
 type = "object"
+required = ["path"]
 [params.properties.path]
 type = "string"
 description = "Directory to scan"
@@ -30,8 +32,14 @@ a security boundary and does not restrict what the command can do. Unknown keys
 in a tool file are rejected, so a misspelled `mutating` surfaces in
 `openmax --check` instead of silently taking the tool out of the approval gate.
 
+A script written with `write_file` has no execute bit, so the example names
+its interpreter as `command` and the script in `args` instead of needing a
+`chmod`.
+
 `params` must declare `type = "object"`, and every `properties` entry must be
-an object. The serialized schema is capped at 4096 bytes because it lives in
+an object. `required = [...]` goes directly under `[params]`: after a
+`[params.properties.*]` header, TOML assigns the line to that property. The
+serialized schema is capped at 4096 bytes because it lives in
 the frozen prompt prefix and is paid on every request; an oversized schema is
 rejected, not truncated. At most 64 external tools load (the name-sorted head);
 the prompt trailer reports how many were left out and `openmax --check` names
@@ -245,7 +253,8 @@ path and `openmax --check` prints the parse error.
 ## Proof of life
 
 A tool file may declare one `[example]` (JSON args plus an optional
-`expect_regex`). `openmax --check --run-examples` executes each declared
+`expect_regex`, matched with trailing whitespace removed, so `^[0-9]+$` passes
+`echo 63`). `openmax --check --run-examples` executes each declared
 example through the real spawn path. In `auto`, valid tools run with host
 authority without content approval, behind hook gates and permission denies.
 In `ask` or `readonly`, for an approved tool the example is the
