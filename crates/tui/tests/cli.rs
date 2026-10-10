@@ -713,9 +713,11 @@ fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
     assert!(all.lines().any(|l| l.starts_with("ok   settings    ")), "{all}");
     assert!(!all.lines().any(|l| l.starts_with("ok: ")), "{all}");
 
-    // A message is reprinted as written: the parse error quotes the broken
-    // line, absolute path and all, and only the row's own path is relative.
-    std::fs::write(tools.join("broken.toml"), format!("name = \"broken\"\ncommand = \"{root}/run.sh\" oops\n")).unwrap();
+    // A message prints as written: the parse error quotes the broken line,
+    // which names this very file by its quoted absolute path, and only the
+    // row's path column is relative.
+    let quoted = format!("'{root}/.openmax/tools/broken.toml'");
+    std::fs::write(tools.join("broken.toml"), format!("name = \"broken\"\ncommand = \"cat {quoted}\" oops\n")).unwrap();
     let (code, report) = check(&project, &["--check"]);
     assert_eq!(code, Some(1), "{report}");
     let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
@@ -730,7 +732,7 @@ fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
         .find(|r| r["path"].as_str().unwrap().ends_with("broken.toml"))
         .and_then(|r| r["message"].as_str())
         .unwrap();
-    assert!(reason.contains(&format!("{root}/run.sh")), "the parse error quotes the line: {reason}");
+    assert!(reason.contains(&quoted), "the parse error quotes the line: {reason}");
     let row = report
         .lines()
         .find(|l| l.starts_with("err  tool        .openmax/tools/broken.toml  "))

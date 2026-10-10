@@ -808,7 +808,11 @@ async fn main() -> std::io::Result<()> {
         }
         // Pure filesystem validation: no session, no endpoint, no state dir.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let findings = open_max_core::doctor::check(&project);
+        // The text face's repair commands name files relative to the project.
+        let findings = match cli.json {
+            true => open_max_core::doctor::check(&project),
+            false => open_max_core::doctor::check_for_report(&project),
+        };
         if cli.json {
             // Machine face of the full report (every finding, as --all
             // prints it): the agent parses this in-turn.
@@ -1637,7 +1641,7 @@ fn prompt_trust(
 /// read the same value. The counter is what actually guarantees uniqueness;
 /// pid and clock only keep leftovers from earlier runs out of the way.
 /// One row of the `--check` human report, naming the file relative to
-/// `project` when it is under it (see doctor::project_relative). The whole row
+/// `project` when it is under it (see doctor::report_path). The whole row
 /// rides one terminal line: a file's own name is author-controlled bytes
 /// (write_file only trims the ends of a path), so a control character in it
 /// could forge a second, clean-looking row. One space per control byte, the
@@ -1645,23 +1649,22 @@ fn prompt_trust(
 /// through serde and needs no counterpart.
 fn check_row(f: &open_max_core::doctor::Finding, project: &std::path::Path) -> String {
     use open_max_core::doctor::Status;
-    let (path, message) = open_max_core::doctor::project_relative(&f.path, f.status.summary(), project);
+    let path = open_max_core::doctor::report_path(&f.path, project);
     let path = path.display();
     let row = match &f.status {
-        Status::Ok(_) => format!("ok   {:<11} {}  ({message})", f.kind, path),
-        Status::Warn(_) => format!("warn {:<11} {}  {message}", f.kind, path),
-        Status::Err(_) => format!("err  {:<11} {}  {message}", f.kind, path),
+        Status::Ok(summary) => format!("ok   {:<11} {}  ({summary})", f.kind, path),
+        Status::Warn(reason) => format!("warn {:<11} {}  {reason}", f.kind, path),
+        Status::Err(reason) => format!("err  {:<11} {}  {reason}", f.kind, path),
     };
     open_max_core::text::one_line(&row)
 }
 
-/// One verdict row of `--check --run-examples`, one-lined and naming the
-/// manifest by the same rules as a finding row: the tool name is the
-/// manifest's own declaration and a failure reason often carries the
-/// example's captured stderr, both author-controlled bytes.
+/// One verdict row of `--check --run-examples`, one-lined by the same rule:
+/// the tool name is the manifest's own declaration and a failure reason often
+/// carries the example's captured stderr, both author-controlled bytes. The
+/// approval command in the badge names the manifest as a finding row does.
 fn example_row(verdict: &open_max_core::doctor::ExampleVerdict, project: &std::path::Path) -> String {
-    let failure = verdict.result.as_ref().err().map_or("", String::as_str);
-    let (path, reason) = open_max_core::doctor::project_relative(&verdict.path, failure, project);
+    let path = open_max_core::doctor::report_path(&verdict.path, project);
     let badge = match verdict.sandboxed {
         // Loud by design: the probe ran UNAPPROVED content with zero
         // host authority; nothing was blessed by it running.
@@ -1681,12 +1684,12 @@ fn example_row(verdict: &open_max_core::doctor::ExampleVerdict, project: &std::p
         // run after approval be the honest signal, rather than failing the
         // check on the largest tool family (anything that reaches the
         // network).
-        Err(_) if verdict.sandboxed => format!(
+        Err(reason) if verdict.sandboxed => format!(
             "warn example     {}  could not be proven in the sandbox (a tool that needs the network or a write outside its scratch dir cannot): {reason}{badge}",
             verdict.tool
         ),
         // Approved content ran with the host's authority: a failure is real.
-        Err(_) => format!("err  example     {}  {reason}{badge}", verdict.tool),
+        Err(reason) => format!("err  example     {}  {reason}{badge}", verdict.tool),
     };
     open_max_core::text::one_line(&row)
 }

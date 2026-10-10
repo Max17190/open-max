@@ -32,9 +32,11 @@ client, used by the proxy tool an MCP server is adopted through; see
 
 `openmax --check` prints the rows of each file that needs attention (`warn` or
 `err`) and of each hook, then one line counting, per surface, the files that
-loaded with nothing to report. A file under the current directory is named
-relative to it, in its repair command too (`openmax --approve
-'.openmax/tools/x.toml'`). `openmax --check --all` prints every row.
+loaded with nothing to report. Each of those rows names a file under the
+current directory relative to it, in its path and in the repair command it
+gives (`openmax --approve '.openmax/tools/x.toml'`); the rest of a message,
+which can quote the file's own lines, prints as written.
+`openmax --check --all` prints every row.
 
 `openmax --check --json` prints every finding as one JSON array of
 `{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),

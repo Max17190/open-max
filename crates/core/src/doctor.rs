@@ -108,31 +108,22 @@ pub fn default_report(findings: &[Finding]) -> (Vec<&Finding>, Option<String>) {
     (rows, Some(format!("ok: {} (openmax --check --all lists them)", counts.join(", "))))
 }
 
-/// How the `--check` text report names `path` and writes `message`, a row
-/// about that file: the path relative to `root`, the directory the report
-/// checks and runs in, and in the message, every repair command naming the
-/// file (`openmax --approve '<path>'`, always shell-quoted) with that same
-/// relative path. The commands still work there: `--approve` and `--forget`
-/// resolve a relative path against the directory they run in, which has to be
-/// the project anyway (approvals are recorded per directory). Nothing else in
-/// the message changes, because a message also quotes author bytes verbatim (a
-/// manifest line in a parse error, a command literal, an example's captured
-/// output) and those must read as written. A path outside `root`, or any path
-/// when `root` is the filesystem root, is left absolute: `~` would not expand
+/// How the `--check` text report names `path`: relative to `root`, the
+/// directory the report checks and runs in, when it is under it. The repair
+/// commands the report prints name a file the same way ([`check_for_report`]),
+/// and they still work there: `--approve` and `--forget` resolve a relative
+/// path against the directory they run in, which has to be the project anyway
+/// (approvals are recorded per directory). A path outside `root`, or any path
+/// when `root` is the filesystem root, stays absolute: `~` would not expand
 /// inside the single quotes a printed command wraps a path in. A relative path
 /// that would start with `-` gets a `./`, so no command reads it as an option.
-pub fn project_relative(path: &Path, message: &str, root: &Path) -> (PathBuf, String) {
-    let relative = match path.strip_prefix(root) {
-        Ok(rest) if root.parent().is_some() && !rest.as_os_str().is_empty() => rest,
-        _ => return (path.to_path_buf(), message.to_string()),
-    };
-    let relative = if relative.to_string_lossy().starts_with('-') {
-        Path::new(".").join(relative)
-    } else {
-        relative.to_path_buf()
-    };
-    let message = message.replace(&shell_quote(path), &shell_quote(&relative));
-    (relative, message)
+pub fn report_path(path: &Path, root: &Path) -> PathBuf {
+    match path.strip_prefix(root) {
+        Ok(rest) if root.parent().is_none() || rest.as_os_str().is_empty() => path.to_path_buf(),
+        Ok(rest) if rest.to_string_lossy().starts_with('-') => Path::new(".").join(rest),
+        Ok(rest) => rest.to_path_buf(),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Validate all extension files for a project (global + project dirs).
@@ -142,11 +133,29 @@ pub fn check(project_root: &Path) -> Vec<Finding> {
     check_at(project_root, &crate::state::default_data_dir())
 }
 
+/// The same findings for the `--check` text report: each repair command the
+/// harness writes into a message names its file by [`report_path`]. Only
+/// those arguments change. The rest of a message prints as written, because
+/// it can quote author bytes (a manifest line in a parse error) that must read
+/// exactly as they are in the file.
+pub fn check_for_report(project_root: &Path) -> Vec<Finding> {
+    check_with(project_root, &crate::state::default_data_dir(), true)
+}
+
 /// A finding plus the identity a loader would file it under, used to work out
 /// which of two files with the same identity actually wins.
 type Entry = (Finding, Option<String>);
 
 pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
+    check_with(project_root, data_dir, false)
+}
+
+fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Finding> {
+    // The file argument of a repair command written into a message.
+    let command_path = |path: &Path| match for_report {
+        true => shell_quote(&report_path(path, project_root)),
+        false => shell_quote(path),
+    };
     let mut findings = Vec::new();
     let default = crate::config::load(data_dir).map(|s| s.approval_mode).unwrap_or(crate::config::ApprovalMode::Ask);
     let mode = match crate::trust::approval_mode(data_dir, project_root, default) {
@@ -251,7 +260,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                      openmax --check --run-examples, which probes unapproved \
                                      tools in a sandbox)",
                                     spec.name,
-                                    shell_quote(&ext.source_path)
+                                    command_path(&ext.source_path)
                                 ))
                             }
                             None => Status::Ok(format!("tool '{}'", spec.name)),
@@ -574,7 +583,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             if was_live && was_gate {
                                 Status::Err(format!(
                                     "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
-                                    shell_quote(&path)
+                                    command_path(&path)
                                 ))
                             } else if let Some((problem, missing)) =
                                 missing_command_reason(&h.command, project_root).or_else(|| {
@@ -590,7 +599,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 // file that exists.
                                 Status::Err(format!(
                                     "inert because {missing}: {}",
-                                    problem.hook_repair(h.command.trim(), &path)
+                                    problem.hook_repair(h.command.trim(), &command_path(&path))
                                 ))
                             } else {
                                 // Only `openmax --approve`, from outside a
@@ -611,7 +620,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 };
                                 Status::Err(format!(
                                     "inert because {reason}: a human must approve this exact content with `openmax --approve {}`, run outside a session (an in-session write approval approves the write and nothing more){shape_note}",
-                                    shell_quote(&path)
+                                    command_path(&path)
                                 ))
                             }
                         }
@@ -695,7 +704,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             if let Status::Err(reason) = &finding.status {
                 finding.status = Status::Err(format!(
                     "{reason}; this file was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
-                    shell_quote(&finding.path)
+                    command_path(&finding.path)
                 ));
             }
         }
@@ -733,7 +742,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 path: path.clone(),
                 status: Status::Err(format!(
                     "an approved hook file was deleted; every tool call fails closed until it is restored or retired with `openmax --forget {}`",
-                    shell_quote(path)
+                    command_path(path)
                 )),
             });
         }
@@ -769,6 +778,10 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 let mut inert = 0;
                 if let Some((reason, dropped)) = inert_verdict {
                     inert = dropped;
+                    // All harness text (the file's path, a count, and the
+                    // command), shared with the in-session notice, so its
+                    // command argument is swapped here rather than built here.
+                    let reason = reason.replace(&shell_quote(&path), &command_path(&path));
                     findings.push(Finding {
                         kind: "permissions",
                         path: path.clone(),
@@ -1600,8 +1613,7 @@ enum CommandProblem {
 impl CommandProblem {
     /// What repairs it, phrased for a hook that is inert until approved: each
     /// case names its own fix, and whether approval is even reachable yet.
-    fn hook_repair(self, command: &str, manifest: &Path) -> String {
-        let manifest = shell_quote(manifest);
+    fn hook_repair(self, command: &str, manifest: &str) -> String {
         let command_q = shell_quote(Path::new(command));
         match self {
             Self::Absent => format!(
@@ -4931,26 +4943,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Only the file's own path and the repair commands quoting it become
-    /// relative: the rest of a message is often author bytes (a parse error
-    /// quoting the manifest line), which must read as written.
+    /// A path under the root is named relative to it; anything else, the
+    /// root itself, and every path when the root is `/` stay as found.
     #[test]
-    fn project_relative_rewrites_only_the_files_own_path() {
+    fn report_path_is_relative_only_under_the_root() {
         let root = Path::new("/w/app");
-        let message = "line 1 | command = '/w/app/x.sh' | openmax --approve '/w/app/.openmax/tools/a.toml'";
-        let (path, message) = project_relative(Path::new("/w/app/.openmax/tools/a.toml"), message, root);
-        assert_eq!(path, Path::new(".openmax/tools/a.toml"));
-        assert_eq!(message, "line 1 | command = '/w/app/x.sh' | openmax --approve '.openmax/tools/a.toml'");
-        let (path, _) = project_relative(Path::new("/w/app/-x.toml"), "", root);
-        assert_eq!(path, Path::new("./-x.toml"));
-        for (path, root) in [("/w/app-old/a.toml", "/w/app"), ("/home/.openmax/tools/a.toml", "/w/app"), ("/w/a.toml", "/")] {
-            let message = format!("openmax --approve {}", shell_quote(Path::new(path)));
-            assert_eq!(
-                project_relative(Path::new(path), &message, Path::new(root)),
-                (PathBuf::from(path), message.clone()),
-                "{path} under {root} stays as found"
-            );
+        assert_eq!(report_path(Path::new("/w/app/.openmax/tools/a.toml"), root), Path::new(".openmax/tools/a.toml"));
+        assert_eq!(report_path(Path::new("/w/app/-x.toml"), root), Path::new("./-x.toml"));
+        for (path, root) in [
+            ("/w/app-old/a.toml", "/w/app"),
+            ("/home/.openmax/tools/a.toml", "/w/app"),
+            ("/w/app", "/w/app"),
+            ("/w/a.toml", "/"),
+        ] {
+            assert_eq!(report_path(Path::new(path), Path::new(root)), Path::new(path), "{path} under {root}");
         }
+    }
+
+    /// The text report's repair commands name the file relative to the
+    /// project, and nothing else in a message changes: the parse error here
+    /// quotes a broken line holding the file's own quoted absolute path, and
+    /// it reads exactly as the file does.
+    #[test]
+    fn the_report_names_files_relative_only_in_repair_commands() {
+        let root = temp_project();
+        let data = root.join("data");
+        let hook = root.join(".openmax/hooks/gate.toml");
+        write(hook.clone(), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n");
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap());
+        crate::ledger::approve_capability(&data, &root, &hook, &[sha]).unwrap();
+        let quoted = shell_quote(&hook);
+        write(hook.clone(), &format!("event = \"pre_tool_use\"\ncommand = \"cat {quoted}\" oops\n"));
+        let reason = |for_report| match &find(&check_with(&root, &data, for_report), "gate.toml").status {
+            Status::Err(reason) => reason.clone(),
+            other => panic!("a broken live hook must err: {other:?}"),
+        };
+        let (full, report) = (reason(false), reason(true));
+        assert!(full.contains(&format!("cat {quoted}")), "the parse error quotes the line: {full}");
+        assert!(full.ends_with(&format!("`openmax --approve {quoted}`")), "{full}");
+        let command = "`openmax --approve '.openmax/hooks/gate.toml'`";
+        assert_eq!(report, format!("{}{command}", full.strip_suffix(&format!("`openmax --approve {quoted}`")).unwrap()));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Ok rows of files with nothing to report fold into one count of files
