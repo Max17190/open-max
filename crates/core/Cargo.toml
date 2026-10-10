@@ -28,3 +28,7 @@ toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+# Paused time, so the token batcher's timing tests are exact.
+tokio = { workspace = true, features = ["test-util"] }

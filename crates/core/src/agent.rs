@@ -38,7 +38,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -61,9 +61,12 @@ const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool
 /// waiting for a slot when the mode left auto. Not declined: requested
 /// again, it takes the serial path, which raises the card.
 const MODE_LEFT_AUTO_BEFORE_START: &str = "Execution mode changed before this call started; this call was not executed. Request it again under the current mode.";
-/// Stream tokens to the UI in ~25ms batches: keeps redraw work negligible
-/// with no perceptible latency.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+/// Hold a streamed delta at most this long before it goes to the UI: under
+/// one frame of a 240 Hz display, so streamed text keeps up with the screen,
+/// while a fast provider's deltas still coalesce into a few hundred events a
+/// second rather than one per delta. A longer window caps text below display
+/// rate whatever the UI's own pacing allows: 25 ms means 40 updates a second.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 const DIGEST_PREFIX: &str = "[context note:";
 /// Outcome of a mutating-tool approval prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2370,15 +2373,26 @@ struct TokenBatcher {
     session_id: String,
     content: String,
     thinking: String,
-    last_flush: Instant,
+    /// On the runtime clock, which the stale flusher's deadline sleeps on.
+    last_flush: tokio::time::Instant,
+    /// Wakes the stale flusher when a batch starts buffering.
+    buffering: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl TokenBatcher {
     fn new(core: Arc<Core>, session_id: String) -> Self {
-        Self { core, session_id, content: String::new(), thinking: String::new(), last_flush: Instant::now() }
+        Self {
+            core,
+            session_id,
+            content: String::new(),
+            thinking: String::new(),
+            last_flush: tokio::time::Instant::now(),
+            buffering: None,
+        }
     }
 
     fn push(&mut self, delta: StreamDelta) {
+        let was_empty = self.content.is_empty() && self.thinking.is_empty();
         match delta {
             StreamDelta::Content(t) => self.content.push_str(&t),
             StreamDelta::Reasoning(t) => self.thinking.push_str(&t),
@@ -2392,6 +2406,12 @@ impl TokenBatcher {
         }
         if self.last_flush.elapsed() >= FLUSH_INTERVAL {
             self.flush();
+        } else if was_empty {
+            if let Some(wake) = &self.buffering {
+                // Full means a wake is already pending; the flusher reads
+                // the window when it takes that wake, so it covers this one.
+                let _ = wake.try_send(());
+            }
         }
     }
 
@@ -2416,30 +2436,38 @@ impl TokenBatcher {
         if !self.thinking.is_empty() {
             self.core.send_agent(&self.session_id, AgentEvent::Thinking { text: std::mem::take(&mut self.thinking) });
         }
-        self.last_flush = Instant::now();
+        self.last_flush = tokio::time::Instant::now();
     }
 }
 
-/// Tick the batcher at the flush interval for the lifetime of one streaming
-/// request; the caller aborts the task as soon as the stream returns. Abort
-/// can only land at an await point, so it never interrupts a flush half way,
-/// and a tick racing the caller's final flush finds the buffers already
-/// drained and does nothing.
+/// Flush each buffered batch when its window ends, for the lifetime of one
+/// streaming request; the caller aborts the task as soon as the stream
+/// returns. Abort can only land at an await point, so it never interrupts a
+/// flush half way, and a wake racing the caller's final flush finds the
+/// buffers already drained and does nothing.
 ///
-/// The ticker holds the batcher weakly: a panicking turn unwinds past the
+/// The task sleeps toward a deadline only while a batch is buffered. Most of
+/// a request has nothing to show (the model thinking before its first token,
+/// or streaming tool-call arguments), and a fixed tick at the batch window
+/// would wake the process 250 times a second through all of it.
+///
+/// The task holds the batcher weakly: a panicking turn unwinds past the
 /// caller's abort, and dropping a JoinHandle detaches rather than aborts, so
-/// a strong reference would leave a task ticking (and pinning `Core`) for the
-/// process lifetime. When the turn's own references drop, the upgrade fails
-/// and the task exits on its next tick.
+/// a strong reference would leave a task parked (and pinning `Core`) for the
+/// process lifetime. When the turn's own references drop, the batcher's
+/// sender drops with them and the task exits.
 fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::JoinHandle<()> {
+    let (wake, mut buffering) = tokio::sync::mpsc::channel(1);
+    batcher.lock().unwrap().buffering = Some(wake);
     let batcher = Arc::downgrade(batcher);
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(FLUSH_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let Some(batcher) = batcher.upgrade() else { return };
-            batcher.lock().unwrap().flush_if_stale();
+        while buffering.recv().await.is_some() {
+            let Some(strong) = batcher.upgrade() else { return };
+            let due = strong.lock().unwrap().last_flush + FLUSH_INTERVAL;
+            drop(strong);
+            tokio::time::sleep_until(due).await;
+            let Some(strong) = batcher.upgrade() else { return };
+            strong.lock().unwrap().flush_if_stale();
         }
     })
 }
@@ -4522,6 +4550,8 @@ fn prune_transcript(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[tokio::test]
@@ -9626,21 +9656,20 @@ mod tests {
 
     /// The stale flush respects the batch window: a fresh batch stays
     /// buffered, an aged one flushes without waiting for another push.
-    #[tokio::test]
+    /// Paused time keeps the window exact: a few milliseconds of scheduling
+    /// delay on a loaded machine would otherwise age the fresh batch.
+    #[tokio::test(start_paused = true)]
     async fn flush_if_stale_flushes_only_an_aged_batch() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-batcher-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let mut batcher = TokenBatcher::new(core.clone(), "s".into());
-        // Stage the batch by hand so the test controls the window exactly:
-        // push's own flush-on-arrival would race the timing it stages.
-        batcher.content.push_str("tail");
-        batcher.last_flush = Instant::now();
+        batcher.push(StreamDelta::Content("tail".into()));
         batcher.flush_if_stale();
         assert!(rx.try_recv().is_err(), "a batch inside the window must stay buffered");
 
-        tokio::time::sleep(FLUSH_INTERVAL + Duration::from_millis(10)).await;
+        tokio::time::sleep(FLUSH_INTERVAL).await;
         batcher.flush_if_stale();
         match rx.try_recv().map(|env| env.event) {
             Ok(AgentEvent::Token { text }) => assert_eq!(text, "tail"),
@@ -9649,13 +9678,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Streamed text must leave core within the batch window (4 ms, one frame
+    /// of a 240 Hz display), on a steady stream and on the tail of a burst
+    /// (several deltas in one network read) that the stream then goes quiet
+    /// on. A 25 ms window, and a flusher polling at that window, held deltas
+    /// up to 50 ms. Under paused time a Token is received at the instant it
+    /// is sent and the flusher's deadline fires exactly, so every hold
+    /// measured here is exact; on a live runtime the millisecond timer rounds
+    /// a quiet-tail hold up to 5 ms, and the paint behind the event is the
+    /// UI's own.
+    #[tokio::test(start_paused = true)]
+    async fn streamed_deltas_reach_the_ui_within_a_display_frame() {
+        use crate::state::Core;
+        use tokio::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("openmax-batcher-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), "s".into())));
+        let flusher = spawn_stale_flusher(&batcher);
+
+        // A delta every millisecond (a fast provider), then three bursts of
+        // five deltas 30 ms apart (a provider whose events arrive grouped).
+        let mut schedule: Vec<Duration> = (0..40).map(Duration::from_millis).collect();
+        for burst in 0..3 {
+            schedule.extend([Duration::from_millis(70 + 30 * burst); 5]);
+        }
+        let deltas = schedule.len();
+        let start = Instant::now();
+        let pusher = {
+            let batcher = batcher.clone();
+            tokio::spawn(async move {
+                let mut pushed = Vec::new();
+                for (i, at) in schedule.into_iter().enumerate() {
+                    tokio::time::sleep_until(start + at).await;
+                    batcher.lock().unwrap().push(StreamDelta::Content(format!("d{i:03} ")));
+                    pushed.push(Instant::now());
+                }
+                pushed
+            })
+        };
+
+        // Every delta is five bytes, so delta i is on screen once the
+        // streamed text reaches 5 * (i + 1) bytes.
+        let mut shown = Vec::new();
+        let mut streamed = 0;
+        while streamed < 5 * deltas {
+            let env = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("every buffered delta must flush")
+                .expect("core outlives the batcher");
+            if let AgentEvent::Token { text } = env.event {
+                streamed += text.len();
+                shown.push((Instant::now(), streamed));
+            }
+        }
+        let pushed = pusher.await.unwrap();
+        flusher.abort();
+
+        let frame = Duration::from_secs(1) / 240;
+        let holds: Vec<Duration> = pushed
+            .iter()
+            .enumerate()
+            .map(|(i, at)| {
+                let (t, _) = shown.iter().find(|(_, len)| *len >= 5 * (i + 1)).unwrap();
+                *t - *at
+            })
+            .collect();
+        let worst = holds.iter().max().unwrap();
+        assert!(
+            *worst <= frame,
+            "a delta waited {worst:?} to reach the UI, longer than a 240 Hz frame ({frame:?}); holds: {holds:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The tail of a streamed reply must not wait for the stream to end: a
     /// delta that lands inside the batch window is flushed only when the next
     /// delta arrives, so when the deltas stop - the model switching to
     /// streaming tool-call arguments, or a stalled endpoint - the buffered
     /// text used to stay invisible until the whole response finished, many
-    /// seconds for a large write_file call. The stale-flush ticker must
-    /// surface it while the stream is still open.
+    /// seconds for a large write_file call. The stale flusher must surface
+    /// it while the stream is still open.
     #[tokio::test]
     async fn a_buffered_stream_tail_flushes_while_the_stream_is_quiet() {
         use std::io::{Read as _, Write as _};
