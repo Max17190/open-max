@@ -26,10 +26,11 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// The longest a cancelled command takes to settle: a SIGTERM grace for its
-/// shell and one for the rest of its group, then both output drain windows
-/// for a descendant that left the group still holding a pipe.
+/// shell and one for the rest of its group, one for a stdin writer the
+/// command never drained, then both output drain windows for a descendant
+/// that left the group still holding a pipe.
 pub const CANCEL_SETTLE: Duration = TERMINATION_GRACE
-    .saturating_mul(3)
+    .saturating_mul(4)
     .saturating_add(OUTPUT_DRAIN_GRACE);
 /// How long a spilled command log stays on disk. Long enough that a resumed
 /// session can still tail a log its transcript points at; short enough that
@@ -723,9 +724,8 @@ pub(crate) async fn run_process(
     #[cfg(all(test, unix))]
     hold_before_exec(&mut command);
 
-    let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+    let (mut child, group) = GroupGuard::spawn(&mut command)?;
     let pid = child.id();
-    let group = GroupGuard::new(pid);
     let stdout = child
         .stdout
         .take()
@@ -1060,8 +1060,8 @@ static LIVE_GROUPS: Mutex<LiveGroups> =
 
 struct LiveGroups {
     leaders: Vec<u32>,
-    /// Set by [`kill_process_groups`]: the process is about to exit, so a
-    /// group started from here on is killed as it registers.
+    /// Set by [`kill_process_groups`]: the process is about to exit, so no
+    /// command starts from here on.
     exiting: bool,
 }
 
@@ -1069,10 +1069,10 @@ fn live_groups() -> std::sync::MutexGuard<'static, LiveGroups> {
     LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Kill every process group a running command started, and any started
-/// after this call, right before the process exits. This is for an exit that
-/// cannot wait out the cancel path's grace, a second signal or a turn that
-/// never settled; once the harness has exited, nothing would stop them.
+/// Kill every process group a running command started, and refuse to start
+/// another, right before the process exits. This is for an exit that cannot
+/// wait out the cancel path's grace, a second signal or a turn that never
+/// settled; once the harness has exited, nothing would stop them.
 pub fn kill_process_groups() {
     let mut live = live_groups();
     live.exiting = true;
@@ -1089,39 +1089,46 @@ pub fn kill_process_groups() {
 struct GroupGuard(Option<u32>);
 
 impl GroupGuard {
-    fn new(pid: Option<u32>) -> Self {
-        let Some(pid) = pid else {
-            return Self(None);
-        };
+    /// Start `command` and register its group under one hold of the lock the
+    /// exit's kill takes, so that kill either finds the group or comes first
+    /// and the command never starts. A thread paused between the two steps
+    /// would otherwise leave a group the kill never saw.
+    fn spawn(command: &mut Command) -> Result<(Child, Self), ProcessError> {
         let mut live = live_groups();
         if live.exiting {
-            // Spawned between the exit's kill and the exit itself.
-            send_kill_group(Some(pid));
-            return Self(None);
+            return Err(ProcessError::Spawn(io::Error::other("openmax is exiting")));
         }
-        live.leaders.push(pid);
-        Self(Some(pid))
+        let child = command.spawn().map_err(ProcessError::Spawn)?;
+        let pid = child.id();
+        live.leaders.extend(pid);
+        Ok((child, Self(pid)))
     }
 
     /// Supervision stopped the group or found it empty. It is not signalled
     /// again: once its last member is gone, the id can name another group.
     fn settled(mut self) {
-        self.forget();
-    }
-
-    fn forget(&mut self) -> Option<u32> {
-        let pid = self.0.take()?;
-        let mut live = live_groups();
-        if let Some(at) = live.leaders.iter().position(|leader| *leader == pid) {
-            live.leaders.swap_remove(at);
+        if let Some(pid) = self.0.take() {
+            live_groups().forget(pid);
         }
-        Some(pid)
+    }
+}
+
+impl LiveGroups {
+    fn forget(&mut self, pid: u32) {
+        if let Some(at) = self.leaders.iter().position(|leader| *leader == pid) {
+            self.leaders.swap_remove(at);
+        }
     }
 }
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.forget() {
+        if let Some(pid) = self.0.take() {
+            // Forgotten and killed under one hold: an exit's kill between
+            // the two would find the group gone from the list and still
+            // running.
+            let mut live = live_groups();
+            live.forget(pid);
             send_kill_group(Some(pid));
         }
     }
@@ -1901,6 +1908,42 @@ mod tests {
         }
         let _ = std::fs::remove_file(&pid_file);
         assert!(!survived, "a background child outlived the command that started it");
+    }
+
+    /// The kill an exit makes must reach a command caught between its spawn
+    /// and its registration: a thread paused there would otherwise start a
+    /// group the kill never saw, left running once the process is gone. The
+    /// kill waits for the spawn instead, and nothing starts after it. It
+    /// marks the process as exiting, so the probe runs in a child.
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_kill_waits_for_a_command_caught_mid_spawn() {
+        const CHILD: &str = "OPENMAX_TEST_KILL_MID_SPAWN";
+        if std::env::var_os(CHILD).is_some() {
+            let spawning = PausedSpawn::start();
+            let kill = std::thread::spawn(kill_process_groups);
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!kill.is_finished(), "the kill ran while a command was mid-spawn");
+            drop(spawning);
+            kill.join().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let late = runtime.block_on(run_process(request("/bin/echo", &[]), Arc::new(CancelToken::default())));
+            assert!(matches!(late, Err(ProcessError::Spawn(_))), "a command started after the kill");
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "execution::tests::the_exit_kill_waits_for_a_command_caught_mid_spawn"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        // "1 passed" rules out a filter that matched nothing and exited 0.
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "{:?}: {stdout}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     /// A command that prompts on the terminal (a git credential prompt, an
