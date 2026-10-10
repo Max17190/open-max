@@ -4,7 +4,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use open_max_core::agent;
 use open_max_core::text::one_line;
@@ -129,20 +128,15 @@ async fn run_turn_events(
     let mut exit_code = 0i32;
 
     loop {
-        let event = match tokio::time::timeout(Duration::from_secs(600), core_rx.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
-                let _ = writeln!(stderr, "openmax: event channel closed");
-                return 1;
-            }
-            Err(_) => {
-                let _ = writeln!(stderr, "openmax: timed out waiting for the agent");
-                core.cancel(session_id);
-                return 1;
-            }
+        // No clock of its own: a live turn can go quiet here for longer than
+        // any fixed bound (a long tool call's arguments stream without an
+        // event). The client's idle timeout already ends a dead endpoint's
+        // turn with Done, and the tool timeouts bound a hung tool.
+        let Some(env) = core_rx.recv().await else {
+            let _ = writeln!(stderr, "openmax: event channel closed");
+            return 1;
         };
 
-        let env = event;
         if env.session_id != session_id {
             continue;
         }
@@ -402,6 +396,39 @@ mod tests {
                     .await;
             assert_eq!(code, 1, "stop reason {stop_reason}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A live turn can send no event for longer than any fixed bound: a
+    /// model streaming one large tool call's arguments (those deltas emit
+    /// nothing), an endpoint holding the stream open with keepalives through
+    /// a long prompt, a provider whose `idle_timeout_secs` is above ten
+    /// minutes. The client's idle timeout already ends a dead endpoint's turn
+    /// and the tool timeouts bound a hung tool, so print mode must not cancel
+    /// a quiet turn on a clock of its own (it did at 600 s, exiting 1 while
+    /// the model was still writing).
+    #[tokio::test(start_paused = true)]
+    async fn print_mode_waits_out_a_quiet_turn() {
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-headless-quiet-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (core, mut rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        let mut saw_tokens = false;
+
+        let turn = run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr);
+        tokio::pin!(turn);
+        // An hour of silence passes in no real time while the clock is paused.
+        let quiet = tokio::time::timeout(std::time::Duration::from_secs(3600), &mut turn).await;
+        assert!(quiet.is_err(), "print mode ended a quiet turn with exit {:?}", quiet.ok());
+
+        core.send_agent("s", AgentEvent::Done { stop_reason: "stop".to_string() });
+        assert_eq!(turn.await, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
