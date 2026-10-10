@@ -1760,6 +1760,95 @@ fn assistant_text_never_dispatches_a_tool() {
     }
 }
 
+/// Opening a named pipe waits for a writer, and reading a pipe takes
+/// whatever arrives for as long as it keeps coming, so a file tool sent to
+/// one could wait indefinitely: Esc could not end the turn, because a
+/// started mutation is waited for, and /quit could not end the process,
+/// which waits on the blocked thread at exit. Each file tool names what the
+/// path is and leaves it unopened: a writer waiting on the pipe would wake
+/// to an open and lose its reader at the close.
+#[cfg(unix)]
+#[test]
+fn file_tools_name_a_pipe_or_socket_and_leave_it_unopened() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    // A socket's path is capped at about a hundred bytes, so the directory
+    // name is kept short.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("om-{:x}-{nonce:x}", std::process::id()));
+    // Take the pipe and socket away even when an assertion fails.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveOnDrop(base.clone());
+    let (project, home) = (base.join("project"), base.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pipe = std::ffi::CString::new(project.join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+    let _socket = std::os::unix::net::UnixListener::bind(project.join("sock")).unwrap();
+    // Opening a pipe to write waits for a reader to open it, so a tool that
+    // opened this one would let the writer through.
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let writer = {
+        let pipe = project.join("pipe");
+        std::thread::spawn(move || {
+            let _ = writer_tx.send("waiting");
+            let file = std::fs::OpenOptions::new().write(true).open(pipe);
+            let _ = writer_tx.send(if file.is_ok() { "opened" } else { "failed" });
+        })
+    };
+    assert_eq!(writer_rx.recv(), Ok("waiting"));
+    let script = vec![
+        (sse_tool_call("read_file", serde_json::json!({"path": "pipe"})), true),
+        (sse_tool_call("edit_file", serde_json::json!({"path": "pipe", "old_string": "a", "new_string": "b"})), true),
+        (sse_tool_call("write_file", serde_json::json!({"path": "pipe", "content": "x"})), true),
+        (sse_tool_call("read_file", serde_json::json!({"path": "sock"})), true),
+        (sse_text("done"), true),
+    ];
+    let (base_url, _requests, _server) = spawn_scripted_server(script);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "use the pipe"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let ends: Vec<(bool, String)> = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("every stdout line is JSON"))
+        .filter(|l| l["type"] == "tool_end")
+        .map(|l| (l["ok"] == true, l["output"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    let expected = [
+        "pipe is a named pipe, not a regular file",
+        "pipe is a named pipe, not a regular file",
+        "pipe is a named pipe, not a regular file",
+        "sock is a socket, not a regular file",
+    ];
+    assert_eq!(ends.len(), expected.len(), "every call must end: {stdout}");
+    for ((ok, output), expected) in ends.iter().zip(expected) {
+        assert!(!ok && output == expected, "{output:?} should be {expected:?}: {stdout}");
+    }
+    assert!(
+        std::fs::symlink_metadata(project.join("pipe")).unwrap().file_type().is_fifo(),
+        "write_file must not replace the pipe"
+    );
+    // An open by any tool let the writer through well before the run ended.
+    let early = writer_rx.recv_timeout(std::time::Duration::from_millis(200));
+    assert_eq!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout), "no file tool may open the pipe");
+    let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(project.join("pipe"));
+    assert_eq!(writer_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok("opened"), "the writer was waiting");
+    writer.join().unwrap();
+}
+
 /// A settings file this process will never act on must not be able to hide
 /// the project's own history. `--recall` reads no settings - it reaches an
 /// endpoint never and spends nothing - so it answers, and says plainly that
