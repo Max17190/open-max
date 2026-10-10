@@ -1342,8 +1342,11 @@ fn example_verdict(
         return Ok(());
     };
     // Tool parsing rejects an invalid expect_regex, so a mismatch is the only
-    // failure reachable here.
-    if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&outcome.output)) {
+    // failure reachable here. The match sees the output trimmed the same way
+    // `detail` prints it: `$` is end of text, so against raw output
+    // `^[0-9]+$` never matches `echo 63`, and the verdict would print `63`
+    // as the output it rejected.
+    if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(outcome.output.trim_end())) {
         return Ok(());
     }
     Err(format!(
@@ -3478,6 +3481,26 @@ mod tests {
         let missed = verdict(&results, "misser").result.as_ref().unwrap_err();
         assert!(missed.contains("want expect_regex \"WANTED\""), "{missed}");
         assert!(missed.contains("actual-output"), "{missed}");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Nearly every command ends its output with a newline, and `$` in a Rust
+    /// regex is end of text. Matched raw, `^[0-9]+$` fails `echo 63` while the
+    /// verdict, which prints the output trimmed, reports `got: 63`: a mismatch
+    /// the author cannot see.
+    #[tokio::test]
+    async fn an_anchored_expect_regex_matches_output_that_ends_in_a_newline() {
+        let root = temp_project();
+        let counter = tool_file(
+            &root,
+            "counter.toml",
+            "name = \"counter\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat >/dev/null; echo 63\"]\n\n[example]\nexpect_regex = \"^[0-9]+$\"\n",
+        );
+        let data = approved_data_dir(&root, &[&counter]);
+
+        let results = examples(&root, &data).await.unwrap();
+        assert_eq!(verdict(&results, "counter").result, Ok(()));
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }

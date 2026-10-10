@@ -176,12 +176,14 @@ With nothing installed, extensions cost zero tokens. Project paths win over glob
 # .openmax/tools/todo_scan.toml
 name = "todo_scan"
 description = "List TODO/FIXME comments with file and line"
-command = "./scripts/todo-scan.sh"
+command = "sh"
+args = ["./scripts/todo-scan.sh"]
 timeout_secs = 30
 mutating = false
 
 [params]
 type = "object"
+required = ["path"]
 [params.properties.path]
 type = "string"
 description = "Directory to scan"
