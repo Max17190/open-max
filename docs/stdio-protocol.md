@@ -146,7 +146,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
 | `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), or its refusal could not be persisted; the reply stands unverified |
 | `blocked` | A `user_prompt_submit` hook refused the prompt |
-| `cancelled` | A `cancel` command or shutdown stopped the turn |
+| `cancelled` | A `cancel` command, a signal, or shutdown stopped the turn |
 | `error` | The turn failed; an `error` line precedes it |
 | `refused` | The command started no turn; a `protocol_error` precedes it |
 
@@ -158,7 +158,10 @@ The process exit code is 1 when the last turn ended with `stop_reason`
 `error`, 2 when `--continue` finds no prior session in the directory, and 0
 otherwise, including `max_iterations`, `budget_exhausted`, and `unverified`:
 over this wire the client reads `done` and decides for itself, unlike `-p`,
-which exits 4 on those three.
+which exits 4 on those three. SIGTERM, SIGINT, or SIGHUP cancels the running
+turn instead of draining it, declines pending approvals, and exits 128 plus
+the signal number once that turn's `done` is written, or after 3 seconds if
+it has not ended; see [usage](usage.md#command-line).
 
 Bad input leaves the session unharmed. A line that is not valid UTF-8, or one
 longer than 8 MiB, is reported as a `protocol_error` and skipped; the reader

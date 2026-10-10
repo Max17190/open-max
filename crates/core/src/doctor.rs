@@ -1398,7 +1398,9 @@ fn watch_cancel_signals(cancel: std::sync::Arc<crate::state::CancelToken>) {
                 _ = terminate.recv() => {}
             }
             if fired {
-                // The operator insisting: stop waiting for the group to die.
+                // The operator insisting: stop waiting for the group to die,
+                // but kill it on the way out, since exit runs no destructor.
+                crate::execution::kill_process_groups();
                 std::process::exit(130);
             }
             fired = true;

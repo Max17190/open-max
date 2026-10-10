@@ -452,8 +452,9 @@ mod first_frame {
         let answered_at = s.out.len();
         s.write(ANSWER);
 
+        // The session ends as a quit would, then reports the signal.
         let status = s.wait_exit(Duration::from_secs(10));
-        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+        assert_eq!(status.and_then(|e| e.code()), Some(143), "{status:?}: {}", s.context());
         // A cooked terminal echoes the answer (its device attributes are the
         // tail of it) and leaves it queued as input for the shell.
         assert!(

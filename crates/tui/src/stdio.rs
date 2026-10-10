@@ -44,7 +44,8 @@ use open_max_core::state::Core;
 use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::time::Instant;
 
 pub const PROTO: &str = "openmax-stdio/6";
 /// Machine-comparable protocol major. A client negotiates on this integer;
@@ -69,6 +70,8 @@ enum Command {
 
 pub struct StdioArgs {
     pub continue_session: bool,
+    /// Notified on SIGTERM, SIGINT, or SIGHUP (see `watch_quit_signals`).
+    pub quit: Arc<Notify>,
 }
 
 pub async fn run(
@@ -122,7 +125,7 @@ pub async fn run(
         emit(&mut stdout, &transcript_value(&session_id, &history));
     }
     let stdin_rx = spawn_stdin_reader();
-    drive(core, core_rx, session_id, project, stdin_rx, &mut stdout, !continued).await
+    drive(core, core_rx, session_id, project, stdin_rx, &args.quit, &mut stdout, !continued).await
 }
 
 /// The blocking stdin reader on its own thread; malformed input travels as
@@ -175,16 +178,18 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Result<Command, String>> {
 /// to `out`. `fresh` says this process created the session: a client that
 /// quits before any turn persisted anything (or whose only prompt a gate
 /// refused) would otherwise leave an index entry with nothing behind it.
+#[allow(clippy::too_many_arguments)]
 async fn drive<W: Write>(
     core: Arc<Core>,
     core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: String,
     project: PathBuf,
     stdin_rx: mpsc::Receiver<Result<Command, String>>,
+    quit: &Notify,
     out: &mut W,
     fresh: bool,
 ) -> i32 {
-    let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, out).await;
+    let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, quit, out).await;
     if fresh {
         if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
             let e = sessions::refusal_with_repair(&core, e);
@@ -205,6 +210,7 @@ async fn drive_loop<W: Write>(
     session_id: String,
     project: PathBuf,
     mut stdin_rx: mpsc::Receiver<Result<Command, String>>,
+    quit: &Notify,
     out: &mut W,
 ) -> i32 {
     let mut running = false;
@@ -213,12 +219,33 @@ async fn drive_loop<W: Write>(
     // Approvals awaiting a client answer; declined in bulk when the client
     // quits so the drain never sits out the approval timeout.
     let mut open_approvals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Set by a signal: the status the session exits with, and when it stops
+    // waiting for the cancelled turn.
+    let mut stopping: Option<i32> = None;
+    let mut settle_by = Instant::now();
+    let quit = quit.notified();
+    tokio::pin!(quit);
 
     loop {
         if closing && !running {
-            return exit_code;
+            return stopping.unwrap_or(exit_code);
         }
         tokio::select! {
+            // A quit that cancels the turn instead of letting it finish: the
+            // signal reached this process alone, and the done arrives once
+            // the turn's tools are stopped.
+            _ = &mut quit, if stopping.is_none() => {
+                closing = true;
+                for id in open_approvals.drain() {
+                    core.respond_approval(&id, false);
+                }
+                core.cancel(&session_id);
+                stopping = Some(crate::quit_status());
+                settle_by = Instant::now() + crate::STOP_SETTLE;
+            }
+            _ = tokio::time::sleep_until(settle_by), if stopping.is_some() => {
+                return stopping.unwrap_or(exit_code);
+            }
             cmd = stdin_rx.recv(), if !closing => {
                 match cmd {
                     None | Some(Ok(Command::Quit)) => {
@@ -907,7 +934,8 @@ mod tests {
         }
         drop(tx);
         let mut out = Vec::new();
-        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &mut out, true).await;
+        let quit = tokio::sync::Notify::new();
+        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &quit, &mut out, true).await;
         let lines = String::from_utf8(out)
             .unwrap()
             .lines()

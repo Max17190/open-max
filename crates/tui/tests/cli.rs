@@ -2123,3 +2123,379 @@ fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
     assert_eq!(settings["approval_mode"], "ask", "the global default must not change");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// A run whose model answered with one bash call that leaves a tree behind,
+/// the shape of a build or a dev server the agent started: the shell (which
+/// then becomes a long foreground command) and a background child each
+/// record their pid, and both outlive any test unless something stops them.
+struct ToolTree {
+    child: std::process::Child,
+    /// Held open: a stdio client that has not quit, so only a signal ends it.
+    _stdin: Option<std::process::ChildStdin>,
+    pids: Vec<i32>,
+    base: PathBuf,
+}
+
+/// Start `args` (a print or a stdio run) and return once the bash call's
+/// shell and its background child are both running. `preamble` runs first in
+/// that shell.
+fn start_tool_tree(tag: &str, args: &[&str], preamble: &str) -> ToolTree {
+    let (project, home) = fresh_dirs(tag);
+    let pid_file = project.parent().unwrap().join("pids");
+    let script = format!(
+        "{preamble}echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+        p = pid_file.display()
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let stdio = args.contains(&"--stdio");
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .args(args)
+        .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take();
+    if let Some(stdin) = stdin.as_mut() {
+        writeln!(stdin, r#"{{"cmd":"user","text":"start the tree"}}"#).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pids = loop {
+        let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        let pids: Vec<i32> = recorded.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        if pids.len() == 2 {
+            break pids;
+        }
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the tool tree never started: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    ToolTree { child, _stdin: stdin, pids, base: project.parent().unwrap().to_path_buf() }
+}
+
+/// Send each signal after its delay, wait for the run to end, and return its
+/// output and every recorded pid still alive once the tree had time to go.
+/// Survivors are killed before returning, so a failing assertion leaks
+/// nothing.
+fn signal_tool_tree(
+    tree: ToolTree,
+    signals: &[(std::time::Duration, libc::c_int)],
+) -> (std::process::Output, Vec<i32>) {
+    let ToolTree { child, _stdin, pids, base } = tree;
+    for (delay, signal) in signals {
+        std::thread::sleep(*delay);
+        unsafe { libc::kill(child.id() as libc::pid_t, *signal) };
+    }
+    let output = finish_with_deadline(child);
+    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while pids.iter().any(alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = pids.iter().copied().filter(alive).collect();
+    for pid in &survivors {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(base);
+    (output, survivors)
+}
+
+fn last_event(stdout: &[u8]) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(stdout);
+    let last = stdout.lines().last().unwrap_or_default();
+    serde_json::from_str(last).unwrap_or_else(|_| panic!("the stream must end in an event: {stdout}"))
+}
+
+/// SIGTERM is how a supervisor, a CI runner, or a frontend shutting down
+/// stops a run. Every tool runs in a session of its own, so the signal
+/// reaches openmax alone, and dying on it left the shell and its children
+/// changing the project with nobody left to report to. The run stops the
+/// tree first, ends its stream with the cancelled turn's done event, and
+/// exits 143, the status of a job a SIGTERM stopped.
+#[test]
+fn sigterm_stops_a_print_run_and_its_tool_tree() {
+    let tree = start_tool_tree("sigterm-print", &["--json", "-p", "start the tree"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGTERM)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(143), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+}
+
+/// Ctrl+C at a shell sends SIGINT to openmax's process group, which no tool
+/// is in. A stdio client gets the terminator a cancel gives it, then the 130
+/// exit.
+#[test]
+fn sigint_stops_a_stdio_session_and_its_tool_tree() {
+    let tree = start_tool_tree("sigint-stdio", &["--stdio"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGINT)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(130), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+}
+
+/// A terminal that closes sends SIGHUP. A text run says the turn stopped and
+/// exits 129.
+#[test]
+fn sighup_stops_a_text_print_run_and_its_tool_tree() {
+    let tree = start_tool_tree("sighup-print", &["-p", "start the tree"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGHUP)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(129), "{:?}\n{stderr}", output.status);
+    assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
+}
+
+/// A second signal while the first is still stopping the tools exits
+/// without waiting for that stop. Exiting runs no destructor, so the tool
+/// groups must still be killed on the way out. This tree ignores SIGTERM, so
+/// the cancel's grace is still running when the second signal lands, and
+/// only that kill stops it.
+#[test]
+fn a_second_signal_kills_the_tool_tree_on_the_way_out() {
+    let tree = start_tool_tree("sigterm-twice", &["--json", "-p", "start the tree"], "trap '' TERM; ");
+    let (output, survivors) = signal_tool_tree(
+        tree,
+        &[
+            (std::time::Duration::ZERO, libc::SIGTERM),
+            (std::time::Duration::from_millis(100), libc::SIGTERM),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(143), "{:?}\n{stderr}", output.status);
+}
+
+/// A consumer that stops reading leaves the run blocked in a write to a full
+/// pipe, so the first signal never reaches the stopped turn: the run stays
+/// up. The second must still end it: waiting for stdout on the way out
+/// would hold the exit until something drained the pipe, and only SIGKILL,
+/// which stops no tool, would end it.
+#[test]
+fn a_second_signal_exits_while_output_is_stuck_on_a_full_pipe() {
+    use std::os::fd::AsRawFd;
+    let (project, home) = fresh_dirs("sigterm-stuck-pipe");
+    let (base_url, _requests, _server) =
+        spawn_scripted_server(vec![(sse_text(&"x".repeat(1 << 20)), true)]);
+    write_settings(&home, &base_url);
+    let mut child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "say a lot"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Held and never read until the run has ended. The answer is sixteen
+    // times what a pipe holds, so once the bytes waiting in the pipe stop
+    // growing, the run is blocked writing the rest.
+    let mut stdout = child.stdout.take().unwrap();
+    let queued = || {
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int, the bytes waiting in the pipe.
+        unsafe { libc::ioctl(stdout.as_raw_fd(), libc::FIONREAD, &mut n) };
+        n
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (mut last, mut steady) = (0, 0);
+    while steady < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = queued();
+        steady = if now > 0 && now == last { steady + 1 } else { 0 };
+        last = now;
+    }
+    let pid = child.id() as libc::pid_t;
+    let signal = || unsafe { libc::kill(pid, libc::SIGTERM) };
+    signal();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let stuck = child.try_wait().unwrap().is_none();
+    signal();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut written = Vec::new();
+    let _ = stdout.read_to_end(&mut written);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert!(steady >= 3, "the output never stalled on the full pipe");
+    assert!(stuck, "the first signal ended a run whose writer was blocked");
+    let status = status.expect("the second signal did not end a run stuck writing its output");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let written = String::from_utf8_lossy(&written);
+    assert!(!written.contains(r#""type":"done""#), "the stuck run still finished its stream");
+}
+
+/// A signal the run inherited as ignored stays ignored: `nohup` keeps a run
+/// alive past its terminal's SIGHUP, and a shell starts a script's
+/// background job with SIGINT ignored so Ctrl+C stops only the foreground.
+/// A handler for it would cancel the turn the parent meant to keep.
+#[test]
+fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
+    use std::os::unix::process::CommandExt;
+    let (project, home) = fresh_dirs("sighup-ignored");
+    let pid_file = project.parent().unwrap().join("pids");
+    let script = format!("echo $$ >> '{}'; sleep 1", pid_file.display());
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let mut command = cmd(&project, &home);
+    command
+        .args(["--trust-project", "--json", "-p", "outlive the terminal"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: sigaction is async-signal-safe, and nothing else runs between
+    // fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            match libc::sigaction(libc::SIGHUP, &ignore, std::ptr::null_mut()) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty() {
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the tool never started: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGHUP) };
+    let output = finish_with_deadline(child);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("stop")), "{done}");
+}
+
+/// A supervisor stopping a session, or a terminal closing under it, ends the
+/// TUI with a signal. The session ends through its normal exit path, which
+/// hands the terminal back, and then exits 128 plus the signal's number: a
+/// wrapper that read 0 took the stop for a /quit. Exiting there runs no
+/// destructor, so a tool tree the turn left running must be killed on the
+/// way out, or it outlives the session as it would under a plain exit.
+#[test]
+fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
+    let (project, home) = fresh_dirs("sigterm-tui");
+    let pid_file = project.parent().unwrap().join("pids");
+    let script = format!(
+        "echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+        p = pid_file.display()
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let (pty, terminal) = pseudo_terminal();
+    let size = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCSWINSZ reads one winsize from a live descriptor.
+    unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&terminal), libc::TIOCSWINSZ, &size) };
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .env("TERM", "xterm-256color")
+        .stdin(terminal.try_clone().unwrap())
+        .stdout(terminal.try_clone().unwrap())
+        .stderr(terminal)
+        .spawn()
+        .unwrap();
+    // A terminal nobody reads stops the writer, so the screen is drained on
+    // a thread for as long as the session holds it.
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let mut reader = pty.try_clone().unwrap();
+    let drained = screen.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            drained.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let shown = |bytes: &[u8]| screen.lock().unwrap().windows(bytes.len()).any(|w| w == bytes);
+    let wait_for = |what: &str, done: &dyn Fn() -> bool, child: &mut std::process::Child| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what}: {}", String::from_utf8_lossy(&screen.lock().unwrap()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    // The keyboard protocol query goes out behind the first frame. Answered
+    // as a terminal without the protocol, input starts at once.
+    wait_for("the TUI never asked about the keyboard", &|| shown(b"\x1b[?u"), &mut child);
+    let mut keys = pty.try_clone().unwrap();
+    keys.write_all(b"\x1b[?62cstart the tree\r").unwrap();
+    let pids = || -> Vec<i32> {
+        let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        recorded.lines().filter_map(|l| l.trim().parse().ok()).collect()
+    };
+    wait_for("the tool tree never started", &|| pids().len() == 2, &mut child);
+    let pids = pids();
+    let restored_before = shown(b"\x1b[?1049l");
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while pids.iter().any(alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = pids.iter().copied().filter(alive).collect();
+    for pid in &survivors {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    let screen_text = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+    drop(pty);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let status = status.expect("SIGTERM did not end the TUI");
+    assert!(!restored_before, "the alternate screen was left before the signal");
+    assert!(screen_text.contains("\x1b[?1049l"), "the terminal was not handed back: {screen_text:?}");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}");
+}
