@@ -294,8 +294,9 @@ pub struct Args {
     pub continue_session: bool,
     /// Notified when a signal asks the session to end. The loop treats it
     /// as /quit, so the normal exit path restores the terminal. The signal
-    /// watcher holds it weakly: once the loop drops it, a signal exits at
-    /// once, so keep no other strong handle past the loop.
+    /// watcher holds it weakly: once `run` drops it, after stopping the
+    /// running turns, a signal exits at once, so keep no other strong
+    /// handle.
     pub quit: Arc<tokio::sync::Notify>,
 }
 
@@ -488,30 +489,42 @@ pub async fn run(
     let mut app = App::new(core.clone(), project, files_tx);
 
     app.startup(&args).await;
+    let mut input = None;
     let result =
-        event_loop(&mut terminal, &mut app, &mut core_rx, &mut files_rx, &args.quit).await;
-    // The quit's last strong handle goes with the loop, so a signal during
-    // the stop and the discard below exits at once instead of waiting on them.
+        event_loop(&mut terminal, &mut app, &mut core_rx, &mut files_rx, &args.quit, &mut input)
+            .await;
+    // Never dropped: its drop shows the cursor, which the restore does too,
+    // and reports a failed write with `eprintln!`, which panics once the
+    // terminal is gone (a closed tab, a dropped ssh link), so a hangup
+    // exited 101 instead of 129.
+    std::mem::forget(terminal);
+    // Nothing reads the terminal from here on, so a line typed while the
+    // turns stop waits for the shell instead of a reader nobody drains.
+    if let Some(input) = input {
+        input.abort();
+        let _ = input.await;
+    }
+    stop_running_work(&app.core, &mut core_rx).await;
+    // The quit's last strong handle goes only now: a signal during the stop
+    // sets the exit status as one that ended the loop does, and a second
+    // exits at once. A closing terminal's SIGHUP lands there whenever the
+    // end of its input ended the loop first. From here on a signal exits at
+    // once.
     drop(args);
-    stop_running_work(&app.core, terminal, &mut core_rx).await;
     // Every way out of the loop, a failed terminal included, leaves here.
     let warnings = app.discard_created_sessions_on_exit();
     (result, warnings)
 }
 
-/// Cancel every turn still running when the session ends, as Esc does, and
-/// wait for each to settle: its tools' process groups get SIGTERM before
-/// SIGKILL, and it saves its cancelled stop and runs its `turn_end` hooks.
-/// Left to the runtime's shutdown, a turn is dropped mid-step instead: its
-/// tools are killed outright, with no chance to clean up, and its transcript
-/// ends at a call that never got an answer. The terminal goes back to the
-/// shell first, so the quit shows at once. The wait is bounded as a print
-/// run's stop is, and a signal during it exits at once.
-async fn stop_running_work(
-    core: &Core,
-    terminal: Term,
-    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
-) {
+/// Cancel every turn still running when the session ends, through the
+/// cancel Esc uses, and wait for each to settle: its tools' process groups
+/// get SIGTERM before SIGKILL, and it saves its cancelled stop and runs its
+/// `turn_end` hooks. Left to the runtime's shutdown, a turn is dropped
+/// mid-step instead: its tools are killed outright, with no chance to clean
+/// up, and its transcript ends at a call that never got an answer. The full
+/// screen closes first, so the quit shows at once while the shell's prompt
+/// waits for the stop. The wait is bounded as a print run's stop is.
+async fn stop_running_work(core: &Core, core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>) {
     let running: Vec<String> = core.running.lock().unwrap().iter().cloned().collect();
     if running.is_empty() {
         return;
@@ -519,7 +532,6 @@ async fn stop_running_work(
     for id in &running {
         core.cancel(id);
     }
-    drop(terminal);
     crate::restore_terminal();
     let settle_by = tokio::time::Instant::now() + crate::STOP_SETTLE;
     // A turn leaves `running` before it sends its last event, so each event
@@ -538,6 +550,7 @@ async fn event_loop(
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
     files_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
     quit: &tokio::sync::Notify,
+    input: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> std::io::Result<()> {
     let quit = quit.notified();
     tokio::pin!(quit);
@@ -572,7 +585,7 @@ async fn event_loop(
     // since the event stream would read that answer itself. Keys pressed
     // meanwhile wait in crossterm's queue.
     let (probed_tx, mut probed) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    *input = Some(tokio::spawn(async move {
         let _ = tokio::task::spawn_blocking(crate::enable_keyboard_enhancement).await;
         let _ = probed_tx.send(());
         let mut term_events = crossterm::event::EventStream::new();
@@ -583,7 +596,7 @@ async fn event_loop(
             }
         }
         // Dropping input_tx closes the channel; the loop reads that as quit.
-    });
+    }));
     // No frame is written while the probe waits, so none can cut into its
     // query or the flags pushed on its answer. Input has not started, so no
     // keypress waits on this.

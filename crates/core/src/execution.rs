@@ -1099,9 +1099,9 @@ pub fn kill_process_groups() {
 
 /// Keeps a command's group in `LIVE_GROUPS` while it runs, and kills the
 /// group when the command is dropped before it settles: the runtime shutting
-/// down under a TUI that quit, or an aborted task. A destructor cannot wait
-/// out a SIGTERM grace, so this is SIGKILL, as `kill_on_drop` is for the
-/// leader.
+/// down under a TUI that quit before its turn settled, or an aborted task. A
+/// destructor cannot wait out a SIGTERM grace, so this is SIGKILL, as
+/// `kill_on_drop` is for the leader.
 struct GroupGuard(Option<u32>);
 
 impl GroupGuard {
@@ -1894,9 +1894,9 @@ mod tests {
     }
 
     /// A command dropped mid-run (the runtime shutting down under a TUI that
-    /// quit, an aborted task) stops its whole process group. `kill_on_drop`
-    /// reaches only the shell, so a background child kept running with
-    /// nobody left to stop it.
+    /// quit before its turn settled, an aborted task) stops its whole process
+    /// group. `kill_on_drop` reaches only the shell, so a background child
+    /// kept running with nobody left to stop it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_dropped_command_stops_its_whole_process_group() {
