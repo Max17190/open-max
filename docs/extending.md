@@ -459,7 +459,7 @@ run it after writing extension files. It also reads the session index: a
 damaged one is an `err` row whose message carries the repair (close every
 openmax, then move the file aside to the name the row gives).
 
-Each line is `ok`, `warn`, or `err`, and only `err` exits nonzero:
+Each row is `ok`, `warn`, or `err`, and only `err` exits nonzero:
 
 - `err` is a file the loop cannot use: it does not parse, it fails closed, or
   it can never work (a tool shadowing a built-in name).
@@ -467,6 +467,15 @@ Each line is `ok`, `warn`, or `err`, and only `err` exits nonzero:
   nothing reads, a definition another tier overrides, a rule naming a tool
   that does not exist. Each of these is legitimate in some project, so none
   of them fails the check.
+
+The agent rereads the report with every later request of its session, so by
+default it prints only the rows of files with a `warn` or `err` and of hooks
+(a hook's `ok` row says what it enforces: its event, and whether it gates).
+Files that loaded with nothing to report are counted, per surface, on one
+line (a memory not in the index is noted in its count), and
+`openmax --check --all` prints their rows. The report names files under the
+current directory relative to it, in each row's path and in the paths and
+repair commands it writes into a message.
 
 Warnings cover the ways a file goes missing without being broken. A directory
 at `.openmax/tool/` or `.openmax/skills/`, a `.yaml` where a `.toml` is read,
