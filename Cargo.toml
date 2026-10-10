@@ -21,6 +21,9 @@ serde_json = { version = "1", features = ["raw_value"] }
 # Only the runtime pieces the harness uses; "full" would drag in the rest.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Only the proxy matcher the HTTP client above decides with, so a connect
+# failure can tell whether the request went through a proxy.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 regex = "1"
 ignore = "0.4"
