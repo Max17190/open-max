@@ -415,21 +415,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
                 ));
             }
         }
-        let mut line = Line::from(spans);
-        if selected {
-            line.style = Style::default().bg(theme::SURFACE());
-            for span in &mut line.spans {
-                span.style = span.style.bg(theme::SURFACE());
-            }
-            let used = line.width();
-            if used < width {
-                line.spans.push(Span::styled(
-                    " ".repeat(width - used),
-                    Style::default().bg(theme::SURFACE()),
-                ));
-            }
-        }
-        lines.push(line);
+        lines.push(Line::from(spans));
     }
     if popup.total_matches > visible {
         lines.push(Line::from(Span::styled(
@@ -593,9 +579,12 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("/quit"));
-        assert!(lines
+        let marked: Vec<_> = lines
             .iter()
-            .any(|line| line.style.bg == Some(theme::SURFACE())));
+            .filter(|line| line.spans.first().is_some_and(|span| span.content == "▸ "))
+            .collect();
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     /// The old char-table scorer, kept as the oracle: the streaming rewrite
