@@ -3087,7 +3087,7 @@ impl App {
                     "unverified" => {
                         self.pending_submit = None;
                         self.note(
-                            "stopped: a blocking turn_end hook kept refusing this answer, so the turn ended unverified (see openmax --check)",
+                            "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
                         );
                     }
                     "error" => {
