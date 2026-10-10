@@ -353,7 +353,7 @@ impl Block {
         self.cache.clear();
         self.cache_maps.clear();
         for (i, (line, map)) in wrapped.into_iter().zip(maps).enumerate() {
-            let (line, x_offset) = decorate_line(self.kind, line, i == 0, width);
+            let (line, x_offset) = decorate_line(self.kind, line, i == 0);
             self.cache.push(line);
             self.cache_maps.push(map.map(|mut map| {
                 // The wrapper may already have shifted continuation rows by a
@@ -1905,12 +1905,7 @@ fn hanging_indent(chars: &[(char, Style)], width: usize) -> usize {
     }
 }
 
-fn decorate_line(
-    kind: BlockKind,
-    mut line: Line<'static>,
-    first: bool,
-    width: u16,
-) -> (Line<'static>, usize) {
+fn decorate_line(kind: BlockKind, mut line: Line<'static>, first: bool) -> (Line<'static>, usize) {
     match kind {
         BlockKind::User => {
             let prefix = if first { "❯ " } else { "  " };
@@ -1920,15 +1915,12 @@ fn decorate_line(
                     prefix,
                     Style::default()
                         .fg(theme::USER())
-                        .bg(theme::USER_BG())
                         .add_modifier(Modifier::BOLD),
                 ),
             );
-            (surface_line(line, width, theme::USER_BG()), 2)
+            (line, 2)
         }
-        BlockKind::Assistant => (line, 0),
-        BlockKind::Tool => (surface_line(line, width, theme::SURFACE()), 0),
-        BlockKind::System => (line, 0),
+        BlockKind::Assistant | BlockKind::Tool | BlockKind::System => (line, 0),
     }
 }
 
@@ -3267,8 +3259,9 @@ mod tests {
         assert!(rendered[0].starts_with("❯ hello"));
         assert!(rendered[2].starts_with("world"));
         assert!(!rendered[2].starts_with('│'));
-        assert_eq!(t.lines()[0].style.bg, Some(theme::USER_BG()));
-        assert_ne!(t.lines()[2].style.bg, Some(theme::USER_BG()));
+        let gutter = &t.lines()[0].spans[0];
+        assert_eq!(gutter.content, "❯ ");
+        assert!(gutter.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

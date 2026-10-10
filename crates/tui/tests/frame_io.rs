@@ -121,7 +121,8 @@ fn frame_flush_timing() {
 /// The first frame against a real pseudo-terminal. Asking the terminal
 /// whether it speaks the kitty keyboard protocol costs a round trip (a
 /// network one over ssh), and a terminal that never answers leaves crossterm
-/// waiting out its 2 s timeout, so the first frame must not wait on it.
+/// waiting out its 2 s timeout, so the first frame must not wait on it. The
+/// colors it selects are checked here too, as the bytes a terminal receives.
 #[cfg(unix)]
 mod first_frame {
     use std::fs::File;
@@ -341,6 +342,57 @@ mod first_frame {
         assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
     }
 
+    /// The parameters of every SGR in `out` that selects a foreground or
+    /// background other than the terminal's own (39, 49) or palette slot 8,
+    /// in the 16-color, 256-color and truecolor forms a terminal backend
+    /// writes.
+    fn foreign_colors(out: &[u8]) -> Vec<String> {
+        let mut hits = Vec::new();
+        let mut from = 0;
+        while let Some(at) = find(out, b"\x1b[", from) {
+            from = at + 2;
+            let len = out[from..].iter().take_while(|b| b.is_ascii_digit() || **b == b';').count();
+            if out.get(from + len) != Some(&b'm') {
+                continue;
+            }
+            let params = std::str::from_utf8(&out[from..from + len]).unwrap();
+            let p: Vec<u16> = params.split(';').map(|n| n.parse().unwrap_or(0)).collect();
+            let mut i = 0;
+            while i < p.len() {
+                let foreign = match (p[i], p.get(i + 1)) {
+                    (38 | 48, Some(5)) => {
+                        i += 2;
+                        p.get(i) != Some(&8)
+                    }
+                    (38 | 48, Some(2)) => {
+                        i += 4;
+                        true
+                    }
+                    // 90 and 100 are slot 8 in its 16-color form.
+                    (30..=37 | 40..=47 | 91..=97 | 101..=107, _) => true,
+                    _ => false,
+                };
+                if foreign {
+                    hits.push(params.to_string());
+                }
+                i += 1;
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn foreign_colors_allow_only_the_terminals_own_colors_and_slot_8() {
+        for own in ["39;49", "38;5;8;48;5;8", "90", "100", "0;1;22"] {
+            let sgr = format!("\x1b[{own}m");
+            assert!(foreign_colors(sgr.as_bytes()).is_empty(), "{own}");
+        }
+        for foreign in ["38;5;15", "1;48;5;0", "97", "40", "31", "38;2;8;8;8"] {
+            let sgr = format!("\x1b[{foreign}m");
+            assert_eq!(foreign_colors(sgr.as_bytes()), vec![foreign], "{foreign}");
+        }
+    }
+
     fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| from + i)
     }
@@ -469,5 +521,24 @@ mod first_frame {
             "flags not pushed on the answer and popped before leaving: {}",
             s.context()
         );
+    }
+
+    /// An absolute palette slot is the background of some terminal theme:
+    /// slot 15 text vanishes on a light terminal and a slot 0 fill is a box
+    /// there. The first frame as the terminal receives it (header, focused
+    /// composer and its border, status line) selects only the terminal's own
+    /// colors and the palette's gray, whatever the tokens map to.
+    #[test]
+    fn the_first_frame_uses_only_the_terminals_own_colors_and_its_gray() {
+        let mut s = Session::spawn("palette", 80, 24);
+        let frame = s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| {
+            panic!("no first frame: {}", s.context())
+        });
+        let foreign = foreign_colors(&s.out[..frame]);
+        assert!(foreign.is_empty(), "{foreign:?}: {}", s.context());
+        s.write(ANSWER);
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
     }
 }

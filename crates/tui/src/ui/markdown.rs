@@ -278,10 +278,12 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(close) = find(&chars, i + 1, "`") {
                 flush(&mut buf, &mut spans);
                 let code: String = chars[i + 1..close].iter().collect();
-                // Colour only. Reverse video paints a filled block behind
-                // every `--flag` and `PLAN.md`, which reads as a heavier
-                // emphasis than the prose it is quoted inside and breaks up
-                // a paragraph you are trying to read straight through.
+                // The terminal's own foreground (which lifts code out of a
+                // dim quote), no plate and no weight. Reverse video paints a
+                // filled block behind every `--flag` and `PLAN.md`, which
+                // reads as a heavier emphasis than the prose it is quoted
+                // inside and breaks up a paragraph you are trying to read
+                // straight through.
                 spans.push(Span::styled(code, base.fg(theme::CODE())));
                 i = close + 1;
                 continue;
@@ -365,15 +367,22 @@ mod tests {
             .iter()
             .find(|span| span.content == "code")
             .unwrap();
-        assert_eq!(code.style.fg, Some(theme::CODE()));
         assert!(code.style.bg.is_none());
+        // Inside a dim quote, code keeps the terminal's own foreground.
+        let quoted = render("> see `PLAN.md` first");
+        let code = quoted[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "PLAN.md")
+            .unwrap();
+        assert_ne!(code.style.fg, Some(theme::DIM()));
     }
 
     /// Inline code is quoted inside prose, so it must never carry a heavier
     /// weight than the emphasis markers around it: no reverse-video plate, no
-    /// bold. Colour alone separates it from the surrounding text.
+    /// bold.
     #[test]
-    fn inline_code_is_lighter_than_the_prose_it_sits_in() {
+    fn inline_code_carries_no_plate_or_weight() {
         let lines = render("run `--recall` before reading `PLAN.md`");
         for name in ["--recall", "PLAN.md"] {
             let span = lines[0]
