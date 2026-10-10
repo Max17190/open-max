@@ -54,12 +54,17 @@ const WHEEL_LINES: usize = 3;
 
 /// How close together two presses on a cell count as one multi-click gesture.
 const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
-/// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
-/// leaves normal scheduler overhead inside a 144 Hz display interval without
-/// busy-spinning. The loop remains event-driven, so idle produces no frames.
-/// It paces agent events, ticks, and machine-speed input; a keystroke paints
+/// Paint-rate cap: about one frame per refresh of a 120 Hz display. The
+/// runtime's timer fires on whole milliseconds and rounds a deadline up, so
+/// a frame held for 7 ms lands about 8 ms after the last (125 a second), and
+/// a wake latency under a millisecond does not add to it. Holding a full
+/// 120 Hz refresh (8.3 ms) would land at 9 ms, fewer frames than the display
+/// refreshes; a shorter cap paints a token firehose faster than a 120 Hz
+/// display shows it, and every frame costs CPU. Faster displays get the
+/// same 125. The loop remains event-driven, so idle produces no frames. It
+/// paces agent events, ticks, and machine-speed input; a keystroke paints
 /// at once (see `paint_pacing`).
-const MIN_DRAW_INTERVAL: Duration = Duration::from_micros(5_500);
+const MIN_DRAW_INTERVAL: Duration = Duration::from_millis(7);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
@@ -645,7 +650,7 @@ async fn event_loop(
 /// One frame, wrapped in a synchronized update so the terminal applies it
 /// atomically: no half-painted frames under tmux or slow connections. The
 /// writer holds ratatui's own flushes until the update is closed, so a frame
-/// within its 256 KiB buffer reaches the terminal in one write(2), the one
+/// within the writer's buffer reaches the terminal in one write(2), the one
 /// `flush_ms` times.
 fn draw_frame<W: std::io::Write>(
     terminal: &mut Terminal<CrosstermBackend<crate::FrameWriter<W>>>,
@@ -4750,11 +4755,71 @@ mod tests {
         assert!(!d.chat && !d.tail && !d.chrome && !d.selection);
     }
 
+    /// Core hands a fast stream to the UI as one batch per 4 ms window, 250 a
+    /// second, and the paint cap holds the frames those batches make. The
+    /// runtime's timer fires on whole milliseconds, so a held frame can only
+    /// land on a millisecond: the one that keeps up with a 120 Hz display
+    /// without outrunning it is the last one inside a 120 Hz refresh. Every
+    /// gap must fall within that millisecond. A shorter gap paints frames a
+    /// 120 Hz display never shows, at the cost of a draw each; a longer one
+    /// leaves a refresh with no new text. Paused time keeps the cadence exact
+    /// on a loaded machine. The clock sits a fraction of a millisecond past
+    /// the tick, as a live loop reads it, and batches land off the frame
+    /// grid, as live ones do.
     #[test]
-    fn paint_budget_supports_144_hz_with_scheduler_headroom() {
-        let display_144hz = std::time::Duration::from_nanos(1_000_000_000 / 144);
-        assert!(MIN_DRAW_INTERVAL < display_144hz);
-        assert!(MIN_DRAW_INTERVAL < std::time::Duration::from_millis(6));
+    fn a_token_firehose_paints_within_a_timer_tick_of_120_hz() {
+        let refresh_120hz = Duration::from_nanos(1_000_000_000 / 120);
+        let timer_tick = Duration::from_millis(1);
+        for phase_us in [100, 500, 900] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let frames = runtime.block_on(async {
+                tokio::time::advance(Duration::from_micros(phase_us)).await;
+                let start = tokio::time::Instant::now();
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                // A second of batches.
+                tokio::spawn(async move {
+                    let batch = Duration::from_millis(4);
+                    let mut every = tokio::time::interval_at(start + timer_tick, batch);
+                    for _ in 0..250 {
+                        every.tick().await;
+                        let _ = tx.send(());
+                    }
+                });
+                // The event loop's pacing: the first frame paints before any
+                // batch, then each batch paints now or holds to the deadline.
+                let mut last_draw = start.into_std();
+                let (mut frames, mut deadline) = (vec![last_draw], None);
+                loop {
+                    tokio::select! {
+                        biased;
+                        batch = rx.recv() => if batch.is_none() { break },
+                        _ = tokio::time::sleep_until(deadline.unwrap_or(last_draw).into()),
+                            if deadline.is_some() => {}
+                    }
+                    let now = tokio::time::Instant::now().into_std();
+                    match paint_pacing(now, last_draw, false, None, Wake::Other) {
+                        Paint::Now => {
+                            frames.push(now);
+                            (last_draw, deadline) = (now, None);
+                        }
+                        Paint::At(when) => deadline = Some(when),
+                    }
+                }
+                frames
+            });
+            for pair in frames.windows(2) {
+                let gap = pair[1] - pair[0];
+                assert!(
+                    gap > refresh_120hz - timer_tick && gap <= refresh_120hz,
+                    "{} frames for a second of batches, two of them {gap:?} apart (clock {phase_us} us past the tick)",
+                    frames.len()
+                );
+            }
+        }
     }
 
     /// A keystroke frame costs well under a millisecond, so holding it to the
