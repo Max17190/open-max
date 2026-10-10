@@ -1219,10 +1219,10 @@ fn watch_quit_signals(_: bool) -> std::sync::Arc<tokio::sync::Notify> {
 /// The signal behind the last quit, recorded before the quit is notified.
 static QUIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-/// How long a stopping print or stdio run waits for its cancelled turn: the
-/// longest a cancelled command takes to settle, then a second for the rest
-/// of the turn (its transcript save and its `turn_end` hooks). A turn still
-/// running after that is abandoned, and its tool groups, a slow hook's
+/// How long a stopping session, in any mode, waits for its cancelled turns:
+/// the longest a cancelled command takes to settle, then a second for the
+/// rest of the turn (its transcript save and its `turn_end` hooks). A turn
+/// still running after that is abandoned, and its tool groups, a slow hook's
 /// included, are killed on the way out.
 pub(crate) const STOP_SETTLE: std::time::Duration =
     open_max_core::execution::CANCEL_SETTLE.saturating_add(std::time::Duration::from_secs(1));

@@ -491,11 +491,45 @@ pub async fn run(
     let result =
         event_loop(&mut terminal, &mut app, &mut core_rx, &mut files_rx, &args.quit).await;
     // The quit's last strong handle goes with the loop, so a signal during
-    // the discard below exits at once instead of waiting on it.
+    // the stop and the discard below exits at once instead of waiting on them.
     drop(args);
+    stop_running_work(&app.core, terminal, &mut core_rx).await;
     // Every way out of the loop, a failed terminal included, leaves here.
     let warnings = app.discard_created_sessions_on_exit();
     (result, warnings)
+}
+
+/// Cancel every turn still running when the session ends, as Esc does, and
+/// wait for each to settle: its tools' process groups get SIGTERM before
+/// SIGKILL, and it saves its cancelled stop and runs its `turn_end` hooks.
+/// Left to the runtime's shutdown, a turn is dropped mid-step instead: its
+/// tools are killed outright, with no chance to clean up, and its transcript
+/// ends at a call that never got an answer. The terminal goes back to the
+/// shell first, so the quit shows at once. The wait is bounded as a print
+/// run's stop is, and a signal during it exits at once.
+async fn stop_running_work(
+    core: &Core,
+    terminal: Term,
+    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
+) {
+    let running: Vec<String> = core.running.lock().unwrap().iter().cloned().collect();
+    if running.is_empty() {
+        return;
+    }
+    for id in &running {
+        core.cancel(id);
+    }
+    drop(terminal);
+    crate::restore_terminal();
+    let settle_by = tokio::time::Instant::now() + crate::STOP_SETTLE;
+    // A turn leaves `running` before it sends its last event, so each event
+    // is the moment to look again.
+    while !core.running.lock().unwrap().is_empty() {
+        match tokio::time::timeout_at(settle_by, core_rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 async fn event_loop(
@@ -996,11 +1030,11 @@ impl App {
         }
     }
 
-    /// Quitting leaves the current session too, and nothing will settle the
-    /// ones still running: their turns end with the process. The discard
-    /// decides under the store lock, so a turn that saved in time still
-    /// keeps its session. Returns the failures, for the shell to print once
-    /// the terminal is restored.
+    /// Quitting leaves the current session too. A turn the quit's stop did
+    /// not see settle ends with the process. The discard decides under the
+    /// store lock, so a turn that saved in time still keeps its session.
+    /// Returns the failures, for the shell to print once the terminal is
+    /// restored.
     fn discard_created_sessions_on_exit(&mut self) -> Vec<String> {
         let mut ids = std::mem::take(&mut self.left_running);
         ids.extend(self.session_id.clone().filter(|_| self.created_session));

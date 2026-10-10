@@ -2603,18 +2603,50 @@ fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
     assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("stop")), "{done}");
 }
 
-/// A supervisor stops a TUI session with a signal. The session ends through
-/// its normal exit path, which hands the terminal back, and then exits 128
-/// plus the signal's number: a wrapper that read 0 took the stop for a
-/// /quit. It returns through main, so the runtime's shutdown drops the
-/// command still running, and the command's group guard kills the tool tree
-/// it left behind, which `kill_on_drop` alone would leave running.
-#[test]
-fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
-    let (project, home) = fresh_dirs("sigterm-tui");
-    let pid_file = project.parent().unwrap().join("pids");
+/// How a test ends a TUI session while its tool runs.
+enum Stop {
+    Signal(libc::c_int),
+    Keys(&'static [u8]),
+    /// /quit, then this signal once the full screen has closed, while the
+    /// quit still waits for the turn to stop.
+    QuitThenSignal(libc::c_int),
+    /// The terminal goes away: its controller closes, as when a tab closes,
+    /// a multiplexer pane is killed, or an ssh link drops.
+    Hangup,
+}
+
+/// What became of a TUI session stopped while its one bash call ran.
+struct TuiStop {
+    status: std::process::ExitStatus,
+    /// Whether the full screen was closed (unknowable after a hangup).
+    handed_back: bool,
+    /// Tool processes still alive once the tree had time to go. They are
+    /// killed before the stop returns, so a failing assertion leaks nothing.
+    survivors: Vec<i32>,
+    /// Whether the call's shell ran its SIGTERM trap: a stop that kills the
+    /// tree outright gives a tool no chance to clean up.
+    trapped: bool,
+    /// Everything the session saved.
+    transcript: String,
+}
+
+/// Start the TUI as a terminal's session leader in a pseudo-terminal, submit
+/// a prompt the model answers with one bash call that leaves a tree behind,
+/// and end the session with `stop` once the tree runs. The call's shell
+/// waits on a background child, as a build or a dev server's shell does,
+/// and records a SIGTERM, or with `ignores_term` ignores it, so the stop
+/// waits out the grace before its SIGKILL.
+fn stop_the_tui_mid_tool(tag: &str, ignores_term: bool, stop: Stop) -> TuiStop {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (project, home) = fresh_dirs(tag);
+    let base = project.parent().unwrap().to_path_buf();
+    let pid_file = base.join("pids");
+    let trap_file = base.join("trapped");
+    let on_term = if ignores_term { String::new() } else { format!("echo > \"{}\"; exit", trap_file.display()) };
     let script = format!(
-        "echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+        "trap '{on_term}' TERM; echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; wait",
         p = pid_file.display()
     );
     let (base_url, _requests, _server) = spawn_scripted_server(vec![
@@ -2625,36 +2657,63 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
     let (pty, terminal) = pseudo_terminal();
     let size = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCSWINSZ reads one winsize from a live descriptor.
-    unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&terminal), libc::TIOCSWINSZ, &size) };
-    let mut child = cmd(&project, &home)
+    unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    let mut command = cmd(&project, &home);
+    command
         .arg("--trust-project")
         .env("TERM", "xterm-256color")
         .stdin(terminal.try_clone().unwrap())
         .stdout(terminal.try_clone().unwrap())
-        .stderr(terminal)
-        .spawn()
-        .unwrap();
-    // A terminal nobody reads stops the writer, so the screen is drained on
-    // a thread for as long as the session holds it.
-    let screen = Arc::new(Mutex::new(Vec::new()));
-    let mut reader = pty.try_clone().unwrap();
-    let drained = screen.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
+        .stderr(terminal);
+    // SAFETY: setsid and ioctl are async-signal-safe, and nothing else runs
+    // between fork and exec. The terminal becomes the session's controlling
+    // terminal, so closing its controller sends the hangup a real one does.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-            drained.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    // A terminal nobody reads stops the writer, so the screen is drained on
+    // a thread for as long as the session holds it. The thread polls, so a
+    // hangup can close its descriptor too.
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let hung_up = Arc::new(AtomicBool::new(false));
+    let mut reader = pty.try_clone().unwrap();
+    let (drained, hang) = (screen.clone(), hung_up.clone());
+    let reading = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while !hang.load(Ordering::SeqCst) {
+            let mut ready = libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one pollfd for a descriptor this thread owns.
+            if unsafe { libc::poll(&mut ready, 1, 20) } <= 0 {
+                continue;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained.lock().unwrap().extend_from_slice(&buf[..n]),
+            }
         }
     });
     let shown = |bytes: &[u8]| screen.lock().unwrap().windows(bytes.len()).any(|w| w == bytes);
+    let recorded = || -> Vec<i32> {
+        let pids = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        pids.lines().filter_map(|l| l.trim().parse().ok()).collect()
+    };
     let wait_for = |what: &str, done: &dyn Fn() -> bool, child: &mut std::process::Child| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !done() {
             if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
                 let _ = child.kill();
                 let _ = child.wait();
+                for pid in recorded() {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                let _ = std::fs::remove_dir_all(&base);
                 panic!("{what}: {}", String::from_utf8_lossy(&screen.lock().unwrap()));
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2663,17 +2722,26 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
     // The keyboard protocol query goes out behind the first frame. Answered
     // as a terminal without the protocol, input starts at once.
     wait_for("the TUI never asked about the keyboard", &|| shown(b"\x1b[?u"), &mut child);
-    let mut keys = pty.try_clone().unwrap();
+    let mut keys = pty;
     keys.write_all(b"\x1b[?62cstart the tree\r").unwrap();
-    let pids = || -> Vec<i32> {
-        let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
-        recorded.lines().filter_map(|l| l.trim().parse().ok()).collect()
-    };
-    wait_for("the tool tree never started", &|| pids().len() == 2, &mut child);
-    let pids = pids();
-    let restored_before = shown(b"\x1b[?1049l");
+    wait_for("the tool tree never started", &|| recorded().len() == 2, &mut child);
+    let pids = recorded();
+    let left_early = shown(b"\x1b[?1049l");
 
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    match stop {
+        Stop::Signal(signal) => unsafe {
+            libc::kill(child.id() as libc::pid_t, signal);
+        },
+        Stop::Keys(bytes) => keys.write_all(bytes).unwrap(),
+        Stop::QuitThenSignal(signal) => {
+            keys.write_all(b"/quit\r").unwrap();
+            wait_for("the quit never closed the full screen", &|| shown(b"\x1b[?1049l"), &mut child);
+            unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+        }
+        // The reader's descriptor is the other one; it closes within a poll.
+        Stop::Hangup => hung_up.store(true, Ordering::SeqCst),
+    }
+    drop(keys);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -2686,6 +2754,13 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
+    // The session's end closes the terminal, so the reader drains what is
+    // left and stops by itself.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !reading.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    hung_up.store(true, Ordering::SeqCst);
     let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while pids.iter().any(alive) && std::time::Instant::now() < deadline {
@@ -2695,12 +2770,79 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
     for pid in &survivors {
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
-    let screen_text = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
-    drop(pty);
-    let _ = std::fs::remove_dir_all(project.parent().unwrap());
-    let status = status.expect("SIGTERM did not end the TUI");
-    assert!(!restored_before, "the alternate screen was left before the signal");
-    assert!(screen_text.contains("\x1b[?1049l"), "the terminal was not handed back: {screen_text:?}");
-    assert_eq!(status.code(), Some(143), "{status:?}");
-    assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}");
+    let handed_back = shown(b"\x1b[?1049l");
+    let trapped = trap_file.exists();
+    let transcript = std::fs::read_dir(home.join(".openmax").join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect();
+    let _ = std::fs::remove_dir_all(&base);
+    let screen = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+    assert!(!left_early, "the full screen closed before the stop: {screen:?}");
+    let status = status.unwrap_or_else(|| panic!("the stop did not end the TUI: {screen:?}"));
+    TuiStop { status, handed_back, survivors, trapped, transcript }
+}
+
+/// The checks every stop of a running TUI turn shares: the turn is cancelled
+/// through the cancel Esc uses rather than dropped with the process, so none
+/// of its tools outlives the session and its transcript records the
+/// cancelled call.
+fn assert_stopped_like_a_cancel(stop: &TuiStop) {
+    assert!(stop.survivors.is_empty(), "tool processes outlived the session: {:?}", stop.survivors);
+    assert!(
+        stop.transcript.contains("command cancelled by user"),
+        "the transcript does not record the cancelled call: {}",
+        stop.transcript
+    );
+}
+
+/// A supervisor stops a TUI session with a signal. The session ends as
+/// /quit ends it, asking its tool to stop before killing it, and then exits
+/// 128 plus the signal's number: a wrapper that read 0 took the stop for a
+/// /quit.
+#[test]
+fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
+    let stop = stop_the_tui_mid_tool("sigterm-tui", false, Stop::Signal(libc::SIGTERM));
+    assert_stopped_like_a_cancel(&stop);
+    assert!(stop.trapped, "the tool was killed without being asked to stop first");
+    assert!(stop.handed_back, "the full screen was not closed");
+    assert_eq!(stop.status.code(), Some(143), "{:?}", stop.status);
+}
+
+/// /quit while a tool runs cancels the turn instead of leaving it to end
+/// with the process: the tool's group gets SIGTERM, then SIGKILL, and the
+/// cancelled call is saved, so a resumed session shows where it stopped.
+#[test]
+fn quit_cancels_the_running_turn_before_the_tui_exits() {
+    let stop = stop_the_tui_mid_tool("quit-tui", false, Stop::Keys(b"/quit\r"));
+    assert_stopped_like_a_cancel(&stop);
+    assert!(stop.trapped, "the tool was killed without being asked to stop first");
+    assert!(stop.handed_back, "the full screen was not closed");
+    assert_eq!(stop.status.code(), Some(0), "{:?}", stop.status);
+}
+
+/// A terminal that goes away mid-tool sends SIGHUP, and every write to it
+/// fails from then on. The session still stops its turn as any signal does
+/// and exits 129; a cursor write that panicked on the dead terminal on the
+/// way out made it exit 101 instead.
+#[test]
+fn a_terminal_hangup_stops_the_tui_with_its_status() {
+    let stop = stop_the_tui_mid_tool("hangup-tui", false, Stop::Hangup);
+    assert_stopped_like_a_cancel(&stop);
+    assert!(stop.trapped, "the tool was killed without being asked to stop first");
+    assert_eq!(stop.status.code(), Some(129), "{:?}", stop.status);
+}
+
+/// A signal that lands while a quit waits for its turn is a stop like the
+/// first: the turn still settles and saves its cancelled call, and the
+/// session exits with the signal's status. A closing terminal's SIGHUP lands
+/// there whenever its input ends the session first. The tool ignores
+/// SIGTERM, so the wait lasts the grace before the SIGKILL.
+#[test]
+fn a_signal_during_the_quits_wait_lets_the_turn_settle() {
+    let stop = stop_the_tui_mid_tool("quit-then-sigterm-tui", true, Stop::QuitThenSignal(libc::SIGTERM));
+    assert_stopped_like_a_cancel(&stop);
+    assert_eq!(stop.status.code(), Some(143), "{:?}", stop.status);
 }

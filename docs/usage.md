@@ -96,7 +96,10 @@ stopped reading holds stdout full, the run cannot act on the first signal,
 and only a second one ends it. A signal the run inherited as ignored, as
 under `nohup`, stays ignored. The TUI, where Ctrl+C is a key, ends the
 session on one of these signals as `/quit` does, then exits with the same
-status, unless its terminal has already gone away.
+status, even when its terminal has gone away. `/quit` stops a running turn
+the same way: the full screen closes at once, and openmax waits at most 3
+seconds for the turn to end; a signal during that wait sets the exit
+status, and a second exits at once.
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
