@@ -1299,16 +1299,24 @@ pub(crate) async fn until_stopped<T: Send + 'static>(
 /// thread and a stop bounds it like the turn: it gets what is left of the
 /// stop's deadline (`stop_by`), a signal that lands during it sets one, and
 /// a deadline already past skips it. The session then stays indexed, and
-/// the run exits on time.
+/// the run exits on time. Only an empty session is reported as kept: one
+/// with history was never to be removed, and the lock-free check for that
+/// runs whether or not the deadline left time for the removal.
 pub(crate) async fn discard_empty_session(
     core: &std::sync::Arc<Core>,
     session_id: &str,
     quit: &tokio::sync::Notify,
     stop_by: Option<std::time::Instant>,
 ) {
-    let stopped = || format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed");
+    let stopped = || {
+        if open_max_core::sessions::backed(core, session_id) {
+            Ok(false)
+        } else {
+            Err(format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed"))
+        }
+    };
     let removed = if stop_by.is_some_and(|by| by <= std::time::Instant::now()) {
-        Err(stopped())
+        stopped()
     } else {
         let discard = tokio::task::spawn_blocking({
             let (core, session_id) = (core.clone(), session_id.to_string());
@@ -1325,7 +1333,7 @@ pub(crate) async fn discard_empty_session(
                     expiry = Some(deadline(std::time::Instant::now() + STOP_SETTLE));
                 }
                 _ = async { if let Some(expiry) = expiry.as_mut() { let _ = expiry.await; } },
-                    if expiry.is_some() => break Err(stopped()),
+                    if expiry.is_some() => break stopped(),
             }
         }
     };

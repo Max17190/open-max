@@ -2694,6 +2694,11 @@ enum IndexHeld {
     /// one left to drive the runtime's timers: no runtime timer fires until
     /// the lock is free.
     AfterTheModelHungUp,
+    /// While a stdio session's second turn waits on a model that never
+    /// answers, once its first turn finished and saved history. The session
+    /// is not empty, so the stop must keep it without a warning, even when
+    /// the deadline passes before the empty-session check gets its turn.
+    AfterASavedTurn,
 }
 
 /// A signal must end a print or stdio run within the stop's deadline
@@ -2702,7 +2707,7 @@ enum IndexHeld {
 /// long as the other process kept the lock, so that only a second signal
 /// ended the run. The run must exit
 /// 143 within the deadline, plus half of it for the exit itself, and say so
-/// when the empty session it created stays indexed.
+/// when the empty session it created stays indexed, and only then.
 fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     // The binary's STOP_SETTLE: a cancelled command's settle, then a second
     // for the rest of the turn.
@@ -2713,9 +2718,21 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
     // An endpoint that takes one request and stops listening. Unless it
     // hangs up, the turn stays in that first model request, so nothing of
-    // it is saved.
+    // it is saved. After a saved turn, the request it takes is the second:
+    // the first gets a finished answer.
     let (asked, request) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        if held == IndexHeld::AfterASavedTurn {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let _ = read_request(&mut stream);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{HELLO_SSE}",
+                    HELLO_SSE.len()
+                )
+                .as_bytes(),
+            );
+        }
         let Ok((mut stream, _)) = listener.accept() else { return };
         let _ = read_request(&mut stream);
         let _ = asked.send(stream);
@@ -2789,6 +2806,29 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
             // Time for the session to read the command and start the turn.
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
+        IndexHeld::AfterASavedTurn => {
+            let stdin = stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"cmd":"user","text":"one"}}"#).unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stdout.read_line(&mut line).unwrap_or(0) == 0 {
+                    fail(&mut child, "the stream ended before the first turn's done");
+                }
+                if line.contains(r#""type":"done""#) {
+                    break;
+                }
+            }
+            if !line.contains(r#""stop_reason":"stop""#) {
+                fail(&mut child, &format!("the first turn did not finish: {line}"));
+            }
+            writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
+            match request.recv_timeout(wait) {
+                Ok(stream) => endpoint = Some(stream),
+                Err(_) => fail(&mut child, "the second turn never asked the endpoint"),
+            }
+            take_lock(&index_lock);
+        }
         IndexHeld::DuringTheTurn | IndexHeld::AfterTheModelHungUp => {
             if let Some(stdin) = stdin.as_mut() {
                 writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
@@ -2838,6 +2878,11 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
             let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
             assert!(listed.is_empty(), "{tag}: the session opened under the signal stayed indexed: {index}");
         }
+        IndexHeld::AfterASavedTurn => {
+            assert!(!stderr.contains("stays indexed"), "{tag}: a session with history was reported empty: {stderr}");
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
+            assert_eq!(listed.len(), 1, "{tag}: the session with history left the index: {index}");
+        }
         IndexHeld::FreedAfterTheSignal => {
             let done = last_event(rest.as_bytes());
             assert_eq!(
@@ -2872,6 +2917,11 @@ fn a_signal_ends_a_fresh_print_run_on_time_after_the_model_hung_up_while_the_ses
         &["--json", "-p", "wait"],
         IndexHeld::AfterTheModelHungUp,
     );
+}
+
+#[test]
+fn a_signal_keeps_a_stdio_session_with_history_without_a_warning_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-stdio-saved", &["--stdio"], IndexHeld::AfterASavedTurn);
 }
 
 #[test]
