@@ -1380,6 +1380,20 @@ mod tests {
         assert!(!live_groups().contains(&leader), "the settled group {leader} is still listed");
     }
 
+    /// Forgetting a settled group keeps every other on the list, so the
+    /// exit's kill still reaches the groups of commands still running. The
+    /// list is shared by every command in the process, so this is checked
+    /// on a list of its own.
+    #[test]
+    fn forgetting_a_group_keeps_the_others() {
+        let mut live = vec![11, 22, 33];
+        forget(&mut live, 22);
+        live.sort_unstable();
+        assert_eq!(live, [11, 33]);
+        forget(&mut live, 44);
+        assert_eq!(live, [11, 33], "forgetting an unlisted group changed the list");
+    }
+
     /// The human attestation never reaches an agent-spawned child, even when
     /// the harness itself was launched under one: otherwise a bash call
     /// could unset the session marker and inherit a ready-made bypass.
