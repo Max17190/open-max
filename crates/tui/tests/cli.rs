@@ -2809,6 +2809,15 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         IndexHeld::AfterASavedTurn => {
             let stdin = stdin.as_mut().unwrap();
             writeln!(stdin, r#"{{"cmd":"user","text":"one"}}"#).unwrap();
+            // A first turn that never ends would hold the read below: past
+            // the wait, the run is killed, which ends its stdout.
+            let (turn_ended, watch) = std::sync::mpsc::channel::<()>();
+            let pid = child.id() as libc::pid_t;
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(wait) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            });
             let mut line = String::new();
             loop {
                 line.clear();
@@ -2819,6 +2828,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
                     break;
                 }
             }
+            let _ = turn_ended.send(());
             if !line.contains(r#""stop_reason":"stop""#) {
                 fail(&mut child, &format!("the first turn did not finish: {line}"));
             }
