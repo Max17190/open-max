@@ -12,7 +12,7 @@ use open_max_core::state::Core;
 use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use tokio::sync::{mpsc, Notify};
-use tokio::time::Instant;
+use std::time::Instant;
 
 pub struct HeadlessArgs {
     /// One or more user prompts; each runs as a sequential turn on the same session.
@@ -167,7 +167,7 @@ async fn run_turn_events(
     // its done, which arrives once the tools are stopped; returning at once
     // would exit with them running.
     let mut stopping: Option<i32> = None;
-    let mut settle_by = Instant::now();
+    let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
     let quit = args.quit.notified();
     tokio::pin!(quit);
 
@@ -188,13 +188,13 @@ async fn run_turn_events(
             _ = &mut quit, if stopping.is_none() => {
                 core.cancel(session_id);
                 stopping = Some(crate::quit_status());
-                settle_by = Instant::now() + crate::STOP_SETTLE;
-                *stop_by = Some(settle_by);
+                let by = Instant::now() + crate::STOP_SETTLE;
+                *stop_by = Some(by);
+                settle = Some(crate::deadline(by));
                 continue;
             }
-            _ = tokio::time::sleep_until(settle_by), if stopping.is_some() => {
-                return stopping.unwrap_or(1);
-            }
+            _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
+                if settle.is_some() => return stopping.unwrap_or(1),
         };
 
         if env.session_id != session_id {

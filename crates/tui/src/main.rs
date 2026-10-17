@@ -1239,6 +1239,21 @@ pub(crate) fn signalled() -> bool {
     QUIT_SIGNAL.load(Ordering::SeqCst) != 0
 }
 
+/// Resolves at `at`, timed by a thread of its own instead of the runtime's
+/// timer, so a stop's deadline holds whatever the runtime is doing. A
+/// runtime worker blocked in a lock wait (a cancelled turn saving its
+/// transcript while another process holds the session index) can be the one
+/// left to drive that timer, and then no runtime timer fires until the lock
+/// is free. Should the thread fail to start, it resolves at once.
+pub(crate) fn deadline(at: std::time::Instant) -> tokio::sync::oneshot::Receiver<()> {
+    let (expired, deadline) = tokio::sync::oneshot::channel();
+    let _ = std::thread::Builder::new().name("stop-deadline".into()).spawn(move || {
+        std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+        let _ = expired.send(());
+    });
+    deadline
+}
+
 /// Run `work`, a print or stdio run's session setup or the start of one of
 /// its turns, on a blocking thread unless a signal (`quit`) lands first.
 /// Both wait on the session index lock, which another openmax process on the
@@ -1271,10 +1286,10 @@ pub(crate) async fn discard_empty_session(
     core: &std::sync::Arc<Core>,
     session_id: &str,
     quit: &tokio::sync::Notify,
-    mut stop_by: Option<tokio::time::Instant>,
+    stop_by: Option<std::time::Instant>,
 ) {
     let stopped = || format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed");
-    let removed = if stop_by.is_some_and(|by| by <= tokio::time::Instant::now()) {
+    let removed = if stop_by.is_some_and(|by| by <= std::time::Instant::now()) {
         Err(stopped())
     } else {
         let discard = tokio::task::spawn_blocking({
@@ -1284,14 +1299,15 @@ pub(crate) async fn discard_empty_session(
         tokio::pin!(discard);
         let quit = quit.notified();
         tokio::pin!(quit);
+        let mut expiry = stop_by.map(deadline);
         loop {
             tokio::select! {
                 joined = &mut discard => break joined.unwrap_or_else(|e| Err(e.to_string())),
-                _ = &mut quit, if stop_by.is_none() => {
-                    stop_by = Some(tokio::time::Instant::now() + STOP_SETTLE);
+                _ = &mut quit, if expiry.is_none() => {
+                    expiry = Some(deadline(std::time::Instant::now() + STOP_SETTLE));
                 }
-                _ = tokio::time::sleep_until(stop_by.unwrap_or_else(tokio::time::Instant::now)),
-                    if stop_by.is_some() => break Err(stopped()),
+                _ = async { if let Some(expiry) = expiry.as_mut() { let _ = expiry.await; } },
+                    if expiry.is_some() => break Err(stopped()),
             }
         }
     };

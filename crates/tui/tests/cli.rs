@@ -2679,12 +2679,19 @@ enum IndexHeld {
     /// nothing is saved, so the stop removes the empty session, and that
     /// removal waits on the lock.
     DuringTheTurn,
+    /// Once the model hung up on a fresh run's first request and stopped
+    /// listening, so the turn is retrying. The cancelled turn's save then
+    /// waits on the lock inside a runtime worker, and that worker can be the
+    /// one left to drive the runtime's timers: no runtime timer fires until
+    /// the lock is free.
+    AfterTheModelHungUp,
 }
 
 /// A signal must end a print or stdio run within the stop's deadline
-/// wherever the run is waiting on the session index lock. Each of these
-/// waits held the first signal unanswered for as long as the other process
-/// kept the lock, and only a second signal ended the run. The run must exit
+/// wherever the run, or its cancelled turn, is waiting on the session index
+/// lock. Each of these waits could hold the first signal unanswered for as
+/// long as the other process kept the lock, so that only a second signal
+/// ended the run. The run must exit
 /// 143 within the deadline, plus half of it for the exit itself, and say so
 /// when the empty session it created stays indexed.
 fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
@@ -2695,8 +2702,9 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     let (project, home) = fresh_dirs(tag);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
-    // An endpoint that takes the request and never answers: the turn stays
-    // in its first model request, so nothing of it is saved.
+    // An endpoint that takes one request and stops listening. Unless it
+    // hangs up, the turn stays in that first model request, so nothing of
+    // it is saved.
     let (asked, request) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let Ok((mut stream, _)) = listener.accept() else { return };
@@ -2741,6 +2749,8 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         })
     };
     let wait = std::time::Duration::from_secs(10);
+    // The model's connection, held open while the turn waits on it.
+    let mut endpoint = None;
     let fail = |child: &mut std::process::Child, what: &str| -> ! {
         let _ = child.kill();
         let _ = child.wait();
@@ -2766,12 +2776,14 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
             // Time for the session to read the command and start the turn.
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        IndexHeld::DuringTheTurn => {
+        IndexHeld::DuringTheTurn | IndexHeld::AfterTheModelHungUp => {
             if let Some(stdin) = stdin.as_mut() {
                 writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
             }
-            if request.recv_timeout(wait).is_err() {
-                fail(&mut child, "the turn never asked the endpoint");
+            match request.recv_timeout(wait) {
+                Ok(stream) if held == IndexHeld::DuringTheTurn => endpoint = Some(stream),
+                Ok(hung_up) => drop(hung_up),
+                Err(_) => fail(&mut child, "the turn never asked the endpoint"),
             }
             take_lock();
         }
@@ -2790,7 +2802,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     };
     let elapsed = signalled.elapsed();
     let _ = child.wait();
-    drop(index_lock);
+    drop((index_lock, endpoint));
     drop(stdin);
     let stderr = stderr.join().unwrap();
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
@@ -2812,6 +2824,20 @@ fn a_signal_ends_a_fresh_stdio_session_on_time_while_the_session_index_is_held()
 #[test]
 fn a_signal_ends_a_fresh_print_run_on_time_while_the_session_index_is_held() {
     stop_with_the_session_index_held("index-held-print", &["--json", "-p", "wait"], IndexHeld::DuringTheTurn);
+}
+
+#[test]
+fn a_signal_ends_a_fresh_stdio_session_on_time_after_the_model_hung_up_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-stdio-hung-up", &["--stdio"], IndexHeld::AfterTheModelHungUp);
+}
+
+#[test]
+fn a_signal_ends_a_fresh_print_run_on_time_after_the_model_hung_up_while_the_session_index_is_held() {
+    stop_with_the_session_index_held(
+        "index-held-print-hung-up",
+        &["--json", "-p", "wait"],
+        IndexHeld::AfterTheModelHungUp,
+    );
 }
 
 #[test]

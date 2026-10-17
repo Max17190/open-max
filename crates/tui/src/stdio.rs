@@ -45,7 +45,7 @@ use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
 use tokio::sync::{mpsc, Notify};
-use tokio::time::Instant;
+use std::time::Instant;
 
 pub const PROTO: &str = "openmax-stdio/6";
 /// Machine-comparable protocol major. A client negotiates on this integer;
@@ -241,7 +241,7 @@ async fn drive_loop<W: Write>(
     // Set by a signal: the status the session exits with, and when it stops
     // waiting for the cancelled turn.
     let mut stopping: Option<i32> = None;
-    let mut settle_by = Instant::now();
+    let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
     let quit = quit.notified();
     tokio::pin!(quit);
 
@@ -260,12 +260,12 @@ async fn drive_loop<W: Write>(
                 }
                 core.cancel(&session_id);
                 stopping = Some(crate::quit_status());
-                settle_by = Instant::now() + crate::STOP_SETTLE;
-                *stop_by = Some(settle_by);
+                let by = Instant::now() + crate::STOP_SETTLE;
+                *stop_by = Some(by);
+                settle = Some(crate::deadline(by));
             }
-            _ = tokio::time::sleep_until(settle_by), if stopping.is_some() => {
-                return stopping.unwrap_or(exit_code);
-            }
+            _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
+                if settle.is_some() => return stopping.unwrap_or(exit_code),
             cmd = stdin_rx.recv(), if !closing => {
                 match cmd {
                     None | Some(Ok(Command::Quit)) => {
