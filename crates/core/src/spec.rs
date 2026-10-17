@@ -962,6 +962,10 @@ Commands, one JSON object per line:
   `protocol_error` while a turn is in flight.
 - {"cmd":"cancel"} cancels the running turn.
 - {"cmd":"quit"} drains the in-flight turn, then exits. EOF behaves like quit.
+  SIGTERM, SIGINT, or SIGHUP cancels that turn instead, and exits 128 plus
+  the signal number after its `done` and the removal of a new session that
+  saved nothing, or after 3 seconds at most, plus up to 250 ms for a tool
+  command still being started.
 Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
 session continues; extra fields on a known command are ignored; blank lines
 are skipped.

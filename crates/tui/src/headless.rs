@@ -11,13 +11,16 @@ use open_max_core::sessions;
 use open_max_core::state::Core;
 use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use std::time::Instant;
 
 pub struct HeadlessArgs {
     /// One or more user prompts; each runs as a sequential turn on the same session.
     pub prompts: Vec<String>,
     pub continue_session: bool,
     pub json: bool,
+    /// Notified on SIGTERM, SIGINT, or SIGHUP (see `watch_quit_signals`).
+    pub quit: Arc<Notify>,
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
@@ -31,42 +34,60 @@ pub async fn run(
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_key = project.display().to_string();
 
-    let session_id = if args.continue_session {
-        match sessions::latest(&core, &project_key) {
-            Ok(Some(meta)) => meta.id,
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                return 2;
-            }
-            Err(e) => {
-                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(&core, e)));
-                return 1;
-            }
-        }
-    } else {
-        match sessions::create(&core, project_key) {
-            Ok(meta) => meta.id,
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(&core, e);
-                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
-                return 1;
-            }
-        }
+    // Finding or creating the session waits on the session index lock.
+    let setup = {
+        let (core, continue_session) = (core.clone(), args.continue_session);
+        move || open_session(&core, project_key, continue_session)
+    };
+    let mut stop_by = None;
+    let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
+        return crate::quit_status();
+    };
+    let session_id = match opened {
+        Ok(session_id) => session_id,
+        Err(code) => return code,
     };
 
-    let code = run_prompts(&core, &mut core_rx, &session_id, &args).await;
+    // A signal that landed while the session opened leaves no turn to run.
+    let code = if stop_by.is_some() {
+        crate::quit_status()
+    } else {
+        run_prompts(&core, &mut core_rx, &session_id, &args, &mut stop_by).await
+    };
     // A run whose every turn ended before anything was persisted (an endpoint
     // that never resolved, a prompt a gate refused) leaves an index entry with
     // nothing behind it.
     if !args.continue_session {
-        if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
-            let e = sessions::refusal_with_repair(&core, e);
-            // The reason quotes the index path, an authored byte string, so it
-            // is flattened like every other harness line on this stream.
-            eprintln!("openmax: warning: the empty session {session_id} stays indexed: {}", one_line(&e));
-        }
+        crate::discard_empty_session(&core, &session_id, &args.quit, stop_by).await;
     }
     code
+}
+
+/// The latest session here, or a new one: Ok(its id), or Err(the exit
+/// status) once the reason is on stderr.
+fn open_session(core: &Core, project_key: String, continue_session: bool) -> Result<String, i32> {
+    if continue_session {
+        match sessions::latest(core, &project_key) {
+            Ok(Some(meta)) => Ok(meta.id),
+            Ok(None) => {
+                eprintln!("openmax: no prior session in this directory to continue");
+                Err(2)
+            }
+            Err(e) => {
+                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(core, e)));
+                Err(1)
+            }
+        }
+    } else {
+        match sessions::create(core, project_key) {
+            Ok(meta) => Ok(meta.id),
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(core, e);
+                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
+                Err(1)
+            }
+        }
+    }
 }
 
 async fn run_prompts(
@@ -74,6 +95,7 @@ async fn run_prompts(
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: &str,
     args: &HeadlessArgs,
+    stop_by: &mut Option<Instant>,
 ) -> i32 {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut exit_code = 0i32;
@@ -81,17 +103,29 @@ async fn run_prompts(
     let mut stderr = io::stderr();
 
     for prompt in &args.prompts {
+        // A signal that landed as the previous turn ended stops the run here,
+        // before the next prompt is recorded and its hooks run.
+        if crate::signalled() {
+            break;
+        }
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
         // would, so hooks and the transcript see the expanded text.
-        if let Err(e) = agent::start_turn(
-            core.clone(),
-            session_id.to_string(),
-            project.clone(),
-            templates::expand_user_input(&core.data_dir, &project, prompt),
-        ) {
-            eprintln!("openmax: {e}");
-            return 1;
+        let text = templates::expand_user_input(&core.data_dir, &project, prompt);
+        // Starting a turn claims the session, which waits on the session
+        // index lock.
+        let start = {
+            let (core, session_id, project) = (core.clone(), session_id.to_string(), project.clone());
+            move || agent::start_turn(core, session_id, project, text)
+        };
+        // A turn started under a signal is stopped by `run_turn_events`.
+        match crate::until_stopped(args.quit.notified(), stop_by, start).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                eprintln!("openmax: {e}");
+                return 1;
+            }
+            None => return crate::quit_status(),
         }
 
         let mut saw_tokens = false;
@@ -99,10 +133,11 @@ async fn run_prompts(
             core,
             core_rx,
             session_id,
-            args.json,
+            args,
             &mut saw_tokens,
             &mut stdout,
             &mut stderr,
+            stop_by,
         )
         .await;
         if turn_exit != 0 {
@@ -116,27 +151,58 @@ async fn run_prompts(
     exit_code
 }
 
+/// `stop_by` holds the stop's deadline once a signal lands, here or while
+/// a turn starts; the empty-session cleanup after the run is held to it too.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_events(
     core: &Arc<Core>,
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: &str,
-    json: bool,
+    args: &HeadlessArgs,
     saw_tokens: &mut bool,
     stdout: &mut io::Stdout,
     stderr: &mut io::Stderr,
+    stop_by: &mut Option<Instant>,
 ) -> i32 {
+    let json = args.json;
     let mut exit_code = 0i32;
     // Whether this turn's error line is already on stderr.
     let mut error_printed = false;
+    // Once a signal has stopped the run: the status it exits with, and when
+    // it stops waiting for the turn. The stop cancels the turn and waits for
+    // its done, which arrives once the tools are stopped; returning at once
+    // would exit with them running.
+    let mut stopping: Option<i32> = None;
+    let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    let quit = args.quit.notified();
+    tokio::pin!(quit);
 
     loop {
+        // A signal, here or while the turn was starting, cancels the turn.
+        if let (None, Some(by)) = (stopping, *stop_by) {
+            core.cancel(session_id);
+            stopping = Some(crate::quit_status());
+            settle = Some(crate::deadline(by));
+        }
         // No clock of its own: a live turn can go quiet here for longer than
         // any fixed bound (a long tool call's arguments stream without an
         // event). The client's idle timeout already ends a dead endpoint's
-        // turn with Done, and the tool timeouts bound a hung tool.
-        let Some(env) = core_rx.recv().await else {
-            let _ = writeln!(stderr, "openmax: event channel closed");
-            return 1;
+        // turn with Done, and the tool timeouts bound a hung tool. The one
+        // deadline is a stop's: how long its cancelled turn gets to settle.
+        let env = tokio::select! {
+            event = core_rx.recv() => match event {
+                Some(event) => event,
+                None => {
+                    let _ = writeln!(stderr, "openmax: event channel closed");
+                    return 1;
+                }
+            },
+            _ = &mut quit, if stop_by.is_none() => {
+                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                continue;
+            }
+            _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
+                if settle.is_some() => return stopping.unwrap_or(1),
         };
 
         if env.session_id != session_id {
@@ -242,7 +308,7 @@ async fn run_turn_events(
                     // start, which repeats until the hook is repaired.
                     exit_code = 4;
                 }
-                return exit_code;
+                return stopping.unwrap_or(exit_code);
             }
             AgentEvent::Refrozen { tools, skills, changes } => {
                 if !json {
@@ -372,6 +438,12 @@ mod tests {
         let (core, mut rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
+        let args = HeadlessArgs {
+            prompts: Vec::new(),
+            continue_session: false,
+            json: true,
+            quit: Arc::new(Notify::new()),
+        };
 
         // Every stop reason a Done event can carry, and what a caller gets.
         // `truncated` and `blocked` reach 0 here on purpose: both emit an
@@ -387,10 +459,11 @@ mod tests {
         ];
         for (stop_reason, expected) in cases {
             core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
-            let mut saw_tokens = false;
-            let code =
-                run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr)
-                    .await;
+            let (mut saw_tokens, mut stop_by) = (false, None);
+            let code = run_turn_events(
+                &core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr, &mut stop_by,
+            )
+            .await;
             assert_eq!(code, expected, "stop reason {stop_reason}");
         }
 
@@ -398,10 +471,11 @@ mod tests {
         for stop_reason in ["truncated", "blocked"] {
             core.send_agent("s", AgentEvent::Error { message: "boom".into() });
             core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
-            let mut saw_tokens = false;
-            let code =
-                run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr)
-                    .await;
+            let (mut saw_tokens, mut stop_by) = (false, None);
+            let code = run_turn_events(
+                &core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr, &mut stop_by,
+            )
+            .await;
             assert_eq!(code, 1, "stop reason {stop_reason}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -427,9 +501,17 @@ mod tests {
         let (core, mut rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        let mut saw_tokens = false;
+        let (mut saw_tokens, mut stop_by) = (false, None);
+        let args = HeadlessArgs {
+            prompts: Vec::new(),
+            continue_session: false,
+            json: true,
+            quit: Arc::new(Notify::new()),
+        };
 
-        let turn = run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr);
+        let turn = run_turn_events(
+            &core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr, &mut stop_by,
+        );
         tokio::pin!(turn);
         // An hour of silence passes in no real time while the clock is paused.
         let quiet = tokio::time::timeout(std::time::Duration::from_secs(3600), &mut turn).await;
