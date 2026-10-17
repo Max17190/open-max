@@ -1985,7 +1985,11 @@ fn a_write_that_fails_partway_leaves_the_file_as_it_was() {
 /// gives it, the symlink that points at it, and whether it can be written at
 /// all. A file in a directory that does not let a new file be created next
 /// to it is still writable in place, and a name near the length limit still
-/// leaves room for the temp file beside it.
+/// leaves room for the temp file beside it. A hard-linked file this user may
+/// write but not read is left unchanged, and the result says so: written in
+/// place for its second name, it could not have its old contents put back if
+/// that write failed. That refusal is new; the rest held when every write
+/// was made in place.
 #[cfg(unix)]
 #[test]
 fn a_write_keeps_the_files_mode_links_and_permissions() {

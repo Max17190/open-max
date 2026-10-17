@@ -637,16 +637,20 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// bytes go to a temp file beside it instead, which takes its place once
 /// they are all written, so a failure leaves the file as it was.
 ///
-/// The replacement gets the file's permissions, owner and group, but not its
-/// ACLs, extended attributes or file flags. A file is written in place
-/// instead, with its old contents written back if that fails, when it has
-/// other hard links, which a new file would split from; when this user
-/// cannot give a new file its owner or group (only the superuser can give a
-/// file to another user or to a group it is not in); when its directory
-/// takes no new file from this user; when the rename over it is refused (a
-/// file mounted on its own, another user's file in a sticky directory); or
-/// when its path leaves no room for the longer path of a temp file beside
-/// it.
+/// The replacement gets the file's permissions less setuid and setgid, and
+/// its owner and group, but not its ACLs, extended attributes or file flags.
+/// A file is written in place instead, with its old contents written back if
+/// that fails, when it has other hard links, which a new file would split
+/// from; when this user cannot give a new file its owner or group (only the
+/// superuser can give a file to another user or to a group it is not in);
+/// when its directory takes no new file from this user; when the rename
+/// over it is refused (a file mounted on its own, a file an access control
+/// entry keeps from being deleted); or when its path leaves no room for the
+/// longer path of a temp file beside it. Such a file whose contents cannot
+/// be read first is not written at all, since there would be nothing to
+/// write back. In a directory flagged append-only, which refuses both the
+/// rename and the removal of the temp file, the file is written in place
+/// and the temp file, holding the new contents, is left beside it.
 ///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
