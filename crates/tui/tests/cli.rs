@@ -2665,6 +2665,96 @@ fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
     assert_eq!(status.code(), Some(143), "{status:?}");
 }
 
+/// A stop's deadline covers the whole way out, not only the turn. A fresh
+/// run that a signal stops before anything was saved removes its empty
+/// session on the way out, and that removal waits for the session index
+/// lock, which another openmax process on the same data dir can hold for as
+/// long as its own write takes. Waiting on it past the deadline left the
+/// first signal unanswered for as long as the other process kept the lock.
+/// The run must exit 143 within the deadline, plus a margin for the exit
+/// itself, and say that the empty session stays indexed.
+fn stop_with_the_session_index_held(tag: &str, args: &[&str]) {
+    // The binary's STOP_SETTLE: a cancelled command's settle, then a second
+    // for the rest of the turn.
+    let bound = open_max_core::execution::CANCEL_SETTLE + std::time::Duration::from_secs(1);
+    let margin = bound / 2;
+    let (project, home) = fresh_dirs(tag);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
+    // An endpoint that takes the request and never answers: the turn
+    // stays in its first model request, so nothing of it is saved.
+    let (asked, request) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let _ = read_request(&mut stream);
+        let _ = asked.send(stream);
+    });
+    let stdio = args.contains(&"--stdio");
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .args(args)
+        .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open: a stdio client that has not quit, so only the signal ends it.
+    let mut stdin = child.stdin.take();
+    if let Some(stdin) = stdin.as_mut() {
+        writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
+    }
+    let _stream = match request.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(stream) => stream,
+        Err(_) => {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("{tag}: the turn never asked the endpoint: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    };
+    // Another process's index write, held for longer than any deadline.
+    let index_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(home.join(".openmax").join("sessions").join("index.lock"))
+        .unwrap();
+    index_lock.try_lock().expect("the index is idle while the turn waits on the model");
+    let signalled = std::time::Instant::now();
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if signalled.elapsed() >= bound + margin {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let elapsed = signalled.elapsed();
+    drop(index_lock);
+    let output = child.wait_with_output().unwrap();
+    drop(stdin);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("{tag}: {elapsed:?} from SIGTERM to {status:?}");
+    let status = status.unwrap_or_else(|| {
+        panic!("{tag}: still running {elapsed:?} after SIGTERM, past the {bound:?} stop deadline: {stderr}")
+    });
+    assert_eq!(status.code(), Some(143), "{tag}: {status:?}\n{stderr}");
+    assert!(stderr.contains("stays indexed"), "{tag}: the kept empty session went unreported: {stderr}");
+}
+
+#[test]
+fn a_signal_ends_a_fresh_stdio_session_on_time_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-stdio", &["--stdio"]);
+}
+
+#[test]
+fn a_signal_ends_a_fresh_print_run_on_time_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-print", &["--json", "-p", "wait"]);
+}
+
 /// A signal the run inherited as ignored stays ignored: `nohup` keeps a run
 /// alive past its terminal's SIGHUP, and a shell starts a script's
 /// background job with SIGINT ignored so Ctrl+C stops only the foreground.

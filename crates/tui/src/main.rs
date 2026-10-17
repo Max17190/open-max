@@ -1239,6 +1239,53 @@ pub(crate) fn signalled() -> bool {
     QUIT_SIGNAL.load(Ordering::SeqCst) != 0
 }
 
+/// Remove the session a print or stdio run created, when nothing was ever
+/// persisted to it (see `sessions::discard_if_empty`). The removal waits for
+/// the session index lock, which another openmax process on the same data
+/// dir can hold for as long as its own write takes, so it runs on a blocking
+/// thread and a stop bounds it like the turn: it gets what is left of the
+/// stop's deadline (`stop_by`), a signal that lands during it sets one, and
+/// a deadline already past skips it. The session then stays indexed, and
+/// the run exits on time.
+pub(crate) async fn discard_empty_session(
+    core: &std::sync::Arc<Core>,
+    session_id: &str,
+    quit: &tokio::sync::Notify,
+    mut stop_by: Option<tokio::time::Instant>,
+) {
+    let stopped = || format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed");
+    let removed = if stop_by.is_some_and(|by| by <= tokio::time::Instant::now()) {
+        Err(stopped())
+    } else {
+        let discard = tokio::task::spawn_blocking({
+            let (core, session_id) = (core.clone(), session_id.to_string());
+            move || open_max_core::sessions::discard_if_empty(&core, &session_id)
+        });
+        tokio::pin!(discard);
+        let quit = quit.notified();
+        tokio::pin!(quit);
+        loop {
+            tokio::select! {
+                joined = &mut discard => break joined.unwrap_or_else(|e| Err(e.to_string())),
+                _ = &mut quit, if stop_by.is_none() => {
+                    stop_by = Some(tokio::time::Instant::now() + STOP_SETTLE);
+                }
+                _ = tokio::time::sleep_until(stop_by.unwrap_or_else(tokio::time::Instant::now)),
+                    if stop_by.is_some() => break Err(stopped()),
+            }
+        }
+    };
+    if let Err(e) = removed {
+        let e = open_max_core::sessions::refusal_with_repair(core, e);
+        // One line, like every other harness line on stderr: the reason
+        // quotes the index path, an authored byte string.
+        eprintln!(
+            "openmax: warning: the empty session {session_id} stays indexed: {}",
+            open_max_core::text::one_line(&e)
+        );
+    }
+}
+
 /// XTWINOPS title stack: save the shell's tab title on entry, restore it on
 /// every exit path. Terminals without the stack ignore both writes and are
 /// left with the last presence title, which at exit reads "project · openmax".

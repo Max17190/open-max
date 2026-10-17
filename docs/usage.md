@@ -93,9 +93,12 @@ Tools run in a session of their own, so Ctrl+C at the shell reaches openmax
 and not them. SIGINT, SIGTERM, or SIGHUP to a print or stdio run cancels the
 running turn, which stops each tool's process group (SIGTERM, then SIGKILL),
 and exits 128 plus the signal number (130, 143, 129) once the turn has ended,
-waiting at most 3 seconds; a `turn_end` hook still running then is killed. A
-process that leaves its tool's group (one that starts a session of its own,
-as `setsid` does) is not stopped. A second signal exits at once, with 128
+waiting at most 3 seconds; a `turn_end` hook still running then is killed.
+Removing a new session that nothing was saved to takes its share of the same
+3 seconds: while another openmax process holds the session index past them,
+the session stays indexed and the run says so on stderr. A process that
+leaves its tool's group (one that starts a session of its own, as `setsid`
+does) is not stopped. A second signal exits at once, with 128
 plus its own number, and kills the tools outright. While a consumer that
 stopped reading holds stdout full, the run cannot act on the first signal,
 and only a second one ends it. A signal the run inherited as ignored, as

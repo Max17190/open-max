@@ -189,21 +189,19 @@ async fn drive<W: Write>(
     out: &mut W,
     fresh: bool,
 ) -> i32 {
-    let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, quit, out).await;
+    let mut stop_by = None;
+    let code =
+        drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, quit, out, &mut stop_by)
+            .await;
     if fresh {
-        if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
-            let e = sessions::refusal_with_repair(&core, e);
-            // One line, like every other harness line on stderr: the reason
-            // quotes the index path, an authored byte string.
-            eprintln!(
-                "openmax: warning: the empty session {session_id} stays indexed: {}",
-                open_max_core::text::one_line(&e)
-            );
-        }
+        crate::discard_empty_session(&core, &session_id, quit, stop_by).await;
     }
     code
 }
 
+/// `stop_by` receives a signal's stop deadline, which the empty-session
+/// cleanup after this loop is held to as well.
+#[allow(clippy::too_many_arguments)]
 async fn drive_loop<W: Write>(
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
@@ -212,6 +210,7 @@ async fn drive_loop<W: Write>(
     mut stdin_rx: mpsc::Receiver<Result<Command, String>>,
     quit: &Notify,
     out: &mut W,
+    stop_by: &mut Option<Instant>,
 ) -> i32 {
     let mut running = false;
     let mut closing = false;
@@ -242,6 +241,7 @@ async fn drive_loop<W: Write>(
                 core.cancel(&session_id);
                 stopping = Some(crate::quit_status());
                 settle_by = Instant::now() + crate::STOP_SETTLE;
+                *stop_by = Some(settle_by);
             }
             _ = tokio::time::sleep_until(settle_by), if stopping.is_some() => {
                 return stopping.unwrap_or(exit_code);
@@ -310,7 +310,10 @@ async fn drive_loop<W: Write>(
                         // session at once instead of waiting it out.
                         let reloaded = tokio::select! {
                             reloaded = agent::reload_session(&core, &session_id, &project) => reloaded,
-                            _ = &mut quit, if stopping.is_none() => return crate::quit_status(),
+                            _ = &mut quit, if stopping.is_none() => {
+                                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                return crate::quit_status();
+                            }
                         };
                         match reloaded {
                             Ok((tools, skills, changes)) => {

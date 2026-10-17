@@ -57,17 +57,13 @@ pub async fn run(
         }
     };
 
-    let code = run_prompts(&core, &mut core_rx, &session_id, &args).await;
+    let mut stop_by = None;
+    let code = run_prompts(&core, &mut core_rx, &session_id, &args, &mut stop_by).await;
     // A run whose every turn ended before anything was persisted (an endpoint
     // that never resolved, a prompt a gate refused) leaves an index entry with
     // nothing behind it.
     if !args.continue_session {
-        if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
-            let e = sessions::refusal_with_repair(&core, e);
-            // The reason quotes the index path, an authored byte string, so it
-            // is flattened like every other harness line on this stream.
-            eprintln!("openmax: warning: the empty session {session_id} stays indexed: {}", one_line(&e));
-        }
+        crate::discard_empty_session(&core, &session_id, &args.quit, stop_by).await;
     }
     code
 }
@@ -77,6 +73,7 @@ async fn run_prompts(
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: &str,
     args: &HeadlessArgs,
+    stop_by: &mut Option<Instant>,
 ) -> i32 {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut exit_code = 0i32;
@@ -111,6 +108,7 @@ async fn run_prompts(
             &mut saw_tokens,
             &mut stdout,
             &mut stderr,
+            stop_by,
         )
         .await;
         if turn_exit != 0 {
@@ -124,6 +122,9 @@ async fn run_prompts(
     exit_code
 }
 
+/// `stop_by` receives a signal's stop deadline, which the empty-session
+/// cleanup after the run is held to as well.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_events(
     core: &Arc<Core>,
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
@@ -132,6 +133,7 @@ async fn run_turn_events(
     saw_tokens: &mut bool,
     stdout: &mut io::Stdout,
     stderr: &mut io::Stderr,
+    stop_by: &mut Option<Instant>,
 ) -> i32 {
     let json = args.json;
     let mut exit_code = 0i32;
@@ -164,6 +166,7 @@ async fn run_turn_events(
                 core.cancel(session_id);
                 stopping = Some(crate::quit_status());
                 settle_by = Instant::now() + crate::STOP_SETTLE;
+                *stop_by = Some(settle_by);
                 continue;
             }
             _ = tokio::time::sleep_until(settle_by), if stopping.is_some() => {
@@ -423,10 +426,11 @@ mod tests {
         ];
         for (stop_reason, expected) in cases {
             core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
-            let mut saw_tokens = false;
-            let code =
-                run_turn_events(&core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr)
-                    .await;
+            let (mut saw_tokens, mut stop_by) = (false, None);
+            let code = run_turn_events(
+                &core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr, &mut stop_by,
+            )
+            .await;
             assert_eq!(code, expected, "stop reason {stop_reason}");
         }
 
@@ -434,10 +438,11 @@ mod tests {
         for stop_reason in ["truncated", "blocked"] {
             core.send_agent("s", AgentEvent::Error { message: "boom".into() });
             core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
-            let mut saw_tokens = false;
-            let code =
-                run_turn_events(&core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr)
-                    .await;
+            let (mut saw_tokens, mut stop_by) = (false, None);
+            let code = run_turn_events(
+                &core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr, &mut stop_by,
+            )
+            .await;
             assert_eq!(code, 1, "stop reason {stop_reason}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -463,7 +468,7 @@ mod tests {
         let (core, mut rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        let mut saw_tokens = false;
+        let (mut saw_tokens, mut stop_by) = (false, None);
         let args = HeadlessArgs {
             prompts: Vec::new(),
             continue_session: false,
@@ -471,7 +476,9 @@ mod tests {
             quit: Arc::new(Notify::new()),
         };
 
-        let turn = run_turn_events(&core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr);
+        let turn = run_turn_events(
+            &core, &mut rx, "s", &args, &mut saw_tokens, &mut stdout, &mut stderr, &mut stop_by,
+        );
         tokio::pin!(turn);
         // An hour of silence passes in no real time while the clock is paused.
         let quiet = tokio::time::timeout(std::time::Duration::from_secs(3600), &mut turn).await;
