@@ -2105,6 +2105,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A rename over a file can be refused when writing it is not: an
+    /// access control entry that denies deleting the file refuses the rename
+    /// with `EACCES` after the temp file already has the file's owner, group
+    /// and mode. The file is still written, in place, as it was before
+    /// writes went through a temp file, and no temp file is left beside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_the_rename_may_not_replace_is_written_in_place() {
+        let root = temp_project();
+        let path = root.join("guarded.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let acl = |flag: &str, entry: Option<&str>| {
+            let status = std::process::Command::new("/bin/chmod").arg(flag).args(entry).arg(&path).status().unwrap();
+            assert!(status.success(), "chmod {flag} {entry:?} failed");
+        };
+        acl("+a", Some("everyone deny delete"));
+        let probe = root.join("probe.txt");
+        std::fs::write(&probe, "probe\n").unwrap();
+        let rename = std::fs::rename(&probe, &path);
+        let written = write_regular(&path, "guarded.txt", b"new\n");
+        let text = std::fs::read_to_string(&path);
+        let names: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
+        // Deletable again before any assertion, so a failure leaves nothing
+        // that cannot be removed.
+        acl("-N", None);
+        assert_eq!(rename.map_err(|e| e.kind()), Err(std::io::ErrorKind::PermissionDenied), "the rename over it must be refused");
+        assert_eq!(written, Ok(()));
+        assert_eq!(text.unwrap(), "new\n");
+        assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left beside it: {names:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Reading a device takes whatever it hands out for as long as it keeps
     /// coming, and a write to one is not a file edit. With the project at
     /// /dev, each file tool names the device and leaves it alone.
