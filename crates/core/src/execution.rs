@@ -1957,12 +1957,10 @@ mod tests {
     }
 
     /// The kill an exit makes waits for a command caught between its spawn
-    /// and its registration, so it finds the group instead of leaving it
-    /// running once the process is gone, but only for `EXIT_SPAWN_WAIT`: a
-    /// child stalled before exec (a hung mount, a slow exec check) must not
-    /// hold a second signal's exit. Nothing starts after the kill, and the
-    /// stalled command kills its own group once it registers. The kill marks
-    /// the process as exiting, so the probe runs in a child.
+    /// and its registration, but only for `EXIT_SPAWN_WAIT`: a child stalled
+    /// before exec (a hung mount, a slow exec check) must not hold a second
+    /// signal's exit. Nothing starts after the kill. The kill marks the
+    /// process as exiting, so the probe runs in a child.
     #[cfg(unix)]
     #[test]
     fn the_exit_kill_waits_a_bounded_time_for_a_command_caught_mid_spawn() {
