@@ -1647,7 +1647,7 @@ fn stale_code_reason(
 /// resolves to no file binds nothing it can read, while an unexecutable script
 /// approves fine and still cannot spawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CommandProblem {
+pub(crate) enum CommandProblem {
     Absent,
     NotExecutable,
     NotOnPath,
@@ -1677,7 +1677,7 @@ impl CommandProblem {
 /// spawns it; a bare name resolves on PATH. This warns rather than errors:
 /// check-time and run-time environments legitimately differ (CI without the
 /// tool installed, a script the agent writes next).
-fn missing_command_reason(
+pub(crate) fn missing_command_reason(
     command: &str,
     project_root: &Path,
 ) -> Option<(CommandProblem, String)> {
@@ -1724,31 +1724,25 @@ fn missing_command_reason(
 }
 
 /// Why the script an interpreter-style command names will not run, if it
-/// will not. Judged the way `bound_code` binds it: the first positional
-/// argument, and only when it is shaped like a script file, so a module name
-/// (`python3 -m pytest`) or a data argument never draws a warning about a
-/// file it never was. The repair is `Absent`'s: the file has to exist before
-/// anything else about it can be true.
+/// will not: the first positional argument, and only when it is shaped like a
+/// script file, so a module name (`python3 -m pytest`) or a data argument
+/// never draws a warning about a file it never was. The hook runtime asks the
+/// same question before it spawns, so a warning here and a hook that cannot
+/// start there always agree. The repair is `Absent`'s: the file has to exist
+/// before anything else about it can be true.
 fn missing_script_reason(
     command: &str,
     args: &[String],
     project_root: &Path,
 ) -> Option<(CommandProblem, String)> {
-    let script = crate::ledger::interpreter_script(command, args)?;
-    let path = if Path::new(script).is_absolute() {
-        PathBuf::from(script)
-    } else {
-        project_root.join(script)
-    };
-    (!path.is_file()).then(|| {
-        (
-            CommandProblem::Absent,
-            format!(
-                "command '{}' runs '{script}', which does not exist from the project root",
-                command.trim()
-            ),
-        )
-    })
+    let script = crate::hooks::missing_interpreter_script(command, args, project_root)?;
+    Some((
+        CommandProblem::Absent,
+        format!(
+            "command '{}' runs '{script}', which does not exist from the project root",
+            command.trim()
+        ),
+    ))
 }
 
 /// The clamp warnings for the entries that survived shadowing and the cap. A
