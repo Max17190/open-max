@@ -2672,6 +2672,10 @@ fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
 enum IndexHeld {
     /// From before the run starts: its session setup waits on the lock.
     FromLaunch,
+    /// As `FromLaunch`, but the lock is freed a moment after the signal, so
+    /// the session opens inside the stop's deadline. No turn ran: the stop
+    /// must remove the session it opened, not leave it indexed.
+    OpenFreedAfterTheSignal,
     /// Once a stdio session has said hello, before its first turn: starting
     /// that turn claims the session, which waits on the lock.
     BeforeTheTurn,
@@ -2729,7 +2733,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     let take_lock = |lock: &Option<std::fs::File>| {
         lock.as_ref().unwrap().try_lock().expect("nothing else holds the index yet")
     };
-    if held == IndexHeld::FromLaunch {
+    if matches!(held, IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal) {
         take_lock(&index_lock);
     }
     let stdio = args.contains(&"--stdio");
@@ -2766,7 +2770,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         panic!("{tag}: {what}");
     };
     match held {
-        IndexHeld::FromLaunch => {
+        IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal => {
             // The trust line comes just before the signal watcher starts, and
             // the setup waits on the lock just after it.
             if !std::iter::from_fn(|| lines.recv_timeout(wait).ok()).any(|l| l.contains("trusted project")) {
@@ -2799,7 +2803,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     }
     let signalled = std::time::Instant::now();
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-    if held == IndexHeld::FreedAfterTheSignal {
+    if matches!(held, IndexHeld::FreedAfterTheSignal | IndexHeld::OpenFreedAfterTheSignal) {
         std::thread::sleep(bound / 6);
         index_lock = None;
     }
@@ -2820,6 +2824,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     let stderr = stderr.join().unwrap();
     let mut rest = String::new();
     let _ = stdout.read_to_string(&mut rest);
+    let index = std::fs::read_to_string(sessions.join("index.json")).unwrap_or_default();
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
     eprintln!("{tag}: {elapsed:?} from SIGTERM to {status:?}");
     let status = status.unwrap_or_else(|| {
@@ -2828,6 +2833,11 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     assert_eq!(status.code(), Some(143), "{tag}: {status:?}\n{stderr}");
     match held {
         IndexHeld::FromLaunch => {}
+        IndexHeld::OpenFreedAfterTheSignal => {
+            assert!(!stderr.contains("stays indexed"), "{tag}: {stderr}");
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
+            assert!(listed.is_empty(), "{tag}: the session opened under the signal stayed indexed: {index}");
+        }
         IndexHeld::FreedAfterTheSignal => {
             let done = last_event(rest.as_bytes());
             assert_eq!(
@@ -2872,6 +2882,20 @@ fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_open() {
 #[test]
 fn a_signal_ends_a_print_run_waiting_on_the_session_index_to_open() {
     stop_with_the_session_index_held("index-held-print-open", &["--json", "-p", "wait"], IndexHeld::FromLaunch);
+}
+
+#[test]
+fn a_stdio_session_that_opens_after_the_signal_is_removed_and_ends() {
+    stop_with_the_session_index_held("index-freed-stdio-open", &["--stdio"], IndexHeld::OpenFreedAfterTheSignal);
+}
+
+#[test]
+fn a_print_run_whose_session_opens_after_the_signal_removes_it_and_ends() {
+    stop_with_the_session_index_held(
+        "index-freed-print-open",
+        &["--json", "-p", "wait"],
+        IndexHeld::OpenFreedAfterTheSignal,
+    );
 }
 
 #[test]

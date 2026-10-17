@@ -1367,6 +1367,19 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
     }
 
+    /// A command's group leaves the exit's kill list once the command
+    /// settles: the group is gone by then, and by the time the exit's kill
+    /// runs its id can name another process's group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_settled_command_leaves_no_group_for_the_exit_to_kill() {
+        let mut request = request("/bin/sh", &["-c", "echo $$"]);
+        request.capture.head_bytes = 64;
+        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        let leader: u32 = String::from_utf8_lossy(&output.stdout.head).trim().parse().unwrap();
+        assert!(!live_groups().contains(&leader), "the settled group {leader} is still listed");
+    }
+
     /// The human attestation never reaches an agent-spawned child, even when
     /// the harness itself was launched under one: otherwise a bash call
     /// could unset the session marker and inherit a ready-made bypass.
