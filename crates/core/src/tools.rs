@@ -640,11 +640,13 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// The replacement gets the file's permissions, owner and group, but not its
 /// ACLs, extended attributes or file flags. A file is written in place
 /// instead, with its old contents written back if that fails, when it has
-/// other hard links, which a new file would split from, or when no temp
-/// file can be made beside it, given its owner, group and permissions, and
-/// renamed over it: in a directory that takes no new file from this user, in
-/// a sticky directory, for a file mounted on its own, or for a path that
-/// leaves no room for the longer path of a temp file beside it.
+/// other hard links, which a new file would split from; when this user
+/// cannot give a new file its owner or group (only the superuser can give a
+/// file to another user or to a group it is not in); when its directory
+/// takes no new file from this user; when the rename over it is refused (a
+/// file mounted on its own, another user's file in a sticky directory); or
+/// when its path leaves no room for the longer path of a temp file beside
+/// it.
 ///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
@@ -666,7 +668,7 @@ fn write_regular(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
     let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return crate::sessions::replace_atomic(path, bytes, |_| Ok(()))
+            return crate::sessions::replace_atomic(path, bytes, 0o666, |_| Ok(()))
                 .map_err(|e| format!("cannot write {rel}: {e}; {rel} was not created"));
         }
         // A pipe with no reader refuses an open that does not wait.
@@ -683,7 +685,11 @@ fn write_regular(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
     }
     if !has_other_links(&meta) {
         let mut ready = false;
-        let replaced = crate::sessions::replace_atomic(path, bytes, |tmp| {
+        // Only this user may open the temp file until it has the file's
+        // owner, group and mode. Created with the default mode and the
+        // directory's group, it would let a user the file keeps out open it
+        // and read what is written next.
+        let replaced = crate::sessions::replace_atomic(path, bytes, 0o600, |tmp| {
             take_identity(tmp, &meta)?;
             ready = true;
             Ok(())
@@ -722,6 +728,8 @@ fn take_identity(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Resu
     let mode = {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let fresh = tmp.metadata()?;
+        #[cfg(test)]
+        CREATED_MODE.with(|created| created.set(Some(fresh.mode())));
         if (fresh.uid(), fresh.gid()) != (meta.uid(), meta.gid()) {
             std::os::unix::fs::fchown(tmp, Some(meta.uid()), Some(meta.gid()))?;
         }
@@ -730,6 +738,12 @@ fn take_identity(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Resu
     #[cfg(not(unix))]
     let mode = meta.permissions();
     tmp.set_permissions(mode)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The mode `take_identity` found a temp file created with.
+    static CREATED_MODE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Write `bytes` over the regular `file`, open at `path` with metadata
@@ -2067,6 +2081,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(names, vec![std::ffi::OsString::from("a.txt")], "nothing left beside it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A replacement's temp file exists before it has the file's owner,
+    /// group and mode, and whoever opens it in that window keeps reading
+    /// what is written to it. Created with the default mode, a 0640 file's
+    /// new contents would be open to every user for that window.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_opens_to_no_one_but_this_user_until_it_has_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_project();
+        let path = root.join("secret.env");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        CREATED_MODE.with(|created| created.set(None));
+        assert_eq!(write_regular(&path, "secret.env", b"new\n"), Ok(()));
+        let created = CREATED_MODE.with(|created| created.take()).expect("replaced through a temp file");
+        assert_eq!(created & 0o077, 0, "the temp file was created with mode {:o}", created & 0o7777);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
         let _ = std::fs::remove_dir_all(root);
     }
 
