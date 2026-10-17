@@ -1255,22 +1255,40 @@ pub(crate) fn deadline(at: std::time::Instant) -> tokio::sync::oneshot::Receiver
 }
 
 /// Run `work`, a print or stdio run's session setup or the start of one of
-/// its turns, on a blocking thread unless a signal (`quit`) lands first.
-/// Both wait on the session index lock, which another openmax process on the
+/// its turns, on a blocking thread, and let a signal (`quit`) bound it. Both
+/// wait on the session index lock, which another openmax process on the
 /// same data dir can hold for as long as its own write takes, and on this
 /// thread that wait left the first signal unanswered until the lock was
-/// free. No turn of the run is live yet for a stop to cancel, so the signal
-/// ends the run at once with its status (`Err`), as one during a reload
-/// does. Work still waiting ends with the process, and the exit kills any
-/// tool group it started.
-pub(crate) async fn unless_quit<T: Send + 'static>(
+/// free. A signal during the work starts the stop's deadline (`stop_by`,
+/// which may already be running), and the work gets until then: `Some` with
+/// its result, which the caller winds down with the stop in `stop_by` (a
+/// turn it started is cancelled and settled like any other), or `None` once
+/// the deadline passes first. Work still waiting then ends with the process,
+/// and the exit kills any tool group it started.
+pub(crate) async fn until_stopped<T: Send + 'static>(
     quit: impl std::future::Future<Output = ()>,
+    stop_by: &mut Option<std::time::Instant>,
     work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, i32> {
+) -> Option<T> {
     let work = tokio::task::spawn_blocking(work);
-    tokio::select! {
-        done = work => Ok(done.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))),
-        _ = quit => Err(quit_status()),
+    tokio::pin!(work);
+    tokio::pin!(quit);
+    let mut expiry = stop_by.map(deadline);
+    loop {
+        tokio::select! {
+            // A result in hand is never dropped for a signal that came with it.
+            biased;
+            done = &mut work => {
+                return Some(done.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic())));
+            }
+            _ = &mut quit, if expiry.is_none() => {
+                let by = std::time::Instant::now() + STOP_SETTLE;
+                *stop_by = Some(by);
+                expiry = Some(deadline(by));
+            }
+            _ = async { if let Some(expiry) = expiry.as_mut() { let _ = expiry.await; } },
+                if expiry.is_some() => return None,
+        }
     }
 }
 

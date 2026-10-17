@@ -39,13 +39,21 @@ pub async fn run(
         let (core, continue_session) = (core.clone(), args.continue_session);
         move || open_session(&core, project_key, continue_session)
     };
-    let session_id = match crate::unless_quit(args.quit.notified(), setup).await {
-        Ok(Ok(session_id)) => session_id,
-        Ok(Err(code)) | Err(code) => return code,
+    let mut stop_by = None;
+    let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
+        return crate::quit_status();
+    };
+    let session_id = match opened {
+        Ok(session_id) => session_id,
+        Err(code) => return code,
     };
 
-    let mut stop_by = None;
-    let code = run_prompts(&core, &mut core_rx, &session_id, &args, &mut stop_by).await;
+    // A signal that landed while the session opened leaves no turn to run.
+    let code = if stop_by.is_some() {
+        crate::quit_status()
+    } else {
+        run_prompts(&core, &mut core_rx, &session_id, &args, &mut stop_by).await
+    };
     // A run whose every turn ended before anything was persisted (an endpoint
     // that never resolved, a prompt a gate refused) leaves an index entry with
     // nothing behind it.
@@ -110,16 +118,14 @@ async fn run_prompts(
             let (core, session_id, project) = (core.clone(), session_id.to_string(), project.clone());
             move || agent::start_turn(core, session_id, project, text)
         };
-        match crate::unless_quit(args.quit.notified(), start).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+        // A turn started under a signal is stopped by `run_turn_events`.
+        match crate::until_stopped(args.quit.notified(), stop_by, start).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
                 eprintln!("openmax: {e}");
                 return 1;
             }
-            Err(code) => {
-                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
-                return code;
-            }
+            None => return crate::quit_status(),
         }
 
         let mut saw_tokens = false;
@@ -145,8 +151,8 @@ async fn run_prompts(
     exit_code
 }
 
-/// `stop_by` receives a signal's stop deadline, which the empty-session
-/// cleanup after the run is held to as well.
+/// `stop_by` holds the stop's deadline once a signal lands, here or while
+/// a turn starts; the empty-session cleanup after the run is held to it too.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_events(
     core: &Arc<Core>,
@@ -172,6 +178,12 @@ async fn run_turn_events(
     tokio::pin!(quit);
 
     loop {
+        // A signal, here or while the turn was starting, cancels the turn.
+        if let (None, Some(by)) = (stopping, *stop_by) {
+            core.cancel(session_id);
+            stopping = Some(crate::quit_status());
+            settle = Some(crate::deadline(by));
+        }
         // No clock of its own: a live turn can go quiet here for longer than
         // any fixed bound (a long tool call's arguments stream without an
         // event). The client's idle timeout already ends a dead endpoint's
@@ -185,12 +197,8 @@ async fn run_turn_events(
                     return 1;
                 }
             },
-            _ = &mut quit, if stopping.is_none() => {
-                core.cancel(session_id);
-                stopping = Some(crate::quit_status());
-                let by = Instant::now() + crate::STOP_SETTLE;
-                *stop_by = Some(by);
-                settle = Some(crate::deadline(by));
+            _ = &mut quit, if stop_by.is_none() => {
+                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
                 continue;
             }
             _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },

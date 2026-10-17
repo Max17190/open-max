@@ -87,10 +87,21 @@ pub async fn run(
         let (core, project_key, continue_session) = (core.clone(), project_key.clone(), args.continue_session);
         move || open_session(&core, &project_key, continue_session)
     };
-    let (session_id, continued, history) = match crate::unless_quit(args.quit.notified(), setup).await {
-        Ok(Ok(opened)) => opened,
-        Ok(Err(code)) | Err(code) => return code,
+    let mut stop_by = None;
+    let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
+        return crate::quit_status();
     };
+    let (session_id, continued, history) = match opened {
+        Ok(opened) => opened,
+        Err(code) => return code,
+    };
+    if stop_by.is_some() {
+        // A signal landed while the session opened, so no turn ever ran.
+        if !continued {
+            crate::discard_empty_session(&core, &session_id, &args.quit, stop_by).await;
+        }
+        return crate::quit_status();
+    }
     let mut stdout = std::io::stdout();
     emit(&mut stdout, &hello_value(&session_id, &project_key, continued));
     if continued {
@@ -219,8 +230,8 @@ async fn drive<W: Write>(
     code
 }
 
-/// `stop_by` receives a signal's stop deadline, which the empty-session
-/// cleanup after this loop is held to as well.
+/// `stop_by` holds the stop's deadline once a signal lands, here or while
+/// a turn starts; the empty-session cleanup after this loop is held to it too.
 #[allow(clippy::too_many_arguments)]
 async fn drive_loop<W: Write>(
     core: Arc<Core>,
@@ -246,24 +257,24 @@ async fn drive_loop<W: Write>(
     tokio::pin!(quit);
 
     loop {
+        // A signal, here or while a turn was starting, quits by cancelling
+        // the turn instead of letting it finish: the signal reached this
+        // process alone, and the done arrives once the turn's tools are
+        // stopped.
+        if let (None, Some(by)) = (stopping, *stop_by) {
+            closing = true;
+            for id in open_approvals.drain() {
+                core.respond_approval(&id, false);
+            }
+            core.cancel(&session_id);
+            stopping = Some(crate::quit_status());
+            settle = Some(crate::deadline(by));
+        }
         if closing && !running {
             return stopping.unwrap_or(exit_code);
         }
         tokio::select! {
-            // A quit that cancels the turn instead of letting it finish: the
-            // signal reached this process alone, and the done arrives once
-            // the turn's tools are stopped.
-            _ = &mut quit, if stopping.is_none() => {
-                closing = true;
-                for id in open_approvals.drain() {
-                    core.respond_approval(&id, false);
-                }
-                core.cancel(&session_id);
-                stopping = Some(crate::quit_status());
-                let by = Instant::now() + crate::STOP_SETTLE;
-                *stop_by = Some(by);
-                settle = Some(crate::deadline(by));
-            }
+            _ = &mut quit, if stop_by.is_none() => *stop_by = Some(Instant::now() + crate::STOP_SETTLE),
             _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
                 if settle.is_some() => return stopping.unwrap_or(exit_code),
             cmd = stdin_rx.recv(), if !closing => {
@@ -330,7 +341,7 @@ async fn drive_loop<W: Write>(
                         // session at once instead of waiting it out.
                         let reloaded = tokio::select! {
                             reloaded = agent::reload_session(&core, &session_id, &project) => reloaded,
-                            _ = &mut quit, if stopping.is_none() => {
+                            _ = &mut quit, if stop_by.is_none() => {
                                 *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
                                 return crate::quit_status();
                             }
@@ -367,13 +378,10 @@ async fn drive_loop<W: Write>(
                             let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
                             move || agent::start_turn(core, session_id, project, text)
                         };
-                        match crate::unless_quit(&mut quit, start).await {
-                            Ok(Ok(())) => running = true,
-                            Ok(Err(e)) => refuse(out, &session_id, &e),
-                            Err(code) => {
-                                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
-                                return code;
-                            }
+                        match crate::until_stopped(&mut quit, stop_by, start).await {
+                            Some(Ok(())) => running = true,
+                            Some(Err(e)) => refuse(out, &session_id, &e),
+                            None => return crate::quit_status(),
                         }
                     }
                 }
