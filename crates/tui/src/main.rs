@@ -1292,53 +1292,80 @@ pub(crate) async fn until_stopped<T: Send + 'static>(
     }
 }
 
+/// How long a stop whose deadline has already passed still waits to learn
+/// whether the session it leaves indexed has history, which decides whether
+/// that is worth a warning. The check takes no lock and only asks whether
+/// the session's files exist, so on working storage it is a few stat calls;
+/// the bound keeps stalled storage from holding the exit.
+const HISTORY_CHECK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Remove the session a print or stdio run created, when nothing was ever
-/// persisted to it (see `sessions::discard_if_empty`). The removal waits for
-/// the session index lock, which another openmax process on the same data
-/// dir can hold for as long as its own write takes, so it runs on a blocking
-/// thread and a stop bounds it like the turn: it gets what is left of the
-/// stop's deadline (`stop_by`), a signal that lands during it sets one, and
-/// a deadline already past skips it. The session then stays indexed, and
-/// the run exits on time. Only an empty session is reported as kept: one
-/// with history was never to be removed, and the lock-free check for that
-/// runs whether or not the deadline left time for the removal.
+/// persisted to it (see `sessions::discard_if_empty`). Every step touches
+/// storage, and the removal waits for the session index lock, which another
+/// openmax process on the same data dir can hold for as long as its own
+/// write takes, so all of it runs on one blocking thread and a stop bounds
+/// the wait like the turn: it gets what is left of the stop's deadline
+/// (`stop_by`), a signal that lands during it sets one, and a deadline
+/// already past leaves only the lock-free history check, for
+/// `HISTORY_CHECK_WAIT`. The session then stays indexed, and the run exits
+/// on time. Only an empty session is reported as kept: one with history was
+/// never to be removed. A check that did not finish says the session may be
+/// empty.
 pub(crate) async fn discard_empty_session(
     core: &std::sync::Arc<Core>,
     session_id: &str,
     quit: &tokio::sync::Notify,
     stop_by: Option<std::time::Instant>,
 ) {
-    let stopped = || {
-        if open_max_core::sessions::backed(core, session_id) {
-            Ok(false)
-        } else {
-            Err(format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed"))
-        }
-    };
-    let removed = if stop_by.is_some_and(|by| by <= std::time::Instant::now()) {
-        stopped()
-    } else {
-        let discard = tokio::task::spawn_blocking({
-            let (core, session_id) = (core.clone(), session_id.to_string());
-            move || open_max_core::sessions::discard_if_empty(&core, &session_id)
-        });
-        tokio::pin!(discard);
-        let quit = quit.notified();
-        tokio::pin!(quit);
-        let mut expiry = stop_by.map(deadline);
-        loop {
-            tokio::select! {
-                joined = &mut discard => break joined.unwrap_or_else(|e| Err(e.to_string())),
-                _ = &mut quit, if expiry.is_none() => {
-                    expiry = Some(deadline(std::time::Instant::now() + STOP_SETTLE));
-                }
-                _ = async { if let Some(expiry) = expiry.as_mut() { let _ = expiry.await; } },
-                    if expiry.is_some() => break stopped(),
+    use open_max_core::sessions;
+    let stopped = || format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed");
+    let past = stop_by.is_some_and(|by| by <= std::time::Instant::now());
+    // Set by the job before it waits on the lock: whether the session has history.
+    let history = std::sync::Arc::new(std::sync::OnceLock::new());
+    let job = tokio::task::spawn_blocking({
+        let (core, session_id, history) = (core.clone(), session_id.to_string(), history.clone());
+        move || {
+            if *history.get_or_init(|| sessions::backed(&core, &session_id)) {
+                return Ok(());
+            }
+            if past {
+                return Err(stopped());
+            }
+            match sessions::discard_if_empty(&core, &session_id) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(sessions::refusal_with_repair(&core, e)),
             }
         }
+    });
+    tokio::pin!(job);
+    let quit = quit.notified();
+    tokio::pin!(quit);
+    let mut expiry = if past {
+        Some(deadline(std::time::Instant::now() + HISTORY_CHECK_WAIT))
+    } else {
+        stop_by.map(deadline)
     };
-    if let Err(e) = removed {
-        let e = open_max_core::sessions::refusal_with_repair(core, e);
+    let kept = loop {
+        tokio::select! {
+            joined = &mut job => break joined.unwrap_or_else(|e| Err(e.to_string())),
+            _ = &mut quit, if expiry.is_none() => {
+                expiry = Some(deadline(std::time::Instant::now() + STOP_SETTLE));
+            }
+            _ = async { if let Some(expiry) = expiry.as_mut() { let _ = expiry.await; } },
+                if expiry.is_some() => break match history.get() {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(stopped()),
+                    None => {
+                        eprintln!(
+                            "openmax: warning: the session {session_id} stays indexed and may be empty: \
+                             the stop's {STOP_SETTLE:?} deadline passed before it could be checked"
+                        );
+                        return;
+                    }
+                },
+        }
+    };
+    if let Err(e) = kept {
         // One line, like every other harness line on stderr: the reason
         // quotes the index path, an authored byte string.
         eprintln!(

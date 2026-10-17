@@ -162,8 +162,9 @@ which exits 4 on those three. SIGTERM, SIGINT, or SIGHUP cancels the running
 turn instead of draining it, declines pending approvals, and exits 128 plus
 the signal number once that turn's `done` is written and, for a new session
 that nothing was saved to, its index entry is removed, or after 3 seconds if
-either has not finished, plus up to 250 ms for a tool command still being
-started; an entry still in place then stays, and a warning says so on stderr.
+either has not finished, plus up to 100 ms to check that the session is empty
+and up to 250 ms for a tool command still being started; an entry still in
+place then stays, and a warning says so on stderr.
 A signal while the session waits on the session index to open or to start a
 turn ends it the same way; see [usage](usage.md#command-line).
 

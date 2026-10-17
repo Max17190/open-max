@@ -964,8 +964,9 @@ Commands, one JSON object per line:
 - {"cmd":"quit"} drains the in-flight turn, then exits. EOF behaves like quit.
   SIGTERM, SIGINT, or SIGHUP cancels that turn instead, and exits 128 plus
   the signal number after its `done` and the removal of a new session that
-  saved nothing, or after 3 seconds at most, plus up to 250 ms for a tool
-  command still being started.
+  saved nothing, or after 3 seconds at most, plus up to 100 ms to check that
+  the session is empty and up to 250 ms for a tool command still being
+  started.
 Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
 session continues; extra fields on a known command are ignored; blank lines
 are skipped.
