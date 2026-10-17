@@ -2038,6 +2038,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A file whose path is near the length limit leaves no room for the
+    /// longer path of a temp file beside it, so no temp file can be made to
+    /// replace it. It is still written, in place, as it was before writes
+    /// went through a temp file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_no_room_for_a_temp_path_beside_it_is_written_in_place() {
+        let root = temp_project();
+        // The longest path an open takes, NUL excluded. The file's path is
+        // two bytes short of it; the temp path beside it is longer than the
+        // file's by the id and suffix it adds.
+        let limit = libc::PATH_MAX as usize - 1;
+        let tail = "/a.txt".len();
+        let mut dir = root.clone();
+        while dir.as_os_str().len() + 1 + 200 + 1 + tail <= limit - 2 {
+            dir.push("d".repeat(200));
+        }
+        dir.push("p".repeat(limit - 2 - tail - 1 - dir.as_os_str().len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        assert_eq!(path.as_os_str().len(), limit - 2);
+        std::fs::write(&path, "old\n").unwrap();
+        let beside = std::fs::File::create(dir.join(format!("a.txt.{}.tmp", "0".repeat(32)))).unwrap_err();
+        assert_eq!(beside.raw_os_error(), Some(libc::ENAMETOOLONG), "the temp path must not fit");
+        assert_eq!(write_regular(&path, "a.txt", b"new\n"), Ok(()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("a.txt")], "nothing left beside it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Reading a device takes whatever it hands out for as long as it keeps
     /// coming, and a write to one is not a file edit. With the project at
     /// /dev, each file tool names the device and leaves it alone.
