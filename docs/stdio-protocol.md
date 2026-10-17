@@ -163,7 +163,9 @@ turn instead of draining it, declines pending approvals, and exits 128 plus
 the signal number once that turn's `done` is written and, for a new session
 that nothing was saved to, its index entry is removed, or after 3 seconds if
 either has not finished; an entry still in place then stays, and a warning
-says so on stderr; see [usage](usage.md#command-line).
+says so on stderr. A signal while the session waits on the session index to
+open or to start a turn ends it the same way; see
+[usage](usage.md#command-line).
 
 Bad input leaves the session unharmed. A line that is not valid UTF-8, or one
 longer than 8 MiB, is reported as a `protocol_error` and skipped; the reader

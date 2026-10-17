@@ -34,27 +34,14 @@ pub async fn run(
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_key = project.display().to_string();
 
-    let session_id = if args.continue_session {
-        match sessions::latest(&core, &project_key) {
-            Ok(Some(meta)) => meta.id,
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                return 2;
-            }
-            Err(e) => {
-                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(&core, e)));
-                return 1;
-            }
-        }
-    } else {
-        match sessions::create(&core, project_key) {
-            Ok(meta) => meta.id,
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(&core, e);
-                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
-                return 1;
-            }
-        }
+    // Finding or creating the session waits on the session index lock.
+    let setup = {
+        let (core, continue_session) = (core.clone(), args.continue_session);
+        move || open_session(&core, project_key, continue_session)
+    };
+    let session_id = match crate::unless_quit(args.quit.notified(), setup).await {
+        Ok(Ok(session_id)) => session_id,
+        Ok(Err(code)) | Err(code) => return code,
     };
 
     let mut stop_by = None;
@@ -66,6 +53,33 @@ pub async fn run(
         crate::discard_empty_session(&core, &session_id, &args.quit, stop_by).await;
     }
     code
+}
+
+/// The latest session here, or a new one: Ok(its id), or Err(the exit
+/// status) once the reason is on stderr.
+fn open_session(core: &Core, project_key: String, continue_session: bool) -> Result<String, i32> {
+    if continue_session {
+        match sessions::latest(core, &project_key) {
+            Ok(Some(meta)) => Ok(meta.id),
+            Ok(None) => {
+                eprintln!("openmax: no prior session in this directory to continue");
+                Err(2)
+            }
+            Err(e) => {
+                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(core, e)));
+                Err(1)
+            }
+        }
+    } else {
+        match sessions::create(core, project_key) {
+            Ok(meta) => Ok(meta.id),
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(core, e);
+                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
+                Err(1)
+            }
+        }
+    }
 }
 
 async fn run_prompts(
@@ -89,14 +103,23 @@ async fn run_prompts(
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
         // would, so hooks and the transcript see the expanded text.
-        if let Err(e) = agent::start_turn(
-            core.clone(),
-            session_id.to_string(),
-            project.clone(),
-            templates::expand_user_input(&core.data_dir, &project, prompt),
-        ) {
-            eprintln!("openmax: {e}");
-            return 1;
+        let text = templates::expand_user_input(&core.data_dir, &project, prompt);
+        // Starting a turn claims the session, which waits on the session
+        // index lock.
+        let start = {
+            let (core, session_id, project) = (core.clone(), session_id.to_string(), project.clone());
+            move || agent::start_turn(core, session_id, project, text)
+        };
+        match crate::unless_quit(args.quit.notified(), start).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("openmax: {e}");
+                return 1;
+            }
+            Err(code) => {
+                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                return code;
+            }
         }
 
         let mut saw_tokens = false;

@@ -2665,15 +2665,29 @@ fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
     assert_eq!(status.code(), Some(143), "{status:?}");
 }
 
-/// A stop's deadline covers the whole way out, not only the turn. A fresh
-/// run that a signal stops before anything was saved removes its empty
-/// session on the way out, and that removal waits for the session index
-/// lock, which another openmax process on the same data dir can hold for as
-/// long as its own write takes. Waiting on it past the deadline left the
-/// first signal unanswered for as long as the other process kept the lock.
-/// The run must exit 143 within the deadline, plus a margin for the exit
-/// itself, and say that the empty session stays indexed.
-fn stop_with_the_session_index_held(tag: &str, args: &[&str]) {
+/// When the test takes the session index lock, standing in for another
+/// openmax process on the same data dir whose index write takes as long as
+/// it likes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum IndexHeld {
+    /// From before the run starts: its session setup waits on the lock.
+    FromLaunch,
+    /// Once a stdio session has said hello, before its first turn: starting
+    /// that turn claims the session, which waits on the lock.
+    BeforeTheTurn,
+    /// While a fresh run's first turn waits on a model that never answers:
+    /// nothing is saved, so the stop removes the empty session, and that
+    /// removal waits on the lock.
+    DuringTheTurn,
+}
+
+/// A signal must end a print or stdio run within the stop's deadline
+/// wherever the run is waiting on the session index lock. Each of these
+/// waits held the first signal unanswered for as long as the other process
+/// kept the lock, and only a second signal ended the run. The run must exit
+/// 143 within the deadline, plus half of it for the exit itself, and say so
+/// when the empty session it created stays indexed.
+fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     // The binary's STOP_SETTLE: a cancelled command's settle, then a second
     // for the rest of the turn.
     let bound = open_max_core::execution::CANCEL_SETTLE + std::time::Duration::from_secs(1);
@@ -2681,44 +2695,87 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str]) {
     let (project, home) = fresh_dirs(tag);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
-    // An endpoint that takes the request and never answers: the turn
-    // stays in its first model request, so nothing of it is saved.
+    // An endpoint that takes the request and never answers: the turn stays
+    // in its first model request, so nothing of it is saved.
     let (asked, request) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let Ok((mut stream, _)) = listener.accept() else { return };
         let _ = read_request(&mut stream);
         let _ = asked.send(stream);
     });
+    let sessions = home.join(".openmax").join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let index_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(sessions.join("index.lock"))
+        .unwrap();
+    let take_lock = || index_lock.try_lock().expect("nothing else holds the index yet");
+    if held == IndexHeld::FromLaunch {
+        take_lock();
+    }
     let stdio = args.contains(&"--stdio");
     let mut child = cmd(&project, &home)
         .arg("--trust-project")
         .args(args)
         .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     // Held open: a stdio client that has not quit, so only the signal ends it.
     let mut stdin = child.stdin.take();
-    if let Some(stdin) = stdin.as_mut() {
-        writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
-    }
-    let _stream = match request.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(stream) => stream,
-        Err(_) => {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!("{tag}: the turn never asked the endpoint: {}", String::from_utf8_lossy(&output.stderr));
-        }
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (line_tx, lines) = std::sync::mpsc::channel::<String>();
+    let stderr = {
+        let stderr = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut all = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = line_tx.send(line.clone());
+                all.push_str(&line);
+                all.push('\n');
+            }
+            all
+        })
     };
-    // Another process's index write, held for longer than any deadline.
-    let index_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(home.join(".openmax").join("sessions").join("index.lock"))
-        .unwrap();
-    index_lock.try_lock().expect("the index is idle while the turn waits on the model");
+    let wait = std::time::Duration::from_secs(10);
+    let fail = |child: &mut std::process::Child, what: &str| -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{tag}: {what}");
+    };
+    match held {
+        IndexHeld::FromLaunch => {
+            // The trust line comes just before the signal watcher starts, and
+            // the setup waits on the lock just after it.
+            if !std::iter::from_fn(|| lines.recv_timeout(wait).ok()).any(|l| l.contains("trusted project")) {
+                fail(&mut child, "the run never reached its session setup");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        IndexHeld::BeforeTheTurn => {
+            let mut hello = String::new();
+            stdout.read_line(&mut hello).unwrap();
+            if !hello.contains(r#""type":"hello""#) {
+                fail(&mut child, &format!("no hello: {hello}"));
+            }
+            take_lock();
+            writeln!(stdin.as_mut().unwrap(), r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
+            // Time for the session to read the command and start the turn.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        IndexHeld::DuringTheTurn => {
+            if let Some(stdin) = stdin.as_mut() {
+                writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
+            }
+            if request.recv_timeout(wait).is_err() {
+                fail(&mut child, "the turn never asked the endpoint");
+            }
+            take_lock();
+        }
+    }
     let signalled = std::time::Instant::now();
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     let status = loop {
@@ -2732,27 +2789,44 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str]) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     let elapsed = signalled.elapsed();
+    let _ = child.wait();
     drop(index_lock);
-    let output = child.wait_with_output().unwrap();
     drop(stdin);
+    let stderr = stderr.join().unwrap();
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
-    let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("{tag}: {elapsed:?} from SIGTERM to {status:?}");
     let status = status.unwrap_or_else(|| {
         panic!("{tag}: still running {elapsed:?} after SIGTERM, past the {bound:?} stop deadline: {stderr}")
     });
     assert_eq!(status.code(), Some(143), "{tag}: {status:?}\n{stderr}");
-    assert!(stderr.contains("stays indexed"), "{tag}: the kept empty session went unreported: {stderr}");
+    if held != IndexHeld::FromLaunch {
+        assert!(stderr.contains("stays indexed"), "{tag}: the kept empty session went unreported: {stderr}");
+    }
 }
 
 #[test]
 fn a_signal_ends_a_fresh_stdio_session_on_time_while_the_session_index_is_held() {
-    stop_with_the_session_index_held("index-held-stdio", &["--stdio"]);
+    stop_with_the_session_index_held("index-held-stdio", &["--stdio"], IndexHeld::DuringTheTurn);
 }
 
 #[test]
 fn a_signal_ends_a_fresh_print_run_on_time_while_the_session_index_is_held() {
-    stop_with_the_session_index_held("index-held-print", &["--json", "-p", "wait"]);
+    stop_with_the_session_index_held("index-held-print", &["--json", "-p", "wait"], IndexHeld::DuringTheTurn);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_open() {
+    stop_with_the_session_index_held("index-held-stdio-open", &["--stdio"], IndexHeld::FromLaunch);
+}
+
+#[test]
+fn a_signal_ends_a_print_run_waiting_on_the_session_index_to_open() {
+    stop_with_the_session_index_held("index-held-print-open", &["--json", "-p", "wait"], IndexHeld::FromLaunch);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_start_a_turn() {
+    stop_with_the_session_index_held("index-held-stdio-turn", &["--stdio"], IndexHeld::BeforeTheTurn);
 }
 
 /// A signal the run inherited as ignored stays ignored: `nohup` keeps a run

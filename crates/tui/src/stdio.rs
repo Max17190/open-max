@@ -82,40 +82,15 @@ pub async fn run(
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_key = project.display().to_string();
 
-    let (session_id, continued) = if args.continue_session {
-        match sessions::latest(&core, &project_key) {
-            Ok(Some(meta)) => (meta.id, true),
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                return 2;
-            }
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(&core, e);
-                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
-                return 1;
-            }
-        }
-    } else {
-        match sessions::create(&core, project_key.clone()) {
-            Ok(meta) => (meta.id, false),
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(&core, e);
-                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
-                return 1;
-            }
-        }
+    // Every step of the setup can wait on the session index lock.
+    let setup = {
+        let (core, project_key, continue_session) = (core.clone(), project_key.clone(), args.continue_session);
+        move || open_session(&core, &project_key, continue_session)
     };
-
-    if let Err(e) = sessions::attach(&core, &session_id) {
-        eprintln!("openmax: {e}");
-        return 1;
-    }
-    let history = if continued {
-        match sessions::load_messages(&core, &session_id) {
-            Ok(messages) => messages.unwrap_or_default(),
-            Err(e) => { eprintln!("openmax: {e}"); return 1; }
-        }
-    } else { Vec::new() };
+    let (session_id, continued, history) = match crate::unless_quit(args.quit.notified(), setup).await {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(code)) | Err(code) => return code,
+    };
     let mut stdout = std::io::stdout();
     emit(&mut stdout, &hello_value(&session_id, &project_key, continued));
     if continued {
@@ -126,6 +101,51 @@ pub async fn run(
     }
     let stdin_rx = spawn_stdin_reader();
     drive(core, core_rx, session_id, project, stdin_rx, &args.quit, &mut stdout, !continued).await
+}
+
+/// Create or find the session, claim it, and read its history to replay:
+/// Ok(id, whether it was continued, history), or Err(the exit status) once
+/// the reason is on stderr.
+fn open_session(
+    core: &Core,
+    project_key: &str,
+    continue_session: bool,
+) -> Result<(String, bool, Vec<open_max_core::types::ChatMessage>), i32> {
+    let (session_id, continued) = if continue_session {
+        match sessions::latest(core, project_key) {
+            Ok(Some(meta)) => (meta.id, true),
+            Ok(None) => {
+                eprintln!("openmax: no prior session in this directory to continue");
+                return Err(2);
+            }
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(core, e);
+                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
+                return Err(1);
+            }
+        }
+    } else {
+        match sessions::create(core, project_key.to_string()) {
+            Ok(meta) => (meta.id, false),
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(core, e);
+                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
+                return Err(1);
+            }
+        }
+    };
+
+    if let Err(e) = sessions::attach(core, &session_id) {
+        eprintln!("openmax: {e}");
+        return Err(1);
+    }
+    let history = if continued {
+        match sessions::load_messages(core, &session_id) {
+            Ok(messages) => messages.unwrap_or_default(),
+            Err(e) => { eprintln!("openmax: {e}"); return Err(1); }
+        }
+    } else { Vec::new() };
+    Ok((session_id, continued, history))
 }
 
 /// The blocking stdin reader on its own thread; malformed input travels as
@@ -343,9 +363,17 @@ async fn drive_loop<W: Write>(
                         // in the composer: a frontend driving this protocol
                         // gets the project's templates for free.
                         let text = templates::expand_user_input(&core.data_dir, &project, &text);
-                        match agent::start_turn(core.clone(), session_id.clone(), project.clone(), text) {
-                            Ok(()) => running = true,
-                            Err(e) => refuse(out, &session_id, &e),
+                        let start = {
+                            let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
+                            move || agent::start_turn(core, session_id, project, text)
+                        };
+                        match crate::unless_quit(&mut quit, start).await {
+                            Ok(Ok(())) => running = true,
+                            Ok(Err(e)) => refuse(out, &session_id, &e),
+                            Err(code) => {
+                                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                return code;
+                            }
                         }
                     }
                 }

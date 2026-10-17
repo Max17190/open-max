@@ -1239,6 +1239,26 @@ pub(crate) fn signalled() -> bool {
     QUIT_SIGNAL.load(Ordering::SeqCst) != 0
 }
 
+/// Run `work`, a print or stdio run's session setup or the start of one of
+/// its turns, on a blocking thread unless a signal (`quit`) lands first.
+/// Both wait on the session index lock, which another openmax process on the
+/// same data dir can hold for as long as its own write takes, and on this
+/// thread that wait left the first signal unanswered until the lock was
+/// free. No turn of the run is live yet for a stop to cancel, so the signal
+/// ends the run at once with its status (`Err`), as one during a reload
+/// does. Work still waiting ends with the process, and the exit kills any
+/// tool group it started.
+pub(crate) async fn unless_quit<T: Send + 'static>(
+    quit: impl std::future::Future<Output = ()>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, i32> {
+    let work = tokio::task::spawn_blocking(work);
+    tokio::select! {
+        done = work => Ok(done.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))),
+        _ = quit => Err(quit_status()),
+    }
+}
+
 /// Remove the session a print or stdio run created, when nothing was ever
 /// persisted to it (see `sessions::discard_if_empty`). The removal waits for
 /// the session index lock, which another openmax process on the same data
