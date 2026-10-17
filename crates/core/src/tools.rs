@@ -643,7 +643,8 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// other hard links, which a new file would split from, or when no temp
 /// file can be made beside it, given its owner, group and permissions, and
 /// renamed over it: in a directory that takes no new file from this user, in
-/// a sticky directory, or for a file mounted on its own.
+/// a sticky directory, for a file mounted on its own, or for a path that
+/// leaves no room for the longer path of a temp file beside it.
 ///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
