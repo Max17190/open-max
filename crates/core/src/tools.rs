@@ -628,31 +628,180 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// Replace the contents of the regular file at `path`, creating it if absent.
+/// Make `bytes` the contents of the regular file at `path`, creating it if
+/// absent.
+///
+/// A write in place truncates first, so one that failed partway (a full
+/// disk, a quota, a file size limit) left a prefix of the new contents under
+/// the old name while the tool reported only that it could not write. The
+/// bytes go to a temp file beside it instead, which takes its place once
+/// they are all written, so a failure leaves the file as it was.
+///
+/// The replacement gets the file's permissions, owner and group, but not its
+/// ACLs, extended attributes or file flags. A file is written in place
+/// instead, with its old contents written back if that fails, when it has
+/// other hard links, which a new file would split from; when this user
+/// cannot give a new file its owner or group (only the superuser can give a
+/// file to another user or to a group it is not in); when its directory
+/// takes no new file from this user; when the rename over it is refused (a
+/// file mounted on its own, another user's file in a sticky directory); or
+/// when its path leaves no room for the longer path of a temp file beside
+/// it.
 ///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
-/// in a mutation Esc cannot cancel. So the open neither waits nor
+/// in a mutation Esc cannot cancel. So the open here neither waits nor
 /// truncates, and nothing is written until the descriptor shows a regular
 /// file.
-fn write_regular(path: &Path, content: &str) -> Result<(), NotRegular> {
+fn write_regular(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let unchanged = |e: std::io::Error| format!("cannot write {rel}: {e}; {rel} is unchanged");
+    // Also the check a write in place makes: a rename needs only the
+    // directory's permission, so without it a file this user may not write
+    // would be replaced.
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return crate::sessions::replace_atomic(path, bytes, 0o666, |_| Ok(()))
+                .map_err(|e| format!("cannot write {rel}: {e}; {rel} was not created"));
+        }
         // A pipe with no reader refuses an open that does not wait.
-        Err(e) => return Err(std::fs::metadata(path).ok().as_ref().and_then(not_regular).unwrap_or(NotRegular::Io(e))),
+        Err(e) => {
+            return Err(match std::fs::metadata(path).ok().as_ref().and_then(not_regular) {
+                Some(kind) => kind.message(rel),
+                None => unchanged(e),
+            })
+        }
     };
-    if let Some(kind) = not_regular(&file.metadata().map_err(NotRegular::Io)?) {
-        return Err(kind);
+    let meta = file.metadata().map_err(unchanged)?;
+    if let Some(kind) = not_regular(&meta) {
+        return Err(kind.message(rel));
     }
-    file.set_len(0).map_err(NotRegular::Io)?;
-    std::io::Write::write_all(&mut file, content.as_bytes()).map_err(NotRegular::Io)
+    if !has_other_links(&meta) {
+        let mut ready = false;
+        // Only this user may open the temp file until it has the file's
+        // owner, group and mode. Created with the default mode and the
+        // directory's group, it would let a user the file keeps out open it
+        // and read what is written next.
+        let replaced = crate::sessions::replace_atomic(path, bytes, 0o600, |tmp| {
+            take_identity(tmp, &meta)?;
+            ready = true;
+            Ok(())
+        });
+        match replaced {
+            Ok(()) => return Ok(()),
+            // No temp file could be made and given the file's identity, or
+            // the rename over the file was refused: the file itself may
+            // still be writable in place.
+            Err(_) if !ready => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ResourceBusy) => {}
+            // The bytes could not be stored (a full disk, a quota, a size
+            // limit, an I/O error). Written in place they would have
+            // truncated the file first, so it stays as it was.
+            Err(e) => return Err(unchanged(e)),
+        }
+    }
+    write_in_place(path, file, &meta, rel, bytes)
+}
+
+/// Unix only: elsewhere the standard library does not give the link count.
+fn has_other_links(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(meta) > 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    linked
+}
+
+/// Give the temp file that replaces a file that file's owner and mode. Only
+/// the superuser can give a file to another user, or to a group it is not
+/// in, so for anyone else such a file fails here. Setuid and setgid stay
+/// off, as a write in place by anyone but the superuser clears them.
+fn take_identity(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fresh = tmp.metadata()?;
+        #[cfg(test)]
+        CREATED_MODE.with(|created| created.set(Some(fresh.mode())));
+        if (fresh.uid(), fresh.gid()) != (meta.uid(), meta.gid()) {
+            std::os::unix::fs::fchown(tmp, Some(meta.uid()), Some(meta.gid()))?;
+        }
+        std::fs::Permissions::from_mode(meta.mode() & 0o1777)
+    };
+    #[cfg(not(unix))]
+    let mode = meta.permissions();
+    tmp.set_permissions(mode)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The mode `take_identity` found a temp file created with.
+    static CREATED_MODE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Write `bytes` over the regular `file`, open at `path` with metadata
+/// `meta`. It is truncated first, so if the write then fails its old
+/// contents are written back, and the result says whether they were. A file
+/// whose old contents cannot be read first is left alone: truncated, it
+/// would have nothing to put back.
+fn write_in_place(
+    path: &Path,
+    mut file: std::fs::File,
+    meta: &std::fs::Metadata,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::{Read, Seek, Write};
+    // The bytes to put back come from the file, not from the text the
+    // caller read: a file that is not UTF-8 reads as empty there. The open
+    // that reads them looks the path up again, so it must have reached the
+    // file being written, not one renamed over it since.
+    let old = open_regular(path).ok().filter(|(_, seen)| same_file(seen, meta)).and_then(|(mut readable, _)| {
+        let mut old = Vec::new();
+        readable.read_to_end(&mut old).ok().map(|_| old)
+    });
+    let Some(old) = old else {
+        return Err(format!(
+            "cannot write {rel} in place: its contents could not be read to put back if the write failed; {rel} is unchanged"
+        ));
+    };
+    let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(bytes)
+    };
+    let Err(e) = overwrite(&mut file, bytes) else {
+        return Ok(());
+    };
+    Err(match overwrite(&mut file, &old) {
+        Ok(()) => format!("cannot write {rel}: {e}; its old contents were written back"),
+        Err(again) => format!(
+            "cannot write {rel}: {e}, and writing its old contents back failed too ({again}), so it may be partly written"
+        ),
+    })
+}
+
+/// Whether `a` and `b` describe the same file. Unix only: elsewhere the
+/// standard library gives no file identity, so any two count as the same.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    };
+    #[cfg(not(unix))]
+    let same = {
+        let _ = (a, b);
+        true
+    };
+    same
 }
 
 /// The numbered lines one read_file call returns.
@@ -881,10 +1030,8 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
             return ToolOutcome::err(format!("cannot create directories: {e}"));
         }
     }
-    match write_regular(&path, content) {
-        Ok(()) => {}
-        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
-        Err(e) => return ToolOutcome::err(e.message(rel)),
+    if let Err(e) = write_regular(&path, rel, content.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("wrote", root, &path, &old, content)
 }
@@ -1065,10 +1212,8 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(hint);
     };
 
-    match write_regular(&path, &new) {
-        Ok(()) => {}
-        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
-        Err(e) => return ToolOutcome::err(e.message(rel)),
+    if let Err(e) = write_regular(&path, rel, new.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("edited", root, &path, &old, &new)
 }
@@ -1871,9 +2016,9 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let target = pipe.clone();
         std::thread::spawn(move || {
-            let alone = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let alone = write_regular(&target, "pipe", b"x").err();
             let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&target).unwrap();
-            let attached = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let attached = write_regular(&target, "pipe", b"x").err();
             drop(reader);
             let _ = done_tx.send((alone, attached));
         });
@@ -1883,6 +2028,81 @@ mod tests {
         assert_eq!(alone, refusal, "no reader attached");
         assert_eq!(attached, refusal, "a reader attached");
         assert!(std::fs::symlink_metadata(&pipe).unwrap().file_type().is_fifo());
+    }
+
+    /// A write in place truncates the file it has open, but reads the old
+    /// contents it would put back through a second open of the path. A file
+    /// renamed over the path in between must not lend its bytes, or a failed
+    /// write would fill the first file with the second's contents and call
+    /// them its own. The write is refused before anything is truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_in_place_puts_back_only_the_file_it_writes() {
+        let root = temp_project();
+        let path = root.join("linked.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::hard_link(&path, root.join("alias.txt")).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        std::fs::rename(root.join("other.txt"), &path).unwrap();
+        let refused = "cannot write linked.txt in place: its contents could not be read to put back if the write failed; linked.txt is unchanged";
+        assert_eq!(write_in_place(&path, file, &meta, "linked.txt", b"new\n"), Err(refused.to_string()));
+        assert_eq!(std::fs::read_to_string(root.join("alias.txt")).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "other\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file whose path is near the length limit leaves no room for the
+    /// longer path of a temp file beside it, so no temp file can be made to
+    /// replace it. It is still written, in place, as it was before writes
+    /// went through a temp file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_no_room_for_a_temp_path_beside_it_is_written_in_place() {
+        let root = temp_project();
+        // The longest path an open takes, NUL excluded. The file's path is
+        // two bytes short of it; the temp path beside it is longer than the
+        // file's by the id and suffix it adds.
+        let limit = libc::PATH_MAX as usize - 1;
+        let tail = "/a.txt".len();
+        let mut dir = root.clone();
+        while dir.as_os_str().len() + 1 + 200 + 1 + tail <= limit - 2 {
+            dir.push("d".repeat(200));
+        }
+        dir.push("p".repeat(limit - 2 - tail - 1 - dir.as_os_str().len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        assert_eq!(path.as_os_str().len(), limit - 2);
+        std::fs::write(&path, "old\n").unwrap();
+        let beside = std::fs::File::create(dir.join(format!("a.txt.{}.tmp", "0".repeat(32)))).unwrap_err();
+        assert_eq!(beside.raw_os_error(), Some(libc::ENAMETOOLONG), "the temp path must not fit");
+        assert_eq!(write_regular(&path, "a.txt", b"new\n"), Ok(()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("a.txt")], "nothing left beside it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A replacement's temp file exists before it has the file's owner,
+    /// group and mode, and whoever opens it in that window keeps reading
+    /// what is written to it. Created with the default mode, a 0640 file's
+    /// new contents would be open to every user for that window.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_opens_to_no_one_but_this_user_until_it_has_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_project();
+        let path = root.join("secret.env");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        CREATED_MODE.with(|created| created.set(None));
+        assert_eq!(write_regular(&path, "secret.env", b"new\n"), Ok(()));
+        let created = CREATED_MODE.with(|created| created.take()).expect("replaced through a temp file");
+        assert_eq!(created & 0o077, 0, "the temp file was created with mode {:o}", created & 0o7777);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Reading a device takes whatever it hands out for as long as it keeps
