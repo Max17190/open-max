@@ -415,11 +415,16 @@ async fn drive_loop<W: Write>(
                         }
                         // A `/name args` line expands here exactly as it does
                         // in the composer: a frontend driving this protocol
-                        // gets the project's templates for free.
-                        let text = templates::expand_user_input(&core.data_dir, &project, &text);
+                        // gets the project's templates for free. The expansion
+                        // reads the template's file, which stalled storage can
+                        // hold for any length of time, so it runs with the
+                        // turn's start, where a signal bounds the wait.
                         let start = {
                             let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
-                            move || agent::start_turn(core, session_id, project, text)
+                            move || {
+                                let text = templates::expand_user_input(&core.data_dir, &project, &text);
+                                agent::start_turn(core, session_id, project, text)
+                            }
                         };
                         match crate::until_stopped(&mut quit, stop_by, start).await {
                             Some(Ok(())) => running = true,

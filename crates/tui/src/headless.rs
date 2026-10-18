@@ -110,13 +110,18 @@ async fn run_prompts(
         }
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
-        // would, so hooks and the transcript see the expanded text.
-        let text = templates::expand_user_input(&core.data_dir, &project, prompt);
-        // Starting a turn claims the session, which waits on the session
-        // index lock.
+        // would, so hooks and the transcript see the expanded text. The
+        // expansion reads the template's file, which stalled storage can hold
+        // for any length of time, and starting the turn claims the session,
+        // which waits on the session index lock, so both run where a signal
+        // bounds them.
         let start = {
             let (core, session_id, project) = (core.clone(), session_id.to_string(), project.clone());
-            move || agent::start_turn(core, session_id, project, text)
+            let prompt = prompt.clone();
+            move || {
+                let text = templates::expand_user_input(&core.data_dir, &project, &prompt);
+                agent::start_turn(core, session_id, project, text)
+            }
         };
         // A turn started under a signal is stopped by `run_turn_events`.
         match crate::until_stopped(args.quit.notified(), stop_by, start).await {

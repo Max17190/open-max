@@ -1257,14 +1257,15 @@ pub(crate) fn deadline(at: std::time::Instant) -> tokio::sync::oneshot::Receiver
 /// Run `work`, a print or stdio run's session setup or the start of one of
 /// its turns, on a blocking thread, and let a signal (`quit`) bound it. Both
 /// wait on the session index lock, which another openmax process on the
-/// same data dir can hold for as long as its own write takes, and on this
-/// thread that wait left the first signal unanswered until the lock was
-/// free. A signal during the work starts the stop's deadline (`stop_by`,
-/// which may already be running), and the work gets until then: `Some` with
-/// its result, which the caller winds down with the stop in `stop_by` (a
-/// turn it started is cancelled and settled like any other), or `None` once
-/// the deadline passes first. Work still waiting then ends with the process,
-/// and the exit kills any tool group it started.
+/// same data dir can hold for as long as its own write takes, and a turn's
+/// start can first read a prompt template, which stalled storage can hold
+/// as long. On this thread either wait left the first signal unanswered
+/// until it ended. A signal during the work starts the stop's deadline
+/// (`stop_by`, which may already be running), and the work gets until then:
+/// `Some` with its result, which the caller winds down with the stop in
+/// `stop_by` (a turn it started is cancelled and settled like any other), or
+/// `None` once the deadline passes first. Work still waiting then ends with
+/// the process, and the exit kills any tool group it started.
 pub(crate) async fn until_stopped<T: Send + 'static>(
     quit: impl std::future::Future<Output = ()>,
     stop_by: &mut Option<std::time::Instant>,
