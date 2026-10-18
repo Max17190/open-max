@@ -86,7 +86,10 @@ options:
                          with --mcp-list or --mcp-call, the longest wait for
                          each server reply (default 30, at most 3600)
       --trust-project    trust this exact project root in auto mode (a project
-                         already trusted keeps its mode), then run
+                         already trusted keeps its mode), then run. With
+                         neither -p nor --stdio and stdout not a terminal, no
+                         session starts: the grant alone exits 0, and with
+                         --continue, --model or --provider it exits 1
   -V, --version          print the version
   -h, --help             this help
 
@@ -878,6 +881,10 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
     if let Err(e) = ensure_project_trust(&cli, &data_dir, &project) {
         eprintln!("openmax: {e}");
         std::process::exit(3);
+    }
+    if let Some(code) = exit_after_grant(&cli, std::io::stdout().is_terminal()) {
+        eprintln!("openmax: stdout is not a terminal, so no session was started");
+        std::process::exit(code);
     }
 
     let (core, core_rx) = match Core::new(data_dir) {
@@ -1756,6 +1763,24 @@ fn print_usage_economics() {
     }
 }
 
+/// The exit code of a run that ends once `ensure_project_trust` has
+/// recorded its grant, or None when it goes on. `--trust-project` with no
+/// `-p` or `--stdio` goes on to the interactive session, which draws on
+/// stdout, so with stdout not a terminal no session starts. Going on there
+/// was wrong either way: with no controlling terminal (a CI job), starting
+/// the session failed after the grant was recorded and the run exited 1;
+/// with one, the session drew its frames into the pipe. The grant alone is
+/// the whole run and exits 0. `--continue`, `--model` and `--provider` ask
+/// for the session itself, so with any of them the run exits 1 rather than
+/// as if that session had run (see `refusal`).
+fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
+    if !cli.trust_project || cli.print || cli.stdio || stdout_is_terminal {
+        return None;
+    }
+    let asks_for_a_session = cli.continue_session || cli.model.is_some() || cli.provider.is_some();
+    Some(if asks_for_a_session { 1 } else { 0 })
+}
+
 fn ensure_project_trust(
     cli: &CliArgs,
     data_dir: &std::path::Path,
@@ -2614,6 +2639,29 @@ mod tests {
         // interactive stdio session and takes no prompt.
         let cli = parse_args_from(["--check", "--stdio"]).unwrap();
         assert!(cli.check && cli.stdio && !cli.print && cli.prompts.is_empty());
+    }
+
+    /// A grant with no session to start in ends the run: `--trust-project`
+    /// ends after the grant when stdout is not a terminal, and goes on to the
+    /// interactive session when it is. The grant alone exits 0; with
+    /// `--continue`, `--model` or `--provider` the session they ask for did
+    /// not start, so it exits 1. With `-p` or `--stdio` the session needs no
+    /// terminal, and without `--trust-project` there is no grant to end on.
+    #[test]
+    fn a_grant_without_a_terminal_ends_there_and_exits_0_only_alone() {
+        let exit = |args: &[&str], stdout_is_terminal: bool| {
+            exit_after_grant(&parse_args_from(args.iter().copied()).unwrap(), stdout_is_terminal)
+        };
+        assert_eq!(exit(&["--trust-project"], false), Some(0));
+        assert_eq!(exit(&["--trust-project"], true), None);
+        assert_eq!(exit(&["--trust-project", "-p", "inspect"], false), None);
+        assert_eq!(exit(&["--trust-project", "--stdio"], false), None);
+        assert_eq!(exit(&[], false), None);
+        for session in [&["--continue"][..], &["-m", "m"], &["--provider", "p"]] {
+            let args = [&["--trust-project"][..], session].concat();
+            assert_eq!(exit(&args, false), Some(1), "{args:?}");
+            assert_eq!(exit(&args, true), None, "{args:?}");
+        }
     }
 
     #[test]

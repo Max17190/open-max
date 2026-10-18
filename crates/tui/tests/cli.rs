@@ -430,10 +430,10 @@ fn stdio_handshake(
 /// Run one documented trust command exactly as written, in a fresh project,
 /// in the context the docs give it: a line commented `from a terminal` gets a
 /// terminal on stdin, any other line gets the pipe a frontend or a CI job
-/// hands it. No variable is set that the line does not set itself. Success is
-/// the documented result: the run itself works, the project is trusted in
-/// auto although settings.json says ask, and a frontend's plain
-/// `openmax --stdio` then starts with no flag.
+/// hands it and, as in CI, no controlling terminal. No variable is set that
+/// the line does not set itself. Success is the documented result: the run
+/// itself works, the project is trusted in auto although settings.json says
+/// ask, and a frontend's plain `openmax --stdio` then starts with no flag.
 fn run_documented_trust_command(line: &str) -> Result<(), String> {
     let (words, comment) = shell_words(line);
     let at = words.iter().position(|w| w == "openmax").ok_or("no openmax invocation")?;
@@ -455,7 +455,8 @@ fn run_documented_trust_command(line: &str) -> Result<(), String> {
         controller = Some(pty);
         command.stdin(terminal);
     } else {
-        command.stdin(Stdio::piped());
+        // What a CI job gets: no controlling terminal either.
+        without_controlling_terminal(command.stdin(Stdio::piped()));
     }
     let mut child = command.spawn().unwrap();
     let out = if args.iter().any(|a| a == "--stdio") {
@@ -466,12 +467,14 @@ fn run_documented_trust_command(line: &str) -> Result<(), String> {
             (None, None) => unreachable!("stdin is piped when no terminal is given"),
         };
         stdio_handshake(child, input)?
-    } else if args.iter().any(|a| a == "-p") {
+    } else if args.iter().any(|a| a == "-p") || controller.is_none() {
+        // A print run ends with its turn, and a grant alone with no terminal
+        // ends once it is recorded.
         finish_with_deadline(child)
     } else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err("neither -p nor --stdio: teach this test the documented result".into());
+        return Err("a grant alone from a terminal starts a session: teach this test the documented result".into());
     };
     drop(controller);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -625,6 +628,86 @@ fn trust_project_records_auto_for_a_project_it_newly_trusts() {
     let store = std::fs::read_to_string(home.join(".openmax/trust.json")).unwrap();
     let spawned = std::fs::canonicalize(&spawned).unwrap();
     assert!(!store.contains(spawned.to_str().unwrap()), "an agent-spawned grant recorded state: {store}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Start `command` with no controlling terminal, as in a CI job. A run that
+/// goes on to the interactive session then fails to open /dev/tty instead of
+/// putting the terminal the tests run in into raw mode and reading its keys.
+fn without_controlling_terminal(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe, and the closure touches nothing
+    // else between fork and exec.
+    unsafe {
+        command.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        })
+    }
+}
+
+/// A grant where nothing gives it a terminal, as in a CI job (what the
+/// attestation is for), ends the run once it is recorded: `--trust-project`
+/// with no `-p` or `--stdio` records the grant, says what it recorded and
+/// that no session started, and exits 0. The interactive session it
+/// otherwise goes on to draws on stdout, and starting it there failed after
+/// the grant was recorded, so a grant that succeeded exited 1 with a terminal
+/// error. A second grant keeps the mode the project has by then (here one
+/// changed to ask since) and exits 0 the same way.
+/// With `--continue` the run asked for that session, which did not start, so
+/// it exits 1 after the grant instead of as if the session had run.
+#[test]
+fn a_grant_with_no_terminal_exits_0_once_it_is_recorded() {
+    let (project, home) = fresh_dirs("grant-only");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let grant = |session: &[&str]| {
+        let mut command = cmd(&project, &home);
+        command
+            .arg("--trust-project")
+            .args(session)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        finish_with_deadline(without_controlling_terminal(&mut command).spawn().unwrap())
+    };
+    let root = std::fs::canonicalize(&project).unwrap();
+    let out = grant(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!("openmax: trusted project {} in auto mode", root.display())),
+        "the run must say what it recorded: {stderr}"
+    );
+    assert!(stderr.contains("no session was started"), "{stderr}");
+    assert!(!stderr.contains("failed to initialize terminal"), "{stderr}");
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    let trust_file = home.join(".openmax/trust.json");
+    let read_store =
+        || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&trust_file).unwrap()).unwrap();
+    let mut store = read_store();
+    let root = root.to_str().unwrap();
+    assert_eq!(store["projects"], serde_json::json!([root]), "{store}");
+    assert_eq!(store["approval_modes"][root], "auto", "{store}");
+
+    // A grant records auto, so the second one starts from ask: had it
+    // recorded its mode again, the project would read auto afterwards.
+    store["approval_modes"][root] = "ask".into();
+    std::fs::write(&trust_file, store.to_string()).unwrap();
+    let out = grant(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("already trusted") && stderr.contains("no session was started"), "{stderr}");
+    assert!(stderr.contains("its approval mode is unchanged"), "{stderr}");
+    assert!(!stderr.contains("failed to initialize terminal"), "{stderr}");
+    let store = read_store();
+    assert_eq!(store["approval_modes"][root], "ask", "{store}");
+
+    let out = grant(&["--continue"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "the session --continue asks for did not start: {stderr}");
+    assert!(stderr.contains("already trusted") && stderr.contains("no session was started"), "{stderr}");
+    assert!(!stderr.contains("failed to initialize terminal"), "{stderr}");
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
