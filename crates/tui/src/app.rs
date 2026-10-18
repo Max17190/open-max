@@ -472,10 +472,11 @@ pub struct App {
     status_line: Line<'static>,
     status_width: u16,
     /// The approval mode the user was last shown: the one `status_line`
-    /// shows, or this TUI's own selection, which its note announces before
-    /// the next frame draws it. A turn can tighten the live mode to one
-    /// another process saved without anything here marking the chrome, so a
-    /// draw compares it with the live mode, and Shift+Tab steps only from it.
+    /// shows, or one a note announced since, before the next frame draws it
+    /// (this TUI's own selection, or a stricter mode Shift+Tab found saved
+    /// elsewhere). A turn can tighten the live mode to one another process
+    /// saved without anything here marking the chrome, so a draw compares it
+    /// with the live mode, and Shift+Tab steps only from it.
     status_mode: Option<config::ApprovalMode>,
 }
 
@@ -1709,6 +1710,9 @@ impl App {
         let live = self.approval_mode();
         if live != shown {
             self.note(&format!("approvals: {} for this project (saved in another session)", live.as_str()));
+            // Shown by that note, so a press handled before the next frame
+            // steps from it, as after a selection.
+            self.status_mode = Some(live);
             self.dirty.mark_chrome();
             return;
         }
@@ -5163,6 +5167,20 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "auto, then readonly, then ask");
+        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Ask);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The same when the first press finds a stricter mode another TUI
+    /// saved: the second steps from the mode the first one announced.
+    #[tokio::test]
+    async fn shift_tab_steps_from_a_mode_a_press_announced_before_a_frame() {
+        let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-quick-after-sibling");
+        sibling.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        }
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "readonly shown, then ask");
         assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Ask);
         fs::remove_dir_all(dir).unwrap();
     }
