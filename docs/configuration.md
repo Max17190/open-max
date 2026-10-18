@@ -220,7 +220,15 @@ session, and the harness strips it from every process it spawns:
 
 ```sh
 OPENMAX_HUMAN_ATTEST=1 openmax --trust-project -p "summarize this repo"
+OPENMAX_HUMAN_ATTEST=1 openmax --trust-project   # the grant alone
 ```
+
+With neither `-p` nor `--stdio`, `--trust-project` goes on to the interactive
+session, which draws on stdout. Where stdout is not a terminal, no session
+starts: the run ends after the grant and says so. The grant alone exits 0.
+With `--continue`, `--model` or `--provider` as well, the run asked for the
+session itself, which cannot start there, so it exits 1 once the grant is
+recorded.
 
 Trust is persisted for the exact canonical path in `~/.openmax/trust.json`,
 together with the project's approval mode (see [approvals](#approvals)). It
