@@ -47,7 +47,10 @@ libc = "0.2"
 # and only then run it, because those jobs hold `contents: write` and build or
 # publish the release. The "Run the npm launcher under node or bun" step in
 # `publish-npm` rewrites the npm package's launcher so it runs without Node.js
-# when bun is on PATH.
+# when bun is on PATH. The "Let the installer verify with shasum where there is
+# no sha256sum" step in `build-global-artifacts` runs
+# scripts/patch-installer-checksum.sh on the shell installer, so it checks the
+# archive it downloads on macOS 14 and earlier instead of skipping the check.
 #
 # `allow-dirty = ["ci"]` is what lets those edits survive: without it `dist plan`
 # fails the job because the checked-in workflow no longer matches what it would

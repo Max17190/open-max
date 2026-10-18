@@ -237,6 +237,18 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Let the installer verify with shasum where there is no sha256sum
+        # LOCAL EDIT, not generated; see the note on the "Install dist" step in
+        # `plan`, and re-apply this step after regenerating.
+        #
+        # dist's installer checks the archive it downloads only with
+        # `sha256sum` and skips the check without it, and macOS 14 and earlier
+        # ship `shasum` but no `sha256sum`. This patches the installer built
+        # above, before it is uploaded, to fall back to `shasum -a 256`, and
+        # fails if dist's check is not in the shape the script expects rather
+        # than publishing an installer that skips it. The installer is in no
+        # checksum file dist publishes, so nothing else changes with it.
+        run: scripts/patch-installer-checksum.sh target/distrib/openmax-installer.sh
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:
