@@ -652,11 +652,12 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// list, or whose directory's inheritable entries would give the new file
 /// one); when its directory takes no new file from this user; when the
 /// rename over it is refused (a file mounted on its own); or when its path
-/// leaves no room for the longer path of a temp file beside it. Such a file whose contents cannot
-/// be read first is not written at all, since there would be nothing to
-/// write back. In a directory flagged append-only, which refuses both the
-/// rename and the removal of the temp file, the file is written in place
-/// and the temp file, holding the new contents, is left beside it.
+/// leaves no room for the longer path of a temp file beside it. Such a file
+/// whose contents cannot be read first is not written at all, since there
+/// would be nothing to write back. In a directory flagged append-only,
+/// which refuses both the rename and the removal of the temp file, the file
+/// is written in place and the temp file, holding the new contents, is left
+/// beside it.
 ///
 /// A replacement is a new file under the old name, so whatever holds the
 /// old file keeps it: a mount of the file itself (a container's single-file
