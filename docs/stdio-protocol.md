@@ -165,8 +165,10 @@ that nothing was saved to, its index entry is removed, or after 3 seconds if
 either has not finished, plus up to 100 ms to check that the session is empty
 and up to 250 ms for a tool command still being started; an entry still in
 place then stays, and a warning says so on stderr.
-A signal while the session waits on the session index to open or to start a
-turn ends it the same way; see [usage](usage.md#command-line).
+A signal while the session waits on the session index to open, to start a
+turn, or to reload, or on the trust store to save an approval mode, ends it
+the same way, and a `reload` or `approval_mode` it cuts short gets no answer;
+see [usage](usage.md#command-line).
 
 Bad input leaves the session unharmed. A line that is not valid UTF-8, or one
 longer than 8 MiB, is reported as a `protocol_error` and skipped; the reader

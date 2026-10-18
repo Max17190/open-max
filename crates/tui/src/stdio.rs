@@ -307,7 +307,31 @@ async fn drive_loop<W: Write>(
                                 // success: the acknowledged state, the live
                                 // state, and the on-disk state must never
                                 // disagree about how mutating tools are gated.
-                                let saved = core.set_project_approval_mode(&project, parsed);
+                                // The save waits on the trust store's lock,
+                                // which another openmax process can hold for
+                                // as long as its own write takes, and on this
+                                // thread that wait left a signal unanswered
+                                // until the lock was free. A turn can be in
+                                // flight, so a signal goes to the top of this
+                                // loop, which cancels and settles that turn.
+                                // A save still waiting gets no answer: it
+                                // finishes on its own or ends with the process.
+                                let save = tokio::task::spawn_blocking({
+                                    let (core, project) = (core.clone(), project.clone());
+                                    move || core.set_project_approval_mode(&project, parsed)
+                                });
+                                let saved = tokio::select! {
+                                    // A result in hand is never dropped for a
+                                    // signal that came with it.
+                                    biased;
+                                    saved = save => {
+                                        saved.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+                                    }
+                                    _ = &mut quit, if stop_by.is_none() => {
+                                        *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                        continue;
+                                    }
+                                };
                                 match saved {
                                     Ok(()) => {
                                         emit(
@@ -337,11 +361,30 @@ async fn drive_loop<W: Write>(
                         }
                         // A reload reads every extension manifest, and a read
                         // can stall (a slow disk, a manifest that is a pipe).
-                        // No turn runs during one, so a signal ends the
-                        // session at once instead of waiting it out.
+                        // It also claims the session, and that waits on the
+                        // session index lock, which another openmax process
+                        // can hold for as long as its own write takes, with
+                        // the thread it runs on blocked. So it runs as a task
+                        // of its own, and this loop stays free to answer a
+                        // signal. No turn runs during a reload, so a signal
+                        // ends the session at once instead of waiting it out.
+                        let mut reload = tokio::spawn({
+                            let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
+                            async move { agent::reload_session(&core, &session_id, &project).await }
+                        });
                         let reloaded = tokio::select! {
-                            reloaded = agent::reload_session(&core, &session_id, &project) => reloaded,
+                            // A result in hand is never dropped for a signal
+                            // that came with it.
+                            biased;
+                            reloaded = &mut reload => {
+                                reloaded.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+                            }
                             _ = &mut quit, if stop_by.is_none() => {
+                                // Stopped at its next await, so a reload the
+                                // signal interrupted is not applied while the
+                                // session is going away. A blocking wait it is
+                                // in finishes first, or ends with the process.
+                                reload.abort();
                                 *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
                                 return crate::quit_status();
                             }

@@ -2665,9 +2665,9 @@ fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
     assert_eq!(status.code(), Some(143), "{status:?}");
 }
 
-/// When the test takes the session index lock, standing in for another
-/// openmax process on the same data dir whose index write takes as long as
-/// it likes.
+/// When the test takes the session index lock, or for one case the trust
+/// store's, standing in for another openmax process on the same data dir
+/// whose write takes as long as it likes.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum IndexHeld {
     /// From before the run starts: its session setup waits on the lock.
@@ -2684,6 +2684,16 @@ enum IndexHeld {
     /// that turn and end its stream with the cancelled `done`, not exit
     /// past a turn it never stopped.
     FreedAfterTheSignal,
+    /// Once a stdio session has said hello, before a `reload`: the reload
+    /// claims the session, which waits on the lock. No turn runs, so the
+    /// stop must end the session without an answer to the reload, and the
+    /// empty session it leaves stays indexed.
+    BeforeAReload,
+    /// Once a stdio session has said hello, the trust store's lock instead
+    /// of the index, before an `approval_mode`: saving the mode waits on it.
+    /// The stop must end the session without an answer to the command, and
+    /// with the index free it removes the empty session.
+    TrustBeforeAnApprovalMode,
     /// While a fresh run's first turn waits on a model that never answers:
     /// nothing is saved, so the stop removes the empty session, and that
     /// removal waits on the lock.
@@ -2703,9 +2713,9 @@ enum IndexHeld {
 
 /// A signal must end a print or stdio run within the stop's deadline
 /// wherever the run, or its cancelled turn, is waiting on the session index
-/// lock. Each of these waits could hold the first signal unanswered for as
-/// long as the other process kept the lock, so that only a second signal
-/// ended the run. The run must exit
+/// lock or the trust store's. Each of these waits could hold the first
+/// signal unanswered for as long as the other process kept the lock, so that
+/// only a second signal ended the run. The run must exit
 /// 143 within the deadline, plus half of it for the exit itself, and say so
 /// when the empty session it created stays indexed, and only then.
 fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
@@ -2739,19 +2749,19 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     });
     let sessions = home.join(".openmax").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    let mut index_lock = Some(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(sessions.join("index.lock"))
-            .unwrap(),
+    let lock_path = if held == IndexHeld::TrustBeforeAnApprovalMode {
+        home.join(".openmax").join("trust.lock")
+    } else {
+        sessions.join("index.lock")
+    };
+    let mut held_lock = Some(
+        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path).unwrap(),
     );
     let take_lock = |lock: &Option<std::fs::File>| {
-        lock.as_ref().unwrap().try_lock().expect("nothing else holds the index yet")
+        lock.as_ref().unwrap().try_lock().expect("nothing else holds the lock yet")
     };
     if matches!(held, IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal) {
-        take_lock(&index_lock);
+        take_lock(&held_lock);
     }
     let stdio = args.contains(&"--stdio");
     let mut child = cmd(&project, &home)
@@ -2795,15 +2805,23 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        IndexHeld::BeforeTheTurn | IndexHeld::FreedAfterTheSignal => {
+        IndexHeld::BeforeTheTurn
+        | IndexHeld::FreedAfterTheSignal
+        | IndexHeld::BeforeAReload
+        | IndexHeld::TrustBeforeAnApprovalMode => {
             let mut hello = String::new();
             stdout.read_line(&mut hello).unwrap();
             if !hello.contains(r#""type":"hello""#) {
                 fail(&mut child, &format!("no hello: {hello}"));
             }
-            take_lock(&index_lock);
-            writeln!(stdin.as_mut().unwrap(), r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
-            // Time for the session to read the command and start the turn.
+            take_lock(&held_lock);
+            let command = match held {
+                IndexHeld::BeforeAReload => r#"{"cmd":"reload"}"#,
+                IndexHeld::TrustBeforeAnApprovalMode => r#"{"cmd":"approval_mode","mode":"ask"}"#,
+                _ => r#"{"cmd":"user","text":"wait"}"#,
+            };
+            writeln!(stdin.as_mut().unwrap(), "{command}").unwrap();
+            // Time for the session to read the command and start on it.
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         IndexHeld::AfterASavedTurn => {
@@ -2837,7 +2855,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
                 Ok(stream) => endpoint = Some(stream),
                 Err(_) => fail(&mut child, "the second turn never asked the endpoint"),
             }
-            take_lock(&index_lock);
+            take_lock(&held_lock);
         }
         IndexHeld::DuringTheTurn | IndexHeld::AfterTheModelHungUp => {
             if let Some(stdin) = stdin.as_mut() {
@@ -2848,14 +2866,14 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
                 Ok(hung_up) => drop(hung_up),
                 Err(_) => fail(&mut child, "the turn never asked the endpoint"),
             }
-            take_lock(&index_lock);
+            take_lock(&held_lock);
         }
     }
     let signalled = std::time::Instant::now();
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     if matches!(held, IndexHeld::FreedAfterTheSignal | IndexHeld::OpenFreedAfterTheSignal) {
         std::thread::sleep(bound / 6);
-        index_lock = None;
+        held_lock = None;
     }
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -2869,7 +2887,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     };
     let elapsed = signalled.elapsed();
     let _ = child.wait();
-    drop((index_lock, endpoint));
+    drop((held_lock, endpoint));
     drop(stdin);
     let stderr = stderr.join().unwrap();
     let mut rest = String::new();
@@ -2892,6 +2910,16 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
             assert!(!stderr.contains("stays indexed"), "{tag}: a session with history was reported empty: {stderr}");
             let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
             assert_eq!(listed.len(), 1, "{tag}: the session with history left the index: {index}");
+        }
+        IndexHeld::BeforeAReload => {
+            assert!(rest.is_empty(), "{tag}: the stopped session wrote on after its hello: {rest}");
+            assert!(stderr.contains("stays indexed"), "{tag}: the kept empty session went unreported: {stderr}");
+        }
+        IndexHeld::TrustBeforeAnApprovalMode => {
+            assert!(rest.is_empty(), "{tag}: the stopped session wrote on after its hello: {rest}");
+            assert!(!stderr.contains("stays indexed"), "{tag}: {stderr}");
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
+            assert!(listed.is_empty(), "{tag}: the empty session stayed indexed: {index}");
         }
         IndexHeld::FreedAfterTheSignal => {
             let done = last_event(rest.as_bytes());
@@ -2966,6 +2994,20 @@ fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_start_a_turn() 
 #[test]
 fn a_turn_that_starts_after_the_signal_is_cancelled_and_ends_its_stream() {
     stop_with_the_session_index_held("index-freed-stdio-turn", &["--stdio"], IndexHeld::FreedAfterTheSignal);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_reload() {
+    stop_with_the_session_index_held("index-held-stdio-reload", &["--stdio"], IndexHeld::BeforeAReload);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_trust_store_to_save_an_approval_mode() {
+    stop_with_the_session_index_held(
+        "trust-held-stdio-approval-mode",
+        &["--stdio"],
+        IndexHeld::TrustBeforeAnApprovalMode,
+    );
 }
 
 /// A signal the run inherited as ignored stays ignored: `nohup` keeps a run
