@@ -1061,18 +1061,21 @@ fn configure_process_group(_: &mut Command, _: bool) {}
 static LIVE_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Held by a command from just before its spawn until its group is
-/// registered, so the exit's kill can wait for a spawn in flight instead of
-/// missing the group it is about to start.
+/// registered, so the exit's kill can wait for a spawn in flight, for at
+/// most `EXIT_SPAWN_WAIT`, instead of missing the group it is about to start.
 static SPAWNING: Mutex<()> = Mutex::new(());
 
-/// Set by [`kill_process_groups`]: the process is about to exit, so no
-/// command starts from here on, and one already spawning kills its own group
-/// as it registers.
+/// Set by [`kill_process_groups`]: the process is about to exit, so a
+/// command whose spawn has not begun is refused. One already spawning is not
+/// stopped by it (see `EXIT_SPAWN_WAIT`).
 static EXITING: AtomicBool = AtomicBool::new(false);
 
 /// How long the exit's kill waits for a command caught between fork and exec.
 /// A child can stall there (exec on a hung mount, a slow exec check), and a
-/// second signal must still end the process.
+/// second signal must still end the process. A spawn still in flight when
+/// the wait ends is not stopped: every caller exits as soon as the kill
+/// returns, so the spawning thread dies before it registers the group, and
+/// the command runs on after the exit.
 const EXIT_SPAWN_WAIT: Duration = TERMINATION_GRACE;
 
 fn live_groups() -> std::sync::MutexGuard<'static, Vec<u32>> {
@@ -1083,7 +1086,8 @@ fn live_groups() -> std::sync::MutexGuard<'static, Vec<u32>> {
 /// another, right before the process exits. This is for an exit that cannot
 /// wait out the cancel path's grace, a second signal or a turn that never
 /// settled; once the harness has exited, nothing would stop them. A spawn in
-/// flight is waited for at most `EXIT_SPAWN_WAIT`.
+/// flight is waited for at most `EXIT_SPAWN_WAIT`, and one still in flight
+/// then is not stopped: its command runs after the exit.
 pub fn kill_process_groups() {
     EXITING.store(true, Ordering::SeqCst);
     let deadline = std::time::Instant::now() + EXIT_SPAWN_WAIT;
@@ -1108,8 +1112,10 @@ impl GroupGuard {
     /// Start `command` and register its group while holding `SPAWNING`, so
     /// the exit's kill waits for this spawn and finds the group, or comes
     /// first and the command never starts. A thread paused between the two
-    /// steps would otherwise leave a group the kill never saw. A kill that
-    /// gave up waiting is answered here: the group kills itself.
+    /// steps would otherwise leave a group the kill never saw. The kill
+    /// waits at most `EXIT_SPAWN_WAIT`, so a spawn that outlasts it is not
+    /// stopped: the process exits while this thread is still spawning, and
+    /// the command runs on after the exit.
     fn spawn(command: &mut Command) -> Result<(Child, Self), ProcessError> {
         let _spawning = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         if EXITING.load(Ordering::SeqCst) {
@@ -1117,11 +1123,7 @@ impl GroupGuard {
         }
         let child = command.spawn().map_err(ProcessError::Spawn)?;
         let pid = child.id();
-        let mut live = live_groups();
-        live.extend(pid);
-        if EXITING.load(Ordering::SeqCst) {
-            send_kill_group(pid);
-        }
+        live_groups().extend(pid);
         Ok((child, Self(pid)))
     }
 
@@ -1959,8 +1961,11 @@ mod tests {
     /// The kill an exit makes waits for a command caught between its spawn
     /// and its registration, but only for `EXIT_SPAWN_WAIT`: a child stalled
     /// before exec (a hung mount, a slow exec check) must not hold a second
-    /// signal's exit. Nothing starts after the kill. The kill marks the
-    /// process as exiting, so the probe runs in a child.
+    /// signal's exit. A command whose spawn begins after the kill is
+    /// refused. This does not show that the held command is stopped, and it
+    /// is not: its spawn outlasts the wait, so it runs once released, as it
+    /// would after a real exit. The kill marks the process as exiting, so
+    /// the probe runs in a child.
     #[cfg(unix)]
     #[test]
     fn the_exit_kill_waits_a_bounded_time_for_a_command_caught_mid_spawn() {
