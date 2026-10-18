@@ -159,7 +159,8 @@ content approval, even under a permission allow rule. Later calls of the same
 bytes need no content approval, but the mutating/permission gate still applies.
 Readonly refuses mutating calls and calls requiring confirmation.
 
-Select /approvals auto|ask|readonly or Shift+Tab in a human-controlled frontend.
+Select /approvals auto|ask|readonly, or Shift+Tab (switches ask and auto) in a
+human-controlled frontend.
 The choice persists for this exact trusted project across launches, including
 headless/stdio. A subdirectory, including a worktree placed under the project,
 without its own choice follows the nearest enclosing project's. A worktree

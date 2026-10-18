@@ -51,14 +51,19 @@ impl ApprovalMode {
         }
     }
 
-    /// The next mode when cycling through all three, ordered by how much the
-    /// agent is allowed to do: readonly, ask, auto, and back. One source of
-    /// truth so a front end offering a cycle key cannot invent its own order.
+    /// The mode a front end's step key (Shift+Tab in the TUI) moves to. It
+    /// switches between `ask` and `auto`, the two modes a session changes
+    /// its mind about, and it leaves `readonly` but never enters it: the key
+    /// is easy to press by accident and the choice is saved per project, so
+    /// one stray press that saved `readonly` would leave the project's next
+    /// session refusing every write in a mode nobody chose on purpose.
+    /// `readonly` is chosen on purpose: at the trust prompt, with
+    /// `/approvals readonly`, or a frontend's explicit mode command. One
+    /// source of truth so a front end cannot invent its own order.
     pub fn next(self) -> Self {
         match self {
-            ApprovalMode::Readonly => ApprovalMode::Ask,
+            ApprovalMode::Readonly | ApprovalMode::Auto => ApprovalMode::Ask,
             ApprovalMode::Ask => ApprovalMode::Auto,
-            ApprovalMode::Auto => ApprovalMode::Readonly,
         }
     }
 }
@@ -334,30 +339,18 @@ mod tests {
         assert!(json.contains(r#""approval_mode":"readonly""#), "{json}");
     }
 
-    /// Cycling has to reach every mode and come back, or a front end that
-    /// only offers the cycle key would strand the user in a subset of them.
+    /// The step key reaches `ask` and `auto` from anywhere and never lands
+    /// in `readonly`: a saved `readonly` from a stray press refuses every
+    /// write in the project's next session, so that mode is only ever chosen
+    /// on purpose.
     #[test]
-    fn cycling_approval_modes_visits_each_one_and_returns() {
-        let start = ApprovalMode::Ask;
-        let mut seen = vec![start];
-        let mut mode = start;
-        for _ in 0..2 {
-            mode = mode.next();
-            assert!(!seen.contains(&mode), "cycle repeats before it closes");
-            seen.push(mode);
+    fn stepping_approval_modes_switches_ask_and_auto_and_never_enters_readonly() {
+        assert_eq!(ApprovalMode::Ask.next(), ApprovalMode::Auto);
+        assert_eq!(ApprovalMode::Auto.next(), ApprovalMode::Ask);
+        assert_eq!(ApprovalMode::Readonly.next(), ApprovalMode::Ask, "the key leaves readonly");
+        for mode in [ApprovalMode::Readonly, ApprovalMode::Ask, ApprovalMode::Auto] {
+            assert_ne!(mode.next(), ApprovalMode::Readonly, "{mode:?} must not step into readonly");
         }
-        assert_eq!(mode.next(), start, "cycle does not close");
-        // Ordered by how much the agent may do, so the key reads as one
-        // direction rather than an arbitrary rotation.
-        assert_eq!(
-            seen,
-            vec![
-                ApprovalMode::Ask,
-                ApprovalMode::Auto,
-                ApprovalMode::Readonly
-            ],
-        );
-        assert_eq!(ApprovalMode::Readonly.next(), ApprovalMode::Ask);
     }
 
     #[test]

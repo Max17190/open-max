@@ -151,7 +151,7 @@ for the repair: close every openmax, then move the file aside.
 | **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Cycle and save project approvals: `ask` → `auto` → `readonly` |
+| **Shift+Tab** | Switch and save project approvals between `ask` and `auto`; from `readonly`, to `ask` (choose `readonly` at the trust prompt or with `/approvals readonly`) |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** twice | Quit |
 
