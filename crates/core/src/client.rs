@@ -365,6 +365,11 @@ struct StreamChoice {
     // Some servers omit `delta` entirely on the final finish_reason chunk,
     // and some send it as null.
     delta: Option<StreamDeltaJson>,
+    // A whole reply: a server that ignores `stream` and labels its one JSON
+    // body as anything but application/json reaches the stream parser, which
+    // reads that body as one bare data line whose choice has no `delta`.
+    // Only its presence is read here; the line is parsed again whole.
+    message: Option<serde::de::IgnoredAny>,
     // A failure can ride the choice instead of the chunk.
     error: Option<Value>,
 }
@@ -875,6 +880,22 @@ async fn read_sse(
             }
             // The usage-bearing final chunk has an empty choices array.
             let Some(choice) = choice else { continue };
+            // A one-shot reply read as a stream. Before anything has streamed,
+            // it is parsed as the labeled body would be, so each call in it
+            // stays its own: read as deltas, calls with no ids join when the
+            // first has no arguments yet.
+            if choice.delta.is_none() && choice.message.is_some() && content.is_empty() && partials.is_empty() {
+                let whole = serde_json::from_slice::<Value>(data).map_err(|e| format!("bad JSON response: {e}"));
+                match whole.and_then(|v| parse_complete_response(&v, on_delta)) {
+                    Ok(reply) => return (reply, None),
+                    // Refused as the labeled body is, and not resent: the same
+                    // body would come back.
+                    Err(message) => {
+                        unfinished = Some(Unfinished::Failed(ServerFailure { message, retryable: false }));
+                        break 'outer;
+                    }
+                }
+            }
 
             if let Some(reason) = choice.finish_reason {
                 // Servers that end a stream here and never send `[DONE]`
@@ -2111,6 +2132,40 @@ mod tests {
         let reply = json!({"choices":[{"message":{"content":"ok"}}]});
         let result = parse_complete_response(&reply, &mut |_| {}).unwrap();
         assert!(result.reasoning_content.is_none() && result.reasoning.is_none());
+    }
+
+    /// A one-shot JSON reply labeled as anything but application/json is
+    /// read as a stream of one bare line, whose choice carries the whole
+    /// reply as `message` rather than `delta`. Reading only `delta` dropped
+    /// the answer and its calls while the finish_reason ended the reply as
+    /// complete. It parses as the labeled body does, so two calls without ids,
+    /// the first without arguments, stay two calls rather than joining.
+    #[tokio::test]
+    async fn a_one_shot_json_reply_under_another_content_type_keeps_its_answer() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[{"type":"function","function":{"name":"ping","arguments":""}},{"type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
+        let mut replies = Vec::new();
+        for label in ["Content-Type: application/json\r\n", "Content-Type: text/plain\r\n", "Content-Type: text/event-stream\r\n", ""] {
+            let url = spawn_response_once(
+                format!("HTTP/1.1 200 OK\r\n{label}Content-Length: {}\r\n\r\n{body}\n", body.len() + 1),
+                None,
+            );
+            let mut texts = Vec::new();
+            let result = ChatClient::new(url, None, "m".into(), None, 64)
+                .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |delta| {
+                    if let StreamDelta::Content(text) = delta {
+                        texts.push(text);
+                    }
+                })
+                .await
+                .unwrap();
+            let calls: Vec<String> = result.tool_calls.iter().map(|c| format!("{} {} {}", c.id, c.function.name, c.function.arguments)).collect();
+            replies.push((texts, result.content, result.finish_reason, calls, result.usage.map(|u| (u.prompt_tokens, u.completion_tokens))));
+        }
+        assert_eq!(replies[0].3, ["call_0 ping {}", r#"call_1 bash {"command":"true"}"#]);
+        assert_eq!(replies[0].0, ["ok"]);
+        for reply in &replies[1..] {
+            assert_eq!(reply, &replies[0]);
+        }
     }
 
     /// Some servers report prompt cache hits only as a top-level
