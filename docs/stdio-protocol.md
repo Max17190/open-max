@@ -71,7 +71,7 @@ either, but carry one).
 | `token` | `text` |
 | `thinking` | `text` |
 | `message_done` | `text` |
-| `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas re-sent every request, scaled up when the server reported more prompt tokens than estimated for the session's last request), `context_tokens` |
+| `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas re-sent every request, scaled up when the server reported more prompt tokens than estimated for the session's last request, or refused a request for length (recognized by the error's wording) that the estimate said fit), `context_tokens` |
 | `usage` | `prompt_tokens`, `completion_tokens`, `cached_tokens` (or null) |
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |

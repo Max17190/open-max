@@ -2828,9 +2828,9 @@ async fn run_loop(
     let turn_usage = std::sync::Mutex::new(TurnUsage::default());
     let context_tokens = endpoint.context_tokens;
     let max_tokens = endpoint.max_tokens;
-    // Seeded from the session, not reset per turn: a turn whose request the
-    // provider refused for length learned nothing, and the next one must
-    // still budget with what the earlier requests on this route taught.
+    // Seeded from the session, not reset per turn: the next turn must budget
+    // with what the earlier requests on this route taught, a request the
+    // provider refused for length included (see `refusal_ratio`).
     let origin = client.origin();
     let mut prompt_ratio = route_ratio(
         core.sessions.lock().await.get(session_id).and_then(|d| d.prompt_ratio.as_ref()),
@@ -2901,6 +2901,16 @@ async fn run_loop(
         let result = match result {
             Ok(r) => r,
             Err(mut message) => {
+                // No usage comes back with a refusal, so without this a
+                // request the estimate wrongly let through is refused again
+                // on every later turn: nothing calibrates, and the transcript
+                // stays under a budget it does not fit.
+                let fits = context_tokens.saturating_sub(max_tokens);
+                if let Some(ratio) = refusal_ratio(&message, used, fits, factor) {
+                    if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+                        data.prompt_ratio = Some((origin.clone(), ratio));
+                    }
+                }
                 // A knowingly oversized request that then fails owes the user
                 // the local accounting, not just the provider's opaque error.
                 if used > budget {
@@ -4447,6 +4457,48 @@ fn observed_prompt_ratio(result: &CompletionResult, estimated: usize) -> Option<
     (prompt_tokens > 0 && estimated > 0).then(|| prompt_tokens as f64 / estimated as f64)
 }
 
+/// The ratio a refusal for length proves, when it proves more than `factor`
+/// (the one the request was budgeted with). The provider refused a request
+/// estimated at `estimated` because it did not fit what the window leaves
+/// beside the reply reserve, `fits` real tokens, so the real ratio is at
+/// least `fits / estimated`. Budgeting the next request with that floor makes
+/// compaction fire where the plain estimate never would: a transcript the
+/// estimate puts under the budget, but which the provider counts over the
+/// window, is otherwise refused on every turn. A floor past
+/// [`MAX_TOKEN_FACTOR`] is not an estimation error (no tokenizer is that far
+/// from bytes/4), so it teaches nothing, and neither does a refusal that
+/// does not read as one for length.
+fn refusal_ratio(message: &str, estimated: usize, fits: usize, factor: f64) -> Option<f64> {
+    if estimated == 0 || !refused_for_length(message) {
+        return None;
+    }
+    let floor = fits as f64 / estimated as f64;
+    (floor > factor && floor <= MAX_TOKEN_FACTOR).then_some(floor)
+}
+
+/// Whether a provider error reads as a refusal for length: the prompt, or
+/// the prompt plus the reply reserve, is more than the model's window. The
+/// wording differs by server, so this matches the phrases the common ones
+/// use; one it misses keeps today's behavior. An error status keeps only the
+/// body's message, not its code, so a message that names no window still
+/// needs a phrase of its own.
+fn refused_for_length(message: &str) -> bool {
+    const PHRASES: [&str; 10] = [
+        "context length",
+        "context_length",
+        "context size",
+        "context window",
+        "context limit",
+        "prompt is too long",
+        "maximum model length",
+        "maximum prompt length",
+        "input token count",
+        "reduce the length of the messages",
+    ];
+    let message = message.to_ascii_lowercase();
+    PHRASES.iter().any(|phrase| message.contains(phrase))
+}
+
 /// The session's last observed ratio, if `origin` is the route that taught
 /// it. A ratio measured on another route says nothing about this one.
 fn route_ratio(stored: Option<&(String, f64)>, origin: &str) -> Option<f64> {
@@ -4454,7 +4506,8 @@ fn route_ratio(stored: Option<&(String, f64)>, origin: &str) -> Option<f64> {
 }
 
 /// How many real tokens one estimated token is worth on this endpoint: the
-/// last observed ratio, or 1.0 (the plain estimate) before there is one. It
+/// last observed ratio (or the floor a refusal for length proved, see
+/// `refusal_ratio`), or 1.0 (the plain estimate) before there is one. It
 /// only ever tightens. Below 1.0 the estimator over-counts, which is today's
 /// behavior and stays as is; a server that counts only the uncached part of
 /// the prompt lands there too, and must not loosen the budget past the
@@ -4463,8 +4516,11 @@ fn route_ratio(stored: Option<&(String, f64)>, origin: &str) -> Option<f64> {
 /// plus template overhead, and the cap keeps a gateway reporting nonsense
 /// from collapsing the budget.
 fn token_factor(ratio: Option<f64>) -> f64 {
-    ratio.map_or(1.0, |ratio| ratio.clamp(1.0, 4.0))
+    ratio.map_or(1.0, |ratio| ratio.clamp(1.0, MAX_TOKEN_FACTOR))
 }
+
+/// The most real tokens one estimated token can be worth; see `token_factor`.
+const MAX_TOKEN_FACTOR: f64 = 4.0;
 
 /// Real tokens (the window, the setting) in the estimator units compaction
 /// compares, rounded down so rounding never adds room.
@@ -8953,6 +9009,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A provider that counts tokens denser than bytes/4 and refuses, the way
+    /// a window does, every request whose body is over `limit` bytes; the rest
+    /// get `STOP_SSE` and report no usage, so only a refusal can teach the
+    /// harness anything. Counts every request it reads.
+    async fn length_refusing_endpoint(limit: usize) -> (String, Arc<StdMutex<usize>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let length: usize = String::from_utf8_lossy(&head)
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0u8; length];
+                if sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                *seen.lock().unwrap() += 1;
+                let resp = if payload.len() > limit {
+                    let body = r#"{"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested more. Please reduce the length of the messages or completion.","type":"invalid_request_error"}}"#;
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{STOP_SSE}")
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    /// A session whose transcript is over 30k estimated tokens (a request of
+    /// ~125 KB), on a 65_536 window with a 1_024 reply reserve and a
+    /// `length_refusing_endpoint(limit)`. The send budget is
+    /// 65_536 - (1_024 + 1_024) = 63_488, so the plain estimate sends the
+    /// whole transcript; 64_512 tokens fit beside the reserve.
+    async fn long_session_on_a_window(
+        limit: usize,
+    ) -> (
+        std::path::PathBuf,
+        Arc<crate::state::Core>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
+        std::path::PathBuf,
+        String,
+        Arc<StdMutex<usize>>,
+    ) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 30_000 {
+                data.messages.push(ChatMessage::user("q ".repeat(2_000)));
+                data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+            }
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+        let (base_url, requests) = length_refusing_endpoint(limit).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(65_536);
+            s.max_tokens = 1_024;
+        }
+        (dir, core, rx, project, id, requests)
+    }
+
+    /// The first request on a route budgets on the plain estimate, and a
+    /// refusal reports no usage. A transcript the estimate puts under the
+    /// budget but the provider counts over the window was refused on every
+    /// later turn: nothing calibrated, so compaction never fired. A refusal
+    /// for length proves the real ratio is at least what fits over the
+    /// estimate. Here the provider counts the refused request at about 1.25
+    /// times what fits, so the next turn budgets with that floor, compacts,
+    /// and is answered.
+    #[tokio::test]
+    async fn a_refusal_for_length_calibrates_the_next_requests_budget() {
+        // The provider refuses anything over 100 KB, which a prune to 70% of
+        // the calibrated budget gets under.
+        let (dir, core, mut rx, project, id, requests) = long_session_on_a_window(100_000).await;
+
+        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "error", "the provider refused the request for length");
+        let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        assert!(first <= 63_488, "the plain estimate let it through: {first}");
+        assert!(sessions::last_compaction(&core, &id).is_none());
+        let floor = 64_512.0 / first as f64;
+        assert_eq!(
+            core.sessions.lock().await[&id].prompt_ratio.as_ref().map(|r| r.1),
+            Some(floor),
+            "the refusal proves the request was over what the window leaves for it"
+        );
+
+        start_turn(core.clone(), id.clone(), project.clone(), "second".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop", "the calibrated budget compacts the transcript until it fits");
+        assert!(sessions::last_compaction(&core, &id).is_some());
+        let [second] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let estimate = last_request_estimate(&core, &id).await;
+        assert_eq!(second, (estimate as f64 * floor).round() as usize);
+        assert!(second <= 63_488, "{second}");
+        // The refused request, the compaction summary, and the answered one.
+        assert_eq!(*requests.lock().unwrap(), 3);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A refusal proves only that the request did not fit, not by how much.
+    /// When the provider counts it at more than about 1.5 times what fits,
+    /// the first prune is not enough and that turn is refused too. Its
+    /// refusal is still news, a floor about 1.5 times higher than the one the
+    /// budget assumed, so the turn after it prunes again and is answered.
+    #[tokio::test]
+    async fn a_refusal_after_a_prune_raises_the_floor_until_a_turn_fits() {
+        // The provider refuses anything over 76 KB: the seeded request is
+        // about 1.6 times that, a prune to 70% of the first floor's budget is
+        // still about 1.1 times it, and the next prune gets under it.
+        let (dir, core, mut rx, project, id, _requests) = long_session_on_a_window(76_000).await;
+
+        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "error");
+        let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let floor = core.sessions.lock().await[&id].prompt_ratio.as_ref().unwrap().1;
+        assert_eq!(floor, 64_512.0 / first as f64);
+
+        start_turn(core.clone(), id.clone(), project.clone(), "second".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "error", "one prune to the first floor's budget is not enough");
+        assert!(sessions::last_compaction(&core, &id).is_some());
+        let [second] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        // A refused turn adds no reply, so the transcript is the request.
+        let (pruned, raised) = {
+            let map = core.sessions.lock().await;
+            let data = &map[&id];
+            let sent = estimate_tokens(data.registry.schemas_wire_arc().len())
+                + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+            (sent, data.prompt_ratio.as_ref().unwrap().1)
+        };
+        assert_eq!(second, (pruned as f64 * floor).round() as usize);
+        assert_eq!(raised, 64_512.0 / pruned as f64, "the second refusal proves a higher floor");
+        assert!(raised > floor * 1.4, "{floor} -> {raised}");
+
+        start_turn(core.clone(), id.clone(), project.clone(), "third".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop", "the raised floor prunes the transcript until it fits");
+        let [third] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let estimate = last_request_estimate(&core, &id).await;
+        assert_eq!(third, (estimate as f64 * raised).round() as usize);
+        assert!(estimate < pruned, "it pruned again: {estimate} vs {pruned}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A ratio describes the route that reported it: another model, URL, or
     /// credential tokenizes and templates differently. After a switch, the
     /// new route's first request budgets on the plain estimate, in the turn
@@ -11665,6 +11902,48 @@ mod tests {
         assert_eq!(observed_prompt_ratio(&reported(1_200), 1_000), Some(1.2));
         assert_eq!(observed_prompt_ratio(&reported(0), 1_000), None, "an unreported prompt size");
         assert_eq!(observed_prompt_ratio(&completion(None), 1_000), None);
+    }
+
+    /// A refusal for length is a floor on the ratio: what the window leaves
+    /// for the prompt over the estimate of the refused request. It teaches
+    /// only what the budget did not already assume, only what a tokenizer
+    /// can explain, and only when the provider's error reads as one.
+    #[test]
+    fn a_refusal_for_length_proves_a_floor_on_the_ratio() {
+        let length = "backend returned 400 Bad Request: This model's maximum context length is 32768 tokens. However, you requested 43793 tokens";
+        assert_eq!(refusal_ratio(length, 20_000, 28_672, 1.0), Some(1.4336));
+        assert_eq!(refusal_ratio(length, 20_000, 28_672, 1.4), Some(1.4336));
+        assert_eq!(refusal_ratio(length, 20_000, 28_672, 1.4336), None, "the budget already assumed it");
+        assert_eq!(refusal_ratio(length, 30_000, 28_672, 1.0), None, "a request known to be over");
+        assert_eq!(refusal_ratio(length, 7_168, 28_672, 1.0), Some(4.0), "the most a tokenizer explains");
+        assert_eq!(refusal_ratio(length, 7_167, 28_672, 1.0), None, "past it the estimate is not what failed");
+        assert_eq!(refusal_ratio(length, 0, 28_672, 1.0), None);
+        let other = "backend returned 400 Bad Request: Unsupported value: 'temperature'";
+        assert_eq!(refusal_ratio(other, 20_000, 28_672, 1.0), None, "not a refusal for length");
+
+        for refusal in [
+            "This model's maximum context length is 8192 tokens",
+            "backend reported an error (context_length_exceeded): input too large",
+            "the request exceeds the available context size, try increasing it",
+            "Your input exceeds the context window of this model.",
+            "input length and `max_tokens` exceed context limit: 190000 + 20000 > 200000",
+            "prompt is too long: 213000 tokens > 200000 maximum",
+            "The decoder prompt (length 40000) is longer than the maximum model length of 32768.",
+            "This model's maximum prompt length is 131072 but the request contains 140000 tokens.",
+            "The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).",
+            "backend returned 400 Bad Request: Please reduce the length of the messages or completion.",
+        ] {
+            assert!(refused_for_length(refusal), "{refusal}");
+        }
+        for other in [
+            "backend returned 401 Unauthorized: invalid api key",
+            "backend returned 429 Too Many Requests: Rate limit reached for requests",
+            "backend returned 400 Bad Request: Unsupported value: 'temperature'",
+            "request failed: connection refused",
+            "backend reported an error (insufficient_quota): You exceeded your current quota",
+        ] {
+            assert!(!refused_for_length(other), "{other}");
+        }
     }
 
     /// `/compact` exists to fire inside the hysteresis gap, where the budget
