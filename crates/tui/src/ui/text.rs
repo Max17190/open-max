@@ -1,10 +1,157 @@
 //! Terminal-cell aware text primitives shared by compact TUI surfaces.
 
+use std::borrow::Cow;
+
+use ratatui::buffer::{Buffer, CellWidth};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, StyledGrapheme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Cells a tab occupies in the transcript. A fixed width rather than tab
+/// stops: the transcript's gutters (the tool output indent, the fence rail)
+/// and the line numbers `read_file` prints shift content off any stop grid,
+/// which would draw the first level of indentation narrower than the rest.
+pub const TAB_WIDTH: usize = 4;
+
 pub fn width(text: &str) -> usize {
     text.width()
+}
+
+/// Cells one grapheme occupies once painted. The renderer drops any grapheme
+/// holding a control character, so a tab would vanish (and Unicode width
+/// counts every other control as one cell it never gets); the wrapper draws a
+/// tab as [`TAB_WIDTH`] spaces instead and every other control as nothing.
+pub fn cell_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        TAB_WIDTH
+    } else if grapheme.contains(char::is_control) {
+        0
+    } else {
+        grapheme.width()
+    }
+}
+
+/// One line of captured program output without its complete CSI (`ESC [`,
+/// colors and cursor moves), OSC (`ESC ]`, titles and hyperlinks, ended by
+/// BEL or `ESC \`), and charset designation (`ESC (` and kin, as in the
+/// `ESC ( B ESC [ m` a terminfo color reset emits) escape sequences. The
+/// renderer drops the ESC byte and paints the rest, so a red `error` would
+/// read `[31merror[0m`. An incomplete sequence is left as it is, and none
+/// spans a newline: removing text the program did not clearly mark as a
+/// sequence would hide output.
+pub fn strip_escapes(text: &str) -> Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut kept = 0usize;
+    let mut at = 0usize;
+    while let Some(found) = text[at..].find('\u{1b}') {
+        let esc = at + found;
+        match escape_len(&text.as_bytes()[esc..]) {
+            Some(len) => {
+                out.push_str(&text[kept..esc]);
+                at = esc + len;
+                kept = at;
+            }
+            None => at = esc + 1,
+        }
+    }
+    out.push_str(&text[kept..]);
+    Cow::Owned(out)
+}
+
+/// Byte length of the complete CSI, OSC, or charset designation sequence
+/// `seq` starts with (its first byte is ESC). Every byte that can end one is
+/// ASCII, so the length always lands on a char boundary.
+fn escape_len(seq: &[u8]) -> Option<usize> {
+    match seq.get(1)? {
+        // Designates a character set: exactly one final byte follows. Kept
+        // this narrow because a wider escape rule would also eat an ESC
+        // followed by a space and a letter.
+        b'(' | b')' | b'*' | b'+' => (0x30..=0x7e).contains(seq.get(2)?).then_some(3),
+        b'[' => {
+            // Parameter and intermediate bytes, then one final byte.
+            let end = 2 + seq[2..].iter().position(|b| !(0x20..=0x3f).contains(b))?;
+            (0x40..=0x7e).contains(&seq[end]).then_some(end + 1)
+        }
+        b']' => {
+            for (i, &b) in seq.iter().enumerate().skip(2) {
+                match b {
+                    0x07 => return Some(i + 1),
+                    0x1b => return (seq.get(i + 1) == Some(&b'\\')).then_some(i + 2),
+                    b'\n' => return None,
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Paint `line` into the one-row `area` exactly as an unwrapped
+/// `Paragraph` holding it paints it, from a borrowed line. A paragraph
+/// takes owned text, so painting a frame's rows through one cloned each row
+/// on every frame. `prefix` is painted as though it led the line, as a
+/// gutter inserted into a clone of it would be.
+pub fn paint_line(buf: &mut Buffer, area: Rect, prefix: Option<&Span<'_>>, line: &Line<'_>) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    // A span inside a line is styled over the line's own style.
+    let line_style = Style::default().patch(line.style);
+    let graphemes = || {
+        prefix
+            .into_iter()
+            .flat_map(move |span| span.styled_graphemes(line_style))
+            .chain(line.styled_graphemes(Style::default()))
+    };
+    let max = usize::from(area.width);
+    // The paragraph keeps graphemes up to the first one that would overflow
+    // the row, skipping any wider than the whole row, then aligns what it
+    // kept.
+    let mut x = match line.alignment.unwrap_or(Alignment::Left) {
+        Alignment::Left => 0,
+        alignment => {
+            let mut used = 0usize;
+            for grapheme in graphemes() {
+                let width = usize::from(grapheme.symbol.cell_width());
+                if width > max {
+                    continue;
+                }
+                if used + width > max {
+                    break;
+                }
+                used += width;
+            }
+            let used = used as u16;
+            match alignment {
+                Alignment::Center => (area.width / 2).saturating_sub(used / 2),
+                _ => area.width.saturating_sub(used),
+            }
+        }
+    };
+    let mut used = 0usize;
+    for StyledGrapheme { symbol, style } in graphemes() {
+        let width = usize::from(symbol.cell_width());
+        if width > max {
+            continue;
+        }
+        if used + width > max {
+            break;
+        }
+        used += width;
+        if width == 0 {
+            continue;
+        }
+        let symbol = if symbol.is_empty() { " " } else { symbol };
+        buf[(area.x + x, area.y)].set_symbol(symbol).set_style(style);
+        x += width as u16;
+    }
 }
 
 /// Clip to `max` terminal cells without splitting a grapheme cluster.
@@ -114,6 +261,50 @@ pub fn line_bounds(text: &str, offset: usize) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    /// `paint_line` must paint every cell exactly as the paragraph it
+    /// replaced: wide and zero-width graphemes, controls the renderer drops,
+    /// overflow, a wide grapheme straddling the edge, line and span styles,
+    /// alignment, and a gutter prefix.
+    #[test]
+    fn paint_line_paints_exactly_what_a_paragraph_paints() {
+        use ratatui::style::{Color, Modifier};
+        use ratatui::widgets::{Paragraph, Widget};
+
+        let red = Style::default().fg(Color::Red);
+        let on_blue = Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD);
+        let lines = vec![
+            Line::from("plain ascii text"),
+            Line::from("a line far wider than the narrowest row it is painted into"),
+            Line::from(vec![Span::styled("漢字", red), Span::raw("ab漢"), Span::styled("字z", on_blue)]),
+            Line::from("e\u{301}x 👩\u{200d}💻 tab\there esc\u{1b}[31mred\u{7}bell"),
+            Line::from(vec![Span::raw("joined e"), Span::styled("\u{301} across spans", red)]),
+            Line::from(vec![Span::raw("styled line"), Span::raw(" two")]).style(on_blue),
+            Line::from("centered 漢字").alignment(Alignment::Center),
+            Line::from("right 字").alignment(Alignment::Right),
+            Line::from("too wide to center at all here").alignment(Alignment::Center),
+            Line::from(""),
+            Line::default().style(on_blue),
+        ];
+        let gutter = Span::styled("❯ ", Style::default().fg(Color::DarkGray));
+        for line in &lines {
+            for width in [1u16, 2, 3, 7, 12, 40, 80] {
+                for prefix in [None, Some(&gutter)] {
+                    let area = Rect::new(2, 1, width, 1);
+                    let canvas = Rect::new(0, 0, width + 4, 3);
+                    let mut expected = Buffer::empty(canvas);
+                    let mut owned = line.clone();
+                    if let Some(prefix) = prefix {
+                        owned.spans.insert(0, prefix.clone());
+                    }
+                    Paragraph::new(vec![owned]).render(area, &mut expected);
+                    let mut painted = Buffer::empty(canvas);
+                    paint_line(&mut painted, area, prefix, line);
+                    assert_eq!(painted, expected, "{line:?} at {width} columns, prefix {prefix:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn clip_obeys_cell_width_and_grapheme_boundaries() {
         assert_eq!(clip("abcdef", 4), "abc…");
@@ -175,6 +366,49 @@ mod tests {
         let (s, e) = line_bounds("a\n\nb", 2);
         assert_eq!(s, e);
         assert_eq!(line_bounds("", 0), (0, 0));
+    }
+
+    #[test]
+    fn strip_escapes_removes_complete_sequences_and_keeps_the_rest() {
+        let plain = "no escapes\there";
+        assert!(matches!(strip_escapes(plain), Cow::Borrowed(_)));
+        // SGR colors, a cursor move, and private-mode parameters.
+        assert_eq!(
+            strip_escapes("\u{1b}[1;31merror\u{1b}[0m: \u{1b}[2Kdone\u{1b}[?25h"),
+            "error: done"
+        );
+        // OSC 8 hyperlinks under both terminators, around non-ASCII text.
+        assert_eq!(
+            strip_escapes("\u{1b}]8;;https://e.x/é\u{7}café\u{1b}]8;;\u{1b}\\!"),
+            "café!"
+        );
+        // The terminfo color reset designates the ASCII charset first.
+        assert_eq!(
+            strip_escapes("\u{1b}[31merror\u{1b}(B\u{1b}[m: failed"),
+            "error: failed"
+        );
+        // Incomplete and other sequences stay: they are not clearly markup.
+        for kept in [
+            "cut \u{1b}[31",
+            "cut \u{1b}",
+            "cut \u{1b}(",
+            "\u{1b} B",
+            "title \u{1b}]0;never ended",
+            "title \u{1b}]0;ended\non the next line\u{7}",
+        ] {
+            assert_eq!(strip_escapes(kept), kept);
+        }
+        // A broken sequence does not swallow the complete one after it.
+        assert_eq!(strip_escapes("bad \u{1b}[3\u{1b}[0m"), "bad \u{1b}[3");
+    }
+
+    #[test]
+    fn cell_width_matches_what_the_renderer_paints() {
+        assert_eq!(cell_width("\t"), TAB_WIDTH);
+        assert_eq!(cell_width("\u{1b}"), 0);
+        assert_eq!(cell_width("a"), 1);
+        assert_eq!(cell_width("漢"), 2);
+        assert_eq!(cell_width("👩‍💻"), 2);
     }
 
     #[test]

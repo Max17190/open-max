@@ -3,8 +3,9 @@
 //! Two unrelated vocabularies live here because both are contracts. The first
 //! is the OpenAI chat wire format (`ChatMessage`, `ToolCall`), serialized
 //! exactly as a provider expects; `content` is optional because an assistant
-//! message carrying only tool calls has none. The one exception is reasoning,
-//! which the client sends only to the endpoint that produced it.
+//! message carrying only tool calls has none. The one exception is reasoning
+//! and the provider data that rides with it, which the client sends only to
+//! the endpoint that produced it.
 //!
 //! The second is `AgentEvent`, the single channel `core` speaks to any
 //! frontend over. It is the whole public surface of a running turn, which is
@@ -14,6 +15,7 @@
 //! change and bumps `openmax-stdio`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCallFunction {
@@ -28,6 +30,14 @@ pub struct ToolCall {
     #[serde(rename = "type", default = "function_type")]
     pub kind: String,
     pub function: ToolCallFunction,
+    /// Opaque provider data the server attached to this call, kept as it
+    /// arrived and sent back on the call under the message's
+    /// `reasoning_origin` rules. Gemini puts its thought signature here
+    /// (`google.thought_signature`) and refuses the next request of a tool
+    /// loop when a call comes back without it. Absent otherwise, so a call
+    /// without it keeps its exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<Box<RawValue>>,
 }
 
 fn function_type() -> String {
@@ -56,11 +66,21 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
-    /// Which endpoint produced the reasoning above (`ChatClient::origin`).
-    /// The client sends reasoning back only to that endpoint and never sends
-    /// this stamp at all: after a `/model` switch, OpenAI and Groq reject a
-    /// message property their model never emits. Reasoning without a stamp
-    /// goes back nowhere.
+    /// The reply's `reasoning_details`, kept opaque as the array the server
+    /// sent (the text or summary of a block it streamed in parts under one
+    /// index joined into one entry; every other part kept whole).
+    /// OpenRouter carries signed and encrypted reasoning here, which the
+    /// plain text above cannot, and a model whose reasoning is signed needs
+    /// it back. Absent when the server sent none, like the two above, or an
+    /// empty array, which carries nothing to send back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Box<RawValue>>,
+    /// Which endpoint produced the reasoning above and the `extra_content`
+    /// on this message's tool calls (`ChatClient::origin`). The client sends
+    /// them back only to that endpoint and never sends this stamp at all:
+    /// after a `/model` switch, OpenAI and Groq reject a message property
+    /// their model never emits, and a signature only verifies where it was
+    /// made. Without a stamp they go back nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_origin: Option<String>,
 }
@@ -82,21 +102,24 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_origin: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None }
     }
 
     /// Rough size estimate used for context budgeting, plus a small constant
-    /// for the role/envelope bytes every message pays. Reasoning counts: it
-    /// rides every later request, and a server that leaves it out of the
-    /// prompt only makes this an overestimate, which compacts a little early.
+    /// for the role/envelope bytes every message pays. Reasoning and the
+    /// provider data beside it count: they ride every later request, and a
+    /// server that leaves them out of the prompt only makes this an
+    /// overestimate, which compacts a little early.
     pub fn estimated_tokens(&self) -> usize {
         let mut chars = self.content.as_deref().map(str::len).unwrap_or(0);
         for reasoning in [&self.reasoning_content, &self.reasoning].into_iter().flatten() {
             chars += reasoning.len();
         }
+        chars += self.reasoning_details.as_deref().map_or(0, |d| d.get().len());
         if let Some(calls) = &self.tool_calls {
             for c in calls {
                 chars += c.function.name.len() + c.function.arguments.len() + 16;
+                chars += c.extra_content.as_deref().map_or(0, |e| e.get().len());
             }
         }
         estimate_tokens(chars) + 8
@@ -138,12 +161,16 @@ pub enum AgentEvent {
     /// links it to the tool result it rides when it rode one, else empty (a
     /// note inserted before the next prompt, e.g. a turn-start receipt).
     HarnessNote { call_id: String, text: String },
-    /// The model request is being resent: `attempt` of `max_attempts` goes
-    /// out after a backoff, `reason` having ended the previous one (a
-    /// transport failure, a 429, or a stream that died before any reply
-    /// text). Emitted before the wait; a cancel during it ends the turn and
-    /// the attempt never goes out. Thinking streamed for the failed attempt
-    /// is void; no Token preceded it.
+    /// The model request is being resent: `attempt` goes out after a
+    /// backoff, and `max_attempts` is the attempt the request ends on if it
+    /// keeps failing the same way (the budget, or sooner while the latest
+    /// attempts in a row failed to connect or timed out), `reason` having
+    /// ended the previous one (a transport failure, a 429 or transient 5xx,
+    /// or, before any reply text, a stream that died or went silent, or a
+    /// stream or reply the provider failed with a rate limit, an overload,
+    /// or a server fault). Emitted before the wait; a cancel during it ends
+    /// the turn and the attempt never goes out. Thinking streamed for the
+    /// failed attempt is void; no Token preceded it.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
@@ -189,9 +216,10 @@ pub enum AgentEvent {
     },
     /// The session's tools, skills, and system prompt were re-frozen from
     /// current config (extension files changed, or the user forced /reload).
-    /// `changes` is the refreeze receipt: one line per capability file the
-    /// ledger recorded, with who changed it ("tool.toml modified (external)"),
-    /// so the action space never mutates silently.
+    /// `changes` is the refreeze receipt: one line per tool or skill file
+    /// added, modified, or removed (".openmax/tools/deploy.toml modified"),
+    /// read from the outgoing and incoming registries, so the action space
+    /// never mutates silently.
     Refrozen { tools: usize, skills: usize, changes: Vec<String> },
     /// A forced compaction (`/compact`) finished. The automatic budget prune
     /// speaks through the digest note it leaves in the transcript; the forced
@@ -374,9 +402,9 @@ mod tests {
             env(AgentEvent::Refrozen {
                 tools: 7,
                 skills: 2,
-                changes: vec![".openmax/tools/deploy.toml added (session)".into()],
+                changes: vec![".openmax/tools/deploy.toml added".into()],
             }),
-            r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added (session)"]}"#
+            r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added"]}"#
         );
         assert_eq!(
             env(AgentEvent::SchemasOverBudget { schema_tokens: 6800, budget_tokens: 2150 }),

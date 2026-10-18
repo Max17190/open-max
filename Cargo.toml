@@ -3,8 +3,11 @@ resolver = "2"
 members = ["crates/core", "crates/tui"]
 
 [workspace.package]
-version = "2026.10.0"
+version = "2026.10.1"
 edition = "2021"
+# std's `File::lock`, which the session, index, trust and ledger locks use,
+# needs 1.89; an older rustc otherwise fails on an unstable library feature.
+rust-version = "1.89"
 license = "MIT"
 authors = ["Open Max contributors"]
 repository = "https://github.com/Max17190/open-max"
@@ -18,13 +21,15 @@ serde_json = { version = "1", features = ["raw_value"] }
 # Only the runtime pieces the harness uses; "full" would drag in the rest.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Only the proxy matcher the HTTP client above decides with, so a connect
+# failure can tell whether the request went through a proxy.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 regex = "1"
 ignore = "0.4"
 globset = "0.4"
 similar = "2"
 uuid = { version = "1", features = ["v4"] }
-fs2 = "0.4"
 # Content hashes for the capability ledger (objects are addressed by sha256).
 sha2 = "0.10"
 # Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.
@@ -48,7 +53,10 @@ libc = "0.2"
 # fails the job because the checked-in workflow no longer matches what it would
 # generate. The cost is that dist will no longer update the workflow for us, so
 # bumping cargo-dist-version below means regenerating by hand, re-applying every
-# `LOCAL EDIT` step, and re-pinning the installer hash in the same commit.
+# `LOCAL EDIT` step, and re-pinning the installer hash in the same commit. A
+# bump can also move a target to another runner: CI's release-build matrix
+# builds each target where `dist plan --output-format=json` assigns it, so
+# re-sync it, and the default runners crates/tui/tests/release.rs records, too.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"

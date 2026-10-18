@@ -199,8 +199,8 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 /// the prefix carries the index and never the manual. Every line here is
 /// resent on every request for the life of the session.
 const SELF_EXTENSION: &str = "\n\nWhen the user asks for a reusable capability (tool, skill, prompt template, hook, permission rule, provider, or memory), read its contract first with bash: openmax --spec <surface>. It gives the file path, format, approval, and activation rules; verify with openmax --check.\n\
-Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio.\n\
-Past sessions and memories: openmax --recall \"<query>\"; capability-file history and restore: openmax --ledger. Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
+Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp.\n\
+Past sessions and memories: openmax --recall \"<query>\". Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -414,10 +414,9 @@ mod tests {
         assert!(prompt.contains("activation rules"));
         assert!(prompt.contains("openmax --check"));
         assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
-        // The ledger is the only route to a capability file's approved
-        // versions and their restoration commands; neither --spec nor
-        // --recall exposes that, so the pointer has to.
-        assert!(prompt.contains("openmax --ledger"), "capability history must be findable");
+        // Capability-file history is no longer recorded, so a pointer to it
+        // would be bytes every request pays for a command with nothing to show.
+        assert!(!prompt.contains("openmax --ledger"), "no pointer to history that is not kept");
         assert!(prompt.contains("openmax -p or openmax --stdio"));
         assert!(prompt.contains("tmux"));
         // The per-surface paths moved into the contracts the pointer names.
@@ -704,7 +703,7 @@ mod tests {
     /// the executed mutating call that wrote them and at turn start, hooks
     /// from the next turn, templates on next use, permission rules at turn
     /// start (one-directional within a turn), providers on the next turn's
-    /// re-read, and a memory write through the extension fingerprint. It
+    /// re-read, and memory at the next re-freeze, never on its own write. It
     /// lives in the surface specs the pointer sends the model to. The
     /// pointer promises those specs carry it, so both halves are pinned
     /// here for every authoring surface the pointer names: the prefix stays
@@ -724,7 +723,7 @@ mod tests {
         states("prompts", "Activation: next invocation");
         states("permissions", "rules are re-read at turn start");
         states("providers", "providers.json is re-read every turn");
-        states("memory", "a memory write moves the extension fingerprint");
+        states("memory", "a memory write does not re-freeze");
     }
 
     #[test]
@@ -734,13 +733,17 @@ mod tests {
         // authoring surfaces, and the moments that need them carry their own
         // pointer (--check settings rows print "openmax --spec settings"; the
         // guide's memory line names --recall). A new --spec surface must
-        // either join the pointer or this list, consciously.
+        // either join the pointer or this list, consciously. `mcp` adds no
+        // file kind of its own, but it is named: it is the recipe that turns
+        // an MCP server into a tool and a skill, and without it a request
+        // for a server leaves the agent writing its own protocol client.
         let pointer: Vec<&str> = SELF_EXTENSION.lines()
             .find_map(|line| line.strip_prefix("Surfaces: "))
             .expect("the guide lists its authoring contracts")
             .trim_end_matches('.')
             .split('|')
             .collect();
+        assert!(pointer.contains(&"mcp"), "the pointer names the MCP recipe: {pointer:?}");
         for s in &pointer {
             assert!(crate::spec::SURFACES.contains(s), "the pointer names a surface --spec lacks: {s}");
             assert!(crate::spec::render(s).is_some(), "the named contract must render: {s}");
@@ -761,9 +764,9 @@ mod tests {
     }
 
     /// The path-free base rules, extension pointer, and builtin schemas must
-    /// fit in 3,500 bytes (the payload measured 3,412 bytes, 770 tokens on a
-    /// current tokenizer, when the cap was set). Grounding sections have
-    /// separate caps. Measure the payload with
+    /// fit in 3,450 bytes (the payload measured 3,357 bytes when the cap was
+    /// set, and 3,361 bytes once the pointer named `mcp`). Grounding sections
+    /// have separate caps. Measure the payload with
     /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
     /// changing this budget; provider framing is not included.
     #[test]
@@ -791,7 +794,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 3_500;
+        const CAP: usize = 3_450;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \

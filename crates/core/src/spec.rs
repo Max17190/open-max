@@ -10,7 +10,7 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 11] = [
+pub const SURFACES: [&str; 12] = [
     "tools",
     "skills",
     "prompts",
@@ -21,6 +21,7 @@ pub const SURFACES: [&str; 11] = [
     "memory",
     "recall",
     "stdio",
+    "mcp",
     "usage",
 ];
 
@@ -37,6 +38,7 @@ pub fn render(surface: &str) -> Option<&'static str> {
         "memory" => Some(MEMORY),
         "recall" => Some(RECALL),
         "stdio" => Some(STDIO),
+        "mcp" => Some(MCP),
         _ => None,
     }
 }
@@ -89,9 +91,12 @@ fn manifest_toml_reason(err: &toml::de::Error, surface: &str) -> String {
 
 const TOOLS: &str = r#"# External tools
 
-(Every `openmax ...` command below means the binary running THIS session:
-`$OPENMAX_BIN` is set on every process the harness spawns. A bare `openmax`
-on PATH may be a different, older build that prints the same version.)
+(Every `openmax ...` command below means the binary hosting THIS session. In
+bash, a bare `openmax` finds it first on PATH whenever the harness can place
+a link to it there. A hook or tool keeps the inherited PATH, where a bare
+`openmax` may be an older build printing the same version: name
+`$OPENMAX_BIN`, set in every process the harness spawns outside a sandboxed
+probe.)
 
 One TOML file per tool: `.openmax/tools/<name>.toml` (project) or
 `~/.openmax/tools/<name>.toml` (global). Project wins on name collision.
@@ -104,10 +109,15 @@ Fields:
   chars in the schema. Rides in every request, so keep it short and put long
   usage docs in a README the description points at.
 - `params` (optional): a JSON-schema object, written as TOML tables;
-  `params.type = "object"` is required. Omitted means "no parameters". The
+  `params.type = "object"` is required. Omitted means "no parameters". List
+  required properties as `required = [...]` directly under `[params]`: after
+  a `[params.properties.*]` header the line belongs to that property. The
   serialized schema is capped at 4096 bytes (every request pays for these
   bytes); an oversized schema is rejected, not truncated.
 - `command` (required): executable path or name, spawned in the project root.
+  `write_file` creates files without the execute bit, so run a script you
+  write through its interpreter: `command = "sh"` (or `"python3"`) with the
+  script path in `args`, as the example does.
 - `args` (optional): fixed argv strings appended to `command`.
 - `timeout_secs` (optional): default 60, clamped between 1 and 300, inclusive.
 - `mutating` (optional, default false): routes calls through the ordinary
@@ -130,7 +140,15 @@ writes the call's JSON arguments to stdin as one newline-terminated line, and
 returns stdout as the result.
 Nonzero exit makes the result an error carrying `exit code N` plus output.
 Output is capped; overflow spills to `~/.openmax/cmd-logs`, pruned after
-7 days. The process is a
+7 days. The tool runs in its own session and process group, with no
+controlling terminal, so a command in it that prompts on the terminal (a
+password, an ssh host key) fails at once. When the tool exits, any
+process still in that group is terminated (`&`, `nohup` and `disown` leave a
+process there), and the result carries a note saying so. Cleanup reaches only
+that group: a process that moved itself to a new session or group is neither
+stopped nor reported. A
+helper that must outlive the call, such as a long-lived server, belongs in a
+named tmux session. The process is a
 native host process with the network and filesystem authority of Open Max;
 its environment is the scrubbed baseline plus the manifest's `env` list.
 
@@ -143,7 +161,10 @@ Readonly refuses mutating calls and calls requiring confirmation.
 
 Select /approvals auto|ask|readonly or Shift+Tab in a human-controlled frontend.
 The choice persists for this exact trusted project across launches, including
-headless/stdio. Other projects retain their own choice or settings default.
+headless/stdio. A subdirectory, including a worktree placed under the project,
+without its own choice follows the nearest enclosing project's. A worktree
+outside the root (git worktree add ../x) needs its own trust and choice. Other
+projects retain their own choice or settings default.
 Running in auto does not grant hashes: switching back to ask restores content
 requirements. Approve specific bytes with openmax --approve <manifest> or the
 content card in ask. Approving a file write approves only that write.
@@ -171,12 +192,14 @@ Example (`.openmax/tools/todo_scan.toml`):
 ```toml
 name = "todo_scan"
 description = "List TODO/FIXME comments with file and line"
-command = "./scripts/todo-scan.sh"
+command = "sh"
+args = ["./scripts/todo-scan.sh"]
 timeout_secs = 30
 mutating = false
 
 [params]
 type = "object"
+required = ["path"]
 [params.properties.path]
 type = "string"
 description = "Directory to scan"
@@ -187,7 +210,7 @@ iterations after every executed mutating call (a failed call that wrote
 the file still activates it) and at turn start; `/reload`
 forces it now. Verify the file parses with `openmax --check`. Test the
 script itself before first use:
-`echo '{"path":"src"}' | ./scripts/todo-scan.sh`.
+`echo '{"path":"src"}' | sh ./scripts/todo-scan.sh`.
 
 ## Proof of life
 
@@ -205,6 +228,8 @@ real spawn path (stdin JSON, timeout, output caps): the call must exit 0 and
 match `expect_regex` when present. `expect_regex` is matched against the same
 capped rendering a tool call returns (the tail, once output exceeds the cap),
 so a token printed early by a noisy command can scroll out of the window.
+Trailing whitespace, the final newline included, is removed before matching:
+`^[0-9]+$` matches a command that runs `echo 63`.
 Plain `--check` never executes anything.
 
 In auto, examples run the real host command without content approval, behind
@@ -256,11 +281,12 @@ name collision.
 `SKILL.md` starts with a `---`-delimited frontmatter block; only two scalar
 keys are read, and only at the block's top level (no leading indentation), so
 an indented key inside a nested map like `metadata:` never overrides them:
-- `name:` (required): the skill's index name, a bare or double-quoted value on
-  one line.
+- `name:` (required): the skill's index name, a bare, single-quoted, or
+  double-quoted value on one line.
 - `description:` (required in practice): one line saying what the skill does
-  and when to use it; capped at 200 chars. Bare or double-quoted, or a `>`/`|`
-  block scalar folded to one line (the spelling many packaged skills ship).
+  and when to use it; capped at 200 chars. Bare, single-quoted, or
+  double-quoted, or a `>`/`|` block scalar folded to one line (the spelling
+  many packaged skills ship).
   This is the only text that enters the prompt (~15 tokens per skill), so it
   must carry the "when".
 
@@ -342,7 +368,9 @@ with the same stem. Unknown keys are rejected.
 Fields:
 - `event` (required): one of `pre_tool_use`, `post_tool_use`,
   `user_prompt_submit`, `session_start`, `compaction`, `turn_end`.
-- `command` (required): executable, spawned in the project root.
+- `command` (required): executable, spawned in the project root. A script
+  written with `write_file` is not executable: run it through its interpreter
+  (`command = "sh"`, script path in `args`), as the example does.
 - `args` (optional): fixed argv strings.
 - `timeout_secs` (optional): default 10, clamped between 1 and 60, inclusive.
 - `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
@@ -359,7 +387,8 @@ Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
 call or the prompt. The block reason is the hook's stdout (or stderr if stdout
 is empty), capped at 500 chars. A blocked tool call returns to the model as a
 failed tool result carrying the reason; a blocked prompt never reaches the
-model. A gate that times out or fails to start blocks.
+model. A gate that times out or cannot start blocks; auto relaxes the second
+case (below).
 
 Observe events (`post_tool_use`, `session_start`, `compaction`, and `turn_end`
 without `blocking`): exit status is ignored. `session_start` fires on a
@@ -381,8 +410,9 @@ hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
 that, and on `max_iterations` and `budget_exhausted`. A refusal whose injected
 user message cannot be persisted is reported and ends the turn `unverified`
 the same way: a continuation only the running process remembers would diverge
-from every replay of the session. A blocking hook that
-times out or fails to start refuses, like any other gate.
+from every replay of the session. A blocking hook that times out refuses,
+like any other gate, and so does one that cannot start, except in auto
+(below).
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
@@ -414,7 +444,34 @@ Each run receives one JSON payload on stdin, as one newline-terminated line:
 In auto, valid hooks run without content approval, including new and repaired
 hooks. Malformed hook files and over-cap gates block tools until fixed;
 write_file/edit_file on the offending manifest remain available for repair.
-Hook edits apply from the next turn. Explicit mode changes refresh policy
+A gate never gates the repair of its own files: write_file and edit_file on
+its manifest, or on the script it runs, skip that gate when the file is
+inside the project. The script is a `command` written as a path, or the first
+`args` entry of an interpreter `command` (`sh`, `bash`, `zsh`, `dash`, `ksh`,
+`python`, `python3`, `node`, `ruby`, `perl`, `deno`, `bun`) when no option
+precedes it and it ends in `.sh`, `.bash`, `.py`, `.js`, `.mjs`, `.ts`, `.rb`
+or `.pl`. Every other gate and permission rule still judges the write, so in
+auto a gate cannot protect its own files: guard them with a deny rule or
+another gate.
+A hook cannot start when its command cannot be spawned for a reason its files
+explain (not found, no permission to execute it, as for every file write_file
+creates, or a file the system cannot execute), or when the script its
+interpreter gets does not exist (`sh`, `bash`, `ksh` and `dash` also look for
+a bare script name on PATH). A `pre_tool_use` gate that cannot start blocks
+the calls it matches, except writes to the files of another hook that cannot
+start or of a file failing closed, and the block names the repair. A project
+`user_prompt_submit` gate that cannot start judged nothing: the prompt goes on
+and the gate is reported as not having checked it, to the frontend on each
+prompt and to the model once per session for each distinct failure; a global
+one still blocks. A blocking `turn_end` gate that cannot start refuses
+nothing: it is reported and the turn ends `unverified`. A write to a hook
+file, or to the script one runs, is answered with each hook whose command
+path is missing or has no executable bit, whose command is not on PATH, or
+whose interpreter's script does not exist; while a blocking `turn_end` gate
+is in that state, the model is also told at turn start, once per session for
+each distinct failure.
+Manifest edits apply from the next turn; a script runs from disk, so an edit
+to it applies at the hook's next run. Explicit mode changes refresh policy
 before subsequent calls. Execution failures are reported and no hashes are
 automatically granted. Removing a hook in auto removes that policy.
 
@@ -485,13 +542,14 @@ Example (`.openmax/hooks/deny-rm.toml`):
 
 ```toml
 event = "pre_tool_use"
-command = "./scripts/deny-rm.sh"
+command = "sh"
+args = ["./scripts/deny-rm.sh"]
 tool = "bash"
 timeout_secs = 5
 ```
 
 Verify with `openmax --check`. Test the script directly:
-`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | ./scripts/deny-rm.sh`.
+`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
 "#;
 
 const PERMISSIONS: &str = r#"# Permission rules
@@ -565,15 +623,17 @@ and deny rules still block. First-match order still applies; an earlier allow
 can shadow a later deny. Mode changes do not erase earlier deny snapshots.
 
 In ask, `allow` skips the ordinary approval prompt but never an unapproved
-tool's content gate. A project `allow` is inert
-until a human approves that exact content with
-`openmax --approve .openmax/permissions.toml`; until then those calls fall
-through to `approval_mode` and the human is asked. Editing the file revokes
-the approval, as with any other capability content. `deny` and `ask` only add
-friction outside auto. Deny applies in every mode. The global file is outside the project root, where
-your file tools cannot write, so its `allow` rules need no approval. Writing
-yourself an `allow` rule in ask therefore grants nothing; ask the user to
-approve the file when they want those prompts gone.
+tool's content gate. An `allow` in either file is inert
+until a human approves that exact content for this directory with
+`openmax --approve .openmax/permissions.toml` (or the global file's path)
+run here; until then those calls fall through to `approval_mode` and the
+human is asked. The approval is not inherited: a subdirectory or a worktree
+under the project needs its own. Editing the file revokes the approval, as
+with any other capability content.
+`deny` and `ask` only add friction outside auto. Deny applies in every mode.
+Writing yourself an `allow` rule in ask therefore grants nothing, in the
+project file or the global one; ask the user to approve the file when they
+want those prompts gone.
 
 Rules never enter the prompt and are re-read every turn; an empty or missing
 file changes nothing. Fail closed: an unreadable or malformed file denies
@@ -624,13 +684,31 @@ Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
   `chat/completions` on it.
 - `api_key` (optional): literal secret. Prefer `api_key_env`.
 - `api_key_env` (optional): env var name, or list of names (first non-empty
-  wins).
+  wins). With neither (or both resolving empty), the provider uses
+  settings.json's `api_key` / `OPENMAX_API_KEY` only when its `base_url` has
+  the same scheme, host, and port as settings `base_url`; any other server
+  gets no key, and a 401 from it names how to give the provider its own.
 - `headers` (optional): extra HTTP headers as a string map.
 - `models` (optional): list of `{"id", "name"?, "context_tokens"?,
   "max_tokens"?}`. Ids are sent unchanged; order is preserved in `/model`.
 - `compat` (optional): wire quirks for picky servers:
   `{"use_max_completion_tokens": false, "send_stream_options": true}` are the
   defaults.
+- `idle_timeout_secs` (optional, default 600): a positive number of seconds
+  (`--check` rejects 0; it never disables the timeout) the endpoint may send
+  nothing at all (no headers, no bytes, no SSE keepalive comment) before the
+  attempt ends. If no response has arrived, or a stream goes silent before
+  any reply text, it is resent; a stream silent after reply text is reported
+  truncated. Raise it for a local server that works through a long prompt
+  silently for longer.
+
+A key, a credential header (one whose name contains auth, key, token,
+secret, password, credential, or cookie, such as Authorization or
+X-API-Key), or user:password in `base_url` never goes over plain http to
+another machine: such a request fails with an error before anything is
+sent. Use https, or a loopback address (127.0.0.1, ::1, localhost) for a
+server on this machine. A redirect is followed only on the same scheme,
+host, and port as `base_url`; one to another server fails the request.
 
 Select a provider with `"provider"` in settings.json, the `--provider` CLI
 option, or `/provider`; `/model` picks provider and model as one pair. This
@@ -688,13 +766,21 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `base_url`: OpenAI-compatible endpoint root (the harness calls
   `chat/completions` on it). No default, never a localhost fallback.
 - `api_key`: literal, or `$ENV_VAR` indirection; `OPENMAX_API_KEY` also works.
+  Sent only to the server `base_url` names (a named provider without a key of
+  its own inherits it only on the same scheme, host, and port), and never over
+  plain http except to a loopback address.
 - `model`: model id sent with every request.
 - `approval_mode`: `auto` | `ask` | `readonly`; default ask. Used only when
-  this project has no saved choice. /approvals, Shift+Tab, and the card's
-  Auto for project choice persist in trust.json under the canonical root,
-  not in settings.json. They do not change other projects. Auto includes
-  extension execution without content approvals; deny rules and validation
-  still apply. Agent-spawned clients cannot change the saved mode.
+  neither this project nor an enclosing one has a saved choice, such as a
+  project trusted by an earlier version. The trust grant saves the choice:
+  auto, unless the human picks ask or readonly at the trust prompt
+  (`--trust-project` saves auto; an already trusted project keeps its mode).
+  /approvals, Shift+Tab, and the card's Auto for project choice change it.
+  All of these persist in trust.json under the canonical root, not in
+  settings.json, and do not change other projects. Auto includes extension
+  execution without content approvals; deny rules and validation still
+  apply. Agent-spawned clients can neither grant trust nor change the saved
+  mode.
 - `context_tokens`: the model's context window in tokens. REQUIRED here or
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or
@@ -703,7 +789,7 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   providers.json overrides.
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
-- `max_output_bytes`: tool-output byte cap before tail-truncation with spill.
+- `max_output_bytes`: tool-output byte cap before truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction summaries. An unaffordable summary uses the deterministic digest.
@@ -785,12 +871,13 @@ Supersede, do not duplicate: update the existing file when a fact changes
 (date-stamp facts that can go stale). Near-duplicate files split the access
 history that keeps a fact alive.
 
-Activation: a memory write moves the extension fingerprint, so the harness
-re-freezes after the writing call and the fact is indexed in your prompt from
-your next step (the refreeze receipt says "Memory index indexed: <name>");
-the index also rebuilds at session creation, /reload, and any other re-freeze.
-Verify what you wrote with `openmax --check` (it names every ignored file and
-why, and what the index will show).
+Activation: a memory write does not re-freeze. The index is frozen with the
+prompt, and rewriting the prompt would discard the provider's prompt cache to
+show you a fact your own write already put in context. The index rebuilds at
+session creation, /reload, and any re-freeze a tool or skill change causes
+(that receipt then says "Memory index rebuilt with this refreeze (indexed:
+<name>)"). Verify what you wrote with `openmax --check` (it names every
+ignored file and why; `--all` adds what the index will show).
 
 ## Searching what was kept
 
@@ -900,13 +987,14 @@ refreeze receipt, or a policy/providers/settings/approval notice - surfaced
 here so a frontend can render what the model sees; `call_id` links it to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
-model request is being resent after a transport failure, a 429, or a stream
-that died before any reply text; thinking already streamed for that attempt
-is void), `diff` (call_id,
+model request is being resent after a transport failure, a 429 or transient
+5xx, or, before any reply text, a stream that died or went silent, or a
+stream or reply the provider failed with a rate limit, an overload, or a
+server fault; thinking already streamed for that attempt is void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
-outcome), `refrozen` (tools, skills, changes: the refreeze receipt naming
-each recorded capability-file change and its actor), `schemas_over_budget`
+outcome), `refrozen` (tools, skills, changes: the refreeze receipt, one line
+per tool or skill file added, modified, or removed), `schemas_over_budget`
 (schema_tokens, budget_tokens: the installed tools take most of what the
 window can spend, so compaction runs early and stops entirely once they
 reach it; advisory, at most once per session), `compacted` (tokens_before,
@@ -914,7 +1002,10 @@ tokens_after, compacted_messages: the receipt of a forced compaction;
 compacted_messages of 0 means the transcript was already at or under the
 prune target and nothing changed),
 `hook_failed` (hook, event, detail: a hook did not run - an observe-only hook
-failed, or a hook file on disk is not loaded - and the turn proceeded),
+failed or a hook file on disk is not loaded, and the turn proceeded; or, in
+auto, a `user_prompt_submit` gate could not start and did not check the
+prompt, or a blocking `turn_end` gate could not start and the turn ends
+`unverified`),
 `turn_refused` (hook, reason, continuation, continuations_left: a blocking
 `turn_end` hook refused the model's completion and the harness honored it;
 `reason` is already in the transcript as a user message - on disk before this
@@ -943,7 +1034,8 @@ do not fold it into `detail`.
 For an admitted turn, `done` follows cleanup of running state and the cancellation
 token; the client may immediately submit another turn. A continued session is
 claimed before the handshake and stays owned between turns. An unreadable or
-damaged transcript, or a competing owner, causes a nonzero exit before hello.
+damaged session index or transcript, or a competing owner, causes a nonzero
+exit before hello.
 
 Every `user` command is answered by exactly one `done`, and `done` is the
 only guaranteed terminator. A command that starts no turn (empty text, an
@@ -966,6 +1058,84 @@ shutdown drains promptly.
 
 Validate a stream against the contract: `openmax --check --stdio` reads JSONL
 on stdin, reports each line, and exits nonzero on any violation.
+"#;
+
+const MCP: &str = r#"# MCP servers
+
+The agent loop hosts no MCP client. A server joins through two files the loop
+already loads: one proxy tool, and one skill whose body lists the server's
+tools. Every request pays only for the proxy's small schema and the skill's
+index line; the server's own tool schemas are read when the skill is. This
+binary is the bridge between them, so the host needs nothing installed
+besides the server itself.
+
+Each call starts the server, makes one request, and stops it, so the bridge
+serves stateless use. A server that needs a persistent session (state kept
+between calls, a login done once per process) is not supported yet.
+
+## Commands
+
+- `openmax --mcp-list -- <server command...>` prints the server's tools as a
+  skill body: a header, the server's instructions (when it gives any) as a
+  quoted block, then one line per tool,
+  `- name(arg: type, opt?: type): description`, required arguments first and
+  `?` marking an optional one. With `--json` it prints the full tool
+  definitions instead.
+- `openmax --mcp-call -- <server command...>` reads
+  {"tool": "<name>", "arguments": {...}} on stdin, calls that tool, and prints
+  the result's text. A result the tool marks as an error, an error reply, a
+  malformed reply, and a server that exits or stops answering all exit 1 with
+  the reason on stderr. Input it cannot read exits 2 before the server starts.
+
+Everything after `--` is the server's argv, run without a shell. Each wait for
+a reply is bounded by `--mcp-timeout <secs>` (default 30, at most 3600); raise
+it for a server that is slow to start, such as a first `npx` download. The
+server's stderr passes through. When the run ends, the server's stdin is
+closed; a server still running 2 seconds later gets SIGTERM, then SIGKILL.
+The wire is JSON-RPC 2.0 over stdio with the initialize handshake, protocol
+revisions 2024-11-05 through 2025-11-25. A server that speaks only a later,
+handshake-free revision refuses initialize, and its error is reported.
+
+## Recipe
+
+For a server started as `notes-server --stdio` that reads `NOTES_TOKEN`:
+
+1. Generate the skill with bash, so its tool list costs no tokens to write:
+
+```sh
+tools=$(openmax --mcp-list -- notes-server --stdio) && mkdir -p .agents/skills/notes &&
+printf '%s\n' '---' 'name: notes' 'description: Tools of the notes MCP server; call them with the notes tool' '---' "$tools" > .agents/skills/notes/SKILL.md
+```
+
+2. Write the proxy tool, `.openmax/tools/notes.toml`:
+
+```toml
+name = "notes"
+description = "Call a notes MCP server tool; the notes skill lists names and arguments"
+command = "sh"
+args = ["-c", "exec \"$OPENMAX_BIN\" --mcp-call -- \"$@\"", "mcp", "notes-server", "--stdio"]
+env = ["NOTES_TOKEN"]
+timeout_secs = 120
+mutating = true
+
+[params]
+type = "object"
+required = ["tool", "arguments"]
+[params.properties.tool]
+type = "string"
+[params.properties.arguments]
+type = "object"
+```
+
+The words after `"mcp"` are the server command. `$OPENMAX_BIN` names the
+binary hosting the session (see `openmax --spec tools`), and the call's JSON
+reaches it on stdin. A tool's environment is scrubbed and the server inherits
+exactly what the tool receives, so name every credential the server reads in
+`env`. Keep `mutating = true` unless every tool the server offers is
+read-only. `timeout_secs` must cover starting the server and the call.
+
+3. Verify both files with `openmax --check`. They activate like any other tool
+and skill (`openmax --spec tools`, `openmax --spec skills`).
 "#;
 
 #[cfg(test)]
@@ -1141,18 +1311,13 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, body).unwrap();
         };
-        // The example tools reference scripts relative to the project root;
-        // create them so the command-existence check sees what a real user
-        // following the spec would have.
+        // The examples run scripts relative to the project root; create them
+        // the way `write_file` does (a plain write, so no execute bit) so the
+        // command check sees what an agent following the spec would have. An
+        // example whose `command` is the script itself fails here until a
+        // chmod nobody told the agent to run.
         for script in ["scripts/todo-scan.sh", "scripts/deny-rm.sh"] {
-            let path = root.join(script);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            write(script, "#!/bin/sh\nexit 0\n");
         }
         write(".openmax/tools/todo_scan.toml", &example(TOOLS));
         write(".agents/skills/release/SKILL.md", &example(SKILLS));
@@ -1207,6 +1372,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The tool example is what a first manifest copies. Without `required`
+    /// in it, authors invent `[params.required]` (a table, which the parser
+    /// rejects) or append the line after the property tables, where TOML
+    /// assigns it to the last property.
+    #[test]
+    fn the_tools_example_declares_required_at_the_schema_root() {
+        let spec = crate::registry::parse_tool_file_from_text_for_tests(&example(TOOLS))
+            .expect("the tools example parses");
+        assert_eq!(spec.parameters["required"], serde_json::json!(["path"]));
+    }
+
     /// The settings example must survive the strict, fail-closed parser: a
     /// spec whose own example bricks the next launch is worse than none.
     #[test]
@@ -1236,11 +1412,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The MCP recipe's proxy tool is a tool manifest like any other, so it
+    /// must load through the real parser, and its schema must be the
+    /// documented `{tool, arguments}` pair: the model sees nothing else of
+    /// the server until it reads the skill. The pass-through is the binary
+    /// itself, named by `$OPENMAX_BIN`, and credentials reach the server only
+    /// through the manifest's `env` grant.
+    #[test]
+    fn the_mcp_recipe_tool_loads_as_a_tool_and_arguments_proxy() {
+        let text = render("mcp").expect("--spec mcp renders");
+        let start = text.find("```toml\n").expect("the recipe shows the proxy tool") + "```toml\n".len();
+        let end = text[start..].find("```").expect("the block closes") + start;
+        let spec = crate::registry::parse_tool_file_from_text_for_tests(&text[start..end])
+            .expect("the recipe's proxy tool parses");
+        assert_eq!(
+            spec.parameters,
+            serde_json::json!({
+                "type": "object",
+                "required": ["tool", "arguments"],
+                "properties": {"tool": {"type": "string"}, "arguments": {"type": "object"}},
+            })
+        );
+        assert!(spec.mutating, "a server's tools may write, so the proxy is gated as mutating");
+        let crate::registry::ToolKind::External(tool) = spec.kind else { panic!("external") };
+        assert_eq!(tool.env, ["NOTES_TOKEN"], "the server's credential is granted through env");
+        assert_eq!(tool.command, "sh");
+        assert_eq!(tool.args[1], "exec \"$OPENMAX_BIN\" --mcp-call -- \"$@\"");
+        // The words after $0 are the server command, run as its own argv.
+        assert_eq!(tool.args[3..], ["notes-server", "--stdio"]);
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("Each call starts the server"), "the spec says calls are stateless");
+        assert!(flat.contains("needs a persistent session"), "the spec names what is unsupported");
+        assert!(flat.contains("is not supported yet"), "the spec names what is unsupported");
+    }
+
     /// Every file surface tells the agent how to verify what it wrote, and
     /// every spec states when the file takes effect.
     #[test]
     fn specs_name_verification_and_activation() {
-        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory"] {
+        for name in ["tools", "skills", "prompts", "hooks", "permissions", "providers", "memory", "mcp"] {
             let text = render(name).unwrap();
             assert!(text.contains("openmax --check"), "{name} spec must point at --check");
         }

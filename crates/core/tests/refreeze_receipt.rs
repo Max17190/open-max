@@ -194,18 +194,20 @@ async fn drive_turn(
     session: &str,
     project: &std::path::Path,
     text: &str,
-) {
+) -> Vec<AgentEvent> {
     start_turn(Arc::clone(core), session.into(), project.to_path_buf(), text.into()).unwrap();
+    let mut events = Vec::new();
     loop {
         let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
-        match envelope.event {
-            AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(&approval_id, true); }
+        match &envelope.event {
+            AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(approval_id, true); }
             AgentEvent::Done { .. } => break,
             _ => {}
         }
+        events.push(envelope.event);
     }
     // Done is emitted before the session's `running` flag clears; a second
     // start_turn racing that window is refused as "already working". Wait
@@ -213,6 +215,7 @@ async fn drive_turn(
     while core.is_running(session) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    events
 }
 
 /// A broken tool write refreezes too (its bytes moved the fingerprint), and
@@ -566,8 +569,20 @@ async fn an_unrecordable_approval_does_not_claim_cardless_future_calls() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+const MEMORY_WRITE: &str = "# archive rotation interval is 17 days\n\nSeen in corpus/doc04.txt.\n";
+
+fn request(bodies: &[String], i: usize) -> serde_json::Value {
+    serde_json::from_str(&bodies[i]).unwrap()
+}
+
+/// Saving a memory must not rewrite the session's prompt. Memory bytes used
+/// to sit in the extension fingerprint, so the call that saved a fact
+/// replaced the system message and rewrote the whole transcript: the next
+/// request missed the provider's prompt cache from its first byte, only to
+/// show the model a fact it had just written. The prefix stays byte-identical
+/// across the write and no refreeze receipt is emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_memory_write_refreezes_and_is_indexed_for_the_next_step() {
+async fn a_memory_write_keeps_the_frozen_prompt_and_emits_no_receipt() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
     let project = dir.join("project");
@@ -578,7 +593,7 @@ async fn a_memory_write_refreezes_and_is_indexed_for_the_next_step() {
             "write_file",
             serde_json::json!({
                 "path": ".openmax/memory/rotation-interval.md",
-                "content": "# archive rotation interval is 17 days\n\nSeen in corpus/doc04.txt.\n"
+                "content": MEMORY_WRITE
             }),
         ),
         completion_with_text("noted"),
@@ -586,31 +601,96 @@ async fn a_memory_write_refreezes_and_is_indexed_for_the_next_step() {
     .await;
     write_config(&data, &base_url, &project);
     let (core, mut rx) = Core::new(data).unwrap();
-    drive_turn(&core, &mut rx, "memory-live", &project, "remember it").await;
+    let events = drive_turn(&core, &mut rx, "memory-frozen", &project, "remember it").await;
+    assert_eq!(
+        std::fs::read_to_string(project.join(".openmax/memory/rotation-interval.md")).unwrap(),
+        MEMORY_WRITE,
+        "the memory write landed"
+    );
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2);
-    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let (first, second) = (request(&bodies, 0), request(&bodies, 1));
+    assert_eq!(second["messages"][0]["role"], "system");
+    assert_eq!(
+        first["messages"][0], second["messages"][0],
+        "a memory write must leave the frozen prompt byte-identical"
+    );
+    assert_eq!(first["tools"], second["tools"], "and the tool schemas with it");
     let messages = second["messages"].as_array().unwrap();
     let tool = messages.iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap();
-    assert!(tool.contains("[extension refreeze:"), "the memory write refreezes: {tool}");
+    assert!(!tool.contains("[extension refreeze:"), "no receipt rides the memory write: {tool}");
     assert!(
-        tool.contains("Memory index indexed: rotation-interval"),
-        "the receipt names the newly indexed memory: {tool}"
-    );
-    assert!(tool.contains("live in your prompt from your next step"), "{tool}");
-    let system = messages[0]["content"].as_str().unwrap();
-    assert!(
-        system.contains("rotation-interval: archive rotation interval is 17 days"),
-        "the next request's frozen prompt carries the index line: {system}"
+        !events.iter().any(|e| matches!(e, AgentEvent::Refrozen { .. })),
+        "no refreeze is announced: {events:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A tool write still refreezes after a memory write, and that refreeze is
+/// when the saved fact reaches the index: the rebuilt prompt carries its line
+/// and the receipt names it as part of the rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_write_still_refreezes_and_rebuilds_the_memory_index() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\nmutating = false\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({
+                "path": ".openmax/memory/rotation-interval.md",
+                "content": MEMORY_WRITE
+            }),
+        ),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wordfreq.toml", "content": manifest }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    let events = drive_turn(&core, &mut rx, "memory-then-tool", &project, "remember, then build").await;
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    let (first, second, third) = (request(&bodies, 0), request(&bodies, 1), request(&bodies, 2));
+    assert_eq!(first["messages"][0], second["messages"][0], "the memory write froze nothing");
+    assert_ne!(second["messages"][0], third["messages"][0], "the tool write refreezes the prompt");
+    let system = third["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("rotation-interval: archive rotation interval is 17 days"),
+        "the refreeze rebuilds the memory index from disk: {system}"
+    );
+    let tools: Vec<&str> = third["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert!(!tools[0].contains("[extension refreeze:"), "{}", tools[0]);
+    assert!(tools[1].contains("[extension refreeze:"), "the tool write refreezes: {}", tools[1]);
+    assert!(tools[1].contains("wordfreq"), "{}", tools[1]);
+    assert!(
+        tools[1].contains("Memory index rebuilt with this refreeze (indexed: rotation-interval)"),
+        "the receipt names the memory the rebuilt index gained: {}",
+        tools[1]
+    );
+    let refrozen = events.iter().filter(|e| matches!(e, AgentEvent::Refrozen { .. })).count();
+    assert_eq!(refrozen, 1, "exactly one refreeze, for the tool: {events:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A memory file the prompt index REJECTS (bad stem) must not be claimed
-/// live. Before this fix, memory_files listed every readable .md, so writing
-/// `.openmax/memory/Invalid-Stem.md` refroze and told the model
-/// "Memory index indexed: Invalid-Stem" while the next prompt had no such
-/// entry. The receipt is now built from the indexed selection.
+/// indexed. The receipt's memory clause is built from the indexed selection,
+/// so a refreeze that rebuilds the index after
+/// `.openmax/memory/Invalid-Stem.md` was written names no such entry, and the
+/// rebuilt prompt carries none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_memory_name_is_never_claimed_indexed() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
@@ -618,6 +698,7 @@ async fn a_rejected_memory_name_is_never_claimed_indexed() {
     let project = dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let project = project.canonicalize().unwrap();
+    let manifest = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\nmutating = false\n";
     let (base_url, bodies) = recording_endpoint(vec![
         completion_with_tool_call(
             "write_file",
@@ -626,6 +707,10 @@ async fn a_rejected_memory_name_is_never_claimed_indexed() {
                 "content": "# a fact\n\nbody\n"
             }),
         ),
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/tools/wordfreq.toml", "content": manifest }),
+        ),
         completion_with_text("done"),
     ])
     .await;
@@ -633,24 +718,32 @@ async fn a_rejected_memory_name_is_never_claimed_indexed() {
     let (core, mut rx) = Core::new(data).unwrap();
     drive_turn(&core, &mut rx, "bad-mem", &project, "remember badly").await;
     let bodies = bodies.lock().unwrap();
-    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
-    let messages = second["messages"].as_array().unwrap();
+    let last = request(&bodies, bodies.len() - 1);
+    let messages = last["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().filter_map(|m| m["content"].as_str()).any(|c| c.contains("[extension refreeze:")),
+        "the tool write refreezes, so the index was rebuilt"
+    );
     for m in messages {
         if let Some(c) = m["content"].as_str() {
             assert!(
-                !c.contains("Memory index indexed: Invalid-Stem"),
+                !c.contains("indexed: Invalid-Stem"),
                 "a rejected name must not be claimed indexed: {c}"
             );
         }
     }
-    // And the frozen prompt carries no Invalid-Stem index line.
+    // And the rebuilt prompt carries no Invalid-Stem index line.
     let system = messages[0]["content"].as_str().unwrap();
     assert!(!system.contains("Invalid-Stem"), "the prompt omits it: {system}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Removing a tool file is named in the receipt as exactly that: the file,
+/// and that it was removed. Capability-file history is no longer recorded,
+/// so the receipt makes no claim about what an earlier approval would do if
+/// the bytes came back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removing_an_approved_tool_says_the_approval_outlives_it() {
+async fn removing_an_approved_tool_names_the_file_as_removed() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
     let project = dir.join("project");
@@ -683,118 +776,12 @@ async fn removing_an_approved_tool_says_the_approval_outlives_it() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(content.contains("Removed approved tools: echoer"), "{content}");
-    assert!(content.contains("the approval outlives the file"), "{content}");
-    assert!(content.contains("nothing needs forgetting"), "{content}");
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Deleting a tool whose SCRIPT was edited (manifest unchanged, but the
-/// bound code no longer matches what was approved) must NOT be classified
-/// as a removed-approved tool: the runtime gate would ask again, so the
-/// receipt cannot claim 'would run without a card'.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removing_a_tool_with_edited_bound_code_is_not_called_approved() {
-    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
-    let data = dir.join("data");
-    let project = dir.join("project");
-    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
-    let project = project.canonicalize().unwrap();
-    let script = project.join("run.sh");
-    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
-    let manifest = project.join(".openmax/tools/t.toml");
-    std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
-    std::fs::create_dir_all(&data).unwrap();
-    // Approve manifest + the ORIGINAL script.
-    let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
-    shas.extend(open_max_core::ledger::manifest_code(&manifest, &project).into_iter().filter_map(|c| c.sha256));
-    open_max_core::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
-    // Edit the script AND delete the manifest in one turn.
-    let (base_url, bodies) = recording_endpoint(vec![
-        completion_with_tool_call("write_file", serde_json::json!({ "path": "run.sh", "content": "#!/bin/sh\n# edited\ncat\n" })),
-        completion_with_tool_call("bash", serde_json::json!({ "command": "rm .openmax/tools/t.toml" })),
-        completion_with_text("gone"),
-    ])
-    .await;
-    write_config(&data, &base_url, &project);
-    let (core, mut rx) = Core::new(data).unwrap();
-    drive_turn(&core, &mut rx, "edit-then-remove", &project, "go").await;
-    let bodies = bodies.lock().unwrap();
-    // The removal receipt (request 3) must not name t as removed-approved.
-    let third: serde_json::Value = serde_json::from_str(&bodies[2]).unwrap();
-    for m in third["messages"].as_array().unwrap() {
-        if let Some(c) = m["content"].as_str() {
-            assert!(
-                !c.contains("Removed approved tools: t"),
-                "a tool with edited bound code is not approved: {c}"
-            );
-        }
-    }
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Deleting BOTH an approved manifest and its bound script in one turn must
-/// still report that the approval SURVIVES: the ledger keeps the record and
-/// the content-addressed objects, so the bytes are restorable. Recomputing
-/// bound_code after the script is gone makes covers_code fail, which used to
-/// drop the tool from the receipt entirely, hiding the surviving approval.
-/// It is now named in a distinct clause that does not claim the
-/// deleted bytes would run without another approval.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removing_an_approved_tool_and_its_script_reports_the_surviving_approval() {
-    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
-    let data = dir.join("data");
-    let project = dir.join("project");
-    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
-    let project = project.canonicalize().unwrap();
-    let script = project.join("run.sh");
-    std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
-    let manifest = project.join(".openmax/tools/t.toml");
-    std::fs::write(&manifest, "name = \"t\"\ndescription = \"d\"\ncommand = \"./run.sh\"\n").unwrap();
-    std::fs::create_dir_all(&data).unwrap();
-    // Approve manifest + the script it runs.
-    let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
-    shas.extend(open_max_core::ledger::manifest_code(&manifest, &project).into_iter().filter_map(|c| c.sha256));
-    open_max_core::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
-    // Delete BOTH the manifest and the script in one turn.
-    let (base_url, bodies) = recording_endpoint(vec![
-        completion_with_tool_call("bash", serde_json::json!({ "command": "rm .openmax/tools/t.toml run.sh" })),
-        completion_with_text("gone"),
-    ])
-    .await;
-    write_config(&data, &base_url, &project);
-    let (core, mut rx) = Core::new(data).unwrap();
-    drive_turn(&core, &mut rx, "remove-both", &project, "go").await;
-    let bodies = bodies.lock().unwrap();
-    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
-    let content = second["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["role"] == "tool")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .to_string();
     assert!(
-        content.contains("surviving approval: t"),
-        "the surviving approval must be reported, not hidden: {content}"
+        content.contains("[extension refreeze: .openmax/tools/echoer.toml removed."),
+        "{content}"
     );
-    // ...and it must NOT claim the deleted bytes run without a card.
-    assert!(
-        !content.contains("Removed approved tools: t"),
-        "deleted code cannot be called cardless-runnable: {content}"
-    );
-    // Restorability is qualified, not promised: a stored object can be missing
-    // or corrupt, so the claim is "may".
-    assert!(
-        content.contains("may run without a card"),
-        "the receipt must not overstate object restorability: {content}"
-    );
-    assert!(
-        !content.contains("objects remain in the ledger (restorable)"),
-        "the unconditional restorable claim was removed: {content}"
-    );
+    assert!(!content.contains("Removed approved"), "{content}");
+    assert!(!content.contains("--ledger"), "{content}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

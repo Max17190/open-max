@@ -3,6 +3,7 @@ name = "open-max-core"
 description = "Open Max core: agent harness and native process supervision"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -16,15 +17,19 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+hyper-util.workspace = true
 futures-util.workspace = true
 regex.workspace = true
 ignore.workspace = true
 globset.workspace = true
 similar.workspace = true
 uuid.workspace = true
-fs2.workspace = true
 sha2.workspace = true
 toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+# Paused time, so the token batcher's timing tests are exact.
+tokio = { workspace = true, features = ["test-util"] }

@@ -28,10 +28,6 @@ use crate::config::Settings;
 use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
-/// One extension generation exactly as a freeze captured it: for each file,
-/// its path, sha256, and bytes.
-pub type ExtensionGeneration = Vec<(PathBuf, String, Vec<u8>)>;
-
 /// In-memory state of one agent session.
 #[derive(Default, Clone)]
 pub struct SessionData {
@@ -43,6 +39,13 @@ pub struct SessionData {
     pub prompt_breakdown: Arc<crate::prompt::PromptBreakdown>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,
+    /// Replay-boundary edits for a hydration repair whose boundaries have not
+    /// moved yet: the rewrite that should have landed it failed, or the index
+    /// write after it did. Applied by the first save that has the repair on
+    /// disk and gets the index write through: applied before, the boundaries
+    /// would mark messages the file does not hold yet, and never applied, a
+    /// replay draws each later divider early. In memory only.
+    pub deferred_resume_edits: Vec<crate::sessions::ResumeEdit>,
     /// Process-unique id of the turn that last took `messages`; a restore is
     /// only valid while this still matches the taker (guards against a newer
     /// turn or a recreated session reusing the id).
@@ -51,17 +54,6 @@ pub struct SessionData {
     /// context window. The condition holds on every turn once it holds at all,
     /// so the advisory is emitted once and not per turn.
     pub schemas_over_budget_reported: bool,
-    /// Whether the ledger has reconciled with the extension files this session
-    /// froze. False until the first turn start: a freeze reads disk directly,
-    /// so changes made while no session was running would otherwise never be
-    /// recorded - and the next mid-turn sync would sweep them up as the
-    /// agent's own work.
-    pub ledger_synced: bool,
-    /// A turn-start generation the ledger could not record. Held so a later
-    /// mid-turn sync lands it as external work first: the delta that sync
-    /// records would otherwise span a human's pre-session edits and file
-    /// them as the agent's. In memory only; see `agent::settle_ledger`.
-    pub unrecorded_external: Option<ExtensionGeneration>,
     /// Content hashes of policy notices (inert allow rules, hooks that did
     /// not load) already narrated to the MODEL this session. The condition
     /// holds every turn once it holds at all, so the transcript gets one
@@ -73,9 +65,11 @@ pub struct SessionData {
     /// seeded from the chain at build, then advanced as new events are
     /// narrated. An approval recorded outside the running session (a human
     /// at another terminal, #199) reaches it through no other channel - the
-    /// refreeze receipt names file changes, not approvals - so the turn
-    /// start names any it has not seen.
-    pub seen_ledger_events: HashSet<u64>,
+    /// refreeze receipt names file changes, not approvals - so a turn start
+    /// outside auto names any it has not seen. None until the chain was
+    /// first read: auto never consults it, so a session built in auto is
+    /// seeded by its first turn in another mode, which narrates nothing.
+    pub seen_ledger_events: Option<HashSet<u64>>,
     /// Server-reported `prompt_tokens` over the local estimate of the same
     /// request, as last observed on a turn's completion. The bytes/4
     /// estimator under-counts BPE tokenizers on code, by far more than the
@@ -142,8 +136,10 @@ pub struct Core {
     pub cancel_flags: Mutex<HashMap<String, Arc<CancelToken>>>,
     /// Pending tool-approval prompts awaiting a user decision.
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
-    /// Serializes read-modify-write cycles on the session index file.
-    pub sessions_lock: Mutex<()>,
+    /// Serializes this process's session store writes, the index's
+    /// read-modify-write cycles included, and guards what it knows about the
+    /// store without reading it (`sessions::StoreMemo`).
+    pub(crate) sessions_lock: Mutex<crate::sessions::StoreMemo>,
     /// Process ownership lasts as long as writable session state is attached.
     pub(crate) session_owners: Mutex<HashMap<String, crate::sessions::SessionOwner>>,
     /// Panic restorations must finish before the terminal receipt releases a turn.
@@ -186,17 +182,29 @@ fn settings_file_fingerprint(data_dir: &std::path::Path) -> SettingsFingerprint 
     }
 }
 
+/// The form a project's approval mode is keyed by: the canonical path, or the
+/// path as given when it cannot be resolved.
+pub fn canonical_root(project_root: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf())
+}
+
 impl Core {
-    /// The choice for this exact canonical project, or the settings default.
+    /// The choice for this canonical project or its nearest enclosing one
+    /// (see `trust::nearest_approval_mode`), or the settings default.
     /// Never call while holding the settings lock.
     pub fn approval_mode(&self, project_root: &std::path::Path) -> crate::config::ApprovalMode {
-        let canonical = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-        self.project_approval_modes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&canonical)
-            .copied()
-            .unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
+        self.approval_mode_canonical(&canonical_root(project_root))
+    }
+
+    /// `approval_mode` for a root already passed through `canonical_root`.
+    /// It touches no filesystem, so a frontend can read it on every frame.
+    /// Never call while holding the settings lock.
+    pub fn approval_mode_canonical(&self, canonical_root: &std::path::Path) -> crate::config::ApprovalMode {
+        let saved = crate::trust::nearest_approval_mode(
+            &self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner()),
+            canonical_root,
+        );
+        saved.unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
     }
 
     /// Persist before changing the live gate. A failed save leaves both the
@@ -243,10 +251,9 @@ impl Core {
     /// Settings say how to reach an endpoint and what a turn may spend. A
     /// history search uses neither, so an unreadable settings file - a key
     /// from a newer build, a hand edit, a stray comma - must not also make the
-    /// project's own history unreadable. `--ledger` already reads its store
-    /// without loading settings at all; this puts `--recall` on the same
-    /// footing, and leaves the fail-closed rule exactly where it earns its
-    /// keep: the paths that spend money and run tools.
+    /// project's own history unreadable. This leaves the fail-closed rule
+    /// exactly where it earns its keep: the paths that spend money and run
+    /// tools.
     ///
     /// The failure is returned, never swallowed. Degrading silently to
     /// defaults would hide a real misconfiguration behind a working search;
@@ -376,6 +383,25 @@ mod tests {
         assert!(core.set_project_approval_mode(&project, ApprovalMode::Ask).is_err());
         assert_eq!(core.approval_mode(&project), ApprovalMode::Auto, "a failed save must leave the live policy unchanged");
         assert!(Core::new(data).is_err(), "unreadable authority state fails closed at launch");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A process started in a worktree of a project gates its tools with the
+    /// project's choice, from the launch snapshot and after a live selection;
+    /// otherwise a delegated headless child under auto declines every write.
+    #[test]
+    fn project_mode_covers_sessions_in_its_subdirectories() {
+        use crate::config::ApprovalMode;
+        let dir = std::env::temp_dir().join(format!("omx-mode-sub-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        let worktree = project.join(".worktrees").join("task-a");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let data = dir.join("data");
+        crate::trust::trust_project(&data, &project).unwrap();
+        let (core, _) = Core::new(data.clone()).unwrap();
+        core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
+        assert_eq!(core.approval_mode(&worktree), ApprovalMode::Auto, "live selection");
+        assert_eq!(Core::new(data).unwrap().0.approval_mode(&worktree), ApprovalMode::Auto, "launch snapshot");
         let _ = std::fs::remove_dir_all(dir);
     }
 

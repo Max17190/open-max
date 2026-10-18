@@ -58,6 +58,91 @@ pub fn has_warnings(findings: &[Finding]) -> bool {
     findings.iter().any(|f| matches!(f.status, Status::Warn(_)))
 }
 
+/// How a memory's ok row says its line is not in the frozen index.
+const MEMORY_NOT_INDEXED: &str = "faded from the index";
+
+/// The default `--check` text report: the findings it prints as rows, in
+/// report order, and one line counting the rest. The report is read by the
+/// agent that just wrote an extension and stays in that session's transcript,
+/// re-sent with every later request, so a row that only confirms a file
+/// loaded is counted instead of printed. A file with any warn or err row keeps
+/// all of its rows: its ok row finishes its story ("3 rules, 1 inert until
+/// approved" after the inert warning). A hook's row prints even when ok: in
+/// auto mode, where no approval receipt is printed, it is the only report of
+/// what the hook enforces (its event, and whether it gates), and a turn_end
+/// observer written as a completion gate reads as healthy everywhere else.
+pub fn default_report(findings: &[Finding]) -> (Vec<&Finding>, Option<String>) {
+    let flagged: Vec<&Path> = findings
+        .iter()
+        .filter(|f| !matches!(f.status, Status::Ok(_)))
+        .map(|f| f.path.as_path())
+        .collect();
+    let mut rows = Vec::new();
+    let mut counted: Vec<(&str, Vec<&Path>)> = Vec::new();
+    // A memory's ok row says whether its line is in the index. The count keeps
+    // the "not", so the default report still says when a note is missing from
+    // the index the agent reads.
+    let mut not_indexed = 0;
+    for finding in findings {
+        if !matches!(finding.status, Status::Ok(_))
+            || finding.kind == "hook"
+            || flagged.contains(&finding.path.as_path())
+        {
+            rows.push(finding);
+            continue;
+        }
+        if finding.kind == "memory" && finding.status.summary().contains(MEMORY_NOT_INDEXED) {
+            not_indexed += 1;
+        }
+        match counted.iter_mut().find(|(kind, _)| *kind == finding.kind) {
+            Some((_, paths)) if paths.contains(&finding.path.as_path()) => {}
+            Some((_, paths)) => paths.push(&finding.path),
+            None => counted.push((finding.kind, vec![&finding.path])),
+        }
+    }
+    if counted.is_empty() {
+        return (rows, None);
+    }
+    let counts: Vec<String> = counted
+        .into_iter()
+        .map(|(kind, paths)| match (kind, paths.len()) {
+            ("memory", n) => {
+                let noun = if n == 1 { "memory" } else { "memories" };
+                match not_indexed {
+                    0 => format!("{n} {noun}"),
+                    k => format!("{n} {noun} ({k} not in the index)"),
+                }
+            }
+            // Surfaces named after their file: settings, providers, permissions.
+            (kind, 1) if kind.ends_with('s') => format!("1 {kind} file"),
+            (kind, n) if kind.ends_with('s') => format!("{n} {kind} files"),
+            (kind, 1) => format!("1 {kind}"),
+            (kind, n) => format!("{n} {kind}s"),
+        })
+        .collect();
+    (rows, Some(format!("ok: {} (openmax --check --all lists them)", counts.join(", "))))
+}
+
+/// How the `--check` text report names `path`: relative to `root`, the
+/// directory the report checks and runs in, when it is under it. The harness's
+/// own message text names a file the same way ([`check_for_report`]), repair
+/// commands included, and those still work there: `--approve` and `--forget`
+/// resolve a relative path against the directory they run in, which has to be
+/// the project anyway (approvals are recorded per directory). Every other path
+/// is returned unchanged: one outside `root` (the global tier, which a `~`
+/// could not shorten inside the single quotes a printed command uses), `root`
+/// itself, and every path when `root` is the filesystem root, where a relative
+/// form would only drop the leading `/`. A relative path that would start with
+/// `-` gets a `./`, so no command reads it as an option.
+pub fn report_path(path: &Path, root: &Path) -> PathBuf {
+    match path.strip_prefix(root) {
+        Ok(rest) if root.parent().is_none() || rest.as_os_str().is_empty() => path.to_path_buf(),
+        Ok(rest) if rest.to_string_lossy().starts_with('-') => Path::new(".").join(rest),
+        Ok(rest) => rest.to_path_buf(),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// Validate all extension files for a project (global + project dirs).
 /// Missing dirs and files contribute nothing; an empty report means an empty
 /// (and healthy) configuration.
@@ -65,11 +150,33 @@ pub fn check(project_root: &Path) -> Vec<Finding> {
     check_at(project_root, &crate::state::default_data_dir())
 }
 
+/// The same findings for the `--check` text report: where this module writes
+/// a file's path into a message (a repair command's argument, the file that
+/// shadows this one, the script whose bytes changed), it names the file by
+/// [`report_path`]. Nothing a message quotes changes, because that can be
+/// author bytes (a manifest line in a parse error) that must read exactly as
+/// they are in the file, and a reason relayed whole from a loader (the hook
+/// loader's fail-closed summary) prints as the loader wrote it.
+pub fn check_for_report(project_root: &Path) -> Vec<Finding> {
+    check_with(project_root, &crate::state::default_data_dir(), true)
+}
+
 /// A finding plus the identity a loader would file it under, used to work out
 /// which of two files with the same identity actually wins.
 type Entry = (Finding, Option<String>);
 
 pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
+    check_with(project_root, data_dir, false)
+}
+
+fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Finding> {
+    // A file's path as the harness writes it into a message, bare or as a
+    // repair command's argument.
+    let shown = |path: &Path| match for_report {
+        true => report_path(path, project_root),
+        false => path.to_path_buf(),
+    };
+    let command_path = |path: &Path| shell_quote(&shown(path));
     let mut findings = Vec::new();
     let default = crate::config::load(data_dir).map(|s| s.approval_mode).unwrap_or(crate::config::ApprovalMode::Ask);
     let mode = match crate::trust::approval_mode(data_dir, project_root, default) {
@@ -139,6 +246,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                         (None, Some(ext)) => match stale_code_reason(
                             data_dir,
                             project_root,
+                            &shown,
                             &ext.source_sha256,
                             &ext.command,
                             &ext.args,
@@ -174,7 +282,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                      openmax --check --run-examples, which probes unapproved \
                                      tools in a sandbox)",
                                     spec.name,
-                                    shell_quote(&ext.source_path)
+                                    command_path(&ext.source_path)
                                 ))
                             }
                             None => Status::Ok(format!("tool '{}'", spec.name)),
@@ -189,7 +297,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
     // Later directories overwrite earlier ones by name, so the last file to
     // claim a name is the live one.
-    let tool_shadows = mark_shadowed(&mut tools_found, false);
+    let tool_shadows = mark_shadowed(&mut tools_found, false, &shown);
     let tool_capped = mark_beyond_cap(
         &mut tools_found,
         crate::registry::MAX_EXTERNAL_TOOLS,
@@ -330,7 +438,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             skills_found.push((Finding { kind: "skill", path, status }, id));
         }
     }
-    let skill_shadows = mark_shadowed(&mut skills_found, false);
+    let skill_shadows = mark_shadowed(&mut skills_found, false, &shown);
     mark_beyond_cap(&mut skills_found, crate::skills::MAX_SKILLS, &skill_shadows, |_| true, "skill cap");
     // The index byte cap drops whole lines from the frozen prompt: a skill
     // past it parses fine, but the model never sees its name, so nothing can
@@ -391,7 +499,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             templates_found.push((Finding { kind: "template", path, status }, id));
         }
     }
-    mark_shadowed(&mut templates_found, false);
+    mark_shadowed(&mut templates_found, false, &shown);
     // Last word to the shadowing above: a note only describes a file whose
     // line the popup will actually show.
     for (i, reason) in template_notes {
@@ -461,6 +569,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                     let unapproved = stale_code_reason(
                         data_dir,
                         project_root,
+                        &shown,
                         &h.source_sha256,
                         &h.command,
                         &h.args,
@@ -497,7 +606,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                             if was_live && was_gate {
                                 Status::Err(format!(
                                     "{reason}; this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
-                                    shell_quote(&path)
+                                    command_path(&path)
                                 ))
                             } else if let Some((problem, missing)) =
                                 missing_command_reason(&h.command, project_root).or_else(|| {
@@ -513,7 +622,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 // file that exists.
                                 Status::Err(format!(
                                     "inert because {missing}: {}",
-                                    problem.hook_repair(h.command.trim(), &path)
+                                    problem.hook_repair(h.command.trim(), &command_path(&path))
                                 ))
                             } else {
                                 // Only `openmax --approve`, from outside a
@@ -534,7 +643,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                                 };
                                 Status::Err(format!(
                                     "inert because {reason}: a human must approve this exact content with `openmax --approve {}`, run outside a session (an in-session write approval approves the write and nothing more){shape_note}",
-                                    shell_quote(&path)
+                                    command_path(&path)
                                 ))
                             }
                         }
@@ -576,7 +685,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
     }
     // First stem wins, and a shadowed file is never loaded: the runtime does
     // not fail closed on one, so neither does this.
-    let hook_shadows = mark_shadowed(&mut hooks_found, true);
+    let hook_shadows = mark_shadowed(&mut hooks_found, true, &shown);
     let mut hook_capped = std::collections::HashSet::new();
     for event in crate::hooks::HookEvent::ALL {
         let event = event.as_str();
@@ -618,7 +727,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
             if let Status::Err(reason) = &finding.status {
                 finding.status = Status::Err(format!(
                     "{reason}; this file was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve {}`",
-                    shell_quote(&finding.path)
+                    command_path(&finding.path)
                 ));
             }
         }
@@ -656,7 +765,7 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 path: path.clone(),
                 status: Status::Err(format!(
                     "an approved hook file was deleted; every tool call fails closed until it is restored or retired with `openmax --forget {}`",
-                    shell_quote(path)
+                    command_path(path)
                 )),
             });
         }
@@ -692,6 +801,18 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
                 let mut inert = 0;
                 if let Some((reason, dropped)) = inert_verdict {
                     inert = dropped;
+                    // All harness text (the file's path, a count, and the
+                    // command), shared with the in-session notice, so the
+                    // report's form is made here: the path column already
+                    // names the file, so the notice's own "<path>: " lead-in
+                    // goes, and the command names the file as the report does.
+                    let reason = match for_report {
+                        true => reason
+                            .strip_prefix(&format!("{}: ", path.display()))
+                            .unwrap_or(&reason)
+                            .replace(&shell_quote(&path), &command_path(&path)),
+                        false => reason,
+                    };
                     findings.push(Finding {
                         kind: "permissions",
                         path: path.clone(),
@@ -775,6 +896,42 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
         }
     }
 
+    // A damaged session index refuses every new session and every
+    // `--continue`, in every project, until it is moved aside. Only damage
+    // is a finding: a healthy index is state, not configuration. Moving it
+    // is the whole repair (a missing index is an empty store), but only
+    // with openmax closed: a running session's entry leaves with the file.
+    // One claimed while the index was healthy keeps saving, so its later
+    // history is written but listed nowhere (invisible to `--continue`,
+    // `/resume`, and `--recall`); one claimed over the damage, or claimed
+    // again later, has its saves dropped. The target is a name not yet
+    // taken, so a second incident never overwrites the copy an earlier one
+    // moved aside. That name is only free when this prints; `-n` keeps it
+    // so when the command runs later (rerun from shell history, or copied
+    // from an older `--check`), and a skipped move leaves the index
+    // damaged, so the next `--check` names a free target again.
+    // `-n` skips without a word and exits 0, so the command checks that the
+    // index left and, when it did not, says so and exits nonzero: a silent
+    // skip, or a zero status a script checks, reads as a done repair while
+    // every session still refuses.
+    if let Some((path, reason)) = crate::sessions::index_damage(data_dir) {
+        let mut aside = path.with_extension("json.damaged");
+        let mut n = 1;
+        while std::fs::symlink_metadata(&aside).is_ok() {
+            n += 1;
+            aside = path.with_extension(format!("json.damaged-{n}"));
+        }
+        let index = shell_quote(&path);
+        findings.push(Finding {
+            kind: "sessions",
+            status: Status::Err(format!(
+                "{reason}; close every openmax, then move it aside to start a new index: mv -n {index} {} && test ! -e {index} || {{ echo 'the index was not moved; run openmax --check again'; false; }}",
+                shell_quote(&aside)
+            )),
+            path,
+        });
+    }
+
     findings.extend(inline_program_findings(data_dir, project_root));
     findings.extend(memory_findings(project_root));
     findings.extend(unread_paths(project_root));
@@ -797,6 +954,15 @@ pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
 /// embedded single quote (closed, escaped, reopened).
 pub fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// The printed trust grant for `project`. `--trust-project` trusts the
+/// current directory and a grant covers its subtree, so a bare command pasted
+/// into a terminal opened elsewhere (often $HOME) would trust that directory
+/// and everything under it while the refused project stays untrusted. The
+/// quoted `cd` makes the paste grant exactly the project that was refused.
+pub fn trust_command(project: &std::path::Path) -> String {
+    format!("cd {} && openmax --trust-project", shell_quote(project))
 }
 
 fn inline_program_findings(data_dir: &Path, project_root: &Path) -> Vec<Finding> {
@@ -904,7 +1070,7 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
             let visibility = if memory.in_index {
                 "indexed at the next prompt freeze (session start, /reload, or any refreeze); a running session sees it once its prefix rebuilds".to_string()
             } else {
-                "faded from the index (unused; a read_file revives it)".to_string()
+                format!("{MEMORY_NOT_INDEXED} (unused; a read_file revives it)")
             };
             // Indexed under a first line the index had to cut is still a
             // degraded index line: the future session it was written for reads
@@ -1082,7 +1248,15 @@ impl ExampleGates {
         // the mode gates still guard every approved (host) run, unchanged.
         // The in-session content gate (unapproved_capability) is untouched:
         // a passing probe approves nothing.
-        if !crate::ledger::is_approved(data_dir, project_root, &ext.source_sha256) {
+        //
+        // "Approved" is the question that gate asks: the manifest and the
+        // project-local code it runs. A script rewritten after approval
+        // leaves the manifest hash unchanged, so asking about the manifest
+        // alone would run the new bytes on the host while a session asks
+        // for approval again.
+        let approvals = crate::ledger::approvals(data_dir, project_root).unwrap_or_default();
+        let code = crate::ledger::bound_code(&ext.command, &ext.args, project_root);
+        if !approvals.covers_capability(&ext.source_sha256, &code) {
             return Ok(Admission::Sandboxed);
         }
         // One exhaustive read of approval_mode, in the turn's precedence:
@@ -1115,21 +1289,24 @@ impl ExampleGates {
 /// runs, through the exact spawn path a session uses (stdin JSON, timeout,
 /// output caps) and behind the exact gates a session applies. `Err` means
 /// nothing ran at all. This executes project commands: opt-in per invocation,
-/// never part of plain `--check`.
+/// never part of plain `--check`. `for_report` names files in messages as
+/// [`check_for_report`] does, for the text report.
 pub async fn run_examples(
     project_root: &Path,
+    for_report: bool,
     report: impl FnMut(&ExampleVerdict),
 ) -> Result<Vec<ExampleVerdict>, String> {
-    run_examples_at(project_root, &crate::state::default_data_dir(), report).await
+    run_examples_at(project_root, &crate::state::default_data_dir(), for_report, report).await
 }
 
 pub(crate) async fn run_examples_at(
     project_root: &Path,
     data_dir: &Path,
+    for_report: bool,
     report: impl FnMut(&ExampleVerdict),
 ) -> Result<Vec<ExampleVerdict>, String> {
     let stack = std::env::var(RUN_EXAMPLES_STACK).unwrap_or_default();
-    run_examples_within(project_root, data_dir, &stack, report).await
+    run_examples_within(project_root, data_dir, &stack, for_report, report).await
 }
 
 /// `stack` is taken as an argument rather than read here so the recursion
@@ -1138,6 +1315,7 @@ async fn run_examples_within(
     project_root: &Path,
     data_dir: &Path,
     stack: &str,
+    for_report: bool,
     mut report: impl FnMut(&ExampleVerdict),
 ) -> Result<Vec<ExampleVerdict>, String> {
     use crate::registry::{Registry, ToolKind};
@@ -1153,11 +1331,13 @@ async fn run_examples_within(
     }
     // Examples execute repository code with the user's authority, exactly like
     // a turn does, so they need the same trust decision. Plain --check only
-    // reads files and stays trust-free.
+    // reads files and stays trust-free. The repair names a grant on its own:
+    // --check refuses --trust-project, so adding the flag to this run fails.
     if !crate::trust::is_trusted(data_dir, project_root)? {
         return Err(format!(
-            "project {} is not trusted; inspect it, then rerun with --trust-project",
-            project_root.display()
+            "project {} is not trusted; inspect it, then trust it once from a terminal with `{}`",
+            project_root.display(),
+            trust_command(project_root)
         ));
     }
     // Fail closed like a session start: a malformed settings file is a
@@ -1238,7 +1418,10 @@ async fn run_examples_within(
                             Err(format!(
                                 "unapproved source and this host cannot sandbox a probe ({}); a human can run `openmax --approve {}`, or make the tool's first call in a session and approve the card it raises",
                                 outcome.output.trim(),
-                                shell_quote(&ext.source_path)
+                                shell_quote(&match for_report {
+                                    true => report_path(&ext.source_path, project_root),
+                                    false => ext.source_path.clone(),
+                                })
                             ))
                         } else {
                             let verdict = example_verdict(&outcome, example);
@@ -1287,8 +1470,11 @@ fn example_verdict(
         return Ok(());
     };
     // Tool parsing rejects an invalid expect_regex, so a mismatch is the only
-    // failure reachable here.
-    if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&outcome.output)) {
+    // failure reachable here. The match sees the output trimmed the same way
+    // `detail` prints it: `$` is end of text, so against raw output
+    // `^[0-9]+$` never matches `echo 63`, and the verdict would print `63`
+    // as the output it rejected.
+    if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(outcome.output.trim_end())) {
         return Ok(());
     }
     Err(format!(
@@ -1436,6 +1622,7 @@ fn unknown_tool_reason(
 fn stale_code_reason(
     data_dir: &Path,
     project_root: &Path,
+    shown: &dyn Fn(&Path) -> PathBuf,
     manifest_sha: &str,
     command: &str,
     args: &[String],
@@ -1444,9 +1631,11 @@ fn stale_code_reason(
     if !approvals.contains(manifest_sha) {
         return None;
     }
-    let problem = crate::ledger::bound_code(command, args, project_root)
-        .iter()
-        .find_map(|c| c.problem(&approvals))?;
+    let (path, problem) = crate::ledger::bound_code(command, args, project_root)
+        .into_iter()
+        .find_map(|c| c.problem(&approvals).map(|problem| (c.path, problem)))?;
+    // Harness text that leads with the file's path.
+    let problem = problem.replacen(&path.display().to_string(), &shown(&path).display().to_string(), 1);
     Some(format!("the code it runs, {problem}"))
 }
 
@@ -1456,7 +1645,7 @@ fn stale_code_reason(
 /// resolves to no file binds nothing it can read, while an unexecutable script
 /// approves fine and still cannot spawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CommandProblem {
+pub(crate) enum CommandProblem {
     Absent,
     NotExecutable,
     NotOnPath,
@@ -1465,8 +1654,7 @@ enum CommandProblem {
 impl CommandProblem {
     /// What repairs it, phrased for a hook that is inert until approved: each
     /// case names its own fix, and whether approval is even reachable yet.
-    fn hook_repair(self, command: &str, manifest: &Path) -> String {
-        let manifest = shell_quote(manifest);
+    fn hook_repair(self, command: &str, manifest: &str) -> String {
         let command_q = shell_quote(Path::new(command));
         match self {
             Self::Absent => format!(
@@ -1487,7 +1675,7 @@ impl CommandProblem {
 /// spawns it; a bare name resolves on PATH. This warns rather than errors:
 /// check-time and run-time environments legitimately differ (CI without the
 /// tool installed, a script the agent writes next).
-fn missing_command_reason(
+pub(crate) fn missing_command_reason(
     command: &str,
     project_root: &Path,
 ) -> Option<(CommandProblem, String)> {
@@ -1534,31 +1722,25 @@ fn missing_command_reason(
 }
 
 /// Why the script an interpreter-style command names will not run, if it
-/// will not. Judged the way `bound_code` binds it: the first positional
-/// argument, and only when it is shaped like a script file, so a module name
-/// (`python3 -m pytest`) or a data argument never draws a warning about a
-/// file it never was. The repair is `Absent`'s: the file has to exist before
-/// anything else about it can be true.
+/// will not: the first positional argument, and only when it is shaped like a
+/// script file, so a module name (`python3 -m pytest`) or a data argument
+/// never draws a warning about a file it never was. The hook runtime asks the
+/// same question before it spawns, so a warning here and a hook that cannot
+/// start there always agree. The repair is `Absent`'s: the file has to exist
+/// before anything else about it can be true.
 fn missing_script_reason(
     command: &str,
     args: &[String],
     project_root: &Path,
 ) -> Option<(CommandProblem, String)> {
-    let script = crate::ledger::interpreter_script(command, args)?;
-    let path = if Path::new(script).is_absolute() {
-        PathBuf::from(script)
-    } else {
-        project_root.join(script)
-    };
-    (!path.is_file()).then(|| {
-        (
-            CommandProblem::Absent,
-            format!(
-                "command '{}' runs '{script}', which does not exist from the project root",
-                command.trim()
-            ),
-        )
-    })
+    let script = crate::hooks::missing_interpreter_script(command, args, project_root)?;
+    Some((
+        CommandProblem::Absent,
+        format!(
+            "command '{}' runs '{script}', which does not exist from the project root",
+            command.trim()
+        ),
+    ))
 }
 
 /// The clamp warnings for the entries that survived shadowing and the cap. A
@@ -1675,7 +1857,11 @@ fn skill_description_gap(text: &str, name: &str) -> Option<String> {
 /// each surface lists its directories so the project file is the winner.
 /// Returns the shadowed indices: the loader deduplicates before it caps, so
 /// the cap ranking below needs to know which entries never held a slot.
-fn mark_shadowed(entries: &mut [Entry], first_wins: bool) -> std::collections::HashSet<usize> {
+fn mark_shadowed(
+    entries: &mut [Entry],
+    first_wins: bool,
+    shown: &dyn Fn(&Path) -> PathBuf,
+) -> std::collections::HashSet<usize> {
     let mut winner: HashMap<String, usize> = HashMap::new();
     for (i, (_, id)) in entries.iter().enumerate() {
         let Some(id) = id else { continue };
@@ -1699,7 +1885,7 @@ fn mark_shadowed(entries: &mut [Entry], first_wins: bool) -> std::collections::H
         let kind = entries[i].0.kind;
         entries[i].0.status = Status::Warn(format!(
             "shadowed by {}, where {kind} '{id}' resolves",
-            winner_path.display()
+            shown(&winner_path).display()
         ));
     }
     indices
@@ -2158,7 +2344,12 @@ mod tests {
             assert!(matches!(Permissions::discover_for_mode(&project, &first, mode).evaluate("bash", &args), PermissionDecision::Deny { .. }));
         }
         assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Auto).evaluate("bash", &args), PermissionDecision::Allow));
-        assert!(matches!(Permissions::discover_for_mode(&project, &second, ApprovalMode::Ask).evaluate("bash", &args), PermissionDecision::Allow));
+        // Default is also what an unread data dir gives, so the notice is what
+        // shows this one was read: its allow is found, and inert in ask.
+        let ask = Permissions::discover_for_mode(&project, &second, ApprovalMode::Ask);
+        assert!(matches!(ask.evaluate("bash", &args), PermissionDecision::Default));
+        let global = second.join("permissions.toml").display().to_string();
+        assert!(matches!(ask.notices(), [notice] if notice.starts_with(&global)), "{:?}", ask.notices());
         assert!(!crate::hooks::Hooks::discover_for_mode(&project, &first, ApprovalMode::Auto).is_empty());
         assert!(crate::hooks::Hooks::discover_for_mode(&project, &second, ApprovalMode::Auto).is_empty());
         let fingerprint = crate::hooks::hooks_fingerprint(&first, &project);
@@ -2915,8 +3106,16 @@ mod tests {
         data
     }
 
+    /// Every example run publishes the process-wide RUN_EXAMPLES_STACK and
+    /// restores the value it read on entry. Two concurrent runs interleave
+    /// those writes: the later one restores the earlier one's root after it
+    /// already finished, and that test's next run refuses as recursive. One
+    /// run at a time keeps the variable exact.
+    static EXAMPLE_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn examples(root: &Path, data: &Path) -> Result<Vec<ExampleVerdict>, String> {
-        run_examples_at(root, data, |_| {}).await
+        let _serial = EXAMPLE_RUNS.lock().await;
+        run_examples_at(root, data, false, |_| {}).await
     }
 
     fn verdict<'a>(results: &'a [ExampleVerdict], tool: &str) -> &'a ExampleVerdict {
@@ -2942,7 +3141,7 @@ mod tests {
         for name in ["create.toml", "observe.toml", "permissions.toml"] {
             assert!(matches!(find(&findings, name).status, Status::Ok(_)), "{findings:?}");
         }
-        let result = run_examples_at(&root, &data, |_| {}).await.unwrap();
+        let result = examples(&root, &data).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].result.is_ok(), "{:?}", result[0]);
         assert!(!result[0].sandboxed);
@@ -3024,6 +3223,57 @@ mod tests {
             Ok(()) => panic!("a write outside the scratch must fail the probe"),
         }
         assert!(!touched.exists(), "the probe must not touch the project");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// An approval covers the manifest and the project-local script it runs.
+    /// A script rewritten after approval leaves the manifest hash unchanged,
+    /// and a session asks for approval again before running it; an example
+    /// must not run those bytes with host authority either, in ask or in
+    /// readonly mode.
+    #[tokio::test]
+    async fn a_script_edited_after_approval_probes_sandboxed_and_cannot_touch_the_host() {
+        let root = temp_project();
+        let touched = root.join("side-effect");
+        let script = root.join("tool.sh");
+        write(script.clone(), "#!/bin/sh\nprintf ok\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let manifest = tool_file(
+            &root,
+            "scripted.toml",
+            "name = \"scripted\"\ndescription = \"d\"\ncommand = \"./tool.sh\"\n\n[example]\nexpect_regex = \"ok\"\n",
+        );
+        let data = approved_data_dir(&root, &[]);
+        let shas = vec![
+            crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap()),
+            crate::ledger::sha256_hex(&std::fs::read(&script).unwrap()),
+        ];
+        crate::ledger::approve_capability(&data, &root, &manifest, &shas).unwrap();
+
+        let approved = examples(&root, &data).await.unwrap();
+        let v = verdict(&approved, "scripted");
+        assert!(v.result.is_ok(), "{:?}", v.result);
+        assert!(!v.sandboxed, "the approved manifest and script keep their host run");
+
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nprintf ok\n", touched.display())).unwrap();
+        for mode in ["ask", "readonly"] {
+            std::fs::write(data.join("settings.json"), format!(r#"{{"approval_mode":"{mode}"}}"#))
+                .unwrap();
+            let results = examples(&root, &data).await.unwrap();
+            let v = verdict(&results, "scripted");
+            match &v.result {
+                Err(reason) if reason.contains("cannot sandbox a probe") => {
+                    assert!(reason.contains("--approve"), "{reason}");
+                }
+                other => assert!(v.sandboxed, "{mode}: an edited script runs only as a probe: {other:?}"),
+            }
+            assert!(!touched.exists(), "{mode}: the edited script must not touch the project");
+        }
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
@@ -3183,6 +3433,15 @@ mod tests {
         let refusal = examples(&root, &data).await.unwrap_err();
         assert!(refusal.contains("not trusted"), "{refusal}");
         assert!(refusal.contains("--trust-project"), "{refusal}");
+        // --check and --trust-project are separate operations, so the repair
+        // is a grant on its own, not a flag added to this run.
+        assert!(refusal.contains("from a terminal"), "{refusal}");
+        assert!(!refusal.contains("rerun with"), "{refusal}");
+        // A trust grant covers its subtree, so a bare `openmax --trust-project`
+        // pasted into a terminal opened elsewhere (often $HOME) trusts that
+        // directory and everything under it. The repair carries the project.
+        let grant = format!("`cd {} && openmax --trust-project`", shell_quote(&root));
+        assert!(refusal.contains(&grant), "{refusal}");
         assert!(!touched.exists(), "nothing may run in an untrusted project");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
@@ -3354,6 +3613,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
+    /// Nearly every command ends its output with a newline, and `$` in a Rust
+    /// regex is end of text. Matched raw, `^[0-9]+$` fails `echo 63` while the
+    /// verdict, which prints the output trimmed, reports `got: 63`: a mismatch
+    /// the author cannot see.
+    #[tokio::test]
+    async fn an_anchored_expect_regex_matches_output_that_ends_in_a_newline() {
+        let root = temp_project();
+        let counter = tool_file(
+            &root,
+            "counter.toml",
+            "name = \"counter\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"cat >/dev/null; echo 63\"]\n\n[example]\nexpect_regex = \"^[0-9]+$\"\n",
+        );
+        let data = approved_data_dir(&root, &[&counter]);
+
+        let results = examples(&root, &data).await.unwrap();
+        assert_eq!(verdict(&results, "counter").result, Ok(()));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     /// A tool whose example runs the checker re-finds this project and forks a
     /// level deeper every time. The inherited stack stops it at the second.
     #[tokio::test]
@@ -3371,14 +3650,15 @@ mod tests {
         let data = approved_data_dir(&root, &[&tool]);
         let stack = std::fs::canonicalize(&root).unwrap().display().to_string();
 
-        let refusal = run_examples_within(&root, &data, &stack, |_| {})
+        let _serial = EXAMPLE_RUNS.lock().await;
+        let refusal = run_examples_within(&root, &data, &stack, false, |_| {})
             .await
             .unwrap_err();
         assert!(refusal.contains("already running"), "{refusal}");
         assert!(!touched.exists(), "the recursive level must not spawn");
         // An unrelated project on the stack is not this project.
         let other = format!("{}/elsewhere", stack);
-        assert!(run_examples_within(&root, &data, &other, |_| {}).await.is_ok());
+        assert!(run_examples_within(&root, &data, &other, false, |_| {}).await.is_ok());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(data);
     }
@@ -4240,7 +4520,7 @@ mod tests {
         write(data.join("prompt/review.md"), "Review.\n");
         write(data.join("tools/deploy.sh"), "#!/bin/sh\ntrue\n");
         write(data.join("ledger/log.jsonl"), "{}\n");
-        write(data.join("sessions/index.json"), "{}\n");
+        write(data.join("sessions/index.json"), "[]\n");
         write(data.join("notes.txt"), "scratch\n");
 
         let findings: Vec<Finding> = check_at(&root, &data)
@@ -4263,6 +4543,98 @@ mod tests {
                 "{legit} is legitimate and must not warn: {findings:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A damaged session index refuses every new session and every
+    /// `--continue`, in every project, so the command whose job is naming
+    /// what is broken names it, with the repair. A healthy index is silent.
+    /// The copyable `mv` targets a name that does not exist yet: a fixed
+    /// name would overwrite the copy an earlier incident moved aside, and
+    /// with it the only record of that index's sessions.
+    #[test]
+    fn a_damaged_session_index_is_an_error_with_its_repair() {
+        let root = temp_project();
+        let data = root.join("data");
+        let index = data.join("sessions/index.json");
+        write(index.clone(), "[]\n");
+        assert!(!check_at(&root, &data).iter().any(|f| f.path == index), "a healthy index is not a finding");
+
+        let earlier = data.join("sessions/index.json.damaged");
+        write(earlier.clone(), "[{\"id\":\"earlier\"");
+        write(index.clone(), "[{");
+        let findings = check_at(&root, &data);
+        let finding = findings
+            .iter()
+            .find(|f| f.path == index)
+            .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
+        let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
+        let (target, _) = reason
+            .rsplit_once(&format!("mv -n {} '", shell_quote(&index)))
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
+        let target = PathBuf::from(target);
+        assert!(target.starts_with(data.join("sessions")) && target != index, "{reason}");
+        assert!(!target.exists(), "the repair must not overwrite {}: {reason}", target.display());
+        assert!(has_errors(&findings));
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{", "--check never rewrites the index");
+        assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "[{\"id\":\"earlier\"");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The free target is chosen when `--check` prints, but the user runs
+    /// the command later: rerun from shell history after a second incident,
+    /// or copied from an older `--check` whose name another move has since
+    /// taken. A plain `mv` then replaces that copy, and with it the only
+    /// record of its index's sessions. The printed command must leave a copy
+    /// that appeared in between alone, say that it moved nothing and exit
+    /// nonzero (a silent skip, or a zero status a script checks, reads as a
+    /// done repair while every session still refuses), and still do the
+    /// repair once `--check` names a free target again.
+    #[test]
+    fn a_damaged_index_repair_never_overwrites_a_copy_made_after_check() {
+        let root = temp_project();
+        let data = root.join("data");
+        let index = data.join("sessions/index.json");
+        write(index.clone(), "[{");
+        let repair = |data: &Path| {
+            let findings = check_at(&root, data);
+            let finding = findings
+                .iter()
+                .find(|f| f.path == index)
+                .unwrap_or_else(|| panic!("a damaged index must be listed: {findings:?}"));
+            let Status::Err(reason) = &finding.status else { panic!("a damaged index is an error: {finding:?}") };
+            let (_, command) = reason
+                .split_once("move it aside to start a new index: ")
+                .unwrap_or_else(|| panic!("the error carries its repair: {reason}"));
+            command.to_string()
+        };
+
+        let stale = repair(&data);
+        let taken = data.join("sessions/index.json.damaged");
+        assert!(stale.contains(&format!("mv -n {} {}", shell_quote(&index), shell_quote(&taken))), "{stale}");
+        write(taken.clone(), "[{\"id\":\"earlier\"");
+        let skipped = std::process::Command::new("/bin/sh").arg("-c").arg(&stale).output().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "[{\"id\":\"earlier\"",
+            "the repair must not overwrite a copy made after --check: {stale}"
+        );
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), "[{");
+        let said = String::from_utf8_lossy(&skipped.stdout);
+        assert!(
+            said.contains("not moved") && said.contains("openmax --check"),
+            "a skipped repair must say so, not pass as done: {stale}: {said}"
+        );
+        assert!(!skipped.status.success(), "a repair that moved nothing must exit nonzero: {stale}");
+
+        let fresh = repair(&data);
+        let run = std::process::Command::new("/bin/sh").arg("-c").arg(&fresh).output().unwrap();
+        assert!(run.status.success(), "{fresh}: {}", String::from_utf8_lossy(&run.stderr));
+        assert!(run.stdout.is_empty(), "a done repair reports nothing: {}", String::from_utf8_lossy(&run.stdout));
+        assert!(!index.exists(), "the repair moves the damaged index aside: {fresh}");
+        assert_eq!(std::fs::read_to_string(data.join("sessions/index.json.damaged-2")).unwrap(), "[{");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "[{\"id\":\"earlier\"");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4534,7 +4906,7 @@ mod tests {
             entry("hook", "/project/.openmax/hooks/gate.toml", Status::Ok("hook on pre_tool_use".into()), "gate"),
             entry("hook", "/home/.openmax/hooks/gate.toml", Status::Err("unknown event 'on_fire'".into()), "gate"),
         ];
-        mark_shadowed(&mut hooks, true);
+        mark_shadowed(&mut hooks, true, &|p: &Path| p.to_path_buf());
 
         assert!(matches!(hooks[0].0.status, Status::Ok(_)), "the project file wins");
         assert!(
@@ -4552,7 +4924,7 @@ mod tests {
             entry("tool", "/home/.openmax/tools/deploy.toml", Status::Ok("tool 'deploy'".into()), "deploy"),
             entry("tool", "/project/.openmax/tools/deploy.toml", Status::Ok("tool 'deploy'".into()), "deploy"),
         ];
-        mark_shadowed(&mut tools, false);
+        mark_shadowed(&mut tools, false, &|p: &Path| p.to_path_buf());
 
         assert!(matches!(tools[0].0.status, Status::Warn(_)));
         assert!(tools[0].0.status.summary().contains("/project/.openmax/tools/deploy.toml"));
@@ -4608,5 +4980,146 @@ mod tests {
         );
         assert!(!has_errors(&findings), "memory findings never fail a check");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A path under the root is named relative to it; anything else, the
+    /// root itself, and every path when the root is `/` stay as found.
+    #[test]
+    fn report_path_is_relative_only_under_the_root() {
+        let root = Path::new("/w/app");
+        assert_eq!(report_path(Path::new("/w/app/.openmax/tools/a.toml"), root), Path::new(".openmax/tools/a.toml"));
+        assert_eq!(report_path(Path::new("/w/app/-x.toml"), root), Path::new("./-x.toml"));
+        for (path, root) in [
+            ("/w/app-old/a.toml", "/w/app"),
+            ("/home/.openmax/tools/a.toml", "/w/app"),
+            ("/w/app", "/w/app"),
+            ("/w/a.toml", "/"),
+        ] {
+            assert_eq!(report_path(Path::new(path), Path::new(root)), Path::new(path), "{path} under {root}");
+        }
+    }
+
+    /// The text report's repair commands name the file relative to the
+    /// project, and nothing else in a message changes: the parse error here
+    /// quotes a broken line holding the file's own quoted absolute path, and
+    /// it reads exactly as the file does.
+    #[test]
+    fn the_report_names_files_relative_only_in_repair_commands() {
+        let root = temp_project();
+        let data = root.join("data");
+        let hook = root.join(".openmax/hooks/gate.toml");
+        write(hook.clone(), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n");
+        let sha = crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap());
+        crate::ledger::approve_capability(&data, &root, &hook, &[sha]).unwrap();
+        let quoted = shell_quote(&hook);
+        write(hook.clone(), &format!("event = \"pre_tool_use\"\ncommand = \"cat {quoted}\" oops\n"));
+        let reason = |for_report| match &find(&check_with(&root, &data, for_report), "gate.toml").status {
+            Status::Err(reason) => reason.clone(),
+            other => panic!("a broken live hook must err: {other:?}"),
+        };
+        let (full, report) = (reason(false), reason(true));
+        assert!(full.contains(&format!("cat {quoted}")), "the parse error quotes the line: {full}");
+        assert!(full.ends_with(&format!("`openmax --approve {quoted}`")), "{full}");
+        let command = "`openmax --approve '.openmax/hooks/gate.toml'`";
+        assert_eq!(report, format!("{}{command}", full.strip_suffix(&format!("`openmax --approve {quoted}`")).unwrap()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Each path this module writes into a message names a project file
+    /// relative to the project in the text report: every repair command, the
+    /// file that shadows another, and the script whose bytes changed. One
+    /// project triggers them all, in ask (the untrusted default), and the full
+    /// face, which keeps absolute paths, shows each one fired.
+    /// The root is canonical, as the current directory the CLI checks is.
+    #[test]
+    fn the_report_writes_no_absolute_project_path() {
+        let root = std::fs::canonicalize(temp_project()).unwrap();
+        let data = root.join("data");
+        let approve = |path: &Path, code: &[&Path]| {
+            let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(path).unwrap())];
+            shas.extend(code.iter().map(|c| crate::ledger::sha256_hex(&std::fs::read(c).unwrap())));
+            crate::ledger::approve_capability(&data, &root, path, &shas).unwrap();
+        };
+        // An unapproved tool, shadowing a global one of the same name.
+        write(root.join(".openmax/tools/t.toml"), "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n");
+        write(data.join("tools/t.toml"), "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n");
+        // An approved tool whose script changed afterwards.
+        let script = root.join("scripts/run.sh");
+        write(script.clone(), "#!/bin/sh\necho one\n");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let stale = root.join(".openmax/tools/stale.toml");
+        write(stale.clone(), "name = \"stale\"\ndescription = \"d\"\ncommand = \"./scripts/run.sh\"\n");
+        approve(&stale, &[&script]);
+        write(script.clone(), "#!/bin/sh\necho two\n");
+        // Hooks: an approved gate rewritten, one whose command is absent, one
+        // never approved, an approved one broken, and an approved one deleted.
+        let hook = |name: &str| root.join(".openmax/hooks").join(format!("{name}.toml"));
+        let gate = "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n";
+        for name in ["live", "broken", "deleted"] {
+            write(hook(name), gate);
+            approve(&hook(name), &[]);
+        }
+        write(hook("live"), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\nargs = [\"x\"]\n");
+        write(hook("broken"), "event = \"pre_tool_use\ncommand = broken");
+        std::fs::remove_file(hook("deleted")).unwrap();
+        write(hook("absent"), "event = \"pre_tool_use\"\ncommand = \"./missing.sh\"\n");
+        write(hook("inert"), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\nargs = [\"inert\"]\n");
+        // An unapproved allow rule.
+        write(root.join(".openmax/permissions.toml"), "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n");
+
+        let fired = [
+            "openmax --approve '.openmax/tools/t.toml'",
+            "shadowed by .openmax/tools/t.toml",
+            "the code it runs, scripts/run.sh is not the content that was approved",
+            "this gate was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve '.openmax/hooks/live.toml'`",
+            "create it, then approve the hook and the code it runs together with `openmax --approve '.openmax/hooks/absent.toml'`",
+            "a human must approve this exact content with `openmax --approve '.openmax/hooks/inert.toml'`",
+            "this file was live, so every tool call fails closed until the approved content is restored or a human re-approves it: `openmax --approve '.openmax/hooks/broken.toml'`",
+            "`openmax --forget '.openmax/hooks/deleted.toml'`",
+            "&& openmax --approve '.openmax/permissions.toml'`",
+        ];
+        let messages = |for_report| -> Vec<String> {
+            check_with(&root, &data, for_report).iter().map(|f| f.status.summary().to_string()).collect()
+        };
+        let (full, report) = (messages(false), messages(true));
+        let prefix = format!("{}/", root.display());
+        for text in fired {
+            assert!(report.iter().any(|m| m.contains(text)), "{text:?} not in {report:#?}");
+            let absolute = text.replace("'.", &format!("'{prefix}.")).replace(" .", &format!(" {prefix}."));
+            let absolute = absolute.replace("runs, scripts", &format!("runs, {prefix}scripts"));
+            assert!(full.iter().any(|m| m.contains(&absolute)), "the full face names {absolute:?}: {full:#?}");
+        }
+        assert!(report.iter().all(|m| !m.contains(&prefix)), "{report:#?}");
+        // The permissions notice drops its "<path>: " lead-in: the path column says it.
+        let notice = report.iter().find(|m| m.contains("are inert")).unwrap();
+        assert!(notice.starts_with("1 allow rule(s) are inert"), "{notice}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Ok rows of files with nothing to report fold into one count of files
+    /// per surface, in report order; a file with a warn or err row keeps its ok
+    /// row, and a hook's row always prints.
+    #[test]
+    fn the_default_report_counts_files_with_nothing_to_report() {
+        let finding = |kind: &'static str, path: &str, status: Status| Finding { kind, path: PathBuf::from(path), status };
+        let findings = [
+            finding("tool", "/p/a.toml", Status::Ok("tool 'a'".into())),
+            finding("tool", "/p/b.toml", Status::Ok("tool 'b'".into())),
+            finding("tool", "/p/c.toml", Status::Ok("tool 'c'".into())),
+            finding("tool", "/p/c.toml", Status::Warn("timeout clamped".into())),
+            finding("skill", "/p/s/SKILL.md", Status::Ok("skill 's'".into())),
+            finding("hook", "/p/h.toml", Status::Ok("hook on turn_end".into())),
+            finding("settings", "/h/settings.json", Status::Ok("model m".into())),
+            finding("memory", "/p/m/d.md", Status::Ok("memory 'd'".into())),
+            finding("memory", "/p/m/e.md", Status::Ok(format!("memory 'e' - {MEMORY_NOT_INDEXED} (unused)"))),
+        ];
+        let (rows, summary) = default_report(&findings);
+        let rows: Vec<(&str, &str)> = rows.iter().map(|f| (f.kind, f.status.summary())).collect();
+        assert_eq!(rows, [("tool", "tool 'c'"), ("tool", "timeout clamped"), ("hook", "hook on turn_end")]);
+        assert_eq!(
+            summary.as_deref(),
+            Some("ok: 2 tools, 1 skill, 1 settings file, 2 memories (1 not in the index) (openmax --check --all lists them)")
+        );
+        assert_eq!(default_report(&findings[2..4]).1, None);
     }
 }

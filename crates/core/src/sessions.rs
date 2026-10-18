@@ -21,17 +21,21 @@
 //! the user their work. The one thing that is not best-effort is ordering
 //! against deletion. Every writer re-checks under `sessions_lock` that the
 //! session is still indexed, so a session deleted mid-turn cannot be
-//! resurrected by an append that was already in flight.
+//! resurrected by an append that was already in flight. The answer comes from
+//! what this process knows (`StoreMemo`), not from reading the index on every
+//! write.
 //!
 //! The index itself is shared wider than one process: it is one file per data
 //! dir, and parallel openmax processes are normal usage. Its read-modify-write
 //! therefore also holds an exclusive flock (`index.lock`), and a damaged index
 //! is refused rather than defaulted to empty - either failure mode would end
-//! with sessions silently dropped from the index, which the still-indexed gate
-//! then converts into silently dropping their transcripts.
+//! with sessions silently dropped from the index. No lookup finds such a
+//! session again, and the still-indexed gate silently drops the transcript
+//! writes of any claim that did not see it indexed.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -54,10 +58,22 @@ pub struct SessionMeta {
     pub resume_points: Vec<u64>,
 }
 
-/// The lock file is never removed: unlinking it would let a second inode
-/// acquire the same session name while the first owner still holds its lock.
+/// The lock file lives as long as its session: removing the session unlinks
+/// it, while still holding it, under the store lock. Every claim opens and
+/// locks the file under that same lock. A claim that could open the file
+/// before the unlink and lock it after the remover let go would own an inode
+/// no other claim can reach, while the next claim created and locked a fresh
+/// file under the same name: two owners of one session.
+///
+/// An older release takes the same flock(2) (see `lock_index`) but claims
+/// without the store lock and never unlinks. The unlink comes only after the
+/// session has left the index, under the index lock, so for as long as a
+/// session is indexed every binary locks the one file its name holds. An
+/// older binary that races a removal can still lock the unlinked file, but
+/// the session it then owns is no longer indexed, and every release drops
+/// writes to such a session.
 pub(crate) struct SessionOwner {
-    _file: std::fs::File,
+    _file: FileLock,
     detach: bool,
 }
 
@@ -74,25 +90,102 @@ pub(crate) fn ensure_owned(core: &Core, id: &str) -> Result<(), String> {
 }
 
 fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Result<(), String> {
-    use fs2::FileExt;
     let mut owners = core.session_owners.lock().unwrap();
     if let Some(owner) = owners.get_mut(id) {
         if reactivate {
-            load_messages(core, id)?;
+            revalidate_if_changed(core, id)?;
             owner.detach = false;
         }
         return Ok(());
     }
-    let path = sessions_dir(core).join(format!("{id}.lock"));
+    // See `SessionOwner`: the open and the lock go under the store lock.
+    let (mut memo, _flock) = lock_store(core)?;
+    let path = lock_path(core, id);
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
         .open(&path).map_err(|e| format!("cannot open session lock {}: {e}", path.display()))?;
-    file.try_lock_exclusive().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            format!("session {id} is already open in another process; close it there or start a new session")
-        } else { format!("cannot lock session {id}: {e}") }
+    let file = FileLock::try_take(file).map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock =>
+            format!("session {id} is already open in another process; close it there or start a new session"),
+        std::fs::TryLockError::Error(e) => format!("cannot lock session {id}: {e}"),
     })?;
-    if validate { load_messages(core, id)?; }
+    if validate {
+        let seen = stamp(&messages_path(core, id));
+        load_messages_locked(core, id)?;
+        remember_transcript(&mut memo, id, seen);
+    }
+    // The one index read the session's writes cost while this claim lasts.
+    if matches!(read_index(core), IndexRead::Loaded(metas) if metas.iter().any(|m| m.id == id)) {
+        memo.listed.insert(id.to_string());
+    }
     owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
+    Ok(())
+}
+
+/// What this process knows about the session store, so that a steady-state
+/// write reads nothing back to learn it. The index lists every session of
+/// every project and is never pruned: a model request or a save that read it
+/// would cost more with every session ever recorded. Guarded by
+/// `Core::sessions_lock`, the lock every session write and removal holds, so
+/// a write never acts on an answer a removal has already changed.
+#[derive(Default)]
+pub(crate) struct StoreMemo {
+    /// Sessions this process holds and saw indexed when it claimed them. No
+    /// other process can remove one meanwhile, since every removal claims the
+    /// session first, so only this process's own removal or its release of
+    /// the claim can make an entry stale, and both take the entry out first.
+    listed: HashSet<String>,
+    /// Sessions this process removed. A write still in flight when its
+    /// session was removed (cancellation is cooperative) is dropped on this
+    /// record alone.
+    removed: HashSet<String>,
+    /// Each owned transcript as this process last validated or wrote it.
+    transcripts: HashMap<String, Stamp>,
+}
+
+/// A file as a stat sees it: its length, modification time, and status-change
+/// time. The modification time alone can be put back, as a copy or sync that
+/// preserves timestamps does, while the change time moves on every write and
+/// every timestamp change and no caller can set it. Only a write that keeps
+/// the length within one tick of the file system's clock goes unseen.
+type Stamp = (u64, SystemTime, (i64, i64));
+
+/// None when the file is missing or cannot be stat'ed, which matches no
+/// remembered stamp, so whatever is there gets read.
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let changed = (0, 0);
+    Some((meta.len(), meta.modified().ok()?, changed))
+}
+
+/// Record the transcript this process just validated or wrote, as stamped
+/// before it was read or after it was written.
+fn remember_transcript(memo: &mut StoreMemo, id: &str, seen: Option<Stamp>) {
+    match seen {
+        Some(seen) => memo.transcripts.insert(id.to_string(), seen),
+        None => memo.transcripts.remove(id),
+    };
+}
+
+/// Validate an owned transcript again only when it changed since this
+/// process last validated or wrote it. Every turn start claims its session
+/// again, and reparsing the whole history there made each turn cost more
+/// than the one before. Between turns an owned transcript changes only when
+/// something outside openmax writes it, which moves its stamp, so damage
+/// written then is still refused before the turn runs.
+fn revalidate_if_changed(core: &Core, id: &str) -> Result<(), String> {
+    let (mut memo, _flock) = lock_store(core)?;
+    let seen = stamp(&messages_path(core, id));
+    if seen.is_some() && memo.transcripts.get(id) == seen.as_ref() {
+        return Ok(());
+    }
+    load_messages_locked(core, id)?;
+    remember_transcript(&mut memo, id, seen);
     Ok(())
 }
 
@@ -106,18 +199,29 @@ pub fn detach(core: &Core, id: &str) -> Result<(), String> {
         if let Some(owner) = owners.get_mut(id) { owner.detach = true; }
     } else {
         state.remove(id);
-        owners.remove(id);
+        release(core, &mut owners, id);
     }
     Ok(())
 }
 
 /// Called under both the session map and running locks, after turn cleanup.
-pub(crate) fn finish_detach(core: &Core, id: &str, state: &mut std::collections::HashMap<String, crate::state::SessionData>) {
+pub(crate) fn finish_detach(core: &Core, id: &str, state: &mut HashMap<String, crate::state::SessionData>) {
     let mut owners = core.session_owners.lock().unwrap();
     if owners.get(id).is_some_and(|owner| owner.detach) {
         state.remove(id);
-        owners.remove(id);
+        release(core, &mut owners, id);
     }
+}
+
+/// Let go of a claim. What it let this process know goes first: once the
+/// flock is released another process can claim and remove the session, and
+/// from then on only the index can say whether it still exists.
+fn release(core: &Core, owners: &mut HashMap<String, SessionOwner>, id: &str) {
+    let mut memo = core.sessions_lock.lock().unwrap();
+    memo.listed.remove(id);
+    memo.transcripts.remove(id);
+    drop(memo);
+    owners.remove(id);
 }
 
 pub const UNTITLED: &str = "New session";
@@ -134,6 +238,10 @@ fn sessions_dir(core: &Core) -> PathBuf {
     let dir = core.data_dir.join("sessions");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+fn lock_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.lock"))
 }
 
 fn messages_path(core: &Core, id: &str) -> PathBuf {
@@ -167,8 +275,8 @@ pub fn unix_now() -> u64 {
 /// Append a compaction event. Best-effort: failures surface as an agent warning.
 #[cfg(test)]
 pub fn append_compaction(core: &Core, id: &str, record: &CompactionRecord) {
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return;
     }
     let path = compaction_path(core, id);
@@ -221,8 +329,8 @@ pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return;
     }
     let Ok(line) = serde_json::to_string(record) else { return };
@@ -313,8 +421,8 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     if messages.is_empty() {
         return true;
     }
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return true;
     }
     let mut lines = String::new();
@@ -368,8 +476,8 @@ pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::Registry
     // The last of the five session files to take the rule. A refreeze can be
     // in flight when the session is deleted, and cancellation is cooperative,
     // so without this the manifest outlives everything it described.
-    let _guard = core.sessions_lock.lock().unwrap();
-    if !still_indexed_locked(core, id) {
+    let memo = core.sessions_lock.lock().unwrap();
+    if !still_indexed_locked(&memo, core, id) {
         return;
     }
     if let Err(e) = write_atomic(&manifest_path(core, id), json) {
@@ -395,10 +503,35 @@ pub fn load_manifest(core: &Core, id: &str) -> Option<crate::registry::RegistryM
 /// the agent loop, and exactly wrong for a tool whose answer is trusted
 /// when it says nothing was found.
 pub fn index_diagnostic(core: &Core) -> Option<String> {
-    let _store = match lock_store(core) { Ok(store) => store, Err(reason) => return Some(reason) };
+    load_index_checked(core).err()
+}
+
+/// A frontend's refusal to start, continue, list, discard, or delete a
+/// session, pointing at `--check` when the refusal is the index's damage.
+/// Only frontends add the pointer, never the shared reason: `--check` gives
+/// the repair with the step that makes it safe (close every openmax), while
+/// a bare path acted on under a running session leaves that session listed
+/// nowhere: its later saves land in history no lookup finds, or are dropped
+/// without a word. Any other refusal (a lock or write failure) passes
+/// through as is.
+pub fn refusal_with_repair(core: &Core, reason: String) -> String {
     match read_index(core) {
-        IndexRead::Damaged(reason) => Some(reason),
-        _ => None,
+        IndexRead::Damaged(damage) if damage == reason => {
+            format!("{reason}; run openmax --check for the repair")
+        }
+        _ => reason,
+    }
+}
+
+/// The index under `data_dir` and the reason, when it exists but cannot be
+/// read. For `--check`, which validates without a Core, so this takes no
+/// lock and creates no directory; the index is only ever replaced by an
+/// atomic rename, so an unlocked read sees one whole version or the other.
+pub(crate) fn index_damage(data_dir: &Path) -> Option<(PathBuf, String)> {
+    let path = data_dir.join("sessions").join("index.json");
+    match read_index_at(&path) {
+        IndexRead::Damaged(reason) => Some((path, reason)),
+        IndexRead::Missing | IndexRead::Loaded(_) => None,
     }
 }
 
@@ -413,8 +546,19 @@ enum IndexRead {
 }
 
 fn read_index(core: &Core) -> IndexRead {
-    let path = index_path(core);
-    let text = match std::fs::read_to_string(&path) {
+    read_index_at(&index_path(core))
+}
+
+/// The reason names the file and the problem, never a repair. It also
+/// reaches live sessions (the save warning of one claimed over the damage,
+/// the compaction refusal, recall), and moving the index aside under one
+/// leaves its session listed nowhere. A session claimed while the index was
+/// healthy keeps saving history that `--continue`, `/resume`, and `--recall`
+/// never find; one claimed over the damage, or claimed again later, has
+/// every later save dropped without a word. The repair is `--check`'s to
+/// give (see `doctor::check_at`).
+fn read_index_at(path: &Path) -> IndexRead {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexRead::Missing,
         Err(e) => {
@@ -424,6 +568,8 @@ fn read_index(core: &Core) -> IndexRead {
             ))
         }
     };
+    #[cfg(test)]
+    INDEX_BYTES_READ.with(|read| read.set(read.get() + text.len()));
     match serde_json::from_str(&text) {
         Ok(metas) => IndexRead::Loaded(metas),
         Err(e) => IndexRead::Damaged(format!(
@@ -434,32 +580,56 @@ fn read_index(core: &Core) -> IndexRead {
 }
 
 fn load_index(core: &Core) -> Vec<SessionMeta> {
-    let Ok(_store) = lock_store(core) else { return Vec::new(); };
+    load_index_checked(core).unwrap_or_default()
+}
+
+/// The index for a caller that reports what it finds to the user. A damaged
+/// index is an error naming the file, never an empty list: "no previous
+/// session" over a damaged index sends the user off to start fresh with
+/// nothing saying where their history went.
+fn load_index_checked(core: &Core) -> Result<Vec<SessionMeta>, String> {
+    let _store = lock_store(core)?;
     match read_index(core) {
-        IndexRead::Loaded(metas) => metas,
-        IndexRead::Missing | IndexRead::Damaged(_) => Vec::new(),
+        IndexRead::Loaded(metas) => Ok(metas),
+        IndexRead::Missing => Ok(Vec::new()),
+        IndexRead::Damaged(reason) => Err(reason),
     }
 }
 
 /// Whether the session still exists, i.e. whether writing a sidecar for it is
-/// still meaningful.
+/// still meaningful: Ok(false) once it is gone, Err when only a damaged index
+/// could say.
 ///
 /// Every sidecar here is opened with `create`, so a write that lands after
 /// `delete` recreates the file it just removed. Cancellation narrows that
 /// window but cannot close it: a request already on the wire settles when it
-/// settles, and its usage record arrives afterwards. Checking the index makes
-/// the write a no-op instead, which is what "deleted" has to mean if it is to
+/// settles, and its usage record arrives afterwards. Answering no makes the
+/// write a no-op instead, which is what "deleted" has to mean if it is to
 /// mean anything.
 ///
-/// One small read per append. Compaction and archive appends happen at prune
-/// time, and a usage append happens once per request, next to a network round
-/// trip that costs several orders of magnitude more.
-/// Callers must already hold `sessions_lock`: an unlocked check is a
-/// time-of-check/time-of-use bug, because `delete` can remove the entry and
-/// the file between the check passing and the write landing, which recreates
-/// exactly the file that was deleted.
-fn still_indexed_locked(core: &Core, id: &str) -> bool {
-    matches!(read_index(core), IndexRead::Loaded(metas) if metas.iter().any(|m| m.id == id))
+/// `memo` answers for every session this process holds or removed, so a
+/// steady-state write reads nothing. The index answers only for the rest,
+/// such as a session claimed while the index was damaged or did not list it.
+/// Callers must already hold `sessions_lock` and pass what it guards: an
+/// unlocked check is a time-of-check/time-of-use bug, because `delete` can
+/// remove the entry and the file between the check passing and the write
+/// landing, which recreates exactly the file that was deleted.
+fn indexed_locked(memo: &StoreMemo, core: &Core, id: &str) -> Result<bool, String> {
+    if memo.removed.contains(id) {
+        return Ok(false);
+    }
+    if memo.listed.contains(id) {
+        return Ok(true);
+    }
+    match read_index(core) {
+        IndexRead::Loaded(metas) => Ok(metas.iter().any(|m| m.id == id)),
+        IndexRead::Missing => Ok(false),
+        IndexRead::Damaged(reason) => Err(reason),
+    }
+}
+
+fn still_indexed_locked(memo: &StoreMemo, core: &Core, id: &str) -> bool {
+    matches!(indexed_locked(memo, core, id), Ok(true))
 }
 
 fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
@@ -471,16 +641,19 @@ fn save_index(core: &Core, metas: &[SessionMeta]) -> Result<(), String> {
 /// covers turns within one process; the index is one file per data dir, and
 /// two openmax processes are normal usage. Without this, their load -> save
 /// cycles interleave, the loser's `create` entry vanishes from the index, and
-/// the still-indexed gate then silently drops every write that session makes
-/// for the rest of its life - transcript included. Same flock discipline as
-/// the ledger and trust stores.
+/// with it the session: no lookup finds it again, and the still-indexed gate
+/// silently drops the writes, transcript included, of any claim that did not
+/// see it indexed. Same flock discipline as the ledger and trust stores.
+/// std's `File::lock` and `try_lock` are flock(2) on Linux and macOS, the
+/// lock every released binary takes; where std has no file lock (Android,
+/// DragonFly) they return Unsupported, so every store refuses to write rather
+/// than write unlocked.
 ///
 /// Callers must already hold `sessions_lock`: flock is per open file
 /// description, so that is what keeps one process from contending with
 /// itself (see the ledger's `with_lock` note). The lock releases when the
 /// returned handle drops.
-fn lock_index(core: &Core) -> Result<std::fs::File, String> {
-    use fs2::FileExt;
+fn lock_index(core: &Core) -> Result<FileLock, String> {
     let dir = sessions_dir(core);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("index.lock");
@@ -490,16 +663,65 @@ fn lock_index(core: &Core) -> Result<std::fs::File, String> {
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    file.lock_exclusive()
-        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
-    Ok(file)
+    FileLock::wait(file)
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))
+}
+
+/// An exclusive lock held on an open lock file, released by an explicit
+/// unlock when dropped, before the file closes. flock(2) belongs to the open
+/// file description, not to one descriptor, and a child being spawned holds
+/// a copy of every descriptor this process has open until it execs (bash,
+/// tools, and hooks all spawn that way, see `configure_process_group`).
+/// Closing only this copy would keep the lock held until that child exec'd:
+/// a session released and reopened in the window is refused as open in
+/// another process, and other processes waiting on the lock stall. The
+/// unlock releases it whatever copies remain. The lock taken is unchanged,
+/// so older binaries still exclude this one and are excluded by it.
+pub(crate) struct FileLock(std::fs::File);
+
+impl FileLock {
+    /// Wait until the lock is free, then take it.
+    pub(crate) fn wait(file: std::fs::File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    /// Take the lock, or fail at once while another holder has it.
+    pub(crate) fn try_take(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Should the unlock fail, closing the file still releases the lock
+        // once no spawning child holds a copy.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Take a lock file the way every released binary does: an exclusive flock(2)
+/// on its own open file description, without blocking. `None` while another
+/// holder has it. Tests use it to stand in for an older binary sharing the
+/// data dir, because std's `File::lock` must keep excluding that binary. It
+/// is released like the harness's own locks, so a child another test is
+/// spawning cannot hold it past the drop.
+#[cfg(all(test, unix))]
+pub(crate) fn raw_flock(path: &std::path::Path) -> Option<FileLock> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+        .open(path).unwrap();
+    let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    held.then_some(FileLock(file))
 }
 
 /// Read-modify-write the index under the state lock (concurrent turns in
 /// this process) and the index flock (concurrent processes). A damaged index
 /// is refused, not defaulted: saving the empty fallback over it would erase
-/// every session's metadata and turn the still-indexed gate off for all of
-/// them, converting one bad read into permanent, silent data loss.
+/// every session's metadata, hiding all of them from every lookup and closing
+/// the still-indexed gate to every later claim of one, converting one bad
+/// read into permanent, silent data loss.
 fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Result<R, String> {
     let _store = lock_store(core)?;
     let mut metas = match read_index(core) {
@@ -512,17 +734,24 @@ fn with_index<R>(core: &Core, f: impl FnOnce(&mut Vec<SessionMeta>) -> R) -> Res
     Ok(result)
 }
 
-fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, ()>, std::fs::File), String> {
+fn lock_store(core: &Core) -> Result<(std::sync::MutexGuard<'_, StoreMemo>, FileLock), String> {
     let guard = core.sessions_lock.lock().unwrap();
     let flock = lock_index(core)?;
     Ok((guard, flock))
 }
 
-fn shifted_resume_points(points: &[u64], before: usize, after: usize) -> Vec<u64> {
+/// Move replay boundaries with a prune that kept the first `head` messages
+/// and wrote its digest note at index `head`. Boundaries inside the pinned
+/// head are untouched, since nothing before them changed. A shrink collapses
+/// the rest onto `head + 1`, after the note, never on it, or the divider
+/// would render above the context note instead of below it; a note insert
+/// moves them up by what it added.
+fn shifted_resume_points(points: &[u64], before: usize, after: usize, head: usize) -> Vec<u64> {
+    let head = head as u64;
     let mut shifted: Vec<u64> = points.iter().map(|&p| {
-        if after < before && p >= 2 {
-            p.saturating_sub((before - after) as u64).max(3)
-        } else if after > before && p >= 2 {
+        if after < before && p >= head {
+            p.saturating_sub((before - after) as u64).max(head + 1)
+        } else if after > before && p >= head {
             p.saturating_add((after - before) as u64)
         } else { p }
     }).collect();
@@ -535,6 +764,14 @@ fn shifted_resume_points(points: &[u64], before: usize, after: usize) -> Vec<u64
 thread_local! {
     static FAIL_COMPACTION_INDEX_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_COMPACTION_TRANSCRIPT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Every path this thread synced to the device, in order.
+    static SYNCED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The OS error every directory sync on this thread fails with, if any.
+    static FAIL_DIR_SYNC: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// Bytes this thread read from session indexes.
+    static INDEX_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Transcripts this thread read whole to load or validate them.
+    static TRANSCRIPT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Commit archive, digest record, replay boundaries, and transcript under one
@@ -548,7 +785,12 @@ thread_local! {
 /// an archive line and a digest record for a prune that then did not happen,
 /// duplicates of what the transcript still holds, which the readers tolerate
 /// (`--recall` deduplicates, `last_compaction` takes the newest), and a torn
-/// line the next append steps over (`append_text`).
+/// line the next append cuts (`append_text`). Both appends are synced, with
+/// the directory that names their files, before the rewrite, so they reach
+/// the disk ahead of it: otherwise a power cut could keep the rewrite and
+/// lose the archive lines it relies on, or the archive itself when this
+/// compaction created it. `head` is how many leading messages the prune
+/// kept, which is also where its digest note sits.
 pub(crate) fn commit_compaction(
     core: &Core,
     id: &str,
@@ -556,9 +798,10 @@ pub(crate) fn commit_compaction(
     archive: &[ChatMessage],
     record: Option<&CompactionRecord>,
     before_len: usize,
+    head: usize,
 ) -> Result<(), String> {
     ensure_owned(core, id)?;
-    let _store = lock_store(core)?;
+    let (mut memo, _flock) = lock_store(core)?;
     let mut metas = match read_index(core) {
         IndexRead::Loaded(metas) => metas,
         _ => return Err("compaction requires a readable session index".into()),
@@ -566,15 +809,15 @@ pub(crate) fn commit_compaction(
     let pos = metas.iter().position(|m| m.id == id).ok_or("compaction session was deleted")?;
     load_messages_locked(core, id)?;
     if !archive.is_empty() {
-        append_jsonl(&archive_path(core, id), archive)?;
+        append_jsonl(&archive_path(core, id), archive, true)?;
     }
     if let Some(record) = record {
         let mut line = serde_json::to_string(record).map_err(|e| e.to_string())?;
         line.push('\n');
-        append_text(&compaction_path(core, id), &line)?;
+        append_text(&compaction_path(core, id), &line, true)?;
     }
     let before = metas[pos].resume_points.clone();
-    metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len());
+    metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len(), head);
     #[cfg(test)]
     if FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.replace(false)) {
         return Err("injected compaction index failure".into());
@@ -598,12 +841,17 @@ pub(crate) fn commit_compaction(
             Err(restore) => format!("{error}; the replay boundaries could not be restored either: {restore}"),
         });
     }
+    remember_transcript(&mut memo, id, stamp(&messages_path(core, id)));
     Ok(())
 }
 
 /// Write `bytes` via a unique same-directory temp file + rename so readers
 /// never see a partial target. Unique names avoid two processes clobbering
-/// the same `*.tmp`.
+/// the same `*.tmp`. The temp file is synced (`sync`) before the rename: a
+/// rename can reach the disk before the bytes it points at, and a power cut
+/// between the two leaves an empty or partial file under the final name with
+/// the old contents already gone. Synced, the bytes land first, so a power
+/// cut leaves the old file or the new one, never a mix.
 pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     let parent = path
         .parent()
@@ -616,7 +864,11 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         .to_string_lossy();
     let id = uuid::Uuid::new_v4().simple();
     let tmp = parent.join(format!("{base}.{id}.tmp"));
-    if let Err(e) = std::fs::write(&tmp, bytes.as_ref()) {
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(bytes.as_ref())?;
+        sync(&file, &tmp)
+    });
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.to_string());
     }
@@ -626,12 +878,90 @@ pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<()
         return Err(format!("{} is a directory", path.display()));
     }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // The rename lives in the directory, so syncing the directory
+            // puts it on the disk ahead of whatever is written next. Best
+            // effort, and after the fact: the file is already replaced, and
+            // an error here must not report a write that landed as one that
+            // did not.
+            let _ = sync_dir(&parent);
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e.to_string())
         }
     }
+}
+
+/// Put `file`'s writes on the device ahead of every write issued after this
+/// returns. Every barrier in this module goes through here, so a test can
+/// see which ones a write issued and in what order.
+///
+/// Ordering is all the callers need: no rename may land before the bytes it
+/// names, and no transcript rewrite before the archive it relies on. On
+/// Apple targets the standard library's sync is a full drive cache flush,
+/// which would make every atomic write, and so every turn, wait on the drive;
+/// a barrier sync gives the ordering without that wait. A file system that
+/// does not take one gets a plain sync instead.
+fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    sync_device(file, path).map_err(|e| cannot_sync(e, path))
+}
+
+/// `sync` with the OS error as it came, so `sync_dir` can read its code.
+fn sync_device(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
+    #[cfg(not(test))]
+    let _ = path;
+    #[cfg(target_vendor = "apple")]
+    let result = {
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        // SAFETY: `fd` stays open while `file` is borrowed, and neither call
+        // takes a pointer.
+        let synced = unsafe { libc::fcntl(fd, libc::F_BARRIERFSYNC) != -1 || libc::fsync(fd) != -1 };
+        if synced { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    };
+    #[cfg(not(target_vendor = "apple"))]
+    let result = file.sync_all();
+    result
+}
+
+fn cannot_sync(e: std::io::Error, path: &Path) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("cannot sync {}: {e}", path.display()))
+}
+
+/// `sync` a directory, which holds the names of its files: a new name or a
+/// rename reaches the disk through it, not through the file's own sync. Unix
+/// only, since elsewhere a directory cannot be opened as a file to sync. A
+/// file system that cannot sync a directory at all (`dir_sync_unsupported`)
+/// counts as synced: there the sync never succeeds, so failing on it would
+/// fail every ordered append, and so every compaction, for good.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    if !cfg!(unix) {
+        return Ok(());
+    }
+    let file = std::fs::File::open(dir).map_err(|e| cannot_sync(e, dir))?;
+    let synced = sync_device(&file, dir);
+    #[cfg(test)]
+    let synced = FAIL_DIR_SYNC.with(|fail| fail.get()).map_or(synced, |code| Err(std::io::Error::from_raw_os_error(code)));
+    match synced {
+        Err(e) if !dir_sync_unsupported(&e) => Err(cannot_sync(e, dir)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a directory sync failed only because the file system does not
+/// sync directories: some reject it with EINVAL or EBADF (no sync operation
+/// for a directory), others with ENOTSUP. Any other error, such as EIO, is a
+/// real failure to write.
+fn dir_sync_unsupported(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let unsupported = [libc::EINVAL, libc::EBADF, libc::ENOTSUP, libc::EOPNOTSUPP];
+    #[cfg(not(unix))]
+    let unsupported: [i32; 0] = [];
+    e.raw_os_error().is_some_and(|code| unsupported.contains(&code))
 }
 
 fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
@@ -643,7 +973,7 @@ fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
     write_atomic(path, out)
 }
 
-fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+fn append_jsonl(path: &PathBuf, messages: &[ChatMessage], ordered: bool) -> Result<(), String> {
     // Serialize the whole tail first, then one write. Callers must heal on
     // failure (rewrite the full file) so a partial write cannot be re-appended
     // and duplicate complete lines when `persisted` is left unchanged.
@@ -652,17 +982,33 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> 
         buf.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
         buf.push('\n');
     }
-    append_text(path, &buf)
+    append_text(path, &buf, ordered)
 }
 
-/// Append whole lines to a JSONL file, starting on a fresh line. A complete
-/// record need not end in a newline (a crash or a full disk can cut the
-/// terminator), and appending straight after it would glue the next record
-/// onto that line: every reader skips a line that does not parse, so a
-/// record that was just written, and just dropped from the transcript, would
-/// be lost with the fragment. One newline first keeps the loss to the
-/// fragment, which was never a complete record.
-fn append_text(path: &PathBuf, text: &str) -> Result<(), String> {
+/// Append whole lines to a JSONL file, starting on a fresh line after its
+/// last complete record. A crash or a full disk can leave the file ending
+/// without a newline in two ways. A complete record that lost only its
+/// newline gets one, or the next record would be glued onto it and both
+/// would be unreadable. A torn record (`is_torn`) is cut: no reader can use
+/// it, and left in place it would sit mid-file after this append, where the
+/// transcript loader refuses the whole session. No record moves either way,
+/// and a final line that is neither (damage) is kept and gets a newline like
+/// a complete record, so the loader still refuses it with its bytes intact.
+/// A write that fails part way is cut back off too, since the caller will
+/// append the same records again.
+///
+/// `ordered` syncs the bytes and then the directory (`sync`), so they and the
+/// file's name, which the file's own sync does not cover when this append
+/// created it, reach the disk ahead of any later write. A failed sync fails
+/// the append, before anything that relies on it is written, except a
+/// directory sync the file system does not support (`sync_dir`). A compaction
+/// needs that for what it archives, because the transcript rewrite after it
+/// deletes the same messages. A transcript append does not: a power cut
+/// that loses its tail costs the newest messages, not the session, since the
+/// first save wrote the file whole (`save_messages`) and what remains ends
+/// in a complete record or a torn one the loader drops, and a sync per save
+/// would cost every model request one.
+fn append_text(path: &PathBuf, text: &str, ordered: bool) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -670,39 +1016,109 @@ fn append_text(path: &PathBuf, text: &str) -> Result<(), String> {
         .read(true)
         .open(path)
         .map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let start = final_line_start(&mut file, len).map_err(|e| e.to_string())?;
+    let mut keep = len;
     let mut buf = String::with_capacity(text.len() + 1);
-    if file.metadata().map_err(|e| e.to_string())?.len() > 0 {
-        file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
-        let mut last = [0u8];
-        file.read_exact(&mut last).map_err(|e| e.to_string())?;
-        if last[0] != b'\n' {
+    if start < len {
+        let mut line = Vec::new();
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.read_to_end(&mut line))
+            .map_err(|e| e.to_string())?;
+        if is_torn(&line) {
+            file.set_len(start).map_err(|e| e.to_string())?;
+            keep = start;
+        } else {
             buf.push('\n');
         }
     }
     buf.push_str(text);
-    file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
+    if let Err(e) = file.write_all(buf.as_bytes()) {
+        let _ = file.set_len(keep);
+        return Err(e.to_string());
+    }
     file.flush().map_err(|e| e.to_string())?;
+    if ordered {
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        sync(&file, path).and_then(|()| sync_dir(dir)).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
-/// Sessions for one project, most recently updated first.
-pub fn list(core: &Core, project: &str) -> Vec<SessionMeta> {
-    let mut metas: Vec<(usize, SessionMeta)> = load_index(core)
+/// Where the final line of a file `len` bytes long starts: `len` itself when
+/// the file is empty or ends in a newline. Reads backwards a block at a time,
+/// so an append never reads the history it extends.
+fn final_line_start(file: &mut std::fs::File, len: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut block = [0u8; 4096];
+    let mut end = len;
+    while end > 0 {
+        let begin = end.saturating_sub(block.len() as u64);
+        let part = &mut block[..(end - begin) as usize];
+        file.seek(SeekFrom::Start(begin))?;
+        file.read_exact(part)?;
+        if let Some(i) = part.iter().rposition(|&b| b == b'\n') {
+            return Ok(begin + i as u64 + 1);
+        }
+        end = begin;
+    }
+    Ok(0)
+}
+
+/// Whether an unterminated final line reads as a record a crash or a full
+/// disk cut off mid-write: its JSON runs out before it closes. A tear keeps
+/// the start of a record and nothing else, so parsing it fails only at the
+/// end of input (a cut inside a multi-byte character included), never at a
+/// wrong byte. A power cut can also leave the end of an append reading as
+/// zeros, which no record contains (the serializer escapes control
+/// characters), so trailing zeros are set aside first. Any other final line
+/// is kept: one that only lost its newline is a record, and one that fails
+/// before its end (a closed record that does not parse) is damage the loader
+/// refuses with the bytes preserved.
+fn is_torn(line: &[u8]) -> bool {
+    let end = line.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    serde_json::from_slice::<serde_json::Value>(&line[..end]).is_err_and(|e| e.is_eof())
+}
+
+/// How many leading bytes of a JSONL file hold its records: all of them,
+/// unless the final line is unterminated and torn.
+fn records_end(bytes: &[u8]) -> usize {
+    let start = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    if start < bytes.len() && is_torn(&bytes[start..]) { start } else { bytes.len() }
+}
+
+/// Sessions for one project, most recently updated first. Err names a
+/// damaged index rather than listing nothing.
+///
+/// A session belongs to `project` when its stored path is the requested one
+/// as spelled or as resolved (`state::canonical_root`). Frontends store the
+/// working directory as the OS reports it, already resolved, which is the
+/// form trust keys a project by, so a lookup spelled through a symlink
+/// (`/tmp` for `/private/tmp`) still finds them. A stored path is never
+/// resolved again: it names the directory the session was recorded in, and
+/// once a symlink takes that path's place (the directory moved), the path
+/// leads to another project, and resolving it would hand that project this
+/// one's history through `--continue`, `/resume`, and `--recall`. A relative
+/// stored path (the "." a frontend stores when it cannot read its working
+/// directory) therefore matches only its own spelling, never every project.
+pub fn list(core: &Core, project: &str) -> Result<Vec<SessionMeta>, String> {
+    let wanted = crate::state::canonical_root(Path::new(project));
+    let mut metas: Vec<(usize, SessionMeta)> = load_index_checked(core)?
         .into_iter()
         .enumerate()
-        .filter(|(_, m)| m.project == project)
+        .filter(|(_, m)| m.project == project || Path::new(&m.project) == wanted.as_path())
         .collect();
     // updated_at is whole seconds and the index is append-ordered, so two
     // sessions touched in the same second tie on the timestamp alone; the
     // later index entry is the newer one and must sort first, or latest()
     // hands --continue an older same-second sibling.
     metas.sort_by_key(|(i, m)| std::cmp::Reverse((m.updated_at, *i)));
-    metas.into_iter().map(|(_, m)| m).collect()
+    Ok(metas.into_iter().map(|(_, m)| m).collect())
 }
 
 /// Most recent session for a project, if any (used by --continue).
-pub fn latest(core: &Core, project: &str) -> Option<SessionMeta> {
-    list(core, project).into_iter().next()
+pub fn latest(core: &Core, project: &str) -> Result<Option<SessionMeta>, String> {
+    Ok(list(core, project)?.into_iter().next())
 }
 
 pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
@@ -726,16 +1142,61 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 
 /// One message was inserted at index `at`, so the transcript grows by exactly
 /// that message and every boundary at or after it moves up one. The mirror
-/// of the boundary shift for a prune, which handles shrinkage. A
-/// truncation-only prune inserts its note at 2; hydration of a transcript
-/// saved without its system prompt inserts that prompt at 0.
+/// of the boundary shift for a prune, which handles shrinkage. Hydration of
+/// a transcript saved without its system prompt inserts that prompt at 0.
 pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
     ensure_owned(core, id)?;
     with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            for p in &mut m.resume_points {
-                if *p >= at {
-                    *p = p.saturating_add(1);
+            shift_points_for_insert(&mut m.resume_points, at);
+        }
+    })
+}
+
+fn shift_points_for_insert(points: &mut [u64], at: u64) {
+    for p in points {
+        if *p >= at {
+            *p = p.saturating_add(1);
+        }
+    }
+}
+
+/// One message was removed from index `at`, so the transcript shrinks by
+/// exactly that message and every boundary after it moves down one: the
+/// mirror of [`shift_resume_points_for_insert`]. A boundary on the removed
+/// message stays put and now marks the message that followed it, so two
+/// boundaries can meet there and become one. Hydration removes a tool reply
+/// that was saved after prompts instead of after its call.
+fn shift_points_for_remove(points: &mut Vec<u64>, at: u64) {
+    for p in points.iter_mut() {
+        if *p > at {
+            *p -= 1;
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+}
+
+/// One message inserted into or removed from a transcript, at an index
+/// counted after the edits before it: what a replay boundary has to follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeEdit {
+    Insert(u64),
+    Remove(u64),
+}
+
+/// Move every replay boundary through `edits`, in the order they were made,
+/// in one index write: either every edit lands or none does, so a caller
+/// whose write failed keeps the edits and retries them whole, and no
+/// boundary moves twice.
+pub fn apply_resume_edits(core: &Core, id: &str, edits: &[ResumeEdit]) -> Result<(), String> {
+    ensure_owned(core, id)?;
+    with_index(core, |metas| {
+        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
+            for edit in edits {
+                match *edit {
+                    ResumeEdit::Insert(at) => shift_points_for_insert(&mut m.resume_points, at),
+                    ResumeEdit::Remove(at) => shift_points_for_remove(&mut m.resume_points, at),
                 }
             }
         }
@@ -763,40 +1224,7 @@ pub fn record_resume_point(core: &Core, id: &str, message_index: u64) {
 }
 
 pub fn delete(core: &Core, id: &str) -> Result<(), String> {
-    // Explicit deletion may remove damaged data, but never a foreign writer.
-    claim_session(core, id, false, false)?;
-    // Stop the session's work before removing its files. A frontend may
-    // delete the session it is currently running, and a turn that keeps going
-    // keeps writing: every sidecar here is opened with `create`, so an
-    // in-flight append recreates the file that was just deleted. Cancelling
-    // first is also the behaviour a user asking to delete a session expects.
-    //
-    // A request already on the wire can still land after this returns and
-    // append one record. That window is inherent to cooperative cancellation
-    // and predates the usage sidecar - the compaction and archive logs have
-    // always shared it - so it is narrowed here, not claimed closed.
-    core.cancel(id);
-    // The index entry and the files go under one lock. Dropping the entry
-    // first and the files second would let an append pass its check against
-    // the stale index and recreate what this call is removing.
-    let _store = lock_store(core)?;
-    let mut metas = match read_index(core) {
-        IndexRead::Loaded(metas) => metas,
-        IndexRead::Missing => Vec::new(),
-        // Deleting one session must not cost every other session its
-        // metadata; repair the index first.
-        IndexRead::Damaged(reason) => return Err(reason),
-    };
-    metas.retain(|m| m.id != id);
-    save_index(core, &metas)?;
-    let _ = std::fs::remove_file(messages_path(core, id));
-    let _ = std::fs::remove_file(manifest_path(core, id));
-    let _ = std::fs::remove_file(compaction_path(core, id));
-    let _ = std::fs::remove_file(archive_path(core, id));
-    let _ = std::fs::remove_file(usage_path(core, id));
-    drop(_store);
-    let _ = detach(core, id);
-    Ok(())
+    remove(core, id, false).map(|_| ())
 }
 
 /// Remove a session that no store backs: no transcript, archive, or
@@ -811,13 +1239,77 @@ pub fn delete(core: &Core, id: &str) -> Result<(), String> {
 /// report, because the entry it leaves behind is exactly the one this
 /// exists to prevent.
 pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
-    let backed = [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
-        .iter()
-        .any(|p| p.exists());
-    if backed {
+    // Settled without claiming: a session with history stays, whoever holds it.
+    if backed(core, id) {
         return Ok(false);
     }
-    delete(core, id).map(|()| true)
+    remove(core, id, true)
+}
+
+fn backed(core: &Core, id: &str) -> bool {
+    [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
+        .iter()
+        .any(|p| p.exists())
+}
+
+/// `delete`, or with `only_if_empty` the removal half of `discard_if_empty`.
+/// Ok(whether the session was removed).
+fn remove(core: &Core, id: &str, only_if_empty: bool) -> Result<bool, String> {
+    // Explicit deletion may remove damaged data, but never a foreign writer.
+    claim_session(core, id, false, false)?;
+    // Stop the session's work before removing its files. A frontend may
+    // delete the session it is currently running, and a turn that keeps going
+    // keeps writing: every sidecar here is opened with `create`, so an
+    // in-flight append recreates the file that was just deleted. Cancelling
+    // first is also the behaviour a user asking to delete a session expects.
+    //
+    // A request already on the wire can still land after this returns and
+    // append one record. That window is inherent to cooperative cancellation
+    // and predates the usage sidecar - the compaction and archive logs have
+    // always shared it - so it is narrowed here, not claimed closed.
+    //
+    // A discard has not decided yet, and a session it keeps must keep its turn.
+    if !only_if_empty {
+        core.cancel(id);
+    }
+    // The index entry and the files go under one lock. Dropping the entry
+    // first and the files second would let an append pass its check against
+    // the stale index and recreate what this call is removing.
+    let (mut memo, flock) = lock_store(core)?;
+    // A turn of this process can save between the caller's look and this
+    // lock. Every transcript write holds the lock, so the answer here is
+    // final: a session that gained history in that window stays.
+    if only_if_empty && backed(core, id) {
+        return Ok(false);
+    }
+    let mut metas = match read_index(core) {
+        IndexRead::Loaded(metas) => metas,
+        IndexRead::Missing => Vec::new(),
+        // Deleting one session must not cost every other session its
+        // metadata; repair the index first.
+        IndexRead::Damaged(reason) => return Err(reason),
+    };
+    metas.retain(|m| m.id != id);
+    save_index(core, &metas)?;
+    // Gone from the index, so gone for every write still in flight here,
+    // which learns it from this record rather than from the index.
+    memo.listed.remove(id);
+    memo.transcripts.remove(id);
+    memo.removed.insert(id.to_string());
+    let _ = std::fs::remove_file(messages_path(core, id));
+    let _ = std::fs::remove_file(manifest_path(core, id));
+    let _ = std::fs::remove_file(compaction_path(core, id));
+    let _ = std::fs::remove_file(archive_path(core, id));
+    let _ = std::fs::remove_file(usage_path(core, id));
+    // Still held by the claim above, and unlinked under the store lock every
+    // claim opens it under (see `SessionOwner`).
+    let _ = std::fs::remove_file(lock_path(core, id));
+    drop((memo, flock));
+    if only_if_empty {
+        core.cancel(id);
+    }
+    let _ = detach(core, id);
+    Ok(true)
 }
 
 /// Set the title from the first user message, once.
@@ -875,7 +1367,11 @@ pub(crate) fn touch_at(core: &Core, id: &str, ts: u64) {
 }
 
 /// Load the authoritative transcript. Only a missing file is a fresh session.
-/// A damaged or unreadable record must survive for explicit recovery.
+/// A damaged or unreadable record must survive for explicit recovery. A torn
+/// final record (`is_torn`) is not one: it is what a crash mid-append leaves,
+/// it never became a message, and refusing it would strand any session a
+/// crash interrupted mid-save. It is skipped here and cut by the next append,
+/// or replaced by the next rewrite.
 pub fn load_messages(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, String> {
     let _store = lock_store(core)?;
     load_messages_locked(core, id)
@@ -883,11 +1379,15 @@ pub fn load_messages(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, 
 
 fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>>, String> {
     let path = messages_path(core, id);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("transcript {} is unreadable: {e}; original file preserved", path.display())),
     };
+    #[cfg(test)]
+    TRANSCRIPT_READS.with(|reads| reads.set(reads.get() + 1));
+    let text = std::str::from_utf8(&bytes[..records_end(&bytes)])
+        .map_err(|e| format!("transcript {} is unreadable: {e}; original file preserved", path.display()))?;
     let mut parsed = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() { continue; }
@@ -898,10 +1398,16 @@ fn load_messages_locked(core: &Core, id: &str) -> Result<Option<Vec<ChatMessage>
         parsed.push(message);
     }
     if parsed.is_empty() {
-        return Err(format!("transcript {} is empty; original file preserved", path.display()));
+        return Err(format!("transcript {} holds no complete record; original file preserved", path.display()));
     }
     Ok(Some(parsed))
 }
+
+/// A `persisted` count past the end of any transcript, for a file known to
+/// differ from memory: [`save_messages`] rewrites whenever `persisted`
+/// exceeds what it is given, so the next save replaces the file whole
+/// instead of appending to it or refusing to.
+pub const PERSISTED_STALE: usize = usize::MAX;
 
 /// Persist messages. Appends only new tail lines when possible; rewrites the
 /// whole file after budget trimming or message drops.
@@ -922,7 +1428,7 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         return false;
     }
     let path = messages_path(core, id);
-    let _store = match lock_store(core) {
+    let (mut memo, _flock) = match lock_store(core) {
         Ok(store) => store,
         Err(reason) => {
             core.send_agent(id, AgentEvent::Error { message: format!("failed to persist session: {reason}") });
@@ -934,11 +1440,14 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
     // ends with an unconditional save. Without this the transcript of a
     // deleted session comes back, which is the one file that made the
     // deletion visible in the first place.
-    if !still_indexed_locked(core, id) {
-        // "Deleted" stays a silent no-op. A damaged index is a different
-        // state: the write is being dropped for a reason the user can fix,
-        // so say so instead of losing the transcript quietly.
-        if let IndexRead::Damaged(reason) = read_index(core) {
+    match indexed_locked(&memo, core, id) {
+        Ok(true) => {}
+        // "Deleted" stays a silent no-op.
+        Ok(false) => return true,
+        // A damaged index is a different state: the write is being dropped
+        // for a reason the user can fix, so say so instead of losing the
+        // transcript quietly.
+        Err(reason) => {
             core.send_agent(
                 id,
                 AgentEvent::Error {
@@ -947,7 +1456,6 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
             );
             return false;
         }
-        return true;
     }
     let needs_rewrite = rewrite || messages.len() < *persisted;
     // Validate before replacing existing bytes. A failed append below may
@@ -965,13 +1473,25 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
         }
     }
 
-    let result = if needs_rewrite {
+    // The first save creates the transcript (the check above refused an
+    // existing one), and is written whole too. An append there that a crash
+    // or a power cut interrupts leaves a fragment or an empty file, with no
+    // complete record to resume from, so the session could never be
+    // resumed; an interrupted rename leaves no transcript, a fresh session.
+    let whole = needs_rewrite || (*persisted == 0 && !messages.is_empty());
+    let wrote = whole || messages.len() > *persisted;
+    // Whether the file this save leaves holds only what this process
+    // validated or wrote, so the next turn start need not read it again
+    // (`revalidate_if_changed`): a whole write does, and an append does when
+    // nothing else wrote the file since this process last did.
+    let known = whole || stamp(&path).is_some_and(|seen| memo.transcripts.get(id) == Some(&seen));
+    let result = if whole {
         write_jsonl(&path, messages)
     } else if messages.len() > *persisted {
         // Append is best-effort for the common path. On any failure (including
         // partial write_all), rewrite the full transcript atomically so a
         // later append cannot duplicate complete lines that already landed.
-        match append_jsonl(&path, &messages[*persisted..]) {
+        match append_jsonl(&path, &messages[*persisted..], false) {
             Ok(()) => Ok(()),
             Err(append_err) => write_jsonl(&path, messages).map_err(|rewrite_err| {
                 format!("append failed ({append_err}); rewrite also failed: {rewrite_err}")
@@ -983,10 +1503,14 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
 
     match result {
         Ok(()) => {
+            if wrote {
+                remember_transcript(&mut memo, id, known.then(|| stamp(&path)).flatten());
+            }
             *persisted = messages.len();
             true
         }
         Err(e) => {
+            memo.transcripts.remove(id);
             core.send_agent(
                 id,
                 AgentEvent::Error {
@@ -1018,11 +1542,11 @@ mod tests {
         let record = CompactionRecord { ts: 1, message_count: 2, tools: vec![], paths: vec![], user_snippets: vec![], digest: "digest".into() };
         let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
         FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.set(true));
-        assert!(commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len()).is_err());
+        assert!(commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len(), 2).is_err());
         let bytes = std::fs::read_to_string(messages_path(&core, &id)).unwrap();
         assert!(bytes.contains("first") && !bytes.contains("digest"), "{bytes}");
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3]);
-        commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len()).unwrap();
+        commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len(), 2).unwrap();
         let archived: Vec<String> = load_archive(&core, &id).into_iter().filter_map(|m| m.content).collect();
         assert!(archived.ends_with(&["first".to_string(), "second".to_string()]), "the retry archives what it drops: {archived:?}");
         assert_eq!(last_compaction(&core, &id).unwrap().digest, "digest");
@@ -1046,10 +1570,10 @@ mod tests {
         record_resume_point(&core, &id, 6);
         let candidate = vec![original[0].clone(), original[1].clone(), ChatMessage::user("digest"), original[7].clone()];
         FAIL_COMPACTION_TRANSCRIPT_WRITE.with(|fail| fail.set(true));
-        assert!(commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len()).is_err());
+        assert!(commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len(), 2).is_err());
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![6], "boundaries restored");
         assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
-        commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len()).unwrap();
+        commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len(), 2).unwrap();
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3], "boundaries shift with the prune that landed");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1069,7 +1593,7 @@ mod tests {
         std::fs::OpenOptions::new().append(true).open(archive_path(&core, &id)).unwrap()
             .write_all(b"{\"role\":\"user\",\"content\":\"torn").unwrap();
         let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
-        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len()).unwrap();
+        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len(), 2).unwrap();
         let archived: Vec<String> = load_archive(&core, &id).into_iter().filter_map(|m| m.content).collect();
         assert_eq!(archived, ["prior", "first", "second"], "every dropped message reads back");
         let _ = std::fs::remove_dir_all(dir);
@@ -1089,17 +1613,25 @@ mod tests {
         // and the pinned-prefix boundary is untouched.
         with_index(&core, |metas| {
             let m = metas.iter_mut().find(|m| m.id.as_str() == id.as_str()).unwrap();
-            m.resume_points = shifted_resume_points(&m.resume_points, 6, 3);
+            m.resume_points = shifted_resume_points(&m.resume_points, 6, 3, 2);
         }).unwrap();
         // The prune that fires this shift also inserted its digest note at
-        // index 2; collapsed boundaries land after it, never on it.
+        // the head, index 2 behind `[system, request]`; collapsed boundaries
+        // land after it, never on it.
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![3, 7]);
+
+        // Behind `[system, note, request]` the head is 3 and the note lands
+        // there: a boundary inside the head stays, a collapsed one lands
+        // after the note, and a note insert leaves the head alone too.
+        assert_eq!(shifted_resume_points(&[2, 4, 10], 9, 6, 3), vec![2, 4, 7]);
+        assert_eq!(shifted_resume_points(&[2, 3, 10], 9, 10, 3), vec![2, 4, 11]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A prune that only truncated removes nothing and inserts its note at
-    /// index 2, so the transcript grows by one and every boundary from the
-    /// note onward must follow or replay dividers drift the other way.
+    /// the pinned head, so the transcript grows by one and every boundary
+    /// from the note onward must follow or replay dividers drift the other
+    /// way.
     #[test]
     fn a_note_insert_moves_replay_boundaries_up_one() {
         let dir =
@@ -1136,9 +1668,9 @@ mod tests {
             }
         })
         .unwrap();
-        let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
+        let listed: Vec<String> = list(&core, "/tmp/tie").unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(listed, vec![c.clone(), b.clone(), a.clone()]);
-        assert_eq!(latest(&core, "/tmp/tie").unwrap().id, c);
+        assert_eq!(latest(&core, "/tmp/tie").unwrap().unwrap().id, c);
 
         // Touch recency inside the same second: touching the OLDEST session
         // must make it the latest, so the touched entry re-appends instead
@@ -1151,8 +1683,8 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(latest(&core, "/tmp/tie").unwrap().id, a);
-        let listed: Vec<String> = list(&core, "/tmp/tie").into_iter().map(|m| m.id).collect();
+        assert_eq!(latest(&core, "/tmp/tie").unwrap().unwrap().id, a);
+        let listed: Vec<String> = list(&core, "/tmp/tie").unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(listed, vec![a, c, b]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1177,7 +1709,7 @@ mod tests {
         assert_eq!(discard_if_empty(&core, &manifest_only), Ok(true));
         assert!(!manifest_path(&core, &manifest_only).exists(), "its files go with it");
         assert_eq!(discard_if_empty(&core, &kept), Ok(false), "a transcript is history");
-        let ids: Vec<String> = list(&core, "/tmp/p").into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = list(&core, "/tmp/p").unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![kept.clone()]);
 
         // An index that cannot be rewritten leaves the entry, and says so
@@ -1352,6 +1884,7 @@ mod tests {
             ext_fingerprint: 0,
             memory_files: None,
             memory_rows: None,
+            read_files: None,
         });
         assert!(load_manifest(&core, &id).is_none(), "and so does its manifest");
         // All five session-scoped files, so this cannot regress one at a time.
@@ -1463,6 +1996,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Readers that answer "what history is there" name a damaged index
+    /// instead of answering "none": `--continue` would otherwise report no
+    /// previous session over a file full of them. Every refusal names the
+    /// file, removals included (a frontend discards the empty session it
+    /// leaves), and `--check` sees the same damage without a Core. The shared
+    /// reason carries no repair: it also reaches live sessions, where moving
+    /// the index aside leaves the session listed nowhere, its later saves
+    /// landing where no lookup finds them or dropped without a word. A
+    /// frontend's refusal points at `--check`, and only for the damage: a
+    /// lock or write failure is not something `--check` repairs.
+    #[test]
+    fn a_damaged_index_is_named_to_readers_not_reported_as_empty() {
+        let dir = std::env::temp_dir().join(format!("openmax-damaged-read-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        std::fs::write(index_path(&core), "[{").unwrap();
+        let path = index_path(&core).display().to_string();
+
+        let refusals = [
+            latest(&core, "/tmp/p").unwrap_err(),
+            list(&core, "/tmp/p").unwrap_err(),
+            create(&core, "/tmp/p".into()).unwrap_err(),
+            index_diagnostic(&core).unwrap(),
+            discard_if_empty(&core, &id).unwrap_err(),
+            delete(&core, &id).unwrap_err(),
+        ];
+        for reason in refusals {
+            assert!(reason.contains(&path), "{reason}");
+            assert!(!reason.contains("move it aside") && !reason.contains("--check"), "{reason}");
+            let refusal = refusal_with_repair(&core, reason.clone());
+            assert_eq!(refusal, format!("{reason}; run openmax --check for the repair"));
+        }
+        let unrelated = format!("cannot lock {path}: busy");
+        assert_eq!(refusal_with_repair(&core, unrelated.clone()), unrelated);
+        assert_eq!(index_damage(&dir).map(|(at, _)| at), Some(index_path(&core)));
+        assert_eq!(std::fs::read_to_string(index_path(&core)).unwrap(), "[{");
+
+        std::fs::remove_file(index_path(&core)).unwrap();
+        assert!(latest(&core, "/tmp/p").unwrap().is_none(), "a missing index is an empty store");
+        assert!(index_damage(&dir).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn compaction_records_append_and_load() {
         let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
@@ -1542,6 +2118,7 @@ mod tests {
                 name: "read_file".into(),
                 arguments: r#"{"path":"src/a.rs"}"#.into(),
             },
+            extra_content: None,
         };
         let first = vec![
             ChatMessage::user("find the bug"),
@@ -1573,7 +2150,7 @@ mod tests {
         let cases = [
             Vec::new(), b"{torn".to_vec(), vec![0xff],
             [good.as_slice(), b"{broken middle}\n", good.as_slice()].concat(),
-            [good.as_slice(), b"{torn tail"].concat(),
+            [good.as_slice(), b"{broken tail}\n"].concat(),
         ];
         for bytes in cases {
             std::fs::write(&path, &bytes).unwrap();
@@ -1586,7 +2163,7 @@ mod tests {
                 assert_eq!(persisted, 0);
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
             }
-            assert!(commit_compaction(&core, &id, &[ChatMessage::system("replacement")], &[], None, 1).is_err());
+            assert!(commit_compaction(&core, &id, &[ChatMessage::system("replacement")], &[], None, 1, 2).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e.event, AgentEvent::Error { .. })));
@@ -1610,8 +2187,213 @@ mod tests {
         // Damage after attachment must also survive a rewrite or compaction.
         std::fs::write(messages_path(&core, &id), b"{damage after loading").unwrap();
         assert!(!save_messages(&core, &id, &messages, &mut persisted, true));
-        assert!(commit_compaction(&core, &id, &messages, &[], None, 2).is_err());
+        assert!(commit_compaction(&core, &id, &messages, &[], None, 2, 2).is_err());
         assert_eq!(std::fs::read(messages_path(&core, &id)).unwrap(), b"{damage after loading");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A crash or a power cut mid-append leaves the transcript ending in part
+    /// of a record: no newline, the start of its JSON and nothing else,
+    /// sometimes cut inside a multi-byte character or followed by zeros where
+    /// a power cut left the end of the append unwritten. That fragment was
+    /// never a message, so a resume drops it instead of refusing the session,
+    /// and the next save cuts it instead of stranding it mid-file, where it
+    /// would be damage. Only such a final line gets this: the same bytes
+    /// anywhere else, a whole record that is not a message, or a final record
+    /// that is closed but does not parse, are damage, still refused, and no
+    /// save cuts them.
+    #[test]
+    fn a_torn_final_record_is_dropped_on_load_and_cut_by_the_next_save() {
+        let dir = std::env::temp_dir().join(format!("openmax-torn-tail-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let path = messages_path(&core, &id);
+        let line = |m: &ChatMessage| serde_json::to_string(m).unwrap() + "\n";
+        let good = line(&ChatMessage::system("rules")) + &line(&ChatMessage::user("keep"));
+        let torn: [&[u8]; 4] = [
+            b"{\"role\":\"assistant\",\"content\":\"half", b"{\"role\":\"assistant\",\"content\":\"caf\xc3",
+            b"{\"role\":\"assistant\",\"content\":\"half\0\0\0\0", b"\0\0\0\0",
+        ];
+        for fragment in torn {
+            std::fs::write(&path, [good.as_bytes(), fragment].concat()).unwrap();
+            let mut messages = load_messages(&core, &id).unwrap().expect("the complete records resume");
+            assert_eq!(messages.len(), 2);
+            let mut persisted = messages.len();
+            messages.push(ChatMessage::user("next"));
+            assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), good.clone() + &line(&messages[2]), "the fragment is cut, not stranded");
+            assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), 3);
+        }
+        // A rewrite or a compaction replaces the file whole, fragment and all.
+        let messages = vec![ChatMessage::system("rules"), ChatMessage::user("keep")];
+        std::fs::write(&path, [good.as_bytes(), torn[0]].concat()).unwrap();
+        assert!(save_messages(&core, &id, &messages, &mut 2, true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+        std::fs::write(&path, [good.as_bytes(), torn[0]].concat()).unwrap();
+        commit_compaction(&core, &id, &messages, &[], None, 2, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+
+        let next = [messages.as_slice(), &[ChatMessage::user("next")]].concat();
+        for damaged in [
+            [good.as_bytes(), torn[0], b"\n", good.as_bytes()].concat(),
+            [good.as_bytes(), b"{\"role\":5}"].concat(),
+            [good.as_bytes(), b"{\"role\":\"user\",\"content\":\"edited\"]"].concat(),
+        ] {
+            std::fs::write(&path, &damaged).unwrap();
+            assert!(load_messages(&core, &id).unwrap_err().contains("line 3"));
+            assert!(!save_messages(&core, &id, &messages, &mut 2, true));
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert!(save_messages(&core, &id, &next, &mut 2, false));
+            assert!(std::fs::read(&path).unwrap().starts_with(&damaged), "an append never cuts damage");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A transcript written before messages carried `reasoning_details` or a
+    /// call's `extra_content` loads with neither, and saving it again writes
+    /// the bytes it was read from: the additions are optional on disk and
+    /// never rewrite an older file into a new shape.
+    #[test]
+    fn a_transcript_from_before_reasoning_details_loads_and_saves_unchanged() {
+        let dir = std::env::temp_dir().join(format!("openmax-old-transcript-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let path = messages_path(&core, &id);
+        let old = concat!(
+            "{\"role\":\"system\",\"content\":\"rules\"}\n",
+            "{\"role\":\"user\",\"content\":\"read a.txt\"}\n",
+            "{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}],\"reasoning_content\":\"read it first\",\"reasoning_origin\":\"0123456789abcdef\"}\n",
+            "{\"role\":\"tool\",\"content\":\"alpha\",\"tool_call_id\":\"c1\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"done\"}\n",
+        );
+        std::fs::write(&path, old).unwrap();
+        let messages = load_messages(&core, &id).unwrap().expect("an older transcript resumes");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[2].reasoning_content.as_deref(), Some("read it first"));
+        assert_eq!(messages[2].reasoning_origin.as_deref(), Some("0123456789abcdef"));
+        assert!(messages.iter().all(|m| m.reasoning_details.is_none()));
+        assert!(messages[2].tool_calls.as_ref().unwrap().iter().all(|c| c.extra_content.is_none()));
+        assert!(save_messages(&core, &id, &messages, &mut 5, true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rename can reach the disk before the bytes it points at, so a power
+    /// cut after an unsynced atomic write can leave an empty or partial file
+    /// under the final name with the old contents already gone. The temp file
+    /// is synced before the rename, and the directory after it, so the
+    /// rename itself reaches the disk ahead of later writes too.
+    #[test]
+    fn an_atomic_write_syncs_its_bytes_before_the_rename_and_the_directory_after() {
+        let dir = std::env::temp_dir().join(format!("openmax-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.json");
+        SYNCED.with(|synced| synced.take());
+        write_atomic(&path, "[]").unwrap();
+        let synced = SYNCED.with(|synced| synced.take());
+        assert_eq!(synced.len(), if cfg!(unix) { 2 } else { 1 }, "{synced:?}");
+        let name = synced[0].file_name().unwrap().to_string_lossy();
+        assert!(synced[0].parent() == Some(dir.as_path()) && name.starts_with("index.json.") && name.ends_with(".tmp"), "{synced:?}");
+        if cfg!(unix) {
+            assert_eq!(synced[1], dir);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The transcript rewrite deletes what the archive just gained, so the
+    /// archive has to reach the disk first, or a power cut that keeps the
+    /// rewrite loses those messages from both. That includes its name: the
+    /// first compaction creates the archive, and a file's own sync does not
+    /// cover its directory entry, so the directory is synced right after it.
+    #[test]
+    fn a_compaction_syncs_its_archive_before_the_transcript_rewrite() {
+        let dir = std::env::temp_dir().join(format!("openmax-archive-sync-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        assert!(save_messages(&core, &id, &original, &mut 0, true));
+        let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
+        SYNCED.with(|synced| synced.take());
+        commit_compaction(&core, &id, &candidate, &original[1..], None, original.len(), 2).unwrap();
+        let synced = SYNCED.with(|synced| synced.take());
+        let archive = synced.iter().position(|p| *p == archive_path(&core, &id));
+        let transcript = format!("{id}.messages.json.");
+        let rewrite = synced.iter().position(|p| p.file_name().unwrap().to_string_lossy().starts_with(&transcript));
+        assert!(matches!((archive, rewrite), (Some(a), Some(r)) if a < r), "{synced:?}");
+        if cfg!(unix) {
+            assert_eq!(archive.map(|a| &synced[a + 1]), Some(&sessions_dir(&core)), "{synced:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Some file systems cannot sync a directory at all: every directory sync
+    /// fails with EINVAL, EBADF or ENOTSUP. Failing a compaction on that can
+    /// never succeed later, so every turn past the compaction trigger would
+    /// end in an error and the session could not go on. Those errors count
+    /// as done; a real I/O error still fails the compaction before the
+    /// transcript is touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_system_that_cannot_sync_directories_still_compacts() {
+        let dir = std::env::temp_dir().join(format!("openmax-dir-sync-unsupported-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "project".into()).unwrap().id;
+        let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
+        let transcript = |core: &Core| serde_json::to_value(load_messages(core, &id).unwrap().unwrap()).unwrap();
+        let commit_with = |code: i32| {
+            assert!(save_messages(&core, &id, &original, &mut 0, true));
+            FAIL_DIR_SYNC.with(|fail| fail.set(Some(code)));
+            let committed = commit_compaction(&core, &id, &candidate, &original[1..], None, original.len(), 2);
+            FAIL_DIR_SYNC.with(|fail| fail.set(None));
+            committed
+        };
+        for code in [libc::EINVAL, libc::EBADF, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert_eq!(commit_with(code), Ok(()), "errno {code}");
+            assert_eq!(transcript(&core), serde_json::to_value(&candidate).unwrap());
+        }
+        let error = commit_with(libc::EIO).unwrap_err();
+        assert!(error.contains("cannot sync"), "{error}");
+        assert_eq!(transcript(&core), serde_json::to_value(&original).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session's first save creates its transcript. Appended, a crash or a
+    /// power cut part way through leaves only a fragment or an empty file:
+    /// no complete record to resume from, so the loader refuses it like any
+    /// damage and the session can never be resumed. Written whole through a
+    /// temp file and a rename, the same crash leaves no transcript at all,
+    /// which is a fresh session. Later saves still append, without a sync.
+    #[test]
+    fn a_first_save_is_written_whole_so_a_crash_leaves_a_fresh_session() {
+        let dir = std::env::temp_dir().join(format!("openmax-first-save-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let path = messages_path(&core, &id);
+        for crashed in [&b""[..], b"{\"role\":\"system\",\"content\":\"ru"] {
+            std::fs::write(&path, crashed).unwrap();
+            assert!(load_messages(&core, &id).unwrap_err().contains("no complete record"));
+        }
+        std::fs::remove_file(&path).unwrap();
+        // What an interrupted whole write leaves: its temp file, no transcript.
+        std::fs::write(path.with_file_name(format!("{id}.messages.json.interrupted.tmp")), b"{\"ro").unwrap();
+        assert!(load_messages(&core, &id).unwrap().is_none());
+
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
+        let mut persisted = 0;
+        SYNCED.with(|synced| synced.take());
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        let synced = SYNCED.with(|synced| synced.take());
+        let transcript = format!("{id}.messages.json.");
+        let name = synced.first().map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert!(name.is_some_and(|n| n.starts_with(&transcript) && n.ends_with(".tmp")), "{synced:?}");
+        assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), 2);
+
+        messages.push(ChatMessage::user("second"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        assert_eq!(SYNCED.with(|synced| synced.take()), Vec::<PathBuf>::new());
+        assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1689,6 +2471,507 @@ mod tests {
         detach(&first, &id).unwrap();
         attach(&second, &id).unwrap();
         assert!(dir.join("sessions").join(format!("{id}.lock")).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The lock protocol is part of the on-disk format: every released binary
+    /// takes an exclusive flock(2) on these files, and an older and a newer
+    /// binary often run side by side on one data dir. A raw flock stands in
+    /// for the older binary, so a locking primitive that does not see flock
+    /// locks (fcntl record locks on Linux) fails here instead of letting two
+    /// versions write one session or one index at once.
+    #[cfg(unix)]
+    #[test]
+    fn session_and_index_locks_exclude_a_raw_flock_holder() {
+        let dir = std::env::temp_dir().join(format!("openmax-flock-compat-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let session_lock = sessions_dir(&core).join(format!("{id}.lock"));
+
+        let older = raw_flock(&session_lock).expect("nothing holds the session yet");
+        assert!(attach(&core, &id).unwrap_err().contains("another process"));
+        drop(older);
+        attach(&core, &id).unwrap();
+        assert!(raw_flock(&session_lock).is_none(), "an older binary must not attach this session");
+
+        let older = raw_flock(&sessions_dir(&core).join("index.lock")).expect("the index is idle");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let creator = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                create(&core, "/tmp/p".into()).unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "an index write must wait while an older binary holds index.lock"
+        );
+        drop(older);
+        creator.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Removing a session unlinks its lock file, which an older binary never
+    /// does. That binary must still exclude the removal: unlinking a file it
+    /// holds would delete the session it is writing and hand its name to the
+    /// next claim. A raw flock stands in for it, as above.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_is_refused_while_an_older_binary_holds_the_session() {
+        let dir = std::env::temp_dir().join(format!("openmax-flock-remove-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let session_lock = lock_path(&core, &id);
+
+        let older = raw_flock(&session_lock).expect("nothing holds the session yet");
+        assert!(delete(&core, &id).unwrap_err().contains("another process"));
+        assert!(discard_if_empty(&core, &id).unwrap_err().contains("another process"));
+        assert!(session_lock.exists(), "a lock file an older binary holds was unlinked");
+        assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "a held session was removed");
+        drop(older);
+        assert_eq!(discard_if_empty(&core, &id), Ok(true));
+        assert!(!session_lock.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A released session must be free at once, not when the last copy of
+    /// its lock descriptor closes. flock belongs to the open file
+    /// description, and a child being spawned holds a copy of every open
+    /// descriptor until it execs: a release that only closed the harness's
+    /// copy left the session locked while any bash call, tool, or hook was
+    /// mid-spawn, and reopening it then was refused as open in another
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_session_reopens_while_a_child_is_spawning() {
+        let dir = std::env::temp_dir().join(format!("openmax-spawn-session-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let (other, _other_rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+
+        let spawning = crate::execution::PausedSpawn::start();
+        detach(&core, &id).unwrap();
+        attach(&core, &id).expect("a released session reopens while a child is spawning");
+        detach(&core, &id).unwrap();
+        attach(&other, &id).expect("another process takes a released session while a child is spawning");
+        assert!(attach(&core, &id).unwrap_err().contains("another process"), "a held session stays exclusive");
+        drop(spawning);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The index lock is released the same way, or every other process's
+    /// index write waits on a child it never started.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_index_lock_is_free_while_a_child_is_spawning() {
+        let dir = std::env::temp_dir().join(format!("openmax-spawn-index-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let store = lock_store(&core).unwrap();
+
+        let spawning = crate::execution::PausedSpawn::start();
+        drop(store);
+        assert!(
+            raw_flock(&sessions_dir(&core).join("index.lock")).is_some(),
+            "a released index lock stayed held by a spawning child"
+        );
+        drop(spawning);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every claim creates `<id>.lock`. A deleted or discarded session is
+    /// never claimed again, so a lock file it leaves behind is never reused
+    /// or removed: one stray file for every such session, forever. A session
+    /// that stays keeps its file, which its next claim reuses.
+    #[test]
+    fn deleting_or_discarding_a_session_leaves_no_lock_file() {
+        let dir = std::env::temp_dir().join(format!("openmax-lockfile-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let lock = |id: &str| dir.join("sessions").join(format!("{id}.lock"));
+
+        let deleted = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &deleted).unwrap();
+        assert!(lock(&deleted).exists());
+        delete(&core, &deleted).unwrap();
+        assert!(!lock(&deleted).exists(), "delete left the session's lock file behind");
+
+        let discarded = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &discarded).unwrap();
+        assert_eq!(discard_if_empty(&core, &discarded), Ok(true));
+        assert!(!lock(&discarded).exists(), "discard left the session's lock file behind");
+
+        // Never claimed before: the claim delete makes for itself goes too.
+        let unclaimed = create(&core, "/tmp/p".into()).unwrap().id;
+        delete(&core, &unclaimed).unwrap();
+        assert!(!lock(&unclaimed).exists(), "delete left the lock file its own claim made");
+
+        let kept = create(&core, "/tmp/p".into()).unwrap().id;
+        assert!(save_messages(&core, &kept, &[ChatMessage::system("sys")], &mut 0, false));
+        assert_eq!(discard_if_empty(&core, &kept), Ok(false));
+        assert!(lock(&kept).exists(), "a session that stays keeps its lock file");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The unlink is safe only because no claim can open the file before it
+    /// and lock it after (see `SessionOwner`). Parked rather than raced, since
+    /// a race that misses the bad interleaving proves nothing: while a
+    /// deleter holds the store, a claim from another process must wait
+    /// instead of opening the file.
+    #[test]
+    fn a_claim_cannot_interleave_with_the_unlink_of_its_lock_file() {
+        let dir = std::env::temp_dir().join(format!("openmax-claim-{}", uuid::Uuid::new_v4()));
+        let (deleter, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&deleter, "/tmp/p".into()).unwrap().id;
+        attach(&deleter, &id).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = {
+            let deleter = deleter.clone();
+            std::thread::spawn(move || {
+                let _store = lock_store(&deleter).unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let claimer = {
+            let (dir, id) = (dir.clone(), id.clone());
+            std::thread::spawn(move || {
+                let (other, _rx) = Core::new(dir).unwrap();
+                let claimed = attach(&other, &id);
+                done_tx.send(()).unwrap();
+                claimed
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "a claim must wait while another process holds the store, or it can open \
+             the lock file a delete is about to unlink"
+        );
+        release_tx.send(()).unwrap();
+        parked.join().unwrap();
+        let refused = claimer.join().unwrap().unwrap_err();
+        assert!(refused.contains("another process"), "the deleter still owns it: {refused}");
+
+        // With the file unlinked, claims that race for the name still end
+        // with exactly one owner. Each core outlives the race, so no lock is
+        // released early and handed to a later claim.
+        delete(&deleter, &id).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let (dir, id, start) = (dir.clone(), id.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let (core, _rx) = Core::new(dir).unwrap();
+                    start.wait();
+                    let owned = attach(&core, &id).is_ok();
+                    (owned, core)
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(owned, _)| *owned).count(), 1, "one owner per session");
+        drop(results);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A front end discards at exit, and a turn of its own can still be
+    /// running then. Whether the session is empty is decided under the store
+    /// lock every transcript write holds, so a save that lands while the
+    /// discard waits for that lock keeps the session instead of being
+    /// deleted with it.
+    #[test]
+    fn a_discard_keeps_a_session_that_gained_history_while_it_waited() {
+        let dir = std::env::temp_dir().join(format!("openmax-discard-race-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                let _store = lock_store(&core).unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let discard = {
+            let (core, id) = (core.clone(), id.clone());
+            std::thread::spawn(move || {
+                let discarded = discard_if_empty(&core, &id);
+                done_tx.send(()).unwrap();
+                discarded
+            })
+        };
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err());
+        // The parked holder's save, landing while the discard waits.
+        let line = serde_json::to_string(&ChatMessage::user("hello")).unwrap();
+        std::fs::write(messages_path(&core, &id), format!("{line}\n")).unwrap();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(discard.join().unwrap(), Ok(false), "a session with a transcript is history");
+        assert_eq!(load_messages(&core, &id).unwrap().map(|m| m.len()), Some(1));
+        assert!(list(&core, "/tmp/p").unwrap().iter().any(|m| m.id == id), "and it stays indexed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The index lists every session of every project and is never pruned,
+    /// so a write that reads it costs more with every session ever recorded.
+    /// Once a claim has seen its session indexed, a model request's usage
+    /// record, a transcript save, and a manifest save read none of it: no
+    /// other process can remove a session this one holds, since a removal
+    /// claims first. A removal by this process mid-turn is remembered, so the
+    /// turn's late writes are still dropped, without reading the index either.
+    #[test]
+    fn a_steady_state_request_and_save_read_no_index_bytes() {
+        let dir = std::env::temp_dir().join(format!("openmax-index-hot-path-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        for _ in 0..20 {
+            create(&core, "/tmp/elsewhere".into()).unwrap();
+        }
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let read = || INDEX_BYTES_READ.with(|read| read.replace(0));
+        read();
+
+        let usage = |ts| TokenUsage { ts, prompt_tokens: 10, completion_tokens: 1, cached_tokens: None };
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        for turn in 0..3 {
+            append_usage(&core, &id, &usage(turn));
+            messages.push(ChatMessage::user(format!("message {turn}")));
+            assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        }
+        assert!(save_messages(&core, &id, &messages, &mut persisted, true), "a rewrite too");
+        save_manifest(&core, &id, &crate::registry::Registry::builtin_only().to_manifest());
+        assert_eq!(read(), 0, "a steady-state request or save read the session index");
+        assert_eq!(load_usage(&core, &id).len(), 3);
+        assert_eq!(load_messages(&core, &id).unwrap().unwrap().len(), messages.len());
+
+        // Deleted while its turn runs, the session keeps its claim until the
+        // turn settles, and what the turn still writes is dropped.
+        core.running.lock().unwrap().insert(id.clone());
+        delete(&core, &id).unwrap();
+        read();
+        append_usage(&core, &id, &usage(9));
+        messages.push(ChatMessage::user("late"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false), "a deleted session's save is a silent no-op");
+        save_manifest(&core, &id, &crate::registry::Registry::builtin_only().to_manifest());
+        assert_eq!(read(), 0, "the deleted-session guard read the session index");
+        for suffix in ["messages.json", "manifest.json", "usage.jsonl"] {
+            assert!(!sessions_dir(&core).join(format!("{id}.{suffix}")).exists(), "{suffix} came back after delete");
+        }
+        core.running.lock().unwrap().remove(&id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every turn start claims its session again (`attach`). Reparsing the
+    /// whole transcript there made each turn cost more than the one before,
+    /// though between turns an owned transcript changes only when something
+    /// outside openmax writes it. So a turn start reads it again only once
+    /// its stat stamp moved past what this process last validated or wrote,
+    /// and damage written in between is still refused.
+    #[test]
+    fn a_turn_start_rereads_an_owned_transcript_only_after_it_changed() {
+        let dir = std::env::temp_dir().join(format!("openmax-turn-start-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        messages.push(ChatMessage::user("second"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        let reads = || TRANSCRIPT_READS.with(|reads| reads.replace(0));
+        reads();
+
+        attach(&core, &id).unwrap();
+        attach(&core, &id).unwrap();
+        assert_eq!(reads(), 0, "a turn start reparsed a transcript nothing had changed");
+
+        let path = messages_path(&core, &id);
+        let intact = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [intact.as_slice(), b"{damaged}\n"].concat()).unwrap();
+        assert!(attach(&core, &id).unwrap_err().contains("damaged at line 4"));
+        assert_eq!(reads(), 1);
+        let edited = [intact.as_slice(), b"{\"role\":\"user\",\"content\":\"added outside\"}\n"].concat();
+        std::fs::write(&path, edited).unwrap();
+        attach(&core, &id).unwrap();
+        attach(&core, &id).unwrap();
+        assert_eq!(reads(), 1, "a repaired transcript is read once, then trusted again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An append does not read the history it extends, so it vouches for the
+    /// file it leaves only when nothing else wrote it since this process last
+    /// did. Damage written from outside during a turn, then appended past by
+    /// that turn's own save, would otherwise be trusted by the next turn
+    /// start and go unreported until a later sitting failed to load it.
+    #[test]
+    fn a_turn_start_rereads_a_transcript_written_from_outside_before_an_append() {
+        let dir = std::env::temp_dir().join(format!("openmax-append-over-outside-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        let mut persisted = 0usize;
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        let path = messages_path(&core, &id);
+        let intact = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [intact.as_slice(), b"{damaged}\n"].concat()).unwrap();
+        let reads = || TRANSCRIPT_READS.with(|reads| reads.replace(0));
+        reads();
+
+        messages.push(ChatMessage::user("third"));
+        assert!(save_messages(&core, &id, &messages, &mut persisted, false));
+        assert_eq!(reads(), 0, "the save appended rather than rewrote");
+        let reason = attach(&core, &id).unwrap_err();
+        assert!(reason.contains("damaged at line 4"), "{reason}");
+        assert_eq!(reads(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A stamp of length and modification time alone misses an outside edit
+    /// that keeps the length and puts the modification time back, as a copy
+    /// or sync that preserves timestamps does. The status-change time moves
+    /// on every write and every timestamp change, and no caller can set it,
+    /// so the next turn start still reads such an edit and refuses its damage.
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_start_rereads_a_transcript_edited_with_its_modification_time_restored() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("openmax-restored-mtime-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        attach(&core, &id).unwrap();
+        let messages = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
+        assert!(save_messages(&core, &id, &messages, &mut 0, false));
+        let path = messages_path(&core, &id);
+        let saved = std::fs::metadata(&path).unwrap();
+        // The edit lands on a later tick of the file system's clock than the
+        // save, as an edit by hand or by another program does: within one
+        // tick no stat field tells two writes of the same length apart.
+        let probe = dir.join("clock-probe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for tick in 0u64.. {
+            std::fs::write(&probe, tick.to_string()).unwrap();
+            let probed = std::fs::metadata(&probe).unwrap();
+            if (probed.ctime(), probed.ctime_nsec()) > (saved.ctime(), saved.ctime_nsec()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the file system clock never moved");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let mut damaged = std::fs::read(&path).unwrap();
+        let second_line = damaged.iter().position(|&b| b == b'\n').unwrap() + 1;
+        damaged[second_line] = b'x';
+        std::fs::write(&path, &damaged).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(saved.modified().unwrap()).unwrap();
+        let edited = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (edited.len(), edited.modified().unwrap()),
+            (saved.len(), saved.modified().unwrap()),
+            "the edit kept the length and modification time"
+        );
+
+        let reason = attach(&core, &id).unwrap_err();
+        assert!(reason.contains("damaged at line 2"), "{reason}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Frontends record a session under the working directory as the OS
+    /// reports it, already resolved, which is the form trust keys a project
+    /// by. A lookup spelled through a symlink (`/tmp` for `/private/tmp`)
+    /// still lists them, and `--continue` takes the latest.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_lists_its_sessions_from_any_spelling_of_its_path() {
+        let dir = std::env::temp_dir().join(format!("openmax-spelling-{}", uuid::Uuid::new_v4()));
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let spell = |path: &Path| path.display().to_string();
+        let resolved = std::fs::canonicalize(&real).unwrap();
+        let older = create(&core, spell(&resolved)).unwrap().id;
+        let newer = create(&core, spell(&resolved)).unwrap().id;
+        create(&core, spell(&std::fs::canonicalize(dir.join("other")).unwrap())).unwrap();
+        touch_at(&core, &older, 1_000);
+        touch_at(&core, &newer, 2_000);
+
+        for spelling in [&real, &link, &resolved] {
+            let listed: Vec<String> = list(&core, &spell(spelling)).unwrap().into_iter().map(|m| m.id).collect();
+            assert_eq!(listed, vec![newer.clone(), older.clone()], "{}", spelling.display());
+        }
+        touch_at(&core, &older, 3_000);
+        assert_eq!(latest(&core, &spell(&link)).unwrap().unwrap().id, older);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A stored path is the directory a session was recorded in, resolved
+    /// when it was recorded. Once that directory moves and a symlink to
+    /// another project takes its place, the path leads to the other project,
+    /// as it does for trust. Resolving the stored path again at lookup would
+    /// hand the other project this one's history through `--continue`,
+    /// `/resume`, and `--recall`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_takes_a_projects_place_does_not_carry_its_history() {
+        let dir = std::env::temp_dir().join(format!("openmax-retargeted-{}", uuid::Uuid::new_v4()));
+        let first = dir.join("first");
+        let second = dir.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let spell = |path: &Path| path.display().to_string();
+        let recorded = std::fs::canonicalize(&first).unwrap();
+        let theirs = create(&core, spell(&recorded)).unwrap().id;
+        let ours = create(&core, spell(&std::fs::canonicalize(&second).unwrap())).unwrap().id;
+        touch_at(&core, &ours, 1_000);
+        touch_at(&core, &theirs, 2_000);
+
+        std::fs::rename(&recorded, dir.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&second, &recorded).unwrap();
+        for spelling in [second.clone(), std::fs::canonicalize(&second).unwrap()] {
+            let listed: Vec<String> = list(&core, &spell(&spelling)).unwrap().into_iter().map(|m| m.id).collect();
+            assert_eq!(listed, vec![ours.clone()], "{}", spelling.display());
+        }
+        assert_eq!(latest(&core, &spell(&second)).unwrap().unwrap().id, ours);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A frontend whose working directory cannot be read stores the project
+    /// as ".", which names whatever directory the process that wrote it was
+    /// in. Resolved by a later lookup it would name the lookup's own
+    /// directory, so one stray entry would be every project's history and
+    /// `--continue` anywhere would resume a stranger's session. A stored path
+    /// is never resolved, so a relative one matches only its own spelling.
+    #[test]
+    fn a_relative_project_path_is_no_other_projects_history() {
+        let dir = std::env::temp_dir().join(format!("openmax-relative-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let stray = create(&core, ".".into()).unwrap().id;
+        let here = std::env::current_dir().unwrap().display().to_string();
+
+        assert!(list(&core, &here).unwrap().is_empty());
+        assert!(latest(&core, &here).unwrap().is_none());
+        let own = create(&core, here.clone()).unwrap().id;
+        assert_eq!(latest(&core, &here).unwrap().unwrap().id, own);
+        let listed: Vec<String> = list(&core, ".").unwrap().into_iter().map(|m| m.id).collect();
+        assert!(listed.contains(&stray), "a relative path still matches its own spelling");
         let _ = std::fs::remove_dir_all(dir);
     }
 

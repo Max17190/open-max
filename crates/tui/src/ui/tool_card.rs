@@ -67,10 +67,16 @@ pub fn tool_block_timed(
     }
     let mut lines = vec![Line::from(header)];
     if !ok {
-        if let Some(reason) = output.lines().find(|line| !line.trim().is_empty()) {
+        // Measured after the escape sequences go: a line holding only a
+        // color reset is not the diagnostic.
+        if let Some(reason) = output
+            .lines()
+            .map(super::text::strip_escapes)
+            .find(|line| !line.trim().is_empty())
+        {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(clip(reason, 110), Style::default().fg(theme::ERR())),
+                Span::styled(clip(&reason, 110), Style::default().fg(theme::ERR())),
             ]));
         }
     }
@@ -174,6 +180,14 @@ mod tests {
         assert!(plain(&lines).contains("permission denied"));
         assert!(!plain(&lines).contains("\n  2"));
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn the_diagnostic_line_is_shown_without_escape_sequences() {
+        let output = "\u{1b}[0m\n\u{1b}[1;31merror\u{1b}[0m: linking failed\nmore";
+        let lines = tool_block_timed("bash", "cargo build", false, output, None, None);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(plain(&lines[1..]), "  error: linking failed");
     }
 
     #[test]

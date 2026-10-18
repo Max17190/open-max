@@ -232,9 +232,8 @@ fn load_log(project_root: &Path) -> Vec<AccessRecord> {
 /// writes or deletions.
 /// Score one memory file into an index entry from ALREADY-READ content, or
 /// None if it has no describable first line. Kept separate from the directory
-/// walk so the fingerprint scan and the index scan can share ONE read of each
-/// file: two independent reads could otherwise freeze one generation of a
-/// file's index under another generation's fingerprint.
+/// walk so `scan` and `freeze_snapshot` (which reads bytes and mtime as one
+/// generation) score a file identically.
 fn entry_from(
     name: &str,
     text: &str,
@@ -335,14 +334,12 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
     fill_index(entries)
 }
 
-/// One read of the memory directory producing BOTH the fingerprint bytes and
-/// the index selection from the SAME bytes, so a file replaced between two
-/// separate scans can no longer freeze one generation's index under another
-/// generation's fingerprint. The fingerprint set is every
-/// valid-named `.md` (a write to any refreezes); the index is the describable,
-/// unfaded, in-budget subset.
+/// One read of the memory directory producing the frozen index section and
+/// the receipt identities from the SAME selection. The index is the
+/// describable, unfaded, in-budget subset of the valid-named `.md` files.
+/// Memory is not in the extension fingerprint: every freeze reads it, but a
+/// memory write never causes one.
 pub struct MemoryFreeze {
-    pub fingerprint_files: Vec<(PathBuf, Vec<u8>)>,
     pub section: IndexSection,
     pub identities: Vec<(String, u64)>,
 }
@@ -367,23 +364,16 @@ fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)
     }
     // The file is being rewritten faster than it can be read coherently
     // (pathological sub-read churn): SKIP it this freeze rather than return an
-    // incoherent body/mtime pair. It re-enters the fingerprint and
-    // the index on the next freeze once writes settle - and because it was
-    // absent from this fingerprint, that settling changes the fingerprint and
-    // triggers the refreeze that indexes it.
+    // incoherent body/mtime pair. It re-enters the index on the next freeze
+    // once writes settle.
     None
 }
 
 pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
     let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
-        return MemoryFreeze {
-            fingerprint_files: Vec::new(),
-            section: None,
-            identities: Vec::new(),
-        };
+        return MemoryFreeze { section: None, identities: Vec::new() };
     };
     let log = load_log(project_root);
-    let mut fingerprint_files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut entries: Vec<MemoryEntry> = Vec::new();
     for dirent in read_dir.flatten() {
         let path = dirent.path();
@@ -392,25 +382,21 @@ pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
             continue;
         }
         // Bytes AND mtime describe the SAME generation of the file, so the
-        // fingerprint (which hashes the bytes) and the index scoring (which
-        // uses the mtime) can never be captured from two different generations
-        // - a rename OR an in-place rewrite during the read would otherwise
-        // pair one generation's bytes with another's mtime.
+        // index line (from the bytes) and its rank (from the mtime) can never
+        // be captured from two different generations - a rename OR an
+        // in-place rewrite during the read would otherwise pair one
+        // generation's bytes with another's mtime.
         let Some((bytes, mtime)) = read_coherent(&path) else { continue };
-        // The SAME bytes feed the fingerprint and the index: a describable,
-        // UTF-8 file also enters the index; every valid-named file counts
-        // toward the fingerprint regardless.
+        // A describable, UTF-8 file enters the index.
         if let Ok(text) = std::str::from_utf8(&bytes) {
             if let Some(entry) = entry_from(name, text, mtime, &log, now) {
                 entries.push(entry);
             }
         }
-        fingerprint_files.push((path, bytes));
     }
-    fingerprint_files.sort_by(|a, b| a.0.cmp(&b.0));
     let scan = fill_index(entries);
     let (section, identities) = section_and_identities(&scan);
-    MemoryFreeze { fingerprint_files, section, identities }
+    MemoryFreeze { section, identities }
 }
 
 fn trailer_line(omitted: usize) -> String {
@@ -430,8 +416,7 @@ pub type IndexSection = Option<(String, Vec<(String, usize)>)>;
 
 /// The rendered index section and receipt identities for a completed scan.
 /// Shared by `index_and_identities` (fresh scan) and `freeze_snapshot`
-/// (fingerprint + index in one read) so all three outputs describe the same
-/// selection.
+/// (one coherent read per file) so both outputs describe the same selection.
 fn section_and_identities(scan: &MemoryScan) -> (IndexSection, Vec<(String, u64)>) {
     use std::hash::{Hash, Hasher};
     let shown: Vec<&MemoryEntry> = scan.entries.iter().filter(|e| e.in_index).collect();
@@ -522,25 +507,16 @@ mod tests {
         assert_eq!(d, "first ForgedRow line");
     }
 
-    /// freeze_snapshot reads each memory file ONCE, so the fingerprint set
-    /// and the index it returns describe the same generation of every file -
-    /// two separate scans could freeze one generation's index under another's
-    /// fingerprint. A describable file is in both outputs; a
-    /// valid-named file with no describable first line counts toward the
-    /// fingerprint (a write to it still refreezes) but not the index.
+    /// freeze_snapshot reads each memory file ONCE, so the index section and
+    /// the receipt identities it returns describe the same generation of
+    /// every file. A describable file is in both outputs; a valid-named file
+    /// with no describable first line is in neither.
     #[test]
-    fn freeze_snapshot_derives_fingerprint_and_index_from_one_read() {
+    fn freeze_snapshot_derives_the_index_from_one_read() {
         let dir = temp_project();
         write_memory(&dir, "good", "# The deploy port is 7443\nbody");
         write_memory(&dir, "nodesc", "\n\n");
         let f = freeze_snapshot(&dir, 100 * DAY);
-        let fp: Vec<String> = f
-            .fingerprint_files
-            .iter()
-            .map(|(p, _)| p.file_stem().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(fp.contains(&"good".to_string()) && fp.contains(&"nodesc".to_string()),
-            "every valid-named file counts toward the fingerprint: {fp:?}");
         let (section, _) = f.section.clone().expect("the describable file is indexed");
         assert!(section.contains("The deploy port is 7443"), "{section}");
         let names: Vec<&str> = f.identities.iter().map(|(n, _)| n.as_str()).collect();

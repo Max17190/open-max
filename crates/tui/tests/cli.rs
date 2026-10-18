@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use open_max_core::config::ApprovalMode;
+
 fn openmax_bin() -> &'static str {
     env!("CARGO_BIN_EXE_openmax")
 }
@@ -86,7 +88,7 @@ fn damaged_continuation_preserves_bytes_before_hooks_or_provider_requests() {
     let id = open_max_core::sessions::create(&core, canonical.display().to_string()).unwrap().id;
     drop(core);
     let transcript = data.join("sessions").join(format!("{id}.messages.json"));
-    let bytes = b"{\"role\":\"user\",\"content\":\"preserve\"}\n{torn record";
+    let bytes = b"{\"role\":\"user\",\"content\":\"preserve\"}\n{damaged record}\n";
     std::fs::write(&transcript, bytes).unwrap();
     std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
     std::fs::write(project.join(".openmax/hooks/submit.toml"),
@@ -100,6 +102,90 @@ fn damaged_continuation_preserves_bytes_before_hooks_or_provider_requests() {
         assert_eq!(std::fs::read(&transcript).unwrap(), bytes);
         assert!(!project.join("should-not-run").exists());
     }
+    assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A session is recorded under its project's resolved path. When that
+/// directory moves and a symlink to another project takes its place, the
+/// path leads to the other project, which inherits none of the history
+/// recorded there: run from it, `--recall` finds nothing and `--continue`
+/// has no session to resume.
+#[cfg(unix)]
+#[test]
+fn a_symlink_that_takes_a_projects_place_does_not_carry_its_history() {
+    let (project, home) = fresh_dirs("retargeted-project");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    write_settings(&home, &format!("http://{}/v1", server.local_addr().unwrap()));
+    let earlier = project.parent().unwrap().join("earlier");
+    std::fs::create_dir(&earlier).unwrap();
+    let recorded = std::fs::canonicalize(&earlier).unwrap();
+    let (core, _) = open_max_core::state::Core::new(home.join(".openmax")).unwrap();
+    let id = open_max_core::sessions::create(&core, recorded.display().to_string()).unwrap().id;
+    let messages = [
+        open_max_core::types::ChatMessage::system("rules"),
+        open_max_core::types::ChatMessage::user("the quokkaberry rollout plan"),
+    ];
+    assert!(open_max_core::sessions::save_messages(&core, &id, &messages, &mut 0, false));
+    drop(core);
+    std::fs::rename(&recorded, project.parent().unwrap().join("moved")).unwrap();
+    std::os::unix::fs::symlink(&project, &recorded).unwrap();
+
+    let recalled = cmd(&project, &home).args(["--recall", "quokkaberry", "--json"]).output().unwrap();
+    assert!(recalled.status.success(), "{}", String::from_utf8_lossy(&recalled.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&recalled.stdout).unwrap();
+    assert_eq!(report["sessions_scanned"], 0, "{report}");
+    assert!(report["hits"].as_array().unwrap().is_empty(), "{report}");
+
+    let resumed = finish_with_deadline(cmd(&project, &home).args(["--trust-project", "--continue", "--stdio"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert_eq!(resumed.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no prior session in this directory"), "{stderr}");
+    assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A damaged session index is history openmax cannot read, not an empty past:
+/// `--continue` names the file instead of reporting that no prior session
+/// exists, a new session is refused the same way, and `--check` lists it as
+/// an error with the repair. Each refusal points at `--check` rather than
+/// leaving the user with a bare path to move while another openmax may still
+/// be saving to it. The damaged bytes stay as they were and no request
+/// reaches the model.
+#[test]
+fn a_damaged_session_index_is_named_by_continue_and_check() {
+    let (project, home) = fresh_dirs("damaged-index");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    write_settings(&home, &format!("http://{}/v1", server.local_addr().unwrap()));
+    let index = home.join(".openmax/sessions/index.json");
+    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+    std::fs::write(&index, "[{").unwrap();
+    let path = index.display().to_string();
+    for args in [
+        vec!["--trust-project", "--continue", "-p", "hello"],
+        vec!["--trust-project", "--continue", "--stdio"],
+        vec!["--trust-project", "-p", "hello"],
+        vec!["--trust-project", "--stdio"],
+    ] {
+        let output = finish_with_deadline(cmd(&project, &home).args(&args)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(&path), "{args:?} must name the damaged index: {error}");
+        assert!(error.contains("run openmax --check for the repair"), "{args:?} must point at the repair: {error}");
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {error}");
+        assert!(output.stdout.is_empty(), "{args:?} must fail before any output");
+        assert_eq!(std::fs::read(&index).unwrap(), b"[{");
+    }
+    let check = cmd(&project, &home).arg("--check").output().unwrap();
+    let report = String::from_utf8_lossy(&check.stdout);
+    let row = report.lines().find(|line| line.contains(&path))
+        .unwrap_or_else(|| panic!("--check must list the damaged index: {report}"));
+    assert!(row.starts_with("err") && row.contains("mv "), "{row}");
+    assert_eq!(check.status.code(), Some(1), "{report}");
+    assert_eq!(std::fs::read(&index).unwrap(), b"[{");
     assert_eq!(server.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
@@ -136,6 +222,24 @@ fn write_settings_with_mode(home: &Path, base_url: &str, approval_mode: &str) {
         ),
     )
     .unwrap();
+}
+
+/// Trust `project` as a human who answers `a` at the trust prompt does. For
+/// tests of the ask gates: `--trust-project` records auto, which skips them.
+fn trust_in_ask(project: &Path, home: &Path) {
+    let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), project, ApprovalMode::Ask);
+    assert_eq!(grant.unwrap().1, Some(ApprovalMode::Ask));
+}
+
+/// Approval records in this home's ledger logs, read from disk.
+fn approval_records(home: &Path) -> usize {
+    let Ok(dirs) = std::fs::read_dir(home.join(".openmax").join("ledger")) else {
+        return 0;
+    };
+    dirs.flatten()
+        .filter_map(|dir| std::fs::read_to_string(dir.path().join("log.jsonl")).ok())
+        .map(|log| log.lines().filter(|line| line.contains("\"kind\":\"approval\"")).count())
+        .sum()
 }
 
 fn cmd(project: &Path, home: &Path) -> Command {
@@ -188,6 +292,15 @@ fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The printed repair is pasted into a shell, so a path with a space must
+    // come back quoted, not split into two arguments.
+    let out = bare(&["--approve", ".openmax/hooks/my gate.toml"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`openmax --approve '.openmax/hooks/my gate.toml'`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = bare(&["--trust-project", "-p", "hi"]);
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
     // The attestation (what cmd() sets) is what lets test automation through.
@@ -196,6 +309,323 @@ fn approve_and_trust_refuse_without_a_terminal_or_attestation() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// What a user's shell, a CI job, or a frontend actually runs: none of the
+/// attestation `cmd` adds for test convenience.
+fn plain_cmd(project: &Path, home: &Path) -> Command {
+    let mut c = cmd(project, home);
+    c.env_remove("OPENMAX_HUMAN_ATTEST");
+    c
+}
+
+/// A pseudo-terminal: the controller end the test keeps, and the terminal end
+/// a child gets as stdin, which is what an interactive shell hands openmax.
+/// The controller must outlive the child.
+fn pseudo_terminal() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    // SAFETY: posix_openpt returns a new descriptor that the File then owns,
+    // and ptsname's static buffer is copied out before any other pty call.
+    let (controller, path) = unsafe {
+        let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+        let controller = std::fs::File::from_raw_fd(fd);
+        assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", std::io::Error::last_os_error());
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "ptsname: {}", std::io::Error::last_os_error());
+        let path = std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr(name).to_bytes());
+        (controller, path.to_owned())
+    };
+    let terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path)
+        .unwrap();
+    (controller, terminal)
+}
+
+/// Every line of a ```sh block that runs `--trust-project`.
+fn documented_trust_commands(markdown: &str) -> Vec<String> {
+    let mut shell_block = None;
+    let mut lines = Vec::new();
+    for line in markdown.lines().map(str::trim) {
+        if let Some(lang) = line.strip_prefix("```") {
+            shell_block = match shell_block {
+                Some(_) => None,
+                None => Some(matches!(lang, "sh" | "bash")),
+            };
+        } else if shell_block == Some(true) && line.contains("--trust-project") {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+/// The words and trailing comment of one documented shell line, split the
+/// way sh splits the forms the docs use: bare words, double-quoted strings,
+/// and a `# comment`.
+fn shell_words(line: &str) -> (Vec<String>, String) {
+    let (mut words, mut word, mut quoted) = (Vec::new(), None::<String>, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                word.get_or_insert_with(String::new);
+            }
+            '#' if !quoted && word.is_none() => return (words, chars.as_str().trim().to_string()),
+            c if c.is_whitespace() && !quoted => words.extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    assert!(!quoted, "unterminated quote in a documented command: {line}");
+    words.extend(word);
+    (words, String::new())
+}
+
+/// Read the stdio handshake, then quit through `input`. The child's stdout
+/// closing first (a refusal) is reported with its exit and stderr, and a
+/// child that stays alive without a handshake is killed at a deadline rather
+/// than hanging the test.
+fn stdio_handshake(
+    mut child: std::process::Child,
+    input: &mut dyn Write,
+) -> Result<std::process::Output, String> {
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut hello = String::new();
+        stdout.read_line(&mut hello).unwrap();
+        let _ = tx.send((hello, stdout));
+    });
+    // The reader comes back with the line and is held until the child exits,
+    // so nothing it writes after the handshake meets a closed pipe.
+    let (hello, _stdout) = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(read) => read,
+        Err(e) => {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            return Err(format!(
+                "no stdio handshake ({e}): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    };
+    if !hello.contains("\"hello\"") {
+        let out = finish_with_deadline(child);
+        return Err(format!(
+            "no stdio handshake (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    input.write_all(b"{\"cmd\":\"quit\"}\n").unwrap();
+    Ok(finish_with_deadline(child))
+}
+
+/// Run one documented trust command exactly as written, in a fresh project,
+/// in the context the docs give it: a line commented `from a terminal` gets a
+/// terminal on stdin, any other line gets the pipe a frontend or a CI job
+/// hands it. No variable is set that the line does not set itself. Success is
+/// the documented result: the run itself works, the project is trusted in
+/// auto although settings.json says ask, and a frontend's plain
+/// `openmax --stdio` then starts with no flag.
+fn run_documented_trust_command(line: &str) -> Result<(), String> {
+    let (words, comment) = shell_words(line);
+    let at = words.iter().position(|w| w == "openmax").ok_or("no openmax invocation")?;
+    let (project, home) = fresh_dirs("documented-trust");
+    let (base_url, _requests, _server) = spawn_stub_server();
+    write_settings(&home, &base_url);
+    let mut command = plain_cmd(&project, &home);
+    for assignment in &words[..at] {
+        let (name, value) = assignment
+            .split_once('=')
+            .ok_or_else(|| format!("unexpected word before openmax: {assignment}"))?;
+        command.env(name, value);
+    }
+    let args = &words[at + 1..];
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut controller = None;
+    if comment.contains("from a terminal") {
+        let (pty, terminal) = pseudo_terminal();
+        controller = Some(pty);
+        command.stdin(terminal);
+    } else {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().unwrap();
+    let out = if args.iter().any(|a| a == "--stdio") {
+        let mut pipe = child.stdin.take();
+        let input: &mut dyn Write = match (&mut controller, &mut pipe) {
+            (Some(pty), _) => pty,
+            (None, Some(pipe)) => pipe,
+            (None, None) => unreachable!("stdin is piped when no terminal is given"),
+        };
+        stdio_handshake(child, input)?
+    } else if args.iter().any(|a| a == "-p") {
+        finish_with_deadline(child)
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("neither -p nor --stdio: teach this test the documented result".into());
+    };
+    drop(controller);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() != Some(0) {
+        return Err(format!("exit {:?}: {}", out.status.code(), stderr.trim()));
+    }
+    if args.iter().any(|a| a == "-p") && !stdout.contains("stub says hi") {
+        return Err(format!("the turn did not reach stdout: {stdout}\n{stderr}"));
+    }
+    if open_max_core::trust::is_trusted(&home.join(".openmax"), &project) != Ok(true) {
+        return Err("the project is not trusted afterwards".into());
+    }
+    let mode = approval_mode(&home, &project);
+    if mode != ApprovalMode::Auto {
+        return Err(format!("the grant left the project in {}, not auto", mode.as_str()));
+    }
+    let mut frontend = plain_cmd(&project, &home)
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = frontend.stdin.take().unwrap();
+    let out = stdio_handshake(frontend, &mut pipe).map_err(|e| format!("frontend afterwards: {e}"))?;
+    if out.status.code() != Some(0) {
+        return Err(format!("frontend afterwards exited {:?}", out.status.code()));
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    Ok(())
+}
+
+/// Every trust command the README and the guides show runs verbatim and gets
+/// its documented result. A frontend spawns its command with stdin as the
+/// protocol pipe and CI has no terminal at all, so a command that only works
+/// when a human types it must say so, and the ones meant for a frontend or
+/// automation must work without one.
+#[test]
+fn documented_trust_commands_work_as_written() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut docs = vec![root.join("README.md")];
+    docs.extend(
+        std::fs::read_dir(root.join("docs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md")),
+    );
+    let (mut checked, mut failures) = (0, Vec::new());
+    for doc in docs {
+        let text = std::fs::read_to_string(&doc).unwrap();
+        for line in documented_trust_commands(&text) {
+            checked += 1;
+            if let Err(why) = run_documented_trust_command(&line) {
+                failures.push(format!("{}: `{line}`: {why}", doc.display()));
+            }
+        }
+    }
+    assert!(checked > 0, "the docs show no trust command, so this test pins nothing");
+    assert!(
+        failures.is_empty(),
+        "documented trust commands that do not work as written:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A frontend's stdin is its protocol pipe, never a terminal, so it cannot
+/// grant trust, and the refusal it gets on an untrusted project must name a
+/// grant that works for it rather than the flag that cannot. The grant the
+/// no-terminal refusal prints must paste into a shell as written, from a
+/// project whose path a shell would split.
+#[test]
+fn a_frontend_cannot_grant_trust_and_is_told_where_it_comes_from() {
+    let (base, home) = fresh_dirs("frontend-trust");
+    let project = base.join("my proj");
+    std::fs::create_dir_all(&project).unwrap();
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let spawn = |args: &[&str]| {
+        finish_with_deadline(
+            plain_cmd(&project, &home)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let out = spawn(&["--trust-project", "--stdio"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("no terminal"), "{stderr}");
+    let repair = format!(
+        "`cd {} && openmax --trust-project`",
+        open_max_core::doctor::shell_quote(&std::fs::canonicalize(&project).unwrap())
+    );
+    assert!(stderr.contains(&repair), "the printed grant must paste as written: {stderr}");
+    assert!(out.stdout.is_empty(), "a refused grant must not start a session");
+    assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &project), Ok(false));
+
+    // The frontend's user pastes this into a terminal that is usually not in
+    // the project, and a grant covers its subtree, so the repair must carry
+    // the project rather than trust wherever that terminal happens to be.
+    let out = spawn(&["--stdio"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("not trusted") && stderr.contains("from a terminal"), "{stderr}");
+    assert!(stderr.contains(&repair), "the grant must name the refused project: {stderr}");
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
+}
+
+/// The mode a fresh launch in `project` runs under: the project's saved
+/// choice or an enclosing one, else the settings value.
+fn approval_mode(home: &Path, project: &Path) -> ApprovalMode {
+    open_max_core::state::Core::new(home.join(".openmax")).unwrap().0.approval_mode(project)
+}
+
+/// `--trust-project` records auto for the project in the same trust.json
+/// write as the trust itself, so a newly trusted project runs in auto even
+/// where settings.json says ask (as most files do without the user choosing
+/// it: every settings save writes the whole file). A project trusted before
+/// grants recorded a mode is not granted again: it keeps resolving to the
+/// settings value. An agent-spawned process still can neither trust nor
+/// record a mode.
+#[test]
+fn trust_project_records_auto_for_a_project_it_newly_trusts() {
+    let (project, home) = fresh_dirs("trust-mode");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto, "{stderr}");
+    assert!(stderr.contains("auto") && stderr.contains("/approvals"), "the grant must say what it recorded: {stderr}");
+
+    let earlier = project.parent().unwrap().join("earlier");
+    std::fs::create_dir_all(&earlier).unwrap();
+    open_max_core::trust::trust_project(&home.join(".openmax"), &earlier).unwrap();
+    let out = cmd(&earlier, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(approval_mode(&home, &earlier), ApprovalMode::Ask, "no retroactive mode: {stderr}");
+    assert!(stderr.contains("already trusted") && stderr.contains("unchanged"), "{stderr}");
+
+    let spawned = project.parent().unwrap().join("spawned");
+    std::fs::create_dir_all(&spawned).unwrap();
+    let out = cmd(&spawned, &home)
+        .env("OPENMAX_SESSION", "parent")
+        .args(["--trust-project", "-p", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &spawned), Ok(false));
+    let store = std::fs::read_to_string(home.join(".openmax/trust.json")).unwrap();
+    let spawned = std::fs::canonicalize(&spawned).unwrap();
+    assert!(!store.contains(spawned.to_str().unwrap()), "an agent-spawned grant recorded state: {store}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 #[test]
@@ -230,6 +660,115 @@ fn check_exit_codes_follow_findings() {
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("broken.toml"), "{stdout}");
+}
+
+/// An agent runs `--check` after every extension file it writes, and the
+/// report stays in its transcript, re-sent with every later request. So the
+/// default report prints only rows to act on (warn and err, plus a hook's row,
+/// in auto mode the one place its shape is reported), names files relative to
+/// the project, and counts the files with nothing to report on one line.
+/// `--all` lists every row; the JSON face and the exit codes are unchanged.
+#[test]
+fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
+    let (project, home) = fresh_dirs("check-diet");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto);
+    assert_eq!(grant.unwrap().1, Some(ApprovalMode::Auto));
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.toml"), "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let skill = project.join(".agents").join("skills").join("notes");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: notes\ndescription: Take notes\n---\nBody.\n").unwrap();
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("watch.toml"), "event = \"turn_end\"\ncommand = \"/bin/echo\"\n").unwrap();
+    let root = std::fs::canonicalize(&project).unwrap().display().to_string();
+    let roots = [project.display().to_string(), root.clone()];
+    let check = |project: &Path, args: &[&str]| {
+        let out = cmd(project, &home).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(!report.lines().any(|l| l.starts_with("ok   tool") || l.starts_with("ok   skill")), "{report}");
+    assert!(roots.iter().all(|root| !report.contains(root.as_str())), "absolute path printed:\n{report}");
+    let summary: Vec<&str> = report.lines().filter(|l| l.starts_with("ok: ")).collect();
+    assert_eq!(summary.len(), 1, "{report}");
+    assert!(summary[0].contains("1 tool,") && summary[0].contains("1 skill"), "{report}");
+    assert!(summary[0].contains("openmax --check --all"), "{report}");
+    // A turn_end hook without `blocking` observes only, and in auto mode its
+    // row is the only report of that: it is not folded into the count.
+    assert!(
+        report.lines().any(|l| l.starts_with("ok   hook        .openmax/hooks/watch.toml") && l.contains("observer")),
+        "{report}"
+    );
+
+    let (code, all) = check(&project, &["--check", "--all"]);
+    assert_eq!(code, Some(0), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   tool        .openmax/tools/probe.toml  (tool 'probe'")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   skill       .agents/skills/notes/SKILL.md  (skill 'notes')")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   settings    ")), "{all}");
+    assert!(!all.lines().any(|l| l.starts_with("ok: ")), "{all}");
+
+    // A message prints as written: the parse error quotes the broken line,
+    // which names this very file by its quoted absolute path, and only the
+    // row's path column is relative.
+    let quoted = format!("'{root}/.openmax/tools/broken.toml'");
+    std::fs::write(tools.join("broken.toml"), format!("name = \"broken\"\ncommand = \"cat {quoted}\" oops\n")).unwrap();
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(1), "{report}");
+    let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    // The machine face still carries every finding, at its absolute path.
+    assert!(rows.iter().any(|r| r["status"] == "ok" && r["surface"] == "tool"), "{rows:?}");
+    assert!(rows.iter().all(|r| Path::new(r["path"].as_str().unwrap()).is_absolute()), "{rows:?}");
+    let reason = rows
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with("broken.toml"))
+        .and_then(|r| r["message"].as_str())
+        .unwrap();
+    assert!(reason.contains(&quoted), "the parse error quotes the line: {reason}");
+    let row = report
+        .lines()
+        .find(|l| l.starts_with("err  tool        .openmax/tools/broken.toml  "))
+        .unwrap_or_else(|| panic!("the broken manifest's row:\n{report}"));
+    assert!(row.ends_with(reason), "the row carries the reason as written {reason:?}: {row}");
+
+    // In ask, an unapproved tool's row carries the approval command, naming
+    // the file relative to the project; pasted there, it approves the tool,
+    // which then has nothing to report.
+    let (project, _) = fresh_dirs("check-diet-ask");
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.toml"), "name = \"probe\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    let command = report
+        .split("(openmax --approve ")
+        .nth(1)
+        .and_then(|rest| rest.split(", or").next())
+        .unwrap_or_else(|| panic!("no approval command:\n{report}"));
+    assert_eq!(command, "'.openmax/tools/probe.toml'", "{report}");
+    let approve = Command::new("/bin/sh")
+        .args(["-c", &format!("\"$0\" --approve {command}"), openmax_bin()])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env_remove("OPENMAX_SESSION")
+        .env("OPENMAX_HUMAN_ATTEST", "1")
+        .output()
+        .unwrap();
+    assert_eq!(approve.status.code(), Some(0), "{}", String::from_utf8_lossy(&approve.stderr));
+    let (code, report) = check(&project, &["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.starts_with("ok: 1 tool"), "{report}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let _ = std::fs::remove_dir_all(home.parent().unwrap());
 }
 
 /// `--check --run-examples` is the one path that executes project code, so it
@@ -279,8 +818,8 @@ fn run_examples_is_gated_and_reported_through_json() {
     assert_eq!(out.status.code(), Some(1));
     assert!(messages(&json(&out)).contains("not trusted"), "{}", messages(&json(&out)));
 
-    // Trust it (the endpoint is dead, so the turn fails after trust is stored).
-    cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    // Trust it in ask: the sandbox and approval gates below are ask's.
+    trust_in_ask(&project, &home);
 
     // Trusted but unapproved: each example probes in a sandbox with zero
     // host authority instead of refusing flat. The harmless prover passes
@@ -423,14 +962,6 @@ fn approve_names_every_file_it_blesses() {
         "approving a turn_end observer must say exit status is ignored: {stdout}"
     );
 
-    // The ledger's restore promise is true for what an approval blessed:
-    // the bound script's bytes are stored at approval time, so the audit
-    // row reads as fully restorable, not "(+1 bound file, 1 not stored)".
-    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
-    let ledger = String::from_utf8_lossy(&ledger.stdout);
-    assert!(ledger.contains("(+1 bound file)"), "{ledger}");
-    assert!(!ledger.contains("not stored"), "an approval stores its bound bytes: {ledger}");
-
     // The pair is live, and rewriting the script alone revokes it.
     let out = cmd(&project, &home).arg("--check").output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
@@ -439,6 +970,50 @@ fn approve_names_every_file_it_blesses() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("gate.sh"), "{stdout}");
+}
+
+/// An inert allow names the command that approves it, and `--approve` records
+/// the approval for the directory it runs in. The global file's path names no
+/// project, so a bare `openmax --approve ~/.openmax/permissions.toml` pasted
+/// into a terminal opened elsewhere (often $HOME) printed "approved" for that
+/// directory and left the project prompting. The printed command has to work
+/// from wherever it is pasted.
+#[test]
+fn the_printed_global_allow_approval_works_from_another_directory() {
+    let (project, home) = fresh_dirs("global-allow");
+    trust_in_ask(&project, &home);
+    std::fs::write(
+        home.join(".openmax").join("permissions.toml"),
+        "[[rules]]\neffect = \"allow\"\ntool = \"bash\"\n",
+    )
+    .unwrap();
+    let inert = || -> Option<String> {
+        let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["message"].as_str())
+            .find(|message| message.contains("are inert"))
+            .map(str::to_string)
+    };
+
+    let notice = inert().expect("an unapproved global allow is inert in ask");
+    let command = notice.rsplit('`').nth(1).unwrap_or_else(|| panic!("no command in {notice}"));
+    let bin_dir = Path::new(openmax_bin()).parent().unwrap();
+    let out = Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(&home)
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env_remove("OPENMAX_SESSION")
+        .env("OPENMAX_HUMAN_ATTEST", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{command}: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(inert(), None, "`{command}` run from {} must approve it for the project", home.display());
 }
 
 /// Deleting an approved hook fails every tool call closed, so a human who
@@ -511,8 +1086,8 @@ fn forget_refuses_without_a_human_at_a_terminal() {
     );
 }
 
-/// A ledger nobody can verify refuses to be read as history and names the
-/// way back - which is a human at an interactive terminal: agent sessions
+/// A ledger nobody can verify refuses to be extended and names the way
+/// back - which is a human at an interactive terminal: agent sessions
 /// and terminal-less runs are both refused, and the fail-closed state
 /// survives the refusal. The quarantine itself is proven at the unit level,
 /// where no confirmation prompt stands in the way.
@@ -544,7 +1119,12 @@ fn an_unverifiable_ledger_is_refused_and_repairable() {
     // The easiest tamper there is: delete the pin.
     std::fs::remove_file(dir.join("chain-head")).unwrap();
 
-    let out = cmd(&project, &home).arg("--ledger").output().unwrap();
+    // Approving again cannot extend a chain nobody can verify, and the
+    // refusal names the way back.
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("--ledger-repair"), "the way back must be named: {stderr}");
@@ -579,6 +1159,88 @@ fn an_unverifiable_ledger_is_refused_and_repairable() {
             e.file_name().to_string_lossy().starts_with("log.jsonl.unverified-")
         }),
         "a refused repair must move nothing"
+    );
+}
+
+/// Capability-file history is no longer recorded, so `--ledger` has nothing
+/// to print. It stays accepted so a script that calls it keeps working: one
+/// line says so and names where earlier records and objects stay, and
+/// nothing there is touched.
+#[test]
+fn ledger_is_deprecated_and_leaves_existing_records_in_place() {
+    let (project, home) = fresh_dirs("ledger-deprecated");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("gate.toml"), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n")
+        .unwrap();
+    let out = cmd(&project, &home)
+        .args(["--approve", ".openmax/hooks/gate.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(approval_records(&home), 1);
+    let dir = std::fs::read_dir(home.join(".openmax").join("ledger"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a ledger directory");
+    // An object an earlier build stored.
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    std::fs::write(dir.join("objects").join("a".repeat(64)), "earlier bytes").unwrap();
+    let log = std::fs::read(dir.join("log.jsonl")).unwrap();
+
+    let out = cmd(&project, &home).arg("--ledger").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.contains("no longer recorded"), "{stdout}");
+    assert!(stdout.contains(&dir.display().to_string()), "where the records stay: {stdout}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("objects").join("a".repeat(64))).unwrap(),
+        "earlier bytes",
+        "stored objects are kept"
+    );
+    assert_eq!(std::fs::read(dir.join("log.jsonl")).unwrap(), log, "the log is kept as it was");
+}
+
+/// Each early-exit operation runs and exits before the next one is
+/// considered, so a second operation on the same command line was dropped
+/// without a word: `--check --ledger` printed history and exited 0 having
+/// validated nothing. Any two operations are refused before either runs, with
+/// the usage exit and a first line that names both.
+#[test]
+fn two_operations_on_one_command_line_are_refused_naming_both() {
+    let (project, home) = fresh_dirs("two-operations");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n",
+    )
+    .unwrap();
+    let cases: [(&[&str], [&str; 2]); 3] = [
+        (&["--check", "--ledger"], ["--check", "--ledger"]),
+        (&["-p", "x", "--approve", ".openmax/hooks/gate.toml"], ["--print", "--approve"]),
+        (&["--stdio", "--forget", ".openmax/hooks/gate.toml"], ["--stdio", "--forget"]),
+    ];
+    let mut wrong = Vec::new();
+    for (args, named) in cases {
+        let out = cmd(&project, &home).args(args).stdin(Stdio::null()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The usage text that follows a refusal names every flag, so only the
+        // first line shows whether the refusal named this conflict.
+        let first = stderr.lines().next().unwrap_or_default();
+        if out.status.code() != Some(2) || !named.iter().all(|flag| first.contains(flag)) {
+            wrong.push(format!("{args:?} exited {:?}: {first}", out.status.code()));
+        }
+    }
+    assert!(wrong.is_empty(), "each pair must exit 2 naming both:\n{}", wrong.join("\n"));
+    // Refused before either ran: the approval was never recorded.
+    assert!(
+        !home.join(".openmax").join("ledger").exists(),
+        "a refused --approve must record nothing"
     );
 }
 
@@ -708,6 +1370,57 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("stub says hi"), "stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// The first error a local-model user meets is a server not started yet.
+/// Print mode says so in lines a human acts on: each retry names the server
+/// and the cause and counts to the attempt the request really ends on, and
+/// the error says what to do, once. It used to print reqwest's whole source
+/// chain three times, count retries to a budget of 8 that a refused address
+/// never reaches, and repeat the failure as "stopped (error)".
+#[test]
+fn refused_connection_names_the_host_and_the_cause() {
+    let (project, home) = fresh_dirs("refused");
+    let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    write_settings(&home, &format!("http://{addr}/v1"));
+    let run = |env: &[(&str, &str)]| {
+        let mut command = cmd(&project, &home);
+        for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
+            command.env_remove(var);
+        }
+        command.envs(env.iter().copied());
+        let out = finish_with_deadline(
+            command.args(["--trust-project", "-p", "say hi"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
+        );
+        assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let reason = format!("cannot connect to {addr} (connection refused)");
+    let expected = [
+        format!("openmax: {reason}; retrying (2 of 3)"),
+        format!("openmax: {reason}; retrying (3 of 3)"),
+        format!("openmax: error: {reason}: nothing is listening there; start the server or fix base_url (openmax --spec settings)"),
+    ];
+    let failure = |stderr: &str| -> Vec<String> {
+        stderr.lines().skip_while(|line| !line.contains(&reason)).map(str::to_string).collect()
+    };
+    let stderr = run(&[]);
+    assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
+
+    // Through a proxy that refuses, the refusal is the proxy's: naming the
+    // endpoint and advising to start it would send the user the wrong way,
+    // so the error keeps the client's own account.
+    let proxy = format!("http://{}", TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let stderr = run(&[("HTTP_PROXY", &proxy)]);
+    assert!(!stderr.contains("cannot connect to") && !stderr.contains("start the server"), "stderr: {stderr}");
+    assert!(stderr.contains("openmax: error: request failed: error sending request"), "stderr: {stderr}");
+
+    // A proxy that NO_PROXY exempts the endpoint from never saw the request,
+    // which is the common setup for a local server behind a proxy.
+    let stderr = run(&[("HTTP_PROXY", &proxy), ("NO_PROXY", "127.0.0.1")]);
+    assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 /// Prompt templates are a harness feature, not a TUI one: the delegate
@@ -854,8 +1567,9 @@ fn two_calls_to_an_unapproved_tool_cannot_batch_past_the_gate() {
     )
     .unwrap();
 
+    trust_in_ask(&project, &home);
     let out = cmd(&project, &home)
-        .args(["--trust-project", "--json", "-p", "peek twice"])
+        .args(["--json", "-p", "peek twice"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -910,8 +1624,9 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
     )
     .unwrap();
 
+    trust_in_ask(&project, &home);
     let out = cmd(&project, &home)
-        .args(["--trust-project", "--json", "-p", "peek at it"])
+        .args(["--json", "-p", "peek at it"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1122,6 +1837,43 @@ fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
     );
 }
 
+/// A provider that fails after its 200 has gone out says so inside the
+/// stream. That used to read as a clean end: the turn stopped with nothing
+/// reported, and a tool call that streamed before the failure ran. The turn
+/// fails with the provider's own message and runs nothing.
+#[test]
+fn a_provider_error_inside_the_stream_is_reported_and_runs_no_tool_call() {
+    let (project, home) = fresh_dirs("stream-error");
+    let failure = concat!(
+        "data: {\"error\":{\"code\":400,\"message\":\"upstream rejected the request\"},",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (format!("{WRITE_CALL_SSE}{failure}"), true),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    // auto, so a call that is not run was refused for this reason and not by
+    // the approval gate.
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let (code, lines, stdout) = json_turn(&project, &home, "write the file");
+    assert_eq!(code, Some(1), "a failed reply must not exit 0: {stdout}");
+    assert!(
+        !project.join("side-effect.txt").exists(),
+        "a call from a stream the provider failed must not run: {stdout}"
+    );
+    assert!(!lines.iter().any(|l| l["type"] == "tool_start"), "{stdout}");
+    assert!(
+        lines.iter().any(|l| l["type"] == "error"
+            && l["message"].as_str().is_some_and(|m| m.contains("upstream rejected the request"))),
+        "the provider's message must be reported: {stdout}"
+    );
+    let last = lines.last().expect("at least one line");
+    assert_eq!(last["type"], "done", "{stdout}");
+    assert_eq!(last["stop_reason"], "error", "{stdout}");
+}
+
 /// Control for the refusals above: in the same unattended mode, that exact
 /// call does run once the stream finishes. Without this, the refusal test
 /// could pass for the wrong reason, such as an approval gate.
@@ -1166,6 +1918,95 @@ fn assistant_text_never_dispatches_a_tool() {
         assert!(lines.iter().any(|l| l["type"] == "message_done" && l["text"] == text), "{stdout}");
         assert!(!session_dump(&home).contains("\"role\":\"tool\""));
     }
+}
+
+/// Opening a named pipe waits for a writer, and reading a pipe takes
+/// whatever arrives for as long as it keeps coming, so a file tool sent to
+/// one could wait indefinitely: Esc could not end the turn, because a
+/// started mutation is waited for, and /quit could not end the process,
+/// which waits on the blocked thread at exit. Each file tool names what the
+/// path is and leaves it unopened: a writer waiting on the pipe would wake
+/// to an open and lose its reader at the close.
+#[cfg(unix)]
+#[test]
+fn file_tools_name_a_pipe_or_socket_and_leave_it_unopened() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    // A socket's path is capped at about a hundred bytes, so the directory
+    // name is kept short.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("om-{:x}-{nonce:x}", std::process::id()));
+    // Take the pipe and socket away even when an assertion fails.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveOnDrop(base.clone());
+    let (project, home) = (base.join("project"), base.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pipe = std::ffi::CString::new(project.join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+    let _socket = std::os::unix::net::UnixListener::bind(project.join("sock")).unwrap();
+    // Opening a pipe to write waits for a reader to open it, so a tool that
+    // opened this one would let the writer through.
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let writer = {
+        let pipe = project.join("pipe");
+        std::thread::spawn(move || {
+            let _ = writer_tx.send("waiting");
+            let file = std::fs::OpenOptions::new().write(true).open(pipe);
+            let _ = writer_tx.send(if file.is_ok() { "opened" } else { "failed" });
+        })
+    };
+    assert_eq!(writer_rx.recv(), Ok("waiting"));
+    let script = vec![
+        (sse_tool_call("read_file", serde_json::json!({"path": "pipe"})), true),
+        (sse_tool_call("edit_file", serde_json::json!({"path": "pipe", "old_string": "a", "new_string": "b"})), true),
+        (sse_tool_call("write_file", serde_json::json!({"path": "pipe", "content": "x"})), true),
+        (sse_tool_call("read_file", serde_json::json!({"path": "sock"})), true),
+        (sse_text("done"), true),
+    ];
+    let (base_url, _requests, _server) = spawn_scripted_server(script);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "use the pipe"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let ends: Vec<(bool, String)> = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("every stdout line is JSON"))
+        .filter(|l| l["type"] == "tool_end")
+        .map(|l| (l["ok"] == true, l["output"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    let expected = [
+        "pipe is a named pipe, not a regular file",
+        "pipe is a named pipe, not a regular file",
+        "pipe is a named pipe, not a regular file",
+        "sock is a socket, not a regular file",
+    ];
+    assert_eq!(ends.len(), expected.len(), "every call must end: {stdout}");
+    for ((ok, output), expected) in ends.iter().zip(expected) {
+        assert!(!ok && output == expected, "{output:?} should be {expected:?}: {stdout}");
+    }
+    assert!(
+        std::fs::symlink_metadata(project.join("pipe")).unwrap().file_type().is_fifo(),
+        "write_file must not replace the pipe"
+    );
+    // An open by any tool let the writer through well before the run ended.
+    let early = writer_rx.recv_timeout(std::time::Duration::from_millis(200));
+    assert_eq!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout), "no file tool may open the pipe");
+    let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(project.join("pipe"));
+    assert_eq!(writer_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok("opened"), "the writer was waiting");
+    writer.join().unwrap();
 }
 
 /// A settings file this process will never act on must not be able to hide
@@ -1344,11 +2185,7 @@ fn an_attested_parent_does_not_let_a_bash_child_approve() {
     let out = cmd(&project, &home).args(["--trust-project", "-p", "go"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("exit=3"), "the child's --approve must refuse: {stderr}");
-    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
-    assert!(
-        !String::from_utf8_lossy(&ledger.stdout).contains("approved"),
-        "no approval may land from an agent's bash child"
-    );
+    assert_eq!(approval_records(&home), 0, "no approval may land from an agent's bash child");
 }
 
 /// A process the harness itself spawned has no human on its client: an agent
@@ -1376,25 +2213,9 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
         (sse_text("done"), true),
     ]);
     write_settings_with_mode(&home, &base_url, "ask");
-    // Trust as the human first (attested), then run the nested session the
-    // way an agent's bash would: session marker set, piped stdio, no tty.
-    {
-        // Trust without spending a scripted turn: handshake, then quit.
-        let mut trust = cmd(&project, &home)
-            .args(["--trust-project", "--stdio"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = trust.stdin.take().unwrap();
-        let mut hello = String::new();
-        BufReader::new(trust.stdout.take().unwrap()).read_line(&mut hello).unwrap();
-        assert!(hello.contains("\"hello\""), "{hello}");
-        writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
-        drop(stdin);
-        assert_eq!(trust.wait().unwrap().code(), Some(0));
-    }
+    // Trust as the human first, in ask, then run the nested session the way
+    // an agent's bash would: session marker set, piped stdio, no tty.
+    trust_in_ask(&project, &home);
     let mut child = cmd(&project, &home)
         .env("OPENMAX_SESSION", "1")
         .env_remove("OPENMAX_HUMAN_ATTEST")
@@ -1436,8 +2257,7 @@ fn a_nested_stdio_session_cannot_answer_its_own_content_card() {
     assert!(decline.contains("no human is on this client"), "the refusal says why: {decline}");
     assert!(decline.contains("openmax --approve"), "{decline}");
     assert!(!marker.exists(), "the unapproved tool must not have run");
-    let ledger = cmd(&project, &home).arg("--ledger").output().unwrap();
-    assert!(!String::from_utf8_lossy(&ledger.stdout).contains("approved"), "the ledger must record no grant");
+    assert_eq!(approval_records(&home), 0, "the ledger must record no grant");
 }
 
 /// A sandboxed probe cannot prove a tool that needs the network or a write
@@ -1462,8 +2282,8 @@ fn an_unapproved_sandbox_non_pass_warns_and_does_not_fail_the_check() {
         "name = \"nonpass\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo boom >&2; exit 3\"]\n\n[example]\n",
     )
     .unwrap();
-    // Trust so examples run (the endpoint is dead; trust is stored regardless).
-    cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    // Trust in ask so examples run unapproved, as sandboxed probes.
+    trust_in_ask(&project, &home);
 
     let out = cmd(&project, &home).args(["--check", "--run-examples"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1528,7 +2348,9 @@ fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
         (sse_text("done"), true),
     ]);
     write_settings(&home, &base_url);
-    let mut select = cmd(&project, &home).args(["--trust-project", "--stdio"])
+    // Trusted in ask, so the auto below is the frontend's selection, not the grant's.
+    trust_in_ask(&project, &home);
+    let mut select = cmd(&project, &home).arg("--stdio")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     select.stdin.take().unwrap().write_all(b"{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}\n{\"cmd\":\"quit\"}\n").unwrap();
     let selected = select.wait_with_output().unwrap();

@@ -14,12 +14,14 @@ access of Open Max.
 # .openmax/tools/todo_scan.toml
 name = "todo_scan"
 description = "List TODO/FIXME comments with file and line"
-command = "./scripts/todo-scan.sh"
+command = "sh"
+args = ["./scripts/todo-scan.sh"]
 timeout_secs = 30
 mutating = false
 
 [params]
 type = "object"
+required = ["path"]
 [params.properties.path]
 type = "string"
 description = "Directory to scan"
@@ -30,8 +32,14 @@ a security boundary and does not restrict what the command can do. Unknown keys
 in a tool file are rejected, so a misspelled `mutating` surfaces in
 `openmax --check` instead of silently taking the tool out of the approval gate.
 
+A script written with `write_file` has no execute bit, so the example names
+its interpreter as `command` and the script in `args` instead of needing a
+`chmod`.
+
 `params` must declare `type = "object"`, and every `properties` entry must be
-an object. The serialized schema is capped at 4096 bytes because it lives in
+an object. `required = [...]` goes directly under `[params]`: after a
+`[params.properties.*]` header, TOML assigns the line to that property. The
+serialized schema is capped at 4096 bytes because it lives in
 the frozen prompt prefix and is paid on every request; an oversized schema is
 rejected, not truncated. At most 64 external tools load (the name-sorted head);
 the prompt trailer reports how many were left out and `openmax --check` names
@@ -52,6 +60,32 @@ description: How to cut a release of this project
 Full instructions, checklists, commands...
 ```
 
+## MCP servers
+
+There is no MCP client in the agent loop. A server is adopted through the two
+surfaces above: one proxy tool per server with a `{tool, arguments}` schema,
+and one skill whose body lists the server's tools. Every request pays only
+for that schema and the skill's index line; the server's own tool schemas are
+read when the skill is. The `openmax` binary is the bridge between them, so a
+host needs nothing installed besides the server.
+
+```sh
+openmax --mcp-list -- npx -y @modelcontextprotocol/server-filesystem ~/notes
+echo '{"tool":"list_allowed_directories","arguments":{}}' |
+  openmax --mcp-call -- npx -y @modelcontextprotocol/server-filesystem ~/notes
+```
+
+`--mcp-list` prints the tools as a skill body, one line each with a compact
+argument summary (`--json` prints the full definitions). `--mcp-call` reads
+the call on stdin and prints the result's text; a tool error or a protocol
+error exits 1 with the reason. Each run starts the server, performs the
+initialize handshake, makes one request (every page of tools/list, or one
+tools/call), and stops it, with every wait bounded by `--mcp-timeout`
+(default 30 seconds). A server that needs a persistent session is not
+supported yet. `openmax --spec mcp` prints the recipe the agent follows: the
+proxy tool's TOML, with the server's credentials granted through `env`, and
+the shell lines that generate the skill.
+
 ## Memory
 
 One durable fact per markdown file under `.openmax/memory/`, written with the
@@ -61,6 +95,9 @@ only on demand. At session creation the live memories are ranked by ACT-R
 base-level activation (each past access at age `t` hours contributes
 `t^-0.5`; activation is the log of the sum, so one recall revives an old
 memory) and injected as one index line each under a 1500-byte budget. The
+index is frozen with the prompt: writing a memory mid-session does not
+re-freeze, so the prompt cache survives the write, and the new line appears at
+the next session, `/reload`, or a re-freeze a tool or skill change causes. The
 harness logs accesses through `read_file`, `write_file`, and `edit_file` to
 `.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
 over 21 days old leaves the index but stays searchable on disk. The harness
@@ -120,10 +157,10 @@ what an eval, audit, or telemetry hook needs to be written as a file instead of
 a core feature.
 
 Output is bounded twice and the payload reports both cuts. A tool result is
-itself a bounded rendering of what a process printed: `bash` keeps the tail up
-to its output cap and names a log file holding the bounded capture. So
-`process_bytes` is how many bytes the command actually produced (null when the
-tool ran no process, such as the file and search built-ins) and
+itself a bounded rendering of what a process printed: `bash` keeps the start
+and the end within its output cap and names a log file holding the bounded
+capture. So `process_bytes` is how many bytes the command actually produced
+(null when the tool ran no process, such as the file and search built-ins) and
 `process_truncated` says whether the result dropped part of it. A call killed
 by timeout or cancel reports the bytes it printed before it died, even though
 its result carries none of them. An audit hook can therefore tell a quiet
@@ -140,7 +177,38 @@ filesystem, environment, credentials, and network access.
 
 In `auto`, valid hooks run without content approval, including after edits.
 Malformed hooks block tools until repaired or removed; rewriting the broken
-manifest remains available. File changes activate at the next turn.
+manifest remains available. A gate never gates the repair of its own files:
+`write_file` and `edit_file` on its manifest, or on the script it runs, skip
+that gate when the file is inside the project. The script is a `command`
+written as a path, or the first `args` entry of an interpreter `command` such
+as `sh` or `python3` when no option precedes it and it has a script extension
+(`openmax --spec hooks` lists both). Every other gate and permission rule still
+judges the write, so in `auto` a gate cannot protect its own files: guard them
+with a deny rule or another gate.
+
+A hook cannot start when its command cannot be spawned for a reason its files
+explain (not found, no permission to execute it, as for every file
+`write_file` creates, or a file the system cannot execute), or when the script
+its interpreter gets does not exist (`sh`, `bash`, `ksh` and `dash` also look
+for a bare script name on PATH). In `auto`:
+
+- a `pre_tool_use` gate that cannot start blocks the calls it matches, except
+  writes to the files of another hook that cannot start or of a file failing
+  closed, and names the repair;
+- a project `user_prompt_submit` gate that cannot start lets the prompt go on
+  and is reported as not having checked it (to the frontend on each prompt, to
+  the model once per session for each distinct failure), while a global one
+  still blocks;
+- a blocking `turn_end` gate that cannot start is reported instead of
+  refusing, and the turn ends `unverified`;
+- a write to a hook file, or to the script one runs, is answered with each
+  hook whose command path is missing or has no executable bit, whose command
+  is not on PATH, or whose interpreter's script does not exist, and while a
+  blocking `turn_end` gate is in that state the model is also told at turn
+  start, once per session for each distinct failure.
+
+Manifest changes activate at the next turn; a script runs from disk, so an
+edit to it applies at the hook's next run.
 
 In `ask` and `readonly`, unknown keys in a hook file are rejected, and a hook file that a human approved
 and that no longer parses blocks every tool call until it is fixed or removed
@@ -161,8 +229,18 @@ Optional rules under `.openmax/permissions.toml` or
 `~/.openmax/permissions.toml` (project first). Not in the model prompt; empty
 discovery is free. First match wins. In `auto`, valid `allow` rules need no
 content approval and `ask` rules do not prompt; `deny` still blocks. In `ask`,
-project `allow` rules require content approval. Order: hooks pre → permissions →
-`approval_mode` → execute → hooks post.
+`allow` rules in either file are inert until a human approves that exact
+content with `openmax --approve <path>`, run in the directory the session
+starts in (`openmax --check` prints the command with that `cd`). The global
+file is no exception: `bash` can append to it from any session, and an
+unapproved global `allow` would otherwise skip the prompt in every `ask`
+project. The approval is per directory and per content. Unlike trust and the
+approval mode, it is not inherited, so a session started in a subdirectory, or
+a delegated `-p` child in a worktree under the project, needs its own. Any edit
+to the global file makes its `allow` rules inert again everywhere until it is
+approved again from each directory, and headless `-p` runs in `ask` decline
+those calls meanwhile. Order: hooks pre → permissions → `approval_mode` →
+execute → hooks post.
 
 ```toml
 # .openmax/permissions.toml
@@ -206,7 +284,8 @@ path and `openmax --check` prints the parse error.
 ## Proof of life
 
 A tool file may declare one `[example]` (JSON args plus an optional
-`expect_regex`). `openmax --check --run-examples` executes each declared
+`expect_regex`, matched with trailing whitespace removed, so `^[0-9]+$` passes
+`echo 63`). `openmax --check --run-examples` executes each declared
 example through the real spawn path. In `auto`, valid tools run with host
 authority without content approval, behind hook gates and permission denies.
 In `ask` or `readonly`, for an approved tool the example is the
@@ -223,7 +302,9 @@ honest proof that a freshly written tool actually runs.
 Running an approved example is running the tool: an unsandboxed host process
 in the project root with no snapshot taken. So it passes the same gates a turn
 applies. The project must be trusted. Outside `auto`, a human must have approved the tool
-file's exact bytes with `openmax --approve <path>`, `pre_tool_use` hooks must
+file's exact bytes and the project-local code it runs with
+`openmax --approve <path>` (a script edited since then is probed in the
+sandbox, as an unapproved tool is), `pre_tool_use` hooks must
 allow the call, permission rules must admit it (`deny` refuses, and so does
 `ask` outside auto: nothing here can prompt, so write `effect = "allow"` for a tool whose
 example should run unattended), and `approval_mode` still governs
@@ -240,8 +321,8 @@ content, never to a path: any edit produces a new hash and revokes itself.
 Living in the chain is the point: an approval store beside the log, with none
 of the log's protection, would be approvable by anything that can append a
 line of JSON - including the agent's own `bash`. Forging one now means forging
-the chain, which reads as tampering, and every real approval shows up in
-`openmax --ledger` with its time and actor.
+the chain, which reads as tampering, and every real approval is recorded with
+its time and actor.
 
 What gets hashed is the whole definition, not just the manifest. A tool or
 hook TOML is a pointer: the file its `command` names (or a path in its `args`)
@@ -290,6 +371,9 @@ restores these requirements; running under auto does not bless their hashes:
   runs makes the next call prompt again. Rewriting a blessed script is the same
   act as rewriting the manifest, and it is caught on every path a call can take
   - including the concurrent batch path, where read-only tools run unattended.
+  In `auto` none of this is consulted: every external tool runs without
+  content approval, read-only ones batch like any other read-only call, and
+  no turn reads the ledger.
 - Deleting an approved hook file fails closed too, and is found by reconciling
   the approved paths rather than the directory listing: a deleted file leaves
   nothing to parse and nothing to report against, and `rm gate.toml` is easier
@@ -350,15 +434,10 @@ are the gate.
 
 ## The capability ledger
 
-Every tool and skill file a freeze reads is recorded in a per-project,
-append-only, hash-chained ledger under `~/.openmax/ledger/`, together with a
-content-addressed copy of the bytes. Each record carries the actor at the
-strength the harness can prove: `session` (changed while an agent turn was
-running), `external` (changed while none was: a human, `git pull`, an
-installer), or `initial` (present when the ledger was first populated). The
-ledger lives outside the project, where the confined file tools never write,
-and each record chains the hash of the previous one, so tampering through the
-shell is detectable.
+Approvals live in a per-project, append-only, hash-chained ledger under
+`~/.openmax/ledger/`. The ledger lives outside the project, where the confined
+file tools never write, and each record chains the hash of the previous one,
+so tampering through the shell is detectable. Turns in `auto` never read it.
 
 Beside the log sits `chain-head`, the hash of its final record. The chain
 alone proves internal order but not completeness - lopping off trailing
@@ -367,23 +446,27 @@ detectable, and a log without one cannot be verified at all. Deleting either
 file therefore reads as tampering, not as a fresh project. An append writes a
 pending pin first, flushes the records, then moves the pin, so a crash
 mid-append leaves a state that reads as an interrupted write (nothing was
-removed) and re-pins itself on the next change, rather than an accusation.
+removed) and re-pins itself on the next append, rather than an accusation.
 
-Every re-freeze announces a receipt - the `refrozen` event lists what changed
-and who changed it - so the agent's action space never mutates silently.
-`openmax --ledger` prints the history with object paths, human times, the
-session that observed each change, and every approval; it verifies each object
-against its own hash, so a rewritten one is named instead of silently offered
-for restore. Restoring an earlier version is an ordinary `cp` from the objects
-directory. There is no rollback command: the core guarantees the history
-exists, using it stays file work.
+Earlier versions also recorded every change to a tool or skill file here,
+with a copy of its bytes under `objects/`. That history is no longer
+recorded. Records and objects already on disk are kept unchanged and never
+deleted, and their log still verifies, so an older binary can keep using it.
+`openmax --ledger` is deprecated: it prints one line saying so and where this
+project's records are kept, and exits 0.
+
+Every re-freeze announces a receipt - the `refrozen` event lists each tool or
+skill file added, modified, or removed - so the agent's action space never
+mutates silently. The first re-freeze after a session resumes compares against
+the session's saved manifest, which carries only the loaded tools and the skill
+index, so a skill body edited while the session was closed is not named there.
 
 A ledger that cannot be verified stops appending (a chain nobody can trust
-must not be extended) and revokes every approval it held, but never blocks a
-turn: the failure rides the refreeze receipt. `openmax --ledger-repair` is the
-way back - a human action, refused inside agent-spawned processes, that
-quarantines the damaged log as evidence, keeps the objects, and starts a new
-chain. Approvals in that log go with it and have to be granted again.
+must not be extended) and revokes every approval it held, so outside `auto`
+hooks fail closed until it is repaired. `openmax --ledger-repair` is the way
+back - a human action, refused inside agent-spawned processes, that
+quarantines the damaged log as evidence, keeps any stored objects, and starts
+a new chain. Approvals in that log go with it and have to be granted again.
 
 ## Self-measurement
 
@@ -403,9 +486,11 @@ extensions that were never used.
 `openmax --check` parses tools, skills, templates, hooks, permissions, and
 `providers.json`, then prints per-file results with the reason anything would
 be ignored, fail closed, or fail at request time. The agent is instructed to
-run it after writing extension files.
+run it after writing extension files. It also reads the session index: a
+damaged one is an `err` row whose message carries the repair (close every
+openmax, then move the file aside to the name the row gives).
 
-Each line is `ok`, `warn`, or `err`, and only `err` exits nonzero:
+Each row is `ok`, `warn`, or `err`, and only `err` exits nonzero:
 
 - `err` is a file the loop cannot use: it does not parse, it fails closed, or
   it can never work (a tool shadowing a built-in name).
@@ -413,6 +498,15 @@ Each line is `ok`, `warn`, or `err`, and only `err` exits nonzero:
   nothing reads, a definition another tier overrides, a rule naming a tool
   that does not exist. Each of these is legitimate in some project, so none
   of them fails the check.
+
+The agent rereads the report with every later request of its session, so by
+default it prints only the rows of files with a `warn` or `err` and of hooks
+(a hook's `ok` row says what it enforces: its event, and whether it gates).
+Files that loaded with nothing to report are counted, per surface, on one
+line (a memory not in the index is noted in its count), and
+`openmax --check --all` prints their rows. The report names files under the
+current directory relative to it, in each row's path and in the paths and
+repair commands it writes into a message.
 
 Warnings cover the ways a file goes missing without being broken. A directory
 at `.openmax/tool/` or `.openmax/skills/`, a `.yaml` where a `.toml` is read,
@@ -425,12 +519,12 @@ loop never loads it and so never fails closed on it.
 ## Self-description
 
 `openmax --spec <surface>` prints the complete authoring contract for one
-surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`, or
-`stdio`): file grammar, field caps and defaults, hook stdin payload shapes, and
-activation timing. The frozen prompt carries only a one-line pointer to it, so
-the full contract costs zero tokens until the agent reads it, and the printed
-examples are parsed by the same validation code in tests so the text cannot
-drift from the binary.
+surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
+`stdio`, or `mcp`): file grammar, field caps and defaults, hook stdin payload
+shapes, and activation timing. The frozen prompt carries only a one-line
+pointer to it, so the full contract costs zero tokens until the agent reads
+it, and the printed examples are parsed by the same validation code in tests
+so the text cannot drift from the binary.
 
 ## Freezing and re-freezing
 

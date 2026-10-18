@@ -5,26 +5,51 @@
 //! `stream_options`, and provider-specific headers. The request body is
 //! serialized once before the retry loop so a retry resends identical bytes.
 //!
-//! Retries cover what a network can do to one request before the reply
-//! exists: a transport failure on send, a 429, and a stream that died before
+//! Retries cover what can end one request before the reply exists: a
+//! transport failure on send, a rate limit or transient server error (429,
+//! 500, 502, 503, 504, 529), and a stream that died, went silent, or
+//! carried a data line this client cannot read, or a stream or reply the
+//! server failed with a rate limit, an overload, or a server fault, before
 //! any reply text arrived. Each attempt resends the same bytes after an
-//! exponential backoff and tells the caller through [`StreamDelta::Retry`].
-//! Once reply text has streamed, a retry would duplicate what the caller
-//! already showed, so a failure after that point is reported as a
-//! truncation instead. Reasoning deltas do not count: a retried attempt's
-//! reasoning is void, and the result carries only the final attempt's.
-//! A stream this client ends on purpose (the size cap, an out-of-range tool
-//! index, cancellation) is never retried: the next attempt would end the
-//! same way. A reply carrying only tool calls has no reply text, so a server
-//! that never sends a completion signal costs the whole budget on such a
-//! reply before its truncation is reported.
+//! exponential backoff, stretched to a server's Retry-After, and tells the
+//! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
+//! a Retry-After longer than a minute, are reported at once: no wait the
+//! turn would take lets the request succeed. Once reply text has streamed,
+//! a retry would duplicate what the caller already showed, so a cut after
+//! that point is reported as a truncation instead. A failure the server
+//! reports inside a 200 response (an `error` object on the chunk or reply
+//! or on its choice, or finish_reason `error`) is never a reply, whatever
+//! partial output came with it: unless it is retried, it is an error
+//! carrying the server's own message. So is a reply the server finished as
+//! `tool_calls` with no call in it and no text: returned, it would end the
+//! turn with nothing done and nothing said. A cut after the server finished
+//! its reply leaves the reply finished. Reasoning deltas do not count: a
+//! retried attempt's reasoning is void, and the result carries only the
+//! final attempt's. A stream this client ends on purpose (the size cap, an
+//! out-of-range tool index, cancellation) is never retried: the next attempt
+//! would end the same way. A reply carrying only tool calls has no reply
+//! text, so a server that never sends a completion signal costs the whole
+//! budget on such a reply before its truncation is reported.
 //!
-//! There is no overall request timeout, only a connect timeout. A local or
-//! slow endpoint can legitimately take minutes to generate, and a deadline
-//! here would look like a bug in the model rather than a policy in the client.
+//! There is no overall request timeout. A local or slow endpoint can
+//! legitimately take minutes to generate, and a deadline here would look like
+//! a bug in the model rather than a policy in the client. Silence ends an
+//! attempt instead: an endpoint that sends nothing at all (no response
+//! headers, no reply bytes, not even an SSE keepalive comment) for
+//! [`IDLE_TIMEOUT`], or its provider's `idle_timeout_secs`, is a connection
+//! that failed, under the rules above. A one-shot JSON reply or a refusal
+//! whose body goes silent is an error, as a cut there is.
 //! A stream that ends without `[DONE]` and without a `finish_reason` is
 //! reported as truncated rather than treated as a complete reply.
+//!
+//! A credential never crosses plain http to another machine: a request that
+//! would carry the key, a credential header (Authorization, X-API-Key, or any
+//! header named as one, see `is_credential_header`), or user:password from
+//! the base_url that way is refused before it is sent. Nor does a request
+//! leave the server the base_url names: a redirect is followed only on the
+//! same scheme, host, and port, and one anywhere else fails the request.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -70,8 +95,10 @@ struct StreamOptions {
 
 /// The transcript as one endpoint receives it, borrowed so a request never
 /// copies it. Each message goes out as it serializes on disk, except that
-/// reasoning goes only to the endpoint that produced it (`origin` matches
-/// the message's `reasoning_origin`), and the stamp itself never goes.
+/// reasoning, `reasoning_details`, and each tool call's `extra_content` go
+/// only to the endpoint that produced them (`origin` matches the message's
+/// `reasoning_origin`), and the stamp itself never goes. What does go is
+/// the stored bytes, unchanged.
 struct WireMessages<'a> {
     messages: &'a [ChatMessage],
     origin: &'a str,
@@ -84,10 +111,11 @@ impl Serialize for WireMessages<'_> {
             WireMessage {
                 role: &m.role,
                 content: m.content.as_deref(),
-                tool_calls: m.tool_calls.as_deref(),
+                tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| replay),
                 reasoning: m.reasoning.as_deref().filter(|_| replay),
+                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
             }
         }))
     }
@@ -101,13 +129,45 @@ struct WireMessage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<&'a [ToolCall]>,
+    tool_calls: Option<WireToolCalls<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<&'a RawValue>,
+}
+
+/// One message's tool calls on the wire, each carrying its `extra_content`
+/// only when `replay` says the receiver produced it.
+struct WireToolCalls<'a> {
+    calls: &'a [ToolCall],
+    replay: bool,
+}
+
+impl Serialize for WireToolCalls<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.calls.iter().map(|c| WireToolCall {
+            id: &c.id,
+            kind: &c.kind,
+            function: &c.function,
+            extra_content: c.extra_content.as_deref().filter(|_| self.replay),
+        }))
+    }
+}
+
+/// One tool call on the wire. Fields, order, and skip rules follow
+/// `ToolCall`, so a call without `extra_content` keeps its exact bytes.
+#[derive(Serialize)]
+struct WireToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    function: &'a ToolCallFunction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_content: Option<&'a RawValue>,
 }
 
 /// Serialize the chat-completion request body once. Honors multi-provider
@@ -172,14 +232,16 @@ fn serialize_chat_request_body(
 pub enum StreamDelta {
     Content(String),
     Reasoning(String),
-    /// The request is being resent: `attempt` is the one about to go out of
-    /// the `max_attempts` budget, after `reason` ended the previous one. It
-    /// is announced before the backoff wait, which is what the caller is
-    /// waiting through; a cancellation during the wait ends the request
-    /// instead, and the attempt never goes out. Any reasoning streamed for
-    /// the failed attempt is void; no content was. A request gives up before
-    /// the budget when [`UNREACHED_ATTEMPTS`] in a row never reached the
-    /// endpoint.
+    /// The request is being resent: `attempt` is the one about to go out,
+    /// after `reason` ended the previous one, and `max_attempts` the one the
+    /// request ends on if it keeps failing that way. That is the budget, or,
+    /// while the latest attempts in a row failed to connect or timed out, the
+    /// one that makes [`UNREACHED_ATTEMPTS`] of them if that comes first, so
+    /// it rises again when an attempt ends any other way. It is announced
+    /// before the backoff wait, which is what the caller is waiting through;
+    /// a cancellation during the wait ends the request instead, and the
+    /// attempt never goes out. Any reasoning streamed for the failed attempt
+    /// is void; no content was.
     Retry { attempt: u32, max_attempts: u32, reason: String },
 }
 
@@ -191,6 +253,13 @@ pub const TRUNCATED: &str = "truncated";
 // Bound wire input, including reasoning, unterminated lines, and tool arguments.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
+/// How long an endpoint may send nothing at all (no response headers, no
+/// reply bytes, no keepalive comment) before the attempt ends as a transport
+/// fault. Generous, because a local server can spend minutes on a long
+/// prompt before its first byte; a provider's `idle_timeout_secs` sets
+/// another. Without one, an endpoint that took the request and went quiet
+/// held the turn forever.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct CompletionResult {
     pub content: String,
@@ -201,6 +270,12 @@ pub struct CompletionResult {
     /// string (`reasoning_fields` says which).
     pub reasoning_content: Option<String>,
     pub reasoning: Option<String>,
+    /// The reply's `reasoning_details`, for the same message under the same
+    /// stamp: set when the server sent the key as an array with entries. An
+    /// empty one carries no signature, and OpenRouter sends it on every delta
+    /// of a model that does not reason, so it counts as absent: keeping it
+    /// would change the bytes of every such message on disk and on the wire.
+    pub reasoning_details: Option<Box<RawValue>>,
     /// The server's reason, or `cancelled` (we stopped reading) or
     /// [`TRUNCATED`] (the server stopped writing without ever finishing).
     pub finish_reason: String,
@@ -210,8 +285,9 @@ pub struct CompletionResult {
 
 /// Ground-truth token usage from the server. `cached_tokens` is the number of
 /// prompt tokens served from the prompt cache (servers report it under
-/// `prompt_tokens_details`): if it stays near zero across turns, the harness
-/// broke prefix stability and every step is paying a full re-prefill.
+/// `prompt_tokens_details` or as `prompt_cache_hit_tokens`): if it stays
+/// near zero across turns, the harness broke prefix stability and every
+/// step is paying a full re-prefill.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
@@ -230,51 +306,67 @@ pub struct ChatClient {
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
     pub send_stream_options: bool,
+    /// How long the endpoint may send nothing before an attempt ends.
+    idle_timeout: std::time::Duration,
+    /// Why the settings key was withheld from this endpoint, for a 401 to
+    /// report (see `ActiveEndpoint::key_hint`).
+    key_hint: Option<String>,
     http: reqwest::Client,
 }
 
 #[derive(Default)]
 struct PartialToolCall {
+    // The streamed `index` that opened this call, if the server sent one.
+    index: Option<u64>,
     id: String,
     name: String,
+    // Pieces equal to `name` held back since it last grew: a repeat of the
+    // whole name unless a different piece follows them.
+    name_repeats: usize,
     arguments: String,
+    extra_content: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
 struct StreamChunk {
-    choices: Vec<StreamChoice>,
+    // A failure line may carry no choices at all, or `choices: null`.
+    choices: Option<Vec<StreamChoice>>,
     // Sent on the final chunk when the request asks for it via stream_options.
-    usage: Option<UsageJson>,
+    // Kept untyped and read by [`parse_usage`]: a count typed as a float
+    // (`12.0`) failed the whole chunk, and the reply text beside it.
+    usage: Option<Value>,
+    // A failure the server reports after its 200 has gone out: alone on its
+    // line, or beside a choice that ends with finish_reason `error`.
+    error: Option<Value>,
 }
 
-#[derive(Deserialize)]
-struct UsageJson {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-#[derive(Deserialize)]
-struct PromptTokensDetails {
-    cached_tokens: Option<u64>,
-}
-
-impl UsageJson {
-    fn into_usage(self) -> Usage {
-        Usage {
-            prompt_tokens: self.prompt_tokens.unwrap_or(0),
-            completion_tokens: self.completion_tokens.unwrap_or(0),
-            cached_tokens: self.prompt_tokens_details.and_then(|d| d.cached_tokens),
-        }
+/// The usage a reply reports, or None without a usage object. Each count is
+/// read on its own, so a value of a shape this client does not expect under
+/// one key costs nothing under the others: a count that is not a whole
+/// number (a string, a fraction, a negative) reads as not reported, and a
+/// whole number typed as a float is the count.
+fn parse_usage(usage: &Value) -> Option<Usage> {
+    if !usage.is_object() {
+        return None;
     }
+    let count = |v: &Value| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64));
+    Some(Usage {
+        prompt_tokens: count(&usage["prompt_tokens"]).unwrap_or(0),
+        completion_tokens: count(&usage["completion_tokens"]).unwrap_or(0),
+        // Some servers report cache hits as a top-level
+        // `prompt_cache_hit_tokens` instead of (or beside) the details field.
+        cached_tokens: count(&usage["prompt_tokens_details"]["cached_tokens"]).or_else(|| count(&usage["prompt_cache_hit_tokens"])),
+    })
 }
 
 #[derive(Deserialize)]
 struct StreamChoice {
     finish_reason: Option<String>,
-    // Some servers omit `delta` entirely on the final finish_reason chunk.
-    #[serde(default)]
-    delta: StreamDeltaJson,
+    // Some servers omit `delta` entirely on the final finish_reason chunk,
+    // and some send it as null.
+    delta: Option<StreamDeltaJson>,
+    // A failure can ride the choice instead of the chunk.
+    error: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -282,6 +374,9 @@ struct StreamDeltaJson {
     content: Option<String>,
     reasoning_content: Option<String>,
     reasoning: Option<String>,
+    // Kept untyped, so an entry of a shape this client does not expect
+    // cannot fail the whole chunk and the content beside it.
+    reasoning_details: Option<Value>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -290,12 +385,15 @@ struct ToolCallDelta {
     index: Option<u64>,
     id: Option<String>,
     function: Option<ToolCallFnDelta>,
+    // Opaque: any JSON value parses, so it cannot fail the chunk either.
+    extra_content: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
 struct ToolCallFnDelta {
     name: Option<String>,
-    arguments: Option<String>,
+    // A string on the wire, but some gateways send the object itself.
+    arguments: Option<Value>,
 }
 
 impl ChatClient {
@@ -314,16 +412,20 @@ impl ChatClient {
 
     /// Build a client from a resolved multi-provider endpoint.
     pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
-        Self::with_options(
-            ep.base_url.clone(),
-            ep.api_key.clone(),
-            ep.model.clone(),
-            ep.temperature,
-            ep.max_tokens,
-            ep.headers.clone(),
-            ep.compat.use_max_completion_tokens,
-            ep.compat.send_stream_options,
-        )
+        Self {
+            idle_timeout: ep.idle_timeout_secs.map_or(IDLE_TIMEOUT, |secs| std::time::Duration::from_secs(secs.max(1))),
+            key_hint: ep.key_hint.clone(),
+            ..Self::with_options(
+                ep.base_url.clone(),
+                ep.api_key.clone(),
+                ep.model.clone(),
+                ep.temperature,
+                ep.max_tokens,
+                ep.headers.clone(),
+                ep.compat.use_max_completion_tokens,
+                ep.compat.send_stream_options,
+            )
+        }
     }
 
     // One argument per endpoint option; the call sites build it straight from
@@ -345,11 +447,16 @@ impl ChatClient {
         static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
         let http = HTTP
             .get_or_init(|| {
-                reqwest::Client::builder()
+                let builder = reqwest::Client::builder()
                     .connect_timeout(std::time::Duration::from_secs(10))
-                    // No overall timeout: local generations can legitimately take minutes.
-                    .build()
-                    .expect("failed to build http client")
+                    // No overall timeout: local generations can legitimately
+                    // take minutes. `stream_chat` ends an attempt on silence.
+                    .redirect(reqwest::redirect::Policy::custom(same_server_redirect));
+                // Tests talk to stub servers on loopback, which a developer's
+                // proxy variables must not reroute (see [`through_proxy`]).
+                #[cfg(test)]
+                let builder = builder.no_proxy();
+                builder.build().expect("failed to build http client")
             })
             .clone();
         Self {
@@ -361,12 +468,25 @@ impl ChatClient {
             headers,
             use_max_completion_tokens,
             send_stream_options,
+            idle_timeout: IDLE_TIMEOUT,
+            key_hint: None,
             http,
         }
     }
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Whether a request carries a credential: the key, a credential header
+    /// among the provider's headers (see [`is_credential_header`]), or
+    /// user:password in the base_url, which the HTTP client turns into a
+    /// Basic Authorization header.
+    fn sends_credential(&self) -> bool {
+        self.api_key.as_deref().is_some_and(|key| !key.is_empty())
+            || self.headers.iter().any(|(name, _)| is_credential_header(name))
+            || reqwest::Url::parse(self.base_url.trim())
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
     }
 
     /// The stamp for reasoning this endpoint produces: the first 16 hex chars
@@ -403,6 +523,11 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
+        if self.sends_credential() {
+            if let Some(refusal) = plain_http_refusal(&self.base_url) {
+                return Err(refusal);
+            }
+        }
         // Serialize once before retries: cloning bytes is cheap; re-walking a
         // long transcript into Value (and re-serializing) on every attempt is not.
         // Tools ride as RawValue from the frozen registry wire form.
@@ -439,30 +564,64 @@ impl ChatClient {
             }
             // An endpoint can spend a long time in prompt processing before the
             // first byte arrives, and a large prompt makes that worse wherever
-            // it runs; keep cancellation responsive throughout.
+            // it runs; keep cancellation responsive throughout. Only silence
+            // for the whole idle interval ends the wait.
             let send_result = tokio::select! {
-                r = req.send() => r,
+                r = tokio::time::timeout(self.idle_timeout, req.send()) => r,
                 _ = cancelled.cancelled() => return Ok(cancelled_response()),
             };
             let resp = match send_result {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("request failed: {}", describe_transport(&e));
-                    unreached = if e.is_connect() || e.is_timeout() { unreached + 1 } else { 0 };
-                    if attempt < MAX_ATTEMPTS && unreached < UNREACHED_ATTEMPTS && is_transient_transport(&e) {
-                        if !retry_after(attempt, &msg, &cancelled, &mut on_delta).await {
+                Ok(Ok(r)) => r,
+                // The endpoint took the request and sent nothing back, not
+                // even a status line (a wedged server, a proxy holding a dead
+                // upstream). Waiting on would hold the turn for good. Nothing
+                // has reached the caller, so it is resent like any transport
+                // fault after the connection existed.
+                Err(_) => {
+                    unreached = 0;
+                    let msg = format!("request failed: {}", silence(self.idle_timeout));
+                    if attempt < MAX_ATTEMPTS {
+                        if !retry_after(attempt, MAX_ATTEMPTS, &msg, &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
                     }
                     return Err(msg);
                 }
+                Ok(Err(e)) => {
+                    unreached = if e.is_connect() || e.is_timeout() { unreached + 1 } else { 0 };
+                    // The attempt this request ends on if it keeps failing
+                    // this way: the budget, or, while the latest attempts
+                    // failed to connect or timed out, the one that makes
+                    // UNREACHED_ATTEMPTS of them in a row, if that comes
+                    // first. The retry line counts to it, not to a budget a
+                    // dead address never spends.
+                    let last = match unreached {
+                        0 => MAX_ATTEMPTS,
+                        n => MAX_ATTEMPTS.min(attempt + UNREACHED_ATTEMPTS - n),
+                    };
+                    let (msg, repair) = never_connected(&e, e.url().is_some_and(through_proxy))
+                        .unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
+                    if attempt < last && is_transient_transport(&e) {
+                        if !retry_after(attempt, last, &msg, &cancelled, &mut on_delta).await {
+                            return Ok(cancelled_response());
+                        }
+                        continue;
+                    }
+                    return Err(if repair.is_empty() { msg } else { format!("{msg}: {repair}") });
+                }
             };
             unreached = 0;
             let status = resp.status();
+            // The server's wait governs a resend whether it refused the
+            // request by status or failed it inside a 200. An ask past the
+            // cap outlasts any wait this turn takes: resending would only
+            // meet the same refusal.
+            let asked = retry_after_secs(resp.headers());
+            let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
             if !status.is_success() {
                 let code = status.as_u16();
-                let body = read_body(resp, &cancelled).await
+                let body = read_body(resp, &cancelled, self.idle_timeout).await
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
                 let text = String::from_utf8_lossy(&body);
@@ -471,13 +630,18 @@ impl ChatClient {
                 if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
                 }
-                if attempt < MAX_ATTEMPTS && is_retryable_status(code) {
-                    if !retry_after(attempt, &err, &cancelled, &mut on_delta).await {
+                if code == 401 {
+                    if let Some(hint) = &self.key_hint {
+                        err.push_str(hint);
+                    }
+                }
+                if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) && beyond_cap.is_none() {
+                    if !resend_after(attempt, MAX_ATTEMPTS, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
                     }
                     continue;
                 }
-                return Err(err);
+                return Err(naming_wait(err, beyond_cap));
             }
             let is_json = resp
                 .headers()
@@ -487,38 +651,117 @@ impl ChatClient {
 
             // Some servers ignore `stream` and return a complete JSON body.
             if is_json {
-                let Some(body) = read_body(resp, &cancelled).await? else { return Ok(cancelled_response()); };
+                let Some(body) = read_body(resp, &cancelled, self.idle_timeout).await? else { return Ok(cancelled_response()); };
                 let v: Value = serde_json::from_slice(&body).map_err(|e| format!("bad JSON response: {e}"))?;
+                // A 200 can still carry a failure in place of the reply: an
+                // error at the top level, or one on the choice beside
+                // finish_reason `error` and partial output that must not
+                // stand as the reply. None of it has reached the caller, so
+                // the restart rules hold and a retry repeats nothing.
+                let choice = &v["choices"][0];
+                let error = [&v["error"], &choice["error"]].into_iter().find(|e| !e.is_null());
+                if error.is_some() || choice["finish_reason"] == "error" {
+                    let failure = server_failure(error.unwrap_or(&Value::Null), &String::from_utf8_lossy(&body));
+                    if failure.retryable && attempt < MAX_ATTEMPTS && beyond_cap.is_none() {
+                        if !resend_after(attempt, MAX_ATTEMPTS, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
+                            return Ok(cancelled_response());
+                        }
+                        continue;
+                    }
+                    return Err(naming_wait(failure.message, beyond_cap));
+                }
                 return parse_complete_response(&v, &mut on_delta);
             }
 
-            let (reply, interrupted) = read_sse(resp, &cancelled, &mut on_delta).await;
-            match interrupted {
-                Some(reason) if reply.content.is_empty() && attempt < MAX_ATTEMPTS => {
-                    if !retry_after(attempt, &reason, &cancelled, &mut on_delta).await {
-                        return Ok(cancelled_response());
-                    }
+            let (reply, unfinished) = read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await;
+            // The restart rules: nothing the caller keeps has streamed yet,
+            // and the budget has an attempt left.
+            let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
+            let (reason, wait) = match unfinished {
+                // The network cut it: the server's headers never spoke to that.
+                Some(Unfinished::Interrupted(reason)) if restartable => (reason, backoff(attempt, None)),
+                Some(Unfinished::Failed(failure)) if failure.retryable && restartable && beyond_cap.is_none() => {
+                    (failure.message, backoff(attempt, asked))
                 }
+                // Never a truncated reply: the server said this one failed,
+                // and a tool call it carried must not run.
+                Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
                 _ => return Ok(reply),
+            };
+            if !resend_after(attempt, MAX_ATTEMPTS, &reason, wait, &cancelled, &mut on_delta).await {
+                return Ok(cancelled_response());
             }
         }
     }
 }
 
-/// Parse one SSE stream to its end. The second value names the interruption
-/// when the network ended the stream before the server did: EOF with no
-/// terminator, or a read error. It is `None` for a finished reply and for a
-/// stream this client cut itself, which a fresh attempt would cut the same way.
+/// Why a stream ended without the reply it promised.
+enum Unfinished {
+    /// The network ended the stream before the server did: EOF with no
+    /// terminator, or a read error before one.
+    Interrupted(String),
+    /// The server reported a failure inside the stream.
+    Failed(ServerFailure),
+}
+
+/// A failure a server reported inside a 200 response rather than as its
+/// status, which is how a gateway fails once the stream has begun.
+struct ServerFailure {
+    /// The error to return, or the reason to give for a retry.
+    message: String,
+    /// A rate limit, an overloaded server, or a server fault: what a fresh
+    /// attempt can outlast, on the terms [`is_retryable_status`] resends a
+    /// refused status. A refused request, an exhausted quota, or a filtered
+    /// reply would fail the same way again.
+    retryable: bool,
+}
+
+/// Read an `error` value (an object, or a bare message string) so the
+/// message is the provider's own, wherever in the response it sat. `raw`,
+/// the response text that carried it, stands in only when there is no
+/// message to read (or no error, only finish_reason `error`).
+fn server_failure(error: &Value, raw: &str) -> ServerFailure {
+    let code = &error["code"];
+    // A numeric code, sometimes sent as a string, is an HTTP status.
+    let status = code.as_u64().or_else(|| code.as_str()?.parse().ok());
+    // Only the code and type tell an exhausted quota from a rate limit: a
+    // per-minute limit's message can say "quota" too, and is worth a retry.
+    let kinds = || [code, &error["type"]].into_iter().filter_map(Value::as_str);
+    let retryable = !kinds().any(|kind| kind.contains("quota"))
+        && match status {
+            // Resent exactly when that status would be: a 501 inside a 200
+            // is no more worth a retry than a 501 status.
+            Some(status) => u16::try_from(status).is_ok_and(is_retryable_status),
+            None => kinds().any(|kind| ["rate_limit", "overloaded", "server_error"].iter().any(|k| kind.contains(k))),
+        };
+    let code = match code {
+        Value::Null => String::new(),
+        // Without the quotes a JSON string would print with.
+        Value::String(code) => format!(" ({code})"),
+        code => format!(" ({code})"),
+    };
+    let message = error["message"].as_str().or(error.as_str()).map_or_else(|| describe_backend(raw), |m| truncate(m, 600));
+    ServerFailure { message: format!("backend reported an error{code}: {message}"), retryable }
+}
+
+/// Parse one SSE stream to its end. The second value says why the stream
+/// ended unfinished: the network cut it, or the server reported a failure
+/// inside it. It is `None` for a finished reply and for a stream this client
+/// cut itself, which a fresh attempt would cut the same way.
 async fn read_sse(
     resp: reqwest::Response,
     cancelled: &crate::state::CancelToken,
+    idle: std::time::Duration,
     on_delta: &mut impl FnMut(StreamDelta),
-) -> (CompletionResult, Option<String>) {
+) -> (CompletionResult, Option<Unfinished>) {
     let mut content = String::new();
     // One buffer per key, so the reply goes back under the key that carried
     // it. `None` until the server sends that key as a string, even an empty one.
     let mut reasoning_content: Option<String> = None;
     let mut reasoning: Option<String> = None;
+    // Empty until the server sends `reasoning_details` with an entry in it.
+    let mut reasoning_details: Vec<Value> = Vec::new();
+    let mut open_details = OpenDetails::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
     // Did the server ever say it was done (a `[DONE]` line or a
@@ -533,21 +776,31 @@ async fn read_sse(
     let mut stream = resp.bytes_stream();
     let mut received = 0usize;
     let mut scanned = 0usize;
-    // Set when the network, not the server or this client, ended the
-    // stream: the one truncation a fresh attempt can undo.
-    let mut interrupted: Option<String> = None;
+    // Set when something outside this client ended the stream unfinished:
+    // the network cut it, or the server reported a failure in it.
+    let mut unfinished: Option<Unfinished> = None;
 
     'outer: loop {
         let next = tokio::select! {
-            c = stream.next() => c,
+            c = tokio::time::timeout(idle, stream.next()) => c,
             _ = cancelled.cancelled() => {
                 finish_reason = "cancelled".into();
                 break;
             }
         };
+        // Not a byte, not even a keepalive comment, for the whole idle
+        // interval: the connection failed as surely as a cut, and ends the
+        // same way. After the server finished, the reply stands.
+        let Ok(next) = next else {
+            if !saw_terminator {
+                finish_reason = TRUNCATED.into();
+                unfinished = Some(Unfinished::Interrupted(silence(idle)));
+            }
+            break;
+        };
         let Some(chunk) = next else {
             if !saw_terminator {
-                interrupted = Some("the stream ended before the reply finished".into());
+                unfinished = Some(Unfinished::Interrupted("the stream ended before the reply finished".into()));
             }
             break;
         };
@@ -558,15 +811,19 @@ async fn read_sse(
                 finish_reason = TRUNCATED.into();
                 break;
             }
+            // A cut after the server finished (while the usage chunk or
+            // `[DONE]` was still due) costs nothing of the reply: it stands,
+            // rather than coming back truncated or being generated and
+            // billed a second time.
+            Err(_) if saw_terminator => break,
             Err(e) => {
-                saw_terminator = false;
                 finish_reason = TRUNCATED.into();
                 // Every error this stream yields is the connection failing
                 // under the body: a chunked or sized body cut short surfaces
                 // here, not as a clean end, and this client applies no content
                 // decoding that could fail on its own. So each one is worth a
                 // fresh attempt.
-                interrupted = Some(describe_transport(&e));
+                unfinished = Some(Unfinished::Interrupted(describe_transport(&e)));
                 break;
             }
         };
@@ -582,17 +839,42 @@ async fn read_sse(
             if line.is_empty() || line.first() == Some(&b':') {
                 continue;
             }
-            let data = strip_data_prefix(line);
+            let Some(data) = data_line(line) else { continue };
             if data == b"[DONE]" {
                 saw_terminator = true;
                 break 'outer;
             }
-            let Ok(chunk) = serde_json::from_slice::<StreamChunk>(data) else { continue };
-            if let Some(u) = chunk.usage {
-                usage = Some(u.into_usage());
+            let chunk = match serde_json::from_slice::<StreamChunk>(data) {
+                Ok(chunk) => chunk,
+                // After the server finished, only the usage or `[DONE]` was
+                // still due: the reply stands.
+                Err(_) if saw_terminator => break 'outer,
+                // A data line this client cannot read is a chunk lost. Skipped,
+                // the lines around it joined into a reply the model never
+                // sent: a tool call's arguments streamed in pieces, less the
+                // piece a proxy corrupted, named a different command and ran.
+                // So the attempt ends here, like a connection cut: started
+                // over while nothing has streamed, a truncation otherwise.
+                Err(e) => {
+                    finish_reason = TRUNCATED.into();
+                    unfinished = Some(Unfinished::Interrupted(format!("the stream carried a line this client cannot read: {e}")));
+                    break 'outer;
+                }
+            };
+            if let Some(u) = chunk.usage.as_ref().and_then(parse_usage) {
+                usage = Some(u);
+            }
+            let mut choice = chunk.choices.unwrap_or_default().into_iter().next();
+            let error = chunk.error.or_else(|| choice.as_mut()?.error.take());
+            // finish_reason `error` ends the stream, but not as a reply: it
+            // is a failure even when the server sends no error to go with it.
+            if error.is_some() || choice.as_ref().is_some_and(|c| c.finish_reason.as_deref() == Some("error")) {
+                let error = error.unwrap_or(Value::Null);
+                unfinished = Some(Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data))));
+                break 'outer;
             }
             // The usage-bearing final chunk has an empty choices array.
-            let Some(choice) = chunk.choices.into_iter().next() else { continue };
+            let Some(choice) = choice else { continue };
 
             if let Some(reason) = choice.finish_reason {
                 // Servers that end a stream here and never send `[DONE]`
@@ -600,7 +882,7 @@ async fn read_sse(
                 saw_terminator = true;
                 finish_reason = reason;
             }
-            let delta = choice.delta;
+            let delta = choice.delta.unwrap_or_default();
             if let Some(text) = delta.content {
                 if !text.is_empty() {
                     content.push_str(&text);
@@ -623,27 +905,48 @@ async fn read_sse(
                     on_delta(StreamDelta::Reasoning(text));
                 }
             }
+            if let Some(Value::Array(parts)) = delta.reasoning_details {
+                for part in parts {
+                    merge_reasoning_detail(&mut reasoning_details, &mut open_details, part);
+                }
+            }
             if let Some(calls) = delta.tool_calls {
                 for tc in calls {
-                    let idx = tc.index.unwrap_or(0) as usize;
-                    if idx >= MAX_TOOL_CALLS {
+                    let (name, args) = tc.function.map_or((None, None), |f| (f.name, f.arguments));
+                    let id = tc.id.filter(|id| !id.is_empty());
+                    let name = name.filter(|name| !name.is_empty());
+                    let Some(at) = tool_slot(&mut partials, tc.index, id.as_deref(), name.as_deref(), args.as_ref()) else {
                         saw_terminator = false;
                         finish_reason = TRUNCATED.into();
                         break 'outer;
+                    };
+                    let call = &mut partials[at];
+                    // The first id is the call's: some servers repeat it on
+                    // every delta, others mint a new one per delta. Some also
+                    // repeat the whole name, so a piece equal to the name so
+                    // far waits: a different piece after it means it was part
+                    // of the name (`re`, `re`, `nder`), and none means a repeat.
+                    if let Some(id) = id.filter(|_| call.id.is_empty()) {
+                        call.id = id;
                     }
-                    while partials.len() <= idx {
-                        partials.push(PartialToolCall::default());
-                    }
-                    if let Some(id) = tc.id {
-                        partials[idx].id.push_str(&id);
-                    }
-                    if let Some(function) = tc.function {
-                        if let Some(name) = function.name {
-                            partials[idx].name.push_str(&name);
+                    match name {
+                        Some(name) if name == call.name => call.name_repeats += 1,
+                        Some(name) => {
+                            let held = call.name.repeat(std::mem::take(&mut call.name_repeats));
+                            call.name.push_str(&held);
+                            call.name.push_str(&name);
                         }
-                        if let Some(args) = function.arguments {
-                            partials[idx].arguments.push_str(&args);
-                        }
+                        None => {}
+                    }
+                    match args {
+                        Some(Value::String(args)) => call.arguments.push_str(&args),
+                        // Sent as a JSON value rather than its text, the
+                        // arguments come whole.
+                        Some(args) => call.arguments = args.to_string(),
+                        None => {}
+                    }
+                    if let Some(extra) = tc.extra_content {
+                        call.extra_content = Some(extra);
                     }
                 }
             }
@@ -662,8 +965,76 @@ async fn read_sse(
     if !tool_calls.is_empty() && finish_reason == "stop" {
         finish_reason = "tool_calls".into();
     }
+    // The server ended the reply as a tool call and sent nothing usable as
+    // one (a call without a name, say), and no text either. Returned as it
+    // came, that reply ended the turn as if the model had answered: nothing
+    // ran, nothing was said, and nothing reported it.
+    if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" && unfinished.is_none() {
+        unfinished = Some(Unfinished::Failed(ServerFailure {
+            message: "backend ended the reply with finish_reason tool_calls but sent no tool call".into(),
+            retryable: false,
+        }));
+    }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage }, interrupted)
+    let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
+}
+
+/// Where each text or summary block of a streaming reply's
+/// `reasoning_details` has its latest entry, keyed by the block's `index` and
+/// the field its text streams in, so a part finds the entry it continues in
+/// one lookup. The server decides how many parts a stream has: a scan of the
+/// entries kept so far would make a stream of parts that each start a new
+/// block cost time quadratic in its length.
+type OpenDetails = HashMap<(u64, &'static str), usize>;
+
+/// Fold one streamed `reasoning_details` part into the reply's entries.
+/// OpenRouter streams a text or summary block in parts that share its
+/// `index` and `type`: the text arrives in pieces, and fields such as the
+/// signature arrive null at first and set in a later part. Such a part
+/// continues the latest entry with the same `index` and `type`: its text is
+/// appended, and a value it carries fills a field still null or empty. A
+/// part whose `id` conflicts with that entry's starts a new entry instead,
+/// which later parts of its block continue. Any other part (an encrypted
+/// blob, a type this client does not know, an entry without an index)
+/// arrives whole and is kept as its own entry, since joining two such blobs
+/// would corrupt both.
+fn merge_reasoning_detail(details: &mut Vec<Value>, open: &mut OpenDetails, part: Value) {
+    let text_key = match part["type"].as_str() {
+        Some("reasoning.text") => "text",
+        Some("reasoning.summary") => "summary",
+        _ => {
+            details.push(part);
+            return;
+        }
+    };
+    let Some(index) = part["index"].as_u64() else {
+        details.push(part);
+        return;
+    };
+    // The entry's `index` and `type` are never null or empty, so merging
+    // never changes them: the entry stays under the key it was opened with.
+    let latest = open.get(&(index, text_key)).map(|&at| &mut details[at]);
+    let continued = latest.filter(|entry| entry["id"].is_null() || part["id"].is_null() || entry["id"] == part["id"]);
+    let Some(Value::Object(entry)) = continued else {
+        open.insert((index, text_key), details.len());
+        details.push(part);
+        return;
+    };
+    let Value::Object(part) = part else { return };
+    for (key, value) in part {
+        match entry.get_mut(&key) {
+            Some(Value::String(held)) if key == text_key => {
+                if let Value::String(more) = value {
+                    held.push_str(&more);
+                }
+            }
+            Some(held) if !held.is_null() && held.as_str() != Some("") => {}
+            _ => {
+                entry.insert(key, value);
+            }
+        }
+    }
 }
 
 /// Which key one reply's reasoning goes back under: the one the server sent
@@ -693,6 +1064,7 @@ fn cancelled_response() -> CompletionResult {
         tool_calls: Vec::new(),
         reasoning_content: None,
         reasoning: None,
+        reasoning_details: None,
         finish_reason: "cancelled".into(),
         usage: None,
     }
@@ -701,14 +1073,16 @@ fn cancelled_response() -> CompletionResult {
 async fn read_body(
     resp: reqwest::Response,
     cancelled: &crate::state::CancelToken,
+    idle: std::time::Duration,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut body = Vec::new();
     let mut stream = resp.bytes_stream();
     loop {
         let next = tokio::select! {
             _ = cancelled.cancelled() => return Ok(None),
-            next = stream.next() => next,
+            next = tokio::time::timeout(idle, stream.next()) => next,
         };
+        let Ok(next) = next else { return Err(format!("response body failed: {}", silence(idle))) };
         let Some(chunk) = next else { return Ok(Some(body)); };
         let chunk = chunk.map_err(|e| format!("response body failed: {e}"))?;
         if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
@@ -749,12 +1123,14 @@ fn trim_bytes(mut s: &[u8]) -> &[u8] {
     s
 }
 
-fn strip_data_prefix(line: &[u8]) -> &[u8] {
-    const PREFIX: &[u8] = b"data:";
-    if line.starts_with(PREFIX) {
-        trim_bytes(&line[PREFIX.len()..])
-    } else {
-        line
+/// The payload of one SSE line, or None for a line that carries none: an
+/// empty `data:` line, or another field (`event:`, `id:`, `retry:`), which
+/// is passed over as the format asks. A line with no field name that opens
+/// like JSON is taken as data too, for servers that send it bare.
+fn data_line(line: &[u8]) -> Option<&[u8]> {
+    match line.strip_prefix(b"data:") {
+        Some(data) => Some(trim_bytes(data)).filter(|data| !data.is_empty()),
+        None => matches!(line.first(), Some(b'{' | b'[')).then_some(line),
     }
 }
 
@@ -779,7 +1155,13 @@ fn parse_complete_response(
             partials.push(PartialToolCall {
                 id: tc["id"].as_str().unwrap_or("").to_string(),
                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                arguments: tc["function"]["arguments"].as_str().unwrap_or("").to_string(),
+                arguments: match &tc["function"]["arguments"] {
+                    Value::String(args) => args.clone(),
+                    Value::Null => String::new(),
+                    args => args.to_string(),
+                },
+                extra_content: opaque(&tc["extra_content"]),
+                ..PartialToolCall::default()
             });
         }
     }
@@ -788,12 +1170,85 @@ fn parse_complete_response(
         .as_str()
         .unwrap_or(if tool_calls.is_empty() { "stop" } else { "tool_calls" })
         .to_string();
-    let usage = serde_json::from_value::<UsageJson>(v["usage"].clone())
-        .ok()
-        .map(UsageJson::into_usage);
+    // The same empty reply the stream parser refuses above: a server that
+    // ignores `stream` and answers in one JSON body can end it as a tool call
+    // with nothing usable as one and no text, and returned as it came that
+    // reply ended the turn as if the model had answered.
+    if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" {
+        return Err("backend ended the reply with finish_reason tool_calls but sent no tool call".into());
+    }
+    let usage = parse_usage(&v["usage"]);
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
-    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, finish_reason, usage })
+    let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
+    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
+}
+
+/// A value from a one-shot reply, kept to send back; null is absent. It is
+/// encoded once, here, from the parsed reply, and goes out as stored.
+fn opaque(value: &Value) -> Option<Box<RawValue>> {
+    if value.is_null() {
+        return None;
+    }
+    serde_json::value::to_raw_value(value).ok()
+}
+
+/// Which call in `partials` a streamed tool-call delta adds to, opening a new
+/// one when the delta starts a call; None past [`MAX_TOOL_CALLS`]. A delta
+/// continues the latest call its `index` opened, or without an index the
+/// latest call, unless [`starts_call`] says it begins the next one. A call
+/// opened without an index counts as index 0, since servers that drop zero
+/// values can still mark its later pieces index 0.
+fn tool_slot(
+    partials: &mut Vec<PartialToolCall>,
+    index: Option<u64>,
+    id: Option<&str>,
+    name: Option<&str>,
+    args: Option<&Value>,
+) -> Option<usize> {
+    if index.is_some_and(|index| index >= MAX_TOOL_CALLS as u64) {
+        return None;
+    }
+    let latest = match index {
+        Some(index) => partials.iter().rposition(|call| call.index.unwrap_or(0) == index),
+        None => partials.len().checked_sub(1),
+    };
+    if let Some(at) = latest.filter(|&at| !starts_call(&partials[at], index.is_some(), id, name, args)) {
+        return Some(at);
+    }
+    if partials.len() >= MAX_TOOL_CALLS {
+        return None;
+    }
+    partials.push(PartialToolCall { index, ..PartialToolCall::default() });
+    Some(partials.len() - 1)
+}
+
+/// Does a delta that would continue `call` begin the next call instead?
+/// Servers mark calls differently: some reuse one index for every call, some
+/// send no index and each call whole in one delta, some repeat the id and
+/// name on every delta, and some mint a new id for every delta. Only a delta
+/// that names a function can begin a call, and only once `call` has a name.
+/// It does when it carries an id other than `call`'s. With no two ids to
+/// compare and no index, it does when its own arguments are a whole object
+/// and `call`'s are complete. Its own are checked first, so a stream of
+/// argument pieces does not re-read everything gathered so far at each piece.
+fn starts_call(call: &PartialToolCall, indexed: bool, id: Option<&str>, name: Option<&str>, args: Option<&Value>) -> bool {
+    if name.is_none() || call.name.is_empty() {
+        return false;
+    }
+    let complete = |args: &str| serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok();
+    match id {
+        Some(id) if !call.id.is_empty() => id != call.id,
+        _ if indexed => false,
+        _ => {
+            let whole = match args {
+                Some(Value::String(args)) => args.trim_start().starts_with('{') && complete(args),
+                Some(args) => args.is_object(),
+                None => false,
+            };
+            whole && complete(&call.arguments)
+        }
+    }
 }
 
 fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
@@ -805,15 +1260,22 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
             // Some local servers omit ids; synthesize one so tool replies can refer back.
             id: if p.id.is_empty() { format!("call_{i}") } else { p.id },
             kind: "function".into(),
-            function: ToolCallFunction { name: p.name, arguments: p.arguments },
+            function: ToolCallFunction {
+                name: p.name,
+                // A call to a tool without parameters can come with no
+                // arguments at all, which means the empty object.
+                arguments: if p.arguments.trim().is_empty() { "{}".into() } else { p.arguments },
+            },
+            extra_content: p.extra_content,
         })
         .collect()
 }
 
-/// reqwest's `Display` stops at "error sending request for url (...)" and
-/// hides the cause underneath, which is the only part a user can act on:
-/// "connection refused" means nothing is listening at base_url. Walk the
-/// source chain so that line survives into the transcript.
+/// A fault after a connection existed (a reset on send, a stream cut
+/// mid-reply), or one [`never_connected`] cannot name. reqwest's `Display`
+/// stops at "error sending request for url (...)" and hides the cause
+/// underneath, which is the only part a user can act on, so walk the source
+/// chain.
 fn describe_transport(e: &reqwest::Error) -> String {
     use std::error::Error;
     let mut out = e.to_string();
@@ -828,6 +1290,77 @@ fn describe_transport(e: &reqwest::Error) -> String {
         source = cause.source();
     }
     truncate(&out, 600)
+}
+
+/// A request that never reached its endpoint, as the one line a user acts
+/// on: the server, the cause, and the repair the final error adds.
+/// reqwest's chain ("error sending request for url (...): client error
+/// (Connect): tcp connect error: Connection refused (os error 61)") buries
+/// that under a URL path no request got to and the layers that wrapped the
+/// cause. None for a fault after a connection existed, which keeps the
+/// chain: there the details are the diagnosis. That includes a timeout
+/// outside the connect phase, such as TCP keepalive giving up on a server
+/// that took the request and then went away. None as well when the client
+/// that sent it went through a proxy (`proxied`, see [`through_proxy`]).
+fn never_connected(e: &reqwest::Error, proxied: bool) -> Option<(String, &'static str)> {
+    use std::error::Error;
+    if !e.is_connect() || proxied {
+        return None;
+    }
+    let chain = || std::iter::successors(e.source(), |&cause| cause.source());
+    // An io::Error's source() skips the error it wraps, and the kind can sit
+    // on one wrapped inside another (the TLS connector wraps the
+    // handshake's InvalidData as Other), so look through the wrapping.
+    let io_kind = |kind| {
+        chain().any(|c| {
+            std::iter::successors(c.downcast_ref::<std::io::Error>(), |io| io.get_ref()?.downcast_ref())
+                .any(|io| io.kind() == kind)
+        })
+    };
+    // The innermost cause, which names what failed in its own words.
+    let innermost = || truncate(&chain().last().map_or_else(|| e.to_string(), |c| c.to_string()), 600);
+    let (cause, repair) = if e.is_timeout() {
+        ("timed out".to_string(), "nothing answered; check that the host is up and that base_url names it (openmax --spec settings)")
+    } else if io_kind(std::io::ErrorKind::ConnectionRefused) {
+        ("connection refused".to_string(), "nothing is listening there; start the server or fix base_url (openmax --spec settings)")
+    } else if chain().any(|c| c.to_string() == "dns error") {
+        // The connector's own label for a failed lookup. The resolver's
+        // message under it says why (no such name, or a resolver that could
+        // not answer just now), so it stays, without the prefix the system
+        // lookup puts on every one of them.
+        let why = innermost();
+        let why = why.strip_prefix("failed to lookup address information: ").unwrap_or(&why);
+        (format!("DNS lookup failed: {why}"), "fix the host in base_url or check the network (openmax --spec settings)")
+    } else if io_kind(std::io::ErrorKind::InvalidData) {
+        // How the TLS layer reports a handshake it could not complete: a
+        // certificate it does not trust, or a server not speaking TLS.
+        (format!("TLS handshake failed: {}", innermost()), "")
+    } else {
+        (innermost(), "")
+    };
+    let server = e
+        .url()
+        .and_then(|url| Some(format!("{}:{}", url.host_str()?, url.port_or_known_default()?)))
+        .unwrap_or_else(|| "base_url".to_string());
+    Some((format!("cannot connect to {server} ({cause})"), repair))
+}
+
+/// Whether the shared HTTP client sent a request to `url` through a proxy.
+/// It asks the matcher the client itself decides with (the proxy variables
+/// as curl reads them, NO_PROXY included), so the answer is the one the
+/// request got. A failure to reach that proxy carries the same causes as
+/// one to reach the endpoint, and naming the endpoint (with advice to start
+/// it or fix base_url) would send the user the wrong way, so such a failure
+/// keeps the chain, as does a URL the matcher cannot read. The test build's
+/// client reads no proxy settings, so neither does this.
+fn through_proxy(url: &reqwest::Url) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    match url.as_str().parse() {
+        Ok(uri) => hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&uri).is_some(),
+        Err(_) => true,
+    }
 }
 
 /// OpenAI-compatible servers wrap failures in `{"error": {"message": ...}}`.
@@ -876,12 +1409,14 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 /// Attempts per request. With [`BACKOFF_UNIT`] doubling up to
 /// [`BACKOFF_CAP`], the last attempt goes out about a minute after the
-/// first. A transient fault on the path to an endpoint (a reset or a TLS
-/// alert on send, a stream cut mid-reply) can recur for minutes and clears
-/// within seconds most times and within a minute at worst, so attempts
-/// packed into one second only ever observe the fault and end a turn the
-/// next connection would have completed. Every wait is announced and
-/// cancellable.
+/// first, later only when a server's Retry-After asks for longer waits, up
+/// to [`RETRY_AFTER_CAP_SECS`] each (see [`backoff`]); a longer ask is
+/// reported instead of retried. A transient fault on the path to an
+/// endpoint (a reset or a TLS alert on send, a stream cut mid-reply) can
+/// recur for minutes and clears within seconds most times and within a
+/// minute at worst, so attempts packed into one second only ever observe the
+/// fault and end a turn the next connection would have completed. Every
+/// wait is announced and cancellable.
 const MAX_ATTEMPTS: u32 = 8;
 /// Attempts in a row that may fail before any connection exists (refused,
 /// unresolvable, a connect timeout, a failed TLS handshake) before the
@@ -892,17 +1427,130 @@ const MAX_ATTEMPTS: u32 = 8;
 /// connect timeout on each attempt as well.
 const UNREACHED_ATTEMPTS: u32 = 3;
 
+/// One second: the step of the backoff and the unit a Retry-After header
+/// counts in.
 #[cfg(not(test))]
 const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
-/// Tests exercise the attempt count, never the wall clock.
+/// Tests run every wait in milliseconds: the attempt count and which wait
+/// applies, never seconds of wall clock.
 #[cfg(test)]
 const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_millis(1);
 const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(16);
+/// The longest Retry-After this client waits out, in seconds: a minute, the
+/// whole window of a per-minute rate limit. A longer ask is a limit that
+/// resets hours away (a daily quota, a maintenance window). No resend before
+/// then can succeed and holding the turn that long helps no one, so the
+/// refusal is reported at once with the server's wait.
+const RETRY_AFTER_CAP_SECS: u64 = 60;
 
-/// Only statuses that mean the server rejected the request before doing work.
-/// 5xx from a proxy is not safe to retry without an idempotency key.
+/// Statuses that say the server could not take the request just now: a rate
+/// limit (429), or an upstream that failed or shed load (500, 502, 503, 504,
+/// and the 529 an overloaded provider sends). Resending is safe: a chat
+/// completion changes nothing, tools run only once the agent loop holds a
+/// finished reply, and a refused status carries no reply text the caller
+/// could show twice. A gateway's 500 or 502 can follow work the upstream
+/// already did, so a resend may pay for that work twice. The chat
+/// completions API has no idempotency key to collapse the two, and failing
+/// the turn saves nothing: it ends with no reply, and the only way to one
+/// is the same request sent again. A stream cut before any reply text, and
+/// a failure a server reports inside a 200 before any reply text with one
+/// of these codes (see [`server_failure`]), are resent on the same terms. A
+/// 429 for an exhausted quota is excluded by [`quota_exhausted`].
 fn is_retryable_status(code: u16) -> bool {
-    code == 429
+    matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Whether an error body reports an exhausted quota (`insufficient_quota` as
+/// the error's code or type) rather than a rate limit. Both arrive as 429,
+/// but an account out of credit stays out on every attempt, and retrying
+/// would only hold back the message that says so for the whole budget.
+fn quota_exhausted(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(body) else { return false };
+    let Some(error) = v.get("error") else { return false };
+    ["code", "type"].iter().any(|key| error.get(key).and_then(Value::as_str) == Some("insufficient_quota"))
+}
+
+/// A Retry-After header in delta-seconds. The HTTP-date form is left to the
+/// backoff: honoring it means trusting this clock to agree with the server's.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()
+}
+
+/// The wait after `attempt` (1-based, the one that just failed): the
+/// doubling backoff, or the server's Retry-After (`asked`, in seconds) when
+/// that is longer, up to [`RETRY_AFTER_CAP_SECS`]. A shorter ask never
+/// undercuts the backoff, so a server answering 0 to every client at once
+/// cannot pull this one into a tight loop.
+fn backoff(attempt: u32, asked: Option<u64>) -> std::time::Duration {
+    let floor = BACKOFF_UNIT.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
+    let asked = BACKOFF_UNIT.saturating_mul(asked.unwrap_or(0).min(RETRY_AFTER_CAP_SECS) as u32);
+    floor.max(asked)
+}
+
+/// Why an attempt ended when the endpoint sent nothing for `idle`.
+fn silence(idle: std::time::Duration) -> String {
+    format!("the endpoint sent nothing for {}s", idle.as_secs_f64())
+}
+
+/// Why a request to `base_url` must not carry a credential, or None when it
+/// may. Plain http to another machine puts the key on the network
+/// unencrypted, readable anywhere along the path. Loopback never leaves this
+/// machine, and neither does the unspecified address (0.0.0.0 or ::), which
+/// a local server often prints as its own and which connects here. A
+/// base_url that does not parse is left to the request to fail.
+fn plain_http_refusal(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url.trim()).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let this_machine = bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+            let ip = ip.to_canonical();
+            ip.is_loopback() || ip.is_unspecified()
+        });
+    (!this_machine).then(|| {
+        format!(
+            "refusing to send credentials over plain http to {host}, where anyone on the network path can read them: use an https base_url, or a loopback address (127.0.0.1, ::1, or localhost) for a server on this machine. A server that needs no key works over http once none is configured for it (api_key, api_key_env, OPENMAX_API_KEY, a credential header such as Authorization or X-API-Key, or user:password in the base_url)"
+        )
+    })
+}
+
+/// Whether a configured header carries a credential, judged by its name:
+/// Authorization and Proxy-Authorization, a cookie, or a key, token, secret,
+/// password, or credential under whatever name the server picked (X-API-Key,
+/// api-key, X-Auth-Token). Such a header is read off plain http as easily as
+/// a bearer key, so a check for Authorization alone would let a key in
+/// X-API-Key cross it.
+fn is_credential_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["auth", "key", "token", "secret", "password", "credential", "cookie"]
+        .iter()
+        .any(|word| name.contains(word))
+}
+
+/// The redirect policy of the shared HTTP client: follow a redirect only
+/// within the server the request was sent to (scheme, host, and port). The
+/// HTTP client drops Authorization and cookies on a move to another host but
+/// keeps every other header and, on a 307 or 308, the body, so following one
+/// would hand a key in X-API-Key, and the transcript, to a server nobody
+/// configured, or move them onto plain http.
+fn same_server_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    let server = |url: &reqwest::Url| (url.scheme().to_string(), url.host_str().map(str::to_string), url.port_or_known_default());
+    let next = server(attempt.url());
+    let to = attempt.url().origin().ascii_serialization();
+    if attempt.previous().len() > 10 {
+        // The default policy's limit, for a server that redirects to itself.
+        attempt.error("too many redirects")
+    } else if attempt.previous().first().map(server) == Some(next) {
+        // The first previous URL is the one the request was sent to.
+        attempt.follow()
+    } else {
+        attempt.error(format!(
+            "refusing to follow a redirect to {to}, a server other than the one base_url names: a request and its credentials go only to that server, by scheme, host, and port. If {to} is the endpoint, point base_url at it"
+        ))
+    }
 }
 
 fn is_transient_transport(err: &reqwest::Error) -> bool {
@@ -910,17 +1558,41 @@ fn is_transient_transport(err: &reqwest::Error) -> bool {
 }
 
 /// Announce the retry, then wait out the backoff for `attempt` (1-based, the
-/// one that just failed). Returns false when cancelled during the wait: a
-/// backoff can reach [`BACKOFF_CAP`], and a user who cancels must not sit
-/// through it.
+/// one that just failed). Returns false when cancelled during the wait.
 async fn retry_after(
     attempt: u32,
+    last: u32,
     reason: &str,
     cancelled: &crate::state::CancelToken,
     on_delta: &mut impl FnMut(StreamDelta),
 ) -> bool {
-    on_delta(StreamDelta::Retry { attempt: attempt + 1, max_attempts: MAX_ATTEMPTS, reason: reason.to_string() });
-    let wait = BACKOFF_UNIT.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
+    resend_after(attempt, last, reason, backoff(attempt, None), cancelled, on_delta).await
+}
+
+/// `err`, naming the server's wait when that is past
+/// [`RETRY_AFTER_CAP_SECS`]: why it was not resent, and when to try again.
+fn naming_wait(mut err: String, beyond_cap: Option<u64>) -> String {
+    if let Some(secs) = beyond_cap {
+        err.push_str(&format!(" (the server asks for a retry after {secs}s)"));
+    }
+    err
+}
+
+/// [`retry_after`] with the wait chosen by the caller: a refused status, or
+/// a failure inside a 200, passes the server's Retry-After through
+/// [`backoff`]. `last` is the attempt the request ends on if this keeps
+/// failing, which the announcement counts to. Returns false when cancelled
+/// during the wait: one can reach [`RETRY_AFTER_CAP_SECS`], and a user who
+/// cancels must not sit through it.
+async fn resend_after(
+    attempt: u32,
+    last: u32,
+    reason: &str,
+    wait: std::time::Duration,
+    cancelled: &crate::state::CancelToken,
+    on_delta: &mut impl FnMut(StreamDelta),
+) -> bool {
+    on_delta(StreamDelta::Retry { attempt: attempt + 1, max_attempts: last, reason: reason.to_string() });
     tokio::select! {
         _ = tokio::time::sleep(wait) => true,
         _ = cancelled.cancelled() => false,
@@ -1019,17 +1691,24 @@ mod tests {
     }
 
     #[test]
-    fn strip_data_prefix_bytes() {
-        assert_eq!(super::strip_data_prefix(b"data: {\"x\":1}"), b"{\"x\":1}");
-        assert_eq!(super::strip_data_prefix(b"{\"x\":1}"), b"{\"x\":1}");
+    fn data_lines_are_told_from_the_other_fields() {
+        let json = &b"{\"x\":1}"[..];
+        assert_eq!(data_line(b"data: {\"x\":1}"), Some(json));
+        assert_eq!(data_line(b"data:{\"x\":1}"), Some(json));
+        assert_eq!(data_line(b"{\"x\":1}"), Some(json));
+        assert_eq!(data_line(b"[DONE]"), Some(&b"[DONE]"[..]));
+        for field in [&b"data:"[..], b"event: message", b"id: 1", b"retry: 3000", b"tool_calls\": [{\"index\": 0}]}"] {
+            assert_eq!(data_line(field), None, "{}", String::from_utf8_lossy(field));
+        }
     }
 
     #[test]
     fn parse_sse_line_extracts_content() {
         let line = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
-        let data = super::strip_data_prefix(trim_bytes(line));
+        let data = data_line(trim_bytes(line)).unwrap();
         let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
-        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+        let delta = chunk.choices.unwrap().remove(0).delta.unwrap();
+        assert_eq!(delta.content.as_deref(), Some("hi"));
     }
 
     /// One-shot endpoint that answers with a close-delimited SSE body (no
@@ -1041,6 +1720,21 @@ mod tests {
     }
 
     fn spawn_response_once(response: String, hold: Option<std::sync::mpsc::Receiver<()>>) -> String {
+        serve_once(response, hold, None)
+    }
+
+    /// [`spawn_response_once`] that also hands back the request head it read
+    /// (request line and headers), to show what the client sent.
+    fn spawn_recording_once(response: String) -> (String, std::sync::mpsc::Receiver<String>) {
+        let (head, heads) = std::sync::mpsc::channel();
+        (serve_once(response, None, Some(head)), heads)
+    }
+
+    fn serve_once(
+        response: String,
+        hold: Option<std::sync::mpsc::Receiver<()>>,
+        head: Option<std::sync::mpsc::Sender<String>>,
+    ) -> String {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1057,6 +1751,9 @@ mod tests {
                 }
             }
             let headers = String::from_utf8_lossy(&buf).to_string();
+            if let Some(head) = head {
+                let _ = head.send(headers.clone());
+            }
             let content_length: usize = headers
                 .lines()
                 .find_map(|l| {
@@ -1127,6 +1824,172 @@ mod tests {
     async fn an_out_of_bounds_tool_index_is_refused() {
         let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":128,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
         assert_eq!(stream_once(body).await.finish_reason, TRUNCATED);
+    }
+
+    fn tool_call_line(calls: Value) -> String {
+        format!("data: {}\n\n", json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}]}))
+    }
+
+    async fn stream_calls(lines: Vec<Value>) -> CompletionResult {
+        let mut body: String = lines.into_iter().map(tool_call_line).collect();
+        body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+        stream_once(&body).await
+    }
+
+    async fn calls_of(lines: Vec<Value>) -> Vec<(String, String, String)> {
+        let calls = stream_calls(lines).await.tool_calls;
+        calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect()
+    }
+
+    fn call(id: &str, name: &str, args: &str) -> (String, String, String) {
+        (id.into(), name.into(), args.into())
+    }
+
+    /// Gemini's OpenAI-compatible endpoint streams parallel calls whole and
+    /// without an `index`, in one chunk or one per chunk, with a thought
+    /// signature on the first. Read as index 0, they merged into one call
+    /// named `read_fileread_file` with unparseable arguments, so every
+    /// parallel batch failed.
+    #[tokio::test]
+    async fn parallel_calls_without_an_index_stay_separate() {
+        let (a, b) = (r#"{"path":"a.txt"}"#, r#"{"path":"b.txt"}"#);
+        let signature = json!({"google": {"thought_signature": "sigA=="}});
+        let first = json!({"id": "function-call-111", "type": "function", "function": {"name": "read_file", "arguments": a}, "extra_content": signature});
+        let second = json!({"id": "function-call-222", "type": "function", "function": {"name": "read_file", "arguments": b}});
+        let expected = vec![call("function-call-111", "read_file", a), call("function-call-222", "read_file", b)];
+        for lines in [vec![json!([first, second])], vec![json!([first]), json!([second])]] {
+            let result = stream_calls(lines).await;
+            let signatures: Vec<_> = result.tool_calls.iter().map(|c| c.extra_content.as_ref().map(|e| e.get().to_string())).collect();
+            let calls: Vec<_> = result.tool_calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect();
+            assert_eq!(calls, expected);
+            assert_eq!(signatures, vec![Some(signature.to_string()), None], "the signature stays on its own call");
+        }
+        // Without an id either, a call that arrives whole after a complete
+        // one is the next call.
+        let anonymous = calls_of(vec![json!([
+            {"function": {"name": "read_file", "arguments": a}},
+            {"function": {"name": "read_file", "arguments": b}},
+        ])])
+        .await;
+        assert_eq!(anonymous, vec![call("call_0", "read_file", a), call("call_1", "read_file", b)]);
+        // Pieces without an index still join the call they follow, even one
+        // that repeats the name and looks whole on its own.
+        let continued = calls_of(vec![
+            json!([{"id": "c1", "function": {"name": "bash", "arguments": "{\"command\":"}}]),
+            json!([{"function": {"arguments": "{\"x\":"}}]),
+            json!([{"function": {"name": "bash", "arguments": "{\"y\":1}"}}]),
+            json!([{"function": {"name": "bash", "arguments": "}}"}}]),
+        ])
+        .await;
+        assert_eq!(continued, vec![call("c1", "bash", r#"{"command":{"x":{"y":1}}}"#)]);
+        // Servers that drop zero values send call 0 without an index, yet may
+        // still mark its later pieces index 0; those pieces stay on it.
+        let zero_dropped = calls_of(vec![
+            json!([{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":"}}]),
+            json!([{"index": 0, "function": {"arguments": "\"a.txt\"}"}}]),
+            json!([{"index": 1, "function": {"name": "read_file", "arguments": b}}]),
+        ])
+        .await;
+        assert_eq!(zero_dropped, vec![call("c1", "read_file", a), call("call_1", "read_file", b)]);
+        // The count stays bounded without an index too.
+        let whole = |i: usize| json!([{"id": format!("c{i}"), "function": {"name": "bash", "arguments": "{}"}}]);
+        assert_eq!(stream_calls((0..MAX_TOOL_CALLS).map(whole).collect()).await.tool_calls.len(), MAX_TOOL_CALLS);
+        assert_eq!(stream_calls((0..=MAX_TOOL_CALLS).map(whole).collect()).await.finish_reason, TRUNCATED);
+    }
+
+    /// Some servers repeat the id and name on every delta of a call, some
+    /// reuse index 0 for every call, and some mint a new id for every delta.
+    /// Appended, the first came out as a call to `bashbashbash` and the
+    /// second as one call merging them all. Each call stays whole, and a name
+    /// streamed in pieces is still joined, even when a piece repeats the name
+    /// so far.
+    #[tokio::test]
+    async fn repeated_ids_and_reused_indexes_keep_calls_whole() {
+        let repeated = calls_of(vec![
+            json!([{"index": 0, "id": "chatcmpl-tool-aa62", "type": "function", "function": {"name": "bash", "arguments": ""}}]),
+            json!([{"index": 0, "id": "chatcmpl-tool-aa62", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": "}}]),
+            json!([{"index": 0, "id": "chatcmpl-tool-aa62", "type": "function", "function": {"name": "bash", "arguments": "\"ls\"}"}}]),
+        ])
+        .await;
+        assert_eq!(repeated, vec![call("chatcmpl-tool-aa62", "bash", r#"{"command": "ls"}"#)]);
+        let reused = calls_of(vec![
+            json!([{"index": 0, "id": "call_1", "type": "function", "function": {"name": "list_dir", "arguments": ""}}]),
+            json!([{"index": 0, "id": "call_2", "type": "function", "function": {"name": "grep", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"arguments": "{\"pattern\":\"x\"}"}}]),
+            json!([{"index": 0, "id": "call_3", "type": "function", "function": {"name": "grep", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"arguments": "{\"pattern\":\"y\"}"}}]),
+        ])
+        .await;
+        assert_eq!(
+            reused,
+            vec![call("call_1", "list_dir", "{}"), call("call_2", "grep", r#"{"pattern":"x"}"#), call("call_3", "grep", r#"{"pattern":"y"}"#)]
+        );
+        let minted = calls_of(vec![
+            json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "read_file"}}]),
+            json!([{"index": 0, "id": "call_b", "type": "function", "function": {"arguments": "{\"path\":"}}]),
+            json!([{"index": 0, "id": "call_c", "type": "function", "function": {"arguments": "\"a.txt\"}"}}]),
+        ])
+        .await;
+        assert_eq!(minted, vec![call("call_a", "read_file", r#"{"path":"a.txt"}"#)]);
+        let pieces = calls_of(vec![
+            json!([{"index": 0, "id": "c1", "function": {"name": "read_", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"name": "file", "arguments": "{}"}}]),
+        ])
+        .await;
+        assert_eq!(pieces, vec![call("c1", "read_file", "{}")]);
+        // A piece equal to the name so far is part of it when another piece
+        // follows, and a repeat of the whole name when none does.
+        let stutter = calls_of(vec![
+            json!([{"index": 0, "id": "c1", "function": {"name": "re", "arguments": ""}}]),
+            json!([{"index": 0, "function": {"name": "re"}}]),
+            json!([{"index": 0, "function": {"name": "nder", "arguments": "{}"}}]),
+            json!([{"index": 0, "function": {"name": "rerender"}}]),
+        ])
+        .await;
+        assert_eq!(stutter, vec![call("c1", "rerender", "{}")]);
+    }
+
+    /// A call to a tool without parameters can come with blank arguments or
+    /// none, which failed as invalid JSON; and arguments sent as an object
+    /// rather than a string failed the whole chunk, so the call vanished.
+    #[tokio::test]
+    async fn empty_or_object_arguments_are_the_arguments() {
+        let blank = calls_of(vec![json!([{"index": 0, "id": "c1", "function": {"name": "ping", "arguments": ""}}])]).await;
+        assert_eq!(blank, vec![call("c1", "ping", "{}")]);
+        let absent = calls_of(vec![json!([{"index": 0, "id": "c1", "function": {"name": "ping", "arguments": null}}])]).await;
+        assert_eq!(absent, vec![call("c1", "ping", "{}")]);
+        let object = calls_of(vec![json!([{"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": {"path": "a.txt"}}}])]).await;
+        assert_eq!(object, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#)]);
+        let one_shot = json!({"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
+            {"id": "c2", "type": "function", "function": {"name": "ping", "arguments": ""}},
+        ]}, "finish_reason": "tool_calls"}]});
+        let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap().tool_calls;
+        let calls: Vec<_> = calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect();
+        assert_eq!(calls, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#), call("c2", "ping", "{}")]);
+    }
+
+    /// The one-shot mirror of the stream rule: a server that ignores `stream`
+    /// and ends a JSON reply as a tool call with nothing usable as one (a call
+    /// without a name) and no text used to parse as an empty success, so the
+    /// turn ended as if the model had answered. The same reply with text, or
+    /// with a usable call, still parses.
+    #[test]
+    fn a_one_shot_tool_calls_finish_with_no_call_and_no_text_is_an_error() {
+        let nameless = json!({"choices": [{"message": {"content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"arguments": "{}"}},
+        ]}, "finish_reason": "tool_calls"}]});
+        let err = match parse_complete_response(&nameless, &mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty tool_calls reply parsed as a success"),
+        };
+        assert!(err.contains("finish_reason tool_calls but sent no tool call"), "{err}");
+        let with_text = json!({"choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "tool_calls"}]});
+        assert_eq!(parse_complete_response(&with_text, &mut |_| {}).unwrap().content, "done");
+        let with_call = json!({"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
+        ]}, "finish_reason": "tool_calls"}]});
+        assert_eq!(parse_complete_response(&with_call, &mut |_| {}).unwrap().tool_calls.len(), 1);
     }
 
     /// The bug this guards: a server that dies mid-answer sends neither
@@ -1250,6 +2113,99 @@ mod tests {
         assert!(result.reasoning_content.is_none() && result.reasoning.is_none());
     }
 
+    /// Some servers report prompt cache hits only as a top-level
+    /// `prompt_cache_hit_tokens`. Reading `prompt_tokens_details` alone shows
+    /// their hits as not reported, so a working prompt cache looks absent.
+    #[tokio::test]
+    async fn cache_hits_reported_as_prompt_cache_hit_tokens_are_counted() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let usage = result.usage.expect("the final chunk carries usage");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens), (100, 5, Some(80)));
+
+        let usage_of = |usage: Value| {
+            let reply = json!({"choices":[{"message":{"content":"ok"}}],"usage":usage});
+            parse_complete_response(&reply, &mut |_| {}).unwrap().usage.expect("usage is parsed")
+        };
+        assert_eq!(usage_of(json!({"prompt_tokens":100,"prompt_cache_hit_tokens":64})).cached_tokens, Some(64));
+        // The details field wins when a server sends both.
+        let both = json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":70},"prompt_cache_hit_tokens":64});
+        assert_eq!(usage_of(both).cached_tokens, Some(70));
+        let null_details = json!({"prompt_tokens":100,"prompt_tokens_details":null,"prompt_cache_hit_tokens":64});
+        assert_eq!(usage_of(null_details).cached_tokens, Some(64));
+        assert_eq!(usage_of(json!({"prompt_tokens_details":{"cached_tokens":70}})).cached_tokens, Some(70));
+        // A server that reports neither still reads as not reported, not zero.
+        assert_eq!(usage_of(json!({"prompt_tokens":100})).cached_tokens, None);
+    }
+
+    /// `prompt_cache_hit_tokens` is only a fallback. A value of the wrong
+    /// type there must not fail the whole usage object (or, when streamed,
+    /// the whole chunk with its content): that would lose token counts and
+    /// text that parsed fine before the field was read at all.
+    #[tokio::test]
+    async fn an_unusable_prompt_cache_hit_tokens_keeps_the_rest_of_usage() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":70},\"prompt_cache_hit_tokens\":\"80\"}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("ok", "stop"));
+        let usage = result.usage.expect("usage beside an unusable fallback still parses");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens), (100, 5, Some(70)));
+
+        let usage_of = |usage: Value| {
+            let reply = json!({"choices":[{"message":{"content":"ok"}}],"usage":usage});
+            parse_complete_response(&reply, &mut |_| {}).unwrap().usage.expect("usage is parsed")
+        };
+        let with_details = json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":70},"prompt_cache_hit_tokens":"80"});
+        assert_eq!(usage_of(with_details).cached_tokens, Some(70));
+        // With nothing usable to fall back on, cached tokens read as not reported.
+        for bad in [json!("80"), json!(-1), json!(1.5), json!({})] {
+            let usage = usage_of(json!({"prompt_tokens":100,"prompt_cache_hit_tokens":bad}));
+            assert_eq!((usage.prompt_tokens, usage.cached_tokens), (100, None));
+        }
+    }
+
+    /// A chunk with one field of a shape this client did not expect (`delta:
+    /// null` on the finish chunk, token counts typed `12.0`, `choices: null`
+    /// on the usage chunk) failed as a whole and vanished with everything it
+    /// carried: a reply whose finish chunk was the one lost came back
+    /// truncated, and one whose usage chunk was lost its last words.
+    #[tokio::test]
+    async fn a_null_delta_or_a_float_count_keeps_the_chunk() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":null,\"finish_reason\":\"length\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("the answer", "length"));
+
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":12.0,\"completion_tokens\":3.0,\"prompt_tokens_details\":{\"cached_tokens\":8.0}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("the answer", "stop"));
+        let usage = result.usage.expect("whole counts typed as floats are counts");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens), (12, 3, Some(8)));
+
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":null,\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert_eq!(result.usage.map(|u| (u.prompt_tokens, u.completion_tokens)), Some((12, 3)));
+    }
+
     /// An endpoint that answers successive connections with successive
     /// bodies, each close-delimited, then stops listening. An empty body
     /// closes the connection after reading the request without answering:
@@ -1262,6 +2218,9 @@ mod tests {
         let served = Arc::new(std::sync::Mutex::new(0usize));
         let count = served.clone();
         std::thread::spawn(move || {
+            // Connections that a SILENT or STALL: body leaves open, held
+            // until the sequence ends.
+            let mut held = Vec::new();
             for sse in bodies {
                 let Ok((mut stream, _)) = listener.accept() else { return };
                 let mut buf = Vec::new();
@@ -1288,6 +2247,44 @@ mod tests {
                 if sse.is_empty() {
                     continue;
                 }
+                // SILENT takes the request and answers nothing, not even a
+                // status line, while keeping the connection open.
+                if sse == "SILENT" {
+                    held.push(stream);
+                    continue;
+                }
+                // A body prefixed with STALL: is sent as one chunk of a
+                // chunked stream, which then neither continues nor ends.
+                if let Some(payload) = sse.strip_prefix("STALL:") {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    );
+                    held.push(stream);
+                    continue;
+                }
+                // A body prefixed with KEEPALIVE: is preceded by SSE comments,
+                // each sent well inside [`SILENT_FOR`] and all of them well
+                // past it: a server holding its stream open through a long
+                // prompt.
+                if let Some(payload) = sse.strip_prefix("KEEPALIVE:") {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+                    for _ in 0..12 {
+                        std::thread::sleep(SILENT_FOR / 5);
+                        let _ = stream.write_all(b": keepalive\n\n");
+                    }
+                    let _ = stream.write_all(payload.as_bytes());
+                    continue;
+                }
+                // A body prefixed with RAW: is the whole response, status
+                // line and headers included (see `status_response`).
+                if let Some(response) = sse.strip_prefix("RAW:") {
+                    let _ = stream.write_all(response.as_bytes());
+                    continue;
+                }
                 // A body prefixed with CHUNKED: is framed the way real servers
                 // frame a stream, `Transfer-Encoding: chunked`, and the socket
                 // closes after the first chunk with no terminating chunk: the
@@ -1302,6 +2299,18 @@ mod tests {
                     );
                     continue;
                 }
+                // A body prefixed with JSON: is a whole JSON reply, the
+                // shape of a server that ignores `stream`.
+                if let Some(json) = sse.strip_prefix("JSON:") {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json}",
+                            json.len()
+                        )
+                        .as_bytes(),
+                    );
+                    continue;
+                }
                 let _ = stream.write_all(
                     format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}").as_bytes(),
                 );
@@ -1311,9 +2320,25 @@ mod tests {
     }
 
     async fn stream_sequence(bodies: Vec<String>) -> (CompletionResult, Vec<String>, usize) {
+        let (result, deltas, served) = try_stream_sequence(bodies).await;
+        (result.unwrap(), deltas, served)
+    }
+
+    async fn try_stream_sequence(bodies: Vec<String>) -> (Result<CompletionResult, String>, Vec<String>, usize) {
+        try_stream_sequence_idle(bodies, IDLE_TIMEOUT).await
+    }
+
+    /// [`try_stream_sequence`] with the client giving up on an endpoint
+    /// after `idle` of silence.
+    async fn try_stream_sequence_idle(
+        bodies: Vec<String>,
+        idle: std::time::Duration,
+    ) -> (Result<CompletionResult, String>, Vec<String>, usize) {
         let (url, served) = spawn_sse_sequence(bodies);
         let mut deltas: Vec<String> = Vec::new();
-        let result = ChatClient::new(url, None, "m".into(), None, 64)
+        let mut client = ChatClient::new(url, None, "m".into(), None, 64);
+        client.idle_timeout = idle;
+        let result = client
             .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
                 deltas.push(match d {
                     StreamDelta::Content(t) => format!("content:{t}"),
@@ -1321,8 +2346,7 @@ mod tests {
                     StreamDelta::Retry { attempt, max_attempts, reason } => format!("retry:{attempt}/{max_attempts}:{reason}"),
                 })
             })
-            .await
-            .unwrap();
+            .await;
         let served = *served.lock().unwrap();
         (result, deltas, served)
     }
@@ -1408,29 +2432,164 @@ mod tests {
     }
 
     /// Nothing listening is not a fault worth a minute of backoff: after
-    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early. The port
-    /// was bound and released by this test, so nothing answers on it; the
-    /// deadline keeps a stray listener from turning that into a hang.
+    /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early, and the
+    /// retry line counts to that attempt rather than to a budget it never
+    /// spends. The port was bound and released by this test, so nothing
+    /// answers on it; the deadline keeps a stray listener from turning that
+    /// into a hang.
     #[tokio::test]
     async fn an_address_that_never_answers_gives_up_before_the_budget() {
-        let url = {
-            let released = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://{}/v1", released.local_addr().unwrap())
-        };
-        let mut deltas: Vec<String> = Vec::new();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
+        let reason = format!("cannot connect to {addr} (connection refused)");
+        assert_eq!(deltas, [2, 3].map(|n| format!("{n}/{UNREACHED_ATTEMPTS}:{reason}")));
+        assert_eq!(err, format!("{reason}: nothing is listening there; start the server or fix base_url (openmax --spec settings)"));
+    }
+
+    /// The bug this guards: an address with nothing listening was announced
+    /// as "retrying (2 of 8)" although the request ends on the third attempt
+    /// that cannot connect. The count follows the attempts that can still
+    /// happen: here the first attempt reaches a server that answers 503 and
+    /// then stops listening, so the streak, and the count to its end, starts
+    /// at the second.
+    #[tokio::test]
+    async fn unreached_retry_line_counts_unreached_attempts() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Gone before it answers, so every later attempt is refused.
+            drop(listener);
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                match line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    Some(n) => length = n.trim().parse().unwrap(),
+                    None if line.trim().is_empty() => break,
+                    None => {}
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let _ = reader.get_mut().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy");
+        });
+        let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
+        let refused = format!("cannot connect to {addr} (connection refused)");
+        assert_eq!(
+            deltas,
+            [
+                format!("2/{MAX_ATTEMPTS}:backend returned 503 Service Unavailable: busy"),
+                format!("3/4:{refused}"),
+                format!("4/4:{refused}"),
+            ]
+        );
+        assert!(err.starts_with(&format!("{refused}: nothing is listening there")), "{err}");
+    }
+
+    /// The error a request to `url` ends with and its retry announcements,
+    /// as "attempt/max_attempts:reason", bounded so a stray listener on a
+    /// released port cannot hang the test.
+    async fn unreached_request(url: String) -> (String, Vec<String>) {
+        let mut deltas = Vec::new();
         let client = ChatClient::new(url, None, "m".into(), None, 64);
         let messages = [ChatMessage::user("hi")];
         let request = client.stream_chat(&messages, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
-            if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
-                deltas.push(format!("{attempt}/{max_attempts}"));
+            if let StreamDelta::Retry { attempt, max_attempts, reason } = d {
+                deltas.push(format!("{attempt}/{max_attempts}:{reason}"));
             }
         });
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), request)
             .await
             .expect("a released port answers with a refusal, not silence");
         let Err(err) = result else { panic!("no listener is a failed request") };
-        assert!(err.starts_with("request failed: "), "{err}");
-        assert_eq!(deltas, vec![format!("2/{MAX_ATTEMPTS}"), format!("3/{MAX_ATTEMPTS}")]);
+        (err, deltas)
+    }
+
+    /// A failure before any connection names the server and the cause: a
+    /// name that does not resolve and a connect that never completes (from
+    /// resolvers that fail every lookup or never answer, so the test asks no
+    /// real one), and a TLS handshake with a server that does not speak TLS,
+    /// which says what failed and offers no repair it cannot know.
+    #[tokio::test]
+    async fn a_connect_failure_names_the_server_and_its_cause() {
+        struct NoSuchHost;
+        impl reqwest::dns::Resolve for NoSuchHost {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async { Err(std::io::Error::other("no such host").into()) })
+            }
+        }
+        let http = reqwest::Client::builder().no_proxy().dns_resolver(Arc::new(NoSuchHost)).build().unwrap();
+        let err = http.get("http://models.example:8080/v1").send().await.unwrap_err();
+        assert_eq!(
+            never_connected(&err, false),
+            Some((
+                "cannot connect to models.example:8080 (DNS lookup failed: no such host)".to_string(),
+                "fix the host in base_url or check the network (openmax --spec settings)"
+            ))
+        );
+        // Through a proxy the same causes can be the proxy's own.
+        assert_eq!(never_connected(&err, true), None);
+
+        struct NoAnswer;
+        impl reqwest::dns::Resolve for NoAnswer {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(std::future::pending())
+            }
+        }
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(NoAnswer))
+            .connect_timeout(std::time::Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let err = http.get("http://models.example:8080/v1").send().await.unwrap_err();
+        assert_eq!(
+            never_connected(&err, false),
+            Some((
+                "cannot connect to models.example:8080 (timed out)".to_string(),
+                "nothing answered; check that the host is up and that base_url names it (openmax --spec settings)"
+            ))
+        );
+
+        // Plain http where the handshake expects TLS; the connection stays
+        // open until the client hangs up, so the cause is the handshake's.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let err = http.get(format!("https://{addr}/v1")).send().await.unwrap_err();
+        let (line, repair) = never_connected(&err, false).expect("a failed handshake never reached the endpoint");
+        assert!(line.starts_with(&format!("cannot connect to {addr} (TLS handshake failed: ")), "{line}");
+        assert!(!line.contains("error sending request"), "{line}");
+        assert_eq!(repair, "");
+    }
+
+    /// A timeout after the connection existed is not a failure to connect:
+    /// TCP keepalive giving up on a server that took the request and then
+    /// went away reads as a timeout too, and telling the user nothing
+    /// answered there would be false. It keeps the chain.
+    #[tokio::test]
+    async fn a_timeout_after_connecting_is_not_named_a_connect_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let accepted = listener.accept();
+            let _ = hold.recv();
+            drop(accepted);
+        });
+        let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_millis(50)).build().unwrap();
+        let err = http.get(format!("http://{addr}/v1")).send().await.unwrap_err();
+        assert!(err.is_timeout() && !err.is_connect(), "{err:?}");
+        assert_eq!(never_connected(&err, false), None);
+        let _ = release.send(());
     }
 
     /// The client reports what arrived without hiding it: once the retry
@@ -1483,17 +2642,835 @@ mod tests {
         assert_eq!(result.reasoning_content.as_deref(), Some("fresh"));
     }
 
+    /// A data line a proxy split in two with a stray newline is one this
+    /// client cannot read. Skipped, the lines around it joined: a call whose
+    /// arguments streamed as `{"command": "rm -rf ./build`, `/cache`, `"}`
+    /// came back without the middle piece as `rm -rf ./build`, finished as
+    /// `tool_calls`, and ran. The attempt ends at that line instead: a reply
+    /// nothing of which has streamed starts over, and one that has comes
+    /// back truncated, which the agent loop never dispatches.
+    #[tokio::test]
+    async fn an_unreadable_stream_line_ends_the_attempt() {
+        let piece = |call: Value| format!("data: {}\n\n", json!({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": null}]}));
+        let opening = piece(json!({"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{\"command\": \"rm -rf ./build"}}));
+        let middle = piece(json!({"index": 0, "function": {"arguments": "/cache"}}));
+        let (head, tail) = middle.split_at(40);
+        let closing = piece(json!({"index": 0, "function": {"arguments": "\"}"}}));
+        let corrupted = format!("{opening}{head}\n{tail}{closing}data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+        let good = "data: {\"choices\":[{\"delta\":{\"content\":\"cleaned\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+        let (result, deltas, served) = stream_sequence(vec![corrupted.clone(), good.into()]).await;
+        assert_eq!(served, 2, "the attempt was started over");
+        assert!(result.tool_calls.is_empty(), "{:?}", result.tool_calls.iter().map(|c| &c.function.arguments).collect::<Vec<_>>());
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("cleaned", "stop"));
+        assert_eq!(deltas.len(), 2, "{deltas:?}");
+        assert!(deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:the stream carried a line this client cannot read")), "{}", deltas[0]);
+
+        let shown = "data: {\"choices\":[{\"delta\":{\"content\":\"Clearing.\"},\"finish_reason\":null}]}\n\n";
+        let (result, _, served) = stream_sequence(vec![format!("{shown}{corrupted}"), good.into()]).await;
+        assert_eq!(served, 1, "reply text already shown is never generated twice");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("Clearing.", TRUNCATED));
+
+        // After the finish chunk, nothing of the reply was still due: an
+        // unreadable usage line costs the usage alone.
+        let finished = "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let result = stream_once(&format!("{finished}data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\"\n\ndata: [DONE]\n\n")).await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert!(result.usage.is_none());
+    }
+
+    /// The other SSE fields and comments are passed over, never read as data:
+    /// ending the attempt on them would fail every server that sends
+    /// `event:` or `id:` lines, or keepalive comments, beside its chunks.
+    #[tokio::test]
+    async fn field_lines_and_comments_between_chunks_are_passed_over() {
+        let result = stream_once(concat!(
+            "event: message\nid: 1\nretry: 3000\ndata:{\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":null}]}\n\n",
+            ": keepalive\n\n",
+            "data:\n\n",
+            "event: message\ndata:{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data:[DONE]\n\n",
+        ))
+        .await;
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+    }
+
+    /// The server ended the reply as a tool call (finish_reason `tool_calls`)
+    /// and the one call it streamed has no name, so there is nothing to run,
+    /// and no text, so nothing to show. Returned as it came, that reply ended
+    /// the turn as if the model had answered, with nothing done and nothing
+    /// reported. It is a failure of the server's, not one a resend outlasts.
+    #[tokio::test]
+    async fn a_tool_calls_finish_with_no_call_and_no_text_is_an_error() {
+        let nameless = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n";
+        let finish = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        let (result, _, served) = try_stream_sequence(vec![format!("{nameless}{finish}")]).await;
+        assert_eq!(served, 1);
+        let Err(err) = result else { panic!("nothing to run and nothing to show is not a reply") };
+        assert!(err.contains("finish_reason tool_calls but sent no tool call"), "{err}");
+        // With text, the model answered, whatever it called the finish.
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":null}]}\n\n";
+        let result = stream_once(&format!("{text}{nameless}{finish}")).await;
+        assert_eq!((result.content.as_str(), result.tool_calls.len()), ("Done.", 0));
+    }
+
+    /// A refusal for [`spawn_sse_sequence`] to send verbatim: `status`, any
+    /// extra `headers` (each ending in CRLF), and a JSON error body.
+    fn status_response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "RAW:HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// How a gateway reports a failure once its 200 has gone out: an `error`
+    /// object beside a choice that ends with finish_reason `error`.
+    fn gateway_error_chunk(code: Value, message: &str) -> String {
+        let chunk = json!({
+            "id": "gen-1",
+            "object": "chat.completion.chunk",
+            "error": {"code": code, "message": message},
+            "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+    }
+
+    const FINISHED: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The bug this guards: an overloaded or failing upstream ended the turn
+    /// on a refusal the next attempt would not have seen. A refused status
+    /// carries no reply text, and a chat completion has no side effect before
+    /// the agent loop dispatches tools, so it is resent like a 429.
+    #[tokio::test]
+    async fn a_transient_server_error_is_resent_until_a_reply_arrives() {
+        for status in ["500 Internal Server Error", "502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout", "529 Overloaded"] {
+            let refused = status_response(status, "", r#"{"error":{"message":"upstream overloaded"}}"#);
+            let (result, deltas, served) = stream_sequence(vec![refused, FINISHED.into()]).await;
+            assert_eq!(served, 2, "{status} was resent");
+            assert_eq!(result.content, "all of it", "{status}");
+            assert_eq!(deltas.len(), 2, "{status}: {deltas:?}");
+            assert!(
+                deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:backend returned {}", &status[..3]))
+                    && deltas[0].ends_with("upstream overloaded"),
+                "the resend names the refusal: {}",
+                deltas[0]
+            );
+            assert_eq!(deltas[1], "content:all of it");
+        }
+    }
+
+    /// The bug this guards: finish_reason `error` read as a clean end, so a
+    /// failure the server reported inside its stream ended the turn with
+    /// nothing said. It is an error carrying the provider's own message, and
+    /// one that would fail the same way again is not resent.
+    #[tokio::test]
+    async fn an_error_inside_the_stream_is_reported_with_the_providers_message() {
+        let (result, deltas, served) = try_stream_sequence(vec![
+            gateway_error_chunk(json!(400), "the prompt is longer than this endpoint accepts"),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a failure the server reported is an error");
+        assert!(err.contains("the prompt is longer than this endpoint accepts"), "{err}");
+        assert_eq!(served, 1, "a refused request is not resent");
+        assert!(deltas.is_empty(), "{deltas:?}");
+
+        // A retryable failure after reply text streamed is reported, not
+        // resent: the caller has already shown that text.
+        let (result, deltas, served) = try_stream_sequence(vec![
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"half an ans\"}},\"finish_reason\":null}}]}}\n\n{}",
+                gateway_error_chunk(json!("server_error"), "upstream disconnected unexpectedly")
+            ),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a failure after reply text is still an error");
+        assert!(err.contains("upstream disconnected unexpectedly"), "{err}");
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+    }
+
+    /// A rate limit, an overloaded upstream, or a server fault reported
+    /// before any reply text is what a fresh attempt outlasts, as the same
+    /// failure sent as a status is: the reply starts over under the same
+    /// rules as a dropped stream, and the retry names the provider's reason.
+    #[tokio::test]
+    async fn a_retryable_error_inside_the_stream_is_started_over_before_reply_text() {
+        for (failure, reason) in [
+            (
+                gateway_error_chunk(json!(429), "rate limit reached upstream"),
+                "backend reported an error (429): rate limit reached upstream",
+            ),
+            (
+                "data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"too many requests upstream\"}}\n\n".to_string(),
+                "backend reported an error: too many requests upstream",
+            ),
+            (
+                "data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n".to_string(),
+                "backend reported an error: upstream overloaded",
+            ),
+            (
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"upstream reset\"}}]}\n\n".to_string(),
+                "backend reported an error (server_error): upstream reset",
+            ),
+            // The failure can ride the choice instead of the chunk. Read only
+            // at the top level, this one was a failure with no code (never
+            // retried) and the raw chunk stood in for its message.
+            (
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\",\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\"}}]}\n\n".to_string(),
+                "backend reported an error (429): Rate limit exceeded",
+            ),
+        ] {
+            let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
+            let result = result.expect("the second attempt finished");
+            assert_eq!(served, 2);
+            assert_eq!(result.finish_reason, "stop");
+            assert_eq!(result.content, "all of it");
+            assert_eq!(
+                deltas,
+                vec![format!("retry:2/{MAX_ATTEMPTS}:{reason}"), "content:all of it".to_string()]
+            );
+        }
+    }
+
+    /// The bug this guards: a status code inside a 200 was resent whenever it
+    /// was a 5xx, so a 501 or 505, which no attempt can get past and which
+    /// the same refusal as a status reports at once, cost the whole retry
+    /// budget, about a minute, before its message was shown. A code inside a
+    /// 200 is resent exactly when that status would be.
+    #[tokio::test]
+    async fn a_status_inside_a_200_is_resent_on_the_terms_of_that_status() {
+        for code in [429, 500, 502, 503, 504, 529, 501, 505] {
+            let failure = gateway_error_chunk(json!(code), "upstream failed");
+            let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
+            if is_retryable_status(code) {
+                assert_eq!(result.expect("the second attempt finished").content, "all of it", "{code}");
+                assert_eq!(served, 2, "{code} is resent as its status is");
+                assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend reported an error ({code}): upstream failed"));
+            } else {
+                assert_eq!(result.err(), Some(format!("backend reported an error ({code}): upstream failed")));
+                assert_eq!(served, 1, "{code} is reported at once, as its status is");
+                assert!(deltas.is_empty(), "{code}: {deltas:?}");
+            }
+        }
+    }
+
+    /// A server that names its wait is waited for. Before, Retry-After was
+    /// ignored and the resend went out after the bare backoff, into the same
+    /// limit. The header counts seconds, which are [`BACKOFF_UNIT`]s outside
+    /// tests; here a unit is a millisecond, so the wait stays measurable.
+    #[tokio::test]
+    async fn a_retry_after_header_sets_the_wait_before_the_resend() {
+        let limited = status_response("429 Too Many Requests", "Retry-After: 40\r\n", r#"{"error":{"message":"rate limited"}}"#);
+        let started = std::time::Instant::now();
+        let (result, deltas, served) = stream_sequence(vec![limited, FINISHED.into()]).await;
+        let waited = started.elapsed();
+        assert_eq!(served, 2);
+        assert_eq!(result.content, "all of it");
+        assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend returned 429 Too Many Requests: rate limited"));
+        assert!(waited >= BACKOFF_UNIT * 40, "resent after {waited:?}, before the 40 units the server asked for");
+    }
+
+    /// Stream against a server that sends `refusal` and then a finished
+    /// reply. Returns the outcome, the resends announced, and the requests
+    /// served.
+    async fn stream_after_refusal(refusal: String) -> (Result<CompletionResult, String>, usize, usize) {
+        let (url, served) = spawn_sse_sequence(vec![refusal, FINISHED.into()]);
+        let mut retries = 0;
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+                if let StreamDelta::Retry { .. } = d {
+                    retries += 1;
+                }
+            })
+            .await;
+        let served = *served.lock().unwrap();
+        (result, retries, served)
+    }
+
+    /// An exhausted account also answers 429, but no wait makes it succeed:
+    /// the bug this guards spent the whole retry budget, about a minute, on
+    /// such a refusal before showing it. The server's message comes back
+    /// after the one request.
+    #[tokio::test]
+    async fn an_exhausted_quota_is_reported_without_a_retry() {
+        let exhausted = status_response(
+            "429 Too Many Requests",
+            "",
+            r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#,
+        );
+        let (result, retries, served) = stream_after_refusal(exhausted).await;
+        let Err(err) = result else { panic!("an exhausted quota is an error, not a resend") };
+        assert_eq!(
+            err,
+            "backend returned 429 Too Many Requests: You exceeded your current quota, please check your plan and billing details."
+        );
+        assert_eq!(retries, 0);
+        assert_eq!(served, 1);
+    }
+
+    /// A Retry-After past [`RETRY_AFTER_CAP_SECS`] is a limit that lifts
+    /// long after any wait a turn can take (a daily token limit, a
+    /// maintenance window). The bug this guards cut such an ask to the cap
+    /// and resent anyway on every attempt: minutes of waits, each answered
+    /// with the same refusal. It comes back at once with the server's wait,
+    /// so the user knows when to try again.
+    #[tokio::test]
+    async fn a_retry_after_past_the_cap_is_reported_without_a_retry() {
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let refused = status_response(status, "Retry-After: 3600\r\n", r#"{"error":{"message":"daily limit reached"}}"#);
+            let (result, retries, served) = stream_after_refusal(refused).await;
+            let Err(err) = result else { panic!("{status}: an ask past the cap is an error, not a resend") };
+            assert_eq!(err, format!("backend returned {status}: daily limit reached (the server asks for a retry after 3600s)"));
+            assert_eq!(retries, 0, "{status}");
+            assert_eq!(served, 1, "{status}");
+        }
+    }
+
+    /// A failure inside a 200 is resent on the terms of a refused status,
+    /// and those include the server's Retry-After. The bug this guards read
+    /// the header only on a refused status: a rate limit a gateway put
+    /// inside a 200 with `Retry-After: 3600` was resent on the bare backoff
+    /// into a limit the server said would hold for an hour, and the error
+    /// came only after the whole budget, without the server's wait.
+    #[tokio::test]
+    async fn a_failure_inside_a_200_waits_as_the_server_asks() {
+        let ok = |content_type: &str, retry_after: u64, body: &str| {
+            format!(
+                "RAW:HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nRetry-After: {retry_after}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let json_failure = r#"{"error":{"code":429,"message":"rate limit reached upstream"}}"#.to_string();
+        let sse_failure = gateway_error_chunk(json!(429), "rate limit reached upstream");
+        for (content_type, body) in [("application/json", json_failure), ("text/event-stream", sse_failure)] {
+            let (result, retries, served) = stream_after_refusal(ok(content_type, 3600, &body)).await;
+            assert_eq!(
+                result.err().as_deref(),
+                Some("backend reported an error (429): rate limit reached upstream (the server asks for a retry after 3600s)"),
+                "{content_type}"
+            );
+            assert_eq!((retries, served), (0, 1), "{content_type}");
+
+            let started = std::time::Instant::now();
+            let (result, retries, served) = stream_after_refusal(ok(content_type, 40, &body)).await;
+            let waited = started.elapsed();
+            assert_eq!(result.expect("the second attempt finished").content, "all of it", "{content_type}");
+            assert_eq!((retries, served), (1, 2), "{content_type}");
+            assert!(waited >= BACKOFF_UNIT * 40, "{content_type}: resent after {waited:?}, before the 40 units the server asked for");
+        }
+    }
+
+    /// Some servers send the failure alone on its line, with no choices. That
+    /// line failed to parse and was skipped, so the stream read as one that
+    /// died with nothing said, and was resent until the budget ran out.
+    #[tokio::test]
+    async fn a_bare_error_line_is_reported_with_the_providers_message() {
+        for line in [
+            r#"data: {"error":{"message":"insufficient credits for this request","code":402}}"#,
+            r#"data: {"error":"insufficient credits for this request"}"#,
+        ] {
+            let (result, _, served) = try_stream_sequence(vec![format!("{line}\n\n"), FINISHED.into()]).await;
+            let err = result.err().expect("a bare error line is an error");
+            assert!(err.contains("insufficient credits for this request"), "{err}");
+            assert_eq!(served, 1, "a refused request is not resent");
+        }
+
+        // finish_reason `error` with no error beside it still fails the
+        // reply, and says what the server sent.
+        let (result, _, served) = try_stream_sequence(vec![
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n".into(),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("finish_reason error is an error");
+        assert!(err.contains(r#""finish_reason":"error""#), "{err}");
+        assert_eq!(served, 1);
+    }
+
+    /// A server that ignores `stream` can put the same failure in its JSON
+    /// reply. It reads the same way: the provider's message, and a retry when
+    /// a fresh attempt can outlast it.
+    #[tokio::test]
+    async fn a_failure_in_a_json_reply_is_reported_like_one_in_a_stream() {
+        let (result, deltas, served) = try_stream_sequence(vec![
+            r#"JSON:{"error":{"code":503,"message":"upstream overloaded"}}"#.into(),
+            FINISHED.into(),
+        ])
+        .await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert!(deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:")) && deltas[0].contains("upstream overloaded"), "{deltas:?}");
+
+        let (result, _, served) = try_stream_sequence(vec![
+            r#"JSON:{"error":{"type":"invalid_request_error","message":"unknown parameter: tools"}}"#.into(),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a refused request is an error");
+        assert_eq!(err, "backend reported an error: unknown parameter: tools");
+        assert_eq!(served, 1);
+
+        // A failed JSON reply can instead carry its error on the choice,
+        // beside finish_reason `error` and the partial output that came
+        // first. That read as a finished reply: the partial text was kept
+        // and its tool call ran. None of it has reached the caller yet, so
+        // a failure a fresh attempt can outlast is resent.
+        let (result, deltas, served) = try_stream_sequence(vec![
+            failed_json_reply(json!({"code": 502, "message": "Provider disconnected mid-stream"})),
+            FINISHED.into(),
+        ])
+        .await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(
+            deltas,
+            vec![
+                format!("retry:2/{MAX_ATTEMPTS}:backend reported an error (502): Provider disconnected mid-stream"),
+                "content:all of it".to_string(),
+            ]
+        );
+
+        // One that would fail the same way again is an error, and neither
+        // the partial text nor the tool call comes back.
+        let (result, deltas, served) = try_stream_sequence(vec![
+            failed_json_reply(json!({"code": 403, "message": "output flagged by a content filter"})),
+            FINISHED.into(),
+        ])
+        .await;
+        let err = result.err().expect("a failed reply is an error");
+        assert_eq!(err, "backend reported an error (403): output flagged by a content filter");
+        assert_eq!(served, 1);
+        assert!(deltas.is_empty(), "{deltas:?}");
+
+        // finish_reason `error` with no error beside it fails the reply too.
+        let (result, deltas, served) = try_stream_sequence(vec![failed_json_reply(Value::Null), FINISHED.into()]).await;
+        let err = result.err().expect("finish_reason error is an error");
+        assert!(err.contains(r#""finish_reason":"error""#), "{err}");
+        assert_eq!(served, 1);
+        assert!(deltas.is_empty(), "{deltas:?}");
+    }
+
+    /// A JSON reply a gateway failed partway: partial output, a tool call,
+    /// and finish_reason `error` with `error` on the choice.
+    fn failed_json_reply(error: Value) -> String {
+        let reply = json!({"choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "partial output",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{\"path\":\"a.rs\",\"content\":\"x\"}"},
+                }],
+            },
+            "finish_reason": "error",
+            "error": error,
+        }]});
+        format!("JSON:{reply}")
+    }
+
+    #[test]
+    fn server_failures_a_retry_can_outlast() {
+        let retryable = |error: Value| server_failure(&error, "").retryable;
+        // A status code is retried exactly when that status would be.
+        for code in [json!(429), json!(500), json!(502), json!(503), json!(504), json!(529), json!("429"), json!("503")] {
+            assert!(retryable(json!({"code": code, "message": "m"})), "{code}");
+        }
+        for kind in ["rate_limit_exceeded", "rate_limit_error", "server_error", "overloaded_error"] {
+            assert!(retryable(json!({"code": kind})), "{kind}");
+            assert!(retryable(json!({"type": kind})), "{kind}");
+        }
+        // A per-minute limit can name its quota in the message; only the
+        // code and type mark one as exhausted.
+        assert!(retryable(json!({"code": 429, "message": "Quota exceeded for requests per minute"})));
+        for error in [
+            // A refusal no attempt gets past, as a status or inside a 200.
+            json!({"code": 501}),
+            json!({"code": 505}),
+            json!({"code": "501"}),
+            json!({"code": 400}),
+            json!({"code": 401}),
+            json!({"code": 402}),
+            json!({"code": 404}),
+            json!({"code": "insufficient_quota", "type": "insufficient_quota"}),
+            // An exhausted quota fails the same way however it is coded.
+            json!({"code": 429, "type": "insufficient_quota"}),
+            json!({"type": "invalid_request_error"}),
+            json!({"message": "no code at all"}),
+            json!("a bare message"),
+            Value::Null,
+        ] {
+            assert!(!retryable(error.clone()), "{error}");
+        }
+
+        let raw = r#"{"error":{"code":429,"message":"slow down"}}"#;
+        let error: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(server_failure(&error["error"], raw).message, "backend reported an error (429): slow down");
+        let raw = r#"{"error":{"code":"server_error","message":"upstream reset"}}"#;
+        let error: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(server_failure(&error["error"], raw).message, "backend reported an error (server_error): upstream reset");
+    }
+
+    /// The bug this guards: a connection cut after the server finished its
+    /// reply threw that finish away. A reply with text came back truncated,
+    /// and one carrying only tool calls has no text, so it was generated and
+    /// billed a second time. The finish the server sent stands.
+    #[tokio::test]
+    async fn a_finished_reply_survives_a_connection_cut_after_it() {
+        let (result, deltas, served) = stream_sequence(vec![
+            concat!(
+                "CHUNKED:data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .into(),
+            FINISHED.into(),
+        ])
+        .await;
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:all of it".to_string()]);
+
+        let call = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+        let (result, deltas, served) = stream_sequence(vec![format!("CHUNKED:{call}"), call.into()]).await;
+        assert_eq!(served, 1, "the finished reply is generated once");
+        assert!(deltas.is_empty(), "{deltas:?}");
+        assert_eq!(result.finish_reason, "tool_calls");
+        assert_eq!(result.tool_calls.len(), 1);
+    }
+
+    /// How long a test endpoint stays quiet before the client gives up on
+    /// it: the idle interval, injected in place of the minutes a real
+    /// endpoint gets.
+    const SILENT_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// [`try_stream_sequence_idle`] at [`SILENT_FOR`], under a deadline that
+    /// turns a hang into a failure.
+    async fn stream_with_silence(bodies: Vec<String>) -> (Result<CompletionResult, String>, Vec<String>, usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), try_stream_sequence_idle(bodies, SILENT_FOR))
+            .await
+            .expect("a silent endpoint must not hold the request forever")
+    }
+
+    /// The bug this guards: only connecting had a deadline, so an endpoint
+    /// that took the request and then sent nothing (a wedged server, a proxy
+    /// holding a dead upstream) held the turn forever, and a headless run
+    /// never exited. Silence for the whole idle interval ends the attempt as
+    /// a transport fault: before any reply text it is resent, whether the
+    /// endpoint never answered or its stream stopped part way.
+    #[tokio::test]
+    async fn a_silent_endpoint_is_resent_before_reply_text() {
+        let silent = format!("the endpoint sent nothing for {}s", SILENT_FOR.as_secs_f64());
+        let (result, deltas, served) = stream_with_silence(vec!["SILENT".into(), FINISHED.into()]).await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(deltas, vec![format!("retry:2/{MAX_ATTEMPTS}:request failed: {silent}"), "content:all of it".to_string()]);
+
+        let thinking = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me\"},\"finish_reason\":null}]}\n\n";
+        let (result, deltas, served) = stream_with_silence(vec![format!("STALL:{thinking}"), FINISHED.into()]).await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(
+            deltas,
+            vec!["reasoning:let me".to_string(), format!("retry:2/{MAX_ATTEMPTS}:{silent}"), "content:all of it".to_string()]
+        );
+    }
+
+    /// Silence after reply text is a truncation, as a cut there is: the
+    /// caller has already shown that text. Silence after the server finished
+    /// leaves the reply finished.
+    #[tokio::test]
+    async fn a_stream_silent_after_reply_text_or_its_finish_is_not_resent() {
+        let half = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+        let (result, deltas, served) = stream_with_silence(vec![format!("STALL:{half}"), FINISHED.into()]).await;
+        let result = result.expect("a truncated reply is still a reply");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("half an ans", TRUNCATED));
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let (result, _, served) = stream_with_silence(vec![format!("STALL:{done}"), FINISHED.into()]).await;
+        let result = result.expect("a finished reply");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert_eq!(served, 1);
+    }
+
+    /// Any byte is activity, an SSE comment too: a server that keeps its
+    /// stream alive with comments through a long prompt is waited for, however
+    /// long that takes in all.
+    #[tokio::test]
+    async fn keepalive_comments_hold_off_the_idle_timeout() {
+        let started = std::time::Instant::now();
+        let (result, deltas, served) = stream_with_silence(vec![format!("KEEPALIVE:{FINISHED}")]).await;
+        assert_eq!(result.expect("a kept-alive stream finishes").content, "all of it");
+        assert_eq!((served, deltas), (1, vec!["content:all of it".to_string()]));
+        assert!(started.elapsed() > SILENT_FOR * 2, "the stream outlasted the idle interval");
+    }
+
+    /// A reply for [`spawn_recording_once`]: the finished stream.
+    fn finished_response() -> String {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{FINISHED}")
+    }
+
+    /// The bug this guards: a provider without a key of its own was sent the
+    /// key settings.json holds for settings.base_url, whatever host the
+    /// provider named. It inherits that key only when it is the same server
+    /// (scheme, host, and port); any other gets no key, and the 401 that
+    /// follows says how to give it its own.
+    #[tokio::test]
+    async fn a_settings_key_reaches_only_its_own_host() {
+        let dir = std::env::temp_dir().join(format!("openmax-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider_at = |url: &str| {
+            let catalog = json!({"providers": {"local": {"base_url": url, "models": [{"id": "m", "context_tokens": 8192}]}}});
+            std::fs::write(crate::providers::providers_path(&dir), catalog.to_string()).unwrap();
+        };
+        let mut settings = crate::config::Settings {
+            provider: Some("local".into()),
+            model: "m".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: Some("sk-settings".into()),
+            ..Default::default()
+        };
+        let request = |endpoint: &crate::providers::ActiveEndpoint| {
+            let client = ChatClient::from_endpoint(endpoint);
+            async move {
+                client
+                    .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+                    .await
+            }
+        };
+
+        let refusal = r#"{"error":{"message":"missing credentials"}}"#;
+        let (url, heads) = spawn_recording_once(format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{refusal}",
+            refusal.len()
+        ));
+        provider_at(&url);
+        let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
+        let err = request(&endpoint).await.err().expect("a 401 is an error");
+        let head = heads.recv().unwrap().to_ascii_lowercase();
+        assert!(!head.contains("authorization") && !head.contains("sk-settings"), "{head}");
+        assert!(err.starts_with("backend returned 401 Unauthorized: missing credentials"), "{err}");
+        assert!(err.contains("provider 'local'") && err.contains("api_key_env"), "{err}");
+
+        // The same scheme, host, and port is the same server, whatever the path.
+        let (url, heads) = spawn_recording_once(finished_response());
+        provider_at(&url);
+        settings.base_url = url.trim_end_matches("/v1").into();
+        let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
+        assert_eq!(request(&endpoint).await.unwrap().content, "all of it");
+        let head = heads.recv().unwrap().to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-settings"), "{head}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The bug this guards: the key went out as a bearer header over plain
+    /// http to any host, readable anywhere on the path. A request that would
+    /// carry a credential (the key, a credential header such as Authorization
+    /// or X-API-Key, or user:password in the base_url, which the HTTP client
+    /// sends as Basic auth) over http to another machine is refused before
+    /// anything is sent, naming the fix; over loopback, to a server on this
+    /// machine, it goes out.
+    #[tokio::test]
+    async fn a_key_never_crosses_plain_http_to_another_machine() {
+        for (base_url, key, headers) in [
+            ("http://models.example.invalid/v1", Some("sk-test".to_string()), Vec::new()),
+            ("http://models.example.invalid/v1", None, vec![("Authorization".to_string(), "Bearer sk-test".to_string())]),
+            ("http://models.example.invalid/v1", None, vec![("X-API-Key".to_string(), "sk-test".to_string())]),
+            ("http://user:secret@models.example.invalid/v1", None, Vec::new()),
+            ("http://:secret@models.example.invalid/v1", None, Vec::new()),
+        ] {
+            let mut client = ChatClient::new(base_url.into(), key, "m".into(), None, 64);
+            client.headers = headers;
+            let mut retries = 0;
+            let err = client
+                .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| retries += 1)
+                .await
+                .err()
+                .expect("a key over plain http to another machine is refused");
+            assert!(err.starts_with("refusing to send"), "{err}");
+            assert!(err.contains("models.example.invalid") && err.contains("https") && err.contains("127.0.0.1"), "{err}");
+            assert!(err.contains("user:password in the base_url") && !err.contains("secret"), "{err}");
+            assert_eq!(retries, 0, "nothing was sent, so nothing was resent");
+        }
+
+        let (url, heads) = spawn_recording_once(finished_response());
+        let result = ChatClient::new(url, Some("sk-local".into()), "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .expect("loopback http carries a key");
+        assert_eq!(result.content, "all of it");
+        let head = heads.recv().unwrap().to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-local"), "{head}");
+    }
+
+    /// https goes anywhere; plain http only to this machine, however its
+    /// address is spelled.
+    #[test]
+    fn only_https_or_this_machine_may_carry_a_key() {
+        for url in [
+            "https://api.example.com/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://127.8.9.10/v1",
+            "http://localhost:1234/v1",
+            "http://LOCALHOST/v1",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]/v1",
+            "http://0.0.0.0:8000/v1",
+        ] {
+            assert_eq!(plain_http_refusal(url), None, "{url}");
+        }
+        for url in [
+            "http://api.example.com/v1",
+            "http://192.168.1.5:8000/v1",
+            "http://10.0.0.2/v1",
+            "http://[2001:db8::1]/v1",
+            "http://localhost.example.com/v1",
+        ] {
+            assert!(plain_http_refusal(url).is_some(), "{url}");
+        }
+    }
+
+    /// A header is a credential by its name, whatever name the server picked
+    /// for its key or token; routing and attribution headers are not, so a
+    /// keyless server that wants one still works over http.
+    #[test]
+    fn a_credential_header_is_known_by_its_name() {
+        let sends = |name: &str| {
+            let mut client = ChatClient::new("http://models.example.invalid/v1".into(), None, "m".into(), None, 64);
+            client.headers = vec![(name.to_string(), "value".to_string())];
+            client.sends_credential()
+        };
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "X-API-Key",
+            "api-key",
+            "X-Auth-Token",
+            "X-Access-Token",
+            "Cookie",
+            "X-Client-Secret",
+            "X-Upstream-Password",
+        ] {
+            assert!(sends(name), "{name}");
+        }
+        for name in ["X-Route", "HTTP-Referer", "X-Title", "User-Agent", "Accept"] {
+            assert!(!sends(name), "{name}");
+        }
+    }
+
+    /// The bug this guards: the HTTP client followed any redirect, and on a
+    /// move to another host it drops only Authorization and cookies, so an
+    /// endpoint that redirected sent the request on, with a key in X-API-Key
+    /// or any other header, to a server nobody configured. A redirect is
+    /// followed only within the server the base_url names (scheme, host, and
+    /// port); one anywhere else fails the request, and nothing reaches that
+    /// server.
+    #[tokio::test]
+    async fn a_redirect_never_carries_a_request_to_another_server() {
+        let (elsewhere, heads) = spawn_recording_once(finished_response());
+        let elsewhere = elsewhere.trim_end_matches("/v1").to_string();
+        let moved = |location: &str| status_response("307 Temporary Redirect", &format!("Location: {location}\r\n"), "");
+        let (url, served) = spawn_sse_sequence(vec![moved(&format!("{elsewhere}/v1/chat/completions"))]);
+        let mut client = ChatClient::new(url, None, "m".into(), None, 64);
+        client.headers = vec![("X-API-Key".into(), "sk-test".into())];
+        let mut deltas = 0;
+        let err = client
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| deltas += 1)
+            .await
+            .err()
+            .expect("a redirect to another server fails the request");
+        assert!(err.contains("redirect") && err.contains(&elsewhere) && !err.contains("sk-test"), "{err}");
+        assert!(heads.try_recv().is_err(), "the other server was sent nothing");
+        assert_eq!((*served.lock().unwrap(), deltas), (1, 0), "the refusal is not resent");
+
+        // Within the same server, a moved path is followed.
+        let (url, served) = spawn_sse_sequence(vec![moved("/v2/chat/completions"), FINISHED.into()]);
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .await
+            .expect("a redirect within the server is followed");
+        assert_eq!(result.content, "all of it");
+        assert_eq!(*served.lock().unwrap(), 2);
+    }
+
+    /// A provider's `idle_timeout_secs` replaces the default interval for
+    /// its requests; a provider without one keeps the default.
+    #[test]
+    fn a_providers_idle_timeout_secs_sets_its_interval() {
+        let dir = std::env::temp_dir().join(format!("openmax-idle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = json!({"providers": {
+            "slow": {"base_url": "http://127.0.0.1:8080/v1", "idle_timeout_secs": 1800, "models": [{"id": "m", "context_tokens": 8192}]},
+            "plain": {"base_url": "http://127.0.0.1:8081/v1", "models": [{"id": "m", "context_tokens": 8192}]},
+        }});
+        std::fs::write(crate::providers::providers_path(&dir), catalog.to_string()).unwrap();
+        let idle = |provider: &str| {
+            let settings = crate::config::Settings { provider: Some(provider.into()), model: "m".into(), ..Default::default() };
+            ChatClient::from_endpoint(&crate::providers::resolve(&settings, &dir).unwrap()).idle_timeout
+        };
+        assert_eq!(idle("slow"), std::time::Duration::from_secs(1800));
+        assert_eq!(idle("plain"), IDLE_TIMEOUT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn retryable_status_codes() {
-        assert!(is_retryable_status(429));
-        // Proxy 5xx may have already started work; do not retry.
-        assert!(!is_retryable_status(502));
-        assert!(!is_retryable_status(503));
-        assert!(!is_retryable_status(504));
-        assert!(!is_retryable_status(400));
-        assert!(!is_retryable_status(401));
-        assert!(!is_retryable_status(404));
-        assert!(!is_retryable_status(500));
+        // A rate limit, or an upstream that cannot serve the request right now.
+        for code in [429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable_status(code), "{code}");
+        }
+        // A refusal of the request itself: every attempt gets the same answer.
+        for code in [400, 401, 403, 404, 413, 422, 501] {
+            assert!(!is_retryable_status(code), "{code}");
+        }
+    }
+
+    /// Retry-After stretches the backoff up to the cap and never shortens
+    /// it; a value the header cannot hold as whole seconds is left to the
+    /// backoff.
+    #[test]
+    fn retry_after_stretches_the_backoff_but_never_shortens_it() {
+        assert_eq!(backoff(1, None), BACKOFF_UNIT);
+        assert_eq!(backoff(4, None), BACKOFF_UNIT * 8);
+        assert_eq!(backoff(1, Some(40)), BACKOFF_UNIT * 40);
+        assert_eq!(backoff(1, Some(u64::MAX)), BACKOFF_UNIT * RETRY_AFTER_CAP_SECS as u32);
+        assert_eq!(backoff(4, Some(0)), BACKOFF_UNIT * 8);
+        assert_eq!(backoff(4, Some(3)), BACKOFF_UNIT * 8);
+
+        let header = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            retry_after_secs(&headers)
+        };
+        assert_eq!(header("40"), Some(40));
+        assert_eq!(header(" 7 "), Some(7));
+        assert_eq!(header("99999999999999"), Some(99_999_999_999_999));
+        assert_eq!(header("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(header("1.5"), None);
+        assert_eq!(header("-1"), None);
+        assert_eq!(retry_after_secs(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    /// Only an exhausted quota stops the retry: a rate limit says when it
+    /// lifts, and a body that is not an error envelope says nothing.
+    #[test]
+    fn only_an_exhausted_quota_is_not_worth_a_retry() {
+        assert!(quota_exhausted(r#"{"error":{"message":"out of credit","type":"insufficient_quota","code":"insufficient_quota"}}"#));
+        assert!(quota_exhausted(r#"{"error":{"message":"out of credit","code":"insufficient_quota"}}"#));
+        assert!(quota_exhausted(r#"{"error":{"message":"out of credit","type":"insufficient_quota","code":null}}"#));
+        assert!(!quota_exhausted(r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#));
+        assert!(!quota_exhausted("insufficient_quota"));
+        assert!(!quota_exhausted(""));
     }
 
     #[test]
@@ -1580,11 +3557,163 @@ mod tests {
 
         let mut foreign = messages.clone();
         foreign[1].reasoning_content = Some("thought".into());
+        foreign[1].reasoning_details = Some(RawValue::from_string(r#"[{"type":"reasoning.encrypted","data":"x"}]"#.into()).unwrap());
+        foreign[1].tool_calls.as_mut().unwrap()[0].extra_content = Some(RawValue::from_string(r#"{"google":{"thought_signature":"s"}}"#.into()).unwrap());
         foreign[1].reasoning_origin = Some("elsewhere".into());
         assert_eq!(wire(&foreign, "o"), old_shape);
 
         let old: ChatMessage = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
         assert!(old.reasoning_content.is_none() && old.reasoning.is_none() && old.reasoning_origin.is_none());
+        assert!(old.reasoning_details.is_none());
+        let old: ToolCall = serde_json::from_str(r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}"#).unwrap();
+        assert!(old.extra_content.is_none());
+    }
+
+    /// Gemini streams each call whole, without an `index`, and puts its
+    /// thought signature in the call's `extra_content`; its next request
+    /// fails without it. The value comes back on that call exactly as it
+    /// arrived, through the session file too, to the endpoint that produced
+    /// it and to no other. A call beside it without one keeps its old bytes.
+    #[tokio::test]
+    async fn a_calls_extra_content_goes_back_as_it_came_to_its_endpoint_only() {
+        let result = stream_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"extra_content\": {\"google\": {\"thought_signature\": \"sig/A==\"}},\"function\":{\"arguments\":\"{}\",\"name\":\"bash\"},\"id\":\"c1\",\"type\":\"function\"}]},\"index\":0}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .await;
+        assert_eq!(result.finish_reason, "tool_calls");
+        let signature = r#"{"google": {"thought_signature": "sig/A=="}}"#;
+        assert_eq!(result.tool_calls[0].extra_content.as_deref().map(RawValue::get), Some(signature));
+        assert!(result.tool_calls[1].extra_content.is_none());
+
+        let client = |base: &str| ChatClient::new(base.into(), None, "m".into(), None, 64);
+        let (signing, other) = (client("http://signing/v1"), client("http://other/v1"));
+        let mut reply = ChatMessage::assistant(None, Some(result.tool_calls));
+        reply.reasoning_origin = Some(signing.origin());
+        let signed = concat!(
+            r#"[{"role":"assistant","tool_calls":["#,
+            r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"},"extra_content":{"google": {"thought_signature": "sig/A=="}}},"#,
+            r#"{"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"}}]}]"#,
+        );
+        let unsigned = concat!(
+            r#"[{"role":"assistant","tool_calls":["#,
+            r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}},"#,
+            r#"{"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"}}]}]"#,
+        );
+        assert_eq!(wire(std::slice::from_ref(&reply), &signing.origin()), signed);
+        assert_eq!(wire(std::slice::from_ref(&reply), &other.origin()), unsigned);
+
+        // The session file holds the same bytes, and a resumed session sends them.
+        let line = serde_json::to_string(&reply).unwrap();
+        assert!(line.contains(&format!(r#""extra_content":{signature}"#)), "{line}");
+        let resumed: ChatMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(wire(&[resumed], &signing.origin()), signed);
+        // Unstamped, it goes nowhere; it rides every request, so it is counted.
+        let mut unstamped = reply.clone();
+        unstamped.reasoning_origin = None;
+        assert_eq!(wire(std::slice::from_ref(&unstamped), &signing.origin()), unsigned);
+        unstamped.tool_calls.as_mut().unwrap()[0].extra_content = None;
+        assert!(reply.estimated_tokens() > unstamped.estimated_tokens());
+
+        // A one-shot JSON reply keeps it too; a null is no value.
+        let one_shot = json!({"choices":[{"message":{"tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sig"}}},
+            {"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"},"extra_content":null},
+        ]},"finish_reason":"tool_calls"}]});
+        let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap().tool_calls;
+        assert_eq!(calls[0].extra_content.as_deref().map(RawValue::get), Some(r#"{"google":{"thought_signature":"sig"}}"#));
+        assert!(calls[1].extra_content.is_none());
+    }
+
+    /// OpenRouter streams a signed model's `reasoning_details` in parts: a
+    /// block's text in pieces under one `index`, its signature null until a
+    /// later part. Those parts come back as one entry per block, with the
+    /// signature; encrypted blobs, and a block with another `id`, stay
+    /// separate entries even under a shared index, since joining them would
+    /// corrupt them. An array the server sent empty carries no signature and
+    /// is no details at all, as if absent; a key of another shape is ignored
+    /// without losing the chunk.
+    #[tokio::test]
+    async fn streamed_reasoning_details_are_merged_by_index() {
+        let detail = |parts: &str| format!("data: {{\"choices\":[{{\"delta\":{{\"reasoning_details\":{parts}}},\"finish_reason\":null}}]}}\n\n");
+        let sse = [
+            detail(r#"[{"type":"reasoning.summary","summary":"plan ","index":0},{"type":"reasoning.text","text":"think ","signature":null,"id":"t1","index":1}]"#),
+            detail(r#"[{"type":"reasoning.summary","summary":"done","index":0},{"type":"reasoning.text","text":"more","signature":null,"index":1}]"#),
+            detail(r#"[{"type":"reasoning.text","text":"","signature":"sig1","index":1},{"type":"reasoning.encrypted","data":"blobA","id":"e1","index":2},{"type":"reasoning.encrypted","data":"blobB","id":"e2","index":2}]"#),
+            detail(r#"[{"type":"reasoning.text","text":"second","signature":"sig2","id":"t2","index":1}]"#),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"reasoning_details\":{\"odd\":true}},\"finish_reason\":\"stop\"}]}\n\n".into(),
+        ]
+        .concat();
+        let result = stream_once(&sse).await;
+        assert_eq!(result.content, "ok", "a key of another shape must not cost the chunk its content");
+        let details: Value = serde_json::from_str(result.reasoning_details.as_deref().expect("the server sent details").get()).unwrap();
+        assert_eq!(
+            details,
+            json!([
+                {"type": "reasoning.summary", "summary": "plan done", "index": 0},
+                {"type": "reasoning.text", "text": "think more", "signature": "sig1", "id": "t1", "index": 1},
+                {"type": "reasoning.encrypted", "data": "blobA", "id": "e1", "index": 2},
+                {"type": "reasoning.encrypted", "data": "blobB", "id": "e2", "index": 2},
+                {"type": "reasoning.text", "text": "second", "signature": "sig2", "id": "t2", "index": 1},
+            ])
+        );
+
+        // OpenRouter sends an empty array on every delta of a model that
+        // does not reason.
+        let empty = stream_once(&[detail("[]"), detail("[]"), "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"reasoning\":null,\"reasoning_details\":[]},\"finish_reason\":\"stop\"}]}\n\n".into()].concat()).await;
+        assert_eq!(empty.content, "ok");
+        assert!(empty.reasoning_details.is_none(), "{:?}", empty.reasoning_details);
+        let absent = stream_once("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n").await;
+        assert!(absent.reasoning_details.is_none());
+
+        // A one-shot JSON reply keeps its array as sent, unless it is empty.
+        let one_shot = |details: Value| {
+            let reply = json!({"choices":[{"message":{"content":"ok","reasoning_details":details}}]});
+            parse_complete_response(&reply, &mut |_| {}).unwrap().reasoning_details.map(|d| d.get().to_string())
+        };
+        assert_eq!(one_shot(json!([{"data": "x", "type": "reasoning.encrypted"}])).as_deref(), Some(r#"[{"data":"x","type":"reasoning.encrypted"}]"#));
+        assert_eq!(one_shot(json!([])), None);
+        assert_eq!(one_shot(Value::Null), None);
+        assert_eq!(one_shot(json!("text")), None);
+
+        // They go back, as stored, beside the plain text, to their endpoint only.
+        let origin = ChatClient::new("http://a/v1".into(), None, "m".into(), None, 64).origin();
+        let mut reply = ChatMessage::assistant(Some("ok".into()), None);
+        reply.reasoning = Some("think more".into());
+        reply.reasoning_details = result.reasoning_details;
+        reply.reasoning_origin = Some(origin.clone());
+        let stored = reply.reasoning_details.as_deref().unwrap().get().to_string();
+        assert_eq!(
+            wire(std::slice::from_ref(&reply), &origin),
+            format!(r#"[{{"role":"assistant","content":"ok","reasoning":"think more","reasoning_details":{stored}}}]"#)
+        );
+        assert_eq!(wire(std::slice::from_ref(&reply), "elsewhere"), r#"[{"role":"assistant","content":"ok"}]"#);
+        let mut without = reply.clone();
+        without.reasoning_details = None;
+        assert!(reply.estimated_tokens() > without.estimated_tokens(), "they ride every request, so they are counted");
+    }
+
+    /// The server decides how many `reasoning_details` parts a stream has, so
+    /// a part must find the entry it continues without scanning every entry
+    /// kept so far: a stream of parts that each start a new block (a fresh
+    /// `index`, or none) would otherwise cost time quadratic in its length
+    /// and stall the turn. Each such part stays its own entry, and a late
+    /// part of an early block still finds that block.
+    #[test]
+    fn many_reasoning_detail_blocks_each_keep_their_own_entry() {
+        let blocks = 10_000u64;
+        let (mut details, mut open) = (Vec::new(), OpenDetails::new());
+        for index in 0..blocks {
+            merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.text", "text": "a", "index": index}));
+            merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.summary", "summary": "s"}));
+        }
+        merge_reasoning_detail(&mut details, &mut open, json!({"type": "reasoning.text", "text": "b", "signature": "sig", "index": 0}));
+        let mut expected: Vec<Value> = (0..blocks)
+            .flat_map(|index| [json!({"type": "reasoning.text", "text": "a", "index": index}), json!({"type": "reasoning.summary", "summary": "s"})])
+            .collect();
+        expected[0] = json!({"type": "reasoning.text", "text": "ab", "signature": "sig", "index": 0});
+        assert_eq!(details.len(), expected.len(), "a part with a new index, or none, starts its own entry");
+        assert!(details == expected, "each block keeps its own entry, and a late part continues its block");
     }
 
     /// The bug this guards: a session that ran on DeepSeek and then moved to
@@ -1679,6 +3808,7 @@ mod tests {
             id: "c1".into(),
             kind: "function".into(),
             function: ToolCallFunction { name: "bash".into(), arguments: "{}".into() },
+            extra_content: None,
         }
     }
 

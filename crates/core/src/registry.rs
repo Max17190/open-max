@@ -103,17 +103,19 @@ pub struct Registry {
     /// reason. Receipts and the unknown-tool error name these so a broken
     /// write is never mistaken for a live capability.
     pub broken: Vec<(PathBuf, String)>,
-    /// Every capability file path THIS freeze's capture actually read (tool
-    /// manifests and SKILL.mds). The refreeze classifier asks whether a path
-    /// still existed in this generation without a second disk probe, which
-    /// would race the capture it claims to describe. Empty for a
-    /// manifest-restored registry, which only ever sits on the outgoing side
-    /// of that comparison.
-    pub(crate) read_paths: std::collections::HashSet<PathBuf>,
+    /// Every capability file THIS freeze's capture actually read (tool
+    /// manifests and SKILL.mds), with a hash of the bytes it read. The
+    /// refreeze receipt compares two generations file by file from these
+    /// without a second disk probe, which would race the capture it claims
+    /// to describe. The session manifest carries them, so a resumed registry
+    /// compares the same way. None for built-ins only or a manifest written
+    /// before they were kept, which only ever sits on the outgoing side of
+    /// that comparison.
+    pub(crate) read_paths: Option<HashMap<PathBuf, u64>>,
     /// Broken TOOL manifests with the name each occupies: the declared name,
     /// or the file stem when the document is too broken to yield one - the
-    /// same derivation the withhold pass uses. Lets the refreeze classifier
-    /// see that a broken file already explains an absent name. Empty for a
+    /// same derivation the withhold pass uses. Lets the unknown-tool error
+    /// name the broken file that occupies a called name. Empty for a
     /// manifest-restored registry.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
     /// Same-directory skill name collisions, one record per name (name,
@@ -156,7 +158,8 @@ pub struct Registry {
 /// One immutable read generation of every file the registry can activate.
 /// Parsing and fingerprinting consume these same bytes, so a concurrent edit
 /// or atomic symlink swap cannot produce a registry whose content disagrees
-/// with its persisted fingerprint.
+/// with its persisted fingerprint. Memory is not part of the generation:
+/// activation reads it.
 pub(crate) struct ExtensionSnapshot {
     fingerprint: u64,
     external: Vec<ToolSpec>,
@@ -165,29 +168,29 @@ pub(crate) struct ExtensionSnapshot {
     tools_omitted: usize,
     /// Skills discovered but dropped by the `MAX_SKILLS` index cap.
     skills_omitted: usize,
-    /// Every capability file this generation read: (path, sha256, bytes).
-    /// The ledger records exactly this generation, so what it attests is what
-    /// the freeze actually used - never a second read that could differ.
-    pub(crate) files: Vec<(PathBuf, String, Vec<u8>)>,
+    /// Every capability file this generation read, with a hash of its bytes
+    /// taken where they were read: the receipt names a changed file from
+    /// this, so nothing downstream needs a copy of the bytes.
+    read_paths: Vec<(PathBuf, u64)>,
     /// Files read but not loaded, with the reason. The bytes are already in
     /// the fingerprint (a broken write still triggers a refreeze); keeping
     /// the reason lets that refreeze's receipt say the tool is NOT live.
     pub(crate) broken: Vec<(PathBuf, String)>,
     /// The tool-tier subset of `broken` with the name each file occupies
-    /// (declared, or stem as the fallback), for the refreeze classifier.
+    /// (declared, or stem as the fallback), for the unknown-tool error.
     pub(crate) broken_tools: Vec<(PathBuf, String)>,
     /// Same-directory skill name collisions, one record per name: (name,
     /// displaced paths, winning path, winner indexed). The receipt names
     /// these; cross-tier precedence is not here.
     pub(crate) shadowed_skills: Vec<(String, Vec<PathBuf>, PathBuf, bool)>,
-    /// Project memory files (stem, content hash). Memory rides the frozen
-    /// prompt's index, so a memory write moves the fingerprint and refreezes:
-    /// the fact is live from the next step, deterministically, instead of
-    /// whenever some unrelated extension file happens to change. Not ledger
-    /// files (data, not capability), so not in `files`.
-    pub(crate) memory_files: Vec<(String, u64)>,
-    /// The index section from the same scan as `memory_files`.
-    pub(crate) memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// The project whose memory index `Registry::from_snapshot` reads.
+    /// Memory rides the frozen prompt's index but not the fingerprint, so a
+    /// memory write never refreezes on its own; the index catches up at the
+    /// next refreeze or /reload. It is read at activation, not here: most
+    /// captures match the frozen fingerprint and are discarded, and a memory
+    /// scan in each would read every memory file and the whole access log
+    /// for nothing. Data, not capability, so not in `read_paths`.
+    project_root: PathBuf,
 }
 
 impl ExtensionSnapshot {
@@ -204,7 +207,15 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    let mut files_read: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+    let mut read_paths: Vec<(PathBuf, u64)> = Vec::new();
+    // One file's content identity, for the refreeze receipt. The fingerprint
+    // still hashes the bytes itself, so the value persisted sessions recorded
+    // does not move.
+    let identity = |bytes: &[u8]| {
+        let mut file = DefaultHasher::new();
+        bytes.hash(&mut file);
+        file.finish()
+    };
     // (path, reason, dir precedence index, declared name if recoverable):
     // tools are keyed by DECLARED name, not file stem, so a collision between
     // a broken file and a loaded definition must be judged on the name the
@@ -244,7 +255,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             };
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
-            files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
+            read_paths.push((path.clone(), identity(&bytes)));
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 broken_at.push((path, "not valid UTF-8".into(), dir_index, None));
                 continue;
@@ -269,8 +280,8 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
     // under a valid project override: the override is legitimately active,
     // and the reason says so instead of claiming the name is not callable.
     let mut broken: Vec<(PathBuf, String)> = Vec::new();
-    // (path, occupied name) per broken tool file: the refreeze classifier
-    // tells "removed" from "explained by a broken file" with this, never by
+    // (path, occupied name) per broken tool file: the unknown-tool error
+    // names the broken file behind a called name with this, never by
     // re-probing disk after the capture.
     let mut broken_tools: Vec<(PathBuf, String)> = Vec::new();
     for (path, mut reason, broken_dir, declared) in broken_at {
@@ -323,7 +334,7 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             let bytes = std::fs::read(&path).ok();
             bytes.hash(&mut h);
             let Some(bytes) = bytes else { continue };
-            files_read.push((path.clone(), crate::ledger::sha256_hex(&bytes), bytes.clone()));
+            read_paths.push((path.clone(), identity(&bytes)));
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 broken.push((path, "not valid UTF-8".into()));
                 continue;
@@ -359,24 +370,18 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
             }
         }
     }
-    // Memory: ONE read produces both the fingerprint bytes and the index, so
-    // the fingerprint (which decides refreeze) and the frozen index cannot be
-    // captured from two different file generations - an atomic replace between
-    // two scans could otherwise freeze the replacement's index under the
-    // original's fingerprint, and a restore-to-original would then skip the
-    // refreeze that would fix it. The fingerprint hashes every
-    // VALID-named memory byte (a write to one refreezes); the index is the
-    // indexed subset of the SAME bytes. Never ledgered (data, not capability).
-    let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
-    {
-        let dir = project_root.join(crate::memory::MEMORY_DIR);
-        dir.hash(&mut h);
-        for (path, bytes) in &mem.fingerprint_files {
-            path.hash(&mut h);
-            bytes.hash(&mut h);
-        }
-    }
-    let (memory_section, memory_files) = (mem.section, mem.identities);
+    // Memory rides the frozen prompt's index but stays OUT of the
+    // fingerprint. The fingerprint decides refreeze, and a refreeze replaces
+    // the system message and rewrites the transcript: hashing memory bytes
+    // turned every saved fact into a full prompt-cache miss and an
+    // O(transcript) rewrite, only to show the model a fact it had just
+    // written. The index is frozen with the prompt instead, so it changes
+    // only when a tool or skill change refreezes, or on /reload, and it is
+    // read when the generation activates (`Registry::from_snapshot`). The
+    // directory path is still hashed so a project without memories keeps the
+    // fingerprint its persisted sessions recorded and resumes without a
+    // refreeze.
+    project_root.join(crate::memory::MEMORY_DIR).hash(&mut h);
     let mut external: Vec<ToolSpec> = external_by_name.into_values().collect();
     // Built-in shadows never load (assemble drops them); excluding them here
     // keeps them from wasting a cap slot, so --check and the loader agree on
@@ -413,12 +418,11 @@ pub(crate) fn capture_extensions(data_dir: &Path, project_root: &Path) -> Extens
         skills: discovered_skills,
         tools_omitted,
         skills_omitted,
-        files: files_read,
+        read_paths,
         broken,
         broken_tools,
         shadowed_skills,
-        memory_files,
-        memory_section,
+        project_root: project_root.to_path_buf(),
     }
 }
 
@@ -451,15 +455,15 @@ impl Registry {
         registry.ext_fingerprint = snapshot.fingerprint;
         registry.tools_omitted = snapshot.tools_omitted;
         registry.skills_omitted = snapshot.skills_omitted;
-        registry.read_paths = snapshot.files.iter().map(|(p, _, _)| p.clone()).collect();
+        registry.read_paths = Some(snapshot.read_paths.into_iter().collect());
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
         registry.shadowed_skills = snapshot.shadowed_skills;
-        registry.frozen_memory_rows = Some(
-            snapshot.memory_section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default(),
-        );
-        registry.memory_files = Some(snapshot.memory_files);
-        registry.memory_section = snapshot.memory_section;
+        let mem = crate::memory::freeze_snapshot(&snapshot.project_root, crate::memory::unix_now());
+        registry.frozen_memory_rows =
+            Some(mem.section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default());
+        registry.memory_files = Some(mem.identities);
+        registry.memory_section = mem.section;
         registry.memory_scanned = true;
         registry
     }
@@ -508,7 +512,7 @@ impl Registry {
             tools_omitted: 0,
             ext_fingerprint: 0,
             broken: Vec::new(),
-            read_paths: std::collections::HashSet::new(),
+            read_paths: None,
             broken_tools: Vec::new(),
             shadowed_skills: Vec::new(),
             memory_files: None,
@@ -683,6 +687,12 @@ pub struct RegistryManifest {
     /// sections.
     #[serde(default)]
     pub memory_rows: Option<Vec<(String, usize)>>,
+    /// Every capability file the freeze read, with the hash of the bytes it
+    /// read, so the first refreeze of a resumed session names each file that
+    /// changed while it was closed, a SKILL.md body edit included. Additive:
+    /// absent in older manifests, whose first receipt compares index lines.
+    #[serde(default)]
+    pub read_files: Option<Vec<(PathBuf, u64)>>,
 }
 
 /// Current manifest format. A manifest carrying any other version is treated
@@ -758,6 +768,12 @@ impl Registry {
             // re-suspending must keep the accounting its persisted prompt
             // still depends on.
             memory_rows: self.frozen_memory_rows.clone(),
+            read_files: self.read_paths.as_ref().map(|read| {
+                let mut files: Vec<(PathBuf, u64)> =
+                    read.iter().map(|(path, hash)| (path.clone(), *hash)).collect();
+                files.sort();
+                files
+            }),
             version: MANIFEST_VERSION,
             external_tools,
             skills: self.skills.clone(),
@@ -801,6 +817,7 @@ impl Registry {
         // the persisted prompt, which is precisely what the manifest carries.
         registry.memory_files = manifest.memory_files.clone();
         registry.frozen_memory_rows = manifest.memory_rows.clone();
+        registry.read_paths = manifest.read_files.map(|files| files.into_iter().collect());
         registry
     }
 
@@ -1256,6 +1273,7 @@ async fn spawn_external(
         },
         sandbox,
         env_allowlist: Some(tool.env.clone()),
+        self_link: false,
     };
 
     match execution::run_process(request, cancel).await {
@@ -1289,13 +1307,11 @@ async fn spawn_external(
                     truncated,
                 )
             }
+            // A helper the tool backgrounded (a server it means to talk to
+            // later) is killed with the group, and the exit is still 0. The
+            // shared rendering carries the note that says so.
             Termination::Exited(status) => {
-                let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
-                let (ok, text) = match status.success() {
-                    true => (true, text),
-                    false => (false, format!("{}\n{text}", tools::describe_exit(status))),
-                };
-                ToolOutcome::from_process(ok, text, &output, truncated)
+                tools::exited_outcome(&output, status, caps.command_bytes)
             }
         },
     }
@@ -2038,6 +2054,8 @@ mod tests {
     /// The env allowlist is enforced at spawn: declared names arrive,
     /// undeclared parent env - API keys included - does not. Both variables
     /// are set on the test process, so the only difference is the manifest.
+    /// The git terminal-prompt switch bash and hooks get is not added to a
+    /// tool's declared environment either.
     #[tokio::test]
     async fn an_external_tool_receives_only_its_declared_env() {
         let dir = std::env::temp_dir().join(format!("openmax-envtool-{}", uuid::Uuid::new_v4()));
@@ -2045,7 +2063,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/envcheck.toml"),
-            "name = \"envcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '%s|%s' \\\"$OPENMAX_TEST_KEEP\\\" \\\"$OPENMAX_TEST_DROP\\\"\"]\nenv = [\"OPENMAX_TEST_KEEP\"]\n",
+            "name = \"envcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '%s|%s|%s' \\\"$OPENMAX_TEST_KEEP\\\" \\\"$OPENMAX_TEST_DROP\\\" \\\"$GIT_TERMINAL_PROMPT\\\"\"]\nenv = [\"OPENMAX_TEST_KEEP\"]\n",
         )
         .unwrap();
         std::env::set_var("OPENMAX_TEST_KEEP", "kept");
@@ -2064,7 +2082,42 @@ mod tests {
         std::env::remove_var("OPENMAX_TEST_KEEP");
         std::env::remove_var("OPENMAX_TEST_DROP");
         assert!(out.ok, "{}", out.output);
-        assert_eq!(out.output.trim(), "kept|", "declared env arrives; the rest is scrubbed");
+        assert_eq!(out.output.trim(), "kept||", "declared env arrives; the rest is scrubbed");
+    }
+
+    /// The agent's account can write the harness link directory. On an
+    /// approved tool's PATH, a name planted there would run in place of the
+    /// system binary the human approved, and no sweep before the spawn stops
+    /// one planted while the tool runs. A tool's scrubbed baseline keeps the
+    /// PATH the harness inherited.
+    #[tokio::test]
+    async fn an_external_tool_never_gets_the_harness_link_on_path() {
+        let dir = std::env::temp_dir().join(format!("openmax-pathtool-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/pathcheck.toml"),
+            "name = \"pathcheck\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf %s \\\"$PATH\\\"\"]\n",
+        )
+        .unwrap();
+        let registry = Registry::build(&dir.join("data"), &project);
+        let out = registry
+            .execute(
+                "pathcheck",
+                &serde_json::json!({}),
+                &dir.join("data"),
+                &project,
+                tools::OutputCaps::default(),
+                Arc::new(CancelToken::default()),
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(out.ok, "{}", out.output);
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let linked: Vec<PathBuf> = std::env::split_paths(out.output.trim())
+            .filter(|entry| std::fs::read_link(entry.join("openmax")).ok().as_ref() == Some(&exe))
+            .collect();
+        assert!(linked.is_empty(), "an approved tool got the harness link on PATH: {linked:?}");
     }
 
     #[test]
@@ -2243,6 +2296,32 @@ mutatng = true
         let _ = std::fs::remove_dir_all(project);
     }
 
+    /// Memory is outside the fingerprint, so a capture that matches the
+    /// frozen registry (every turn start, and every iteration with an
+    /// executed mutating call) is discarded. A memory scan taken there read
+    /// every memory file and the whole access log for nothing; the scan
+    /// belongs to activation, so a memory written between capture and
+    /// activation is in the activated index.
+    #[test]
+    fn memory_is_read_when_a_generation_activates_not_when_it_is_captured() {
+        let project = temp_dir("memactivate");
+        let memory_dir = project.join(crate::memory::MEMORY_DIR);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let snapshot = capture_extensions(&project.join("data"), &project);
+        let fingerprint = snapshot.fingerprint();
+        std::fs::write(memory_dir.join("deploy-port.md"), "# The deploy port is 7443\n").unwrap();
+
+        let registry = Registry::from_snapshot(snapshot);
+        assert_eq!(registry.ext_fingerprint, fingerprint);
+        let (section, _) =
+            registry.memory_section.clone().expect("activation reads the memory directory");
+        assert!(section.contains("The deploy port is 7443"), "{section}");
+        let names: Vec<&str> =
+            registry.memory_files.iter().flatten().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["deploy-port"]);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
     #[test]
     fn external_description_capped_and_builtin_shadowing_rejected() {
         let global = temp_dir("glob");
@@ -2345,6 +2424,66 @@ mutatng = true
         let produced = out.process_bytes.expect("a successful external tool reports its size");
         assert!(produced > out.output.len() as u64, "the result is a bounded rendering");
         assert!(out.process_truncated);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// An external tool runs in its own process group like bash, and the
+    /// group is cleaned up when the tool exits. A tool that starts a helper in
+    /// the background (a long-lived server it means to talk to later) still
+    /// exits 0, so without the note the model is handed success and a helper
+    /// that is already gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_external_tools_stopped_background_process_is_reported() {
+        let project = temp_dir("bgtool");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let padding = "for i in $(seq 1 500); do echo padding-line-$i; done";
+        for (name, script) in [
+            ("serve", "sleep 30 & echo ok".to_string()),
+            ("tight_bg", format!("{padding}; sleep 30 &")),
+            ("tight_plain", padding.to_string()),
+        ] {
+            write_tool(
+                &tools_dir,
+                &format!("{name}.toml"),
+                &format!(
+                    "name = \"{name}\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"{script}\"]\n"
+                ),
+            );
+        }
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let data = Path::new("/nonexistent-openmax-data");
+        let args = serde_json::json!({});
+        let run = |name: &'static str, caps| {
+            registry.execute(name, &args, data, &project, caps, no_cancel())
+        };
+
+        let out = run("serve", tools::OutputCaps::default()).await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("ok"), "{}", out.output);
+        assert!(
+            out.output.contains(tools::BACKGROUND_TERMINATED_NOTE),
+            "a stopped background process must be reported: {}",
+            out.output
+        );
+
+        // The note is reserved out of the cap, not appended past it. The same
+        // output without a background process is the baseline: a reserved
+        // note keeps the result within a line of it, an appended one adds
+        // the whole note on top.
+        let tight = tools::OutputCaps { command_bytes: 1_000 };
+        let plain = run("tight_plain", tight).await;
+        assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
+        assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);
+        let noted = run("tight_bg", tight).await;
+        assert!(noted.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", noted.output);
+        assert!(
+            noted.output.len() < plain.output.len() + tools::BACKGROUND_TERMINATED_NOTE.len() / 2,
+            "note must be reserved from the cap: {} bytes against {} without it",
+            noted.output.len(),
+            plain.output.len()
+        );
         let _ = std::fs::remove_dir_all(project);
     }
 

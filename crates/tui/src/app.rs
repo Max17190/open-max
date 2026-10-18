@@ -15,11 +15,12 @@ use futures_util::StreamExt;
 use open_max_core::state::Core;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use open_max_core::{agent, config, prompt, registry, sessions};
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
-use ratatui::Frame;
+use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use crate::clipboard;
@@ -28,8 +29,9 @@ use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
 use crate::ui::tool_card::{self, DiffText};
+use crate::ui::text::paint_line;
 use crate::ui::transcript::{
-    wrap_lines, Term, Transcript,
+    wrap_lines, RowRef, Term, Transcript,
 };
 use crate::ui::{context, extensions, markdown, model_picker};
 
@@ -55,13 +57,97 @@ const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// Paint-rate cap for high-refresh terminals. Five and a half milliseconds
 /// leaves normal scheduler overhead inside a 144 Hz display interval without
 /// busy-spinning. The loop remains event-driven, so idle produces no frames.
+/// It paces agent events, ticks, and machine-speed input; a keystroke paints
+/// at once (see `paint_pacing`).
 const MIN_DRAW_INTERVAL: Duration = Duration::from_micros(5_500);
 /// A resize storm settles for this long before the transcript rewraps.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
 /// Core events drained per wake before painting once for the whole batch.
 const CORE_DRAIN_MAX: usize = 32;
 
-/// Fine-grained redraw reasons so spinner ticks can skip history rebuilds.
+/// Mouse reporting for exactly what `on_term_event` handles: presses,
+/// releases, and the wheel (1000), drags (1002), SGR-encoded (1006) so columns
+/// past 223 survive. Crossterm's `EnableMouseCapture` also turns on
+/// any-motion tracking (1003), which reports every pointer movement: a loop
+/// wake per cell crossed, and bytes on the wire over SSH, for events nothing
+/// reads.
+#[cfg(not(windows))]
+pub(crate) struct EnableMouseTracking;
+
+/// Turns off exactly the modes `EnableMouseTracking` turned on, in reverse.
+#[cfg(not(windows))]
+pub(crate) struct DisableMouseTracking;
+
+#[cfg(not(windows))]
+impl crossterm::Command for EnableMouseTracking {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+    }
+}
+
+#[cfg(not(windows))]
+impl crossterm::Command for DisableMouseTracking {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1006l\x1b[?1002l\x1b[?1000l")
+    }
+}
+
+// The Windows console reports the mouse through its own input API, which
+// crossterm's capture commands switch as a whole.
+#[cfg(windows)]
+pub(crate) use crossterm::event::{
+    DisableMouseCapture as DisableMouseTracking, EnableMouseCapture as EnableMouseTracking,
+};
+
+/// What woke the loop, for paint pacing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// Input the next frame shows (see `App::on_input`) with no more input
+    /// queued behind it. Input with more still queued (a paste without
+    /// bracketed paste) wakes as `Other`, so a burst coalesces at the cap
+    /// instead of painting once per event.
+    Input,
+    /// Agent events, ticks, the file index, or a deferred paint coming due.
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Paint {
+    Now,
+    /// Hold until then, coalescing whatever else lands before it.
+    At(Instant),
+}
+
+/// When a dirty frame paints. A pending resize settles first, whatever woke
+/// the loop. After that, input paints at once: a frame costs well under a
+/// millisecond, so capping it would only delay the echo of a keystroke.
+/// Everything else paints at most once per `MIN_DRAW_INTERVAL`, which is
+/// what turns a token firehose into display-rate frames. That includes input
+/// landing within the cap of a frame that already showed input
+/// (`last_drew_input`): nobody types faster than a display refreshes, and a
+/// paste without bracketed paste can arrive one character per wake, each
+/// handled before the next lands, so painting each would draw frames no
+/// display can show.
+fn paint_pacing(
+    now: Instant,
+    last_draw: Instant,
+    last_drew_input: bool,
+    resize_hold: Option<Instant>,
+    wake: Wake,
+) -> Paint {
+    if let Some(until) = resize_hold.filter(|&until| now < until) {
+        return Paint::At(until);
+    }
+    let next = last_draw + MIN_DRAW_INTERVAL;
+    if (wake == Wake::Input && !last_drew_input) || now >= next {
+        Paint::Now
+    } else {
+        Paint::At(next)
+    }
+}
+
+/// Fine-grained redraw reasons, so token and spinner frames can reuse the
+/// header and status lines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Dirty {
     /// Finished transcript (blocks, scroll, selection, fold).
@@ -112,18 +198,6 @@ impl Dirty {
     fn clear(&mut self) {
         *self = Self::default();
     }
-}
-
-/// Viewport fingerprint for reusing the history portion of `chat_buf`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HistReuseKey {
-    hist_len: usize,
-    start: usize,
-    hist_view_end: usize,
-    sticky: bool,
-    focus_scroll: bool,
-    selected: Option<usize>,
-    width: u16,
 }
 
 /// Chat-mode geometry. The input owns the terminal's bottom edge; every
@@ -218,6 +292,11 @@ fn conversation_layout(
 
 pub struct Args {
     pub continue_session: bool,
+    /// Notified when a signal asks the session to end. The loop treats it
+    /// as /quit, so the normal exit path restores the terminal. The signal
+    /// watcher holds it weakly: once the loop drops it, a signal exits at
+    /// once, so keep no other strong handle past the loop.
+    pub quit: Arc<tokio::sync::Notify>,
 }
 
 #[derive(PartialEq)]
@@ -236,7 +315,22 @@ struct ToolMeta {
 pub struct App {
     core: Arc<Core>,
     project: PathBuf,
+    /// `project` resolved, the key its approval mode is read by. The status
+    /// line shows that mode on every chrome frame; resolving the path there
+    /// cost filesystem syscalls on every keystroke. So it is resolved at
+    /// launch and again only where the mode is read to act on it (see
+    /// `refresh_project_root`).
+    project_root: PathBuf,
     session_id: Option<String>,
+    /// `session_id` was created by this app on a first submit, so leaving it
+    /// with nothing saved (a prompt a gate refused, a turn that failed
+    /// before its first save) discards it instead of leaving an empty entry
+    /// for `--continue` to reattach. A resumed session is never discarded.
+    created_session: bool,
+    /// Created sessions left while their work still ran. Whether they are
+    /// empty is known only once it settles: a cancelled turn still saves the
+    /// prompt it was given.
+    left_running: Vec<String>,
     /// A /resume (or --continue) picked this session and no turn has
     /// hydrated it yet: /context's numbers are still today's-config
     /// preview, not the session's own. A freshly created id never sets
@@ -328,12 +422,11 @@ pub struct App {
     /// running metadata, so a token only rebuilds that suffix.
     tail_stable_len: usize,
     tail_buf: Vec<Line<'static>>,
-    chat_buf: Vec<Line<'static>>,
-    /// Lines in `chat_buf` that are sticky + history (before live tail).
-    hist_prefix_len: usize,
-    hist_reuse_key: Option<HistReuseKey>,
-    /// Absolute transcript line for each rendered row in `chat_buf`.
-    chat_line_map: Vec<Option<usize>>,
+    /// What each painted conversation row shows (None for the sticky header
+    /// and the live tail), by block and row in it: input handled before the
+    /// next paint can wrap history above the view, which moves every
+    /// absolute row index below it.
+    chat_line_map: Vec<Option<RowRef>>,
     chat_draw_area: Rect,
     /// Where the composer text last painted, so the wheel and the mouse can
     /// tell the prompt apart from the conversation above it.
@@ -359,6 +452,12 @@ pub struct App {
     /// turn-done ring silent instead of ringing at a user who is already
     /// watching every turn end.
     term_focus: Option<bool>,
+    /// Where the out-of-band terminal writes go: the presence title and its
+    /// bell, the turn-done notification, OSC 52 copies. Stdout, except in
+    /// unit tests, which discard them: libtest captures `print!` but not raw
+    /// writes, so a test driving a turn or a copy would retitle and ring the
+    /// terminal running it, and set its clipboard where it honors OSC 52.
+    term_out: Box<dyn std::io::Write + Send>,
     approval_hits: [Option<Rect>; 3],
     /// Whether the last draw showed the pending approval's full credential
     /// grant. When a grant is too large for the card (a tiny terminal clamps
@@ -374,23 +473,74 @@ pub struct App {
     status_width: u16,
 }
 
+/// Returns how the loop ended and, apart from it, the warnings that must wait
+/// for the restored terminal: anything written before then lands on the
+/// alternate screen and vanishes with it. They come back on a terminal error
+/// too, since the exit discard ran either way.
 pub async fn run(
     mut terminal: Term,
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: Args,
-) -> std::io::Result<()> {
+) -> (std::io::Result<()>, Vec<String>) {
     let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut app = App::new(core.clone(), project, files_tx);
 
     app.startup(&args).await;
+    let result =
+        event_loop(&mut terminal, &mut app, &mut core_rx, &mut files_rx, &args.quit).await;
+    // The quit's last strong handle goes with the loop, so a signal during
+    // the discard below exits at once instead of waiting on it.
+    drop(args);
+    // Every way out of the loop, a failed terminal included, leaves here.
+    let warnings = app.discard_created_sessions_on_exit();
+    (result, warnings)
+}
 
+async fn event_loop(
+    terminal: &mut Term,
+    app: &mut App,
+    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    files_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
+    quit: &tokio::sync::Notify,
+) -> std::io::Result<()> {
+    let quit = quit.notified();
+    tokio::pin!(quit);
     // Terminal events are forwarded through a channel so the core-event arm
     // can be gated on `input_rx.is_empty()` — a token firehose must never
     // starve a keypress (crossterm's EventStream itself is not peekable).
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick_period = TICK;
+
+    // Paint pacing (see `paint_pacing`): a redraw that may not paint yet is
+    // deferred to `draw_deadline` and coalesced with everything else that
+    // lands before it. `resize_hold` is the end of the current resize storm.
+    // `input_unpainted` marks input handled since the last paint that the
+    // next frame shows, and `last_drew_input` whether that paint showed some.
+    // An idle app has no armed tick and may receive no terminal event after
+    // entering the alternate screen. Paint once before waiting so first launch
+    // can never sit on a blank frame until the user presses a key.
+    let mut last_draw = Instant::now();
+    let mut draw_deadline: Option<Instant> = None;
+    let mut resize_hold: Option<Instant> = None;
+    let (mut input_unpainted, mut last_drew_input) = (false, false);
+    draw_frame(terminal, app, MIN_DRAW_INTERVAL)?;
+    app.dirty.clear();
+    // State the initial presence in the title; transitions are edge-driven.
+    app.emit_presence_title();
+
+    // The keyboard protocol probe goes out behind the first frame, so that
+    // frame never waits on the terminal's answer, and input starts after it,
+    // since the event stream would read that answer itself. Keys pressed
+    // meanwhile wait in crossterm's queue.
+    let (probed_tx, mut probed) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(crate::enable_keyboard_enhancement).await;
+        let _ = probed_tx.send(());
         let mut term_events = crossterm::event::EventStream::new();
         while let Some(ev) = term_events.next().await {
             let Ok(e) = ev else { break };
@@ -400,27 +550,18 @@ pub async fn run(
         }
         // Dropping input_tx closes the channel; the loop reads that as quit.
     });
-
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut tick_period = TICK;
-
-    // Paint pacing: at most one frame per MIN_DRAW_INTERVAL. A redraw that
-    // arrives too early is deferred to `draw_deadline` and coalesced with
-    // everything else that lands before it.
-    // An idle app has no armed tick and may receive no terminal event after
-    // entering the alternate screen. Paint once before waiting so first launch
-    // can never sit on a blank frame until the user presses a key.
-    let mut last_draw = Instant::now();
-    let mut draw_deadline: Option<Instant> = None;
-    draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL)?;
-    app.dirty.clear();
-    // State the initial presence in the title; transitions are edge-driven.
-    app.emit_presence_title();
+    // No frame is written while the probe waits, so none can cut into its
+    // query or the flags pushed on its answer. Input has not started, so no
+    // keypress waits on this.
+    let mut probing = true;
 
     loop {
+        let mut wake = Wake::Other;
         tokio::select! {
             biased;
+            // First, so a signal cannot wait behind a token stream.
+            _ = &mut quit => app.should_quit = true,
+            _ = &mut probed, if probing => probing = false,
             // Streaming sits above input but is gated on the input queue
             // being empty: input-first would let held keys starve redraws,
             // while the gate keeps cancel/quit ahead of the firehose.
@@ -442,9 +583,16 @@ pub async fn run(
                         // Terminals emit resize storms mid-drag; rewrapping
                         // the transcript on each one is wasted layout work.
                         app.dirty = Dirty::all();
-                        draw_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+                        resize_hold = Some(Instant::now() + RESIZE_DEBOUNCE);
                     }
-                    Some(e) => app.on_term_event(e).await?,
+                    Some(e) => {
+                        if app.on_input(e).await? {
+                            input_unpainted = true;
+                            if input_rx.is_empty() {
+                                wake = Wake::Input;
+                            }
+                        }
+                    }
                     None => app.should_quit = true,
                 }
             }
@@ -470,26 +618,37 @@ pub async fn run(
             tick = tokio::time::interval(desired_tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
-        if app.dirty.any() {
+        if app.dirty.any() && !probing {
             let now = Instant::now();
-            let deferred = draw_deadline.is_some_and(|d| now < d);
-            if !deferred && now.duration_since(last_draw) >= MIN_DRAW_INTERVAL {
-                draw_frame(&mut terminal, &mut app, now.duration_since(last_draw))?;
-                last_draw = now;
-                draw_deadline = None;
-                app.dirty.clear();
-            } else if draw_deadline.is_none() {
-                draw_deadline = Some(last_draw + MIN_DRAW_INTERVAL);
+            match paint_pacing(now, last_draw, last_drew_input, resize_hold, wake) {
+                Paint::Now => {
+                    draw_frame(terminal, app, now.duration_since(last_draw))?;
+                    last_draw = now;
+                    last_drew_input = std::mem::take(&mut input_unpainted);
+                    draw_deadline = None;
+                    resize_hold = None;
+                    app.dirty.clear();
+                }
+                Paint::At(when) => draw_deadline = Some(when),
             }
         }
+    }
+    // Only a signal ends the loop this early. The terminal stays raw until
+    // the probe has its answer: restored first, the answer would reach the
+    // shell as typed text.
+    if probing {
+        let _ = probed.await;
     }
     Ok(())
 }
 
 /// One frame, wrapped in a synchronized update so the terminal applies it
-/// atomically — no half-painted frames under tmux or slow connections.
-fn draw_frame(
-    terminal: &mut Term,
+/// atomically: no half-painted frames under tmux or slow connections. The
+/// writer holds ratatui's own flushes until the update is closed, so a frame
+/// within its 256 KiB buffer reaches the terminal in one write(2), the one
+/// `flush_ms` times.
+fn draw_frame<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<crate::FrameWriter<W>>>,
     app: &mut App,
     frame_interval: Duration,
 ) -> std::io::Result<()> {
@@ -507,10 +666,14 @@ fn draw_frame(
         let flush_ms = t_flush.elapsed().as_secs_f64() * 1000.0;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let interval_ms = frame_interval.as_secs_f64() * 1000.0;
-        eprintln!(
-            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} flush_ms={flush_ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}",
+        // One write: stderr is unbuffered, and `eprintln!` writes each
+        // formatted piece on its own, about twenty syscalls per frame inside
+        // the loop being measured.
+        let line = format!(
+            "openmax_perf frame_interval_ms={interval_ms:.3} draw_frame_ms={ms:.3} flush_ms={flush_ms:.3} transcript_layout_ms={:.3} selection_overlay_ms={:.3}\n",
             app.perf_layout_ms, app.perf_selection_ms
         );
+        let _ = std::io::stderr().write_all(line.as_bytes());
     }
     Ok(())
 }
@@ -525,8 +688,11 @@ impl App {
         Self {
             composer: Composer::new(&core.data_dir, &project),
             core,
+            project_root: open_max_core::state::canonical_root(&project),
             project,
             session_id: None,
+            created_session: false,
+            left_running: Vec::new(),
             resumed_awaiting_hydration: false,
             pending_submit: None,
             mode: Mode::Chat,
@@ -578,9 +744,6 @@ impl App {
             tail_content_len: 0,
             tail_stable_len: 0,
             tail_buf: Vec::new(),
-            chat_buf: Vec::new(),
-            hist_prefix_len: 0,
-            hist_reuse_key: None,
             chat_line_map: Vec::new(),
             chat_draw_area: Rect::default(),
             composer_draw_area: Rect::default(),
@@ -590,6 +753,11 @@ impl App {
             last_content_w: 0,
             presence: Presence::Idle,
             term_focus: None,
+            term_out: if cfg!(test) {
+                Box::new(std::io::sink())
+            } else {
+                Box::new(std::io::stdout())
+            },
             approval_hits: [None; 3],
             approval_grant_fully_shown: true,
             perf_layout_ms: 0.0,
@@ -605,11 +773,12 @@ impl App {
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
-                Some(meta) => {
+                Ok(Some(meta)) => {
                     self.session_id = Some(meta.id.clone());
                     self.replay(&meta.id);
                 }
-                None => self.note("no previous session here; starting fresh"),
+                Ok(None) => self.note("no previous session here; starting fresh"),
+                Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
             }
         }
     }
@@ -753,7 +922,8 @@ impl App {
                 return false;
             }
         }
-        self.session_id = None;
+        let left = self.session_id.take().filter(|_| self.created_session);
+        self.created_session = false;
         self.resumed_awaiting_hydration = false;
         self.transcript = Transcript::new();
         self.running = false;
@@ -796,8 +966,6 @@ impl App {
         self.tail_content_len = 0;
         self.tail_stable_len = 0;
         self.tail_buf.clear();
-        self.hist_prefix_len = 0;
-        self.hist_reuse_key = None;
         self.chat_line_map.clear();
         self.chat_draw_area = Rect::default();
         self.composer_draw_area = Rect::default();
@@ -808,10 +976,57 @@ impl App {
         self.transcript.follow();
         self.dirty.mark_chat();
         self.dirty.mark_chrome();
+        // Last, so a failure lands in the fresh transcript, not the old one.
+        if let Some(id) = left {
+            if self.core.is_running(&id) {
+                self.left_running.push(id);
+            } else {
+                self.discard_if_empty(&id);
+            }
+        }
         true
     }
 
+    /// Discard a session this app created, if nothing was saved to it. A
+    /// failure is reported: the entry it leaves is the one this prevents.
+    fn discard_if_empty(&mut self, id: &str) {
+        if let Err(e) = sessions::discard_if_empty(&self.core, id) {
+            let e = sessions::refusal_with_repair(&self.core, e);
+            self.error(&format!("the empty session {id} stays indexed: {e}"));
+        }
+    }
+
+    /// Quitting leaves the current session too, and nothing will settle the
+    /// ones still running: their turns end with the process. The discard
+    /// decides under the store lock, so a turn that saved in time still
+    /// keeps its session. Returns the failures, for the shell to print once
+    /// the terminal is restored.
+    fn discard_created_sessions_on_exit(&mut self) -> Vec<String> {
+        let mut ids = std::mem::take(&mut self.left_running);
+        ids.extend(self.session_id.clone().filter(|_| self.created_session));
+        ids.into_iter()
+            .filter_map(|id| {
+                let e = sessions::discard_if_empty(&self.core, &id).err()?;
+                let e = sessions::refusal_with_repair(&self.core, e);
+                Some(format!("the empty session {id} stays indexed: {e}"))
+            })
+            .collect()
+    }
+
     // ---------- terminal events ----------
+
+    /// Handles one input event and returns whether the next frame shows it,
+    /// which paint pacing counts as input awaiting a paint. A focus report
+    /// changes nothing on screen, even while an agent frame waits, and an
+    /// event that leaves nothing to paint (an ignored button) shows nothing
+    /// either. Counted as input, either would make the next agent frame
+    /// record that it showed input, and a keystroke within the cap of that
+    /// frame would wait for the cap instead of echoing at once.
+    async fn on_input(&mut self, event: TermEvent) -> std::io::Result<bool> {
+        let focus = matches!(event, TermEvent::FocusGained | TermEvent::FocusLost);
+        self.on_term_event(event).await?;
+        Ok(!focus && self.dirty.any())
+    }
 
     async fn on_term_event(&mut self, event: TermEvent) -> std::io::Result<()> {
         match event {
@@ -1284,7 +1499,7 @@ impl App {
                         self.transcript.select_prev();
                     }
                     if let Some(text) = self.transcript.selected_copy_text() {
-                        if clipboard::copy_text(&text) {
+                        if clipboard::copy_text(&mut self.term_out, &text) {
                             self.note("copied block");
                         } else {
                             self.note("copy failed (terminal may block OSC 52)");
@@ -1406,12 +1621,15 @@ impl App {
         (cell, row)
     }
 
-    fn transcript_position(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+    /// The transcript line and column under the pointer: the text the last
+    /// frame painted there, wherever it sits now.
+    fn transcript_position(&mut self, column: u16, row: u16) -> Option<(usize, usize)> {
         if !rect_contains(self.chat_draw_area, column, row) {
             return None;
         }
         let rendered_row = row.saturating_sub(self.chat_draw_area.y) as usize;
-        let line = self.chat_line_map.get(rendered_row).copied().flatten()?;
+        let painted = self.chat_line_map.get(rendered_row).copied().flatten()?;
+        let line = self.transcript.line_of(painted)?;
         let x = column.saturating_sub(self.chat_draw_area.x) as usize;
         Some((line, x))
     }
@@ -1441,7 +1659,7 @@ impl App {
     }
 
     fn note_copied(&mut self, text: &str) {
-        if clipboard::copy_text(text) {
+        if clipboard::copy_text(&mut self.term_out, text) {
             self.note("copied selection");
         } else {
             self.note("copy failed (terminal may block OSC 52)");
@@ -1452,6 +1670,8 @@ impl App {
     fn select_approval_mode(&mut self, mode: config::ApprovalMode) -> bool {
         match self.core.set_project_approval_mode(&self.project, mode) {
             Ok(()) => {
+                // The save resolved the path itself; show the project it saved for.
+                self.refresh_project_root();
                 self.note(&format!("approvals: {} for this project (saved)", mode.as_str()));
                 self.dirty.mark_chrome();
                 true
@@ -1464,7 +1684,27 @@ impl App {
     }
 
     fn cycle_approval_mode(&mut self) {
-        self.select_approval_mode(self.core.approval_mode(&self.project).next());
+        self.refresh_project_root();
+        self.select_approval_mode(self.approval_mode().next());
+    }
+
+    /// The mode the status line shows. Reads no filesystem.
+    fn approval_mode(&self) -> config::ApprovalMode {
+        self.core.approval_mode_canonical(&self.project_root)
+    }
+
+    /// Re-resolve `project_root`. Turns and saves resolve the project path
+    /// when they run, so once the path leads to another project (the
+    /// directory moved and a symlink took its place) a stale root would show
+    /// one project's mode while turns enforce the other's. Called where the
+    /// mode is read to act on it: a submit, a tool call, a selection. Never
+    /// per frame.
+    fn refresh_project_root(&mut self) {
+        let root = open_max_core::state::canonical_root(&self.project);
+        if root != self.project_root {
+            self.project_root = root;
+            self.dirty.mark_chrome();
+        }
     }
 
     /// Approval hit regions use the fixed order allow once, auto for project,
@@ -1932,6 +2172,7 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            self.created_session = false;
                             self.resumed_awaiting_hydration = false;
                         }
                         if panel.items.is_empty() {
@@ -1940,7 +2181,7 @@ impl App {
                             self.note("no sessions left in this project");
                         }
                     }
-                    Err(e) => self.error(&e),
+                    Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
                 }
             }
             return;
@@ -1980,6 +2221,9 @@ impl App {
                         let _ = sessions::detach(&self.core, &id);
                         return;
                     }
+                    // Resumed now, so no longer this app's to discard when
+                    // the turn it was left with settles.
+                    self.left_running.retain(|left| *left != id);
                     self.session_id = Some(id.clone());
                     self.replay(&id);
                 }
@@ -1991,6 +2235,8 @@ impl App {
     // ---------- submission and slash commands ----------
 
     async fn handle_submit(&mut self, text: String) -> std::io::Result<()> {
+        // A turn, /status, and /approvals all read the mode.
+        self.refresh_project_root();
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
             let builtin = head == "exit"
@@ -2028,9 +2274,18 @@ impl App {
         let session_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
-                let meta = sessions::create(&self.core, self.project.display().to_string())
-                    .map_err(std::io::Error::other)?;
+                // A refused session (a damaged index) is the user's to see
+                // and repair, not an I/O error: returned through the event
+                // loop, it would close the app on the first prompt.
+                let meta = match sessions::create(&self.core, self.project.display().to_string()) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        self.error(&sessions::refusal_with_repair(&self.core, e));
+                        return Ok(());
+                    }
+                };
                 self.session_id = Some(meta.id.clone());
+                self.created_session = true;
                 self.resumed_awaiting_hydration = false;
                 meta.id
             }
@@ -2161,7 +2416,7 @@ impl App {
                     .clone()
                     .or_else(|| self.transcript.last_assistant_text())
                 {
-                    if clipboard::copy_text(&text) {
+                    if clipboard::copy_text(&mut self.term_out, &text) {
                         self.note("copied latest assistant response");
                     } else {
                         self.note("copy failed (terminal may block OSC 52)");
@@ -2243,16 +2498,15 @@ impl App {
                 Some(mode) => { self.select_approval_mode(mode); }
                 None => self.note("usage: /approvals auto|ask|readonly"),
             },
-            "resume" => {
-                let items = sessions::list(&self.core, &self.project.display().to_string());
-                if items.is_empty() {
-                    self.note("no sessions in this project yet");
-                } else {
+            "resume" => match sessions::list(&self.core, &self.project.display().to_string()) {
+                Ok(items) if items.is_empty() => self.note("no sessions in this project yet"),
+                Ok(items) => {
                     self.sessions_panel = Some(sessions_ui::SessionsState::new(items));
                     self.completion = None;
                     self.mode = Mode::Sessions;
                 }
-            }
+                Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
+            },
             "reload" => match &self.session_id {
                 None => self.note("no session yet; a new session always freezes the current config"),
                 Some(id) => {
@@ -2430,7 +2684,7 @@ impl App {
                     kv("model", &model),
                     kv("endpoint", &endpoint),
                     kv("host", &host),
-                    kv("approvals", self.core.approval_mode(&self.project).as_str()),
+                    kv("approvals", self.approval_mode().as_str()),
                     kv(
                         "context",
                         &if context_tokens == 0 {
@@ -2469,6 +2723,13 @@ impl App {
     async fn on_core_event(&mut self, env: AgentEventEnvelope) {
         if self.session_id.as_deref() == Some(env.session_id.as_str()) {
             self.on_agent_event(env.event);
+        } else if let Some(i) = self.left_running.iter().position(|id| *id == env.session_id) {
+            // Its last event goes out only after it leaves `running`, so
+            // this is reached once the work has settled.
+            if !self.core.is_running(&env.session_id) {
+                let id = self.left_running.swap_remove(i);
+                self.discard_if_empty(&id);
+            }
         }
         // Send the next queued message once the turn has fully settled.
         if self.flush_queue {
@@ -2591,6 +2852,8 @@ impl App {
                 self.dirty.mark_chrome();
             }
             AgentEvent::ToolStart { call_id, name, args } => {
+                // The turn reads the approval mode for this call.
+                self.refresh_project_root();
                 let summary = registry::summarize_call(&name, &args);
                 self.tool_meta.insert(
                     call_id,
@@ -2694,7 +2957,7 @@ impl App {
                 }
             }
             AgentEvent::Refrozen { tools, skills, changes } => {
-                // The receipt: what changed and who changed it, so the action
+                // The receipt: which capability files changed, so the action
                 // space never mutates silently (a poisoned skill arriving via
                 // git pull is announced, not slipped in).
                 let detail = if changes.is_empty() {
@@ -2824,7 +3087,7 @@ impl App {
                     "unverified" => {
                         self.pending_submit = None;
                         self.note(
-                            "stopped: a blocking turn_end hook kept refusing this answer, so the turn ended unverified (see openmax --check)",
+                            "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
                         );
                     }
                     "error" => {
@@ -2888,8 +3151,8 @@ impl App {
     }
 
     /// Announce a presence change in the terminal title (edge-triggered),
-    /// with a bell on the needs-you edge. Best-effort raw writes, same as
-    /// the OSC 52 clipboard path; never part of a frame.
+    /// with a bell on the needs-you edge. Best-effort raw writes to
+    /// `term_out`, same as the OSC 52 clipboard path; never part of a frame.
     fn set_presence(&mut self, presence: Presence) {
         if self.presence == presence {
             return;
@@ -2902,14 +3165,14 @@ impl App {
         }
     }
 
-    fn emit_presence_title(&self) {
+    fn emit_presence_title(&mut self) {
         use std::io::Write;
         let title = presence_title(self.presence, &self.project);
         let mut seq = format!("\x1b]0;{title}\x07");
         if self.presence == Presence::NeedsApproval {
             seq.push('\x07');
         }
-        let mut out = std::io::stdout();
+        let out = &mut self.term_out;
         let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
     }
 
@@ -2918,10 +3181,10 @@ impl App {
     /// so the pair only fires while the user is away; terminals that support
     /// neither consume the OSC unrendered and never reach here at all, since
     /// `term_focus` stays None without focus reports.
-    fn emit_turn_done_notification(&self) {
+    fn emit_turn_done_notification(&mut self) {
         use std::io::Write;
         let seq = format!("\x1b]9;{} · turn complete\x07\x07", project_label(&self.project));
-        let mut out = std::io::stdout();
+        let out = &mut self.term_out;
         let _ = out.write_all(seq.as_bytes()).and_then(|_| out.flush());
     }
 
@@ -3124,15 +3387,12 @@ impl App {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .style(Style::default().bg(theme::COMPOSER_BG()));
+                .border_style(Style::default().fg(border_color));
             let inner = block.inner(layout.input);
             block.render(layout.input, frame.buffer_mut());
             let (composer_lines, cx, cy) = self.composer.render(inner.width, inner.height);
             self.composer_draw_area = inner;
-            Paragraph::new(composer_lines)
-                .style(Style::default().bg(theme::COMPOSER_BG()))
-                .render(inner, frame.buffer_mut());
+            Paragraph::new(composer_lines).render(inner, frame.buffer_mut());
             if self.focus == Focus::Composer
                 && self.history_search.is_none()
                 && self.scroll_search.is_none()
@@ -3151,9 +3411,7 @@ impl App {
                 ..layout.input
             };
             self.composer_draw_area = composer_area;
-            Paragraph::new(composer_lines)
-                .style(Style::default().bg(theme::COMPOSER_BG()))
-                .render(composer_area, frame.buffer_mut());
+            Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
             if self.focus == Focus::Composer
                 && self.history_search.is_none()
                 && self.scroll_search.is_none()
@@ -3182,9 +3440,7 @@ impl App {
                 height,
                 ..area
             };
-            Paragraph::new(lines)
-                .style(Style::default().bg(theme::SURFACE()))
-                .render(draw_area, frame.buffer_mut());
+            Paragraph::new(lines).render(draw_area, frame.buffer_mut());
             if height > 0 {
                 self.approval_hits = approval_choice_hit_regions(Rect {
                     x: draw_area.x,
@@ -3208,8 +3464,7 @@ impl App {
                 Style::default()
                     .fg(theme::WARN())
                     .add_modifier(Modifier::BOLD),
-            ))
-            .style(Style::default().bg(theme::SURFACE()));
+            ));
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
         let lines = approval_card_lines(name, summary, detail, env, inner.width);
@@ -3220,9 +3475,7 @@ impl App {
         // clipped off - then there are no click targets, which is the safe
         // outcome: you cannot Allow what the card could not fully show.
         let row_count = lines.len() as u16;
-        Paragraph::new(lines)
-            .style(Style::default().bg(theme::SURFACE()))
-            .render(inner, frame.buffer_mut());
+        Paragraph::new(lines).render(inner, frame.buffer_mut());
 
         let fully_shown = row_count <= inner.height;
         if row_count >= 3 && fully_shown {
@@ -3251,8 +3504,10 @@ impl App {
     /// Finished transcript plus the live tail, bottom anchored, honoring the
     /// scroll offset (0 follows the latest output).
     ///
-    /// When only the live tail is dirty (spinner / tokens), the history prefix
-    /// of `chat_buf` is reused and the tail is re-stitched.
+    /// Only the blocks the viewport shows are wrapped, and every row is
+    /// painted straight from its block's cache or the tail: a frame clones
+    /// no lines except the selected block's, which take the selection
+    /// surface.
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let layout_started = Instant::now();
         let mut content_w = area.width;
@@ -3263,7 +3518,6 @@ impl App {
             self.perf_selection_ms = 0.0;
             return;
         }
-        let chat_dirty = self.dirty.chat;
 
         // Start from the previous frame's scrollbar decision. Re-deciding
         // from the full width on every paint re-wrapped the entire
@@ -3273,7 +3527,7 @@ impl App {
         if self.scrollbar_reserved && area.width > 1 {
             content_w = area.width - 1;
         }
-        // A width change re-wraps every block, and the bottom-anchored
+        // A width change re-measures every block, and the bottom-anchored
         // offset would resolve to different content afterward. Anchor the
         // history line at the viewport bottom by content and restore it
         // after the re-wrap; positions inside the live tail keep the
@@ -3289,17 +3543,20 @@ impl App {
         self.transcript.set_width(content_w);
         let mut tail_len = self.rebuild_tail(content_w);
 
-        let mut hist_len = self.transcript.len();
-        let mut total = hist_len + tail_len;
         let visible = area.height as usize;
+        // Whether history overflows is exact even though most blocks are
+        // only estimated: an estimate never exceeds the wrap, and history
+        // short enough to fit is wrapped whole to count it.
+        let total = self
+            .transcript
+            .len_exact_up_to(visible.saturating_sub(tail_len))
+            + tail_len;
         if total > visible && content_w == area.width && area.width > 1 {
             // Overflow began: rewrap once with a dedicated one-cell track.
             self.scrollbar_reserved = true;
             content_w = area.width - 1;
             self.transcript.set_width(content_w);
             tail_len = self.rebuild_tail(content_w);
-            hist_len = self.transcript.len();
-            total = hist_len + tail_len;
         } else if total <= visible && content_w < area.width {
             // Fits again at the narrowed width, so it also fits at the full
             // width (a wider wrap never yields more lines): reclaim the
@@ -3308,8 +3565,6 @@ impl App {
             content_w = area.width;
             self.transcript.set_width(content_w);
             tail_len = self.rebuild_tail(content_w);
-            hist_len = self.transcript.len();
-            total = hist_len + tail_len;
         }
         // Keep a scrolled-up reader stationary as the live tail changes.
         // History pushes already bump the offset; the tail below history
@@ -3325,11 +3580,12 @@ impl App {
         }
         self.last_content_w = content_w;
         self.last_tail_len = tail_len;
+        // Wrap what the view shows, now that the offset says where it is.
+        self.transcript.settle_view(visible, tail_len);
+        let hist_len = self.transcript.len();
+        let total = hist_len + tail_len;
         if total == 0 && self.pending_approval.is_none() {
-            self.chat_buf.clear();
             self.chat_line_map.clear();
-            self.hist_prefix_len = 0;
-            self.hist_reuse_key = None;
             self.chat_draw_area = Rect::default();
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
@@ -3344,66 +3600,19 @@ impl App {
         let end = total - offset;
         let start = end.saturating_sub(visible);
 
-        // Fingerprint sticky presence without cloning spans; clone only if we rebuild.
-        let has_sticky = offset > 0 && self.transcript.has_sticky_user(start);
-        let focus_scroll = self.focus == Focus::Scrollback;
-        let selected = self.transcript.selected();
-        let hist_view_end = end.min(hist_len);
-        let reuse_key = HistReuseKey {
-            hist_len,
-            start,
-            hist_view_end,
-            sticky: has_sticky,
-            focus_scroll,
-            selected,
-            width: content_w,
-        };
+        // Rows top to bottom: the sticky user header while scrolled away
+        // from it, the history in view, then the live tail below it.
+        let sticky_rows = usize::from(offset > 0 && self.transcript.has_sticky_user(start));
+        let view_end = start
+            .saturating_add(visible - sticky_rows)
+            .min(end.min(hist_len));
+        let history_rows = view_end.saturating_sub(start);
+        let tail_rows = (start.max(hist_len)..end)
+            .take(visible - sticky_rows - history_rows)
+            .count();
+        let rows = sticky_rows + history_rows + tail_rows;
 
-        let rebuild_hist = chat_dirty
-            || self.hist_reuse_key != Some(reuse_key)
-            || self.hist_prefix_len > self.chat_buf.len();
-
-        if rebuild_hist {
-            self.chat_buf.clear();
-            self.chat_line_map.clear();
-            // One clone of sticky spans: take ownership and insert the gutter.
-            if has_sticky {
-                if let Some(mut s) = self.transcript.sticky_user_line(start) {
-                    s.spans
-                        .insert(0, Span::styled("❯ ", Style::default().fg(theme::DIM())));
-                    self.chat_buf.push(s);
-                    self.chat_line_map.push(None);
-                }
-            }
-            let budget = visible.saturating_sub(self.chat_buf.len());
-            let view_end = start.saturating_add(budget).min(hist_view_end);
-            let selected_bi = if focus_scroll { selected } else { None };
-            // Single clone per viewport history line (reuse path skips this).
-            self.transcript
-                .fill_viewport(&mut self.chat_buf, start, view_end, selected_bi);
-            self.chat_line_map.extend((start..view_end).map(Some));
-            self.hist_prefix_len = self.chat_buf.len();
-            self.hist_reuse_key = Some(reuse_key);
-        } else {
-            self.chat_buf.truncate(self.hist_prefix_len);
-            self.chat_line_map.truncate(self.hist_prefix_len);
-        }
-
-        // Stitch visible tail after the history prefix.
-        let budget = visible.saturating_sub(self.chat_buf.len());
-        let mut idx = start.max(hist_len);
-        let mut taken = 0usize;
-        while taken < budget && idx < end {
-            let ti = idx - hist_len;
-            if ti < self.tail_buf.len() {
-                self.chat_buf.push(self.tail_buf[ti].clone());
-                self.chat_line_map.push(None);
-            }
-            idx += 1;
-            taken += 1;
-        }
-
-        let pad = area.height.saturating_sub(self.chat_buf.len() as u16);
+        let pad = area.height.saturating_sub(rows as u16);
         let draw_area = Rect {
             x: area.x,
             y: area.y + pad,
@@ -3411,7 +3620,46 @@ impl App {
             height: area.height - pad,
         };
         self.chat_draw_area = draw_area;
-        Paragraph::new(self.chat_buf.as_slice()).render(draw_area, frame.buffer_mut());
+        let row_at = |row: usize| Rect {
+            y: draw_area.y + row as u16,
+            height: 1,
+            ..draw_area
+        };
+        if sticky_rows > 0 {
+            if let Some(line) = self.transcript.sticky_user_line(start) {
+                let gutter = Span::styled("❯ ", Style::default().fg(theme::DIM()));
+                paint_line(frame.buffer_mut(), row_at(0), Some(&gutter), line);
+            }
+        }
+        let selected_bi = if self.focus == Focus::Scrollback {
+            self.transcript.selected()
+        } else {
+            None
+        };
+        self.chat_line_map.clear();
+        self.chat_line_map.extend(std::iter::repeat_n(None, sticky_rows));
+        self.transcript.paint_rows(
+            frame.buffer_mut(),
+            Rect {
+                height: history_rows as u16,
+                ..row_at(sticky_rows)
+            },
+            start,
+            view_end,
+            selected_bi,
+            &mut self.chat_line_map,
+        );
+        self.chat_line_map.resize(sticky_rows + history_rows, None);
+        self.chat_line_map.extend(std::iter::repeat_n(None, tail_rows));
+        let tail_from = start.max(hist_len) - hist_len;
+        for (row, line) in self.tail_buf[tail_from..tail_from + tail_rows].iter().enumerate() {
+            paint_line(
+                frame.buffer_mut(),
+                row_at(sticky_rows + history_rows + row),
+                None,
+                line,
+            );
+        }
         self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
 
         let selection_started = Instant::now();
@@ -3580,7 +3828,7 @@ impl App {
             self.status_width = area.width;
             // Read the mode before taking the settings lock: the accessor
             // takes it too, and this mutex is not reentrant.
-            let approvals = self.core.approval_mode(&self.project).as_str().to_string();
+            let approvals = self.approval_mode().as_str().to_string();
             let model = self.core.settings.lock().unwrap().model.clone();
             let width = area.width as usize;
             let hint = self.status_hint();
@@ -4059,14 +4307,12 @@ fn truncate_replay_output(output: &str) -> String {
 fn paint_text_selection(
     buffer: &mut ratatui::buffer::Buffer,
     transcript: &mut Transcript,
-    line_map: &[Option<usize>],
+    line_map: &[Option<RowRef>],
     area: Rect,
 ) {
-    // One palette read for the whole overlay: the accessor takes the theme
-    // lock, and the inner loop touches every selected cell per frame.
     let select_bg = theme::SELECT();
-    for (row, line_idx) in line_map.iter().copied().enumerate() {
-        let Some(line_idx) = line_idx else {
+    for (row, painted) in line_map.iter().copied().enumerate() {
+        let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
             continue;
         };
         let Some((start_col, end_col)) = transcript.selection_columns(line_idx) else {
@@ -4343,8 +4589,9 @@ mod tests {
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
         compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
         wide_status_right,
-        model_selection, presence_title, rect_contains, turn_end_rings,
-        App, Dirty, Focus, Presence, TermEvent, MIN_DRAW_INTERVAL, TICK, WAIT_TICK,
+        model_selection, paint_pacing, presence_title, rect_contains, turn_end_rings,
+        draw_frame, App, Dirty, Focus, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK,
+        WAIT_TICK,
     };
     use std::time::Duration;
     use crossterm::event::{
@@ -4358,7 +4605,6 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use ratatui::text::Line;
-    use ratatui::widgets::{Paragraph, Widget};
     use ratatui::Terminal;
     use serde_json::json;
     use std::fs;
@@ -4421,6 +4667,82 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Feed the app core events until `id`'s work settles.
+    async fn settle(
+        app: &mut App,
+        core_rx: &mut mpsc::UnboundedReceiver<open_max_core::types::AgentEventEnvelope>,
+        id: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(env) = core_rx.recv().await {
+                let done = env.session_id == id && matches!(env.event, AgentEvent::Done { .. });
+                app.on_core_event(env).await;
+                if done {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the turn never settled");
+    }
+
+    /// The app creates its session on the first submit, so a first prompt
+    /// that fails before anything is saved (here at endpoint resolution:
+    /// nothing is configured) leaves an index entry with nothing behind it,
+    /// which `--continue` then reattaches to. Leaving such a session, by
+    /// /new or by quitting, discards it, whether its turn is still running
+    /// or already settled; a session the app resumed stays.
+    #[tokio::test]
+    async fn a_created_session_left_before_anything_was_saved_leaves_no_entry() {
+        let dir = crate::test_temp_dir("openmax-app-ghost");
+        let (core, mut core_rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core.clone(), dir.clone(), files_tx);
+        let key = dir.display().to_string();
+        let ids = |core: &std::sync::Arc<Core>| -> Vec<String> {
+            open_max_core::sessions::list(core, &key).unwrap().into_iter().map(|m| m.id).collect()
+        };
+
+        // Settled before the user moves on.
+        app.handle_submit("hello".into()).await.unwrap();
+        let settled = app.session_id.clone().unwrap();
+        settle(&mut app, &mut core_rx, &settled).await;
+        assert_eq!(ids(&core), vec![settled.clone()], "the failed prompt's session is indexed");
+        app.handle_submit("/new".into()).await.unwrap();
+        assert!(ids(&core).is_empty(), "/new left an empty session behind");
+
+        // Left while its turn is still running (it has not yet been polled):
+        // discarded once it settles, since a cancelled turn may still save.
+        app.handle_submit("hello".into()).await.unwrap();
+        let running = app.session_id.clone().unwrap();
+        app.handle_submit("/new".into()).await.unwrap();
+        settle(&mut app, &mut core_rx, &running).await;
+        assert!(ids(&core).is_empty(), "a session left mid-turn stayed behind empty");
+        let sessions_dir = core.data_dir.join("sessions");
+        for id in [&settled, &running] {
+            assert!(!sessions_dir.join(format!("{id}.lock")).exists(), "{id} left its lock file");
+        }
+
+        // A resumed session was not this app's to create, so it stays even
+        // though nothing was ever saved to it.
+        let resumed = open_max_core::sessions::create(&core, key.clone()).unwrap().id;
+        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        assert_eq!(app.session_id.as_deref(), Some(resumed.as_str()));
+        app.handle_submit("/new".into()).await.unwrap();
+        assert_eq!(ids(&core), vec![resumed.clone()], "a resumed session was discarded");
+
+        // Quitting leaves the current session and the ones left running,
+        // and no turn of theirs will settle after it.
+        app.handle_submit("hello".into()).await.unwrap();
+        app.handle_submit("/new".into()).await.unwrap();
+        app.handle_submit("hello".into()).await.unwrap();
+        assert_eq!(app.left_running.len(), 1);
+        assert!(app.discard_created_sessions_on_exit().is_empty());
+        assert_eq!(ids(&core), vec![resumed], "quitting left an empty session behind");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn dirty_default_is_clean() {
         let d = Dirty::default();
@@ -4433,6 +4755,260 @@ mod tests {
         let display_144hz = std::time::Duration::from_nanos(1_000_000_000 / 144);
         assert!(MIN_DRAW_INTERVAL < display_144hz);
         assert!(MIN_DRAW_INTERVAL < std::time::Duration::from_millis(6));
+    }
+
+    /// A keystroke frame costs well under a millisecond, so holding it to the
+    /// frame cap only delays the echo. The cap exists to coalesce a token
+    /// firehose, and it still does.
+    #[test]
+    fn keystrokes_paint_at_once_while_agent_frames_wait_for_the_cap() {
+        let last_draw = std::time::Instant::now();
+        let soon = last_draw + Duration::from_millis(1);
+        assert_eq!(paint_pacing(soon, last_draw, false, None, Wake::Input), Paint::Now);
+        assert_eq!(
+            paint_pacing(soon, last_draw, false, None, Wake::Other),
+            Paint::At(last_draw + MIN_DRAW_INTERVAL),
+        );
+        let later = last_draw + MIN_DRAW_INTERVAL;
+        assert_eq!(paint_pacing(later, last_draw, false, None, Wake::Other), Paint::Now);
+        // A resize storm still settles first: a keystroke mid-drag must not
+        // rewrap the transcript at a size the terminal is about to leave.
+        let settle = soon + Duration::from_millis(10);
+        assert_eq!(paint_pacing(soon, last_draw, false, Some(settle), Wake::Input), Paint::At(settle));
+        assert_eq!(paint_pacing(settle, last_draw, false, Some(settle), Wake::Input), Paint::Now);
+    }
+
+    /// Input that lands within the cap of the last frame that showed input is
+    /// machine speed (a paste without bracketed paste, synthetic typing), and
+    /// each event can be handled before the next arrives, so nothing is ever
+    /// queued behind it. Painting each one would produce frames faster than
+    /// any display shows them: 400 characters 1 ms apart painted 400 frames.
+    #[test]
+    fn input_faster_than_the_frame_cap_coalesces_at_the_cap() {
+        let start = std::time::Instant::now();
+        let (mut last_draw, mut last_drew_input) = (start, false);
+        let mut deadline = None;
+        let mut frames = Vec::new();
+        for ms in 1..=400 {
+            let now = start + Duration::from_millis(ms);
+            // A deferred paint that came due before this key paints first.
+            if let Some(due) = deadline.filter(|&due| due <= now) {
+                (last_draw, last_drew_input, deadline) = (due, true, None);
+                frames.push(due);
+            }
+            match paint_pacing(now, last_draw, last_drew_input, None, Wake::Input) {
+                Paint::Now => {
+                    (last_draw, last_drew_input) = (now, true);
+                    frames.push(now);
+                }
+                Paint::At(when) => deadline = Some(when),
+            }
+        }
+        // The first key after an agent frame still echoes at once.
+        assert_eq!(frames[0], start + Duration::from_millis(1));
+        for pair in frames.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= MIN_DRAW_INTERVAL,
+                "{} frames for 400 keys, two of them {gap:?} apart",
+                frames.len()
+            );
+        }
+    }
+
+    /// Each frame reaches the terminal in one write(2), opening and closing
+    /// its synchronized update. ratatui's cursor commands flush inside every
+    /// draw (the cursor show or hide carries the cell diff), which sent a
+    /// composer frame in three writes and a scrollback frame in two, the last
+    /// of each carrying only the close. A frame larger than the buffer still
+    /// leaves whole by the time the draw returns: the hold never strands one.
+    #[test]
+    fn each_frame_reaches_the_terminal_in_one_write() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{TerminalOptions, Viewport};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Writes(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut app, dir) = app_fixture();
+        let writes = Writes::default();
+        let terminal_over = |capacity| {
+            let backend = CrosstermBackend::new(crate::FrameWriter::new(writes.clone(), capacity));
+            // A fixed viewport: a fullscreen one asks the real terminal its size.
+            let viewport = Viewport::Fixed(Rect::new(0, 0, 80, 24));
+            Terminal::with_options(backend, TerminalOptions { viewport }).unwrap()
+        };
+        let mut terminal = terminal_over(256 * 1024);
+        // The composer shows the cursor and places it; scrollback hides it.
+        for (focus, cursor) in [(Focus::Composer, "\x1b[?25h"), (Focus::Scrollback, "\x1b[?25l")] {
+            app.focus = focus;
+            writes.0.lock().unwrap().clear();
+            draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL).unwrap();
+            let lossy = |w: &Vec<u8>| String::from_utf8_lossy(w).into_owned();
+            let sent: Vec<String> = writes.0.lock().unwrap().iter().map(lossy).collect();
+            assert_eq!(sent.len(), 1, "a frame left in {} writes: {sent:?}", sent.len());
+            let frame = &sent[0];
+            assert!(frame.contains(cursor), "the frame sets the cursor: {frame:?}");
+            assert!(
+                frame.starts_with("\x1b[?2026h") && frame.ends_with("\x1b[?2026l"),
+                "one synchronized update per write: {frame:?}"
+            );
+        }
+
+        let mut terminal = terminal_over(64);
+        writes.0.lock().unwrap().clear();
+        draw_frame(&mut terminal, &mut app, MIN_DRAW_INTERVAL).unwrap();
+        let sent = writes.0.lock().unwrap().concat();
+        assert!(writes.0.lock().unwrap().len() > 1, "the frame must outgrow a 64-byte buffer");
+        assert!(
+            sent.starts_with(b"\x1b[?2026h") && sent.ends_with(b"\x1b[?2026l"),
+            "a spilled frame must still leave whole: {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Input that changes nothing on screen is not input a frame shows. A
+    /// focus report counted as such made the next agent frame record that it
+    /// showed input, so a keystroke within the cap of that frame waited for
+    /// the cap instead of echoing at once.
+    #[tokio::test]
+    async fn input_that_changes_nothing_does_not_hold_back_the_next_keystroke() {
+        let (mut app, dir) = app_fixture();
+        // Mid-stream: an agent frame waits for the cap when focus returns.
+        app.dirty.clear();
+        app.dirty.mark_tail();
+        let mut input_unpainted = app.on_input(TermEvent::FocusGained).await.unwrap();
+        // An ignored button on a clean frame leaves nothing to paint either.
+        app.dirty.clear();
+        let right = mouse(MouseEventKind::Down(MouseButton::Right), 1, 1);
+        input_unpainted |= app.on_input(right).await.unwrap();
+        assert!(!app.dirty.any());
+        // The agent frame paints, then the user types 1 ms later.
+        let last_drew_input = std::mem::take(&mut input_unpainted);
+        let painted = std::time::Instant::now();
+        let key_at = painted + Duration::from_millis(1);
+        assert_eq!(
+            paint_pacing(key_at, painted, last_drew_input, None, Wake::Input),
+            Paint::Now,
+            "the first keystroke after a focus report waited for the cap",
+        );
+        let key = TermEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.on_input(key).await.unwrap(), "a keystroke is input its frame shows");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Only presses, releases, drags, and the wheel are handled, so the
+    /// terminal reports exactly those: any-motion tracking (1003) sends a
+    /// report and wakes the loop on every pointer movement, which over SSH is
+    /// network traffic for nothing. Exit turns off exactly what was enabled.
+    #[cfg(not(windows))]
+    #[test]
+    fn mouse_tracking_reports_buttons_drags_and_wheel_but_not_bare_motion() {
+        use super::{DisableMouseTracking, EnableMouseTracking};
+        fn ansi(command: impl crossterm::Command) -> String {
+            let mut out = String::new();
+            command.write_ansi(&mut out).unwrap();
+            out
+        }
+        assert_eq!(ansi(EnableMouseTracking), "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert_eq!(ansi(DisableMouseTracking), "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    }
+
+    /// The status line shows the project's approval mode on every chrome
+    /// frame, so resolving the project path there put filesystem syscalls on
+    /// every keystroke. The root is resolved once at launch; removing the
+    /// launch path afterwards proves a draw no longer looks at the disk.
+    #[cfg(unix)]
+    #[test]
+    fn status_draw_reads_the_resolved_root_not_the_filesystem() {
+        let dir = crate::test_temp_dir("openmax-app-resolved-root");
+        let real = dir.join("real");
+        let link = dir.join("link");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &real).unwrap();
+        core.set_project_approval_mode(&link, config::ApprovalMode::Auto).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core, link.clone(), files_tx);
+        render_app(&mut app, 100, 12);
+        let before = line_text(&app.status_line);
+        assert!(before.ends_with("  auto "), "{before:?}");
+
+        fs::remove_file(&link).unwrap();
+        app.dirty.mark_chrome();
+        render_app(&mut app, 100, 12);
+        let after = line_text(&app.status_line);
+        assert!(after.ends_with("  auto "), "a draw re-resolved the project path: {after:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Turns and saves resolve the project path when they run. When the
+    /// launch path comes to lead to another trusted project (the directory
+    /// moved and a symlink to another project took its place), Shift+Tab and
+    /// the status line must follow it too, or the line shows one project's
+    /// mode while turns enforce the other's, and Shift+Tab steps from the
+    /// shown mode but saves the result for the other project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_mode_follows_the_project_turns_resolve() {
+        let dir = crate::test_temp_dir("openmax-app-retargeted-root");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let link = dir.join("link");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &first).unwrap();
+        open_max_core::trust::trust_project(&dir, &second).unwrap();
+        core.set_project_approval_mode(&first, config::ApprovalMode::Auto).unwrap();
+        core.set_project_approval_mode(&second, config::ApprovalMode::Readonly).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core, link.clone(), files_tx);
+        render_app(&mut app, 100, 12);
+        let launch = line_text(&app.status_line);
+        assert!(launch.ends_with("  auto "), "{launch:?}");
+
+        let retarget = |to: &std::path::Path| {
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(to, &link).unwrap();
+        };
+        retarget(&second);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(
+            app.core.approval_mode(&link),
+            config::ApprovalMode::Ask,
+            "Shift+Tab must step from the mode turns enforce (readonly), not the one last shown",
+        );
+        assert_eq!(app.core.approval_mode(&first), config::ApprovalMode::Auto);
+        render_app(&mut app, 100, 12);
+        let stepped = line_text(&app.status_line);
+        assert!(stepped.ends_with("  ask "), "{stepped:?}");
+
+        // A tool call is where a turn reads the mode, so it re-syncs the line.
+        retarget(&first);
+        app.dirty.clear();
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            args: json!({"command": "ls"}),
+        });
+        render_app(&mut app, 100, 12);
+        let during_turn = line_text(&app.status_line);
+        assert!(during_turn.ends_with("  auto "), "{during_turn:?}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -4671,17 +5247,16 @@ mod tests {
         assert!(transcript.update_text_selection_at(0, 7));
         transcript.finish_text_selection();
 
-        let mut lines = Vec::new();
-        transcript.fill_viewport(&mut lines, 0, 1, None);
         let area = Rect::new(0, 0, 20, 1);
         let mut buffer = Buffer::empty(area);
-        Paragraph::new(lines).render(area, &mut buffer);
-        paint_text_selection(&mut buffer, &mut transcript, &[Some(0)], area);
+        let mut rows = Vec::new();
+        transcript.paint_rows(&mut buffer, area, 0, 1, None, &mut rows);
+        paint_text_selection(&mut buffer, &mut transcript, &rows, area);
 
-        assert_eq!(buffer[(1, 0)].bg, theme::USER_BG());
+        assert_eq!(buffer[(1, 0)].bg, ratatui::style::Color::Reset);
         assert_eq!(buffer[(2, 0)].bg, theme::SELECT());
         assert_eq!(buffer[(6, 0)].bg, theme::SELECT());
-        assert_eq!(buffer[(7, 0)].bg, theme::USER_BG());
+        assert_eq!(buffer[(7, 0)].bg, ratatui::style::Color::Reset);
     }
 
     /// What is highlighted is exactly what a copy carries, on the real buffer
@@ -5018,6 +5593,113 @@ mod tests {
             config::ApprovalMode::Readonly,
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A damaged session index: a JSON array that ends inside its first
+    /// entry.
+    fn damage_session_index(data_dir: &std::path::Path) -> std::path::PathBuf {
+        let index = data_dir.join("sessions").join("index.json");
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(&index, "[{").unwrap();
+        index
+    }
+
+    /// Where a refusal over a damaged index sends the user: `--check` gives
+    /// the repair with the step that makes it safe.
+    const REPAIR_POINTER: &str = "run openmax --check for the repair";
+
+    /// A damaged session index refuses the session a first prompt creates.
+    /// Returned as an I/O error, that refusal unwound the event loop and
+    /// closed the app on the first prompt in every project. It belongs in
+    /// the transcript, naming the file and pointing at `--check` for the
+    /// repair, with the app still running and the damaged bytes left for
+    /// the user to recover.
+    #[tokio::test]
+    async fn a_damaged_session_index_is_reported_and_the_app_keeps_running() {
+        let (mut app, dir) = app_fixture();
+        let index = damage_session_index(&dir);
+
+        app.composer.load("hello");
+        app.on_term_event(TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+            .await
+            .expect("a refused session must not end the event loop");
+
+        let shown = app.transcript.export_text();
+        assert!(
+            shown.contains(&index.display().to_string()),
+            "the error must name the damaged index: {shown}"
+        );
+        assert!(shown.contains(REPAIR_POINTER), "the error must point at the repair: {shown}");
+        assert!(!app.should_quit && !app.running && app.session_id.is_none());
+        assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `--continue` and `/resume` read the same index. A damaged one is
+    /// history the app cannot read, not an empty past: each must name the
+    /// file, and point at `--check` for the repair, rather than report that
+    /// there is nothing to resume.
+    #[tokio::test]
+    async fn continue_and_resume_name_a_damaged_session_index() {
+        let (mut app, dir) = app_fixture();
+        let index = damage_session_index(&dir);
+        let path = index.display().to_string();
+
+        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        let continued = app.transcript.export_text();
+        assert!(
+            continued.contains(&path)
+                && continued.contains(REPAIR_POINTER)
+                && !continued.contains("no previous session"),
+            "--continue must name the damaged index: {continued}"
+        );
+
+        app.handle_submit("/resume".into()).await.unwrap();
+        let resumed = app.transcript.export_text()[continued.len()..].to_string();
+        assert!(
+            resumed.contains(&path) && resumed.contains(REPAIR_POINTER) && !resumed.contains("no sessions"),
+            "/resume must name the damaged index: {resumed}"
+        );
+        assert!(app.sessions_panel.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An empty session this app created is discarded when the user leaves
+    /// it, and that removal rewrites the index, so an index damaged since
+    /// the session began refuses it. The warning that the entry stays must
+    /// name the file and point at `--check` for the repair like every other
+    /// refusal over the damage, both in the transcript (/new) and among the
+    /// warnings printed once the terminal is restored (quitting).
+    #[tokio::test]
+    async fn an_empty_session_left_over_a_damaged_index_points_at_the_repair() {
+        let dir = crate::test_temp_dir("openmax-app-discard-damaged");
+        let (core, mut core_rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &dir).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core.clone(), dir.clone(), files_tx);
+
+        // Nothing is configured, so the turn fails before its first save.
+        app.handle_submit("hello".into()).await.unwrap();
+        let id = app.session_id.clone().unwrap();
+        settle(&mut app, &mut core_rx, &id).await;
+        let index = damage_session_index(&dir);
+        let path = index.display().to_string();
+
+        let warnings = app.discard_created_sessions_on_exit();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("stays indexed") && warnings[0].contains(&path) && warnings[0].contains(REPAIR_POINTER),
+            "the exit warning must name the damaged index and the repair: {warnings:?}"
+        );
+
+        app.handle_submit("/new".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(
+            shown.contains("stays indexed") && shown.contains(&path) && shown.contains(REPAIR_POINTER),
+            "/new must name the damaged index and the repair: {shown}"
+        );
+        assert_eq!(fs::read_to_string(&index).unwrap(), "[{", "a damaged index is never replaced");
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// Plain Tab keeps its own job.
@@ -5667,6 +6349,74 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The presence title, its bells, the turn-done notification, and OSC 52
+    /// copies are raw writes, which libtest does not capture: an App that sent
+    /// them to the real stdout retitled and rang the terminal running
+    /// `cargo test`, set its clipboard where it honors OSC 52, and spliced
+    /// control bytes into its output. The child drives each kind of write;
+    /// none may reach its stdout.
+    #[tokio::test]
+    async fn titles_bells_and_copies_stay_out_of_test_output() {
+        const CHILD: &str = "OPENMAX_TEST_OUT_OF_BAND_WRITES";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::titles_bells_and_copies_stay_out_of_test_output",
+                    "--color",
+                    "never",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            // "1 passed" rules out a filter that matched nothing and exited 0.
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                !child.stdout.iter().any(|b| matches!(b, 0x1b | 0x07)),
+                "terminal control bytes reached stdout: {stdout:?}"
+            );
+            return;
+        }
+        let (mut app, dir) = app_fixture();
+        // Unfocused, so the turn's end also rings the notification.
+        app.on_focus_change(false);
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            approval_id: "a1".into(),
+            name: "write_file".into(),
+            summary: "write x".into(),
+            detail: String::new(),
+            reason: "gate".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
+            env: vec![],
+        });
+        assert_eq!(app.presence, Presence::NeedsApproval);
+        app.on_agent_event(AgentEvent::ApprovalSettled {
+            approval_id: "a1".into(),
+            outcome: "allowed".into(),
+        });
+        assert_eq!(app.presence, Presence::Working);
+        app.on_agent_event(AgentEvent::Done {
+            stop_reason: "stop".into(),
+        });
+        assert_eq!(app.presence, Presence::Idle);
+
+        app.transcript.set_width(40);
+        app.transcript.push_assistant(vec![Line::from("the final answer")]);
+        app.focus = Focus::Scrollback;
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let rendered = buffer_text(&render_app(&mut app, 60, 14));
+        assert!(rendered.contains("copied block"), "{rendered}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn replay_never_badges_a_read_only_tool() {
         let (mut app, dir) = app_fixture();
@@ -5687,10 +6437,12 @@ mod tests {
                         name: "read_file".into(),
                         arguments: "{\"path\":\"CHANGELOG.md\"}".into(),
                     },
+                    extra_content: None,
                 }]),
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             // File content that happens to look like an edit summary.
@@ -5701,6 +6453,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
         ];
@@ -5747,10 +6500,12 @@ mod tests {
                             name: "bash".into(),
                             arguments: "{\"command\":\"cargo test\"}".into(),
                         },
+                        extra_content: None,
                     }]),
                     tool_call_id: None,
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     reasoning_origin: None,
                 });
                 messages.push(open_max_core::types::ChatMessage {
@@ -5760,6 +6515,7 @@ mod tests {
                     tool_call_id: Some(format!("c{i}")),
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     reasoning_origin: None,
                 });
             }
@@ -5793,6 +6549,50 @@ mod tests {
         }
     }
 
+    /// First-paint, resize, and steady-frame cost at ten thousand blocks:
+    /// the frames that wrapped the whole history before blocks wrapped
+    /// lazily, and the frame that cloned every visible row. Not a
+    /// correctness test; run with:
+    ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_resize_and_first_paint
+    #[test]
+    #[ignore]
+    fn measure_resize_and_first_paint_at_scale() {
+        use std::time::Instant;
+        const ROWS: u16 = 45;
+        let (mut app, dir) = app_fixture();
+        push_long_history(&mut app, 10_000);
+        let frame_at = |app: &mut App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, ROWS)).unwrap();
+            app.dirty.mark_chat();
+            let allocations = crate::allocations();
+            let started = Instant::now();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            (ms, crate::allocations() - allocations)
+        };
+        let (first_ms, first_allocs) = frame_at(&mut app, 140);
+        // A window dragged narrower and wider: every frame a new width.
+        let mut resize = Vec::new();
+        for width in [120, 139, 100, 141, 90, 133, 72, 140, 110, 125] {
+            resize.push(frame_at(&mut app, width));
+        }
+        let mut steady = Vec::new();
+        for _ in 0..50 {
+            steady.push(frame_at(&mut app, 125));
+        }
+        let worst = |samples: &[(f64, u64)]| {
+            samples.iter().fold((0f64, 0u64), |(ms, n), &(m, a)| (ms.max(m), n.max(a)))
+        };
+        let (resize_ms, resize_allocs) = worst(&resize);
+        let (steady_ms, steady_allocs) = worst(&steady);
+        println!(
+            "MEASURE 10000 blocks, {ROWS} rows: first paint {first_ms:.3} ms / {first_allocs} allocs, \
+             resize max {resize_ms:.3} ms / {resize_allocs} allocs, \
+             steady max {steady_ms:.3} ms / {steady_allocs} allocs"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The approval timeout is persisted without the `Error:` prefix
     /// (agent::tool_message_content keeps it verbatim so the model reads the
     /// stop instruction), so replay must classify it as the failure it was:
@@ -5820,6 +6620,7 @@ mod tests {
                             name: "bash".into(),
                             arguments: "{\"command\":\"./deploy.sh\"}".into(),
                         },
+                        extra_content: None,
                     },
                     open_max_core::types::ToolCall {
                         id: "c2".into(),
@@ -5828,11 +6629,13 @@ mod tests {
                             name: "bash".into(),
                             arguments: "{\"command\":\"./probe.sh\"}".into(),
                         },
+                        extra_content: None,
                     },
                 ]),
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
@@ -5842,6 +6645,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             // A SUCCESSFUL command whose output merely opens with the same
@@ -5854,6 +6658,7 @@ mod tests {
                 tool_call_id: Some("c2".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
         ];
@@ -5903,10 +6708,12 @@ mod tests {
                         name: "write_file".into(),
                         arguments: "{\"path\":\"notes.md\",\"content\":\"x\"}".into(),
                     },
+                    extra_content: None,
                 }]),
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
@@ -5916,6 +6723,7 @@ mod tests {
                 tool_call_id: Some("c1".into()),
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
             open_max_core::types::ChatMessage {
@@ -5925,6 +6733,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
                 reasoning: None,
+                reasoning_details: None,
                 reasoning_origin: None,
             },
         ];
@@ -6058,7 +6867,8 @@ mod tests {
             .iter()
             .position(|row| row.contains("❯ please test this"))
             .unwrap() as u16;
-        assert_eq!(running[(0, user_y)].bg, theme::USER_BG());
+        assert_eq!(running[(0, user_y)].symbol(), "❯");
+        assert!(running[(0, user_y)].modifier.contains(Modifier::BOLD));
 
         app.on_agent_event(AgentEvent::ToolEnd {
             call_id: "call-1".into(),
@@ -6073,6 +6883,91 @@ mod tests {
             app.last_tool_output.as_deref(),
             Some("test one ok\ntest two ok\ntest three ok\ntest four ok")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An absolute palette slot is the background of some terminal theme:
+    /// slot 15 text vanishes on a light terminal, and a slot 0 fill is a dark
+    /// box there and a black bar on a dark gray one. Every surface the
+    /// conversation shows (user row, heading, inline and fenced code,
+    /// finished and failed tool cards, the focused composer, the completion
+    /// menu, the approval card) uses the terminal's own colors, plus the
+    /// palette's gray for secondary text, borders and selection.
+    #[test]
+    fn every_cell_uses_the_terminals_own_colors_or_the_chrome_gray() {
+        use ratatui::style::Color;
+        fn assert_terminal_colors(buffer: &Buffer, frame: &str) {
+            let area = buffer.area;
+            let own = |color| matches!(color, Color::Reset | Color::DarkGray);
+            let hits: Vec<(u16, u16, &str, Color, Color)> = (area.y..area.bottom())
+                .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+                .map(|(x, y)| (x, y, &buffer[(x, y)]))
+                .filter(|(_, _, cell)| !own(cell.fg) || !own(cell.bg))
+                .map(|(x, y, cell)| (x, y, cell.symbol(), cell.fg, cell.bg))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "{frame}: {} cells paint another color, first {:?}",
+                hits.len(),
+                &hits[..hits.len().min(4)],
+            );
+        }
+
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("why does the cache miss?");
+        app.on_agent_event(AgentEvent::MessageDone {
+            text: "## Cause\nThe key is `normalized` twice.\n```rust\nfn key() {}\n```\n- one\n".into(),
+        });
+        for (call_id, ok) in [("call-1", true), ("call-2", false)] {
+            app.on_agent_event(AgentEvent::ToolStart {
+                call_id: call_id.into(),
+                name: "bash".into(),
+                args: json!({"command": "cargo test"}),
+            });
+            app.on_agent_event(AgentEvent::ToolEnd {
+                call_id: call_id.into(),
+                ok,
+                output: "exit 1\nerror: linking failed".into(),
+            });
+        }
+        app.composer.load("a draft");
+        let conversation = render_app(&mut app, 96, 30);
+        let text = buffer_text(&conversation);
+        for shown in ["❯ why does", "Cause", "normalized", "│ fn key", "✓ Shell", "✗ Shell", "a draft"] {
+            assert!(text.contains(shown), "{shown} not rendered:\n{text}");
+        }
+        assert_terminal_colors(&conversation, "conversation");
+
+        app.composer.load("/");
+        app.sync_completion();
+        let menu = render_app(&mut app, 96, 30);
+        assert!(buffer_text(&menu).contains("/help"));
+        assert_terminal_colors(&menu, "completion menu");
+
+        // Below three rows the composer draws without its border.
+        app.composer.load("a draft");
+        app.sync_completion();
+        let short = render_app(&mut app, 96, 2);
+        assert!(buffer_text(&short).contains("a draft"));
+        assert_terminal_colors(&short, "borderless composer");
+
+        app.on_agent_event(AgentEvent::ApprovalRequest {
+            reason: "gate".into(),
+            approval_id: "approval-1".into(),
+            name: "bash".into(),
+            summary: "install dependencies".into(),
+            detail: "cargo fetch".into(),
+            source_path: String::new(),
+            source_sha: String::new(),
+            env: vec![],
+        });
+        // The full card has a border; below five rows the card is compact
+        // and has none.
+        for height in [30, 4] {
+            let approval = render_app(&mut app, 96, height);
+            assert!(buffer_text(&approval).contains("[y] Allow once"));
+            assert_terminal_colors(&approval, &format!("approval card, {height} rows"));
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6145,6 +7040,354 @@ mod tests {
             render_app(&mut app, 40, 6);
         }
         assert_eq!(app.transcript.rewraps, settled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A long history, as a resumed marathon session leaves it: prose that
+    /// wraps at narrow widths, folded and failed tool cards, and notices.
+    fn push_long_history(app: &mut App, blocks: usize) {
+        let output = "src/ledger.rs:42: let hash = sha256(&bytes); // a grep or test log line\n"
+            .repeat(6);
+        for index in 0..blocks {
+            match index % 4 {
+                0 => app.insert_user_block(&format!(
+                    "turn {index}: inspect the ledger reconciliation and fix the failing test"
+                )),
+                1 => app.transcript.push_assistant(crate::ui::markdown::render(&format!(
+                    "Reply {index} with **markdown** long enough to wrap below a hundred \
+                     columns, a list:\n\n- alpha item\n- beta item\n\n```rust\nlet value = \
+                     compute(input);\n```"
+                ))),
+                2 => {
+                    let ok = index % 8 == 2;
+                    let compact =
+                        crate::ui::tool_card::tool_block("bash", "cargo test", ok, &output, None);
+                    app.transcript.push_tool(compact, output.clone(), ok);
+                }
+                _ => app.transcript.push(vec![Line::from(format!("history line {index}"))]),
+            }
+        }
+    }
+
+    /// A width change, the first paint of a long history, and a replay into
+    /// a painted window wrap only the blocks the viewport shows. Wrapping the
+    /// whole history made each of them linear in the session's length, every
+    /// block's wrap and its allocations on the UI loop in one frame. Every
+    /// block is at least one row, so a viewport of `ROWS` rows shows at most
+    /// `ROWS` blocks.
+    #[test]
+    fn resize_first_paint_and_replay_wrap_only_the_blocks_in_view() {
+        const BLOCKS: usize = 10_000;
+        const ROWS: u16 = 40;
+        let (mut app, dir) = app_fixture();
+        push_long_history(&mut app, BLOCKS);
+
+        let wraps_during = |app: &mut App, width: u16| {
+            let before = crate::ui::transcript::block_wraps();
+            render_app(app, width, ROWS);
+            crate::ui::transcript::block_wraps() - before
+        };
+        let first_paint = wraps_during(&mut app, 100);
+        assert!(
+            first_paint <= usize::from(ROWS),
+            "the first paint wrapped {first_paint} of {BLOCKS} blocks"
+        );
+        for width in [72, 130, 99] {
+            let resize = wraps_during(&mut app, width);
+            assert!(
+                resize <= usize::from(ROWS),
+                "a resize to {width} columns wrapped {resize} of {BLOCKS} blocks"
+            );
+        }
+
+        // Replay pushes every persisted message at the painted width.
+        let before = crate::ui::transcript::block_wraps();
+        push_long_history(&mut app, BLOCKS);
+        let replay = crate::ui::transcript::block_wraps() - before;
+        let next_paint = wraps_during(&mut app, 99);
+        assert!(
+            replay + next_paint <= usize::from(ROWS),
+            "a replay wrapped {replay} blocks and its paint {next_paint}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// One thing a reader or the agent does to the conversation view.
+    #[derive(Clone, Copy, Debug)]
+    enum ViewStep {
+        Size(u16, u16),
+        Up(usize),
+        Down(usize),
+        Top,
+        Follow,
+        Arrive(usize),
+        Stream,
+        Done,
+        Find(usize),
+        Prev,
+        Fold,
+        Expand,
+        Pop,
+        Focus,
+    }
+
+    fn apply_view_step(app: &mut App, step: ViewStep, index: usize) {
+        match step {
+            ViewStep::Size(..) => {}
+            ViewStep::Up(n) => app.transcript.scroll_up(n),
+            ViewStep::Down(n) => app.transcript.scroll_down(n),
+            ViewStep::Top => app.transcript.select_first(),
+            ViewStep::Follow => app.transcript.follow(),
+            ViewStep::Arrive(kind) => {
+                let text = format!(
+                    "arrival {index} while scrolled, long enough to wrap at narrow widths"
+                );
+                match kind % 3 {
+                    0 => app.transcript.push_assistant(crate::ui::markdown::render(&text)),
+                    1 => app.insert_user_block(&text),
+                    _ => {
+                        let output = format!("{text}\n").repeat(4);
+                        let compact = crate::ui::tool_card::tool_block(
+                            "bash", "cargo test", false, &output, None,
+                        );
+                        app.transcript.push_tool(compact, output, false);
+                    }
+                }
+            }
+            ViewStep::Stream => app.on_agent_event(AgentEvent::Token {
+                text: format!("streamed line {index} of a reply that wraps when narrow\n"),
+            }),
+            ViewStep::Done => {
+                let text = app.stream_text.clone();
+                app.on_agent_event(AgentEvent::MessageDone { text });
+            }
+            ViewStep::Find(block) => app.transcript.select_find_match(block),
+            ViewStep::Prev => app.transcript.select_prev(),
+            ViewStep::Fold => {
+                app.transcript.toggle_fold_selected();
+            }
+            ViewStep::Expand => {
+                app.transcript.expand_last_tool();
+            }
+            ViewStep::Pop => {
+                app.transcript.pop_last_user();
+            }
+            ViewStep::Focus => {
+                app.focus = match app.focus {
+                    Focus::Composer => Focus::Scrollback,
+                    Focus::Scrollback => Focus::Composer,
+                };
+            }
+        }
+    }
+
+    /// Paint `steps` into an app that wraps lazily and one that wraps every
+    /// block up front, both starting from `history` blocks, and require the
+    /// same frame after every step. Only the scrollbar marker, a proportion
+    /// of the estimated total, may differ.
+    fn assert_lazy_paints_like_eager(history: usize, steps: &[ViewStep]) {
+        let (mut lazy, lazy_dir) = app_fixture();
+        let (mut eager, eager_dir) = app_fixture();
+        eager.transcript.eager = true;
+        for app in [&mut lazy, &mut eager] {
+            push_long_history(app, history);
+        }
+        let (mut width, mut height) = (100, 30);
+        for (index, &step) in steps.iter().enumerate() {
+            if let ViewStep::Size(w, h) = step {
+                (width, height) = (w, h);
+            }
+            for app in [&mut lazy, &mut eager] {
+                apply_view_step(app, step, index);
+            }
+            // The header row names each fixture's own directory.
+            let painted = |app: &mut App| -> Vec<String> {
+                rows(&render_app(app, width, height))
+                    .into_iter()
+                    .skip(1)
+                    .map(|row| row.replace('▐', " "))
+                    .collect()
+            };
+            assert_eq!(
+                painted(&mut lazy),
+                painted(&mut eager),
+                "{history} blocks, step {index} ({step:?}) painted differently at {width}x{height}"
+            );
+        }
+        fs::remove_dir_all(lazy_dir).unwrap();
+        fs::remove_dir_all(eager_dir).unwrap();
+    }
+
+    /// `count` seeded steps of every kind over a history of `blocks` blocks.
+    fn random_view_steps(seed: u64, count: usize, blocks: usize) -> Vec<ViewStep> {
+        use ViewStep::*;
+        let mut seed = seed;
+        let mut roll = |bound: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % bound
+        };
+        (0..count)
+            .map(|_| match roll(22) {
+                0 | 1 => Size(20 + roll(121) as u16, 6 + roll(35) as u16),
+                2..=5 => Up(1 + roll(80)),
+                6..=9 => Down(1 + roll(80)),
+                10 => Top,
+                11 => Follow,
+                12 => Arrive(roll(3)),
+                13 | 14 => Stream,
+                15 => Done,
+                16 => Find(roll(blocks + 20)),
+                17 => Prev,
+                18 => Fold,
+                19 => Expand,
+                20 => Pop,
+                _ => Focus,
+            })
+            .collect()
+    }
+
+    /// Lazy wrapping is invisible: across scrolls, resizes, arrivals while
+    /// scrolled up, a streamed reply, find, block navigation, folds, and a
+    /// removed prompt, every frame paints exactly what wrapping every block
+    /// up front paints. Blocks off screen count their estimated heights, so
+    /// this pins that a scroll moves by exactly the rows it names and that
+    /// an estimate turning exact never moves what a scrolled reader is
+    /// looking at. A scripted walk, then seeded random ones over a long
+    /// history and over one short enough to fit on screen.
+    #[test]
+    fn lazy_wrapping_paints_exactly_what_eager_wrapping_paints() {
+        use ViewStep::*;
+        let scripted = [
+            Size(100, 30), Up(45), Size(40, 30), Down(3), Down(3), Down(3), Down(9),
+            Up(200), Size(72, 24), Top, Down(7), Size(120, 24), Down(13), Size(50, 24),
+            Arrive(0), Arrive(1), Arrive(2), Down(20), Down(20), Down(20), Stream, Up(30),
+            Stream, Size(64, 18), Stream, Down(5), Done, Down(40), Down(40), Follow,
+            Size(90, 20), Up(100), Size(33, 20), Down(25), Follow, Stream, Stream,
+            Focus, Find(37), Prev, Prev, Fold, Size(45, 16), Find(150), Done, Follow,
+        ];
+        assert_lazy_paints_like_eager(400, &scripted);
+        for seed in [1, 2] {
+            assert_lazy_paints_like_eager(400, &random_view_steps(seed, 300, 400));
+            assert_lazy_paints_like_eager(6, &random_view_steps(seed, 300, 6));
+        }
+    }
+
+    /// Heap allocations of one frame that repaints the conversation, after
+    /// earlier frames settled wrapping, the scrollbar, and every cache.
+    fn repaint_allocations(app: &mut App, width: u16, height: u16) -> u64 {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        for _ in 0..2 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            app.dirty.clear();
+        }
+        app.dirty.mark_chat();
+        let before = crate::allocations();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        crate::allocations() - before
+    }
+
+    /// A steady frame paints the visible rows straight from the block
+    /// caches. Cloning every visible line into a frame-sized vector, and
+    /// again into the paragraph that painted it, cost allocations per
+    /// visible row on every frame. So a taller window may not allocate more
+    /// per frame than a short one, and a frame allocates less than once per
+    /// row it shows.
+    #[test]
+    fn steady_frames_allocate_nothing_per_visible_row() {
+        let (mut app, dir) = app_fixture();
+        push_long_history(&mut app, 10_000);
+        let short = repaint_allocations(&mut app, 100, 20);
+        let tall = repaint_allocations(&mut app, 100, 80);
+        assert!(
+            tall <= short,
+            "80 rows allocated {tall} times per frame, 20 rows {short}"
+        );
+        assert!(tall < 80, "a frame showing 80 rows allocated {tall} times");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A press, drag, and release select the text the last frame painted
+    /// under the pointer, even when wheel input handled before the next
+    /// paint wrapped history above the view. Wrapping a block changes its
+    /// height and so the index of every row below it: resolved through the
+    /// last frame's row indices, the gesture selected and copied text from
+    /// rows above the one under the pointer.
+    #[tokio::test]
+    async fn a_selection_after_an_unpainted_scroll_takes_the_painted_text() {
+        let (mut app, dir) = app_fixture();
+        // A word to a row leaves most of each row empty, so every block
+        // wraps to far more rows than its estimate counts.
+        for block in 0..300 {
+            let words: Vec<String> =
+                (0..10).map(|word| format!("w{block:04}x{word:02}abcdefg")).collect();
+            app.transcript.push_user(vec![Line::from(words.join(" "))]);
+        }
+        for step in 0u16..12 {
+            let painted = render_app(&mut app, 29, 30);
+            let area = app.chat_draw_area;
+            // Wheel input queued behind the frame, handled before the next.
+            for _ in 0..1 + step % 3 {
+                app.on_term_event(mouse(MouseEventKind::ScrollUp, area.x, area.y))
+                    .await
+                    .unwrap();
+            }
+            // Below the sticky header row, a new row each step so no two
+            // presses make a double click.
+            let row = area.y + 1 + (step * 7) % (area.height - 1);
+            let (from, to) = (area.x + 2, area.x + 11);
+            for (kind, column) in [
+                (MouseEventKind::Down(MouseButton::Left), from),
+                (MouseEventKind::Drag(MouseButton::Left), to),
+                (MouseEventKind::Up(MouseButton::Left), to),
+            ] {
+                app.on_term_event(mouse(kind, column, row)).await.unwrap();
+            }
+            let shown: String = (from..=to).map(|x| painted[(x, row)].symbol()).collect();
+            assert_eq!(
+                app.transcript.selected_text().unwrap_or_default(),
+                shown.trim(),
+                "step {step}: the copy is not the text painted on row {row}"
+            );
+            app.transcript.clear_text_selection();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A prompt a hook rejects is rolled back from above the notices its
+    /// turn already painted. A selection handled before the next paint
+    /// takes the notice under the pointer, not the one that slid into its
+    /// place in the transcript.
+    #[tokio::test]
+    async fn a_selection_after_a_rejected_prompt_takes_the_painted_notice() {
+        let (mut app, dir) = app_fixture();
+        app.insert_user_block("a prompt a hook rejects");
+        app.pending_submit = Some("a prompt a hook rejects".into());
+        for index in 0..3 {
+            app.on_agent_event(AgentEvent::HookFailed {
+                hook: "lint".into(),
+                event: "user_prompt_submit".into(),
+                detail: format!("notice {index}"),
+            });
+        }
+        let painted = render_app(&mut app, 80, 20);
+        app.on_agent_event(AgentEvent::Done {
+            stop_reason: "blocked".into(),
+        });
+        let shown = rows(&painted);
+        let row = shown.iter().position(|text| text.contains("notice 0")).unwrap();
+        let byte = shown[row].find("notice 0").unwrap();
+        let from = shown[row][..byte].chars().count() as u16;
+        let (row, to) = (row as u16, from + 7);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), from),
+            (MouseEventKind::Drag(MouseButton::Left), to),
+            (MouseEventKind::Up(MouseButton::Left), to),
+        ] {
+            app.on_term_event(mouse(kind, column, row)).await.unwrap();
+        }
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("notice 0"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6679,7 +7922,7 @@ mod tests {
             .iter()
             .position(|row| row.contains("/help"))
             .unwrap() as u16;
-        assert_eq!(wide[(0, selected_y)].bg, theme::SURFACE());
+        assert!(wide_rows[selected_y as usize].contains("▸ /help"));
 
         app.composer.load("/co");
         app.sync_completion();

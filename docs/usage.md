@@ -5,9 +5,16 @@ cd ~/code/my-app
 openmax
 ```
 
-On the first interactive run, inspect the project and accept the trust prompt.
-See [configuration](configuration.md#project-trust) for headless and stdio
+On the first interactive run, inspect the project and answer the trust
+prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
+Change the mode later with `/approvals` or **Shift+Tab**. See
+[configuration](configuration.md#project-trust) for headless and stdio
 trust.
+
+The interface uses your terminal's own foreground and background colors. The
+palette's gray (color 8) marks secondary text, selection, and every border
+except the focused prompt's and the approval card's. There is no color
+setting.
 
 ## Command line
 
@@ -17,15 +24,30 @@ openmax -c
 openmax --provider ollama --model qwen2.5-coder:7b
 openmax -p "summarize the top level layout of this repo"
 openmax -p --json "list public modules in crates/core"
-openmax --check                       # validate extension files
+openmax --check                       # validate extension files and the session index
 openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
 openmax --stdio                       # full session over JSONL pipes
+openmax --mcp-list -- <server>        # list an MCP server's tools
 ```
 
-`openmax --check --json` prints the same findings as one JSON array of
+`openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
+client, used by the proxy tool an MCP server is adopted through; see
+[extending](extending.md#mcp-servers) and `openmax --spec mcp`.
+
+`openmax --check` prints the rows of each file that needs attention (`warn` or
+`err`) and of each hook, then one line counting, per surface, the files that
+loaded with nothing to report (and how many memories are not in the index).
+The report names files under the current directory relative to it, in each
+row's path and in the paths and repair commands it writes into a message
+(`openmax --approve '.openmax/tools/x.toml'`); text a message quotes, such as
+a manifest line in a parse error, prints as written.
+`openmax --check --all` prints every row.
+
+`openmax --check --json` prints every finding as one JSON array of
 `{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
-with the same exit code, so the agent can parse its own verification.
+with absolute paths and the same exit code, so the agent can parse its own
+verification.
 
 `openmax --check --run-examples` adds one `example` surface row per declared
 `[example]`, in text and in JSON, and fails the check when one fails. It is
@@ -36,9 +58,36 @@ permission rules, `pre_tool_use` hooks, and `approval_mode` exactly as a turn
 does. See [extending](extending.md#proof-of-life).
 
 In print mode, text goes to stdout and tool progress to stderr. With `--json`,
-each `AgentEvent` is one JSON line on stdout. Mutating tools still honor
-`approval_mode`; select `/approvals auto` once in the trusted project for
-unattended runs.
+each `AgentEvent` is one JSON line on stdout. Mutating tools honor the
+project's approval mode, and a print run declines every approval request, so
+unattended runs need `auto`: the mode a trust grant records unless you pick
+another. For a project in `ask`, select `/approvals auto` once.
+
+A print run has no overall deadline, like a TUI or stdio session. A turn keeps
+going while the endpoint sends anything, keepalives and tool call arguments
+included; silence for the provider's idle timeout ends the attempt (see
+[configuration](configuration.md#multiple-providers)). A request that got no
+response, or a stream that went silent before any reply text, is resent until
+the client's attempts are spent, so a server that takes requests and never
+answers holds the turn for about 80 minutes at the default interval, sooner
+with a lower `idle_timeout_secs`. Any other silence fails the turn after one
+interval: a stream that stops partway through a reply ends it as truncated,
+and a server that stalls while sending a reply as one JSON body is not
+resent. An address with nothing listening fails within seconds. A tool that
+runs past its own timeout is stopped and the turn goes on. A caller that
+needs a deadline sets one, for example the `timeout_secs` of the bash call
+that runs a child `openmax -p`. A run stopped by a signal ends with that
+signal's status (a shell reports 128 plus its number); otherwise the exit
+code says how the run ended, and a turn that ends with any code but 0 skips
+the prompts after it.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Every turn finished |
+| 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
+| 2 | A usage or configuration error before any turn, or `--continue` found no prior session here |
+| 3 | The project is not trusted, or trust cannot be granted from this process |
+| 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue, though an `unverified` from a gate that could not start repeats until the hook is repaired |
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
@@ -53,7 +102,16 @@ history and recall remain available.
 A damaged or unreadable transcript stops continuation with its path and the
 failure reason. Open Max preserves the original bytes and does not silently
 skip records or replace the transcript. Repair or recover a copy explicitly
-before resuming. A session that has never saved messages can still start fresh.
+before resuming. A crash or power loss mid-save is not damage. A final
+record it cut off never became a message, so the session resumes from the
+last complete record and the next save removes the fragment. A session whose
+first save it interrupted has no transcript yet, and like any session that
+has never saved messages, starts fresh.
+
+A damaged or unreadable session index (`~/.openmax/sessions/index.json`)
+refuses new sessions and continuation with its path, and the app keeps
+running. Open Max never replaces it with an empty index. Run `openmax --check`
+for the repair: close every openmax, then move the file aside.
 
 ## Keys
 

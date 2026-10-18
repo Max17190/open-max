@@ -7,7 +7,7 @@
 //! <path>"); the memory PR made facts durable. Recall is the searchable form
 //! of the same commitment: what the harness preserved must be findable
 //! without hand-grepping home-dir JSONL over bash. It is a read-only
-//! standalone operation like `--ledger`: no session, no endpoint, no daemon,
+//! standalone operation like `--check`: no session, no endpoint, no daemon,
 //! and no derived index - the stores on disk stay the single source of truth
 //! and every scan reads them directly. At harness scale (megabytes, not the
 //! hundreds of millions of rows a database engine plans for) a bounded
@@ -735,8 +735,9 @@ fn collect_chunks(
 
     // Already filtered to this project and sorted newest first; duplicate
     // index entries collapse so one session cannot scan (and bill the
-    // ceiling) more than once.
-    let mut metas = sessions::list(core, &root);
+    // ceiling) more than once. `recall` refuses a damaged index before
+    // collecting, so an error here has already been reported.
+    let mut metas = sessions::list(core, &root).unwrap_or_default();
     let mut seen_ids = std::collections::HashSet::new();
     metas.retain(|m| seen_ids.insert(m.id.clone()));
 

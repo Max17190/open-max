@@ -4,7 +4,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use open_max_core::agent;
 use open_max_core::text::one_line;
@@ -34,17 +33,22 @@ pub async fn run(
 
     let session_id = if args.continue_session {
         match sessions::latest(&core, &project_key) {
-            Some(meta) => meta.id,
-            None => {
+            Ok(Some(meta)) => meta.id,
+            Ok(None) => {
                 eprintln!("openmax: no prior session in this directory to continue");
                 return 2;
+            }
+            Err(e) => {
+                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(&core, e)));
+                return 1;
             }
         }
     } else {
         match sessions::create(&core, project_key) {
             Ok(meta) => meta.id,
             Err(e) => {
-                eprintln!("openmax: failed to create session: {e}");
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
                 return 1;
             }
         }
@@ -56,6 +60,7 @@ pub async fn run(
     // nothing behind it.
     if !args.continue_session {
         if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            let e = sessions::refusal_with_repair(&core, e);
             // The reason quotes the index path, an authored byte string, so it
             // is flattened like every other harness line on this stream.
             eprintln!("openmax: warning: the empty session {session_id} stays indexed: {}", one_line(&e));
@@ -121,22 +126,19 @@ async fn run_turn_events(
     stderr: &mut io::Stderr,
 ) -> i32 {
     let mut exit_code = 0i32;
+    // Whether this turn's error line is already on stderr.
+    let mut error_printed = false;
 
     loop {
-        let event = match tokio::time::timeout(Duration::from_secs(600), core_rx.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
-                let _ = writeln!(stderr, "openmax: event channel closed");
-                return 1;
-            }
-            Err(_) => {
-                let _ = writeln!(stderr, "openmax: timed out waiting for the agent");
-                core.cancel(session_id);
-                return 1;
-            }
+        // No clock of its own: a live turn can go quiet here for longer than
+        // any fixed bound (a long tool call's arguments stream without an
+        // event). The client's idle timeout already ends a dead endpoint's
+        // turn with Done, and the tool timeouts bound a hung tool.
+        let Some(env) = core_rx.recv().await else {
+            let _ = writeln!(stderr, "openmax: event channel closed");
+            return 1;
         };
 
-        let env = event;
         if env.session_id != session_id {
             continue;
         }
@@ -211,13 +213,17 @@ async fn run_turn_events(
             AgentEvent::Error { message } => {
                 if !json {
                     let _ = writeln!(stderr, "openmax: error: {message}");
+                    error_printed = true;
                 }
                 exit_code = 1;
             }
             AgentEvent::Done { stop_reason } => {
                 if !json {
                     let _ = writeln!(stdout);
-                    if stop_reason != "stop" && stop_reason != "tool_calls" {
+                    // A failed turn already printed its error line; a
+                    // "stopped (error)" after it would only repeat it.
+                    let reported = stop_reason == "error" && error_printed;
+                    if stop_reason != "stop" && stop_reason != "tool_calls" && !reported {
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
                     }
                 }
@@ -231,16 +237,19 @@ async fn run_turn_events(
                     // script that reads exit 0 as "the work is done" would be
                     // wrong. Its own code: 1 is an operational failure and
                     // nothing failed, 3 is a human boundary and no human was
-                    // asked. Resubmitting continues the work.
+                    // asked. Resubmitting continues the work, except after an
+                    // `unverified` from a completion gate that could not
+                    // start, which repeats until the hook is repaired.
                     exit_code = 4;
                 }
                 return exit_code;
             }
             AgentEvent::Refrozen { tools, skills, changes } => {
                 if !json {
-                    // `changes` names capability files the ledger recorded; a
-                    // refreeze driven by memory files alone records none, and
-                    // the line must not end in a colon with nothing after it.
+                    // `changes` names the capability files that changed; a
+                    // refreeze can name none (a manifest that turned
+                    // unreadable), and the line must not end in a colon with
+                    // nothing after it.
                     let what = match changes.is_empty() {
                         true => String::new(),
                         false => format!(": {}", changes.join(", ")),
@@ -320,8 +329,10 @@ fn call_line(name: &str, summary: &str) -> String {
 fn truncate_line(s: &str, max: usize) -> String {
     // The same rule as every other authored line in the workspace: this
     // preview is raw tool output on a terminal, so an ESC or a U+2028 must not
-    // survive it either (the old inline map flattened only \n and \r).
-    let flattened = one_line(s);
+    // survive it either (the old inline map flattened only \n and \r). Complete
+    // escape sequences go first, or flattening the ESC alone would print the
+    // rest of a color code as text.
+    let flattened = one_line(&crate::ui::text::strip_escapes(s));
     let trimmed = flattened.trim();
     if trimmed.chars().count() <= max {
         return trimmed.to_string();
@@ -396,6 +407,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A live turn can send no event for longer than any fixed bound: a
+    /// model streaming one large tool call's arguments (those deltas emit
+    /// nothing), an endpoint holding the stream open with keepalives through
+    /// a long prompt, a provider whose `idle_timeout_secs` is above ten
+    /// minutes. The client's idle timeout already ends a dead endpoint's turn
+    /// and the tool timeouts bound a hung tool, so print mode must not cancel
+    /// a quiet turn on a clock of its own (it did at 600 s, exiting 1 while
+    /// the model was still writing).
+    #[tokio::test(start_paused = true)]
+    async fn print_mode_waits_out_a_quiet_turn() {
+        let dir = std::env::temp_dir().join(format!(
+            "openmax-headless-quiet-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (core, mut rx) = open_max_core::state::Core::new(dir.clone()).unwrap();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        let mut saw_tokens = false;
+
+        let turn = run_turn_events(&core, &mut rx, "s", true, &mut saw_tokens, &mut stdout, &mut stderr);
+        tokio::pin!(turn);
+        // An hour of silence passes in no real time while the clock is paused.
+        let quiet = tokio::time::timeout(std::time::Duration::from_secs(3600), &mut turn).await;
+        assert!(quiet.is_err(), "print mode ended a quiet turn with exit {:?}", quiet.ok());
+
+        core.send_agent("s", AgentEvent::Done { stop_reason: "stop".to_string() });
+        assert_eq!(turn.await, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A tool file the agent named can carry a space or a shell
     /// metacharacter; the pasted repair command must name that file, not run
     /// part of it.
@@ -415,8 +459,12 @@ mod tests {
         // The preview is raw tool output on a terminal. The old inline rule
         // flattened only \n and \r, so an ESC could restyle the rest of the
         // line and a Unicode line separator could break it; both go through
-        // the workspace's one sanitizer now.
-        assert_eq!(truncate_line("a\u{1b}[31mb", 20), "a [31mb");
+        // the workspace's one sanitizer now. A complete color sequence goes
+        // whole, or its `[31m` tail would print; an incomplete one still has
+        // its ESC flattened.
+        assert_eq!(truncate_line("a\u{1b}[31mb", 20), "ab");
+        assert_eq!(truncate_line("\u{1b}[1m\u{1b}[31merror\u{1b}(B\u{1b}[m: x", 20), "error: x");
+        assert_eq!(truncate_line("a\u{1b}[31", 20), "a [31");
         assert_eq!(truncate_line("a\u{2028}b\u{2029}c", 20), "a b c");
         assert_eq!(truncate_line("  padded  ", 10), "padded");
         let long = "é".repeat(200);

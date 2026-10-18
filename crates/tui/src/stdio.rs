@@ -81,17 +81,23 @@ pub async fn run(
 
     let (session_id, continued) = if args.continue_session {
         match sessions::latest(&core, &project_key) {
-            Some(meta) => (meta.id, true),
-            None => {
+            Ok(Some(meta)) => (meta.id, true),
+            Ok(None) => {
                 eprintln!("openmax: no prior session in this directory to continue");
                 return 2;
+            }
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
+                return 1;
             }
         }
     } else {
         match sessions::create(&core, project_key.clone()) {
             Ok(meta) => (meta.id, false),
             Err(e) => {
-                eprintln!("openmax: failed to create session: {e}");
+                let refusal = sessions::refusal_with_repair(&core, e);
+                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
                 return 1;
             }
         }
@@ -181,6 +187,7 @@ async fn drive<W: Write>(
     let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, out).await;
     if fresh {
         if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
+            let e = sessions::refusal_with_repair(&core, e);
             // One line, like every other harness line on stderr: the reason
             // quotes the index path, an authored byte string.
             eprintln!(
@@ -848,6 +855,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             reasoning: None,
+            reasoning_details: None,
             reasoning_origin: None,
         };
         let messages = vec![
@@ -933,7 +941,7 @@ mod tests {
         )
         .await;
 
-        let title = sessions::latest(&core, &dir.display().to_string()).unwrap().title;
+        let title = sessions::latest(&core, &dir.display().to_string()).unwrap().unwrap().title;
         assert_eq!(title, "MARKER: greet world", "the raw slash line must not be submitted");
         // The turn really started: the only error is the missing endpoint.
         let errors: Vec<&str> = lines
@@ -958,12 +966,12 @@ mod tests {
         let (_lines, code, core, dir) = drive_in_project(|_| {}, false, vec![Command::Quit]).await;
         assert_eq!(code, 0);
         let key = dir.display().to_string();
-        assert!(sessions::list(&core, &key).is_empty(), "nothing to resume was left indexed");
+        assert!(sessions::list(&core, &key).unwrap().is_empty(), "nothing to resume was left indexed");
         let _ = std::fs::remove_dir_all(dir);
 
         let (_lines, _code, core, dir) = drive_in_project(|_| {}, true, vec![Command::Quit]).await;
         let key = dir.display().to_string();
-        assert_eq!(sessions::list(&core, &key).len(), 1, "a transcript is history");
+        assert_eq!(sessions::list(&core, &key).unwrap().len(), 1, "a transcript is history");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1018,16 +1026,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Every stdin command the reader accepts and every bespoke stdout line
-    /// the session emits must appear in the printed contract: a frontend is
-    /// written against `openmax --spec stdio` and judged by `validate_line`,
-    /// so a name the spec omits is either a capability its author cannot
-    /// discover or a line their client rejects on arrival. The match is
-    /// exhaustive, so adding a Command variant without teaching the spec
-    /// stops compiling here.
-    #[test]
-    fn the_spec_names_every_command_and_bespoke_line() {
-        let text = open_max_core::spec::render("stdio").unwrap();
+    /// Every stdin command the reader accepts, by wire name. The match is
+    /// exhaustive, so adding a Command variant without listing it here stops
+    /// compiling, and every surface checked against this list sees it.
+    fn accepted_commands() -> Vec<&'static str> {
         let wire = [
             r#"{"cmd":"user","text":"hi"}"#,
             r#"{"cmd":"approve","approval_id":"a","approved":true}"#,
@@ -1036,16 +1038,27 @@ mod tests {
             r#"{"cmd":"cancel"}"#,
             r#"{"cmd":"quit"}"#,
         ];
-        for line in wire {
-            let cmd: Command = serde_json::from_str(line).expect(line);
-            let name = match cmd {
+        wire.iter()
+            .map(|line| match serde_json::from_str::<Command>(line).expect(line) {
                 Command::User { .. } => "user",
                 Command::Approve { .. } => "approve",
                 Command::ApprovalMode { .. } => "approval_mode",
                 Command::Reload => "reload",
                 Command::Cancel => "cancel",
                 Command::Quit => "quit",
-            };
+            })
+            .collect()
+    }
+
+    /// Every stdin command the reader accepts and every bespoke stdout line
+    /// the session emits must appear in the printed contract: a frontend is
+    /// written against `openmax --spec stdio` and judged by `validate_line`,
+    /// so a name the spec omits is either a capability its author cannot
+    /// discover or a line their client rejects on arrival.
+    #[test]
+    fn the_spec_names_every_command_and_bespoke_line() {
+        let text = open_max_core::spec::render("stdio").unwrap();
+        for name in accepted_commands() {
             assert!(
                 text.contains(&format!("\"cmd\":\"{name}\"")),
                 "--spec stdio never names command '{name}'"
@@ -1057,6 +1070,28 @@ mod tests {
                 "--spec stdio never names bespoke line '{ty}'"
             );
         }
+    }
+
+    /// `--help` is where a frontend author first meets `--stdio`, so its
+    /// command list must be the protocol's: a command it omits is a
+    /// capability nobody finds there. The `{"cmd":...}` list is parsed and
+    /// compared as a SET, so a reflow cannot hide a missing or stale name.
+    #[test]
+    fn help_names_every_command() {
+        let help = crate::HELP;
+        let start = help.find("--stdio ").expect("--stdio is documented");
+        let open = help[start..].find(r#"{"cmd":"#).expect("--stdio lists its commands")
+            + start
+            + r#"{"cmd":"#.len();
+        let close = help[open..].find('}').expect("the list closes") + open;
+        let mut listed: Vec<&str> = help[open..close]
+            .split('|')
+            .map(|name| name.trim().trim_matches('"'))
+            .collect();
+        listed.sort_unstable();
+        let mut accepted = accepted_commands();
+        accepted.sort_unstable();
+        assert_eq!(listed, accepted, "--help's --stdio list must equal the commands stdin accepts");
     }
 
     #[test]

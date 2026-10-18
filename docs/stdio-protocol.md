@@ -33,8 +33,9 @@ whole line at 256 KiB of content; `truncated` says whether anything was cut.
 The session file on disk remains the full record. No live events are replayed,
 so a `token` stream always means a running turn.
 
-A continued session must have a readable transcript and no other writable
-owner. Failure is reported on stderr with a nonzero exit before the handshake.
+A continued session must have a readable session index and transcript and no
+other writable owner. Failure is reported on stderr with a nonzero exit before
+the handshake.
 The process retains ownership while waiting for commands, including between turns.
 
 ## Commands (stdin)
@@ -72,14 +73,14 @@ one).
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
 | `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt, or a policy, providers, settings, or approval notice. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |
-| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out of the `max_attempts` budget after a backoff wait, `reason` having ended the previous one with a transport failure, a 429, or a stream that died before any reply text arrived. Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` lines already emitted for that attempt are void and the reply starts over; no `token` line precedes a retried stream. A request gives up before the budget when three attempts in a row never reached the endpoint) |
+| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out after a backoff wait, and `max_attempts` the one the request ends on if it keeps failing the same way, `reason` having ended the previous one with a transport failure, a 429 or transient server error (500, 502, 503, 504, 529), or, before any reply text arrived, a stream that died, went silent, or carried a data line the client cannot read, or a stream or reply the provider failed with a rate limit, an overload, or a server fault. The wait is the backoff, or the response's `Retry-After` in seconds when that is longer. A `Retry-After` of more than a minute is not retried: the request fails at once and the error names the server's wait. Neither is a 429 reporting an exhausted quota (`insufficient_quota`). Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` lines already emitted for that attempt are void and the reply starts over; no `token` line precedes a retried stream. A request gives up before its budget after three attempts in a row that failed to connect or timed out: while that streak runs, `max_attempts` counts to its third attempt (or to the budget, if that comes first), and it returns to the budget when an attempt ends any other way) |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha`, and optional `env` (see below) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
-| `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: what changed and who) |
+| `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
-| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed, or a hook file on disk is not loaded; the turn proceeded) |
+| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
 | `done` | `stop_reason` |
 | `error` | `message` |
@@ -120,12 +121,14 @@ state and cancellation token. A client may submit the next turn immediately.
 Every `user` command is answered by exactly one `done`, and `done` is the only
 guaranteed terminator: never block waiting for another event. On a normal turn
 a run of `token` deltas is terminated by one `message_done`, but a turn that
-hits a provider-stream error emits an `error` line and then `done` with no
-`message_done`. A turn that dies unexpectedly reports `error` and then `done`
-with `stop_reason` `error`, so a crash is an event rather than a silent stall.
-A stream the provider abandons mid-answer still emits `message_done` (with the
-partial text, which is kept in the session), then an `error` line, then `done`
-with `stop_reason` `truncated`: an incomplete answer is never reported as a
+hits a provider-stream error, including a failure the provider reports inside
+the stream after some `token` lines, emits an `error` line and then `done`
+with no `message_done`; that partial text is not kept. A turn that dies
+unexpectedly reports `error` and then `done` with `stop_reason` `error`, so a
+crash is an event rather than a silent stall. A stream that ends mid-answer
+with no completion signal still emits `message_done` (with the partial text,
+which is kept in the session), then an `error` line, then `done` with
+`stop_reason` `truncated`: an incomplete answer is never reported as a
 finished one. No tool call carried by such a stream is dispatched, even one
 whose arguments parse, because a stream with no completion signal never said
 which calls the model meant to make.
@@ -138,10 +141,10 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `stop_reason` | Meaning |
 | --- | --- |
 | provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
-| `truncated` | The provider stream ended with no completion signal (after reply text had streamed, or on the last retry) or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
+| `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, or on the last retry), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
-| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), or its refusal could not be persisted; the reply stands unverified |
+| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), its refusal could not be persisted, or in auto it could not start; the reply stands unverified |
 | `blocked` | A `user_prompt_submit` hook refused the prompt |
 | `cancelled` | A `cancel` command or shutdown stopped the turn |
 | `error` | The turn failed; an `error` line precedes it |

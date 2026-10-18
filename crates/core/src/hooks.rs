@@ -196,6 +196,12 @@ pub struct Hooks {
     /// Hooks that exist but are not live, reported once per turn instead of
     /// vanishing: content no human approved, or a revoked observe hook.
     notices: Vec<HookFailure>,
+    /// Discovered under auto, where the files on disk are the policy and the
+    /// agent writes them. A gate there never gates the repair of its own
+    /// files, and one that cannot start refuses nothing where a refusal would
+    /// leave no turn to repair it in: otherwise one non-executable script
+    /// written by `write_file` locks the session until a human deletes it.
+    auto: bool,
 }
 
 /// First stem wins: project dirs are listed before global, and that
@@ -283,6 +289,7 @@ impl Hooks {
             return Self::discover(project_root, data_dir);
         }
         let mut hooks = discover_in_dirs(&hook_dirs(data_dir, project_root));
+        hooks.auto = true;
         hooks.repair_paths = hooks.invalid.iter().map(|(path, _)| path.clone()).collect();
         hooks.apply_cap();
         hooks.repair_paths.extend(hooks.not_running.iter().map(|(path, _)| path.clone()));
@@ -704,17 +711,85 @@ impl Hooks {
             }
         }
         for hook in &self.pre {
-            if !hook.matches(tool) {
+            // A gate never gates its own repair: a broken one would otherwise
+            // block the only writes that can fix it. Every other gate still
+            // judges the call, and permission rules apply after.
+            if !hook.matches(tool) || (self.auto && hook.is_own_repair(tool, args, cwd)) {
                 continue;
             }
             let payload = tool_payload(hook, session_id, tool, args, cwd, None);
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
                 HookRun::Block(reason) => return PreToolResult::Block { reason },
+                // It judged nothing, so it does not stand between another
+                // broken hook and its repair: otherwise two gates that cannot
+                // start each block the writes that would fix the other. A
+                // healthy hook's files stay gated.
+                HookRun::Unstarted(_) if self.auto && self.repairs_broken_hook(tool, args, cwd) => {}
+                HookRun::Unstarted(reason) => {
+                    return PreToolResult::Block { reason: self.with_repair(hook, reason, cwd) }
+                }
                 HookRun::Cancelled => return PreToolResult::Cancelled,
             }
         }
         PreToolResult::Allow
+    }
+
+    /// Whether this call rewrites a file of a broken hook: the manifest or
+    /// script of a hook that cannot start, or a file failing closed.
+    fn repairs_broken_hook(&self, tool: &str, args: &Value, project_root: &Path) -> bool {
+        self.events().into_iter().flatten().any(|hook| {
+            hook.is_own_repair(tool, args, project_root) && hook.cannot_start_reason(project_root).is_some()
+        }) || self.repairs_failed_hook(tool, args, project_root)
+    }
+
+    /// A start failure with its repair appended, under auto, where the hook
+    /// that failed never gates the writes the hint names.
+    fn with_repair(&self, hook: &HookSpec, reason: String, project_root: &Path) -> String {
+        if self.auto {
+            format!("{reason}; {}", repair_hint(hook, project_root))
+        } else {
+            reason
+        }
+    }
+
+    /// Every hook whose command will not start from this checkout, one line
+    /// each with its repair. Asked when hook files change, so a hook that
+    /// cannot start is named on the write that left it so, while that turn
+    /// can still fix it, instead of at its first run in the next.
+    pub(crate) fn cannot_start(&self, project_root: &Path) -> Vec<String> {
+        self.events()
+            .into_iter()
+            .flatten()
+            .filter_map(|hook| {
+                let why = hook.cannot_start_reason(project_root)?;
+                Some(format!(
+                    "'{}' on {}: {why}; {}",
+                    hook_stem(hook),
+                    hook.event.as_str(),
+                    repair_hint(hook, project_root)
+                ))
+            })
+            .collect()
+    }
+
+    /// Blocking `turn_end` gates that cannot start, under auto, where each one
+    /// ends every turn `unverified` without refusing anything. The turn is
+    /// over by the time one fails, so the model hears of it at a turn start,
+    /// while it can still repair the gate: otherwise a session of `-p` turns
+    /// keeps exiting 4 with nothing telling the model why.
+    pub(crate) fn completion_gates_that_cannot_start(&self, project_root: &Path) -> Vec<HookFailure> {
+        if !self.auto {
+            return Vec::new();
+        }
+        self.turn_end
+            .iter()
+            .filter(|hook| hook.gates())
+            .filter_map(|hook| {
+                let why = hook.cannot_start_reason(project_root)?;
+                Some(failure(hook, format!("{why}; {}", repair_hint(hook, project_root))))
+            })
+            .collect()
     }
 
     /// Run all matching `post_tool_use` hooks with what the call returned.
@@ -737,7 +812,9 @@ impl Hooks {
             let payload = tool_payload(hook, session_id, tool, args, cwd, Some(outcome));
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
-                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
+                    failures.push(failure(hook, reason))
+                }
                 HookRun::Cancelled => break,
             }
         }
@@ -746,17 +823,26 @@ impl Hooks {
 
     /// Run all `user_prompt_submit` hooks against the text the user typed,
     /// before it enters the transcript. First block wins (nonzero exit); the
-    /// blocked turn never starts and never reaches the model. Gate only:
-    /// the reason goes to the frontend, and nothing reaches the model.
+    /// blocked turn never starts and never reaches the model. A block reason
+    /// goes to the frontend only.
+    ///
+    /// Under auto a project gate that cannot start judged nothing, and
+    /// refusing on its behalf refused every prompt, the one asking for the
+    /// repair included, with no turn left to make it in. The prompt goes
+    /// through, and the returned failures say the gate did not check it. A gate
+    /// whose manifest is outside the project still blocks: no turn can
+    /// rewrite it, so letting the prompt through would buy no repair and
+    /// only switch off a screen its owner installed.
     pub async fn user_prompt_submit(
         &self,
         session_id: &str,
         text: &str,
         cwd: &Path,
         cancel: &Arc<CancelToken>,
-    ) -> PreToolResult {
+    ) -> (PreToolResult, Vec<HookFailure>) {
+        let mut unchecked = Vec::new();
         if let Some(reason) = self.ledger_fail_closed_reason() {
-            return PreToolResult::Block { reason };
+            return (PreToolResult::Block { reason }, unchecked);
         }
         for hook in &self.user_prompt {
             let payload = serde_json::json!({
@@ -767,11 +853,19 @@ impl Hooks {
             });
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
-                HookRun::Block(reason) => return PreToolResult::Block { reason },
-                HookRun::Cancelled => return PreToolResult::Cancelled,
+                HookRun::Unstarted(reason) if self.auto && hook.manifest_in_project(cwd) => {
+                    // Worded for both outcomes: a later gate may still block
+                    // the prompt this one never saw.
+                    let detail = format!("did not check this prompt: {}", self.with_repair(hook, reason, cwd));
+                    unchecked.push(failure(hook, detail));
+                }
+                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
+                    return (PreToolResult::Block { reason }, unchecked)
+                }
+                HookRun::Cancelled => return (PreToolResult::Cancelled, unchecked),
             }
         }
-        PreToolResult::Allow
+        (PreToolResult::Allow, unchecked)
     }
 
     /// Run `session_start` hooks (a session's first turn). Observe only:
@@ -791,7 +885,9 @@ impl Hooks {
             });
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
-                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
+                    failures.push(failure(hook, reason))
+                }
                 HookRun::Cancelled => break,
             }
         }
@@ -817,7 +913,9 @@ impl Hooks {
             });
             match run_hook(hook, payload, cwd, cancel).await {
                 HookRun::Allow => {}
-                HookRun::Block(reason) => failures.push(failure(hook, reason)),
+                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
+                    failures.push(failure(hook, reason))
+                }
                 HookRun::Cancelled => break,
             }
         }
@@ -855,7 +953,17 @@ impl Hooks {
             });
             match run_hook(hook, payload, cwd, &cancel).await {
                 HookRun::Allow => {}
-                HookRun::Block(reason) => {
+                // A gate that cannot start judged nothing. Its spawn error,
+                // sent back as the user's refusal, asked the model to repair
+                // the harness on every end attempt, a request the user never
+                // made, and spent each continuation on it. It is reported
+                // instead of refusing, and the end it could not judge is not
+                // verified.
+                HookRun::Unstarted(reason) if self.auto && hook.gates() => {
+                    outcome.failures.push(failure(hook, self.with_repair(hook, reason, cwd)));
+                    outcome.unverified = true;
+                }
+                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
                     if !hook.gates() {
                         outcome.failures.push(failure(hook, reason));
                         continue;
@@ -901,6 +1009,10 @@ pub struct TurnEndAttempt {
 pub struct TurnEndOutcome {
     pub failures: Vec<HookFailure>,
     pub refusal: Option<Refusal>,
+    /// A gate that should have judged this end could not start (under auto):
+    /// it is among the failures, it refused nothing, and the end is not
+    /// verified.
+    pub unverified: bool,
 }
 
 /// A gating hook's refusal: which hook said no, by file stem - the name every
@@ -1051,9 +1163,10 @@ fn tool_payload(
 /// the same shape hook block reasons already take.
 ///
 /// This is the second of two bounds. The tool layer has already rendered the
-/// process output down to a result, keeping its tail and saying so inline when
-/// it dropped anything, and that result is what the model reasoned about. It
-/// is therefore what a hook is shown, and what `output_bytes` measures.
+/// process output down to a result, keeping its tail (for bash, its start and
+/// its end) and saying so inline when it dropped anything, and that result is
+/// what the model reasoned about. It is therefore what a hook is shown, and
+/// what `output_bytes` measures.
 fn head_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -1087,6 +1200,139 @@ impl HookSpec {
     pub(crate) fn gates(&self) -> bool {
         self.event.is_gate() || (self.event == HookEvent::TurnEnd && self.blocking)
     }
+
+    /// The project file this hook's process runs, as its manifest spells it:
+    /// the script an interpreter `command` is handed, or a `command` written
+    /// as a path. A bare command names no file of the project's.
+    fn script(&self) -> Option<&str> {
+        crate::ledger::interpreter_script(&self.command, &self.args)
+            .or_else(|| self.command.contains('/').then_some(self.command.as_str()))
+    }
+
+    /// Why this hook will not start from this checkout, when its files show
+    /// it: a command path missing or without an executable bit, a command
+    /// not on PATH, or an interpreter's script that does not exist.
+    fn cannot_start_reason(&self, project_root: &Path) -> Option<String> {
+        crate::doctor::missing_command_reason(&self.command, project_root)
+            .map(|(_, why)| why)
+            .or_else(|| {
+                missing_interpreter_script(&self.command, &self.args, project_root)
+                    .map(|script| format!("script '{script}' does not exist from the project root"))
+            })
+    }
+
+    /// Whether `write_file` reaches this hook's manifest: false for a global
+    /// hook, or a project hook directory that links outside the project.
+    fn manifest_in_project(&self, project_root: &Path) -> bool {
+        crate::tools::resolve(project_root, &self.source_path.to_string_lossy()).is_ok()
+    }
+
+    /// Whether this call rewrites this hook's own manifest or script. Both
+    /// sides resolve exactly as `write_file` resolves its target, so the call
+    /// is exempt only when the write lands on that file, a script whose
+    /// directory does not exist yet can still be created, and nothing outside
+    /// the project matches. A data file named in `args` stays gated: a gate
+    /// that guards a file keeps guarding it.
+    fn is_own_repair(&self, tool: &str, args: &Value, project_root: &Path) -> bool {
+        if !matches!(tool, "write_file" | "edit_file") {
+            return false;
+        }
+        let resolve = |path: &str| crate::tools::resolve(project_root, path).ok();
+        let Some(target) = args["path"].as_str().and_then(resolve) else {
+            return false;
+        };
+        let manifest = self.source_path.to_string_lossy();
+        std::iter::once(manifest.as_ref())
+            .chain(self.script())
+            .any(|own| resolve(own).is_some_and(|own| own == target))
+    }
+}
+
+/// What repairs a hook that cannot start, in the terms the agent acts on.
+/// Only files inside the project are named: one outside is past the reach of
+/// `write_file`, and naming it would send the agent at a write that is
+/// refused. Under auto a `pre_tool_use` gate never gates the writes named
+/// here. A file `write_file` creates is not executable, which is how most of
+/// these hooks came to be, so a hook that runs a project script directly is
+/// pointed at the form that needs no executable bit.
+fn repair_hint(hook: &HookSpec, project_root: &Path) -> String {
+    let writable = |path: &str| crate::tools::resolve(project_root, path).is_ok();
+    let manifest = hook.source_path.strip_prefix(project_root).unwrap_or(&hook.source_path);
+    let manifest_open = hook.manifest_in_project(project_root);
+    let script = hook.script().filter(|script| writable(script));
+    // A script run as the command needs an executable bit no write can give
+    // it, so writing it repairs the hook only when the manifest can change
+    // too; a script an interpreter runs is repaired by writing it alone.
+    let runs_directly = script.is_some_and(|script| script == hook.command);
+    let files = match (manifest_open, script) {
+        (true, Some(script)) => format!("{} or {script}", manifest.display()),
+        (true, None) => manifest.display().to_string(),
+        (false, Some(script)) if !runs_directly => script.to_string(),
+        (false, _) => {
+            return format!(
+                "{} is outside the project, where write_file and edit_file do not reach",
+                hook.source_path.display()
+            )
+        }
+    };
+    let mut hint = format!("repair it with write_file or edit_file on {files}");
+    if !manifest_open {
+        hint.push_str(&format!(" ({} is outside the project)", hook.source_path.display()));
+    }
+    if hook.event == HookEvent::PreToolUse {
+        hint.push_str(", which skip this hook");
+    }
+    if let Some(script) = script.filter(|_| runs_directly) {
+        let interpreter = match Path::new(script).extension().and_then(|e| e.to_str()) {
+            Some("py") => "python3",
+            Some("js" | "mjs") => "node",
+            Some("rb") => "ruby",
+            Some("pl") => "perl",
+            Some("bash") => "bash",
+            _ => "sh",
+        };
+        hint.push_str(&format!(
+            "; write_file creates files without the executable bit, so run the script through its interpreter: command = \"{interpreter}\", args = [\"{script}\"]"
+        ));
+    }
+    hint
+}
+
+/// The script an interpreter-style `command` is handed, as its manifest
+/// spells it, when nothing is there to run. The interpreter would start,
+/// fail to open it, and exit nonzero, which reads as the hook refusing when
+/// it never ran. Whatever is there is left to the interpreter (`python3` runs
+/// a directory holding `__main__.py`). A shell that also looks for a bare
+/// script name on PATH finds one there, so that one is not missing: a hook
+/// that would run must never be reported as one that cannot. `openmax
+/// --check` asks the same question, so its warning and the runtime agree.
+pub(crate) fn missing_interpreter_script<'a>(command: &str, args: &'a [String], cwd: &Path) -> Option<&'a str> {
+    missing_interpreter_script_on(command, args, cwd, || {
+        std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).collect()).unwrap_or_default()
+    })
+}
+
+/// Shells that look for a bare script name on PATH when the working
+/// directory has none. `zsh` and the language interpreters do not.
+const SHELLS_SEARCHING_PATH: [&str; 4] = ["sh", "bash", "ksh", "dash"];
+
+/// `missing_interpreter_script` against an explicit PATH, so a test can
+/// supply one without touching the process environment.
+fn missing_interpreter_script_on<'a>(
+    command: &str,
+    args: &'a [String],
+    cwd: &Path,
+    path_dirs: impl FnOnce() -> Vec<PathBuf>,
+) -> Option<&'a str> {
+    let script = crate::ledger::interpreter_script(command, args)?;
+    if cwd.join(script).exists() {
+        return None;
+    }
+    let shell = Path::new(command.trim())
+        .file_name()
+        .is_some_and(|name| SHELLS_SEARCHING_PATH.iter().any(|shell| name == *shell));
+    let on_path = shell && !script.contains('/') && path_dirs().iter().any(|dir| dir.join(script).is_file());
+    (!on_path).then_some(script)
 }
 
 /// How a hook shape reads in a diagnostic. `turn_end` gates only when its
@@ -1103,6 +1349,11 @@ pub(crate) fn shape_name(event: &str, blocking: bool) -> String {
 enum HookRun {
     Allow,
     Block(String),
+    /// The hook's process never ran: its command could not be spawned as
+    /// written (see `unstartable_as_written`), or the script its interpreter
+    /// is handed is not there. That is not a verdict, so each event decides
+    /// what a missing one means.
+    Unstarted(String),
     Cancelled,
 }
 
@@ -1243,6 +1494,25 @@ fn code_changed_since_approval(hook: &HookSpec) -> Option<String> {
     None
 }
 
+/// Whether a spawn failed because of what the hook's files say: no such
+/// command (ENOENT, ENOTDIR), no permission to execute it (EACCES), or a file
+/// the system cannot execute (ENOEXEC). A write can fix those, so they are a
+/// hook that cannot start. Any other spawn error is the host's: EPERM is
+/// policy, and running out of processes or descriptors or catching a script
+/// mid-write passes. A gate those hit blocks as before: under auto a prompt
+/// gate that cannot start lets the prompt through, which must never follow
+/// from host policy or a moment of resource pressure.
+fn unstartable_as_written(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR | libc::EACCES | libc::ENOEXEC))
+    }
+    #[cfg(not(unix))]
+    {
+        e.kind() == std::io::ErrorKind::NotFound
+    }
+}
+
 async fn run_hook(
     hook: &HookSpec,
     payload: Value,
@@ -1254,8 +1524,15 @@ async fn run_hook(
     }
     if let Some(reason) = code_changed_since_approval(hook) {
         // Block for gates, reported (never silent) for observers: the caller
-        // maps this variant per event, exactly as it does a spawn failure.
+        // maps this variant per event.
         return HookRun::Block(reason);
+    }
+    if let Some(script) = missing_interpreter_script(&hook.command, &hook.args, cwd) {
+        return HookRun::Unstarted(format!(
+            "failed to start hook '{}' ({}): script '{script}' does not exist",
+            hook.command,
+            hook.source_path.display()
+        ));
     }
     let request = ProcessRequest {
         program: hook.command.clone().into(),
@@ -1273,17 +1550,21 @@ async fn run_hook(
         },
         sandbox: None,
         env_allowlist: None,
+        self_link: false,
     };
 
     match execution::run_process(request, cancel.clone()).await {
         Err(ProcessError::Spawn(e)) => {
-            // Misconfigured hook: fail closed for pre, ignore for post-style.
-            // Caller maps Block for pre_tool_use only.
-            HookRun::Block(format!(
+            let reason = format!(
                 "failed to start hook '{}' ({}): {e}",
                 hook.command,
                 hook.source_path.display()
-            ))
+            );
+            if unstartable_as_written(&e) {
+                HookRun::Unstarted(reason)
+            } else {
+                HookRun::Block(reason)
+            }
         }
         // Hooks never run sandboxed (sandbox: None above); a gate still
         // fails closed if that ever changes.
@@ -1899,6 +2180,301 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// Under auto a gate never gates writes to its own manifest or script,
+    /// and nothing wider: a data file it names in `args`, a read of its own
+    /// files, and every other call stay gated. Outside auto the approved gate
+    /// judges writes to its own script like any other call.
+    #[tokio::test]
+    async fn a_gate_exempts_only_writes_to_its_own_files_and_only_under_auto() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_script(&tmp.join("scripts"), "guard.sh", "#!/bin/sh\necho no\nexit 1\n");
+        let toml = hooks_dir.join("guard.toml");
+        std::fs::write(
+            &toml,
+            "event = \"pre_tool_use\"\ncommand = \"./scripts/guard.sh\"\nargs = [\"config.yaml\"]\n",
+        )
+        .unwrap();
+        let cancel = Arc::new(CancelToken::default());
+        let write = |path: &str| serde_json::json!({"path": path, "content": "x"});
+        let hooks = Hooks::discover_for_mode(&tmp, &data, crate::config::ApprovalMode::Auto);
+        for own in [".openmax/hooks/guard.toml", "scripts/guard.sh", "./scripts/../scripts/guard.sh"] {
+            for tool in ["write_file", "edit_file"] {
+                assert_eq!(
+                    hooks.pre_tool_use("s", tool, &write(own), &tmp, &cancel).await,
+                    PreToolResult::Allow,
+                    "{tool} on {own}"
+                );
+            }
+        }
+        for (tool, args) in [
+            ("write_file", write("config.yaml")),
+            ("write_file", write("../scripts/guard.sh")),
+            ("read_file", serde_json::json!({"path": "scripts/guard.sh"})),
+            ("bash", serde_json::json!({"command": "ls"})),
+        ] {
+            assert_eq!(
+                hooks.pre_tool_use("s", tool, &args, &tmp, &cancel).await,
+                PreToolResult::Block { reason: "no".into() },
+                "{tool} {args}"
+            );
+        }
+        approve_hook_file(&tmp, &data, &toml);
+        let hooks = Hooks::discover(&tmp, &data);
+        assert_eq!(
+            hooks.pre_tool_use("s", "write_file", &write("scripts/guard.sh"), &tmp, &cancel).await,
+            PreToolResult::Block { reason: "no".into() },
+            "outside auto an approved gate judges its own script's writes"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// An interpreter handed a script path that is not there would start,
+    /// fail to open it, and exit nonzero, which read as the gate refusing.
+    /// It is a gate that cannot start: under auto a prompt gate in that state
+    /// lets the prompt through and says so, and outside auto it still blocks.
+    #[tokio::test]
+    async fn an_interpreter_whose_script_is_missing_cannot_start() {
+        let tmp = tempfile_dir();
+        let data = tmp.join("data");
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_hook_toml(
+            &hooks_dir,
+            "screen.toml",
+            "event = \"user_prompt_submit\"\ncommand = \"sh\"\nargs = [\"./scripts/screen.sh\"]\n",
+        );
+        let cancel = Arc::new(CancelToken::default());
+        let hooks = Hooks::discover_for_mode(&tmp, &data, crate::config::ApprovalMode::Auto);
+        let (result, unchecked) = hooks.user_prompt_submit("s", "text", &tmp, &cancel).await;
+        assert_eq!(result, PreToolResult::Allow);
+        assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+        assert_eq!(unchecked[0].event, "user_prompt_submit");
+        assert!(
+            unchecked[0].detail.contains("script './scripts/screen.sh' does not exist"),
+            "{}",
+            unchecked[0].detail
+        );
+        assert!(
+            unchecked[0].detail.starts_with("did not check this prompt: ")
+                && unchecked[0].detail.contains("edit_file on .openmax/hooks/screen.toml or ./scripts/screen.sh"),
+            "{}",
+            unchecked[0].detail
+        );
+        assert_eq!(hooks.cannot_start(&tmp).len(), 1, "the write-time note names it too");
+        std::fs::create_dir_all(tmp.join("scripts/screen.sh")).unwrap();
+        assert!(hooks.cannot_start(&tmp).is_empty(), "whatever is at the path is the interpreter's to judge");
+        std::fs::remove_dir(tmp.join("scripts/screen.sh")).unwrap();
+
+        let strict = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        let (result, _) = strict.user_prompt_submit("s", "text", &tmp, &cancel).await;
+        assert!(
+            matches!(&result, PreToolResult::Block { reason } if reason.contains("does not exist")),
+            "{result:?}"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The repair a start failure names has to be one the agent can make. A
+    /// manifest outside the project is past `write_file`, so naming it as an
+    /// open write would send the agent at a call that is refused.
+    #[tokio::test]
+    async fn a_start_failure_names_only_repairs_inside_the_project() {
+        let tmp = tempfile_dir();
+        let project = tmp.join("project");
+        let global = tmp.join("global-hooks");
+        std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        let gate = "event = \"pre_tool_use\"\ncommand = \"./scripts/absent.sh\"\n";
+        write_hook_toml(&project.join(".openmax/hooks"), "local.toml", gate);
+        write_hook_toml(&global, "global.toml", &gate.replace("absent", "elsewhere"));
+        let mut hooks = discover_in_dirs(&[project.join(".openmax/hooks"), global.clone()]);
+        hooks.auto = true;
+        let cancel = Arc::new(CancelToken::default());
+        let args = serde_json::json!({"command": "ls"});
+        let PreToolResult::Block { reason } = hooks.pre_tool_use("s", "bash", &args, &project, &cancel).await else {
+            panic!("a gate that cannot start blocks what it matches");
+        };
+        assert!(reason.contains("global.toml is outside the project"), "{reason}");
+        assert!(!reason.contains("repair it with"), "{reason}");
+        let notes = hooks.cannot_start(&project);
+        assert!(
+            notes.iter().any(|n| n.starts_with("'local'")
+                && n.contains("on .openmax/hooks/local.toml or ./scripts/absent.sh, which skip this hook")
+                && n.contains("command = \"sh\", args = [\"./scripts/absent.sh\"]")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.starts_with("'global'") && n.contains("outside the project")), "{notes:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// The prompt goes through unchecked only where a turn can repair the
+    /// gate. A global gate is past `write_file`, so letting the prompt
+    /// through would buy no repair and only switch off its owner's screen.
+    #[tokio::test]
+    async fn a_global_prompt_gate_that_cannot_start_still_blocks() {
+        let tmp = tempfile_dir();
+        let project = tmp.join("project");
+        let global = tmp.join("global-hooks");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        write_hook_toml(&global, "screen.toml", "event = \"user_prompt_submit\"\ncommand = \"./scripts/screen.sh\"\n");
+        let mut hooks = discover_in_dirs(&[project.join(".openmax/hooks"), global.clone()]);
+        hooks.auto = true;
+        let cancel = Arc::new(CancelToken::default());
+        let (result, unchecked) = hooks.user_prompt_submit("s", "text", &project, &cancel).await;
+        assert!(unchecked.is_empty(), "{unchecked:?}");
+        let PreToolResult::Block { reason } = result else { panic!("{result:?}") };
+        assert!(reason.starts_with("failed to start hook"), "{reason}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Only a shell looks for a bare script name on PATH. `python3 check.py`
+    /// with no `check.py` beside it exits nonzero, which used to read as a
+    /// prompt gate refusing every prompt; it is a hook that cannot start, and
+    /// the precheck says so before anything is spawned. The PATH here is the
+    /// test's own directory list, never the process environment.
+    #[tokio::test]
+    async fn a_bare_script_name_is_missing_unless_a_shell_can_find_it() {
+        let tmp = tempfile_dir();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(tmp.join("here.py"), "").unwrap();
+        std::fs::write(bin.join("found.sh"), "").unwrap();
+        std::fs::write(bin.join("found.py"), "").unwrap();
+        let args = |script: &str| vec![script.to_string()];
+        let path = || vec![bin.clone()];
+        let missing = |command: &str, script: &str| {
+            missing_interpreter_script_on(command, &args(script), &tmp, path).map(str::to_string)
+        };
+        assert_eq!(missing("python3", "here.py"), None, "a file beside the hook is the interpreter's to run");
+        for shell in ["sh", "bash", "ksh", "dash", "/bin/sh"] {
+            assert_eq!(missing(shell, "found.sh"), None, "{shell} finds a bare name on PATH");
+            assert_eq!(missing(shell, "./found.sh"), Some("./found.sh".into()), "{shell}: a path is not searched");
+        }
+        for interpreter in ["python3", "zsh", "node"] {
+            let script = if interpreter == "python3" { "found.py" } else { "found.sh" };
+            assert_eq!(missing(interpreter, script), Some(script.into()), "{interpreter} never searches PATH");
+        }
+
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_hook_toml(&hooks_dir, "py.toml", "event = \"user_prompt_submit\"\ncommand = \"python3\"\nargs = [\"check.py\"]\n");
+        let mut hooks = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        hooks.auto = true;
+        let cancel = Arc::new(CancelToken::default());
+        let (result, unchecked) = hooks.user_prompt_submit("s", "text", &tmp, &cancel).await;
+        assert_eq!(result, PreToolResult::Allow);
+        assert!(unchecked[0].detail.contains("script 'check.py' does not exist"), "{unchecked:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A gate that cannot start is reported for the check it skipped, never
+    /// as having let the prompt reach the model: a later gate may still
+    /// block it.
+    #[tokio::test]
+    async fn a_prompt_gate_that_cannot_start_never_claims_the_prompt_was_sent() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_hook_toml(&hooks_dir, "a-broken.toml", "event = \"user_prompt_submit\"\ncommand = \"./scripts/gone.sh\"\n");
+        write_script(&tmp.join("scripts"), "refuse.sh", "#!/bin/sh\necho refused\nexit 1\n");
+        write_hook_toml(&hooks_dir, "b-refuse.toml", "event = \"user_prompt_submit\"\ncommand = \"./scripts/refuse.sh\"\n");
+        let mut hooks = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        hooks.auto = true;
+        let cancel = Arc::new(CancelToken::default());
+        let (result, unchecked) = hooks.user_prompt_submit("s", "text", &tmp, &cancel).await;
+        assert_eq!(result, PreToolResult::Block { reason: "refused".into() });
+        assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+        assert!(unchecked[0].detail.starts_with("did not check this prompt: "), "{}", unchecked[0].detail);
+        assert!(!unchecked[0].detail.contains(" sent "), "{}", unchecked[0].detail);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Only a spawn failure the hook's own files explain is a hook that
+    /// cannot start. Host policy (EPERM, which shares EACCES's error kind)
+    /// and resource pressure are the host's, and they must never let a
+    /// prompt through a screen.
+    #[test]
+    fn only_spawn_failures_a_write_can_fix_count_as_cannot_start() {
+        use std::io::{Error, ErrorKind};
+        assert!(unstartable_as_written(&Error::from_raw_os_error(libc::ENOENT)));
+        assert!(unstartable_as_written(&Error::from_raw_os_error(libc::ENOTDIR)));
+        assert!(unstartable_as_written(&Error::from_raw_os_error(libc::EACCES)));
+        assert!(unstartable_as_written(&Error::from_raw_os_error(libc::ENOEXEC)));
+        assert_eq!(Error::from_raw_os_error(libc::EPERM).kind(), ErrorKind::PermissionDenied);
+        assert!(!unstartable_as_written(&Error::from_raw_os_error(libc::EPERM)), "EPERM is host policy");
+        assert!(!unstartable_as_written(&Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(!unstartable_as_written(&Error::from_raw_os_error(libc::EMFILE)));
+        assert!(!unstartable_as_written(&Error::from_raw_os_error(libc::ETXTBSY)));
+    }
+
+    /// Under auto a gate that cannot start stands only between broken hooks
+    /// and their repair: a write to a healthy hook's files is still judged by
+    /// it. Outside auto it judges every write it matches, broken hooks'
+    /// included, exactly as before.
+    #[tokio::test]
+    async fn a_gate_that_cannot_start_opens_only_broken_hooks_and_only_under_auto() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        write_hook_toml(&hooks_dir, "a-broken.toml", "event = \"pre_tool_use\"\ncommand = \"./scripts/gone.sh\"\n");
+        write_hook_toml(&hooks_dir, "b-broken.toml", "event = \"post_tool_use\"\ncommand = \"./scripts/also-gone.sh\"\n");
+        write_script(&tmp.join("scripts"), "ok.sh", "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        write_hook_toml(&hooks_dir, "c-healthy.toml", "event = \"post_tool_use\"\ncommand = \"./scripts/ok.sh\"\n");
+        let cancel = Arc::new(CancelToken::default());
+        let write = |path: &str| serde_json::json!({"path": path, "content": "x"});
+        let blocks = |result: &PreToolResult| {
+            matches!(result, PreToolResult::Block { reason } if reason.contains("failed to start hook"))
+        };
+        let mut hooks = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        hooks.auto = true;
+        for target in [".openmax/hooks/b-broken.toml", "scripts/also-gone.sh"] {
+            let result = hooks.pre_tool_use("s", "write_file", &write(target), &tmp, &cancel).await;
+            assert_eq!(result, PreToolResult::Allow, "{target}");
+        }
+        for target in [".openmax/hooks/c-healthy.toml", "scripts/ok.sh", "notes.txt"] {
+            let result = hooks.pre_tool_use("s", "write_file", &write(target), &tmp, &cancel).await;
+            assert!(blocks(&result), "{target}: {result:?}");
+        }
+        let strict = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        let result = strict.pre_tool_use("s", "write_file", &write(".openmax/hooks/b-broken.toml"), &tmp, &cancel).await;
+        assert!(blocks(&result), "outside auto: {result:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Outside auto a blocking `turn_end` gate that cannot start refuses the
+    /// end like any other gate, and the end is not marked unverified for it.
+    #[tokio::test]
+    async fn outside_auto_a_completion_gate_that_cannot_start_still_refuses() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax/hooks");
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(tmp.join("scripts/gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        write_hook_toml(&hooks_dir, "gate.toml", "event = \"turn_end\"\ncommand = \"./scripts/gate.sh\"\nblocking = true\n");
+        let attempt = TurnEndAttempt { continuation: 0, blockable: true };
+        let strict = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        let outcome = strict.turn_end("s", &tmp, "stop", attempt).await;
+        assert!(!outcome.unverified);
+        let refusal = outcome.refusal.expect("the gate refuses outside auto");
+        assert!(refusal.reason.contains("failed to start hook"), "{}", refusal.reason);
+        assert!(strict.completion_gates_that_cannot_start(&tmp).is_empty(), "the turn-start notice is auto's");
+
+        let mut auto = discover_in_dirs(std::slice::from_ref(&hooks_dir));
+        auto.auto = true;
+        let outcome = auto.turn_end("s", &tmp, "stop", attempt).await;
+        assert!(outcome.unverified && outcome.refusal.is_none(), "{outcome:?}");
+        let named = auto.completion_gates_that_cannot_start(&tmp);
+        assert!(named.len() == 1 && named[0].detail.contains("not executable"), "{named:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     /// The ledger erroring is a verdict, not an empty store: it fires exactly
     /// when tamper detection works (a rewritten chain, a partial line from an
     /// interrupted append, a deleted log with a surviving pin). An approved
@@ -1947,7 +2523,7 @@ mod tests {
         // hook (a secret or PII screen) not running means the text would
         // reach the model endpoint and the transcript, which no later block
         // can undo.
-        let submitted = hooks.user_prompt_submit("s", "the prompt", &tmp, &cancel).await;
+        let (submitted, _) = hooks.user_prompt_submit("s", "the prompt", &tmp, &cancel).await;
         match submitted {
             PreToolResult::Block { reason } => {
                 assert!(reason.contains("--ledger-repair"), "{reason}");
@@ -2501,6 +3077,45 @@ tool = "bash"
         assert_eq!(allow, PreToolResult::Allow);
     }
 
+    /// The agent's account can write the harness link directory. On an
+    /// approved hook's PATH, a `python3` planted there would run in place of
+    /// the system binary the human approved, and no sweep before the spawn
+    /// stops one planted while the hook runs. A hook keeps the PATH the
+    /// harness inherited.
+    #[tokio::test]
+    async fn an_approved_hook_never_gets_the_harness_link_on_path() {
+        let tmp = tempfile_dir();
+        let hooks_dir = tmp.join(".openmax").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // Every PATH entry holding an `openmax` symlink, whatever PATH's
+        // length (a block reason is capped), reported by blocking.
+        let script = write_script(
+            &tmp,
+            "path.sh",
+            "#!/bin/sh\nIFS=:\nfor dir in $PATH; do [ -L \"$dir/openmax\" ] && echo \"$dir\"; done\nexit 1\n",
+        );
+        write_hook_toml(
+            &hooks_dir,
+            "path.toml",
+            &format!("event = \"pre_tool_use\"\ncommand = \"{}\"\n", script.display()),
+        );
+        let hooks = discover_for_test(&tmp);
+        let cancel = Arc::new(CancelToken::default());
+        let result = hooks
+            .pre_tool_use("sess", "bash", &serde_json::json!({"command": "ls"}), &tmp, &cancel)
+            .await;
+        let PreToolResult::Block { reason } = result else {
+            panic!("expected the hook to report its PATH: {result:?}");
+        };
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let linked: Vec<&str> = reason
+            .lines()
+            .filter(|dir| std::fs::read_link(Path::new(dir).join("openmax")).ok().as_ref() == Some(&exe))
+            .collect();
+        assert!(linked.is_empty(), "an approved hook got the harness link on PATH: {linked:?}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     #[tokio::test]
     async fn session_start_and_compaction_hooks_observe_via_stdin() {
         let tmp = tempfile_dir();
@@ -2728,14 +3343,14 @@ tool = "bash"
         );
         let hooks = discover_for_test(&tmp);
         let cancel = Arc::new(CancelToken::default());
-        let blocked = hooks
+        let (blocked, _) = hooks
             .user_prompt_submit("sess", "here is a SECRET token", &tmp, &cancel)
             .await;
         match blocked {
             PreToolResult::Block { reason } => assert!(reason.contains("secret"), "{reason}"),
             PreToolResult::Allow | PreToolResult::Cancelled => panic!("expected block"),
         }
-        let allowed = hooks.user_prompt_submit("sess", "plain request", &tmp, &cancel).await;
+        let (allowed, _) = hooks.user_prompt_submit("sess", "plain request", &tmp, &cancel).await;
         assert_eq!(allowed, PreToolResult::Allow);
     }
 
@@ -2755,7 +3370,7 @@ tool = "bash"
         let cancel = Arc::new(CancelToken::default());
         let cancel_flag = cancel.clone();
         let task = tokio::spawn(async move {
-            hooks.user_prompt_submit("sess", "prompt", &tmp, &cancel_flag).await
+            hooks.user_prompt_submit("sess", "prompt", &tmp, &cancel_flag).await.0
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
@@ -2844,6 +3459,26 @@ command = "{}"
         assert_eq!(failures[0].event, "post_tool_use");
         assert!(failures[0].detail.contains("7"), "{}", failures[0].detail);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A hook gets the user's environment, but git cannot ask for credentials
+    /// in one: a hook has no terminal, and a gate waiting out its timeout on
+    /// a prompt blocks the call it guards. Terminal prompts are off, as in
+    /// bash, so git fails at once instead.
+    #[tokio::test]
+    async fn a_hook_runs_with_git_terminal_prompts_off() {
+        let dir = tempfile_dir();
+        write_hook_toml(
+            &dir,
+            "env.toml",
+            "event = \"pre_tool_use\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf '[%s]' \\\"$GIT_TERMINAL_PROMPT\\\"; exit 1\"]\n",
+        );
+        let hooks = discover_in_dirs(std::slice::from_ref(&dir));
+        let result = hooks
+            .pre_tool_use("s1", "bash", &serde_json::json!({}), &dir, &Arc::new(CancelToken::default()))
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(result, PreToolResult::Block { reason: "[0]".into() });
     }
 
     fn tempfile_dir() -> PathBuf {

@@ -46,13 +46,21 @@ pub(crate) struct ProcessRequest {
     /// has approved yet: see [`SandboxPolicy`].
     pub sandbox: Option<SandboxPolicy>,
     /// Env var NAMES forwarded from the parent environment. `None` = the
-    /// full host environment (bash, hooks: the user's shell). `Some(names)`
+    /// full host environment (bash, hooks: the user's shell) with git's
+    /// terminal prompt turned off. `Some(names)`
     /// = scrub, then a baseline (PATH, HOME, LANG, TERM from the parent)
     /// plus exactly the named variables - external tools, whose manifest
     /// declares the list, making the credential grant part of the bytes a
     /// human approves. Ignored under `sandbox`: a probe stays fully
     /// scrubbed whatever its manifest asks for.
     pub env_allowlist: Option<Vec<String>>,
+    /// Put the self link, a bare `openmax` naming the running harness, first
+    /// on the child's PATH. Only the agent's shell sets it. The agent's
+    /// account can write that directory, so on a hook's or tool's PATH a
+    /// name planted there while it runs would replace the system binary the
+    /// human approved, and the approval binding hashes no code outside the
+    /// project. Ignored under `sandbox`.
+    pub self_link: bool,
 }
 
 /// Containment for a probe run: no network, filesystem reads allowed, writes
@@ -482,6 +490,133 @@ fn apply_sandbox(
     }
 }
 
+/// The directory whose one entry, `openmax`, links to the executable running
+/// this harness; the agent's shell gets it first on PATH. None leaves PATH as
+/// inherited, which is never a wrong link.
+///
+/// Lifecycle: the name derives from the account and the canonical executable
+/// path, so whichever process writes the directory writes the same link.
+/// Concurrent harnesses on one build share it, different builds never touch
+/// each other's, and nothing needs removing on exit: a crash leaves nothing
+/// a later run could misread, and the OS temp cleaner reaps the directories
+/// of builds no longer run. The directory is checked on every spawn: the
+/// link is renamed back into place when something removed or replaced it,
+/// any other entry is removed, and a link whose binary has since been
+/// deleted keeps the directory off PATH. A build installed over this one at
+/// the same path is what the link then runs, as `$OPENMAX_BIN` names it: the
+/// replaced bytes have no path left to link to, and dropping the link would
+/// hand a bare `openmax` back to whichever install comes first on the
+/// inherited PATH, possibly an older one.
+#[cfg(unix)]
+fn self_link_dir() -> Option<PathBuf> {
+    static TARGET: std::sync::OnceLock<Option<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
+    let (exe, dir) = TARGET
+        .get_or_init(|| {
+            // Canonical, so a harness started through the link lands on the
+            // same directory instead of linking to a link.
+            let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+            let digest = crate::ledger::sha256_hex(exe.as_os_str().as_encoded_bytes());
+            let uid = unsafe { libc::geteuid() };
+            // A per-account runtime directory, where one exists, so another
+            // account cannot take the name first the way it can in /tmp.
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute() && dir.is_dir())
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join(format!("openmax-{uid}-{}", &digest[..16]));
+            Some((exe, dir))
+        })
+        .as_ref()?;
+    ensure_self_link(dir, exe).ok()?;
+    Some(dir.clone())
+}
+
+#[cfg(not(unix))]
+fn self_link_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn ensure_self_link(dir: &Path, exe: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // The temp dir can be shared between accounts (/tmp on Linux), and an
+    // entry first on PATH runs under every bare `openmax`: only a directory
+    // this account owns and nobody else can write may hold it, or another
+    // account could create the name first and swap the link mid-session.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other("self link directory is not private to this account"));
+    }
+    // The agent's own account can write here too, and this directory comes
+    // first on the PATH of every bash command: a `python3` planted beside the
+    // link by one command would replace the system binary in every later
+    // one, including a command a human read and approved. Only the link, and
+    // another harness's staged link mid-rename, may stay; anything that
+    // cannot be removed keeps the directory off PATH.
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "openmax" || is_staged_link(&name) {
+            continue;
+        }
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(entry.path()),
+            _ => std::fs::remove_file(entry.path()),
+        };
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    let link = dir.join("openmax");
+    if std::fs::read_link(&link).ok().as_deref() != Some(exe) {
+        // Staged, then renamed over: a concurrent harness on the same build
+        // never sees the name missing.
+        let staged = dir.join(format!(".openmax-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(exe, &staged)?;
+        if let Err(error) = std::fs::rename(&staged, &link) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
+    // Follows the link: a binary deleted since (an uninstall, a cleaned
+    // target dir) must not leave a dangling entry first on PATH.
+    std::fs::metadata(&link).map(|_| ())
+}
+
+/// The name `ensure_self_link` stages a link under before renaming it into
+/// place; no command is ever run by such a name.
+#[cfg(unix)]
+fn is_staged_link(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(".openmax-"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// The PATH the agent's shell gets: the self link directory first, then the
+/// harness's own entries. None when the harness has no PATH: a PATH holding
+/// only the link would hide every system binary from the shell, which falls
+/// back to its own default search path only while PATH is unset.
+fn child_path() -> Option<OsString> {
+    let inherited = std::env::var_os("PATH")?;
+    self_link_dir()
+        .and_then(|dir| path_with_self_link(&dir, &inherited))
+        .or(Some(inherited))
+}
+
+/// The child's PATH: the self link directory first, then the inherited
+/// entries without it, so a harness started from a harness's child does not
+/// stack another copy per level.
+fn path_with_self_link(dir: &Path, inherited: &std::ffi::OsStr) -> Option<OsString> {
+    let rest = std::env::split_paths(inherited).filter(|entry| entry != dir);
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
+}
+
 /// Execute one native process with concurrent bounded output capture.
 pub(crate) async fn run_process(
     request: ProcessRequest,
@@ -528,6 +663,13 @@ pub(crate) async fn run_process(
                 command.env(name, value);
             }
         }
+    } else {
+        // Bash and hooks keep the user's whole environment, but git must not
+        // prompt for credentials: the child has no terminal to answer on
+        // (see `configure_process_group`). Turned off, git fails at once and
+        // names the cause. A credential helper or askpass program still
+        // answers first.
+        command.env("GIT_TERMINAL_PROMPT", "0");
     }
     // Mark every native child as agent-spawned. Trust grants are human
     // actions: the CLI refuses --trust-project (and the interactive trust
@@ -541,14 +683,21 @@ pub(crate) async fn run_process(
     // inherit the attestation, grant authority. Stripped unconditionally;
     // no child of the harness is the human.
     command.env_remove("OPENMAX_HUMAN_ATTEST");
-    // Name the binary that is running this session. Every spec tells the
-    // agent to shell out to `openmax --check` / `--spec`, and a PATH
-    // `openmax` can be an older build than the harness hosting the session,
-    // teaching claims that build has since retracted - both print the same
-    // version string. `$OPENMAX_BIN` is the same
-    // build by construction. Not applied under a sandbox: a probe gets no
-    // handle to the harness.
+    // Point the child at the binary that is running this session. The
+    // prompt, receipts, and every spec tell the agent to shell out to a bare
+    // `openmax`, and the first one on the inherited PATH can be an older
+    // build than the harness hosting the session, teaching claims that build
+    // has since retracted - both print the same version string. So in the
+    // agent's shell a bare `openmax` resolves through the self link first;
+    // hooks and tools keep the inherited PATH (see `self_link`), and
+    // `$OPENMAX_BIN` names the same build in every one of them. Not applied
+    // under a sandbox: a probe gets no handle to the harness.
     if request.sandbox.is_none() {
+        if request.self_link {
+            if let Some(path) = child_path() {
+                command.env("PATH", path);
+            }
+        }
         if let Ok(exe) = std::env::current_exe() {
             command.env("OPENMAX_BIN", exe);
         }
@@ -561,7 +710,12 @@ pub(crate) async fn run_process(
             command.stdin(std::process::Stdio::piped());
         }
     }
-    configure_process_group(&mut command);
+    // A sandboxed probe keeps the group it has always had: it starts only
+    // from `openmax --check --run-examples`, never from a session the TUI
+    // draws.
+    configure_process_group(&mut command, request.sandbox.is_none());
+    #[cfg(all(test, unix))]
+    hold_before_exec(&mut command);
 
     let mut child = command.spawn().map_err(ProcessError::Spawn)?;
     let pid = child.id();
@@ -855,14 +1009,126 @@ async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     true
 }
 
+/// Make the child lead its own process group, the unit every termination
+/// path signals: a cancel or a timeout stops the whole tree, and members left
+/// behind after a normal exit are found and stopped.
+///
+/// With `new_session` the child also leads a new session, which has no
+/// controlling terminal. A child in the harness's session can open the
+/// terminal the TUI draws on: a git credential prompt, an ssh host-key
+/// question, or sudo then writes over the screen, and its read stops the
+/// child (a background group may not read its terminal) until the call times
+/// out. In a session of its own, opening /dev/tty fails at once and the
+/// command reports why. A session leader's group id is its own pid, so the
+/// group signals and the check for members left behind are unchanged.
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+fn configure_process_group(command: &mut Command, new_session: bool) {
     use std::os::unix::process::CommandExt;
-    command.as_std_mut().process_group(0);
+    if !new_session {
+        command.as_std_mut().process_group(0);
+        return;
+    }
+    // Runs between fork and exec, where only async-signal-safe calls are
+    // allowed, and setsid is one. A failure fails the spawn rather than
+    // running the command on the terminal. std has no stable way to ask
+    // posix_spawn for a new session, so these spawns take its fork path.
+    unsafe {
+        command.as_std_mut().pre_exec(|| match libc::setsid() {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_: &mut Command) {}
+fn configure_process_group(_: &mut Command, _: bool) {}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Set by [`PausedSpawn`] for the next spawn on its thread: the pipe the
+    /// child reports its fork on, the pipe it waits on before exec, and that
+    /// pipe's write end.
+    static PAUSE_BEFORE_EXEC: std::cell::Cell<Option<[std::os::fd::RawFd; 3]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn hold_before_exec(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let Some([forked, resume, resume_writer]) = PAUSE_BEFORE_EXEC.take() else { return };
+    // SAFETY: close, write, and read are async-signal-safe, the only kind of
+    // call allowed between fork and exec.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            // The child's own copy of the write end would keep it waiting
+            // forever if the test let go without writing.
+            libc::close(resume_writer);
+            let mut byte = 0_u8;
+            libc::write(forked, (&raw const byte).cast(), 1);
+            libc::read(resume, (&raw mut byte).cast(), 1);
+            Ok(())
+        });
+    }
+}
+
+/// A command started through [`run_process`] and held between fork and exec,
+/// the window in which a spawning child holds a copy of every descriptor the
+/// harness has open. Dropping it lets the child exec and waits for the
+/// command to finish.
+#[cfg(all(test, unix))]
+pub(crate) struct PausedSpawn {
+    resume: Option<std::io::PipeWriter>,
+    spawner: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(test, unix))]
+impl PausedSpawn {
+    pub(crate) fn start() -> Self {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (mut forked, forked_writer) = std::io::pipe().unwrap();
+        let (resume_reader, resume) = std::io::pipe().unwrap();
+        let fds = [forked_writer.as_raw_fd(), resume_reader.as_raw_fd(), resume.as_raw_fd()];
+        let spawner = std::thread::spawn(move || {
+            PAUSE_BEFORE_EXEC.set(Some(fds));
+            let request = ProcessRequest {
+                program: "/bin/echo".into(),
+                args: Vec::new(),
+                cwd: std::env::temp_dir(),
+                stdin: StdinMode::Null,
+                timeout: Duration::from_secs(30),
+                capture: CaptureSpec { head_bytes: 64, tail_bytes: 64, spill_dir: None, spill_bytes_per_stream: 1024 },
+                sandbox: None,
+                env_allowlist: None,
+                self_link: false,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let output = runtime.block_on(run_process(request, Arc::new(CancelToken::default())));
+            // Held until the spawn returns, so a spawn that never forked
+            // reads as end of file instead of a wait that never ends.
+            drop((forked_writer, resume_reader));
+            assert!(output.is_ok(), "the held command failed once resumed");
+        });
+        assert_eq!(forked.read(&mut [0_u8]).unwrap(), 1, "the command never reached its fork");
+        Self { resume: Some(resume), spawner: Some(spawner) }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for PausedSpawn {
+    fn drop(&mut self) {
+        use std::io::Write;
+        if let Some(mut resume) = self.resume.take() {
+            let _ = resume.write_all(&[0]);
+        }
+        if let Some(spawner) = self.spawner.take() {
+            let finished = spawner.join();
+            if !std::thread::panicking() {
+                finished.unwrap();
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 fn send_termination(_: &mut Child, pid: Option<u32>) {
@@ -942,6 +1208,7 @@ mod tests {
             },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         }
     }
 
@@ -984,6 +1251,7 @@ mod tests {
             },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
@@ -1004,6 +1272,7 @@ mod tests {
             capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         std::env::remove_var("OPENMAX_HUMAN_ATTEST");
@@ -1025,11 +1294,93 @@ mod tests {
             capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
             sandbox: None,
             env_allowlist: None,
+            self_link: false,
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         let got = String::from_utf8_lossy(&output.stdout.head).to_string();
         let expected = std::env::current_exe().unwrap().to_string_lossy().to_string();
         assert_eq!(got, expected, "OPENMAX_BIN must name the running executable");
+    }
+
+    /// The self link directory is shared and never cleaned up, so every
+    /// spawn re-checks it: a replaced link is put back, anything planted
+    /// beside it is removed, a deleted build keeps the directory off PATH
+    /// instead of leaving a dangling first entry, a directory another account
+    /// can write is never used, and a nested harness does not stack a second
+    /// copy of the entry.
+    #[cfg(unix)]
+    #[test]
+    fn the_self_link_is_rechecked_and_never_left_dangling_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("omx-selflink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("build");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        let dir = base.join("links");
+        let link = dir.join("openmax");
+        ensure_self_link(&dir, &exe).expect("a fresh directory gets the link");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), &link).unwrap();
+        ensure_self_link(&dir, &exe).expect("a replaced link is put back");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+
+        // Only the link and a concurrent harness's staged link may stay.
+        let staged = dir.join(format!(".openmax-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(&exe, &staged).unwrap();
+        std::fs::write(dir.join("python3"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(dir.join("bin/nested")).unwrap();
+        ensure_self_link(&dir, &exe).expect("planted entries are cleared");
+        let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, vec![staged.file_name().unwrap().to_os_string(), "openmax".into()]);
+
+        std::fs::remove_file(&exe).unwrap();
+        assert!(ensure_self_link(&dir, &exe).is_err(), "a link to a deleted build must stay off PATH");
+
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_self_link(&dir, &exe).is_err(), "a directory others can write is never used");
+
+        let inherited = std::env::join_paths([dir.clone(), "/usr/bin".into(), dir.clone()]).unwrap();
+        let path = path_with_self_link(&dir, &inherited).unwrap();
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), vec![dir.clone(), "/usr/bin".into()]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The agent's shell gets the self link directory first on PATH, and the
+    /// agent's own account can write it: a `python3` planted there by one
+    /// command would replace the system binary in every later one, including
+    /// a command a human read and approved. So each such spawn clears
+    /// everything but the link first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_name_planted_beside_the_self_link_never_runs() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = self_link_dir().expect("this host can place the self link");
+        let name = format!("omx-planted-{}", uuid::Uuid::new_v4().simple());
+        let planted = dir.join(&name);
+        // Created executable in one step: a concurrent spawn may clear the
+        // name at any moment, and a separate chmod would then fail.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&planted)
+            .unwrap();
+        file.write_all(b"#!/bin/sh\necho planted-ran\n").unwrap();
+        drop(file);
+        let mut request = request(&name, &[]);
+        request.capture.head_bytes = 4096;
+        request.self_link = true;
+        let ran = run_process(request, Arc::new(CancelToken::default())).await;
+        let _ = std::fs::remove_file(&planted);
+        let stdout = ran
+            .map(|output| String::from_utf8_lossy(&output.stdout.head).into_owned())
+            .unwrap_or_default();
+        assert!(!stdout.contains("planted-ran"), "a name planted beside the self link ran");
     }
 
     /// A bash heredoc (and process substitution) writes a temp file; a
@@ -1067,6 +1418,7 @@ mod tests {
             },
             sandbox: Some(SandboxPolicy { rw_scratch: scratch.to_path_buf() }),
             env_allowlist: None,
+            self_link: false,
         }
     }
 
@@ -1400,5 +1752,152 @@ mod tests {
             !marker.exists(),
             "background descendant survived process cleanup"
         );
+    }
+
+    /// A timeout stops everything the command started, not just the shell:
+    /// a background descendant that ignores SIGTERM is still killed once the
+    /// grace runs out, so nothing keeps running after the call reported its
+    /// timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_stops_every_process_the_command_started() {
+        let dir = std::env::temp_dir().join(format!("openmax-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (started, survived) = (dir.join("started"), dir.join("survived"));
+        // The shell waits for the descendant to start, so the timeout stops
+        // a tree and not a lone shell.
+        let script = format!(
+            "(trap '' TERM; : > '{}'; sleep 2; : > '{}') & while [ ! -e '{}' ]; do sleep 0.05; done; sleep 30",
+            started.display(),
+            survived.display(),
+            started.display()
+        );
+        let mut request = request("/bin/sh", &["-c", &script]);
+        request.timeout = Duration::from_secs(1);
+        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        assert!(matches!(output.termination, Termination::TimedOut));
+        assert!(started.exists(), "the descendant never ran, so this proved nothing");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let survivor = survived.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!survivor, "a descendant outlived the timeout that stopped its command");
+    }
+
+    /// A command that prompts on the terminal (a git credential prompt, an
+    /// ssh host-key question, sudo) has nobody to answer it: the TUI owns the
+    /// screen and the keyboard. A child in the harness's session could open
+    /// that terminal, so the prompt drew over the TUI, and the read stopped
+    /// the child (a background group may not read its terminal) until the
+    /// call timed out. A child that leads its own session has no terminal to
+    /// open: the command fails at once, and nothing reaches the screen.
+    ///
+    /// The harness side must hold a controlling terminal for this to prove
+    /// anything, and the shared test process must not be given one, so the
+    /// probe runs in a child whose terminal is a fresh pseudo-terminal.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_prompts_on_the_terminal_fails_at_once() {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "OPENMAX_TEST_TERMINAL_PROMPT";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(
+                std::fs::File::open("/dev/tty").is_ok(),
+                "the harness side must hold a controlling terminal"
+            );
+            let mut request = request(
+                "/bin/sh",
+                &["-c", "printf 'Password: ' > /dev/tty && read -r answer < /dev/tty"],
+            );
+            request.timeout = Duration::from_secs(10);
+            let runtime =
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let output = runtime
+                .block_on(run_process(request, Arc::new(CancelToken::default())))
+                .unwrap();
+            assert!(
+                matches!(output.termination, Termination::Exited(status) if !status.success()),
+                "a command that prompted on the terminal waited there until its timeout"
+            );
+            return;
+        }
+
+        let (mut controller, terminal) = pseudo_terminal();
+        let mut probe = std::process::Command::new(std::env::current_exe().unwrap());
+        probe
+            .args(["--exact", "execution::tests::a_command_that_prompts_on_the_terminal_fails_at_once"])
+            .env(CHILD, "1")
+            .stdin(terminal)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // A new session whose controlling terminal is the pseudo-terminal on
+        // stdin: what a TUI started from an interactive shell holds.
+        unsafe {
+            probe.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = probe.spawn().unwrap();
+        // Only the probe holds the terminal end now, so the controller reads
+        // end-of-file once it exits. It is read while the probe runs: a
+        // session leader's exit can wait for its terminal's output to drain.
+        drop(probe);
+        let (sent, screen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut chunk = [0_u8; 1024];
+            while let Ok(read @ 1..) = controller.read(&mut chunk) {
+                if sent.send(chunk[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let out = child.wait_with_output().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut shown = Vec::new();
+        while let Ok(bytes) = screen.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            shown.extend(bytes);
+        }
+        let shown = String::from_utf8_lossy(&shown);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(shown.is_empty(), "the prompt reached the terminal: {shown:?}\n{stdout}");
+        // "1 passed" rules out a filter that matched nothing and exited 0.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A pseudo-terminal: the controller end the test reads, and the terminal
+    /// end a child takes as its controlling terminal.
+    #[cfg(unix)]
+    fn pseudo_terminal() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        // SAFETY: posix_openpt returns a new descriptor that the File then
+        // owns, and ptsname's static buffer is copied out before any other
+        // pty call.
+        let (controller, path) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(fd >= 0, "posix_openpt: {}", io::Error::last_os_error());
+            let controller = std::fs::File::from_raw_fd(fd);
+            assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", io::Error::last_os_error());
+            assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", io::Error::last_os_error());
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null(), "ptsname: {}", io::Error::last_os_error());
+            let path = std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr(name).to_bytes());
+            (controller, path.to_owned())
+        };
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .unwrap();
+        (controller, terminal)
     }
 }
