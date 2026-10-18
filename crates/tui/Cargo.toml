@@ -35,8 +35,9 @@ unicode-width = "0.2"
 unicode-segmentation = "1.13"
 ignore.workspace = true
 # SIGTERM for an MCP server still running after `--mcp-call` or `--mcp-list`
-# closed its stdin. The CLI tests also use it to give a child a
-# pseudo-terminal on stdin, which is how an interactive shell runs openmax.
+# closed its stdin, and the signal watcher's check for signals inherited as
+# ignored. The CLI tests also use it to give a child a pseudo-terminal on
+# stdin, which is how an interactive shell runs openmax.
 libc.workspace = true
 
 [dev-dependencies]

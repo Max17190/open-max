@@ -44,7 +44,8 @@ use open_max_core::state::Core;
 use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use std::time::Instant;
 
 pub const PROTO: &str = "openmax-stdio/6";
 /// Machine-comparable protocol major. A client negotiates on this integer;
@@ -69,6 +70,8 @@ enum Command {
 
 pub struct StdioArgs {
     pub continue_session: bool,
+    /// Notified on SIGTERM, SIGINT, or SIGHUP (see `watch_quit_signals`).
+    pub quit: Arc<Notify>,
 }
 
 pub async fn run(
@@ -79,40 +82,26 @@ pub async fn run(
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_key = project.display().to_string();
 
-    let (session_id, continued) = if args.continue_session {
-        match sessions::latest(&core, &project_key) {
-            Ok(Some(meta)) => (meta.id, true),
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                return 2;
-            }
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(&core, e);
-                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
-                return 1;
-            }
-        }
-    } else {
-        match sessions::create(&core, project_key.clone()) {
-            Ok(meta) => (meta.id, false),
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(&core, e);
-                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
-                return 1;
-            }
-        }
+    // Every step of the setup can wait on the session index lock.
+    let setup = {
+        let (core, project_key, continue_session) = (core.clone(), project_key.clone(), args.continue_session);
+        move || open_session(&core, &project_key, continue_session)
     };
-
-    if let Err(e) = sessions::attach(&core, &session_id) {
-        eprintln!("openmax: {e}");
-        return 1;
-    }
-    let history = if continued {
-        match sessions::load_messages(&core, &session_id) {
-            Ok(messages) => messages.unwrap_or_default(),
-            Err(e) => { eprintln!("openmax: {e}"); return 1; }
+    let mut stop_by = None;
+    let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
+        return crate::quit_status();
+    };
+    let (session_id, continued, history) = match opened {
+        Ok(opened) => opened,
+        Err(code) => return code,
+    };
+    if stop_by.is_some() {
+        // A signal landed while the session opened, so no turn ever ran.
+        if !continued {
+            crate::discard_empty_session(&core, &session_id, &args.quit, stop_by).await;
         }
-    } else { Vec::new() };
+        return crate::quit_status();
+    }
     let mut stdout = std::io::stdout();
     emit(&mut stdout, &hello_value(&session_id, &project_key, continued));
     if continued {
@@ -122,7 +111,52 @@ pub async fn run(
         emit(&mut stdout, &transcript_value(&session_id, &history));
     }
     let stdin_rx = spawn_stdin_reader();
-    drive(core, core_rx, session_id, project, stdin_rx, &mut stdout, !continued).await
+    drive(core, core_rx, session_id, project, stdin_rx, &args.quit, &mut stdout, !continued).await
+}
+
+/// Create or find the session, claim it, and read its history to replay:
+/// Ok(id, whether it was continued, history), or Err(the exit status) once
+/// the reason is on stderr.
+fn open_session(
+    core: &Core,
+    project_key: &str,
+    continue_session: bool,
+) -> Result<(String, bool, Vec<open_max_core::types::ChatMessage>), i32> {
+    let (session_id, continued) = if continue_session {
+        match sessions::latest(core, project_key) {
+            Ok(Some(meta)) => (meta.id, true),
+            Ok(None) => {
+                eprintln!("openmax: no prior session in this directory to continue");
+                return Err(2);
+            }
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(core, e);
+                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
+                return Err(1);
+            }
+        }
+    } else {
+        match sessions::create(core, project_key.to_string()) {
+            Ok(meta) => (meta.id, false),
+            Err(e) => {
+                let refusal = sessions::refusal_with_repair(core, e);
+                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
+                return Err(1);
+            }
+        }
+    };
+
+    if let Err(e) = sessions::attach(core, &session_id) {
+        eprintln!("openmax: {e}");
+        return Err(1);
+    }
+    let history = if continued {
+        match sessions::load_messages(core, &session_id) {
+            Ok(messages) => messages.unwrap_or_default(),
+            Err(e) => { eprintln!("openmax: {e}"); return Err(1); }
+        }
+    } else { Vec::new() };
+    Ok((session_id, continued, history))
 }
 
 /// The blocking stdin reader on its own thread; malformed input travels as
@@ -175,37 +209,39 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Result<Command, String>> {
 /// to `out`. `fresh` says this process created the session: a client that
 /// quits before any turn persisted anything (or whose only prompt a gate
 /// refused) would otherwise leave an index entry with nothing behind it.
+#[allow(clippy::too_many_arguments)]
 async fn drive<W: Write>(
     core: Arc<Core>,
     core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: String,
     project: PathBuf,
     stdin_rx: mpsc::Receiver<Result<Command, String>>,
+    quit: &Notify,
     out: &mut W,
     fresh: bool,
 ) -> i32 {
-    let code = drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, out).await;
+    let mut stop_by = None;
+    let code =
+        drive_loop(core.clone(), core_rx, session_id.clone(), project, stdin_rx, quit, out, &mut stop_by)
+            .await;
     if fresh {
-        if let Err(e) = sessions::discard_if_empty(&core, &session_id) {
-            let e = sessions::refusal_with_repair(&core, e);
-            // One line, like every other harness line on stderr: the reason
-            // quotes the index path, an authored byte string.
-            eprintln!(
-                "openmax: warning: the empty session {session_id} stays indexed: {}",
-                open_max_core::text::one_line(&e)
-            );
-        }
+        crate::discard_empty_session(&core, &session_id, quit, stop_by).await;
     }
     code
 }
 
+/// `stop_by` holds the stop's deadline once a signal lands, here or while
+/// a turn starts; the empty-session cleanup after this loop is held to it too.
+#[allow(clippy::too_many_arguments)]
 async fn drive_loop<W: Write>(
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     session_id: String,
     project: PathBuf,
     mut stdin_rx: mpsc::Receiver<Result<Command, String>>,
+    quit: &Notify,
     out: &mut W,
+    stop_by: &mut Option<Instant>,
 ) -> i32 {
     let mut running = false;
     let mut closing = false;
@@ -213,12 +249,34 @@ async fn drive_loop<W: Write>(
     // Approvals awaiting a client answer; declined in bulk when the client
     // quits so the drain never sits out the approval timeout.
     let mut open_approvals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Set by a signal: the status the session exits with, and when it stops
+    // waiting for the cancelled turn.
+    let mut stopping: Option<i32> = None;
+    let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    let quit = quit.notified();
+    tokio::pin!(quit);
 
     loop {
+        // A signal, here or while a turn was starting, quits by cancelling
+        // the turn instead of letting it finish: the signal reached this
+        // process alone, and the done arrives once the turn's tools are
+        // stopped.
+        if let (None, Some(by)) = (stopping, *stop_by) {
+            closing = true;
+            for id in open_approvals.drain() {
+                core.respond_approval(&id, false);
+            }
+            core.cancel(&session_id);
+            stopping = Some(crate::quit_status());
+            settle = Some(crate::deadline(by));
+        }
         if closing && !running {
-            return exit_code;
+            return stopping.unwrap_or(exit_code);
         }
         tokio::select! {
+            _ = &mut quit, if stop_by.is_none() => *stop_by = Some(Instant::now() + crate::STOP_SETTLE),
+            _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
+                if settle.is_some() => return stopping.unwrap_or(exit_code),
             cmd = stdin_rx.recv(), if !closing => {
                 match cmd {
                     None | Some(Ok(Command::Quit)) => {
@@ -249,7 +307,31 @@ async fn drive_loop<W: Write>(
                                 // success: the acknowledged state, the live
                                 // state, and the on-disk state must never
                                 // disagree about how mutating tools are gated.
-                                let saved = core.set_project_approval_mode(&project, parsed);
+                                // The save waits on the trust store's lock,
+                                // which another openmax process can hold for
+                                // as long as its own write takes, and on this
+                                // thread that wait left a signal unanswered
+                                // until the lock was free. A turn can be in
+                                // flight, so a signal goes to the top of this
+                                // loop, which cancels and settles that turn.
+                                // A save still waiting gets no answer: it
+                                // finishes on its own or ends with the process.
+                                let save = tokio::task::spawn_blocking({
+                                    let (core, project) = (core.clone(), project.clone());
+                                    move || core.set_project_approval_mode(&project, parsed)
+                                });
+                                let saved = tokio::select! {
+                                    // A result in hand is never dropped for a
+                                    // signal that came with it.
+                                    biased;
+                                    saved = save => {
+                                        saved.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+                                    }
+                                    _ = &mut quit, if stop_by.is_none() => {
+                                        *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                        continue;
+                                    }
+                                };
                                 match saved {
                                     Ok(()) => {
                                         emit(
@@ -277,7 +359,37 @@ async fn drive_loop<W: Write>(
                             protocol_error(out, "a turn is in flight; wait for done");
                             continue;
                         }
-                        match agent::reload_session(&core, &session_id, &project).await {
+                        // A reload reads every extension manifest, and a read
+                        // can stall (a slow disk, a manifest that is a pipe).
+                        // It also claims the session, and that waits on the
+                        // session index lock, which another openmax process
+                        // can hold for as long as its own write takes, with
+                        // the thread it runs on blocked. So it runs as a task
+                        // of its own, and this loop stays free to answer a
+                        // signal. No turn runs during a reload, so a signal
+                        // ends the session at once instead of waiting it out.
+                        let mut reload = tokio::spawn({
+                            let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
+                            async move { agent::reload_session(&core, &session_id, &project).await }
+                        });
+                        let reloaded = tokio::select! {
+                            // A result in hand is never dropped for a signal
+                            // that came with it.
+                            biased;
+                            reloaded = &mut reload => {
+                                reloaded.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+                            }
+                            _ = &mut quit, if stop_by.is_none() => {
+                                // Stopped at its next await, so a reload the
+                                // signal interrupted is not applied while the
+                                // session is going away. A blocking wait it is
+                                // in finishes first, or ends with the process.
+                                reload.abort();
+                                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                return crate::quit_status();
+                            }
+                        };
+                        match reloaded {
                             Ok((tools, skills, changes)) => {
                                 let env = AgentEventEnvelope {
                                     session_id: session_id.clone(),
@@ -303,11 +415,21 @@ async fn drive_loop<W: Write>(
                         }
                         // A `/name args` line expands here exactly as it does
                         // in the composer: a frontend driving this protocol
-                        // gets the project's templates for free.
-                        let text = templates::expand_user_input(&core.data_dir, &project, &text);
-                        match agent::start_turn(core.clone(), session_id.clone(), project.clone(), text) {
-                            Ok(()) => running = true,
-                            Err(e) => refuse(out, &session_id, &e),
+                        // gets the project's templates for free. The expansion
+                        // reads the template's file, which stalled storage can
+                        // hold for any length of time, so it runs with the
+                        // turn's start, where a signal bounds the wait.
+                        let start = {
+                            let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
+                            move || {
+                                let text = templates::expand_user_input(&core.data_dir, &project, &text);
+                                agent::start_turn(core, session_id, project, text)
+                            }
+                        };
+                        match crate::until_stopped(&mut quit, stop_by, start).await {
+                            Some(Ok(())) => running = true,
+                            Some(Err(e)) => refuse(out, &session_id, &e),
+                            None => return crate::quit_status(),
                         }
                     }
                 }
@@ -907,7 +1029,8 @@ mod tests {
         }
         drop(tx);
         let mut out = Vec::new();
-        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &mut out, true).await;
+        let quit = tokio::sync::Notify::new();
+        let code = drive(core.clone(), core_rx, meta.id, dir.clone(), rx, &quit, &mut out, true).await;
         let lines = String::from_utf8(out)
             .unwrap()
             .lines()

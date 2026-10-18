@@ -6,7 +6,7 @@ pub mod agent;
 pub mod client;
 pub mod config;
 pub mod doctor;
-pub(crate) mod execution;
+pub mod execution;
 pub mod hooks;
 pub mod ledger;
 pub mod memory;
