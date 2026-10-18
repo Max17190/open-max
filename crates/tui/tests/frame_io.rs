@@ -713,8 +713,14 @@ mod first_frame {
             .unwrap_or_else(|| panic!("no first frame: {}", s.context()));
         s.write(ANSWER);
         s.write(b"add the tool\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| shown.contains("tool ready"));
-        assert!(shown.contains("tool ready"), "the turn did not finish:\n{shown}");
+        // Wait for the turn to settle, not only for its last message: the
+        // reply is drawn before the turn ends, and Ctrl+C on a running turn
+        // cancels instead of arming the quit. The hint that Esc cancels is
+        // gone once the turn has ended.
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| {
+            shown.contains("tool ready") && !shown.contains("esc cancel")
+        });
+        assert!(shown.contains("tool ready") && !shown.contains("esc cancel"), "the turn did not settle:\n{shown}");
         assert!(
             shown.contains("tool wordfreq runs: '/bin/echo' 'release-7f3a'"),
             "the new tool's command line is not on screen:\n{shown}"
