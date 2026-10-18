@@ -1989,11 +1989,14 @@ fn a_write_that_fails_partway_leaves_the_file_as_it_was() {
 /// write but not read is left unchanged, and the result says so: written in
 /// place for its second name, it could not have its old contents put back if
 /// that write failed. That refusal is new; the rest held when every write
-/// was made in place.
+/// was made in place. A new file gets 0666 less the umask, as one created in
+/// place did, and a replaced file loses setuid, as a write by anyone but the
+/// superuser clears it.
 #[cfg(unix)]
 #[test]
 fn a_write_keeps_the_files_mode_links_and_permissions() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
     let (project, home) = fresh_dirs("write-identity");
     // 240 of the 255 bytes a name may have.
     let long = format!("{}.txt", "n".repeat(236));
@@ -2013,6 +2016,11 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
     let script = project.join("run.sh");
     std::fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+    // This user owns it, so it may carry setuid.
+    let setuid = project.join("setuid.sh");
+    std::fs::write(&setuid, "#!/bin/sh\necho old\n").unwrap();
+    std::fs::set_permissions(&setuid, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    assert_eq!(std::fs::metadata(&setuid).unwrap().mode() & 0o7777, 0o4755);
     std::fs::write(project.join("shared.txt"), "old\n").unwrap();
     std::fs::hard_link(project.join("shared.txt"), project.join("alias.txt")).unwrap();
     std::fs::write(project.join("real.txt"), "old\n").unwrap();
@@ -2044,6 +2052,7 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
         ("edit_file", edit(&long)),
         ("write_file", serde_json::json!({"path": long_new, "content": "new\n"})),
         ("edit_file", edit("grouped.txt")),
+        ("edit_file", edit("setuid.sh")),
         ("write_file", serde_json::json!({"path": "writeonly.txt", "content": "new\n"})),
     ];
     let (base_url, _requests, _server) = spawn_scripted_server(vec![
@@ -2051,7 +2060,24 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
         (HELLO_SSE.to_string(), true),
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
-    let (code, lines, stdout) = json_turn(&project, &home, "update the files");
+    // Set for the child alone, so no other test's files are created under
+    // it, and unlike the usual 022, so a new file's mode shows it.
+    let umask: libc::mode_t = 0o027;
+    let mut command = cmd(&project, &home);
+    command.args(["--trust-project", "--json", "-p", "update the files"]);
+    // SAFETY: the closure makes one system call, allocating nothing and
+    // taking no lock, and it changes only the child.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    let out = command.output().unwrap();
+    let code = out.status.code();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<serde_json::Value> =
+        stdout.lines().map(|l| serde_json::from_str(l).expect("every stdout line is JSON")).collect();
     // Writable again before any assertion, so a failure leaves nothing that
     // cannot be deleted.
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2068,6 +2094,10 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
     assert_eq!(std::fs::read_to_string(locked.join("inside.txt")).unwrap(), "new\n", "{stdout}");
     assert_eq!(std::fs::read_to_string(project.join(&long)).unwrap(), "new\n", "{stdout}");
     assert_eq!(std::fs::read_to_string(project.join(&long_new)).unwrap(), "new\n", "{stdout}");
+    let created = std::fs::metadata(project.join(&long_new)).unwrap().mode() & 0o7777;
+    assert_eq!(created, 0o640, "a new file gets 0666 less the umask of 027");
+    assert_eq!(std::fs::read_to_string(&setuid).unwrap(), "#!/bin/sh\necho new\n");
+    assert_eq!(std::fs::metadata(&setuid).unwrap().mode() & 0o7777, 0o755, "a replacement drops setuid");
     assert_eq!(std::fs::read_to_string(&grouped).unwrap(), "new\n");
     if let Some(gid) = other {
         assert_eq!(std::fs::metadata(&grouped).unwrap().gid(), gid, "the group must survive");
