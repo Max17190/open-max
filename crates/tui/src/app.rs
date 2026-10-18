@@ -1347,7 +1347,7 @@ impl App {
         // Completion popup: navigation and acceptance take priority over the
         // composer; anything else falls through and refilters afterwards.
         if self.completion.is_some() {
-            // Shift+Tab steps back through the list here rather than cycling
+            // Shift+Tab steps back through the list here rather than switching
             // approval modes: an open popup owns the keyboard, and the reverse
             // of "Tab picks the next item" is the only reading of it on screen.
             if is_shift_tab(&key) {
@@ -1405,11 +1405,11 @@ impl App {
             }
         }
 
-        // Shift+Tab cycles how much the agent may do without asking. It lands
-        // here, after every modal surface has had the key, because those own
-        // the keyboard while they are open.
+        // Shift+Tab switches the project between ask and auto. It lands here,
+        // after every modal surface has had the key, because those own the
+        // keyboard while they are open.
         if is_shift_tab(&key) {
-            self.cycle_approval_mode();
+            self.step_approval_mode();
             return Ok(());
         }
 
@@ -1683,7 +1683,7 @@ impl App {
         }
     }
 
-    fn cycle_approval_mode(&mut self) {
+    fn step_approval_mode(&mut self) {
         self.refresh_project_root();
         self.select_approval_mode(self.approval_mode().next());
     }
@@ -3954,7 +3954,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "queue the message for after this turn"),
     ("tab", "focus conversation ↔ composer"),
-    ("shift+tab", "cycle saved project approvals: ask → auto → readonly"),
+    ("shift+tab", "switch saved project approvals: ask ↔ auto (readonly → ask)"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
     ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
@@ -4954,6 +4954,40 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Shift+Tab is easy to press by accident and it saves per project. If it
+    /// could step into readonly, one stray press would leave the project's
+    /// next session refusing every write in a mode nobody chose on purpose.
+    /// So the key moves between ask and auto only, and it leaves readonly
+    /// without re-entering it. The saved file is what the next session reads,
+    /// so the first result is checked through a fresh Core as well.
+    #[tokio::test]
+    async fn shift_tab_switches_between_ask_and_auto_and_never_saves_readonly() {
+        let dir = crate::test_temp_dir("openmax-app-shift-tab");
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        open_max_core::trust::trust_project(&dir, &project).unwrap();
+        core.set_project_approval_mode(&project, config::ApprovalMode::Auto).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core, project.clone(), files_tx);
+
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(
+            app.core.approval_mode(&project),
+            config::ApprovalMode::Ask,
+            "from auto the key must step to ask, never save readonly",
+        );
+        let (next_session, _rx) = Core::new(dir.clone()).unwrap();
+        assert_eq!(next_session.approval_mode(&project), config::ApprovalMode::Ask, "the saved file says ask");
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Auto, "from ask the key steps to auto");
+
+        app.core.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "the key leaves readonly");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// Turns and saves resolve the project path when they run. When the
     /// launch path comes to lead to another trusted project (the directory
     /// moved and a symlink to another project took its place), Shift+Tab and
@@ -4973,13 +5007,13 @@ mod tests {
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         open_max_core::trust::trust_project(&dir, &first).unwrap();
         open_max_core::trust::trust_project(&dir, &second).unwrap();
-        core.set_project_approval_mode(&first, config::ApprovalMode::Auto).unwrap();
-        core.set_project_approval_mode(&second, config::ApprovalMode::Readonly).unwrap();
+        core.set_project_approval_mode(&first, config::ApprovalMode::Readonly).unwrap();
+        core.set_project_approval_mode(&second, config::ApprovalMode::Ask).unwrap();
         let (files_tx, _files_rx) = mpsc::unbounded_channel();
         let mut app = App::new(core, link.clone(), files_tx);
         render_app(&mut app, 100, 12);
         let launch = line_text(&app.status_line);
-        assert!(launch.ends_with("  auto "), "{launch:?}");
+        assert!(launch.ends_with("  readonly "), "{launch:?}");
 
         let retarget = |to: &std::path::Path| {
             fs::remove_file(&link).unwrap();
@@ -4989,13 +5023,13 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         assert_eq!(
             app.core.approval_mode(&link),
-            config::ApprovalMode::Ask,
-            "Shift+Tab must step from the mode turns enforce (readonly), not the one last shown",
+            config::ApprovalMode::Auto,
+            "Shift+Tab must step from the mode turns enforce (ask), not the one last shown (readonly)",
         );
-        assert_eq!(app.core.approval_mode(&first), config::ApprovalMode::Auto);
+        assert_eq!(app.core.approval_mode(&first), config::ApprovalMode::Readonly);
         render_app(&mut app, 100, 12);
         let stepped = line_text(&app.status_line);
-        assert!(stepped.ends_with("  ask "), "{stepped:?}");
+        assert!(stepped.ends_with("  auto "), "{stepped:?}");
 
         // A tool call is where a turn reads the mode, so it re-syncs the line.
         retarget(&first);
@@ -5007,7 +5041,7 @@ mod tests {
         });
         render_app(&mut app, 100, 12);
         let during_turn = line_text(&app.status_line);
-        assert!(during_turn.ends_with("  auto "), "{during_turn:?}");
+        assert!(during_turn.ends_with("  readonly "), "{during_turn:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5382,7 +5416,7 @@ mod tests {
         for key in shift_tab_events() {
             assert!(is_shift_tab(&key), "not recognised: {key:?}");
         }
-        // A plain Tab is the focus toggle, not the cycle.
+        // A plain Tab is the focus toggle, not the switch.
         assert!(!is_shift_tab(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         assert!(!is_shift_tab(&KeyEvent::new(
             KeyCode::Tab,
@@ -5390,10 +5424,10 @@ mod tests {
         )));
     }
 
-    /// Both encodings have to drive the same cycle, or the binding works on
+    /// Both encodings have to drive the same switch, or the binding works on
     /// one half of the terminals and silently does something else on the rest.
     #[tokio::test]
-    async fn shift_tab_cycles_approvals_in_both_encodings() {
+    async fn shift_tab_switches_approvals_in_both_encodings() {
         for key in shift_tab_events() {
             let (mut app, dir) = app_fixture();
             let mode = |app: &App| app.core.approval_mode(&app.project);
@@ -5402,9 +5436,11 @@ mod tests {
             app.on_key(key).await.unwrap();
             assert_eq!(mode(&app), config::ApprovalMode::Auto);
             app.on_key(key).await.unwrap();
-            assert_eq!(mode(&app), config::ApprovalMode::Readonly);
+            assert_eq!(mode(&app), config::ApprovalMode::Ask, "from auto the key steps back to ask, never readonly");
+            let project = app.project.clone();
+            app.core.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
             app.on_key(key).await.unwrap();
-            assert_eq!(mode(&app), config::ApprovalMode::Ask, "cycle did not close");
+            assert_eq!(mode(&app), config::ApprovalMode::Ask, "from readonly the key steps to ask");
             fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -5572,7 +5608,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A typed choice replaces the mode selected by the cycle key.
+    /// A typed choice replaces the mode selected by the step key.
     #[tokio::test]
     async fn typed_approvals_command_replaces_the_project_choice() {
         let (mut app, dir) = app_fixture();
