@@ -966,7 +966,8 @@ Commands, one JSON object per line:
   the signal number after its `done` and the removal of a new session that
   saved nothing, or after 3 seconds at most, plus up to 100 ms to check that
   the session is empty and up to 250 ms for a tool command still being
-  started.
+  started. A tool command whose start outlasts those 250 ms is not stopped,
+  and runs on after the exit.
 Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
 session continues; extra fields on a known command are ignored; blank lines
 are skipped.

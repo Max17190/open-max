@@ -164,7 +164,8 @@ the signal number once that turn's `done` is written and, for a new session
 that nothing was saved to, its index entry is removed, or after 3 seconds if
 either has not finished, plus up to 100 ms to check that the session is empty
 and up to 250 ms for a tool command still being started; an entry still in
-place then stays, and a warning says so on stderr.
+place then stays, and a warning says so on stderr. A tool command whose start
+outlasts those 250 ms is not stopped, and runs on after the exit.
 A signal while the session waits on the session index to open, to start a
 turn, or to reload, or on the trust store to save an approval mode, ends it
 the same way, and a `reload` or `approval_mode` it cuts short gets no answer;
