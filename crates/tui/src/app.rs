@@ -471,9 +471,11 @@ pub struct App {
     header_width: u16,
     status_line: Line<'static>,
     status_width: u16,
-    /// The approval mode `status_line` shows. A turn can tighten the live
-    /// mode to one another process saved without anything here marking the
-    /// chrome, so a draw compares it with the live mode.
+    /// The approval mode the user was last shown: the one `status_line`
+    /// shows, or this TUI's own selection, which its note announces before
+    /// the next frame draws it. A turn can tighten the live mode to one
+    /// another process saved without anything here marking the chrome, so a
+    /// draw compares it with the live mode, and Shift+Tab steps only from it.
     status_mode: Option<config::ApprovalMode>,
 }
 
@@ -1678,6 +1680,9 @@ impl App {
                 // The save resolved the path itself; show the project it saved for.
                 self.refresh_project_root();
                 self.note(&format!("approvals: {} for this project (saved)", mode.as_str()));
+                // Shown by that note, so a press handled before the next
+                // frame steps from it.
+                self.status_mode = Some(mode);
                 self.dirty.mark_chrome();
                 true
             }
@@ -1688,15 +1693,18 @@ impl App {
         }
     }
 
-    /// Step to the next mode. When the read-back finds a stricter mode another
-    /// session saved for this project, the press shows it and saves nothing:
-    /// the user has not seen the mode it would step from, and stepping from
-    /// ask lands on auto, over that session's ask, on a press meant to
-    /// tighten. The next press steps from it. Only the read-back is compared;
+    /// Step to the next mode, from the one the user was shown. When the live
+    /// mode after the read-back is another, because another session saved a
+    /// stricter one for this project or a turn took that up before the line
+    /// drew it, the press shows it and saves nothing: the user has not seen
+    /// the mode it would step from, and stepping from ask lands on auto, over
+    /// that session's ask, on a press meant to tighten. The next press steps
+    /// from it. Only the mode of the root the line was drawn for is compared;
     /// the path is re-resolved after it, so a path that now leads to another
     /// project steps from that project's mode.
     fn step_approval_mode(&mut self) {
-        let shown = self.approval_mode();
+        // Before the first frame, the mode ahead of the read-back stands in.
+        let shown = self.status_mode.unwrap_or_else(|| self.approval_mode());
         self.core.refresh_saved_approval_modes();
         let live = self.approval_mode();
         if live != shown {
@@ -5121,6 +5129,41 @@ mod tests {
         render_app(&mut app, 100, 12);
         let during_turn = line_text(&app.status_line);
         assert!(during_turn.ends_with("  readonly "), "the line must show the mode turns enforce: {during_turn:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A running turn reads the store back before its next call, so this
+    /// process can take up the other TUI's ask before the line draws it. A
+    /// press in that window was made on a line showing auto: it shows ask
+    /// and saves nothing, as when the press's own read-back finds it.
+    #[tokio::test]
+    async fn shift_tab_steps_from_the_mode_the_line_shows_not_one_a_turn_took_up() {
+        let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-turn-took-ask");
+        sibling.set_project_approval_mode(&project, config::ApprovalMode::Ask).unwrap();
+        app.core.refresh_saved_approval_modes();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(
+            Core::new(dir.clone()).unwrap().0.approval_mode(&project),
+            config::ApprovalMode::Ask,
+            "a press on a line showing auto saved auto over the other TUI's ask",
+        );
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask);
+        render_app(&mut app, 100, 12);
+        let shown = line_text(&app.status_line);
+        assert!(shown.ends_with("  ask "), "{shown:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Presses handled before a frame draws step on: each one steps from
+    /// the mode the press before it selected and announced.
+    #[tokio::test]
+    async fn shift_tab_presses_before_a_frame_each_step() {
+        let (dir, project, mut app, _sibling) = app_beside_a_sibling("openmax-app-quick-presses");
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        }
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "auto, then readonly, then ask");
+        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Ask);
         fs::remove_dir_all(dir).unwrap();
     }
 
