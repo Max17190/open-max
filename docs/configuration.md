@@ -199,9 +199,9 @@ along.
 
 Trust grants are human actions. Every process the agent loop spawns carries
 `OPENMAX_SESSION`, and under that marker both `--trust-project` and the
-interactive trust prompt refuse: a session cannot grant itself, or a child it
-starts, trust in a new directory. Outside a session, `--trust-project` also
-needs a terminal on stdin, so grant it once from a shell:
+interactive trust prompt refuse: a process that keeps the marker cannot grant
+trust in a new directory. Outside a session, `--trust-project` also needs a
+terminal on stdin, so grant it once from a shell:
 
 ```sh
 openmax --trust-project -p "summarize this repo"   # from a terminal
@@ -215,7 +215,13 @@ prompt); from then on the frontend starts sessions with plain
 
 Automation a human runs with no terminal, such as CI, states the human act
 explicitly with `OPENMAX_HUMAN_ATTEST=1`. It is honored only outside an agent
-session, and the harness strips it from every process it spawns:
+session, and the harness strips it from every process it spawns. Nothing
+checks who set it, so a shell the agent runs can unset `OPENMAX_SESSION` and
+then either set `OPENMAX_HUMAN_ATTEST=1` or run `openmax` on a pseudo-terminal,
+and the grant goes through. The marker and terminal checks stop a grant made by
+accident or by the plain retry `env -u OPENMAX_SESSION openmax --trust-project`
+from that shell, not one an agent sets out to make. Set
+`OPENMAX_HUMAN_ATTEST=1` on the command that grants trust:
 
 ```sh
 OPENMAX_HUMAN_ATTEST=1 openmax --trust-project -p "summarize this repo"

@@ -198,7 +198,29 @@ File formats, hook events, permission rule syntax (including the in-session repa
 
 ## Native execution and privacy
 
-The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `write_file` and `edit_file` write the new contents to a temp file beside the target and rename it into place with the target's permissions (less setuid and setgid), owner, group and access control list (not the directory's default list, and not the target's other extended attributes or file flags), so a write that fails (a full disk, a quota) leaves the file as it was. The temp file needs room for the whole new file beside the old one, so on a full disk even a write that would shrink a file is refused, and the file is left unchanged. A file is written in place instead, and its old contents are written back if that write fails, when it has other hard links; when Open Max cannot give a new file its owner or group (only the superuser can give a file to another user or to a group it is not in); when its access control list cannot be given to a new file (on macOS, where Open Max does not copy one, a file that has a list, or whose directory's inheritable entries would give the new file one); when its directory takes no new file; when the rename over it is refused (a file mounted on its own); or when its path leaves no room for the longer path of a temp file beside it. Such a file whose contents cannot be read first is not written at all, since there would be nothing to write back, and the write reports it unchanged. In a directory flagged append-only, which refuses both the rename and the removal of the temp file, the file is written in place and the temp file, holding the new contents, is left beside it. The temp file that replaces a file is created with mode `0600`, readable and writable only by its creator, until it has the target's owner, group and permissions. A replacement is a new file under the old name, so whatever holds the old file keeps it: a mount of the file itself (a container's single-file bind mount) and another process's open descriptor or inode watch go on seeing the old contents, so mount or watch the directory instead. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max, except that an external tool's environment is a scrubbed baseline (`PATH`, `HOME`, `LANG`, `TERM`) plus the variables its manifest's `env` names. They run without a controlling terminal, so a command that prompts on the terminal (a password, an ssh host key) fails at once instead of drawing over the TUI and waiting out its timeout. `bash` and hooks also get `GIT_TERMINAL_PROMPT=0`, so git names the cause. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
+The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness.
+
+`write_file` and `edit_file` write the new contents to a temp file beside the target and rename it into place, so a write that fails (a full disk, a quota) leaves the file as it was.
+
+- The temp file that replaces a file is created with mode `0600`, readable and writable only by its creator, until it has the target's owner, group and permissions.
+- The temp file takes the target's permissions (less setuid and setgid), owner, group and access control list. It does not take the directory's default list, or the target's other extended attributes or file flags.
+- The temp file needs room for the whole new file beside the old one, so on a full disk even a write that would shrink a file is refused, and the file is left unchanged.
+- A replacement is a new file under the old name, so whatever holds the old file keeps it. A mount of the file itself (a container's single-file bind mount) and another process's open descriptor or inode watch go on seeing the old contents, so mount or watch the directory instead.
+
+A file is written in place instead, and its old contents are written back if that write fails, when:
+
+- it has other hard links;
+- Open Max cannot give a new file its owner or group (only the superuser can give a file to another user or to a group it is not in);
+- its access control list cannot be given to a new file (on macOS, where Open Max does not copy one, a file that has a list, or whose directory's inheritable entries would give the new file one);
+- its directory takes no new file;
+- the rename over it is refused (a file mounted on its own);
+- or its path leaves no room for the longer path of a temp file beside it.
+
+Such a file whose contents cannot be read first is not written at all, since there would be nothing to write back, and the write reports it unchanged. In a directory flagged append-only, which refuses both the rename and the removal of the temp file, the file is written in place and the temp file, holding the new contents, is left beside it.
+
+`bash`, external TOML tools, and hooks are native processes. The harness does not confine them to the project root. They inherit the host filesystem, environment, credentials, and network access of Open Max, except that an external tool's environment is a scrubbed baseline (`PATH`, `HOME`, `LANG`, `TERM`) plus the variables its manifest's `env` names. They run without a controlling terminal, so a command that prompts on the terminal (a password, an ssh host key) fails at once instead of drawing over the TUI and waiting out its timeout. `bash` and hooks also get `GIT_TERMINAL_PROMPT=0`, so git names the cause.
+
+Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
 Open Max itself does not phone home. Apart from native child processes, the harness contacts only the model endpoint you configure.
 
