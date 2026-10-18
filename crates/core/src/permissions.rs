@@ -299,10 +299,6 @@ impl Permissions {
         candidate == invalid && candidate.starts_with(&root)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty() && !self.fail_closed
-    }
-
     /// First matching rule wins. Missing rules → [`PermissionDecision::Default`].
     pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
         if self.fail_closed {
@@ -948,7 +944,8 @@ arg_regex = "^src/"
     fn missing_file_is_default() {
         let tmp = tempfile_dir();
         let perms = Permissions::discover(&tmp, &tmp.join("data"));
-        assert!(perms.is_empty());
+        assert_eq!(perms.fail_closed_reason(), None);
+        assert!(perms.notices().is_empty(), "{:?}", perms.notices());
         assert_eq!(
             perms.evaluate("bash", &json!({"command": "rm -rf /"})),
             PermissionDecision::Default
