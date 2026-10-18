@@ -1584,7 +1584,7 @@ mod tests {
                 env: vec!["TOKEN".into()],
             },
             AgentEvent::ApprovalSettled { approval_id: String::new(), outcome: String::new() },
-            AgentEvent::Refrozen { tools: 0, skills: 0, changes: Vec::new() },
+            AgentEvent::Refrozen { tools: 0, skills: 0, changes: Vec::new(), runs: Vec::new() },
             AgentEvent::SchemasOverBudget { schema_tokens: 0, budget_tokens: 0 },
             AgentEvent::Compacted { tokens_before: 0, tokens_after: 0, compacted_messages: 0 },
             AgentEvent::HookFailed {

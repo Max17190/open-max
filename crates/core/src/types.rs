@@ -224,7 +224,20 @@ pub enum AgentEvent {
     /// added, modified, or removed (".openmax/tools/deploy.toml modified"),
     /// read from the outgoing and incoming registries, so the action space
     /// never mutates silently.
-    Refrozen { tools: usize, skills: usize, changes: Vec<String> },
+    Refrozen {
+        tools: usize,
+        skills: usize,
+        changes: Vec<String>,
+        /// Each external tool this refreeze added or whose manifest changed,
+        /// as (name, the command line it runs with each argv token
+        /// shell-quoted). In auto such a tool is callable from the next step
+        /// with no card, so this is what the TUI shows when it lands.
+        /// In-process only: `serde(skip)` keeps it off the wire, so
+        /// `openmax-stdio/6` bytes are unchanged and a parsed event carries
+        /// it empty.
+        #[serde(skip)]
+        runs: Vec<(String, String)>,
+    },
     /// A forced compaction (`/compact`) finished. The automatic budget prune
     /// speaks through the digest note it leaves in the transcript; the forced
     /// path has no following turn to carry that note to, so the receipt is an
@@ -416,11 +429,14 @@ mod tests {
             }),
             r#"{"session_id":"s1","type":"approval_settled","approval_id":"ap1","outcome":"approved"}"#
         );
+        // `runs` is the TUI's alone: a refreeze that carries one emits the
+        // same bytes as before the field existed.
         assert_eq!(
             env(AgentEvent::Refrozen {
                 tools: 7,
                 skills: 2,
                 changes: vec![".openmax/tools/deploy.toml added".into()],
+                runs: vec![("deploy".into(), "'./deploy.sh'".into())],
             }),
             r#"{"session_id":"s1","type":"refrozen","tools":7,"skills":2,"changes":[".openmax/tools/deploy.toml added"]}"#
         );

@@ -8,6 +8,9 @@
 //! The fast check asserts the call-count contract against a counting sink.
 //! The ignored run prints timings for realistic frame sizes:
 //!   cargo test -p openmax --test frame_io -- --ignored --nocapture
+//!
+//! `first_frame` then runs the real binary on a pseudo-terminal: the first
+//! frame, its colors, and what a turn or `/reload` leaves on screen.
 
 use std::io::{LineWriter, Write};
 
@@ -121,11 +124,14 @@ fn frame_flush_timing() {
     }
 }
 
-/// The first frame against a real pseudo-terminal. Asking the terminal
-/// whether it speaks the kitty keyboard protocol costs a round trip (a
-/// network one over ssh), and a terminal that never answers leaves crossterm
-/// waiting out its 2 s timeout, so the first frame must not wait on it. The
-/// colors it selects are checked here too, as the bytes a terminal receives.
+/// openmax against a real pseudo-terminal: the first frame, its colors, and
+/// what a turn or `/reload` leaves on screen. Asking the terminal whether it
+/// speaks the kitty keyboard protocol costs a round trip (a network one over
+/// ssh), and a terminal that never answers leaves crossterm waiting out its
+/// 2 s timeout, so the first frame must not wait on it. The colors it selects
+/// are checked as the bytes a terminal receives. What a turn or `/reload`
+/// leaves is read from `screen`, the grid those bytes paint, with a stub
+/// completions endpoint (`endpoint`) answering the turn.
 #[cfg(unix)]
 mod first_frame {
     use std::fs::File;
@@ -165,6 +171,15 @@ mod first_frame {
 
     impl Session {
         fn spawn(tag: &str, cols: u16, rows: u16) -> Session {
+            Session::spawn_with(
+                tag,
+                cols,
+                rows,
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#,
+            )
+        }
+
+        fn spawn_with(tag: &str, cols: u16, rows: u16, settings: &str) -> Session {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -174,11 +189,7 @@ mod first_frame {
             let (home, project) = (dir.join("home"), dir.join("project"));
             std::fs::create_dir_all(home.join(".openmax")).unwrap();
             std::fs::create_dir_all(&project).unwrap();
-            std::fs::write(
-                home.join(".openmax").join("settings.json"),
-                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#,
-            )
-            .unwrap();
+            std::fs::write(home.join(".openmax").join("settings.json"), settings).unwrap();
             let (controller, terminal) = pseudo_terminal();
             set_size(&terminal, cols, rows);
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
@@ -551,6 +562,207 @@ mod first_frame {
         let foreign = foreign_colors(&s.out[..frame]);
         assert!(foreign.is_empty(), "{foreign:?}: {}", s.context());
         s.write(ANSWER);
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
+    /// The screen a terminal shows after `out`, row by row: cursor moves,
+    /// erases and printed characters applied to a `cols` by `rows` grid, and
+    /// every other sequence skipped. A frame is a diff against the one before
+    /// it, so the bytes of one line need not arrive together; a person reads
+    /// whole frames, so `out` ends where a frame does.
+    fn screen(out: &[u8], cols: usize, rows: usize) -> Vec<String> {
+        let blank = || vec![vec![' '; cols]; rows];
+        let mut grid = blank();
+        let (mut row, mut col) = (0usize, 0usize);
+        let text = String::from_utf8_lossy(out);
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => match chars.next() {
+                    Some('[') => {
+                        let mut params = String::new();
+                        let mut last = None;
+                        for c in chars.by_ref() {
+                            if ('\x40'..='\x7e').contains(&c) {
+                                last = Some(c);
+                                break;
+                            }
+                            params.push(c);
+                        }
+                        let n: Vec<usize> = params.split(';').map(|p| p.parse().unwrap_or(1)).collect();
+                        match last {
+                            Some('H') => {
+                                row = n.first().copied().unwrap_or(1).max(1) - 1;
+                                col = n.get(1).copied().unwrap_or(1).max(1) - 1;
+                            }
+                            Some('J') if params == "2" || params == "3" => grid = blank(),
+                            Some('K') => {
+                                if let Some(line) = grid.get_mut(row) {
+                                    line[col.min(cols)..].fill(' ');
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // An OSC runs to BEL or to ESC \.
+                    Some(']') => {
+                        while let Some(c) = chars.next() {
+                            if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                '\r' => col = 0,
+                '\n' => row += 1,
+                c if c.is_control() => {}
+                c => {
+                    if let Some(cell) = grid.get_mut(row).and_then(|line| line.get_mut(col)) {
+                        *cell = c;
+                    }
+                    col += 1;
+                }
+            }
+        }
+        grid.into_iter().map(|line| line.into_iter().collect::<String>().trim_end().to_string()).collect()
+    }
+
+    /// A completions endpoint on its own thread: each request, read whole,
+    /// gets the next reply as one JSON body. Returns the base URL.
+    fn endpoint(replies: Vec<String>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                let length = String::from_utf8_lossy(&head)
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                let _ = stream.read_exact(&mut body);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        base_url
+    }
+
+    /// The screen as of the last whole frame, once `done` holds for it or
+    /// when `within` passes. The TUI sends a frame in one write, but the
+    /// pseudo-terminal can hand it to the reader in pieces, and a note in the
+    /// bottom-anchored transcript rewrites every row above the composer, top
+    /// to bottom: part of a frame can show a new row above an old one, which a
+    /// terminal that honours synchronized updates never does.
+    fn screen_when(
+        s: &mut Session,
+        cols: usize,
+        rows: usize,
+        within: Duration,
+        done: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + within;
+        loop {
+            let end =
+                s.out.windows(FRAME_END.len()).rposition(|w| w == FRAME_END).map_or(0, |at| at + FRAME_END.len());
+            let shown = screen(&s.out[..end], cols, rows).join("\n");
+            if done(&shown) || Instant::now() >= deadline {
+                return shown;
+            }
+            s.pump(Duration::from_millis(50));
+        }
+    }
+
+    /// In auto a tool the agent writes mid-turn is callable on its next step
+    /// with no card, so the screen is the one place a person can see what it
+    /// runs before it does: when the tool lands, the transcript names it and
+    /// the exact command line its manifest declares.
+    #[test]
+    fn a_tool_written_mid_turn_shows_the_command_it_runs() {
+        let manifest = "name = \"wordfreq\"\ndescription = \"count words\"\ncommand = \"/bin/echo\"\nargs = [\"release-7f3a\"]\n";
+        let write = serde_json::json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": null, "tool_calls": [{"id": "call-1", "type": "function", "function": {
+                "name": "write_file",
+                "arguments": serde_json::json!({"path": ".openmax/tools/wordfreq.toml", "content": manifest}).to_string(),
+            }}],
+        }}]});
+        let done = serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": "tool ready",
+        }}]});
+        let base_url = endpoint(vec![write.to_string(), done.to_string()]);
+        let settings =
+            serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384}).to_string();
+        let (cols, rows) = (160, 40);
+        // --trust-project records auto for the project, so nothing stops for a card.
+        let mut s = Session::spawn_with("refreeze", cols as u16, rows as u16, &settings);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("no first frame: {}", s.context()));
+        s.write(ANSWER);
+        s.write(b"add the tool\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| shown.contains("tool ready"));
+        assert!(shown.contains("tool ready"), "the turn did not finish:\n{shown}");
+        assert!(
+            shown.contains("tool wordfreq runs: '/bin/echo' 'release-7f3a'"),
+            "the new tool's command line is not on screen:\n{shown}"
+        );
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
+    /// A tool that lands between turns (through a pull, or written by a turn
+    /// that was cancelled before its refreeze) becomes callable, with no card
+    /// in auto, at the next turn start, or on `/reload` if that runs first.
+    /// The reload's note names the tool and the exact command line its
+    /// manifest declares.
+    #[test]
+    fn a_tool_picked_up_by_reload_shows_the_command_it_runs() {
+        let reply = serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": "hello back",
+        }}]});
+        let base_url = endpoint(vec![reply.to_string()]);
+        let settings =
+            serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384}).to_string();
+        let (cols, rows) = (160, 40);
+        let mut s = Session::spawn_with("reload", cols as u16, rows as u16, &settings);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("no first frame: {}", s.context()));
+        s.write(ANSWER);
+        // A first turn creates the session that /reload re-freezes; the hint
+        // that Esc cancels is gone once the turn has settled.
+        s.write(b"hello\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| {
+            shown.contains("hello back") && !shown.contains("esc cancel")
+        });
+        assert!(shown.contains("hello back") && !shown.contains("esc cancel"), "the turn did not settle:\n{shown}");
+        let tools = s.dir.join("project/.openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(
+            tools.join("stamp.toml"),
+            "name = \"stamp\"\ndescription = \"stamp a build\"\ncommand = \"/bin/echo\"\nargs = [\"build-91c2\"]\n",
+        )
+        .unwrap();
+        s.write(b"/reload\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| shown.contains("re-frozen"));
+        assert!(shown.contains("re-frozen"), "the reload did not finish:\n{shown}");
+        assert!(
+            shown.contains("tool stamp runs: '/bin/echo' 'build-91c2'"),
+            "the reloaded tool's command line is not on screen:\n{shown}"
+        );
         s.write(CTRL_C_TWICE);
         let status = s.wait_exit(Duration::from_secs(10));
         assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());

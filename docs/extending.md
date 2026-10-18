@@ -462,8 +462,14 @@ project's records are kept, and exits 0.
 
 Every re-freeze announces a receipt - the `refrozen` event lists each tool or
 skill file added, modified, or removed - so the agent's action space never
-mutates silently. The first re-freeze after a session resumes compares against
-the session's saved manifest, which carries only the loaded tools and the skill
+mutates silently. The TUI also shows, for each tool a re-freeze (automatic or
+`/reload`) added or whose manifest changed, the command line it runs:
+`tool deploy runs: './deploy.sh' 'prod'`. In `auto` no card stops that tool's
+first call, so this line is where its command is visible. It is the TUI's
+alone: the receipt an automatic re-freeze gives the model names the changed
+file and any newly callable tool, never the command, so request bytes do not
+grow. The first re-freeze after a session resumes compares against the
+session's saved manifest, which carries only the loaded tools and the skill
 index, so a skill body edited while the session was closed is not named there.
 
 A ledger that cannot be verified stops appending (a chain nobody can trust

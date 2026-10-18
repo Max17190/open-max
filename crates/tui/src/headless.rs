@@ -316,7 +316,7 @@ async fn run_turn_events(
                 }
                 return stopping.unwrap_or(exit_code);
             }
-            AgentEvent::Refrozen { tools, skills, changes } => {
+            AgentEvent::Refrozen { tools, skills, changes, .. } => {
                 if !json {
                     // `changes` names the capability files that changed; a
                     // refreeze can name none (a manifest that turned

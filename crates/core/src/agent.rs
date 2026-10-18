@@ -1547,12 +1547,14 @@ fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
 /// on-disk config. This is the deliberate, user-triggered cache break behind
 /// `/reload`: the agent authors a tool, skill, or prompt change mid-session
 /// and uses it in the same conversation instead of losing context to `/new`.
-/// Returns `(tool_count, skill_count)` of the newly frozen registry.
+/// Returns the newly frozen registry's tool and skill counts, the capability
+/// files that changed (as `Refrozen::changes`), and what each new or changed
+/// external tool runs (as `Refrozen::runs`).
 pub async fn reload_session(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
-) -> Result<(usize, usize, Vec<String>), String> {
+) -> Result<(usize, usize, Vec<String>, Vec<(String, String)>), String> {
     if !crate::trust::is_trusted(&core.data_dir, project_root)? {
         return Err(format!(
             "project {} is not trusted; establish trust before reloading it",
@@ -1579,7 +1581,7 @@ pub async fn reload_session(
     ensure_session_hydrated(core, session_id, project_root).await?;
 
     let counts = (registry.tools.len(), registry.skills.len());
-    let changes = {
+    let (changes, runs) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
             .get_mut(session_id)
@@ -1590,10 +1592,11 @@ pub async fn reload_session(
             return Err("a turn is in flight; run /reload after it finishes".into());
         }
         let changes = generation_changes(&data.registry, &registry, project_root);
+        let runs = tool_runs(&data.registry, &registry);
         apply_freeze(core, session_id, data, registry, prompt, breakdown);
-        changes
+        (changes, runs)
     };
-    Ok((counts.0, counts.1, changes))
+    Ok((counts.0, counts.1, changes, runs))
 }
 
 /// The numbers one forced compaction reports. Built inside the guarded task,
@@ -2157,6 +2160,26 @@ fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
         .collect()
 }
 
+/// Each external tool the incoming generation adds or whose manifest bytes
+/// changed, with the command line it runs, for `Refrozen::runs` and the
+/// `/reload` note. In auto nothing stops such a tool before its first call,
+/// so the screen is where a person sees what it runs. Nothing the model
+/// reads carries this line: an automatic refreeze's receipt, which rides
+/// every later request, names the changed file and any newly callable tool,
+/// never the command.
+fn tool_runs(old: &Registry, new: &Registry) -> Vec<(String, String)> {
+    new.tools
+        .iter()
+        .filter_map(|spec| {
+            let crate::registry::ToolKind::External(ext) = &spec.kind else { return None };
+            let unchanged = old.get(&spec.name).is_some_and(|before| {
+                matches!(&before.kind, crate::registry::ToolKind::External(b) if b.source_sha256 == ext.source_sha256)
+            });
+            (!unchanged).then(|| (spec.name.clone(), command_line(ext)))
+        })
+        .collect()
+}
+
 /// What the incoming generation changes against the outgoing one, a line per
 /// capability file: `<path> added`, `<path> modified`, or `<path> removed`,
 /// so the action space never changes without a receipt saying where. Read
@@ -2274,19 +2297,21 @@ async fn refreeze_if_extensions_changed(
             Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
                 let added = classify_added_tools(&data.registry, &registry, mode, &core.data_dir, project_root);
                 let changes = generation_changes(&data.registry, &registry, project_root);
+                let runs = tool_runs(&data.registry, &registry);
                 apply_freeze(core, session_id, data, registry, prompt, breakdown);
-                Some((added, changes))
+                Some((added, changes, runs))
             }
             _ => None,
         }
     };
-    if let Some((added_tools, changes)) = applied {
+    if let Some((added_tools, changes, runs)) = applied {
         let receipt =
             refreeze_receipt_text(&changes, &added_tools, &broken, &shadowed, project_root, mode);
         core.send_agent(session_id, AgentEvent::Refrozen {
             tools: counts.0,
             skills: counts.1,
             changes,
+            runs,
         });
         // The Refrozen event reaches the UI; the returned receipt is for the
         // MODEL. The caller appends it to the turn's transcript, closing the
@@ -2338,6 +2363,7 @@ async fn refreeze_between_iterations(
     let mode = core.approval_mode(project_root);
     let added_tools = classify_added_tools(registry, &new_registry, mode, &core.data_dir, project_root);
     let changes = generation_changes(registry, &new_registry, project_root);
+    let runs = tool_runs(registry, &new_registry);
     let broken = new_registry.broken.clone();
     let shadowed = new_registry.shadowed_skills.clone();
     let new_registry = Arc::new(new_registry);
@@ -2367,6 +2393,7 @@ async fn refreeze_between_iterations(
         tools: counts.0,
         skills: counts.1,
         changes,
+        runs,
     });
     true
 }
@@ -4000,6 +4027,19 @@ struct UnapprovedCapability {
     shas: Vec<String>,
 }
 
+/// `command args...` as an external tool's manifest declares it: what the
+/// approval card and the TUI's refreeze line show the tool runs. Each argv
+/// token is shell-quoted, so `a b`, an empty arg, or a value with
+/// quotes/metacharacters keeps its boundary - a space-joined line reads as a
+/// different or ambiguous invocation.
+fn command_line(ext: &crate::registry::ExternalTool) -> String {
+    std::iter::once(&ext.command)
+        .chain(ext.args.iter())
+        .map(|a| crate::doctor::shell_quote(std::path::Path::new(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The unapproved capability file behind `name`, or None when the call needs
 /// no content approval.
 ///
@@ -4035,18 +4075,10 @@ fn unapproved_capability(
     // `openmax --approve <manifest>` blesses the pair.
     let mut shas = vec![ext.source_sha256.clone()];
     shas.extend(code.into_iter().filter_map(|c| c.sha256));
-    // Each argv token shell-quoted, so `a b`, an empty arg, or a value with
-    // quotes/metacharacters keeps its boundary on the card - a space-joined
-    // line reads as a different or ambiguous invocation.
-    let command_line = std::iter::once(&ext.command)
-        .chain(ext.args.iter())
-        .map(|a| crate::doctor::shell_quote(std::path::Path::new(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
     Some(UnapprovedCapability {
         path: path.display().to_string(),
         sha256: ext.source_sha256.clone(),
-        command_line,
+        command_line: command_line(ext),
         env: ext.env.clone(),
         source_path: ext.source_path.clone(),
         shas,
@@ -5899,9 +5931,12 @@ mod tests {
         assert!(reload_session(&core, id, &project).await.is_err());
         core.running.lock().unwrap().remove(id);
 
-        let (tools, skills, _changes) = reload_session(&core, id, &project).await.unwrap();
+        let (tools, skills, _changes, runs) = reload_session(&core, id, &project).await.unwrap();
         assert_eq!(tools, tools::TOOL_NAMES.len() + 1);
         assert_eq!(skills, 0);
+        // /reload makes the tool callable like any refreeze, so the frontend
+        // is handed what it runs.
+        assert_eq!(runs, [("deploy".to_string(), "'/bin/echo'".to_string())]);
 
         let map = core.sessions.lock().await;
         let data = map.get(id).unwrap();
@@ -6057,6 +6092,111 @@ mod tests {
             "capability-file history is no longer recorded"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// In auto a tool written mid-turn is callable from the next step with no
+    /// card. The Refrozen event hands the TUI what it runs, argv quoted as
+    /// the approval card quotes it, and the receipt the model reads names the
+    /// changed file and any newly callable tool but never the command: that
+    /// receipt rides every later request. An edit that changes the command
+    /// is shown again; a refreeze that leaves the tool's manifest alone
+    /// shows nothing for it.
+    #[tokio::test]
+    async fn midturn_refreeze_shows_the_tui_the_command_and_never_the_model() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        core.settings.lock().unwrap().approval_mode = ApprovalMode::Auto;
+        let id = &sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        let tools = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        {
+            let mut data = build_session_data(&core, id, &project).unwrap();
+            data.messages.push(ChatMessage::user("write a deploy tool"));
+            core.sessions.lock().await.insert(id.to_string(), data);
+        }
+        let (mut messages, mut registry) = {
+            let mut map = core.sessions.lock().await;
+            let data = map.get_mut(id).unwrap();
+            let (messages, _seq) = take_messages(data);
+            (messages, data.registry.clone())
+        };
+        let mut refreeze = async |manifest: Option<&str>| {
+            if let Some(manifest) = manifest {
+                std::fs::write(tools.join("deploy.toml"), manifest).unwrap();
+            }
+            messages.push(ChatMessage::tool("c1", "ok"));
+            assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+            let mut runs = None;
+            while let Ok(env) = rx.try_recv() {
+                if let AgentEvent::Refrozen { runs: shown, .. } = env.event {
+                    runs = Some(shown);
+                }
+            }
+            let receipt = messages.last().unwrap().content.clone().unwrap();
+            (runs.expect("a refreeze announces itself"), receipt)
+        };
+
+        let (runs, receipt) = refreeze(Some(
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nargs = [\"release-7f3a\", \"two words\"]\n",
+        ))
+        .await;
+        assert_eq!(runs, [("deploy".to_string(), "'/bin/echo' 'release-7f3a' 'two words'".to_string())]);
+        assert!(receipt.contains("New tools callable from your next step: deploy."), "{receipt}");
+        assert!(
+            !receipt.contains("/bin/echo") && !receipt.contains("release-7f3a"),
+            "the command line reached the model's receipt: {receipt}"
+        );
+
+        let (runs, receipt) = refreeze(Some(
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"id\"]\n",
+        ))
+        .await;
+        assert_eq!(runs, [("deploy".to_string(), "'/bin/sh' '-c' 'id'".to_string())], "an edit shows the new command");
+        // The receipt names the changed file; the tool is not newly callable,
+        // so it is not listed as one, and its command never appears.
+        assert!(receipt.contains(".openmax/tools/deploy.toml modified"), "{receipt}");
+        assert!(!receipt.contains("New tools callable"), "{receipt}");
+        assert!(!receipt.contains("/bin/sh"), "the command line reached the model's receipt: {receipt}");
+
+        // A skill lands; the tool's manifest is untouched, so nothing new runs.
+        let skill = project.join(".agents/skills/notes");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: notes\ndescription: take notes\n---\nbody\n").unwrap();
+        let (runs, _) = refreeze(None).await;
+        assert!(runs.is_empty(), "an unchanged tool is not shown again: {runs:?}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Built-ins never appear, and a registry compared with itself shows
+    /// nothing; against an empty past every external tool is new.
+    #[test]
+    fn tool_runs_lists_only_external_tools_whose_manifest_is_new() {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (data, project) = (dir.join("data"), dir.join("project"));
+        let tools = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        for name in ["alpha", "beta"] {
+            std::fs::write(
+                tools.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\ndescription = \"d\"\ncommand = \"./{name}.sh\"\n"),
+            )
+            .unwrap();
+        }
+        let registry = Registry::build(&data, &project);
+        assert!(tool_runs(&registry, &registry).is_empty());
+        assert_eq!(
+            tool_runs(&Registry::builtin_only(), &registry),
+            [
+                ("alpha".to_string(), "'./alpha.sh'".to_string()),
+                ("beta".to_string(), "'./beta.sh'".to_string()),
+            ]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7256,12 +7396,19 @@ mod tests {
         assert!(manifest.external_tools.iter().any(|t| t.name == "deploy"));
         assert_ne!(manifest.ext_fingerprint, 0);
         let mut saw_refrozen = false;
+        let mut runs = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if matches!(ev.event, AgentEvent::Refrozen { tools, .. } if tools == tools::TOOL_NAMES.len() + 1) {
-                saw_refrozen = true;
+            if let AgentEvent::Refrozen { tools: count, runs: shown, .. } = ev.event {
+                if count == tools::TOOL_NAMES.len() + 1 {
+                    saw_refrozen = true;
+                    runs = shown;
+                }
             }
         }
         assert!(saw_refrozen, "UI must be told the session shape changed");
+        // The UI is told what the new tool runs; the model's receipt is not.
+        assert_eq!(runs, [("deploy".to_string(), "'/bin/echo'".to_string())]);
+        assert!(!receipt.contains("/bin/echo"), "the command line reached the model's receipt: {receipt}");
 
         // Second check with no further writes: converged, no rebuild.
         let after = core.sessions.lock().await.get(id).unwrap().registry.clone();

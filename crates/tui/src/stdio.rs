@@ -384,10 +384,10 @@ async fn drive_loop<W: Write>(
                             }
                         };
                         match reloaded {
-                            Ok((tools, skills, changes)) => {
+                            Ok((tools, skills, changes, _runs)) => {
                                 let env = AgentEventEnvelope {
                                     session_id: session_id.clone(),
-                                    event: AgentEvent::Refrozen { tools, skills, changes },
+                                    event: AgentEvent::Refrozen { tools, skills, changes, runs: Vec::new() },
                                 };
                                 emit_event(out, &env);
                             }
