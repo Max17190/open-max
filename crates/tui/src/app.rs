@@ -471,6 +471,10 @@ pub struct App {
     header_width: u16,
     status_line: Line<'static>,
     status_width: u16,
+    /// The approval mode `status_line` shows. A turn can tighten the live
+    /// mode to one another process saved without anything here marking the
+    /// chrome, so a draw compares it with the live mode.
+    status_mode: Option<config::ApprovalMode>,
 }
 
 /// Returns how the loop ended and, apart from it, the warnings that must wait
@@ -766,6 +770,7 @@ impl App {
             header_width: u16::MAX,
             status_line: Line::default(),
             status_width: u16::MAX,
+            status_mode: None,
         }
     }
 
@@ -1683,7 +1688,22 @@ impl App {
         }
     }
 
+    /// Step to the next mode. When the read-back finds a stricter mode another
+    /// session saved for this project, the press shows it and saves nothing:
+    /// the user has not seen the mode it would step from, and stepping from
+    /// ask lands on auto, over that session's ask, on a press meant to
+    /// tighten. The next press steps from it. Only the read-back is compared;
+    /// the path is re-resolved after it, so a path that now leads to another
+    /// project steps from that project's mode.
     fn step_approval_mode(&mut self) {
+        let shown = self.approval_mode();
+        self.core.refresh_saved_approval_modes();
+        let live = self.approval_mode();
+        if live != shown {
+            self.note(&format!("approvals: {} for this project (saved in another session)", live.as_str()));
+            self.dirty.mark_chrome();
+            return;
+        }
         self.refresh_project_root();
         self.select_approval_mode(self.approval_mode().next());
     }
@@ -1693,13 +1713,16 @@ impl App {
         self.core.approval_mode_canonical(&self.project_root)
     }
 
-    /// Re-resolve `project_root`. Turns and saves resolve the project path
-    /// when they run, so once the path leads to another project (the
-    /// directory moved and a symlink took its place) a stale root would show
-    /// one project's mode while turns enforce the other's. Called where the
-    /// mode is read to act on it: a submit, a tool call, a selection. Never
-    /// per frame.
+    /// Re-resolve `project_root` and read back the modes other processes
+    /// saved. Turns and saves resolve the project path when they run, so once
+    /// the path leads to another project (the directory moved and a symlink
+    /// took its place) a stale root would show one project's mode while
+    /// turns enforce the other's. Likewise a stricter mode saved by another
+    /// frontend on this project applies to turns, so the line must show it.
+    /// Called where the mode is read to act on it: a submit, a tool call, a
+    /// selection. Never per frame.
     fn refresh_project_root(&mut self) {
+        self.core.refresh_saved_approval_modes();
         let root = open_max_core::state::canonical_root(&self.project);
         if root != self.project_root {
             self.project_root = root;
@@ -3825,11 +3848,13 @@ impl App {
     }
 
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
-        if self.dirty.chrome || self.status_width != area.width {
+        // Read the mode before taking the settings lock: the accessor takes
+        // it too, and this mutex is not reentrant.
+        let mode = self.approval_mode();
+        if self.dirty.chrome || self.status_width != area.width || self.status_mode != Some(mode) {
             self.status_width = area.width;
-            // Read the mode before taking the settings lock: the accessor
-            // takes it too, and this mutex is not reentrant.
-            let approvals = self.approval_mode().as_str().to_string();
+            self.status_mode = Some(mode);
+            let approvals = mode.as_str().to_string();
             let model = self.core.settings.lock().unwrap().model.clone();
             let width = area.width as usize;
             let hint = self.status_hint();
@@ -5043,6 +5068,79 @@ mod tests {
         render_app(&mut app, 100, 12);
         let during_turn = line_text(&app.status_line);
         assert!(during_turn.ends_with("  readonly "), "{during_turn:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A TUI showing auto, with this project trusted in auto, and a second
+    /// core on the same data dir standing in for another TUI.
+    fn app_beside_a_sibling(prefix: &str) -> (std::path::PathBuf, std::path::PathBuf, App, std::sync::Arc<Core>) {
+        let dir = crate::test_temp_dir(prefix);
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+        open_max_core::trust::grant_trust(&dir, &project, config::ApprovalMode::Auto).unwrap();
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let (files_tx, _files_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(core, project.clone(), files_tx);
+        render_app(&mut app, 100, 12);
+        let launch = line_text(&app.status_line);
+        assert!(launch.ends_with("  auto "), "{launch:?}");
+        let sibling = Core::new(dir.clone()).unwrap().0;
+        (dir, project, app, sibling)
+    }
+
+    /// Every TUI on a data dir saves to one trust store, and a stricter mode
+    /// another one saved for this project gates this one's turns. Shift+Tab
+    /// on a line still showing the launch mode must show that mode first and
+    /// save nothing; only the next press steps from it. The status line must
+    /// show it once a turn has taken it up.
+    #[tokio::test]
+    async fn approval_mode_follows_a_stricter_mode_another_tui_saved() {
+        let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-sibling-mode");
+        let saved = || Core::new(dir.clone()).unwrap().0.approval_mode(&project);
+
+        sibling.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
+        assert_eq!(saved(), config::ApprovalMode::Readonly, "the press saved over the other TUI's readonly");
+        render_app(&mut app, 100, 12);
+        let shown = line_text(&app.status_line);
+        assert!(shown.ends_with("  readonly "), "{shown:?}");
+
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "the next press steps from readonly");
+        assert_eq!(saved(), config::ApprovalMode::Ask);
+        render_app(&mut app, 100, 12);
+        let stepped = line_text(&app.status_line);
+        assert!(stepped.ends_with("  ask "), "{stepped:?}");
+
+        // A running turn reads the store back before its next call; nothing
+        // in the TUI marks the chrome for that.
+        sibling.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+        app.core.refresh_saved_approval_modes();
+        app.dirty.clear();
+        render_app(&mut app, 100, 12);
+        let during_turn = line_text(&app.status_line);
+        assert!(during_turn.ends_with("  readonly "), "the line must show the mode turns enforce: {during_turn:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ask comes before auto in the cycle, so a press that stepped from ask
+    /// another TUI saved would save auto over it, on a press the user meant
+    /// to take this TUI from auto to readonly.
+    #[tokio::test]
+    async fn shift_tab_never_saves_auto_over_ask_another_tui_saved() {
+        let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-sibling-ask");
+        sibling.set_project_approval_mode(&project, config::ApprovalMode::Ask).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(
+            Core::new(dir.clone()).unwrap().0.approval_mode(&project),
+            config::ApprovalMode::Ask,
+            "one press saved auto over the other TUI's ask",
+        );
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask);
+        render_app(&mut app, 100, 12);
+        let shown = line_text(&app.status_line);
+        assert!(shown.ends_with("  ask "), "{shown:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 

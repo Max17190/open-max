@@ -859,19 +859,22 @@ async fn execute_readonly_batch(
                 // Calls past the parallelism cap start only as earlier ones
                 // end, long after admission. Auto admitted this one without
                 // asking about its content; if the mode has left auto since,
-                // unapproved content must not start on that admission, or it
-                // runs under ask with no card. Read live, as the serial path
-                // reads the mode right before each call.
-                if unasked
-                    && core.approval_mode_canonical(canonical_root) != ApprovalMode::Auto
-                    && unapproved_capability(&registry, data_dir, &root, &name).is_some()
-                {
-                    let refused = tools::ToolOutcome {
-                        ok: false,
-                        output: MODE_LEFT_AUTO_BEFORE_START.into(),
-                        ..Default::default()
-                    };
-                    return (refused, false);
+                // here or in another frontend that saved it, unapproved
+                // content must not start on that admission, or it runs under
+                // ask with no card. Read the store back, then the live mode,
+                // as the serial path does right before each call.
+                if unasked {
+                    core.refresh_saved_approval_modes();
+                    if core.approval_mode_canonical(canonical_root) != ApprovalMode::Auto
+                        && unapproved_capability(&registry, data_dir, &root, &name).is_some()
+                    {
+                        let refused = tools::ToolOutcome {
+                            ok: false,
+                            output: MODE_LEFT_AUTO_BEFORE_START.into(),
+                            ..Default::default()
+                        };
+                        return (refused, false);
+                    }
                 }
                 (registry.execute(&name, &args, data_dir, &root, caps, cancel).await, true)
             }
@@ -2576,7 +2579,9 @@ async fn refresh_approval_policy(
 
 /// The mode is read by `canonical_root`, the turn's one resolution of
 /// `project_root`, so a refresh walks no path. Hooks and permissions are still
-/// discovered under `project_root` as the turn was given it.
+/// discovered under `project_root` as the turn was given it. A stricter mode
+/// another process saved since applies from here, like a selection made in
+/// this one.
 #[allow(clippy::too_many_arguments)]
 async fn refresh_approval_policy_canonical(
     core: &Arc<Core>,
@@ -2588,6 +2593,7 @@ async fn refresh_approval_policy_canonical(
     permissions: &mut TurnPermissions,
     messages: &mut Vec<ChatMessage>,
 ) {
+    core.refresh_saved_approval_modes();
     let current = core.approval_mode_canonical(canonical_root);
     if current != *mode {
         *mode = current;
@@ -2633,6 +2639,9 @@ async fn run_loop(
     // path resolves while a turn runs, and each read still consults the live
     // map, so a mode chosen on an approval card applies at once.
     let canonical_root = crate::state::canonical_root(project_root);
+    // A stricter mode saved by another process since the last turn gates
+    // this one from its first hook.
+    core.refresh_saved_approval_modes();
     // Discover hooks first: user_prompt_submit gates the input before it
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
@@ -3324,7 +3333,12 @@ async fn run_loop(
                     let source = unapproved_source.as_ref();
                     let approval_reason =
                         if source.is_some() { "unapproved_source" } else { "gate" };
-                    match request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await {
+                    let answer = request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await;
+                    // A card can wait for minutes. Read the store back so
+                    // readonly saved in another frontend meanwhile refuses
+                    // the action, as readonly selected here does.
+                    core.refresh_saved_approval_modes();
+                    match answer {
                         ApprovalOutcome::Approved if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Readonly => {
                             (tools::ToolOutcome {
                                 ok: false,
@@ -8149,6 +8163,20 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_queued_batch_call_does_not_start_once_the_mode_leaves_auto() {
+        queued_batch_call_after_ask(false).await;
+    }
+
+    /// The same when ask is saved by another frontend on the project: the
+    /// queued call reads the store back before it starts, as a serial call
+    /// does, so it does not start on auto's admission either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_queued_batch_call_does_not_start_once_another_frontend_saves_ask() {
+        queued_batch_call_after_ask(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn queued_batch_call_after_ask(elsewhere: bool) {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -8201,7 +8229,8 @@ mod tests {
         let mut stop = None;
         while tokio::time::Instant::now() < deadline {
             if !switched && started.exists() {
-                core.set_project_approval_mode(&project, ApprovalMode::Ask).unwrap();
+                let saver = if elsewhere { Core::new(core.data_dir.clone()).unwrap().0 } else { core.clone() };
+                saver.set_project_approval_mode(&project, ApprovalMode::Ask).unwrap();
                 std::fs::write(&go, "").unwrap();
                 switched = true;
             }
@@ -8331,6 +8360,91 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A turn starts under the mode it enforces. Ask saved by another process
+    /// after this one launched in auto gates the turn from its first hook: an
+    /// unapproved user_prompt_submit hook, which auto runs without content
+    /// approval, stays inert under ask.
+    #[tokio::test]
+    async fn a_turn_starts_under_a_stricter_mode_another_process_saved() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (project, data, marker) = (dir.join("project"), dir.join("data"), dir.join("hook-ran"));
+        std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+        std::fs::write(
+            project.join(".openmax/hooks/mark.toml"),
+            format!("event = \"user_prompt_submit\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch '{}'\"]\n", marker.display()),
+        )
+        .unwrap();
+        crate::trust::grant_trust(&data, &project, ApprovalMode::Auto).unwrap();
+        let (core, mut rx) = Core::new(data.clone()).unwrap();
+        let (base_url, _) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+
+        Core::new(data).unwrap().0.set_project_approval_mode(&project, ApprovalMode::Ask).unwrap();
+        start_turn(core.clone(), "sibling-ask".into(), project.clone(), "go".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert!(!marker.exists(), "an unapproved hook ran under the auto this process launched with");
+        assert_eq!(core.approval_mode(&project), ApprovalMode::Ask);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A card can wait for minutes. Readonly saved by another frontend while
+    /// it waits refuses the approved action, as readonly selected in this
+    /// process does: the approval was given for a session that is now
+    /// read-only.
+    #[tokio::test]
+    async fn readonly_saved_in_another_frontend_while_a_card_waits_refuses_the_action() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (project, data) = (dir.join("project"), dir.join("data"));
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/brokentool.toml"),
+            "name = \"brokentool\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"tool.sh\"]\nmutating = true\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("tool.sh"), "echo ran > tool-result\n").unwrap();
+        crate::trust::grant_trust(&data, &project, ApprovalMode::Ask).unwrap();
+        let (core, mut rx) = Core::new(data.clone()).unwrap();
+        let (base_url, _) = counting_endpoint(BROKEN_TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_agent_iterations = 1;
+        }
+
+        start_turn(core.clone(), "sibling-readonly".into(), project.clone(), "use it".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (mut cards, mut ends) = (0, Vec::new());
+        loop {
+            let env = tokio::time::timeout_at(deadline, rx.recv()).await.expect("the turn never finished").unwrap();
+            match env.event {
+                AgentEvent::ApprovalRequest { approval_id, .. } => {
+                    cards += 1;
+                    Core::new(data.clone()).unwrap().0.set_project_approval_mode(&project, ApprovalMode::Readonly).unwrap();
+                    core.respond_approval(&approval_id, true);
+                }
+                AgentEvent::ToolEnd { output, .. } => ends.push(output),
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(cards, 1);
+        assert!(!project.join("tool-result").exists(), "the approved action ran after another frontend saved readonly");
+        assert_eq!(ends, ["This session is now read-only; the pending action was not executed."]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
