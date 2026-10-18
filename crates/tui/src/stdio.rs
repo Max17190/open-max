@@ -1066,14 +1066,16 @@ mod tests {
 
         let title = sessions::latest(&core, &dir.display().to_string()).unwrap().unwrap().title;
         assert_eq!(title, "MARKER: greet world", "the raw slash line must not be submitted");
-        // The turn really started: the only error is the missing endpoint.
+        // The turn really started: the only error is the unconfigured
+        // endpoint, model and window, and it reached the wire.
         let errors: Vec<&str> = lines
             .iter()
             .filter(|l| l["type"] == "error")
             .filter_map(|l| l["message"].as_str())
             .collect();
         assert!(
-            errors.iter().all(|m| m.contains("no model endpoint configured")),
+            !errors.is_empty()
+                && errors.iter().all(|m| m.contains("no endpoint, model or context window configured")),
             "{errors:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
