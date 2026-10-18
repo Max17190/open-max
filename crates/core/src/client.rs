@@ -365,6 +365,10 @@ struct StreamChoice {
     // Some servers omit `delta` entirely on the final finish_reason chunk,
     // and some send it as null.
     delta: Option<StreamDeltaJson>,
+    // A whole reply: a server that ignores `stream` and labels its one JSON
+    // body as anything but application/json reaches the stream parser, which
+    // reads that body as one bare data line whose choice has no `delta`.
+    message: Option<StreamDeltaJson>,
     // A failure can ride the choice instead of the chunk.
     error: Option<Value>,
 }
@@ -882,7 +886,7 @@ async fn read_sse(
                 saw_terminator = true;
                 finish_reason = reason;
             }
-            let delta = choice.delta.unwrap_or_default();
+            let delta = choice.delta.or(choice.message).unwrap_or_default();
             if let Some(text) = delta.content {
                 if !text.is_empty() {
                     content.push_str(&text);
@@ -2111,6 +2115,28 @@ mod tests {
         let reply = json!({"choices":[{"message":{"content":"ok"}}]});
         let result = parse_complete_response(&reply, &mut |_| {}).unwrap();
         assert!(result.reasoning_content.is_none() && result.reasoning.is_none());
+    }
+
+    /// A one-shot JSON reply labeled as anything but application/json is
+    /// read as a stream of one bare line, whose choice carries the whole
+    /// reply as `message` rather than `delta`. Reading only `delta` dropped
+    /// the answer and its calls while the finish_reason ended the reply as
+    /// complete.
+    #[tokio::test]
+    async fn a_one_shot_json_reply_under_another_content_type_keeps_its_answer() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        for content_type in ["text/plain", "text/event-stream"] {
+            let url = spawn_response_once(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}\n", body.len() + 1),
+                None,
+            );
+            let result = ChatClient::new(url, None, "m".into(), None, 64)
+                .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+            assert_eq!(result.content, "ok", "{content_type}");
+            assert_eq!(result.finish_reason, "tool_calls", "{content_type}");
+            let calls: Vec<(&str, &str)> = result.tool_calls.iter().map(|c| (c.id.as_str(), c.function.name.as_str())).collect();
+            assert_eq!(calls, [("c1", "bash")], "{content_type}");
+        }
     }
 
     /// Some servers report prompt cache hits only as a top-level
