@@ -150,9 +150,9 @@ prompt never reaches the model); `post_tool_use`, `session_start` (a session's
 first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` (receives the stop reason, fires even on cancel) observe only. A
 `turn_end` hook with `blocking = true` is a completion gate instead: a nonzero
-exit refuses the turn's end and sends its reason back as a user message, and
-after 8 honored refusals the turn ends `unverified`. Each hook gets one JSON
-payload on stdin.
+exit refuses the turn's end and sends its reason back as a user message; up to
+8 refusals are honored, and a further refusal ends the turn `unverified`. Each
+hook gets one JSON payload on stdin.
 
 A `post_tool_use` payload carries the tool result the model saw: `output` (its
 first 16 KiB, cut on a character boundary), `output_bytes` (that result's
