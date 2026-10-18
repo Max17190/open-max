@@ -80,11 +80,16 @@ blocks install scripts by default, which is fine here: the binary is fetched on
 first run instead, once, and cached.
 
 Either way there is no Rust toolchain and no build. The script picks the right
-prebuilt binary for your machine, checks it against the published SHA-256
-(skipped, with a message, on a system with no `sha256sum`), and puts `openmax`
-in `~/.openmax/bin` next to the settings and sessions the harness already keeps
-there. It adds that directory to your `PATH` through your shell profile, so
-open a new shell (or `source ~/.openmax/bin/env`) and run `openmax`.
+prebuilt binary for your machine, checks it against the published SHA-256, and
+puts `openmax` in `~/.openmax/bin` next to the settings and sessions the
+harness already keeps there. It adds that directory to your `PATH` through your
+shell profile, so open a new shell (or `source ~/.openmax/bin/env`) and run
+`openmax`.
+
+The check uses `sha256sum`, or `shasum -a 256` where there is no `sha256sum`
+(macOS 14 and earlier), and is skipped, with a message, only on a system with
+neither. The installers of 2026.10.1 and earlier skip it on any system without
+`sha256sum`.
 
 macOS and Linux, x86_64 and arm64. Linux gets a glibc build, or a static musl
 build automatically when glibc is older than 2.35, so it also runs on Alpine and

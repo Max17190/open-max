@@ -43,13 +43,13 @@ fn dist_targets() -> Vec<String> {
     targets
 }
 
-/// The lines of one job in ci.yml, from its key up to the next key at the
+/// The lines of one job in a workflow, from its key up to the next key at the
 /// jobs' indentation or less (the next job, or the end of `jobs:`).
-fn ci_job(name: &str) -> Vec<String> {
-    let ci = read(".github/workflows/ci.yml");
+fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
+    let text = read(workflow);
     let key = format!("  {name}:");
-    let mut lines = ci.lines().skip_while(|line| line.trim_end() != key);
-    assert!(lines.next().is_some(), "ci.yml has no `{name}` job");
+    let mut lines = text.lines().skip_while(|line| line.trim_end() != key);
+    assert!(lines.next().is_some(), "{workflow} has no `{name}` job");
     lines
         .take_while(|line| {
             let body = line.trim_start();
@@ -57,6 +57,11 @@ fn ci_job(name: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+/// The lines of one job in ci.yml.
+fn ci_job(name: &str) -> Vec<String> {
+    workflow_job(".github/workflows/ci.yml", name)
 }
 
 /// `(target, runner)` for each entry of CI's release-build matrix.
@@ -267,4 +272,173 @@ fn ci_pins_every_action_to_a_commit() {
         unpinned.is_empty(),
         "actions not pinned to a full commit SHA with their version in a trailing comment: {unpinned:?}"
     );
+}
+
+/// The release patches the shell installer after dist builds it and before it
+/// is uploaded, on every run of the job. dist's own installer skips the
+/// archive check wherever `sha256sum` is missing, which is every macOS before
+/// 15, so a release that uploaded it unpatched would install whatever archive
+/// it downloaded there.
+#[test]
+fn the_release_patches_the_installer_it_uploads() {
+    let job = workflow_job(".github/workflows/release.yml", "build-global-artifacts");
+    let step = |what: &str, wanted: &dyn Fn(&str) -> bool| {
+        job.iter()
+            .position(|line| wanted(line.trim()))
+            .unwrap_or_else(|| panic!("release.yml's build-global-artifacts job has no {what}"))
+    };
+    let build = step("dist build of the installer", &|line| {
+        line.starts_with("dist build ") && line.contains("--artifacts=global")
+    });
+    let patch = step("step that patches the installer", &|line| {
+        line == "run: scripts/patch-installer-checksum.sh target/distrib/openmax-installer.sh"
+    });
+    let upload = step("upload step", &|line| line == r#"- name: "Upload artifacts""#);
+    assert!(
+        build < patch && patch < upload,
+        "the installer is patched at line {patch} of the job, not between its build (line {build}) and its upload (line {upload})"
+    );
+    // Either one lets the job upload dist's installer unpatched.
+    let soft: Vec<&str> = job
+        .iter()
+        .map(|line| line.trim().trim_start_matches("- "))
+        .filter(|line| {
+            let key = line.split_once(':').map_or("", |(key, _)| key.trim());
+            matches!(key.trim_matches(|c| c == '"' || c == '\''), "if" | "continue-on-error")
+        })
+        .collect();
+    assert!(soft.is_empty(), "build-global-artifacts can skip the installer patch: {soft:?}");
+}
+
+/// Where `tool` is on this machine, if anywhere: on PATH, or in /usr/sbin or
+/// /sbin, where macOS keeps `sha256sum` and a test's PATH may not look.
+fn system_tool(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(["/usr/sbin", "/sbin"].map(PathBuf::from))
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The installer a release publishes checks the archive it downloads with
+/// `sha256sum`, or with `shasum -a 256` where there is no `sha256sum` (macOS
+/// 14 and earlier ship only `shasum`), and refuses one whose hash differs. It
+/// skips the check, saying so, only on a machine with neither. The check is
+/// dist's own, as the v2026.10.1 installer shipped it, patched by the script
+/// the release runs on it, and each run sees only the tools named on its PATH.
+#[test]
+fn the_installer_checks_the_archive_with_sha256sum_or_shasum() {
+    let fixture = "crates/tui/tests/fixtures/dist-installer-checksum.sh";
+    let dist = read(fixture);
+    // Checked against the version the fixture names on its first line, not
+    // DIST_VERSION, which a dist bump updates for the runners: only
+    // re-extracting the fixture clears this.
+    let extracted_from = dist
+        .lines()
+        .next()
+        .and_then(|line| line.split_once("cargo-dist "))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{fixture}'s first line names no cargo-dist version"));
+    assert_eq!(
+        manifest_table("workspace.metadata.dist").get("cargo-dist-version").and_then(toml::Value::as_str),
+        Some(extracted_from),
+        "cargo-dist changed, and with it maybe the installer's check: re-extract {fixture} from an installer the new version generates, name that version on its first line, and update scripts/patch-installer-checksum.sh to match it"
+    );
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("openmax-installer-check-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let installer = dir.join("installer.sh");
+    // Patching only the first of two checks would leave the second skipping,
+    // so an installer with two fails as one with none does.
+    std::fs::write(&installer, dist.repeat(2)).unwrap();
+    let patch = || {
+        let out = Command::new("sh")
+            .arg(repo().join("scripts/patch-installer-checksum.sh"))
+            .arg(&installer)
+            .output()
+            .unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (patched, report) = patch();
+    assert!(!patched, "the patch applies to an installer with two sha256 checks");
+    assert!(report.contains("more than one sha256 check"), "{report}");
+    assert_eq!(std::fs::read_to_string(&installer).unwrap(), dist.repeat(2), "a patch that failed changed the installer");
+
+    std::fs::write(&installer, &dist).unwrap();
+    let (patched, report) = patch();
+    assert!(patched, "the patch does not apply to dist's installer: {report}");
+    // The patched installer no longer has dist's check, so a second run is
+    // what a release built by a dist whose check changed would see: it fails
+    // and leaves the installer as it was.
+    let once = std::fs::read_to_string(&installer).unwrap();
+    let (patched, report) = patch();
+    assert!(!patched, "the patch applies twice, so it would apply to a check it was not written for");
+    assert!(report.contains("no sha256 check"), "{report}");
+    assert_eq!(std::fs::read_to_string(&installer).unwrap(), once, "a patch that failed changed the installer");
+
+    let archive = dir.join("input.tar.xz");
+    std::fs::write(&archive, "openmax archive\n").unwrap();
+    // The SHA-256 of the archive's contents above.
+    let right = "8c334d8230bd31265cd8f1d920694c85b6e148cbfa496a59386c0ca6655e3911";
+    let wrong = "0".repeat(64);
+    let check = |tools: &str, hashers: &[&str], want: &str| {
+        let bin = dir.join(tools);
+        if !bin.exists() {
+            std::fs::create_dir(&bin).unwrap();
+            for tool in hashers.iter().copied().chain(["awk"]) {
+                let found = system_tool(tool)
+                    .unwrap_or_else(|| panic!("no `{tool}` on this machine, and this test runs the installer's check with it"));
+                std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
+            }
+        }
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(r#". "$1"; PATH=$2; verify_checksum "$3" sha256 "$4""#)
+            .arg("sh")
+            .arg(&installer)
+            .arg(&bin)
+            .arg(&archive)
+            .arg(want)
+            .env("PRINT_QUIET", "0")
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), report)
+    };
+
+    // CI has both hashers and runs both cases. A machine can lack either
+    // (macOS 14 and earlier have no `sha256sum`, a Linux without perl no
+    // `shasum`), and there the case it cannot run is skipped, saying so.
+    let under_ci = std::env::var_os("CI").is_some();
+    for hasher in ["sha256sum", "shasum"] {
+        if system_tool(hasher).is_none() {
+            assert!(!under_ci, "no `{hasher}` on this CI runner, so the installer's check with it goes untested");
+            eprintln!("skipping the installer's check with only `{hasher}`: there is no `{hasher}` on this machine");
+            continue;
+        }
+        let tools = format!("only-{hasher}");
+        let (code, report) = check(&tools, &[hasher], right);
+        assert_eq!(code, Some(0), "with only {hasher}, the published archive fails the check: {report}");
+        assert!(!report.contains("skipping"), "with only {hasher}, the check is skipped: {report}");
+        let (code, report) = check(&tools, &[hasher], &wrong);
+        assert_eq!(code, Some(1), "with only {hasher}, an archive with another hash is accepted: {report}");
+        assert!(
+            report.contains("checksum mismatch") && report.contains(right),
+            "with only {hasher}, the refusal does not name the hash it computed: {report}"
+        );
+    }
+    let (code, report) = check("neither", &[], &wrong);
+    assert_eq!(code, Some(0), "with neither hasher, the install stops: {report}");
+    assert!(
+        report.contains("skipping sha256 checksum verification"),
+        "with neither hasher, the check is skipped without saying so: {report}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
