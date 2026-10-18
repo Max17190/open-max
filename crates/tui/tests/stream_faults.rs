@@ -1208,7 +1208,11 @@ fn a_tool_call_only_stream_cut_anywhere_is_resent_and_runs_once() {
         .collect();
     let classes = Mutex::new(BTreeSet::new());
     run_all(&cases, CutCase::label, |case| {
-        classes.lock().unwrap().insert(run_cut(case));
+        // The case runs before the lock is taken: a guard held across it
+        // would run the cases one at a time, and a failing case would poison
+        // the set for every case after it.
+        let class = run_cut(case);
+        classes.lock().unwrap().insert(class);
     });
     assert_eq!(classes.into_inner().unwrap(), BTreeSet::from(["finished", "resent"]));
 }
