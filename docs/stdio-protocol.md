@@ -58,11 +58,13 @@ ignored; blank lines are skipped; EOF behaves like `quit`.
 ## Events (stdout)
 
 Every event line carries the flattened `session_id`, then a `type`
-discriminator, then its fields. openmax emits keys in that order, but object
-key order is not significant: parse every line by field name. Only two lines
-carry no `session_id`: `protocol_error` and the `approval_mode`
-acknowledgement (`hello` and `transcript` are not events either, but carry
-one).
+discriminator, then its fields, and is byte for byte the line
+`openmax --print --json` writes for the same event. Every other line starts
+with `type`, then its fields in the order this page shows. openmax emits keys
+in those orders, but object key order is not significant: parse every line by
+field name. Only two lines carry no `session_id`: `protocol_error` and the
+`approval_mode` acknowledgement (`hello` and `transcript` are not events
+either, but carry one).
 
 | `type` | Fields |
 | --- | --- |
