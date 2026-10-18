@@ -2489,7 +2489,7 @@ impl App {
                                 extensions::display_base_url(&ep.base_url),
                                 ep.model
                             )),
-                            Err(e) => self.note(&e.to_string()),
+                            Err(e) => self.error(&e.to_string()),
                         }
                     }
                 }
@@ -2672,7 +2672,8 @@ impl App {
                         )
                     }
                     Err(e) => (
-                        format!("error: {e}"),
+                        // One row: the first line carries the whole verdict.
+                        format!("error: {}", e.to_string().lines().next().unwrap_or_default()),
                         s.model.clone(),
                         extensions::display_base_url(&s.base_url),
                         extensions::endpoint_host(&s.base_url).unwrap_or_else(|| s.base_url.clone()),

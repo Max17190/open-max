@@ -37,9 +37,10 @@ one is never batched: it takes the serial path, which asks for approval or,
 in `readonly`, refuses the call.
 
 A missing settings file means defaults, and the default `base_url` and `model`
-are empty: endpoint resolution fails with an actionable error until you set
-both, here or through a named provider. There is no built-in localhost
-fallback. A settings file that exists but does not parse, uses an unknown key,
+are empty: endpoint resolution fails until `base_url`, `model` and
+`context_tokens` are set, here or through a named provider, and one error
+names every one that is missing, with an example. There is no built-in
+localhost fallback. A settings file that exists but does not parse, uses an unknown key,
 or sets an unrecognized `approval_mode` is a startup error (fail closed): Open
 Max exits with the parse reason instead of silently reverting your endpoint and
 approval policy to defaults.

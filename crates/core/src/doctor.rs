@@ -882,7 +882,8 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                         endpoint.context_tokens,
                     )),
                     Err(reason) => Status::Warn(format!(
-                        "parses, but every turn will refuse until this resolves: {reason}; read at launch, not hot (openmax --spec settings)"
+                        "parses, but every turn will refuse until this resolves: {}; read at launch, not hot (openmax --spec settings)",
+                        reason.to_string().lines().next().unwrap_or_default().trim_end_matches('.')
                     )),
                 },
             }),

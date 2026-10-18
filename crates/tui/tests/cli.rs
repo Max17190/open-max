@@ -3415,3 +3415,20 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
     assert_eq!(status.code(), Some(143), "{status:?}");
     assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}");
 }
+
+/// A fresh install has no endpoint, model or window. One run must name all
+/// three with an example, because settings are read at launch: reported one
+/// at a time, each field costs an edit and a restart.
+#[test]
+fn a_fresh_install_is_told_every_missing_setting_at_once() {
+    let (project, home) = fresh_dirs("fresh-install");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no endpoint, model or context window configured"), "{stderr}");
+    for key in ["\"base_url\"", "\"model\"", "\"context_tokens\"", "\"api_key\""] {
+        assert!(stderr.contains(key), "{key} missing from {stderr}");
+    }
+    assert!(stderr.contains("read at launch"), "{stderr}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
