@@ -2619,9 +2619,24 @@ fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
+    // A session that never says hello would hold the read below: past the
+    // wait, the run is killed, which ends its stdout.
+    let (said_hello, watch) = std::sync::mpsc::channel::<()>();
+    let pid = child.id() as libc::pid_t;
+    std::thread::spawn(move || {
+        let wait = std::time::Duration::from_secs(10);
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(wait) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    });
     let mut hello = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut hello).unwrap();
-    assert!(hello.contains(r#""type":"hello""#), "{hello}");
+    let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut hello);
+    let _ = said_hello.send(());
+    if !hello.contains(r#""type":"hello""#) {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!("no hello: {hello}{}", String::from_utf8_lossy(&output.stderr));
+    }
     let tools = project.join(".openmax").join("tools");
     std::fs::create_dir_all(&tools).unwrap();
     let pipe = tools.join("stalled.toml");
@@ -2794,7 +2809,10 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     let fail = |child: &mut std::process::Child, what: &str| -> ! {
         let _ = child.kill();
         let _ = child.wait();
-        panic!("{tag}: {what}");
+        // The run is gone, so its stderr ends: what the reader still holds
+        // says why it fell short.
+        let said: Vec<String> = std::iter::from_fn(|| lines.recv_timeout(wait).ok()).collect();
+        panic!("{tag}: {what}\n{}", said.join("\n"));
     };
     match held {
         IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal => {
@@ -2809,8 +2827,18 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         | IndexHeld::FreedAfterTheSignal
         | IndexHeld::BeforeAReload
         | IndexHeld::TrustBeforeAnApprovalMode => {
+            // A session that never says hello would hold the read below:
+            // past the wait, the run is killed, which ends its stdout.
+            let (said_hello, watch) = std::sync::mpsc::channel::<()>();
+            let pid = child.id() as libc::pid_t;
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(wait) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            });
             let mut hello = String::new();
-            stdout.read_line(&mut hello).unwrap();
+            let _ = stdout.read_line(&mut hello);
+            let _ = said_hello.send(());
             if !hello.contains(r#""type":"hello""#) {
                 fail(&mut child, &format!("no hello: {hello}"));
             }
