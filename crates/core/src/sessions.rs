@@ -852,59 +852,85 @@ pub(crate) fn commit_compaction(
 /// between the two leaves an empty or partial file under the final name with
 /// the old contents already gone. Synced, the bytes land first, so a power
 /// cut leaves the old file or the new one, never a mix.
-pub(crate) fn write_atomic(path: &PathBuf, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+    replace_atomic(path, bytes.as_ref(), 0o666, |_| Ok(())).map_err(|e| e.to_string())?;
+    // The rename lives in the directory, so syncing the directory puts it on
+    // the disk ahead of whatever is written next. Best effort, and after the
+    // fact: the file is already replaced, and an error here must not report
+    // a write that landed as one that did not.
+    let _ = sync_dir(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")));
+    Ok(())
+}
+
+/// `write_atomic` without the directory sync. That sync orders the rename
+/// ahead of later writes, which the harness's own files rely on; a file
+/// tool's write needs only to land whole or not at all. `prepare` runs on
+/// the temp file before any byte is written to it, so a caller can give it
+/// the mode and owner of the file it replaces. The temp file is created
+/// with `mode` (Unix, less the umask), so a caller replacing a file other
+/// users may not read passes one they cannot open it with either: a reader
+/// that opens it before `prepare` narrows it keeps reading what is written
+/// after. The error keeps its kind.
+pub(crate) fn replace_atomic(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    prepare: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let base = path
+    let mut base = path
         .file_name()
-        .ok_or_else(|| "path has no file name".to_string())?
-        .to_string_lossy();
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    // The suffix pushes a name near the length limit past it, so the file
+    // could never be written; the id alone keeps the temp name unique.
+    while base.len() > 64 {
+        base.pop();
+    }
     let id = uuid::Uuid::new_v4().simple();
     let tmp = parent.join(format!("{base}.{id}.tmp"));
-    let written = std::fs::File::create(&tmp).and_then(|mut file| {
-        file.write_all(bytes.as_ref())?;
-        sync(&file, &tmp)
-    });
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    // A name already taken is not this call's to remove.
+    let mut file = options.open(&tmp)?;
+    let written = prepare(&file).and_then(|()| file.write_all(bytes)).and_then(|()| sync(&file, &tmp));
+    drop(file);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.to_string());
+        return Err(e);
     }
     // Reject directories, including symlinks to directories.
     if path.is_dir() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{} is a directory", path.display()));
+        return Err(std::io::Error::other(format!("{} is a directory", path.display())));
     }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => {
-            // The rename lives in the directory, so syncing the directory
-            // puts it on the disk ahead of whatever is written next. Best
-            // effort, and after the fact: the file is already replaced, and
-            // an error here must not report a write that landed as one that
-            // did not.
-            let _ = sync_dir(&parent);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e.to_string())
-        }
-    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Put `file`'s writes on the device ahead of every write issued after this
 /// returns. Every barrier in this module goes through here, so a test can
 /// see which ones a write issued and in what order.
 ///
-/// Ordering is all the callers need: no rename may land before the bytes it
-/// names, and no transcript rewrite before the archive it relies on. On
-/// Apple targets the standard library's sync is a full drive cache flush,
-/// which would make every atomic write, and so every turn, wait on the drive;
-/// a barrier sync gives the ordering without that wait. A file system that
-/// does not take one gets a plain sync instead.
-fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+/// Ordering is all the callers in this module need: no rename may land
+/// before the bytes it names, and no transcript rewrite before the archive
+/// it relies on. On Apple targets the standard library's sync is a full
+/// drive cache flush, which would make every atomic write, and so every
+/// turn, wait on the drive; a barrier sync gives the ordering without that
+/// wait. A file system that does not take one gets a plain sync instead.
+/// The file tools' write in place syncs here for the error instead: a file
+/// system that refuses a cached write when it flushes it reports that here.
+pub(crate) fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     sync_device(file, path).map_err(|e| cannot_sync(e, path))
 }
 
@@ -964,7 +990,7 @@ fn dir_sync_unsupported(e: &std::io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| unsupported.contains(&code))
 }
 
-fn write_jsonl(path: &PathBuf, messages: &[ChatMessage]) -> Result<(), String> {
+fn write_jsonl(path: &Path, messages: &[ChatMessage]) -> Result<(), String> {
     let mut out = String::new();
     for msg in messages {
         out.push_str(&serde_json::to_string(msg).map_err(|e| e.to_string())?);
@@ -1246,7 +1272,11 @@ pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
     remove(core, id, true)
 }
 
-fn backed(core: &Core, id: &str) -> bool {
+/// Whether session `id` has history: a transcript, archive, or compaction
+/// file exists. Reads no lock, so a run whose stop deadline cut its
+/// `discard_if_empty` short can still tell a session with history, which was
+/// never to be removed, from an empty one it leaves indexed.
+pub fn backed(core: &Core, id: &str) -> bool {
     [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
         .iter()
         .any(|p| p.exists())

@@ -89,6 +89,29 @@ the prompts after it.
 | 3 | The project is not trusted, or trust cannot be granted from this process |
 | 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue, though an `unverified` from a gate that could not start repeats until the hook is repaired |
 
+Tools run in a session of their own, so Ctrl+C at the shell reaches openmax
+and not them. SIGINT, SIGTERM, or SIGHUP to a print or stdio run cancels the
+running turn, which stops each tool's process group (SIGTERM, then SIGKILL),
+and exits 128 plus the signal number (130, 143, 129) once the turn has ended,
+waiting at most 3 seconds for it; a `turn_end` hook still running then is killed.
+Removing a new session that nothing was saved to takes its share of the same 3
+seconds: while another openmax process holds the session index past them, the
+session stays indexed and the run says so on stderr. Once they are used up, the
+run still takes up to 100 ms to check that the session is empty before it says
+so; a check that takes longer is reported as a session that may be empty. A
+signal while the run waits on that index to open its session or to start a turn
+ends it the same way. A second signal exits without waiting for the turn, with
+128 plus its own number, and kills the tools outright. Either exit first waits up
+to 250 ms for a tool command still being started, so one that starts within that
+wait is killed with the rest. Neither stops a process that leaves its tool's
+group (one that starts a session of its own, as `setsid` does), or a tool command
+whose start outlasts that wait: it runs on after openmax has exited. While a
+consumer that stopped reading holds stdout full, the run cannot act on the first
+signal, and only a second one ends it. A signal the run inherited as ignored, as
+under `nohup`, stays ignored. The TUI, where Ctrl+C is a key, ends the session on
+one of these signals as `/quit` does, then exits with the same status, unless its
+terminal has already gone away.
+
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
 [stdio protocol](stdio-protocol.md).

@@ -1899,6 +1899,230 @@ fn a_finished_stream_still_runs_the_same_write_call() {
     );
 }
 
+/// A write that fails partway, as on a full disk, over a quota or past a file
+/// size limit, must leave the file as it was. Writing in place truncated the
+/// file first, so the failure left a prefix of the new contents under the old
+/// name while the tool said only that it could not write. A file with other
+/// hard links is still written in place, so its old contents are written
+/// back. A file that did not exist is not created, and the result says which.
+#[cfg(unix)]
+#[test]
+fn a_write_that_fails_partway_leaves_the_file_as_it_was() {
+    use std::os::unix::process::CommandExt;
+    let (project, home) = fresh_dirs("failed-write");
+    let original: String = (0..1000).map(|i| format!("record {i:06} value=ORIGINAL\n")).collect();
+    let longer = "ORIGINAL_BUT_MUCH_LONGER_VALUE";
+    let grown = original.replace("ORIGINAL", longer);
+    std::fs::write(project.join("data.txt"), &original).unwrap();
+    std::fs::write(project.join("linked.txt"), &original).unwrap();
+    std::fs::hard_link(project.join("linked.txt"), project.join("alias.txt")).unwrap();
+    let grow = |path: &str| {
+        serde_json::json!({"path": path, "old_string": "ORIGINAL", "new_string": longer, "replace_all": true})
+    };
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (
+            sse_tool_calls(&[
+                ("edit_file", grow("data.txt")),
+                ("edit_file", grow("linked.txt")),
+                ("write_file", serde_json::json!({"path": "fresh.txt", "content": grown})),
+            ]),
+            true,
+        ),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    // Halfway between the two sizes: the old contents fit under the limit
+    // and the new ones cannot.
+    let limit = ((original.len() + grown.len()) / 2) as libc::rlim_t;
+    let mut command = cmd(&project, &home);
+    command.args(["--trust-project", "--json", "-p", "grow the values"]);
+    // SAFETY: the closure makes two system calls, allocating nothing and
+    // taking no lock, and they change only the child. With SIGXFSZ ignored,
+    // a write past the limit fails with EFBIG instead of killing the process.
+    unsafe {
+        command.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let cap = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &cap) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    // The limit is the process's, so it also caps the session transcript
+    // under HOME once the turn appends the assistant message that carries
+    // the new contents. That save fails too; the turn reports it as a
+    // warning, runs the calls anyway, and exits 1 for it, so the exit code
+    // says nothing about the writes. The tool results and the files do. The
+    // output is read while the child runs: the tool_start lines carry the
+    // whole new contents, more than a pipe holds unread.
+    let out = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let ends: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["type"] == "tool_end")
+        .collect();
+    assert_eq!(ends.len(), 3, "every write must run: {stdout}");
+    for name in ["data.txt", "linked.txt", "alias.txt"] {
+        let after = std::fs::read_to_string(project.join(name)).unwrap();
+        assert!(after == original, "a failed write must leave {name} as it was, not {} bytes", after.len());
+    }
+    assert!(!project.join("fresh.txt").exists(), "a failed write must not leave a partial new file");
+    let said: Vec<&str> = ends.iter().map(|end| end["output"].as_str().unwrap_or_default()).collect();
+    assert!(ends.iter().all(|end| end["ok"] == false), "{stdout}");
+    assert!(said[0].starts_with("cannot write data.txt") && said[0].ends_with("data.txt is unchanged"), "{said:?}");
+    assert!(said[1].starts_with("cannot write linked.txt") && said[1].ends_with("old contents were written back"), "{said:?}");
+    assert!(said[2].starts_with("cannot write fresh.txt") && said[2].ends_with("fresh.txt was not created"), "{said:?}");
+    let names: Vec<_> = std::fs::read_dir(&project).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left behind: {names:?}");
+}
+
+/// Replacing a file with a new one must not change what makes it the same
+/// file to everything else: its mode, its group, the other names a hard link
+/// gives it, the symlink that points at it, and whether it can be written at
+/// all. A file in a directory that does not let a new file be created next
+/// to it is still writable in place, and a name near the length limit still
+/// leaves room for the temp file beside it. A hard-linked file this user may
+/// write but not read is left unchanged, and the result says so: written in
+/// place for its second name, it could not have its old contents put back if
+/// that write failed. That refusal is new; the rest held when every write
+/// was made in place. A new file gets 0666 less the umask, as one created in
+/// place did, and a replaced file loses setuid, as a write by anyone but the
+/// superuser clears it.
+#[cfg(unix)]
+#[test]
+fn a_write_keeps_the_files_mode_links_and_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    let (project, home) = fresh_dirs("write-identity");
+    // 240 of the 255 bytes a name may have.
+    let long = format!("{}.txt", "n".repeat(236));
+    std::fs::write(project.join(&long), "old\n").unwrap();
+    let long_new = format!("{}.txt", "m".repeat(236));
+    // A group this user is in that a new file here would not get.
+    let grouped = project.join("grouped.txt");
+    std::fs::write(&grouped, "old\n").unwrap();
+    let mut groups = [0 as libc::gid_t; 64];
+    // SAFETY: getgroups writes at most 64 entries into the buffer it is given.
+    let count = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+    let own = std::fs::metadata(&grouped).unwrap().gid();
+    let other = groups[..count.max(0) as usize].iter().copied().find(|&gid| gid != own);
+    if let Some(gid) = other {
+        std::os::unix::fs::chown(&grouped, None, Some(gid)).unwrap();
+    }
+    let script = project.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+    // This user owns it, so it may carry setuid.
+    let setuid = project.join("setuid.sh");
+    std::fs::write(&setuid, "#!/bin/sh\necho old\n").unwrap();
+    std::fs::set_permissions(&setuid, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    assert_eq!(std::fs::metadata(&setuid).unwrap().mode() & 0o7777, 0o4755);
+    std::fs::write(project.join("shared.txt"), "old\n").unwrap();
+    std::fs::hard_link(project.join("shared.txt"), project.join("alias.txt")).unwrap();
+    std::fs::write(project.join("real.txt"), "old\n").unwrap();
+    std::os::unix::fs::symlink("real.txt", project.join("link.txt")).unwrap();
+    let readonly = project.join("readonly.txt");
+    std::fs::write(&readonly, "old\n").unwrap();
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // The superuser may write it anyway, in place or not.
+    let refused = std::fs::OpenOptions::new().write(true).open(&readonly).is_err();
+    // Written in place for its second name, with nothing to put back if
+    // that write failed, since it cannot be read: left alone instead.
+    let writeonly = project.join("writeonly.txt");
+    std::fs::write(&writeonly, "old\n").unwrap();
+    std::fs::hard_link(&writeonly, project.join("writeonly-alias.txt")).unwrap();
+    std::fs::set_permissions(&writeonly, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let unreadable = std::fs::File::open(&writeonly).is_err();
+    let locked = project.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("inside.txt"), "old\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let edit = |path: &str| serde_json::json!({"path": path, "old_string": "old", "new_string": "new"});
+    let calls = [
+        ("write_file", serde_json::json!({"path": "run.sh", "content": "#!/bin/sh\necho new\n"})),
+        ("edit_file", edit("shared.txt")),
+        ("edit_file", edit("link.txt")),
+        ("edit_file", edit("readonly.txt")),
+        ("edit_file", edit("locked/inside.txt")),
+        ("edit_file", edit(&long)),
+        ("write_file", serde_json::json!({"path": long_new, "content": "new\n"})),
+        ("edit_file", edit("grouped.txt")),
+        ("edit_file", edit("setuid.sh")),
+        ("write_file", serde_json::json!({"path": "writeonly.txt", "content": "new\n"})),
+    ];
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_calls(&calls), true),
+        (HELLO_SSE.to_string(), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    // Set for the child alone, so no other test's files are created under
+    // it, and unlike the usual 022, so a new file's mode shows it.
+    let umask: libc::mode_t = 0o027;
+    let mut command = cmd(&project, &home);
+    command.args(["--trust-project", "--json", "-p", "update the files"]);
+    // SAFETY: the closure makes one system call, allocating nothing and
+    // taking no lock, and it changes only the child.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    let out = command.output().unwrap();
+    let code = out.status.code();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<serde_json::Value> =
+        stdout.lines().map(|l| serde_json::from_str(l).expect("every stdout line is JSON")).collect();
+    // Writable again before any assertion, so a failure leaves nothing that
+    // cannot be deleted.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&writeonly, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(lines.iter().filter(|l| l["type"] == "tool_end").count(), calls.len(), "{stdout}");
+
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\necho new\n");
+    assert_eq!(std::fs::metadata(&script).unwrap().mode() & 0o7777, 0o750, "the mode must survive");
+    assert_eq!(std::fs::read_to_string(project.join("alias.txt")).unwrap(), "new\n", "both names must see the edit");
+    assert_eq!(std::fs::metadata(project.join("shared.txt")).unwrap().nlink(), 2, "the link must survive");
+    assert_eq!(std::fs::read_to_string(project.join("real.txt")).unwrap(), "new\n");
+    assert!(project.join("link.txt").is_symlink(), "the symlink must stay a symlink");
+    assert_eq!(std::fs::read_to_string(locked.join("inside.txt")).unwrap(), "new\n", "{stdout}");
+    assert_eq!(std::fs::read_to_string(project.join(&long)).unwrap(), "new\n", "{stdout}");
+    assert_eq!(std::fs::read_to_string(project.join(&long_new)).unwrap(), "new\n", "{stdout}");
+    let created = std::fs::metadata(project.join(&long_new)).unwrap().mode() & 0o7777;
+    assert_eq!(created, 0o640, "a new file gets 0666 less the umask of 027");
+    assert_eq!(std::fs::read_to_string(&setuid).unwrap(), "#!/bin/sh\necho new\n");
+    assert_eq!(std::fs::metadata(&setuid).unwrap().mode() & 0o7777, 0o755, "a replacement drops setuid");
+    assert_eq!(std::fs::read_to_string(&grouped).unwrap(), "new\n");
+    // The superuser may read and write any file, and a user in one group
+    // has no second one to keep, so those checks cannot run for them. Said
+    // aloud, so such a run does not pass for one that made every check.
+    if let Some(gid) = other {
+        assert_eq!(std::fs::metadata(&grouped).unwrap().gid(), gid, "the group must survive");
+    } else {
+        eprintln!("skipped: this user is in no second group, so grouped.txt's group is not checked");
+    }
+    if refused {
+        assert_eq!(std::fs::read_to_string(&readonly).unwrap(), "old\n", "a file it may not write is not replaced");
+    } else {
+        eprintln!("skipped: this user may write the 0444 readonly.txt, so its refusal is not checked");
+    }
+    if unreadable {
+        assert_eq!(std::fs::read_to_string(&writeonly).unwrap(), "old\n", "{stdout}");
+        let said = lines.iter().rfind(|l| l["type"] == "tool_end").unwrap()["output"].clone();
+        assert!(said.as_str().is_some_and(|s| s.ends_with("writeonly.txt is unchanged")), "{said}");
+    } else {
+        eprintln!("skipped: this user may read the 0200 writeonly.txt, so the refusal this test was added for is not checked; run it as a user who is not the superuser");
+    }
+    let names: Vec<_> = std::fs::read_dir(&project).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left behind: {names:?}");
+}
+
 #[test]
 fn assistant_text_never_dispatches_a_tool() {
     let call = r#"<tool_call>{"name":"write_file","arguments":{"path":"side-effect.txt","content":"written"}}</tool_call>"#;
@@ -2371,4 +2595,823 @@ fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
     let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(".openmax/settings.json")).unwrap()).unwrap();
     assert_eq!(settings["approval_mode"], "ask", "the global default must not change");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A run whose model answered with one bash call that leaves a tree behind,
+/// the shape of a build or a dev server the agent started: the shell (which
+/// then becomes a long foreground command) and a background child each
+/// record their pid, and both outlive any test unless something stops them.
+struct ToolTree {
+    child: std::process::Child,
+    /// Held open: a stdio client that has not quit, so only a signal ends it.
+    _stdin: Option<std::process::ChildStdin>,
+    pids: Vec<i32>,
+    base: PathBuf,
+}
+
+/// Start `args` (a print or a stdio run) and return once the bash call's
+/// shell and its background child are both running. `preamble` runs first in
+/// that shell.
+fn start_tool_tree(tag: &str, args: &[&str], preamble: &str) -> ToolTree {
+    let (project, home) = fresh_dirs(tag);
+    let pid_file = project.parent().unwrap().join("pids");
+    let script = format!(
+        "{preamble}echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+        p = pid_file.display()
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let stdio = args.contains(&"--stdio");
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .args(args)
+        .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take();
+    if let Some(stdin) = stdin.as_mut() {
+        writeln!(stdin, r#"{{"cmd":"user","text":"start the tree"}}"#).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pids = loop {
+        let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        let pids: Vec<i32> = recorded.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        if pids.len() == 2 {
+            break pids;
+        }
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the tool tree never started: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    ToolTree { child, _stdin: stdin, pids, base: project.parent().unwrap().to_path_buf() }
+}
+
+/// Send each signal after its delay, wait for the run to end, and return its
+/// output and every recorded pid still alive once the tree had time to go.
+/// Survivors are killed before returning, so a failing assertion leaks
+/// nothing.
+fn signal_tool_tree(
+    tree: ToolTree,
+    signals: &[(std::time::Duration, libc::c_int)],
+) -> (std::process::Output, Vec<i32>) {
+    let ToolTree { child, _stdin, pids, base } = tree;
+    for (delay, signal) in signals {
+        std::thread::sleep(*delay);
+        unsafe { libc::kill(child.id() as libc::pid_t, *signal) };
+    }
+    let output = finish_with_deadline(child);
+    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while pids.iter().any(alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = pids.iter().copied().filter(alive).collect();
+    for pid in &survivors {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(base);
+    (output, survivors)
+}
+
+fn last_event(stdout: &[u8]) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(stdout);
+    let last = stdout.lines().last().unwrap_or_default();
+    serde_json::from_str(last).unwrap_or_else(|_| panic!("the stream must end in an event: {stdout}"))
+}
+
+/// SIGTERM is how a supervisor, a CI runner, or a frontend shutting down
+/// stops a run. Every tool runs in a session of its own, so the signal
+/// reaches openmax alone, and dying on it left the shell and its children
+/// changing the project with nobody left to report to. The run stops the
+/// tree first, ends its stream with the cancelled turn's done event, and
+/// exits 143, the status of a job a SIGTERM stopped.
+#[test]
+fn sigterm_stops_a_print_run_and_its_tool_tree() {
+    let tree = start_tool_tree("sigterm-print", &["--json", "-p", "start the tree"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGTERM)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(143), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+}
+
+/// Ctrl+C at a shell sends SIGINT to openmax's process group, which no tool
+/// is in. A stdio client gets the terminator a cancel gives it, then the 130
+/// exit.
+#[test]
+fn sigint_stops_a_stdio_session_and_its_tool_tree() {
+    let tree = start_tool_tree("sigint-stdio", &["--stdio"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGINT)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(130), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+}
+
+/// A terminal that closes sends SIGHUP. A text run says the turn stopped and
+/// exits 129.
+#[test]
+fn sighup_stops_a_text_print_run_and_its_tool_tree() {
+    let tree = start_tool_tree("sighup-print", &["-p", "start the tree"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGHUP)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(129), "{:?}\n{stderr}", output.status);
+    assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
+}
+
+/// A second signal while the first is still stopping the tools exits
+/// without waiting for that stop. Exiting runs no destructor, so the tool
+/// groups must still be killed on the way out. This tree ignores SIGTERM, so
+/// the cancel's grace is still running when the second signal lands, and
+/// only that kill stops it.
+#[test]
+fn a_second_signal_kills_the_tool_tree_on_the_way_out() {
+    let tree = start_tool_tree("sigterm-twice", &["--json", "-p", "start the tree"], "trap '' TERM; ");
+    let (output, survivors) = signal_tool_tree(
+        tree,
+        &[
+            (std::time::Duration::ZERO, libc::SIGTERM),
+            (std::time::Duration::from_millis(100), libc::SIGTERM),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(143), "{:?}\n{stderr}", output.status);
+}
+
+/// A consumer that stops reading leaves the run blocked in a write to a full
+/// pipe, so the first signal never reaches the stopped turn: the run stays
+/// up. The second must still end it: waiting for stdout on the way out
+/// would hold the exit until something drained the pipe, and only SIGKILL,
+/// which stops no tool, would end it.
+#[test]
+fn a_second_signal_exits_while_output_is_stuck_on_a_full_pipe() {
+    use std::os::fd::AsRawFd;
+    let (project, home) = fresh_dirs("sigterm-stuck-pipe");
+    let (base_url, _requests, _server) =
+        spawn_scripted_server(vec![(sse_text(&"x".repeat(1 << 20)), true)]);
+    write_settings(&home, &base_url);
+    let mut child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "say a lot"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Held and never read until the run has ended. The answer is sixteen
+    // times what a pipe holds, so once the bytes waiting in the pipe stop
+    // growing, the run is blocked writing the rest.
+    let mut stdout = child.stdout.take().unwrap();
+    let queued = || {
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int, the bytes waiting in the pipe.
+        unsafe { libc::ioctl(stdout.as_raw_fd(), libc::FIONREAD, &mut n) };
+        n
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (mut last, mut steady) = (0, 0);
+    while steady < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = queued();
+        steady = if now > 0 && now == last { steady + 1 } else { 0 };
+        last = now;
+    }
+    let pid = child.id() as libc::pid_t;
+    let signal = || unsafe { libc::kill(pid, libc::SIGTERM) };
+    signal();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let stuck = child.try_wait().unwrap().is_none();
+    signal();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut written = Vec::new();
+    let _ = stdout.read_to_end(&mut written);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert!(steady >= 3, "the output never stalled on the full pipe");
+    // A precondition, not the behavior under test: while the writer is
+    // blocked, the run cannot act on the first signal. A change that lets it
+    // must stall this run another way to keep covering the second signal.
+    assert!(
+        stuck,
+        "precondition: the first signal ended a run whose writer was blocked, so this \
+         test no longer reaches the second signal's exit; stall the run another way"
+    );
+    let status = status.expect("the second signal did not end a run stuck writing its output");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let written = String::from_utf8_lossy(&written);
+    assert!(!written.contains(r#""type":"done""#), "the stuck run still finished its stream");
+}
+
+/// A reload reads every extension manifest, and a read can stall: here the
+/// manifest is a pipe nobody writes. No turn runs during a reload, so a
+/// signal must end the session at once; waiting the read out held the stop
+/// until a second signal.
+#[test]
+fn a_signal_ends_a_stdio_session_stalled_in_a_reload() {
+    use std::os::unix::ffi::OsStrExt;
+    let (project, home) = fresh_dirs("sigterm-reload");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let mut child = cmd(&project, &home)
+        .args(["--trust-project", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A session that never says hello would hold the read below: past the
+    // wait, the run is killed, which ends its stdout.
+    let (said_hello, watch) = std::sync::mpsc::channel::<()>();
+    let pid = child.id() as libc::pid_t;
+    std::thread::spawn(move || {
+        let wait = std::time::Duration::from_secs(10);
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(wait) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    });
+    let mut hello = String::new();
+    let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut hello);
+    let _ = said_hello.send(());
+    if !hello.contains(r#""type":"hello""#) {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!("no hello: {hello}{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let tools = project.join(".openmax").join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let pipe = tools.join("stalled.toml");
+    let path = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    // SAFETY: mkfifo reads one NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{}", std::io::Error::last_os_error());
+    writeln!(stdin, r#"{{"cmd":"reload"}}"#).unwrap();
+    // A write end opens without blocking only once the reload is reading the
+    // pipe. Held open and never written, it keeps that read waiting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let _writer = loop {
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened =
+            std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&pipe);
+        if let Ok(writer) = opened {
+            break writer;
+        }
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the reload never read the manifest: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    drop(stdin);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let status = status.expect("SIGTERM did not end a session stalled in a reload");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
+/// When the test takes the session index lock, or for one case the trust
+/// store's, standing in for another openmax process on the same data dir
+/// whose write takes as long as it likes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum IndexHeld {
+    /// From before the run starts: its session setup waits on the lock.
+    FromLaunch,
+    /// As `FromLaunch`, but the lock is freed a moment after the signal, so
+    /// the session opens inside the stop's deadline. No turn ran: the stop
+    /// must remove the session it opened, not leave it indexed.
+    OpenFreedAfterTheSignal,
+    /// Once a stdio session has said hello, before its first turn: starting
+    /// that turn claims the session, which waits on the lock.
+    BeforeTheTurn,
+    /// As `BeforeTheTurn`, but the lock is freed a moment after the signal,
+    /// so the turn starts inside the stop's deadline: the stop must cancel
+    /// that turn and end its stream with the cancelled `done`, not exit
+    /// past a turn it never stopped.
+    FreedAfterTheSignal,
+    /// Once a stdio session has said hello, before a `reload`: the reload
+    /// claims the session, which waits on the lock. No turn runs, so the
+    /// stop must end the session without an answer to the reload, and the
+    /// empty session it leaves stays indexed.
+    BeforeAReload,
+    /// Once a stdio session has said hello, the trust store's lock instead
+    /// of the index, before an `approval_mode`: saving the mode waits on it.
+    /// The stop must end the session without an answer to the command, and
+    /// with the index free it removes the empty session.
+    TrustBeforeAnApprovalMode,
+    /// While a fresh run's first turn waits on a model that never answers:
+    /// nothing is saved, so the stop removes the empty session, and that
+    /// removal waits on the lock.
+    DuringTheTurn,
+    /// Once the model hung up on a fresh run's first request and stopped
+    /// listening, so the turn is retrying. The cancelled turn's save then
+    /// waits on the lock inside a runtime worker, and that worker can be the
+    /// one left to drive the runtime's timers: no runtime timer fires until
+    /// the lock is free.
+    AfterTheModelHungUp,
+    /// While a stdio session's second turn waits on a model that never
+    /// answers, once its first turn finished and saved history. The session
+    /// is not empty, so the stop must keep it without a warning, even when
+    /// the deadline passes before the empty-session check gets its turn.
+    AfterASavedTurn,
+}
+
+/// A signal must end a print or stdio run within the stop's deadline
+/// wherever the run, or its cancelled turn, is waiting on the session index
+/// lock or the trust store's. Each of these waits could hold the first
+/// signal unanswered for as long as the other process kept the lock, so that
+/// only a second signal ended the run. The run must exit
+/// 143 within the deadline, plus half of it for the exit itself, and say so
+/// when the empty session it created stays indexed, and only then.
+fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
+    // The binary's STOP_SETTLE: a cancelled command's settle, then a second
+    // for the rest of the turn.
+    let bound = open_max_core::execution::CANCEL_SETTLE + std::time::Duration::from_secs(1);
+    let margin = bound / 2;
+    let (project, home) = fresh_dirs(tag);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
+    // An endpoint that takes one request and stops listening. Unless it
+    // hangs up, the turn stays in that first model request, so nothing of
+    // it is saved. After a saved turn, the request it takes is the second:
+    // the first gets a finished answer.
+    let (asked, request) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if held == IndexHeld::AfterASavedTurn {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let _ = read_request(&mut stream);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{HELLO_SSE}",
+                    HELLO_SSE.len()
+                )
+                .as_bytes(),
+            );
+        }
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let _ = read_request(&mut stream);
+        let _ = asked.send(stream);
+    });
+    let sessions = home.join(".openmax").join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let lock_path = if held == IndexHeld::TrustBeforeAnApprovalMode {
+        home.join(".openmax").join("trust.lock")
+    } else {
+        sessions.join("index.lock")
+    };
+    let mut held_lock = Some(
+        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path).unwrap(),
+    );
+    let take_lock = |lock: &Option<std::fs::File>| {
+        lock.as_ref().unwrap().try_lock().expect("nothing else holds the lock yet")
+    };
+    if matches!(held, IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal) {
+        take_lock(&held_lock);
+    }
+    let stdio = args.contains(&"--stdio");
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .args(args)
+        .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open: a stdio client that has not quit, so only the signal ends it.
+    let mut stdin = child.stdin.take();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (line_tx, lines) = std::sync::mpsc::channel::<String>();
+    let stderr = {
+        let stderr = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut all = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = line_tx.send(line.clone());
+                all.push_str(&line);
+                all.push('\n');
+            }
+            all
+        })
+    };
+    let wait = std::time::Duration::from_secs(10);
+    // The model's connection, held open while the turn waits on it.
+    let mut endpoint = None;
+    let fail = |child: &mut std::process::Child, what: &str| -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        // The run is gone, so its stderr ends: what the reader still holds
+        // says why it fell short.
+        let said: Vec<String> = std::iter::from_fn(|| lines.recv_timeout(wait).ok()).collect();
+        panic!("{tag}: {what}\n{}", said.join("\n"));
+    };
+    match held {
+        IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal => {
+            // The trust line comes just before the signal watcher starts, and
+            // the setup waits on the lock just after it.
+            if !std::iter::from_fn(|| lines.recv_timeout(wait).ok()).any(|l| l.contains("trusted project")) {
+                fail(&mut child, "the run never reached its session setup");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        IndexHeld::BeforeTheTurn
+        | IndexHeld::FreedAfterTheSignal
+        | IndexHeld::BeforeAReload
+        | IndexHeld::TrustBeforeAnApprovalMode => {
+            // A session that never says hello would hold the read below:
+            // past the wait, the run is killed, which ends its stdout.
+            let (said_hello, watch) = std::sync::mpsc::channel::<()>();
+            let pid = child.id() as libc::pid_t;
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(wait) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            });
+            let mut hello = String::new();
+            let _ = stdout.read_line(&mut hello);
+            let _ = said_hello.send(());
+            if !hello.contains(r#""type":"hello""#) {
+                fail(&mut child, &format!("no hello: {hello}"));
+            }
+            take_lock(&held_lock);
+            let command = match held {
+                IndexHeld::BeforeAReload => r#"{"cmd":"reload"}"#,
+                IndexHeld::TrustBeforeAnApprovalMode => r#"{"cmd":"approval_mode","mode":"ask"}"#,
+                _ => r#"{"cmd":"user","text":"wait"}"#,
+            };
+            writeln!(stdin.as_mut().unwrap(), "{command}").unwrap();
+            // Time for the session to read the command and start on it.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        IndexHeld::AfterASavedTurn => {
+            let stdin = stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"cmd":"user","text":"one"}}"#).unwrap();
+            // A first turn that never ends would hold the read below: past
+            // the wait, the run is killed, which ends its stdout.
+            let (turn_ended, watch) = std::sync::mpsc::channel::<()>();
+            let pid = child.id() as libc::pid_t;
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(wait) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            });
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stdout.read_line(&mut line).unwrap_or(0) == 0 {
+                    fail(&mut child, "the stream ended before the first turn's done");
+                }
+                if line.contains(r#""type":"done""#) {
+                    break;
+                }
+            }
+            let _ = turn_ended.send(());
+            if !line.contains(r#""stop_reason":"stop""#) {
+                fail(&mut child, &format!("the first turn did not finish: {line}"));
+            }
+            writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
+            match request.recv_timeout(wait) {
+                Ok(stream) => endpoint = Some(stream),
+                Err(_) => fail(&mut child, "the second turn never asked the endpoint"),
+            }
+            take_lock(&held_lock);
+        }
+        IndexHeld::DuringTheTurn | IndexHeld::AfterTheModelHungUp => {
+            if let Some(stdin) = stdin.as_mut() {
+                writeln!(stdin, r#"{{"cmd":"user","text":"wait"}}"#).unwrap();
+            }
+            match request.recv_timeout(wait) {
+                Ok(stream) if held == IndexHeld::DuringTheTurn => endpoint = Some(stream),
+                Ok(hung_up) => drop(hung_up),
+                Err(_) => fail(&mut child, "the turn never asked the endpoint"),
+            }
+            take_lock(&held_lock);
+        }
+    }
+    let signalled = std::time::Instant::now();
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if matches!(held, IndexHeld::FreedAfterTheSignal | IndexHeld::OpenFreedAfterTheSignal) {
+        std::thread::sleep(bound / 6);
+        held_lock = None;
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if signalled.elapsed() >= bound + margin {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let elapsed = signalled.elapsed();
+    let _ = child.wait();
+    drop((held_lock, endpoint));
+    drop(stdin);
+    let stderr = stderr.join().unwrap();
+    let mut rest = String::new();
+    let _ = stdout.read_to_string(&mut rest);
+    let index = std::fs::read_to_string(sessions.join("index.json")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    eprintln!("{tag}: {elapsed:?} from SIGTERM to {status:?}");
+    let status = status.unwrap_or_else(|| {
+        panic!("{tag}: still running {elapsed:?} after SIGTERM, past the {bound:?} stop deadline: {stderr}")
+    });
+    assert_eq!(status.code(), Some(143), "{tag}: {status:?}\n{stderr}");
+    match held {
+        IndexHeld::FromLaunch => {}
+        IndexHeld::OpenFreedAfterTheSignal => {
+            assert!(!stderr.contains("stays indexed"), "{tag}: {stderr}");
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
+            assert!(listed.is_empty(), "{tag}: the session opened under the signal stayed indexed: {index}");
+        }
+        IndexHeld::AfterASavedTurn => {
+            assert!(!stderr.contains("stays indexed"), "{tag}: a session with history was reported empty: {stderr}");
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
+            assert_eq!(listed.len(), 1, "{tag}: the session with history left the index: {index}");
+        }
+        IndexHeld::BeforeAReload => {
+            assert!(rest.is_empty(), "{tag}: the stopped session wrote on after its hello: {rest}");
+            assert!(stderr.contains("stays indexed"), "{tag}: the kept empty session went unreported: {stderr}");
+        }
+        IndexHeld::TrustBeforeAnApprovalMode => {
+            assert!(rest.is_empty(), "{tag}: the stopped session wrote on after its hello: {rest}");
+            assert!(!stderr.contains("stays indexed"), "{tag}: {stderr}");
+            let listed: Vec<serde_json::Value> = serde_json::from_str(&index).unwrap_or_else(|e| panic!("{tag}: {e}: {index}"));
+            assert!(listed.is_empty(), "{tag}: the empty session stayed indexed: {index}");
+        }
+        IndexHeld::FreedAfterTheSignal => {
+            let done = last_event(rest.as_bytes());
+            assert_eq!(
+                (done["type"].as_str(), done["stop_reason"].as_str()),
+                (Some("done"), Some("cancelled")),
+                "{tag}: the turn that started under the signal was not stopped: {rest}\n{stderr}"
+            );
+        }
+        _ => assert!(stderr.contains("stays indexed"), "{tag}: the kept empty session went unreported: {stderr}"),
+    }
+}
+
+#[test]
+fn a_signal_ends_a_fresh_stdio_session_on_time_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-stdio", &["--stdio"], IndexHeld::DuringTheTurn);
+}
+
+#[test]
+fn a_signal_ends_a_fresh_print_run_on_time_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-print", &["--json", "-p", "wait"], IndexHeld::DuringTheTurn);
+}
+
+#[test]
+fn a_signal_ends_a_fresh_stdio_session_on_time_after_the_model_hung_up_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-stdio-hung-up", &["--stdio"], IndexHeld::AfterTheModelHungUp);
+}
+
+#[test]
+fn a_signal_ends_a_fresh_print_run_on_time_after_the_model_hung_up_while_the_session_index_is_held() {
+    stop_with_the_session_index_held(
+        "index-held-print-hung-up",
+        &["--json", "-p", "wait"],
+        IndexHeld::AfterTheModelHungUp,
+    );
+}
+
+#[test]
+fn a_signal_keeps_a_stdio_session_with_history_without_a_warning_while_the_session_index_is_held() {
+    stop_with_the_session_index_held("index-held-stdio-saved", &["--stdio"], IndexHeld::AfterASavedTurn);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_open() {
+    stop_with_the_session_index_held("index-held-stdio-open", &["--stdio"], IndexHeld::FromLaunch);
+}
+
+#[test]
+fn a_signal_ends_a_print_run_waiting_on_the_session_index_to_open() {
+    stop_with_the_session_index_held("index-held-print-open", &["--json", "-p", "wait"], IndexHeld::FromLaunch);
+}
+
+#[test]
+fn a_stdio_session_that_opens_after_the_signal_is_removed_and_ends() {
+    stop_with_the_session_index_held("index-freed-stdio-open", &["--stdio"], IndexHeld::OpenFreedAfterTheSignal);
+}
+
+#[test]
+fn a_print_run_whose_session_opens_after_the_signal_removes_it_and_ends() {
+    stop_with_the_session_index_held(
+        "index-freed-print-open",
+        &["--json", "-p", "wait"],
+        IndexHeld::OpenFreedAfterTheSignal,
+    );
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_start_a_turn() {
+    stop_with_the_session_index_held("index-held-stdio-turn", &["--stdio"], IndexHeld::BeforeTheTurn);
+}
+
+#[test]
+fn a_turn_that_starts_after_the_signal_is_cancelled_and_ends_its_stream() {
+    stop_with_the_session_index_held("index-freed-stdio-turn", &["--stdio"], IndexHeld::FreedAfterTheSignal);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_session_index_to_reload() {
+    stop_with_the_session_index_held("index-held-stdio-reload", &["--stdio"], IndexHeld::BeforeAReload);
+}
+
+#[test]
+fn a_signal_ends_a_stdio_session_waiting_on_the_trust_store_to_save_an_approval_mode() {
+    stop_with_the_session_index_held(
+        "trust-held-stdio-approval-mode",
+        &["--stdio"],
+        IndexHeld::TrustBeforeAnApprovalMode,
+    );
+}
+
+/// A signal the run inherited as ignored stays ignored: `nohup` keeps a run
+/// alive past its terminal's SIGHUP, and a shell starts a script's
+/// background job with SIGINT ignored so Ctrl+C stops only the foreground.
+/// A handler for it would cancel the turn the parent meant to keep.
+#[test]
+fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
+    use std::os::unix::process::CommandExt;
+    let (project, home) = fresh_dirs("sighup-ignored");
+    let pid_file = project.parent().unwrap().join("pids");
+    let script = format!("echo $$ >> '{}'; sleep 1", pid_file.display());
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let mut command = cmd(&project, &home);
+    command
+        .args(["--trust-project", "--json", "-p", "outlive the terminal"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: sigaction is async-signal-safe, and nothing else runs between
+    // fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            match libc::sigaction(libc::SIGHUP, &ignore, std::ptr::null_mut()) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty() {
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the tool never started: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGHUP) };
+    let output = finish_with_deadline(child);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("stop")), "{done}");
+}
+
+/// A supervisor stops a TUI session with a signal. The session ends through
+/// its normal exit path, which hands the terminal back, and then exits 128
+/// plus the signal's number: a wrapper that read 0 took the stop for a
+/// /quit. It returns through main, so the runtime's shutdown drops the
+/// command still running, and the command's group guard kills the tool tree
+/// it left behind, which `kill_on_drop` alone would leave running.
+#[test]
+fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
+    let (project, home) = fresh_dirs("sigterm-tui");
+    let pid_file = project.parent().unwrap().join("pids");
+    let script = format!(
+        "echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+        p = pid_file.display()
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let (pty, terminal) = pseudo_terminal();
+    let size = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCSWINSZ reads one winsize from a live descriptor.
+    unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&terminal), libc::TIOCSWINSZ, &size) };
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .env("TERM", "xterm-256color")
+        .stdin(terminal.try_clone().unwrap())
+        .stdout(terminal.try_clone().unwrap())
+        .stderr(terminal)
+        .spawn()
+        .unwrap();
+    // A terminal nobody reads stops the writer, so the screen is drained on
+    // a thread for as long as the session holds it.
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let mut reader = pty.try_clone().unwrap();
+    let drained = screen.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            drained.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let shown = |bytes: &[u8]| screen.lock().unwrap().windows(bytes.len()).any(|w| w == bytes);
+    let wait_for = |what: &str, done: &dyn Fn() -> bool, child: &mut std::process::Child| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what}: {}", String::from_utf8_lossy(&screen.lock().unwrap()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    // The keyboard protocol query goes out behind the first frame. Answered
+    // as a terminal without the protocol, input starts at once.
+    wait_for("the TUI never asked about the keyboard", &|| shown(b"\x1b[?u"), &mut child);
+    let mut keys = pty.try_clone().unwrap();
+    keys.write_all(b"\x1b[?62cstart the tree\r").unwrap();
+    let pids = || -> Vec<i32> {
+        let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        recorded.lines().filter_map(|l| l.trim().parse().ok()).collect()
+    };
+    wait_for("the tool tree never started", &|| pids().len() == 2, &mut child);
+    let pids = pids();
+    let restored_before = shown(b"\x1b[?1049l");
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while pids.iter().any(alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = pids.iter().copied().filter(alive).collect();
+    for pid in &survivors {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    let screen_text = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+    drop(pty);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let status = status.expect("SIGTERM did not end the TUI");
+    assert!(!restored_before, "the alternate screen was left before the signal");
+    assert!(screen_text.contains("\x1b[?1049l"), "the terminal was not handed back: {screen_text:?}");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}");
 }
