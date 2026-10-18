@@ -145,7 +145,10 @@ pub enum AgentEvent {
     Thinking { text: String },
     /// One assistant message finalized (a leaked leading think block already
     /// stripped).
-    /// A run of Token deltas always ends in exactly one MessageDone.
+    /// A run of Token deltas ends in exactly one MessageDone, unless the
+    /// request fails after them, as when the provider reports an error inside
+    /// the stream: then Error follows with no MessageDone, and that text is
+    /// not kept.
     MessageDone { text: String },
     /// Estimated context usage at the start of a completion.
     Budget { used_tokens: usize, context_tokens: usize },
