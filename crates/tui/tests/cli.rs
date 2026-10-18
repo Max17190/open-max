@@ -2788,6 +2788,66 @@ fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// Every frontend on a data dir saves to one trust store. A run that started
+/// in auto takes up ask that another frontend saved for the project while it
+/// ran: its next mutating call waits for approval, which a headless run
+/// declines, instead of running unasked. The bash call holds the turn open
+/// until the other frontend has saved, and for about 30 seconds at most.
+#[test]
+fn ask_saved_by_another_frontend_reaches_a_running_session() {
+    /// Ends the held run when the test fails before releasing it: the
+    /// release file ends the bash call and the run is killed.
+    struct Held(std::path::PathBuf, Option<std::process::Child>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), "");
+            if let Some(mut running) = self.1.take() {
+                let _ = running.kill();
+                let _ = running.wait();
+            }
+        }
+    }
+    let (project, home) = fresh_dirs("sibling-ask");
+    let hold = "touch ready; i=0; while [ ! -e release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done";
+    let (base_url, _, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({"command": hold})), true),
+        (sse_tool_call("write_file", serde_json::json!({"path": "side-effect.txt", "content": "written"})), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings(&home, &base_url);
+    let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto);
+    assert_eq!(grant.unwrap().1, Some(ApprovalMode::Auto));
+
+    let running = cmd(&project, &home).args(["--json", "-p", "go"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut held = Held(project.clone(), Some(running));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !project.join("ready").exists() {
+        assert!(std::time::Instant::now() < deadline, "the run never reached its bash call");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut select = cmd(&project, &home).arg("--stdio")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    select.stdin.take().unwrap().write_all(b"{\"cmd\":\"approval_mode\",\"mode\":\"ask\"}\n{\"cmd\":\"quit\"}\n").unwrap();
+    let selected = finish_with_deadline(select);
+    let selected = String::from_utf8_lossy(&selected.stdout);
+    assert!(selected.contains("\"type\":\"approval_mode\""), "{selected}");
+    std::fs::write(project.join("release"), "").unwrap();
+
+    let output = finish_with_deadline(held.1.take().unwrap());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !project.join("side-effect.txt").exists(),
+        "the write ran unasked after another frontend saved ask: {stdout}"
+    );
+    let asked = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|event| event["type"] == "approval_request" && event["name"] == "write_file");
+    assert!(asked, "the write must wait for approval: {stdout}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// A run whose model answered with one bash call that leaves a tree behind,
 /// the shape of a build or a dev server the agent started: the shell (which
 /// then becomes a long foreground command) and a background child each
