@@ -635,7 +635,10 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// disk, a quota, a file size limit) left a prefix of the new contents under
 /// the old name while the tool reported only that it could not write. The
 /// bytes go to a temp file beside it instead, which takes its place once
-/// they are all written, so a failure leaves the file as it was.
+/// they are all written, so a failure leaves the file as it was. The temp
+/// file needs room for the whole new file beside the old one, so on a full
+/// disk even a write that would shrink the file is refused, and the file is
+/// left unchanged.
 ///
 /// The replacement gets the file's permissions less setuid and setgid, its
 /// owner and group, and its access control list, not the default list of
