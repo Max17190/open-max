@@ -74,7 +74,10 @@ with a lower `idle_timeout_secs`. Any other silence fails the turn after one
 interval: a stream that stops partway through a reply ends it as truncated,
 and a server that stalls while sending a reply as one JSON body is not
 resent. An address with nothing listening fails within seconds. A tool that
-runs past its own timeout is stopped and the turn goes on. A caller that
+runs past its own timeout is stopped and the turn goes on; a `bash` call is
+stopped after 120 seconds unless it sets `timeout_secs` (1 to 600); a larger
+request is held to 600, and if that command times out, its result names the
+ceiling and the number requested. A caller that
 needs a deadline sets one, for example the `timeout_secs` of the bash call
 that runs a child `openmax -p`. A run stopped by a signal ends with that
 signal's status (a shell reports 128 plus its number); otherwise the exit

@@ -269,7 +269,7 @@ pub fn tool_schemas() -> &'static Value {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string" },
-                        "timeout_secs": { "type": "integer", "description": "Default 60, max 300" }
+                        "timeout_secs": { "type": "integer", "description": format!("Default {BASH_DEFAULT_TIMEOUT_SECS}, max {BASH_MAX_TIMEOUT_SECS}") }
                     },
                     "required": ["command"]
                 }
@@ -1972,6 +1972,49 @@ fn bash_shell() -> &'static str {
     .unwrap_or("/bin/sh")
 }
 
+/// Seconds a bash call may run when the model sets no `timeout_secs`: long
+/// enough for a typical cold test run or dependency fetch, which a shorter
+/// default killed mid-way and then had to be rerun with a deadline.
+const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// The longest one bash call may run. A larger request is held to this, and
+/// a command that then times out is told so: when the result named only the
+/// ceiling, nothing said the request had been cut, and a retry asked for the
+/// same deadline and was held again.
+const BASH_MAX_TIMEOUT_SECS: u64 = 600;
+
+/// The deadline a bash call runs under, and the request it was held down
+/// from when there was one.
+struct BashDeadline {
+    secs: u64,
+    /// Set only when the request exceeded the ceiling.
+    requested: Option<u64>,
+}
+
+fn bash_deadline(args: &Value) -> BashDeadline {
+    match arg(args, "timeout_secs", Value::as_u64) {
+        None => BashDeadline { secs: BASH_DEFAULT_TIMEOUT_SECS, requested: None },
+        Some(asked) if asked > BASH_MAX_TIMEOUT_SECS => {
+            BashDeadline { secs: BASH_MAX_TIMEOUT_SECS, requested: Some(asked) }
+        }
+        Some(asked) => BashDeadline { secs: asked.max(1), requested: None },
+    }
+}
+
+impl BashDeadline {
+    /// The first line of a timed-out result. It names the ceiling when the
+    /// request was held to it, so the model learns the limit from the failure
+    /// instead of guessing why its deadline moved.
+    fn timed_out_heading(&self) -> String {
+        match self.requested {
+            Some(asked) => format!(
+                "command timed out after {}s, the most one call may run (requested {asked}s); output until the kill:",
+                self.secs
+            ),
+            None => format!("command timed out after {}s; output until the kill:", self.secs),
+        }
+    }
+}
+
 async fn bash_tool(
     data_dir: &Path,
     root: &Path,
@@ -1982,13 +2025,13 @@ async fn bash_tool(
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
     };
-    let timeout_secs = arg(args, "timeout_secs", Value::as_u64).unwrap_or(60).clamp(1, 300);
+    let deadline = bash_deadline(args);
     let request = ProcessRequest {
         program: bash_shell().into(),
         args: vec!["-c".into(), command.into()],
         cwd: root.to_path_buf(),
         stdin: StdinMode::Null,
-        timeout: std::time::Duration::from_secs(timeout_secs),
+        timeout: std::time::Duration::from_secs(deadline.secs),
         capture: CaptureSpec {
             head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR,
             tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
@@ -2017,7 +2060,7 @@ async fn bash_tool(
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 ToolOutcome::from_process(
                     false,
-                    format!("command timed out after {timeout_secs}s; output until the kill:\n{text}"),
+                    format!("{}\n{text}", deadline.timed_out_heading()),
                     &output,
                     truncated,
                 )
@@ -3353,6 +3396,39 @@ mod tests {
         );
         assert!(!out.process_truncated, "everything printed made it into the result");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The deadline a call gets is the one the schema promises: the default
+    /// when the call names none, its own number up to the ceiling, and the
+    /// ceiling past it. The timed-out heading names a request that was held:
+    /// when it named only the ceiling, nothing said the request had been cut,
+    /// and a retry asked for the same deadline and was held again. The
+    /// heading's wiring into a real timeout is covered by the unclamped
+    /// timeout test; a clamped one would need a run of the whole ceiling.
+    #[test]
+    fn a_bash_deadline_defaults_is_held_to_the_ceiling_and_says_so() {
+        let unset = bash_deadline(&json!({}));
+        assert_eq!((unset.secs, unset.requested), (BASH_DEFAULT_TIMEOUT_SECS, None));
+        let zero = bash_deadline(&json!({"timeout_secs": 0}));
+        assert_eq!((zero.secs, zero.requested), (1, None), "zero is not a deadline, and not a held request");
+        let at = bash_deadline(&json!({"timeout_secs": BASH_MAX_TIMEOUT_SECS}));
+        assert_eq!((at.secs, at.requested), (BASH_MAX_TIMEOUT_SECS, None), "the ceiling itself is not held down");
+        let asked = BASH_MAX_TIMEOUT_SECS + 300;
+        let past = bash_deadline(&json!({"timeout_secs": asked}));
+        assert_eq!((past.secs, past.requested), (BASH_MAX_TIMEOUT_SECS, Some(asked)));
+        assert_eq!(
+            past.timed_out_heading(),
+            format!("command timed out after {BASH_MAX_TIMEOUT_SECS}s, the most one call may run (requested {asked}s); output until the kill:")
+        );
+        assert_eq!(
+            bash_deadline(&json!({"timeout_secs": 5})).timed_out_heading(),
+            "command timed out after 5s; output until the kill:"
+        );
+        let schema = tool_schemas().to_string();
+        assert!(
+            schema.contains(&format!("Default {BASH_DEFAULT_TIMEOUT_SECS}, max {BASH_MAX_TIMEOUT_SECS}")),
+            "the schema promises the numbers the clamp enforces: {schema}"
+        );
     }
 
     /// A segfault or an OOM kill has no exit code; reporting "exit code -1"
