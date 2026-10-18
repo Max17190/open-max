@@ -2220,7 +2220,10 @@ mod tests {
         let limit = libc::PATH_MAX as usize - 1;
         let tail = "/a.txt".len();
         let mut dir = root.clone();
-        while dir.as_os_str().len() + 1 + 200 + 1 + tail <= limit - 2 {
+        // A byte short of where the filler after it would be empty: pushing
+        // an empty name adds only a separator, and the path would come out
+        // a byte short of its length.
+        while dir.as_os_str().len() + 1 + 200 + 1 + tail < limit - 2 {
             dir.push("d".repeat(200));
         }
         dir.push("p".repeat(limit - 2 - tail - 1 - dir.as_os_str().len()));
