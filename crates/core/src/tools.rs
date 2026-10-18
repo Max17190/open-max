@@ -755,6 +755,14 @@ thread_local! {
 /// contents are written back, and the result says whether they were. A file
 /// whose old contents cannot be read first is left alone: truncated, it
 /// would have nothing to put back.
+///
+/// Each write is synced before it counts. A file system that takes a write
+/// into its cache may refuse it only when it flushes it (a network file
+/// system on close, a FUSE file system on writeback), and the close that
+/// drops the file discards its error. Unsynced, a full disk or a quota
+/// there would leave the file truncated while the result said the write
+/// landed; synced, the refusal fails the write, so the old contents go back
+/// and the result names it.
 fn write_in_place(
     path: &Path,
     mut file: std::fs::File,
@@ -779,7 +787,8 @@ fn write_in_place(
     let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
         file.set_len(0)?;
         file.rewind()?;
-        file.write_all(bytes)
+        file.write_all(bytes)?;
+        crate::sessions::sync(file, Path::new(rel))
     };
     let Err(e) = overwrite(&mut file, bytes) else {
         return Ok(());

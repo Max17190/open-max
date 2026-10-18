@@ -922,13 +922,15 @@ pub(crate) fn replace_atomic(
 /// returns. Every barrier in this module goes through here, so a test can
 /// see which ones a write issued and in what order.
 ///
-/// Ordering is all the callers need: no rename may land before the bytes it
-/// names, and no transcript rewrite before the archive it relies on. On
-/// Apple targets the standard library's sync is a full drive cache flush,
-/// which would make every atomic write, and so every turn, wait on the drive;
-/// a barrier sync gives the ordering without that wait. A file system that
-/// does not take one gets a plain sync instead.
-fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+/// Ordering is all the callers in this module need: no rename may land
+/// before the bytes it names, and no transcript rewrite before the archive
+/// it relies on. On Apple targets the standard library's sync is a full
+/// drive cache flush, which would make every atomic write, and so every
+/// turn, wait on the drive; a barrier sync gives the ordering without that
+/// wait. A file system that does not take one gets a plain sync instead.
+/// The file tools' write in place syncs here for the error instead: a file
+/// system that refuses a cached write when it flushes it reports that here.
+pub(crate) fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     sync_device(file, path).map_err(|e| cannot_sync(e, path))
 }
 
