@@ -648,9 +648,9 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// a new file would split from; when this user cannot give a new file its
 /// owner or group (only the superuser can give a file to another user or to
 /// a group it is not in); when its access control list cannot be given to
-/// a new file (on macOS, where no program may copy one, a file that has a
-/// list, or whose directory's inheritable entries would give the new file
-/// one); when its directory takes no new file from this user; when the
+/// a new file (on macOS, where no list is copied, a file that has a list,
+/// or whose directory's inheritable entries would give the new file one);
+/// when its directory takes no new file from this user; when the
 /// rename over it is refused (a file mounted on its own); or when its path
 /// leaves no room for the longer path of a temp file beside it. Such a file
 /// whose contents cannot be read first is not written at all, since there
@@ -826,10 +826,11 @@ fn get_xattr(file: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<Vec
 }
 
 /// macOS keeps a file's access control list in an extended attribute that
-/// only an entitled process may read or write, so the list cannot be
-/// copied to the temp file, or stripped from it. A file that has a list,
-/// or whose temp file took one from its directory's inheritable entries,
-/// fails this step and is written in place, which keeps its list as it is.
+/// only the superuser may read and only an entitled process may write or
+/// remove, so the list is neither copied to the temp file nor stripped from
+/// it that way. A file that has a list, or whose temp file took one from
+/// its directory's inheritable entries, fails this step and is written in
+/// place, which keeps its list as it is.
 #[cfg(target_vendor = "apple")]
 fn take_acl(tmp: &std::fs::File, target: &std::fs::File) -> std::io::Result<()> {
     if has_acl(target)? || has_acl(tmp)? {
@@ -2380,9 +2381,9 @@ mod tests {
     }
 
     /// A temp file takes the inheritable entries of its directory's access
-    /// control list, which no program may strip on macOS, and an entry that
-    /// lets everyone read would leave a 0640 file readable by all. The file
-    /// is written in place instead, and keeps the list it had: none.
+    /// control list, which a write does not strip on macOS, and an entry
+    /// that lets everyone read would leave a 0640 file readable by all. The
+    /// file is written in place instead, and keeps the list it had: none.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_replacement_takes_no_access_control_list_from_its_directory() {
