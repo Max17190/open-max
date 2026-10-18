@@ -689,13 +689,12 @@ impl Transcript {
     /// or below the `held` edge moves the view; it then moves by `delta`
     /// rows, which must be wrapped to land where wrapped rows would.
     fn wrap_across(&mut self, bi: usize, held: Option<usize>, delta: isize) {
-        if !held.is_some_and(|held| bi >= held) {
-            return;
-        }
-        if delta < 0 {
-            self.settle(delta.unsigned_abs(), 0);
-        } else {
-            self.settle(0, delta.unsigned_abs());
+        if held.is_some_and(|held| bi >= held) {
+            if delta < 0 {
+                self.settle(delta.unsigned_abs(), 0);
+            } else {
+                self.settle(0, delta.unsigned_abs());
+            }
         }
     }
 

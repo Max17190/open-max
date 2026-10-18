@@ -479,7 +479,11 @@ fn load_file(path: &Path) -> FileLoad {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileLoad::Missing,
         Err(e) => return invalid(format!("unreadable ({e}); failing closed")),
     };
-    if !metadata.is_file() && !(metadata.is_symlink() && path.is_file()) {
+    // A regular file, or a link that resolves to one. Anything else that
+    // exists, a directory or a dangling link included, fails closed instead
+    // of reading as no file.
+    let regular_file = metadata.is_file() || (metadata.is_symlink() && path.is_file());
+    if !regular_file {
         return invalid("not a readable regular file; failing closed".into());
     }
     let text = match std::fs::read_to_string(path) {
@@ -596,6 +600,49 @@ mod tests {
             PermissionDecision::Deny { .. }
         ));
         assert!(matches!(load_file(&path), FileLoad::Invalid(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Each row of the predicate that admits a path that exists (A: a regular
+    /// file, B: a link, C: the link resolves to a regular file; A and B never
+    /// hold together), with a path that reaches it. An absent path never
+    /// reaches it and reads as no file:
+    ///
+    /// | path                        | A | B | C | result  |
+    /// |-----------------------------|---|---|---|---------|
+    /// | regular file                | 1 | 0 | - | loads   |
+    /// | directory or other non-link | 0 | 0 | - | invalid |
+    /// | link to a regular file      | 0 | 1 | 1 | loads   |
+    /// | link to a directory         | 0 | 1 | 0 | invalid |
+    /// | dangling link               | 0 | 1 | 0 | invalid |
+    ///
+    /// A link that does not resolve to a regular file is refused for its kind
+    /// before any read is tried: a link to a FIFO would block the read.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_regular_file_or_a_link_to_one_loads() {
+        let dir = tempfile_dir();
+        let file = dir.join("file.toml");
+        write_perms(&file, "");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let to_file = dir.join("to-file.toml");
+        std::os::unix::fs::symlink(&file, &to_file).unwrap();
+        let to_dir = dir.join("to-dir.toml");
+        std::os::unix::fs::symlink(&sub, &to_dir).unwrap();
+        let dangling = dir.join("dangling.toml");
+        std::os::unix::fs::symlink(dir.join("absent.toml"), &dangling).unwrap();
+
+        for path in [&file, &to_file] {
+            assert!(matches!(load_file(path), FileLoad::Ok(..)), "{} should load", path.display());
+        }
+        for path in [&sub, &to_dir, &dangling] {
+            let FileLoad::Invalid(reason) = load_file(path) else {
+                panic!("{} should fail closed", path.display());
+            };
+            assert_eq!(reason, "not a readable regular file; failing closed", "{}", path.display());
+        }
+        assert!(matches!(load_file(&dir.join("absent.toml")), FileLoad::Missing));
         let _ = std::fs::remove_dir_all(dir);
     }
 

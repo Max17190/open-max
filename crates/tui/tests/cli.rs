@@ -1099,6 +1099,39 @@ fn the_printed_global_allow_approval_works_from_another_directory() {
     assert_eq!(inert(), None, "`{command}` run from {} must approve it for the project", home.display());
 }
 
+/// A permissions file is read through a link that resolves to a regular
+/// file. Once the link stops resolving, it fails closed instead of reading
+/// as no file, which would drop its rules without a word.
+#[cfg(unix)]
+#[test]
+fn a_linked_permissions_file_loads_and_fails_closed_once_it_dangles() {
+    let (project, home) = fresh_dirs("linked-permissions");
+    std::fs::create_dir_all(project.join(".openmax")).unwrap();
+    std::fs::write(
+        project.join("rules.toml"),
+        "[[rules]]\neffect = \"deny\"\ntool = \"bash\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../rules.toml", project.join(".openmax/permissions.toml")).unwrap();
+    let check = || -> (Option<i32>, String) {
+        let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["surface"] == "permissions")
+            .unwrap_or_else(|| panic!("no permissions row: {rows}"));
+        let (status, message) = (row["status"].as_str().unwrap(), row["message"].as_str().unwrap());
+        (out.status.code(), format!("{status} {message}"))
+    };
+
+    assert_eq!(check(), (Some(0), "ok 1 rules".to_string()));
+    std::fs::remove_file(project.join("rules.toml")).unwrap();
+    assert_eq!(check(), (Some(1), "err not a readable regular file; failing closed".to_string()));
+}
+
 /// Deleting an approved hook fails every tool call closed, so a human who
 /// meant the removal needs a way to say so. `--forget` is that way, and it is
 /// guarded harder than `--approve` because it removes a policy instead of
