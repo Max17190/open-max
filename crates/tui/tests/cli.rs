@@ -1724,6 +1724,114 @@ fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
     );
 }
 
+/// Run `openmax` with `args` and `commands` on stdin, then EOF, which quits a
+/// stdio session once its turn in flight drains, and hand back its stdout
+/// lines with the session's id, taken from `hello`, replaced by `S`.
+fn stdio_lines(project: &Path, home: &Path, args: &[&str], commands: &[&str]) -> Vec<String> {
+    let mut child = cmd(project, home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for command in commands {
+        writeln!(stdin, "{command}").unwrap();
+    }
+    drop(stdin);
+    let out = finish_with_deadline(child);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    let hello: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    let id = hello["session_id"].as_str().unwrap();
+    stdout.lines().map(|line| line.replace(id, "S")).collect()
+}
+
+/// `--stdio` and `--print --json` render one event stream, and
+/// docs/stdio-protocol.md gives every event line as `session_id`, then
+/// `type`, then the fields in declaration order. So one turn is framed in
+/// the same bytes by both, session id aside, and the lines stdio writes
+/// itself carry `type` first, exactly as the doc shows each one. The stdio
+/// frames used to come out with their keys sorted, so a client comparing or
+/// hashing lines, or reading a captured print run with its stdio parser, met
+/// two different wires.
+#[test]
+fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
+    let (project, home) = fresh_dirs("wire-order");
+    std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+    let turn = [
+        (sse_tool_call("read_file", serde_json::json!({"path": "a.txt"})), true),
+        (sse_text("stub says hi"), true),
+    ];
+    let (base_url, _requests, _server) = spawn_scripted_server([turn.clone(), turn].concat());
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let (code, lines, stdout) = json_turn(&project, &home, "read it");
+    assert_eq!(code, Some(0), "{stdout}");
+    let id = lines[0]["session_id"].as_str().unwrap();
+    let printed: Vec<String> = stdout.lines().map(|line| line.replace(id, "S")).collect();
+    // The doc's example event, as print mode writes it.
+    assert!(
+        printed.iter().any(|line| line
+            == r#"{"session_id":"S","type":"tool_start","call_id":"call_0","name":"read_file","args":{"path":"a.txt"}}"#),
+        "{printed:#?}"
+    );
+
+    let framed = stdio_lines(&project, &home, &["--stdio"], &[r#"{"cmd":"user","text":"read it"}"#]);
+    let hello: serde_json::Value = serde_json::from_str(&framed[0]).unwrap();
+    assert_eq!(
+        framed[0],
+        format!(
+            r#"{{"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            env!("CARGO_PKG_VERSION"),
+            hello["project"],
+        )
+    );
+    assert_eq!(framed[1..], printed[..], "stdio and print mode framed one turn differently");
+
+    let resumed = stdio_lines(&project, &home, &["--continue", "--stdio"], &[]);
+    assert_eq!(resumed.len(), 2, "{resumed:#?}");
+    let history: serde_json::Value = serde_json::from_str(&resumed[1]).unwrap();
+    let messages = history["messages"].as_array().unwrap();
+    assert_eq!(messages[messages.len() - 2..], [
+        serde_json::json!({"role": "user", "content": "read it"}),
+        serde_json::json!({"role": "assistant", "content": "stub says hi"}),
+    ]);
+    let messages: Vec<String> = messages
+        .iter()
+        .map(|m| format!(r#"{{"role":{},"content":{}}}"#, m["role"], m["content"]))
+        .collect();
+    assert_eq!(
+        resumed[1],
+        format!(
+            r#"{{"type":"transcript","session_id":"S","messages":[{}],"truncated":false}}"#,
+            messages.join(",")
+        )
+    );
+
+    let own = stdio_lines(
+        &project,
+        &home,
+        &["--stdio"],
+        &[r#"{"cmd":"approval_mode","mode":"auto"}"#, r#"{"cmd":"reload"}"#, r#"{"cmd":"user","text":" "}"#],
+    );
+    let refrozen: serde_json::Value = serde_json::from_str(&own[2]).unwrap();
+    assert_eq!(
+        own[1..],
+        [
+            r#"{"type":"approval_mode","mode":"auto"}"#.to_string(),
+            format!(
+                r#"{{"session_id":"S","type":"refrozen","tools":{},"skills":{},"changes":[]}}"#,
+                refrozen["tools"], refrozen["skills"],
+            ),
+            r#"{"type":"protocol_error","message":"user text is empty"}"#.to_string(),
+            r#"{"session_id":"S","type":"done","stop_reason":"refused"}"#.to_string(),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Run one print-mode turn as JSON and hand back the exit code, the parsed
 /// event lines, and the raw stdout for assertion messages.
 fn json_turn(

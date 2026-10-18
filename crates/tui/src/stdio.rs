@@ -18,7 +18,7 @@
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
 //! stdout lines:
-//!   {"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"...","project":"..."}
+//!   {"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"...","project":"...","continued":false}
 //!   AgentEvent envelopes exactly as `--print --json` emits them
 //!   {"type":"protocol_error","message":"..."}        bad input; session unharmed
 //!
@@ -43,7 +43,7 @@ use open_max_core::sessions;
 use open_max_core::state::Core;
 use open_max_core::templates;
 use open_max_core::types::{AgentEvent, AgentEventEnvelope};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 use std::time::Instant;
 
@@ -103,12 +103,12 @@ pub async fn run(
         return crate::quit_status();
     }
     let mut stdout = std::io::stdout();
-    emit(&mut stdout, &hello_value(&session_id, &project_key, continued));
+    emit_own(&mut stdout, &hello(&session_id, &project_key, continued));
     if continued {
         // One bounded history line so an attaching frontend can render what
         // came before, without replaying synthetic live events (a replayed
         // `token` stream would be indistinguishable from a running turn).
-        emit(&mut stdout, &transcript_value(&session_id, &history));
+        emit_own(&mut stdout, &transcript(&session_id, &history));
     }
     let stdin_rx = spawn_stdin_reader();
     drive(core, core_rx, session_id, project, stdin_rx, &args.quit, &mut stdout, !continued).await
@@ -334,13 +334,7 @@ async fn drive_loop<W: Write>(
                                 };
                                 match saved {
                                     Ok(()) => {
-                                        emit(
-                                            out,
-                                            &serde_json::json!({
-                                                "type": "approval_mode",
-                                                "mode": parsed.as_str(),
-                                            }),
-                                        );
+                                        emit_own(out, &StdioLine::ApprovalMode { mode: parsed.as_str() });
                                     }
                                     Err(e) => protocol_error(
                                         out,
@@ -395,9 +389,7 @@ async fn drive_loop<W: Write>(
                                     session_id: session_id.clone(),
                                     event: AgentEvent::Refrozen { tools, skills, changes },
                                 };
-                                if let Ok(value) = serde_json::to_value(&env) {
-                                    emit(out, &value);
-                                }
+                                emit_event(out, &env);
                             }
                             Err(e) => protocol_error(out, &e),
                         }
@@ -443,9 +435,7 @@ async fn drive_loop<W: Write>(
                 if env.session_id != session_id {
                     continue;
                 }
-                if let Ok(value) = serde_json::to_value(&env) {
-                    emit(out, &value);
-                }
+                emit_event(out, &env);
                 match &env.event {
                     AgentEvent::ApprovalRequest { approval_id, .. } => {
                         if closing {
@@ -471,18 +461,56 @@ async fn drive_loop<W: Write>(
     }
 }
 
-fn emit<W: Write>(stdout: &mut W, value: &serde_json::Value) {
-    if let Ok(line) = serde_json::to_string(value) {
-        let _ = writeln!(stdout, "{line}");
-        let _ = stdout.flush();
+/// The lines this frontend writes that are not `AgentEvent` envelopes. Like
+/// an envelope, each is serialized straight to a string, so `type` comes
+/// first and the fields follow in the order declared here, which is the
+/// order docs/stdio-protocol.md shows them in. A `serde_json::json!` object
+/// would sort its keys instead.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StdioLine<'a> {
+    Hello {
+        proto: &'static str,
+        protocol_version: u32,
+        session_id: &'a str,
+        version: &'static str,
+        project: &'a str,
+        continued: bool,
+    },
+    Transcript { session_id: &'a str, messages: Vec<TranscriptMessage<'a>>, truncated: bool },
+    ProtocolError { message: &'a str },
+    ApprovalMode { mode: &'a str },
+}
+
+#[derive(Serialize)]
+struct TranscriptMessage<'a> {
+    role: &'a str,
+    content: String,
+}
+
+/// Write one line and flush it, so a client blocked on its next read gets it
+/// at once.
+fn emit<W: Write>(stdout: &mut W, line: &str) {
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+/// An event, framed as the line `--print --json` writes for it.
+fn emit_event<W: Write>(stdout: &mut W, env: &AgentEventEnvelope) {
+    if let Ok(line) = env.to_json_line() {
+        emit(stdout, &line);
+    }
+}
+
+/// One of this frontend's own lines, its keys in `StdioLine`'s order.
+fn emit_own<W: Write>(stdout: &mut W, line: &StdioLine) {
+    if let Ok(text) = serde_json::to_string(line) {
+        emit(stdout, &text);
     }
 }
 
 fn protocol_error<W: Write>(stdout: &mut W, message: &str) {
-    emit(
-        stdout,
-        &serde_json::json!({ "type": "protocol_error", "message": message }),
-    );
+    emit_own(stdout, &StdioLine::ProtocolError { message });
 }
 
 /// Refuse a `user` command that starts no turn: say why, then close it out
@@ -496,9 +524,7 @@ fn refuse<W: Write>(stdout: &mut W, session_id: &str, message: &str) {
         session_id: session_id.to_string(),
         event: AgentEvent::Done { stop_reason: "refused".into() },
     };
-    if let Ok(value) = serde_json::to_value(&env) {
-        emit(stdout, &value);
-    }
+    emit_event(stdout, &env);
 }
 
 /// Cap on one stdin line. Prompts can carry a pasted file, so the ceiling is
@@ -540,16 +566,15 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::R
 /// The `hello` handshake line, single-sourced so `run` and the tests cannot
 /// drift. Carries both the human-readable `proto` id and the integer
 /// `protocol_version` a client compares against.
-fn hello_value(session_id: &str, project: &str, continued: bool) -> serde_json::Value {
-    serde_json::json!({
-        "type": "hello",
-        "proto": PROTO,
-        "protocol_version": PROTO_VERSION,
-        "session_id": session_id,
-        "version": env!("CARGO_PKG_VERSION"),
-        "project": project,
-        "continued": continued,
-    })
+fn hello<'a>(session_id: &'a str, project: &'a str, continued: bool) -> StdioLine<'a> {
+    StdioLine::Hello {
+        proto: PROTO,
+        protocol_version: PROTO_VERSION,
+        session_id,
+        version: env!("CARGO_PKG_VERSION"),
+        project,
+        continued,
+    }
 }
 
 /// Per-message and total content budgets for the `transcript` line. History
@@ -560,10 +585,10 @@ const TRANSCRIPT_TOTAL_CHARS: usize = 262_144;
 
 /// One bounded history line for a continued session: user and assistant text
 /// only (tool traffic and the system prompt are session internals).
-fn transcript_value(
-    session_id: &str,
-    messages: &[open_max_core::types::ChatMessage],
-) -> serde_json::Value {
+fn transcript<'a>(
+    session_id: &'a str,
+    messages: &'a [open_max_core::types::ChatMessage],
+) -> StdioLine<'a> {
     let mut out = Vec::new();
     let mut total = 0usize;
     let mut truncated = false;
@@ -584,14 +609,9 @@ fn transcript_value(
             truncated = true;
         }
         total += text.chars().count();
-        out.push(serde_json::json!({ "role": m.role, "content": text }));
+        out.push(TranscriptMessage { role: &m.role, content: text });
     }
-    serde_json::json!({
-        "type": "transcript",
-        "session_id": session_id,
-        "messages": out,
-        "truncated": truncated,
-    })
+    StdioLine::Transcript { session_id, messages: out, truncated }
 }
 
 /// Validate one JSONL line against the `openmax-stdio/6` contract using the
@@ -771,19 +791,18 @@ mod tests {
 
     #[test]
     fn hello_line_carries_protocol_version() {
-        let hello = hello_value("sess-1", "/tmp/proj", false);
-        assert_eq!(hello["continued"], false);
-        assert_eq!(hello["type"], "hello");
-        assert_eq!(hello["proto"], PROTO);
-        assert_eq!(hello["protocol_version"], PROTO_VERSION);
-        assert_eq!(hello["session_id"], "sess-1");
-        assert_eq!(hello["project"], "/tmp/proj");
-        assert!(hello["version"].is_string());
-        // The validator accepts the line the handshake actually emits.
+        let line = serde_json::to_string(&hello("sess-1", "/tmp/proj", false)).unwrap();
+        // Byte for byte the handshake docs/stdio-protocol.md shows: `type`
+        // first, then the fields in the documented order.
         assert_eq!(
-            validate_line(&serde_json::to_string(&hello).unwrap()).unwrap(),
-            "hello"
+            line,
+            format!(
+                r#"{{"type":"hello","proto":"{PROTO}","protocol_version":{PROTO_VERSION},"session_id":"sess-1","version":"{}","project":"/tmp/proj","continued":false}}"#,
+                env!("CARGO_PKG_VERSION")
+            )
         );
+        // The validator accepts the line the handshake actually emits.
+        assert_eq!(validate_line(&line).unwrap(), "hello");
     }
 
     /// One truth: the human-readable `proto` id and the integer version can
@@ -986,7 +1005,8 @@ mod tests {
             mk("assistant", &"x".repeat(TRANSCRIPT_MSG_CHARS + 10)),
             mk("tool", "internals"),
         ];
-        let t = transcript_value("s1", &messages);
+        let line = serde_json::to_string(&transcript("s1", &messages)).unwrap();
+        let t: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(t["type"], "transcript");
         let out = t["messages"].as_array().unwrap();
         assert_eq!(out.len(), 2, "system and tool messages stay internal");
@@ -994,7 +1014,13 @@ mod tests {
         let long = out[1]["content"].as_str().unwrap();
         assert!(long.chars().count() <= TRANSCRIPT_MSG_CHARS + 1);
         assert_eq!(t["truncated"], true);
-        assert_eq!(validate_line(&serde_json::to_string(&t).unwrap()).unwrap(), "transcript");
+        assert_eq!(validate_line(&line).unwrap(), "transcript");
+        // `type` first, then the fields and each message's keys in the order
+        // docs/stdio-protocol.md shows.
+        assert_eq!(
+            serde_json::to_string(&transcript("s1", &messages[..2])).unwrap(),
+            r#"{"type":"transcript","session_id":"s1","messages":[{"role":"user","content":"hello"}],"truncated":false}"#
+        );
     }
 
     /// Drive the protocol loop in-process: commands in, emitted lines out.

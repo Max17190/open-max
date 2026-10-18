@@ -10,9 +10,10 @@
 //! The second is `AgentEvent`, the single channel `core` speaks to any
 //! frontend over. It is the whole public surface of a running turn, which is
 //! what lets the TUI, `--print`, and `--stdio` be three renderers of one
-//! stream rather than three implementations of one loop. `--stdio` serializes
-//! these envelopes verbatim, so a variant added or renamed here is a protocol
-//! change and bumps `openmax-stdio`.
+//! stream rather than three implementations of one loop. `--stdio` and
+//! `--print --json` both write each envelope as
+//! [`AgentEventEnvelope::to_json_line`] renders it, so a variant added or
+//! renamed here is a protocol change and bumps `openmax-stdio`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -276,6 +277,18 @@ pub struct AgentEventEnvelope {
     pub event: AgentEvent,
 }
 
+impl AgentEventEnvelope {
+    /// The envelope's wire line, without the newline: what `--stdio` frames
+    /// and `--print --json` prints, byte for byte. The keys keep their
+    /// declaration order (`session_id`, `type`, then the variant's fields)
+    /// because this serializes straight to a string. A detour through
+    /// `serde_json::Value` would sort them: this workspace builds serde_json
+    /// without `preserve_order`, so a `Value` object is a sorted map.
+    pub fn to_json_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,12 +296,14 @@ mod tests {
 
     fn env(event: AgentEvent) -> String {
         let e = AgentEventEnvelope { session_id: "s1".into(), event };
-        serde_json::to_string(&e).unwrap()
+        e.to_json_line().unwrap()
     }
 
     /// Golden wire format for every `AgentEvent`, wrapped in its envelope
-    /// exactly as `--stdio` and `--print --json` emit it. These strings are
-    /// the `openmax-stdio/6` contract: session_id first, then the `type`
+    /// exactly as `--stdio` and `--print --json` emit it: both write
+    /// `to_json_line`, which this pins, and crates/tui/tests/cli.rs checks
+    /// that one turn comes out of the two in the same bytes. These strings
+    /// are the `openmax-stdio/6` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant

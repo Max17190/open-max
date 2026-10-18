@@ -215,7 +215,8 @@ async fn run_turn_events(
         }
 
         if json {
-            if let Ok(line) = serde_json::to_string(&env) {
+            // The line `--stdio` frames for the same event, byte for byte.
+            if let Ok(line) = env.to_json_line() {
                 let _ = writeln!(stdout, "{line}");
                 let _ = stdout.flush();
             }
