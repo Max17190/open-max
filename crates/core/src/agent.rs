@@ -655,6 +655,8 @@ struct ReadonlyBatchCtx<'a> {
     session_id: &'a str,
     registry: &'a Arc<Registry>,
     project_root: &'a Path,
+    /// `project_root` as the turn resolved it once, so a mode read walks no path.
+    canonical_root: &'a Path,
     caps: tools::OutputCaps,
     cancelled: Arc<CancelToken>,
     hooks: &'a mut Hooks,
@@ -758,7 +760,7 @@ async fn execute_readonly_batch(
         // because batchable_call excludes mutating tools.
         let mode = *ctx.policy_mode;
         let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
-        refresh_approval_policy(ctx.core, ctx.session_id, ctx.project_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
+        refresh_approval_policy_canonical(ctx.core, ctx.session_id, ctx.project_root, ctx.canonical_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
         if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
             // Nothing has executed. Refuse the batch without replaying hooks,
             // which may have side effects even for a non-mutating tool.
@@ -804,7 +806,7 @@ async fn execute_readonly_batch(
                 }),
                 // Ask is excluded from batching (see batchable_call); if it
                 // still lands here outside auto, refuse the batch call.
-                PermissionDecision::Ask if ctx.core.approval_mode(ctx.project_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
+                PermissionDecision::Ask if ctx.core.approval_mode_canonical(ctx.canonical_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
                     ok: false,
                     output: "permission rule requires approval; re-run outside a concurrent batch"
                         .into(),
@@ -818,7 +820,7 @@ async fn execute_readonly_batch(
         // the serial path can prompt; if one still lands here, block rather
         // than run unapproved host code outside auto. The sites share one
         // predicate, so the batch path cannot drift away from the gate again.
-        let auto = ctx.core.approval_mode(ctx.project_root) == ApprovalMode::Auto;
+        let auto = ctx.core.approval_mode_canonical(ctx.canonical_root) == ApprovalMode::Auto;
         let block = block.or_else(|| {
             if auto { return None; }
             unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
@@ -836,6 +838,7 @@ async fn execute_readonly_batch(
 
     let core = ctx.core;
     let data_dir = &ctx.core.data_dir;
+    let canonical_root = ctx.canonical_root;
     let futures: Vec<_> = calls
         .iter()
         .zip(parsed.iter())
@@ -860,7 +863,7 @@ async fn execute_readonly_batch(
                 // runs under ask with no card. Read live, as the serial path
                 // reads the mode right before each call.
                 if unasked
-                    && core.approval_mode(&root) != ApprovalMode::Auto
+                    && core.approval_mode_canonical(canonical_root) != ApprovalMode::Auto
                     && unapproved_capability(&registry, data_dir, &root, &name).is_some()
                 {
                     let refused = tools::ToolOutcome {
@@ -2553,6 +2556,10 @@ async fn narrate_outside_approvals(
     }
 }
 
+/// `refresh_approval_policy_canonical` for a root that has not been resolved
+/// yet. A turn resolves its root once and calls that directly, so this shape
+/// is only for tests that drive a refresh on its own.
+#[cfg(test)]
 async fn refresh_approval_policy(
     core: &Arc<Core>,
     session_id: &str,
@@ -2562,7 +2569,26 @@ async fn refresh_approval_policy(
     permissions: &mut TurnPermissions,
     messages: &mut Vec<ChatMessage>,
 ) {
-    let current = core.approval_mode(project_root);
+    let canonical_root = crate::state::canonical_root(project_root);
+    refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, mode, hooks, permissions, messages)
+        .await;
+}
+
+/// The mode is read by `canonical_root`, the turn's one resolution of
+/// `project_root`, so a refresh walks no path. Hooks and permissions are still
+/// discovered under `project_root` as the turn was given it.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_approval_policy_canonical(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    canonical_root: &Path,
+    mode: &mut ApprovalMode,
+    hooks: &mut Hooks,
+    permissions: &mut TurnPermissions,
+    messages: &mut Vec<ChatMessage>,
+) {
+    let current = core.approval_mode_canonical(canonical_root);
     if current != *mode {
         *mode = current;
         *hooks = Hooks::discover_for_mode(project_root, &core.data_dir, current);
@@ -2600,10 +2626,17 @@ async fn run_loop(
     settings: Settings,
     cancelled: Arc<CancelToken>,
 ) -> String {
+    // The mode map is keyed by the canonical path, and resolving a path costs
+    // one readlink per component, so the root is resolved here, once per turn,
+    // rather than on each of the mode reads that every iteration and every
+    // call make. Once is enough: no supported flow changes how the project
+    // path resolves while a turn runs, and each read still consults the live
+    // map, so a mode chosen on an approval card applies at once.
+    let canonical_root = crate::state::canonical_root(project_root);
     // Discover hooks first: user_prompt_submit gates the input before it
     // ever enters the transcript. A blocked or cancelled submit is not a
     // started turn (no title write, no session_start, no turn_end).
-    let mut policy_mode = core.approval_mode(project_root);
+    let mut policy_mode = core.approval_mode_canonical(&canonical_root);
     let mut hooks = Hooks::discover_for_mode(project_root, &core.data_dir, policy_mode);
     // A hook that exists but did not load says so every turn. Inert is a
     // policy the user wrote down and is not getting, so it must not be
@@ -2678,7 +2711,7 @@ async fn run_loop(
     // restriction waits for the next turn's fresh discovery. Permissions
     // never enter the prompt, so a reload costs one small file parse and no
     // cache.
-    let turn_start_policy = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
+    let turn_start_policy = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
     let mut startup_notices: Vec<String> = turn_start_policy.notices().to_vec();
     let mut permissions = TurnPermissions::new(turn_start_policy);
     // Hooks that exist but did not load, and allow rules that are inert
@@ -2726,7 +2759,7 @@ async fn run_loop(
     // edit would surface turns later as an unrelated-looking resolve error.
     let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
     let mut hooks_seen = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-    let mut approval_seen = approval_state(core, &registry, project_root);
+    let mut approval_seen = approval_state(core, &registry, project_root, &canonical_root);
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
@@ -2807,7 +2840,7 @@ async fn run_loop(
     let mut repeats = RepeatTracker::default();
 
     'turns: for _ in 0..max_iterations {
-        refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+        refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
         // The tool schemas are re-sent whole on every request, so they are as
         // real as the transcript. Read per iteration: a mid-turn refreeze
         // swaps the wire bytes, and the overhead must follow the current
@@ -2892,7 +2925,7 @@ async fn run_loop(
             }
         }
 
-        refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+        refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
         // Charged in the units admission used, so a reply without usage pays
         // the calibrated estimate rather than a raw one that undercounts it.
         spend.record(core, session_id, used_real, &result);
@@ -3094,7 +3127,7 @@ async fn run_loop(
         // auto nothing asks.
         let mut extensions_touched = false;
 
-        let batch_mode = core.approval_mode(project_root);
+        let batch_mode = core.approval_mode_canonical(&canonical_root);
         let segments = partition_concurrent_runs(&tool_calls, |call| {
             batchable_call(
                 call,
@@ -3107,7 +3140,7 @@ async fn run_loop(
         });
 
         'calls: for segment in segments {
-            refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+            refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
             if cancelled.is_cancelled() {
                 stop_reason = "cancelled".into();
                 break 'turns;
@@ -3123,6 +3156,7 @@ async fn run_loop(
                     session_id,
                     registry: &registry,
                     project_root,
+                    canonical_root: &canonical_root,
                     caps,
                     cancelled: cancelled.clone(),
                     hooks: &mut hooks,
@@ -3145,7 +3179,7 @@ async fn run_loop(
             }
 
             for call in &tool_calls[segment.start..segment.end] {
-                refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+                refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
                 if cancelled.is_cancelled() {
                     stop_reason = "cancelled".into();
                     break 'turns;
@@ -3198,7 +3232,7 @@ async fn run_loop(
                 // replay completed hooks, which can have side effects.
                 let mode = policy_mode;
                 let mut pre = hooks.pre_tool_use(session_id, name, &args, project_root, &cancelled).await;
-                refresh_approval_policy(core, session_id, project_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+                refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
                 if mode != policy_mode && !matches!(pre, PreToolResult::Cancelled) {
                     pre = PreToolResult::Block { reason: POLICY_CHANGED_DURING_HOOK.into() };
                 }
@@ -3263,7 +3297,7 @@ async fn run_loop(
 
                 // Read live so selecting auto on an approval card takes effect
                 // for the rest of this turn, not just the next one.
-                let approval_mode = core.approval_mode(project_root);
+                let approval_mode = core.approval_mode_canonical(&canonical_root);
                 let force_allow = matches!(perm, PermissionDecision::Allow);
                 let force_ask = matches!(perm, PermissionDecision::Ask);
                 let unapproved_source = (approval_mode != ApprovalMode::Auto)
@@ -3291,7 +3325,7 @@ async fn run_loop(
                     let approval_reason =
                         if source.is_some() { "unapproved_source" } else { "gate" };
                     match request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await {
-                        ApprovalOutcome::Approved if core.approval_mode(project_root) == ApprovalMode::Readonly => {
+                        ApprovalOutcome::Approved if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Readonly => {
                             (tools::ToolOutcome {
                                 ok: false,
                                 output: "This session is now read-only; the pending action was not executed.".into(),
@@ -3299,7 +3333,7 @@ async fn run_loop(
                             }, false)
                         }
                         ApprovalOutcome::Approved => {
-                            let source = source.filter(|_| core.approval_mode(project_root) != ApprovalMode::Auto);
+                            let source = source.filter(|_| core.approval_mode_canonical(&canonical_root) != ApprovalMode::Auto);
                             executed = true;
                             // Approving the first run of an unapproved tool
                             // approves this exact content - the manifest and
@@ -3491,7 +3525,7 @@ async fn run_loop(
                     // snapshot as a floor, so a reload can narrow policy
                     // but never widen it; `deny`/`ask` need no approval,
                     // and unapproved `allow` rules are dropped at load.
-                    let current = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
+                    let current = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
                     let inert: Vec<String> = current.notices().to_vec();
                     // A mutation that leaves permissions.toml malformed
                     // bricks EVERY tool call for the rest of this turn
@@ -3604,7 +3638,7 @@ async fn run_loop(
                     // runs it, but moves no fingerprint: no refreeze, no
                     // receipt - and the model learned only when the next
                     // call raised a card. Diff approval state per call.
-                    let approval_now = approval_state(core, &registry, project_root);
+                    let approval_now = approval_state(core, &registry, project_root, &canonical_root);
                     let mut revoked: Vec<String> = Vec::new();
                     for (name, state) in &approval_now {
                         if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
@@ -3633,7 +3667,7 @@ async fn run_loop(
                     let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
                     if hooks_now != hooks_seen {
                         hooks_seen = hooks_now;
-                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
+                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
                         let inert: Vec<String> = discovered
                             .notices()
                             .into_iter()
@@ -3650,7 +3684,7 @@ async fn run_loop(
                         // inert - it fails closed and blocks every tool
                         // call from the next turn until restored or
                         // re-approved. Say that, not "applies next turn".
-                        let note = if core.approval_mode(project_root) == ApprovalMode::Auto {
+                        let note = if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Auto {
                             let mut note = match discovered.fail_closed_reason() {
                                 Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
                                 None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
@@ -3720,7 +3754,7 @@ async fn run_loop(
             schemas_wire = registry.schemas_wire_arc();
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
-            approval_seen = approval_state(core, &registry, project_root);
+            approval_seen = approval_state(core, &registry, project_root, &canonical_root);
         }
         // The system prompt at index 0 changed on refreeze, so the transcript
         // prefix on disk is stale: rewrite instead of append.
@@ -4054,8 +4088,9 @@ fn approval_state(
     core: &Core,
     registry: &Registry,
     project_root: &Path,
+    canonical_root: &Path,
 ) -> std::collections::HashMap<String, Option<String>> {
-    if core.approval_mode(project_root) == ApprovalMode::Auto {
+    if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
         return std::collections::HashMap::new();
     }
     unapproved_tool_map(registry, &core.data_dir, project_root)
