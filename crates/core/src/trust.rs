@@ -34,7 +34,7 @@ impl Default for TrustFile {
     }
 }
 
-fn trust_path(data_dir: &Path) -> PathBuf {
+pub(crate) fn trust_path(data_dir: &Path) -> PathBuf {
     data_dir.join("trust.json")
 }
 
@@ -134,8 +134,11 @@ fn grant(
     Ok((canonical, recorded))
 }
 
-/// Snapshot project choices at launch. They are never adopted from disk
-/// during a turn; only a frontend's explicit selection changes the live mode.
+/// The saved choices of trusted roots: a process's snapshot at launch, and
+/// what `Core::refresh_saved_approval_modes` reads back later. A running
+/// process takes a choice read later only where it is stricter than its own
+/// (see `state::ProjectModes`); only a frontend's explicit selection loosens
+/// the live mode.
 pub(crate) fn approval_modes(data_dir: &Path) -> Result<BTreeMap<PathBuf, ApprovalMode>, String> {
     let file = load(data_dir)?;
     Ok(file.approval_modes.into_iter().filter(|(root, _)| {

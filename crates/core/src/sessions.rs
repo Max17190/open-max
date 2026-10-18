@@ -147,11 +147,11 @@ pub(crate) struct StoreMemo {
 /// preserves timestamps does, while the change time moves on every write and
 /// every timestamp change and no caller can set it. Only a write that keeps
 /// the length within one tick of the file system's clock goes unseen.
-type Stamp = (u64, SystemTime, (i64, i64));
+pub(crate) type Stamp = (u64, SystemTime, (i64, i64));
 
 /// None when the file is missing or cannot be stat'ed, which matches no
 /// remembered stamp, so whatever is there gets read.
-fn stamp(path: &Path) -> Option<Stamp> {
+pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
     let changed = {

@@ -17,14 +17,14 @@
 //! call graph is how capabilities came to be found in one directory and
 //! approved in another.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::Settings;
+use crate::config::{ApprovalMode, Settings};
 use crate::registry::Registry;
 use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
@@ -125,10 +125,9 @@ impl CancelToken {
 pub struct Core {
     pub data_dir: PathBuf,
     pub settings: Mutex<Settings>,
-    /// Project-scoped choices, frozen at launch except for explicit frontend
-    /// changes. Kept outside Settings so unrelated saves cannot widen the
-    /// default for other projects.
-    project_approval_modes: Mutex<std::collections::BTreeMap<PathBuf, crate::config::ApprovalMode>>,
+    /// Project-scoped choices (see [`ProjectModes`]). Kept outside Settings
+    /// so unrelated saves cannot widen the default for other projects.
+    project_approval_modes: Mutex<ProjectModes>,
     /// Live sessions keyed by session id; hydrated from disk on first use.
     pub sessions: tokio::sync::Mutex<HashMap<String, SessionData>>,
     /// Sessions with an agent turn currently in flight.
@@ -153,6 +152,46 @@ pub struct Core {
     /// `approval_mode`'s note; this mutex is leaf-only).
     settings_disk_fingerprint: Mutex<SettingsFingerprint>,
     events: mpsc::UnboundedSender<AgentEventEnvelope>,
+}
+
+/// Project-scoped approval choices as this process applies them: the launch
+/// snapshot, this process's own selections, and every stricter choice other
+/// processes saved since.
+///
+/// Every frontend on a data dir saves to one trust store, so a choice saved
+/// in one is read back by the others (`Core::refresh_saved_approval_modes`)
+/// and applies wherever it is stricter: ask selected in one TUI reaches a
+/// sibling session on the same project at its next tool call instead of
+/// leaving it in auto. If that sibling's status line still shows the older
+/// mode, its Shift+Tab first shows ask and saves nothing; the next press
+/// steps from it. A looser choice is never read back, because the store is a
+/// file a tool can write and taking a wider mode from it would be
+/// self-approval; only this process's own selection loosens its modes.
+#[derive(Default)]
+struct ProjectModes {
+    live: BTreeMap<PathBuf, ApprovalMode>,
+    /// The trust store as last read, so a refresh rereads only a store that
+    /// changed.
+    stamp: Option<crate::sessions::Stamp>,
+}
+
+/// `live` tightened by `saved`: for each root either one names, the stricter
+/// of the two modes that govern it, with `default` for a map that names none
+/// at or above it. Resolving every named root this way keeps each path's mode
+/// the stricter of the two everywhere, a nested root's own choice included.
+/// So where the store is missing, or no longer names a live root or any root
+/// above it, that root drops to `default` wherever that is stricter. A store
+/// that no longer parses never reaches here and changes nothing.
+fn tightened(
+    live: &BTreeMap<PathBuf, ApprovalMode>,
+    saved: &BTreeMap<PathBuf, ApprovalMode>,
+    default: ApprovalMode,
+) -> BTreeMap<PathBuf, ApprovalMode> {
+    let governing = |modes, root| crate::trust::nearest_approval_mode(modes, root).unwrap_or(default);
+    live.keys()
+        .chain(saved.keys())
+        .map(|root| (root.clone(), governing(live, root).stricter(governing(saved, root))))
+        .collect()
 }
 
 /// Content identity of settings.json on disk. Missing and unreadable are
@@ -201,7 +240,7 @@ impl Core {
     /// Never call while holding the settings lock.
     pub fn approval_mode_canonical(&self, canonical_root: &std::path::Path) -> crate::config::ApprovalMode {
         let saved = crate::trust::nearest_approval_mode(
-            &self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner()),
+            &self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner()).live,
             canonical_root,
         );
         saved.unwrap_or_else(|| self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode)
@@ -216,8 +255,33 @@ impl Core {
     ) -> Result<(), String> {
         let mut modes = self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner());
         let canonical = crate::trust::set_approval_mode(&self.data_dir, project_root, mode)?;
-        modes.insert(canonical, mode);
+        modes.live.insert(canonical, mode);
         Ok(())
+    }
+
+    /// Read back the choices other processes saved since this one last
+    /// looked, and apply each one that is stricter (see [`ProjectModes`]).
+    /// Turns call it before each request and tool call, before a queued
+    /// batch call starts, and once an approval card is answered; a frontend
+    /// calls it where it reads the mode to act on it. The store is read only
+    /// when its stamp moved. A missing store, or one that no longer names a
+    /// root, drops that root to the settings default wherever that is
+    /// stricter (see [`tightened`]). One that no longer parses changes
+    /// nothing, as for a process that read it only at launch; the next launch
+    /// fails closed on it.
+    pub fn refresh_saved_approval_modes(&self) {
+        // Taken first and released: the settings lock is never held with this one.
+        let default = self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode;
+        let mut modes = self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner());
+        // Stamped before the read, so a write landing in between is read again.
+        let seen = crate::sessions::stamp(&crate::trust::trust_path(&self.data_dir));
+        if seen.is_some() && seen == modes.stamp {
+            return;
+        }
+        if let Ok(saved) = crate::trust::approval_modes(&self.data_dir) {
+            modes.live = tightened(&modes.live, &saved, default);
+        }
+        modes.stamp = seen;
     }
 
     pub fn new(
@@ -227,11 +291,13 @@ impl Core {
         let _ = std::fs::create_dir_all(&data_dir);
         let settings = crate::config::load(&data_dir)?;
         let core_data_dir = data_dir.clone();
+        // Stamped before the read, so a write landing in between is read again.
+        let stamp = crate::sessions::stamp(&crate::trust::trust_path(&data_dir));
         let modes = crate::trust::approval_modes(&data_dir)?;
         let core = Arc::new(Self {
             data_dir,
             settings: Mutex::new(settings),
-            project_approval_modes: Mutex::new(modes),
+            project_approval_modes: Mutex::new(ProjectModes { live: modes, stamp }),
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
@@ -360,7 +426,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_mode_is_scoped_frozen_and_saved_before_activation() {
+    fn project_mode_is_scoped_and_saved_before_activation() {
         use crate::config::ApprovalMode;
         let dir = std::env::temp_dir().join(format!("omx-mode-{}", uuid::Uuid::new_v4()));
         let project = dir.join("project");
@@ -376,7 +442,7 @@ mod tests {
         assert_eq!(restarted.approval_mode(&project), ApprovalMode::Auto);
         assert_eq!(restarted.approval_mode(&other), ApprovalMode::Ask);
         crate::trust::set_approval_mode(&data, &project, ApprovalMode::Readonly).unwrap();
-        assert_eq!(core.approval_mode(&project), ApprovalMode::Auto, "disk edits are not adopted hot");
+        assert_eq!(core.approval_mode(&project), ApprovalMode::Auto, "a read alone never goes to the disk");
         assert_eq!(Core::new(data.clone()).unwrap().0.approval_mode(&project), ApprovalMode::Readonly);
         std::fs::remove_file(data.join("trust.json")).unwrap();
         std::fs::create_dir(data.join("trust.json")).unwrap();
@@ -402,6 +468,50 @@ mod tests {
         core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
         assert_eq!(core.approval_mode(&worktree), ApprovalMode::Auto, "live selection");
         assert_eq!(Core::new(data).unwrap().0.approval_mode(&worktree), ApprovalMode::Auto, "launch snapshot");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every frontend on a data dir saves to one trust store. A save rereads
+    /// the store under trust.lock, so a process that loaded it at launch
+    /// never writes back a stale copy over another's save. A running process
+    /// reads the store back and takes another's choice wherever it is
+    /// stricter, so ask selected in one TUI does not leave a sibling session
+    /// on the project running auto. It never takes a looser one: the store
+    /// is a file a tool can write, and only its own selection loosens it.
+    #[test]
+    fn a_mode_another_process_saved_applies_only_where_it_is_stricter() {
+        use crate::config::ApprovalMode::{Ask, Auto, Readonly};
+        let dir = std::env::temp_dir().join(format!("omx-mode-sibling-{}", uuid::Uuid::new_v4()));
+        let (project, other, data) = (dir.join("project"), dir.join("other"), dir.join("data"));
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        crate::trust::grant_trust(&data, &project, Auto).unwrap();
+        crate::trust::grant_trust(&data, &other, Auto).unwrap();
+        let (a, _) = Core::new(data.clone()).unwrap();
+        let (b, _) = Core::new(data.clone()).unwrap();
+
+        b.set_project_approval_mode(&project, Ask).unwrap();
+        a.set_project_approval_mode(&other, Readonly).unwrap();
+        let fresh = Core::new(data.clone()).unwrap().0;
+        assert_eq!((fresh.approval_mode(&project), fresh.approval_mode(&other)), (Ask, Readonly), "interleaved saves keep both");
+
+        a.refresh_saved_approval_modes();
+        assert_eq!(a.approval_mode(&project), Ask, "the sibling's stricter choice applies here");
+        assert_eq!(a.approval_mode(&other), Readonly, "next to this process's own");
+
+        b.set_project_approval_mode(&project, Auto).unwrap();
+        b.set_project_approval_mode(&other, Auto).unwrap();
+        a.refresh_saved_approval_modes();
+        assert_eq!((a.approval_mode(&project), a.approval_mode(&other)), (Ask, Readonly), "a looser saved choice is never taken");
+
+        b.set_project_approval_mode(&nested, Readonly).unwrap();
+        a.refresh_saved_approval_modes();
+        assert_eq!((a.approval_mode(&nested), a.approval_mode(&project)), (Readonly, Ask), "a nested root's choice covers its subtree only");
+
+        a.set_project_approval_mode(&project, Auto).unwrap();
+        a.refresh_saved_approval_modes();
+        assert_eq!((a.approval_mode(&project), a.approval_mode(&nested)), (Auto, Readonly), "this process's own selection loosens it");
         let _ = std::fs::remove_dir_all(dir);
     }
 

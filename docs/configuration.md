@@ -131,8 +131,15 @@ Returning to `ask` restores content requirements for anything created in `auto`.
 Only a human can select a saved mode: at the trust grant, or with the
 selectors above in a human-controlled frontend. Agent-spawned processes can
 use an existing choice but can neither grant trust nor change the choice
-through the mode command. Trust and settings are read at process launch;
-editing either file from a tool does not change that process's chosen mode.
+through the mode command. Settings are read at process launch, so editing
+`settings.json` from a tool does not change a running session's mode.
+A running session reads `trust.json` again before each tool call but takes
+only a stricter mode from it, so editing that file from a tool never widens a
+running session's mode either. Select `ask` in one frontend and another
+session on the same project asks from its next tool call. If that session's
+status line still shows the older mode, its Shift+Tab first shows `ask` and
+saves nothing; the next press steps from it. Only that session's own
+selector, or a new launch, loosens it again.
 These controls govern dispatch and are not OS isolation.
 
 ## Multiple providers

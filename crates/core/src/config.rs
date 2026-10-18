@@ -66,6 +66,17 @@ impl ApprovalMode {
             ApprovalMode::Ask => ApprovalMode::Auto,
         }
     }
+
+    /// Whichever of the two lets the agent do less: readonly, then ask, then
+    /// auto. Spelled out rather than derived from the variant order, so
+    /// reordering the variants cannot quietly loosen a running gate.
+    pub fn stricter(self, other: Self) -> Self {
+        match (self, other) {
+            (ApprovalMode::Readonly, _) | (_, ApprovalMode::Readonly) => ApprovalMode::Readonly,
+            (ApprovalMode::Ask, _) | (_, ApprovalMode::Ask) => ApprovalMode::Ask,
+            _ => ApprovalMode::Auto,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
