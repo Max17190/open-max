@@ -172,7 +172,7 @@ With nothing installed, extensions cost zero tokens. Project paths win over glob
 | **Tools** | `.openmax/tools/*.toml` | Schema-described native processes; args on stdin, result on stdout |
 | **Skills** | `.agents/skills/*/SKILL.md` | On-demand workflow packages; only name and description cost prompt tokens |
 | **Prompt templates** | `.agents/prompts/*.md` | User-invoked messages; the file stem becomes a slash command |
-| **Hooks** | `.openmax/hooks/` | Process gates on a fixed set of lifecycle events; two of them can block |
+| **Hooks** | `.openmax/hooks/` | Process gates on a fixed set of lifecycle events; three of them can block |
 | **Permissions** | `.openmax/permissions.toml` | Allow, deny, or ask rules matched against tool arguments; fail closed |
 
 ```toml
@@ -192,13 +192,13 @@ type = "string"
 description = "Directory to scan"
 ```
 
-Unknown keys are rejected everywhere, so a misspelled field surfaces in `openmax --check` rather than silently changing behavior. `openmax --spec <surface>` prints the complete authoring contract for any one of them, and the frozen prompt carries only a one-line pointer to it, so that contract costs zero tokens until the agent reads it.
+Unknown keys are rejected in tool, hook, and permission files and in `settings.json`, and `openmax --check` names any in `providers.json`, so a misspelled field there shows up in `openmax --check` rather than silently changing behavior (`SKILL.md` and template frontmatter ignore keys they do not read). `openmax --spec <surface>` prints the complete authoring contract for any one of them, and the frozen prompt carries only a one-line pointer to it, so that contract costs zero tokens until the agent reads it.
 
 File formats, hook events, permission rule syntax (including the in-session repair path for a broken permissions file), self-description, and the freezing model are documented in [extending](docs/extending.md).
 
 ## Native execution and privacy
 
-The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max. They run without a controlling terminal, so a command that prompts on the terminal (a password, an ssh host key) fails at once instead of drawing over the TUI and waiting out its timeout. `bash` and hooks also get `GIT_TERMINAL_PROMPT=0`, so git names the cause. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
+The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`) are confined to the project root by the harness. `bash`, external TOML tools, and hooks are native processes: they are not confined by that path check and inherit the host filesystem, environment, credentials, and network access of Open Max, except that an external tool's environment is a scrubbed baseline (`PATH`, `HOME`, `LANG`, `TERM`) plus the variables its manifest's `env` names. They run without a controlling terminal, so a command that prompts on the terminal (a password, an ssh host key) fails at once instead of drawing over the TUI and waiting out its timeout. `bash` and hooks also get `GIT_TERMINAL_PROMPT=0`, so git names the cause. Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
 Open Max itself does not phone home. Apart from native child processes, the harness contacts only the model endpoint you configure.
 

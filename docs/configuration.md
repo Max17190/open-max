@@ -21,7 +21,8 @@ optional `~/.openmax/providers.json` for a catalog of named endpoints.
 `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. A key never
 crosses plain http to another machine: with a key (or `user:password` in the
 `base_url`) configured and an `http://` `base_url` that is not a loopback
-address (`127.0.0.1`, `::1`, or `localhost`), every request fails with an
+address (`127.0.0.1`, `::1`, or `localhost`) or the unspecified address
+(`0.0.0.0` or `::`, which reaches this machine), every request fails with an
 error instead of sending it. Use https, or a
 loopback address for a server on this machine; a server that needs no key works
 over http once none is configured. A redirect is followed only on the same
@@ -45,8 +46,9 @@ approval policy to defaults.
 
 ## Context window and compaction
 
-Four more settings shape the context budget; all are optional, and a named
-provider's per-model entries override the first two.
+Five more settings shape the context budget and each turn; all but
+`context_tokens` are optional, and a named provider's per-model entries
+override the first two.
 
 - `context_tokens` (required, here or in the model's `providers.json`
   entry): the model's context window. Nothing is queried from the server,
@@ -69,7 +71,7 @@ provider's per-model entries override the first two.
 - `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
   keeps up to a quarter of each stream's share of the cap from its start and
   the rest from its end, marks the cut with the bytes it dropped, and spills
-  the full log to `~/.openmax/cmd-logs`.
+  up to 16 MiB of each stream to `~/.openmax/cmd-logs`.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
 Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
