@@ -1272,7 +1272,11 @@ pub fn discard_if_empty(core: &Core, id: &str) -> Result<bool, String> {
     remove(core, id, true)
 }
 
-fn backed(core: &Core, id: &str) -> bool {
+/// Whether session `id` has history: a transcript, archive, or compaction
+/// file exists. Reads no lock, so a run whose stop deadline cut its
+/// `discard_if_empty` short can still tell a session with history, which was
+/// never to be removed, from an empty one it leaves indexed.
+pub fn backed(core: &Core, id: &str) -> bool {
     [messages_path(core, id), archive_path(core, id), compaction_path(core, id)]
         .iter()
         .any(|p| p.exists())
