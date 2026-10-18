@@ -28,8 +28,9 @@ true when `--continue` resumed a prior session; the next line is then one
 ```
 
 `messages` carries user and assistant text only (tool traffic and the system
-prompt are session internals), each message capped at 4096 characters and the
-whole line at 256 KiB of content; `truncated` says whether anything was cut.
+prompt are session internals), each message capped at 4096 characters, and no
+message is added once the line holds 262,144 characters of content;
+`truncated` says whether anything was cut.
 The session file on disk remains the full record. No live events are replayed,
 so a `token` stream always means a running turn.
 
@@ -154,8 +155,10 @@ The one case with no `done` is a `user` sent while a turn is already in flight:
 it is refused with a `protocol_error` alone, because the running turn owns the
 next `done` and a second one would report that turn as finished.
 
-The process exit code is 1 when the last turn ended with `stop_reason`
-`error`, 2 when `--continue` finds no prior session in the directory, and 0
+The process exit code is 1 when any turn ended with `stop_reason` `error` or
+the session could not be opened, 2 on a usage or configuration error or when
+`--continue` finds no prior session in the directory, 3 when the project is
+not trusted or trust cannot be granted from this process, and 0
 otherwise, including `max_iterations`, `budget_exhausted`, and `unverified`:
 over this wire the client reads `done` and decides for itself, unlike `-p`,
 which exits 4 on those three. SIGTERM, SIGINT, or SIGHUP cancels the running
