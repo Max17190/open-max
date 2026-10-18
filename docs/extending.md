@@ -7,8 +7,9 @@ global ones on name collision.
 
 A TOML file in `.openmax/tools/` or `~/.openmax/tools/`. The harness runs
 `command`, writes JSON args to stdin, and returns stdout. These native
-processes inherit the host filesystem, environment, credentials, and network
-access of Open Max.
+processes inherit the host filesystem and network access of Open Max; their
+environment is a scrubbed baseline (`PATH`, `HOME`, `LANG`, `TERM`) plus the
+variables the manifest's `env` names.
 
 ```toml
 # .openmax/tools/todo_scan.toml
@@ -147,8 +148,11 @@ Optional process gates under `.openmax/hooks/` or `~/.openmax/hooks/`.
 `pre_tool_use` and `user_prompt_submit` can block (nonzero exit; the blocked
 prompt never reaches the model); `post_tool_use`, `session_start` (a session's
 first turn), `compaction` (context was pruned; receives the digest record), and
-`turn_end` (receives the stop reason, fires even on cancel) observe only. Each
-hook gets one JSON payload on stdin.
+`turn_end` (receives the stop reason, fires even on cancel) observe only. A
+`turn_end` hook with `blocking = true` is a completion gate instead: a nonzero
+exit refuses the turn's end and sends its reason back as a user message, and
+after 8 honored refusals the turn ends `unverified`. Each hook gets one JSON
+payload on stdin.
 
 A `post_tool_use` payload carries the tool result the model saw: `output` (its
 first 16 KiB, cut on a character boundary), `output_bytes` (that result's
@@ -172,8 +176,8 @@ It stays observation: a failing observe hook (spawn error, nonzero exit, or
 timeout) never blocks the turn, but it is not silent either - the harness
 emits a `hook_failed` event that the TUI shows as a note and `--json`/stdio
 streams carry verbatim. Nothing a hook prints changes what the model receives. Hooks never enter the model prompt and,
-like external tools and `bash`, run as native host processes with inherited
-filesystem, environment, credentials, and network access.
+like `bash`, run as native host processes with inherited filesystem,
+environment, credentials, and network access.
 
 In `auto`, valid hooks run without content approval, including after edits.
 Malformed hooks block tools until repaired or removed; rewriting the broken
@@ -263,9 +267,10 @@ empty) to match every call of that tool.
 `tool` is matched by exact name, so a rule naming a tool that does not exist
 never fires: a misspelled `deny` reads exactly like a `deny` that never had to
 act. `openmax --check` warns about any project rule whose tool is neither a
-built-in nor a tool in `.openmax/tools/`. It is a warning rather than an error
-because writing the rule before the tool is a normal order to work in. Hook
-`tool` filters are matched and reported the same way.
+built-in nor a tool that loads from `.openmax/tools/` or `~/.openmax/tools/`.
+It is a warning rather than an error because writing the rule before the tool
+is a normal order to work in. Hook `tool` filters are matched and reported the
+same way.
 
 ### Fail closed, with a repair path
 
@@ -520,17 +525,17 @@ loop never loads it and so never fails closed on it.
 
 `openmax --spec <surface>` prints the complete authoring contract for one
 surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
-`stdio`, or `mcp`): file grammar, field caps and defaults, hook stdin payload
-shapes, and activation timing. The frozen prompt carries only a one-line
-pointer to it, so the full contract costs zero tokens until the agent reads
-it, and the printed examples are parsed by the same validation code in tests
-so the text cannot drift from the binary.
+`settings`, `memory`, `recall`, `stdio`, or `mcp`): file grammar, field caps
+and defaults, hook stdin payload shapes, and activation timing. The frozen
+prompt carries only a one-line pointer to it, so the full contract costs zero
+tokens until the agent reads it, and the printed examples are parsed by the
+same validation code in tests so the text cannot drift from the binary.
 
 ## Freezing and re-freezing
 
 Tools and skills freeze per freeze window for prompt-cache stability, and the
 harness re-freezes them automatically. At each turn start, and again between
-iterations after a mutating tool call succeeded, it captures one immutable
+iterations after a mutating call, even a failed one, it captures one immutable
 generation of extension bytes, fingerprints that snapshot, and parses those
 same bytes. If the generation changed, it rebuilds the registry and prompt in
 place (one deliberate cache re-prefill, conversation kept, a `refrozen` event
