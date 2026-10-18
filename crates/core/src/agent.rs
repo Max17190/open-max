@@ -2578,7 +2578,8 @@ async fn refresh_approval_policy(
 }
 
 /// The mode is read by `canonical_root`, the turn's one resolution of
-/// `project_root`, so a refresh walks no path. Hooks and permissions are still
+/// `project_root`, so a refresh walks no path: it stats the trust store and
+/// rereads it only when that stamp moved. Hooks and permissions are still
 /// discovered under `project_root` as the turn was given it. A stricter mode
 /// another process saved since applies from here, like a selection made in
 /// this one.

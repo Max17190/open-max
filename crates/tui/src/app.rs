@@ -5021,6 +5021,7 @@ mod tests {
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Auto, "from ask the key steps to auto");
 
         app.core.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+        render_app(&mut app, 100, 12);
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "the key leaves readonly");
         let _ = fs::remove_dir_all(dir);
@@ -5163,11 +5164,12 @@ mod tests {
     #[tokio::test]
     async fn shift_tab_presses_before_a_frame_each_step() {
         let (dir, project, mut app, _sibling) = app_beside_a_sibling("openmax-app-quick-presses");
+        assert!(app.select_approval_mode(config::ApprovalMode::Readonly), "the fixture starts the TUI in readonly");
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "auto, then readonly, then ask");
-        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Ask);
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Auto, "readonly, then ask, then auto");
+        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Auto);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5185,9 +5187,9 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Ask comes before auto in the cycle, so a press that stepped from ask
-    /// another TUI saved would save auto over it, on a press the user meant
-    /// to take this TUI from auto to readonly.
+    /// Ask steps to auto, so a press that stepped from ask another TUI saved
+    /// would save auto over it, on a press the user meant to take this TUI
+    /// from auto to ask.
     #[tokio::test]
     async fn shift_tab_never_saves_auto_over_ask_another_tui_saved() {
         let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-sibling-ask");
@@ -5599,6 +5601,7 @@ mod tests {
             assert_eq!(mode(&app), config::ApprovalMode::Ask, "from auto the key steps back to ask, never readonly");
             let project = app.project.clone();
             app.core.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+            render_app(&mut app, 100, 12);
             app.on_key(key).await.unwrap();
             assert_eq!(mode(&app), config::ApprovalMode::Ask, "from readonly the key steps to ask");
             fs::remove_dir_all(dir).unwrap();
