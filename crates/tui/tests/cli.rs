@@ -2099,16 +2099,25 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
     assert_eq!(std::fs::read_to_string(&setuid).unwrap(), "#!/bin/sh\necho new\n");
     assert_eq!(std::fs::metadata(&setuid).unwrap().mode() & 0o7777, 0o755, "a replacement drops setuid");
     assert_eq!(std::fs::read_to_string(&grouped).unwrap(), "new\n");
+    // The superuser may read and write any file, and a user in one group
+    // has no second one to keep, so those checks cannot run for them. Said
+    // aloud, so such a run does not pass for one that made every check.
     if let Some(gid) = other {
         assert_eq!(std::fs::metadata(&grouped).unwrap().gid(), gid, "the group must survive");
+    } else {
+        eprintln!("skipped: this user is in no second group, so grouped.txt's group is not checked");
     }
     if refused {
         assert_eq!(std::fs::read_to_string(&readonly).unwrap(), "old\n", "a file it may not write is not replaced");
+    } else {
+        eprintln!("skipped: this user may write the 0444 readonly.txt, so its refusal is not checked");
     }
     if unreadable {
         assert_eq!(std::fs::read_to_string(&writeonly).unwrap(), "old\n", "{stdout}");
         let said = lines.iter().rfind(|l| l["type"] == "tool_end").unwrap()["output"].clone();
         assert!(said.as_str().is_some_and(|s| s.ends_with("writeonly.txt is unchanged")), "{said}");
+    } else {
+        eprintln!("skipped: this user may read the 0200 writeonly.txt, so the refusal this test was added for is not checked; run it as a user who is not the superuser");
     }
     let names: Vec<_> = std::fs::read_dir(&project).unwrap().flatten().map(|e| e.file_name()).collect();
     assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left behind: {names:?}");
