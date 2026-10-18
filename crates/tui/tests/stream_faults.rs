@@ -1173,8 +1173,13 @@ fn a_stream_cut_at_any_offset_keeps_the_transcript_paired_and_resumable() {
         let seed = 1000 + i as u64;
         let template = Template::a(seed);
         // One byte short of a line's newline, exactly at it, and one past.
+        // The framing turns with the line, so across the lines each offset
+        // meets every framing: a clean close and a cut the client reports as
+        // an error end the stream in different code, and either could count
+        // a line that never got its newline.
         let k = (template.spans[i / 3].1 + i % 3 - 1).min(template.bytes.len());
-        cases.push(CutCase { seed, template, stratum: Stratum::LineEdge, k, framing: framings[i % 3], pieces: Vec::new() });
+        let framing = framings[(i + i / 3) % 3];
+        cases.push(CutCase { seed, template, stratum: Stratum::LineEdge, k, framing, pieces: Vec::new() });
     }
     let classes = Mutex::new(BTreeSet::new());
     let positions = Mutex::new(BTreeSet::new());
