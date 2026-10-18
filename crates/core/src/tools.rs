@@ -628,31 +628,335 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// Replace the contents of the regular file at `path`, creating it if absent.
+/// Make `bytes` the contents of the regular file at `path`, creating it if
+/// absent.
+///
+/// A write in place truncates first, so one that failed partway (a full
+/// disk, a quota, a file size limit) left a prefix of the new contents under
+/// the old name while the tool reported only that it could not write. The
+/// bytes go to a temp file beside it instead, which takes its place once
+/// they are all written, so a failure leaves the file as it was. The temp
+/// file needs room for the whole new file beside the old one, so on a full
+/// disk even a write that would shrink the file is refused, and the file is
+/// left unchanged.
+///
+/// The replacement gets the file's permissions less setuid and setgid, its
+/// owner and group, and its access control list, not the default list of
+/// its directory; it does not get the file's other extended attributes or
+/// its file flags. A file is written in place instead, with its old
+/// contents written back if that fails, when it has other hard links, which
+/// a new file would split from; when this user cannot give a new file its
+/// owner or group (only the superuser can give a file to another user or to
+/// a group it is not in); when its access control list cannot be given to
+/// a new file (on macOS, where no list is copied, a file that has a list,
+/// or whose directory's inheritable entries would give the new file one);
+/// when its directory takes no new file from this user; when the
+/// rename over it is refused (a file mounted on its own); or when its path
+/// leaves no room for the longer path of a temp file beside it. Such a file
+/// whose contents cannot be read first is not written at all, since there
+/// would be nothing to write back. In a directory flagged append-only,
+/// which refuses both the rename and the removal of the temp file, the file
+/// is written in place and the temp file, holding the new contents, is left
+/// beside it.
+///
+/// A replacement is a new file under the old name, so whatever holds the
+/// old file keeps it: a mount of the file itself (a container's single-file
+/// bind mount) and another process's open descriptor or inode watch go on
+/// seeing the old contents, so mount or watch the directory instead.
 ///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
-/// in a mutation Esc cannot cancel. So the open neither waits nor
+/// in a mutation Esc cannot cancel. So the open here neither waits nor
 /// truncates, and nothing is written until the descriptor shows a regular
 /// file.
-fn write_regular(path: &Path, content: &str) -> Result<(), NotRegular> {
+fn write_regular(path: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let unchanged = |e: std::io::Error| format!("cannot write {rel}: {e}; {rel} is unchanged");
+    // Also the check a write in place makes: a rename needs only the
+    // directory's permission, so without it a file this user may not write
+    // would be replaced.
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return crate::sessions::replace_atomic(path, bytes, 0o666, |_| Ok(()))
+                .map_err(|e| format!("cannot write {rel}: {e}; {rel} was not created"));
+        }
         // A pipe with no reader refuses an open that does not wait.
-        Err(e) => return Err(std::fs::metadata(path).ok().as_ref().and_then(not_regular).unwrap_or(NotRegular::Io(e))),
+        Err(e) => {
+            return Err(match std::fs::metadata(path).ok().as_ref().and_then(not_regular) {
+                Some(kind) => kind.message(rel),
+                None => unchanged(e),
+            })
+        }
     };
-    if let Some(kind) = not_regular(&file.metadata().map_err(NotRegular::Io)?) {
-        return Err(kind);
+    let meta = file.metadata().map_err(unchanged)?;
+    if let Some(kind) = not_regular(&meta) {
+        return Err(kind.message(rel));
     }
-    file.set_len(0).map_err(NotRegular::Io)?;
-    std::io::Write::write_all(&mut file, content.as_bytes()).map_err(NotRegular::Io)
+    if !has_other_links(&meta) {
+        let mut ready = false;
+        // Only this user may open the temp file until it has the file's
+        // owner, group, access control list and mode. Created with the
+        // default mode and the directory's group, it would let a user the
+        // file keeps out open it and read what is written next.
+        let replaced = crate::sessions::replace_atomic(path, bytes, 0o600, |tmp| {
+            take_identity(tmp, &file, &meta)?;
+            ready = true;
+            Ok(())
+        });
+        match replaced {
+            Ok(()) => return Ok(()),
+            // No temp file could be made and given the file's identity, or
+            // the rename over the file was refused: the file itself may
+            // still be writable in place.
+            Err(_) if !ready => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ResourceBusy) => {}
+            // The bytes could not be stored (a full disk, a quota, a size
+            // limit, an I/O error). Written in place they would have
+            // truncated the file first, so it stays as it was.
+            Err(e) => return Err(unchanged(e)),
+        }
+    }
+    write_in_place(path, file, &meta, rel, bytes)
+}
+
+/// Unix only: elsewhere the standard library does not give the link count.
+fn has_other_links(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(meta) > 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    linked
+}
+
+/// Give the temp file that replaces `target`, whose metadata is `meta`,
+/// that file's owner, access control list and mode. Only the superuser can
+/// give a file to another user, or to a group it is not in, so for anyone
+/// else such a file fails here. Setuid and setgid stay off, as a write in
+/// place by anyone but the superuser clears them.
+fn take_identity(tmp: &std::fs::File, target: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fresh = tmp.metadata()?;
+        #[cfg(test)]
+        CREATED_MODE.with(|created| created.set(Some(fresh.mode())));
+        if (fresh.uid(), fresh.gid()) != (meta.uid(), meta.gid()) {
+            std::os::unix::fs::fchown(tmp, Some(meta.uid()), Some(meta.gid()))?;
+        }
+        // Before the mode, which on Linux also sets the list's mask.
+        take_acl(tmp, target)?;
+        std::fs::Permissions::from_mode(meta.mode() & 0o1777)
+    };
+    #[cfg(not(unix))]
+    let mode = {
+        let _ = target;
+        meta.permissions()
+    };
+    tmp.set_permissions(mode)
+}
+
+/// Give the temp file `tmp` the access control list of `target`, the file
+/// it replaces, or none when that file has none. Created in the file's
+/// directory, the temp file starts with that directory's default list, and
+/// the mode `take_identity` sets next would let the list's named entries
+/// in: a 0640 file with no list of its own would come out readable by a
+/// user the default names, while its mode still read 0640. Linux keeps the
+/// list in one extended attribute, so copying the attribute copies the
+/// list, and the file's mode, set after it, agrees with it. A file system
+/// that keeps no lists (ENOTSUP) counts as no list on either side; any
+/// other error fails this step, so the file is written in place, which
+/// keeps its list.
+#[cfg(target_os = "linux")]
+fn take_acl(tmp: &std::fs::File, target: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
+    // ENODATA: the file has no list. ENOTSUP, the same number as
+    // EOPNOTSUPP on Linux: its file system keeps none.
+    let none = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP));
+    match get_xattr(target, ACCESS) {
+        Ok(acl) => {
+            // SAFETY: the descriptor stays open while `tmp` is borrowed,
+            // `ACCESS` ends in a NUL, and `acl` holds `acl.len()` readable
+            // bytes.
+            let set = unsafe { libc::fsetxattr(tmp.as_raw_fd(), ACCESS.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
+            if set == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Err(e) if none(&e) => {
+            // SAFETY: the descriptor stays open while `tmp` is borrowed, and
+            // `ACCESS` ends in a NUL.
+            let removed = unsafe { libc::fremovexattr(tmp.as_raw_fd(), ACCESS.as_ptr()) };
+            if removed == -1 {
+                // A temp file that took no list has none to remove.
+                let e = std::io::Error::last_os_error();
+                if !none(&e) {
+                    return Err(e);
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// The value of `file`'s extended attribute `name`.
+#[cfg(target_os = "linux")]
+fn get_xattr(file: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` stays open while `file` is borrowed, `name` ends in a
+    // NUL, and a null buffer of size 0 asks only for the value's size.
+    let size = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = usize::try_from(size).map_err(|_| std::io::Error::last_os_error())?;
+    let mut value = vec![0u8; size];
+    // SAFETY: as above, and `value` holds `value.len()` writable bytes, the
+    // most fgetxattr writes. A value that grew since fails with ERANGE.
+    let read = unsafe { libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    let read = usize::try_from(read).map_err(|_| std::io::Error::last_os_error())?;
+    value.truncate(read);
+    Ok(value)
+}
+
+/// macOS keeps a file's access control list in an extended attribute that
+/// only the superuser may read and only an entitled process may write or
+/// remove, so the list is neither copied to the temp file nor stripped from
+/// it that way. A file that has a list, or whose temp file took one from
+/// its directory's inheritable entries, fails this step and is written in
+/// place, which keeps its list as it is.
+#[cfg(target_vendor = "apple")]
+fn take_acl(tmp: &std::fs::File, target: &std::fs::File) -> std::io::Result<()> {
+    if has_acl(target)? || has_acl(tmp)? {
+        return Err(std::io::Error::other("an access control list cannot be copied"));
+    }
+    Ok(())
+}
+
+/// Whether `file` has an access control list with entries in it, read
+/// through getattrlist, which needs no entitlement. The reply holds its
+/// length, then a reference to the list (the list's offset from the
+/// reference, and its length, 0 for a file with no list), then the list: a
+/// magic number, two 16-byte GUIDs and the entry count, which is read.
+#[cfg(target_vendor = "apple")]
+fn has_acl(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut wanted = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_EXTENDED_SECURITY,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = [0u8; 256];
+    // SAFETY: the descriptor stays open while `file` is borrowed, `wanted`
+    // and `reply` outlive the call, and the kernel writes at most
+    // `reply.len()` bytes into `reply`.
+    let got = unsafe {
+        libc::fgetattrlist(file.as_raw_fd(), (&raw mut wanted).cast(), reply.as_mut_ptr().cast(), reply.len(), 0)
+    };
+    if got == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let word = |at: usize| Some(u32::from_ne_bytes(reply.get(at..at + 4)?.try_into().ok()?));
+    let count = word(4)
+        .and_then(|offset| usize::try_from(offset as i32).ok())
+        .and_then(|offset| word(4 + offset + 36));
+    match (word(8), count) {
+        (Some(0), _) => Ok(false),
+        // No entries, or the count that marks no list at all.
+        (Some(_), Some(0 | u32::MAX)) => Ok(false),
+        (Some(_), Some(_)) => Ok(true),
+        _ => Err(std::io::Error::other("an access control list that does not fit")),
+    }
+}
+
+/// Elsewhere the temp file keeps the list it was created with. No release
+/// is built for such a system.
+#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+fn take_acl(_tmp: &std::fs::File, _target: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The mode `take_identity` found a temp file created with.
+    static CREATED_MODE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Write `bytes` over the regular `file`, open at `path` with metadata
+/// `meta`. It is truncated first, so if the write then fails its old
+/// contents are written back, and the result says whether they were. A file
+/// whose old contents cannot be read first is left alone: truncated, it
+/// would have nothing to put back.
+///
+/// Each write is synced before it counts. A file system that takes a write
+/// into its cache may refuse it only when it flushes it (a network file
+/// system on close, a FUSE file system on writeback), and the close that
+/// drops the file discards its error. Unsynced, a full disk or a quota
+/// there would leave the file truncated while the result said the write
+/// landed; synced, the refusal fails the write, so the old contents go back
+/// and the result names it.
+fn write_in_place(
+    path: &Path,
+    mut file: std::fs::File,
+    meta: &std::fs::Metadata,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::{Read, Seek, Write};
+    // The bytes to put back come from the file, not from the text the
+    // caller read: a file that is not UTF-8 reads as empty there. The open
+    // that reads them looks the path up again, so it must have reached the
+    // file being written, not one renamed over it since.
+    let old = open_regular(path).ok().filter(|(_, seen)| same_file(seen, meta)).and_then(|(mut readable, _)| {
+        let mut old = Vec::new();
+        readable.read_to_end(&mut old).ok().map(|_| old)
+    });
+    let Some(old) = old else {
+        return Err(format!(
+            "cannot write {rel} in place: its contents could not be read to put back if the write failed; {rel} is unchanged"
+        ));
+    };
+    let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(bytes)?;
+        crate::sessions::sync(file, Path::new(rel))
+    };
+    let Err(e) = overwrite(&mut file, bytes) else {
+        return Ok(());
+    };
+    Err(match overwrite(&mut file, &old) {
+        Ok(()) => format!("cannot write {rel}: {e}; its old contents were written back"),
+        Err(again) => format!(
+            "cannot write {rel}: {e}, and writing its old contents back failed too ({again}), so it may be partly written"
+        ),
+    })
+}
+
+/// Whether `a` and `b` describe the same file. Unix only: elsewhere the
+/// standard library gives no file identity, so any two count as the same.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    };
+    #[cfg(not(unix))]
+    let same = {
+        let _ = (a, b);
+        true
+    };
+    same
 }
 
 /// The numbered lines one read_file call returns.
@@ -881,10 +1185,8 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
             return ToolOutcome::err(format!("cannot create directories: {e}"));
         }
     }
-    match write_regular(&path, content) {
-        Ok(()) => {}
-        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
-        Err(e) => return ToolOutcome::err(e.message(rel)),
+    if let Err(e) = write_regular(&path, rel, content.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("wrote", root, &path, &old, content)
 }
@@ -1065,10 +1367,8 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(hint);
     };
 
-    match write_regular(&path, &new) {
-        Ok(()) => {}
-        Err(NotRegular::Io(e)) => return ToolOutcome::err(format!("cannot write {rel}: {e}")),
-        Err(e) => return ToolOutcome::err(e.message(rel)),
+    if let Err(e) = write_regular(&path, rel, new.as_bytes()) {
+        return ToolOutcome::err(e);
     }
     changed_file("edited", root, &path, &old, &new)
 }
@@ -1871,9 +2171,9 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let target = pipe.clone();
         std::thread::spawn(move || {
-            let alone = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let alone = write_regular(&target, "pipe", b"x").err();
             let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&target).unwrap();
-            let attached = write_regular(&target, "x").err().map(|e| e.message("pipe"));
+            let attached = write_regular(&target, "pipe", b"x").err();
             drop(reader);
             let _ = done_tx.send((alone, attached));
         });
@@ -1883,6 +2183,271 @@ mod tests {
         assert_eq!(alone, refusal, "no reader attached");
         assert_eq!(attached, refusal, "a reader attached");
         assert!(std::fs::symlink_metadata(&pipe).unwrap().file_type().is_fifo());
+    }
+
+    /// A write in place truncates the file it has open, but reads the old
+    /// contents it would put back through a second open of the path. A file
+    /// renamed over the path in between must not lend its bytes, or a failed
+    /// write would fill the first file with the second's contents and call
+    /// them its own. The write is refused before anything is truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_in_place_puts_back_only_the_file_it_writes() {
+        let root = temp_project();
+        let path = root.join("linked.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::hard_link(&path, root.join("alias.txt")).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        std::fs::rename(root.join("other.txt"), &path).unwrap();
+        let refused = "cannot write linked.txt in place: its contents could not be read to put back if the write failed; linked.txt is unchanged";
+        assert_eq!(write_in_place(&path, file, &meta, "linked.txt", b"new\n"), Err(refused.to_string()));
+        assert_eq!(std::fs::read_to_string(root.join("alias.txt")).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "other\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file whose path is near the length limit leaves no room for the
+    /// longer path of a temp file beside it, so no temp file can be made to
+    /// replace it. It is still written, in place, as it was before writes
+    /// went through a temp file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_no_room_for_a_temp_path_beside_it_is_written_in_place() {
+        let root = temp_project();
+        // The longest path an open takes, NUL excluded. The file's path is
+        // two bytes short of it; the temp path beside it is longer than the
+        // file's by the id and suffix it adds.
+        let limit = libc::PATH_MAX as usize - 1;
+        let tail = "/a.txt".len();
+        let mut dir = root.clone();
+        // A byte short of where the filler after it would be empty: pushing
+        // an empty name adds only a separator, and the path would come out
+        // a byte short of its length.
+        while dir.as_os_str().len() + 1 + 200 + 1 + tail < limit - 2 {
+            dir.push("d".repeat(200));
+        }
+        dir.push("p".repeat(limit - 2 - tail - 1 - dir.as_os_str().len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        assert_eq!(path.as_os_str().len(), limit - 2);
+        std::fs::write(&path, "old\n").unwrap();
+        let beside = std::fs::File::create(dir.join(format!("a.txt.{}.tmp", "0".repeat(32)))).unwrap_err();
+        assert_eq!(beside.raw_os_error(), Some(libc::ENAMETOOLONG), "the temp path must not fit");
+        assert_eq!(write_regular(&path, "a.txt", b"new\n"), Ok(()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("a.txt")], "nothing left beside it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A replacement's temp file exists before it has the file's owner,
+    /// group and mode, and whoever opens it in that window keeps reading
+    /// what is written to it. Created with the default mode, a 0640 file's
+    /// new contents would be open to every user for that window.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_opens_to_no_one_but_this_user_until_it_has_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_project();
+        let path = root.join("secret.env");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        CREATED_MODE.with(|created| created.set(None));
+        assert_eq!(write_regular(&path, "secret.env", b"new\n"), Ok(()));
+        let created = CREATED_MODE.with(|created| created.take()).expect("replaced through a temp file");
+        assert_eq!(created & 0o077, 0, "the temp file was created with mode {:o}", created & 0o7777);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An access control list as its Linux extended attribute holds it: a
+    /// u32 version, 2, then per entry a u16 tag, a u16 permission set and a
+    /// u32 id, all little-endian. The tags: 1 the owner, 2 a named user, 4
+    /// the group, 8 a named group, 0x10 the mask, 0x20 everyone else; all
+    /// but the named ones take the id u32::MAX.
+    #[cfg(target_os = "linux")]
+    fn acl_xattr(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[cfg(target_os = "linux")]
+    const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
+
+    /// Set the extended attribute `name` of the file at `path` to `value`.
+    #[cfg(target_os = "linux")]
+    fn set_xattr(path: &Path, name: &std::ffi::CStr, value: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` and `name` end in a NUL, and `value` holds
+        // `value.len()` readable bytes.
+        let set = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        if set == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether a failed `set_xattr` of a list means the file system keeps
+    /// none, so a test of lists has nothing to test there.
+    #[cfg(target_os = "linux")]
+    fn acls_unsupported(e: &std::io::Error, root: &Path) -> bool {
+        let unsupported = e.raw_os_error() == Some(libc::ENOTSUP) || e.raw_os_error() == Some(libc::EOPNOTSUPP);
+        if unsupported {
+            eprintln!("skipped: the file system under {} keeps no access control lists", root.display());
+        }
+        unsupported
+    }
+
+    /// A temp file starts with its directory's default access control list,
+    /// and the mode a replacement gives it lets the list's named entries in:
+    /// a 0640 file with no list of its own would come out readable by the
+    /// user the default names, while its mode still read 0640. The
+    /// replacement takes the file's list instead, and this file has none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replacement_takes_no_access_control_list_from_its_directory() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = temp_project();
+        let dir = root.join("shared");
+        std::fs::create_dir(&dir).unwrap();
+        let unnamed = u32::MAX;
+        // The owner, user 12345 and the mask allow everything; the group and
+        // everyone else read and search.
+        let default = acl_xattr(&[(0x01, 7, unnamed), (0x02, 7, 12345), (0x04, 5, unnamed), (0x10, 7, unnamed), (0x20, 5, unnamed)]);
+        if let Err(e) = set_xattr(&dir, c"system.posix_acl_default", &default) {
+            assert!(acls_unsupported(&e, &root), "cannot set the directory's default list: {e}");
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let path = dir.join("secret.env");
+        std::fs::write(&path, "old\n").unwrap();
+        // Created in the directory, the file took its default list. Strip
+        // it, so the file has no list of its own.
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: the descriptor stays open while `file` lives, and the name
+        // ends in a NUL.
+        let stripped = unsafe { libc::fremovexattr(file.as_raw_fd(), ACL_ACCESS.as_ptr()) };
+        assert!(stripped == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA));
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(write_regular(&path, "shared/secret.env", b"new\n"), Ok(()));
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_ne!(meta.ino(), inode, "replaced through a temp file");
+        let acl = get_xattr(&std::fs::File::open(&path).unwrap(), ACL_ACCESS);
+        assert_eq!(acl.map_err(|e| e.raw_os_error()), Err(Some(libc::ENODATA)), "the file took its directory's default list");
+        assert_eq!(meta.mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file's own access control list survives its replacement byte for
+    /// byte, so the users it lets in, and those it keeps out, stay so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replacement_keeps_the_files_access_control_list() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_project();
+        let path = root.join("shared.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let unnamed = u32::MAX;
+        // The owner reads and writes, user 12345 and the group read, and
+        // everyone else is kept out.
+        let acl = acl_xattr(&[(0x01, 6, unnamed), (0x02, 4, 12345), (0x04, 4, unnamed), (0x10, 4, unnamed), (0x20, 0, unnamed)]);
+        if let Err(e) = set_xattr(&path, ACL_ACCESS, &acl) {
+            assert!(acls_unsupported(&e, &root), "cannot set the file's list: {e}");
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let before = get_xattr(&std::fs::File::open(&path).unwrap(), ACL_ACCESS).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(write_regular(&path, "shared.txt", b"new\n"), Ok(()));
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode, "replaced through a temp file");
+        let after = get_xattr(&std::fs::File::open(&path).unwrap(), ACL_ACCESS);
+        assert_eq!(after.map_err(|e| e.raw_os_error()), Ok(before), "the file's list must survive");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A temp file takes the inheritable entries of its directory's access
+    /// control list, which a write does not strip on macOS, and an entry
+    /// that lets everyone read would leave a 0640 file readable by all. The
+    /// file is written in place instead, and keeps the list it had: none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_replacement_takes_no_access_control_list_from_its_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_project();
+        let dir = root.join("shared");
+        std::fs::create_dir(&dir).unwrap();
+        let chmod = |args: &[&str], path: &Path| {
+            let status = std::process::Command::new("/bin/chmod").args(args).arg(path).status().unwrap();
+            assert!(status.success(), "chmod {args:?} failed");
+        };
+        chmod(&["+a", "everyone allow read,file_inherit"], &dir);
+        let path = dir.join("secret.env");
+        std::fs::write(&path, "old\n").unwrap();
+        let listed = |path: &Path| has_acl(&std::fs::File::open(path).unwrap()).map_err(|e| e.to_string());
+        assert_eq!(listed(&path), Ok(true), "a new file takes its directory's inheritable entry");
+        // Strip it, so the file has no list of its own.
+        chmod(&["-N"], &path);
+        assert_eq!(listed(&path), Ok(false));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(write_regular(&path, "shared/secret.env", b"new\n"), Ok(()));
+        // `ls -le` prints a line for each entry of a file's list after the
+        // file's own line, and marks its mode with a + when it has one.
+        let shown = std::process::Command::new("/bin/ls").arg("-le").arg(&path).output().unwrap();
+        let shown = String::from_utf8_lossy(&shown.stdout).into_owned();
+        assert_eq!(shown.lines().count(), 1, "the file took its directory's entry: {shown}");
+        assert!(!shown.split_whitespace().next().unwrap_or_default().ends_with('+'), "{shown}");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A rename over a file can be refused when writing it is not: an
+    /// access control entry that denies deleting the file refuses the rename
+    /// with `EACCES`. On macOS a file with an access control list is written
+    /// in place before any rename is tried, since its list cannot be copied
+    /// to a temp file there. The file is still written, in place, as it was
+    /// before writes went through a temp file, and no temp file is left
+    /// beside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_the_rename_may_not_replace_is_written_in_place() {
+        let root = temp_project();
+        let path = root.join("guarded.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let acl = |flag: &str, entry: Option<&str>| {
+            let status = std::process::Command::new("/bin/chmod").arg(flag).args(entry).arg(&path).status().unwrap();
+            assert!(status.success(), "chmod {flag} {entry:?} failed");
+        };
+        acl("+a", Some("everyone deny delete"));
+        let probe = root.join("probe.txt");
+        std::fs::write(&probe, "probe\n").unwrap();
+        let rename = std::fs::rename(&probe, &path);
+        let written = write_regular(&path, "guarded.txt", b"new\n");
+        let text = std::fs::read_to_string(&path);
+        let names: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
+        // Deletable again before any assertion, so a failure leaves nothing
+        // that cannot be removed.
+        acl("-N", None);
+        assert_eq!(rename.map_err(|e| e.kind()), Err(std::io::ErrorKind::PermissionDenied), "the rename over it must be refused");
+        assert_eq!(written, Ok(()));
+        assert_eq!(text.unwrap(), "new\n");
+        assert!(names.iter().all(|n| !n.to_string_lossy().ends_with(".tmp")), "nothing left beside it: {names:?}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Reading a device takes whatever it hands out for as long as it keeps
