@@ -3683,3 +3683,146 @@ fn a_fresh_install_is_told_every_missing_setting_at_once() {
     assert!(stderr.contains("read at launch"), "{stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// Each request a window server read: its token count, and whether it was
+/// refused.
+type WindowLog = Arc<Mutex<Vec<(usize, bool)>>>;
+
+/// A provider that counts a token per three request bytes (denser than the
+/// harness's bytes/4 estimate, as on JSON or a small-vocabulary model) and
+/// refuses, as a window does, every request whose count plus `max_tokens`
+/// is over `window`. A prompt starting with `BULK` is answered with ~18 KB of
+/// text, anything else with `ok`; answers report their prompt tokens. Each
+/// request's count and whether it was refused is recorded.
+fn spawn_window_server(window: Arc<std::sync::atomic::AtomicUsize>) -> (String, WindowLog) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: WindowLog = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let Some(body) = read_request(&mut stream) else { continue };
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let tokens = body.len() / 3;
+            let reserve = request["max_tokens"].as_u64().or(request["max_completion_tokens"].as_u64()).unwrap_or(0);
+            let limit = window.load(std::sync::atomic::Ordering::SeqCst);
+            let refused = tokens + reserve as usize > limit;
+            log.lock().unwrap().push((tokens, refused));
+            let response = if refused {
+                let error = serde_json::json!({"error": {
+                    "message": format!("This model's maximum context length is {limit} tokens. However, you requested {} tokens.", tokens + reserve as usize),
+                    "type": "invalid_request_error",
+                }})
+                .to_string();
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{error}",
+                    error.len()
+                )
+            } else {
+                let prompt = request["messages"].as_array().and_then(|m| m.last()).and_then(|m| m["content"].as_str()).unwrap_or("");
+                let text = if prompt.starts_with("BULK") { "lorem ipsum ".repeat(1_500) } else { "ok".to_string() };
+                let sse = sse(&[
+                    serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]}),
+                    serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":tokens,"completion_tokens":1}}),
+                ]);
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                    sse.len()
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), seen)
+}
+
+/// Read stdio events through the turn's `done`, returning its stop reason
+/// and every event line.
+fn stdio_turn(reader: &mut impl BufRead) -> (String, Vec<serde_json::Value>) {
+    let mut events = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "the session ended mid-turn: {events:?}");
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if event["type"] == "done" {
+            return (event["stop_reason"].as_str().unwrap_or("").to_string(), events);
+        }
+        events.push(event);
+    }
+}
+
+/// A session continued onto a smaller window starts on the plain bytes/4
+/// estimate, which a dense tokenizer outruns: the first request is under the
+/// budget by the estimate and over the window by the provider's count, so it
+/// is refused. A refusal reports no usage, so nothing calibrated and every
+/// later turn sent the same transcript and was refused the same way. The
+/// refusal now proves a floor on the ratio. This provider counts about a
+/// third more than the estimate, so the refused request is well under 1.5
+/// times what the window leaves for it, and the next turn compacts and is
+/// answered.
+#[test]
+fn a_refusal_for_length_lets_the_next_turn_compact_and_be_answered() {
+    let (project, home) = fresh_dirs("length-refusal");
+    let window = Arc::new(std::sync::atomic::AtomicUsize::new(200_000));
+    let (base_url, requests) = spawn_window_server(window.clone());
+    let settings = |context_tokens: usize| {
+        let dir = home.join(".openmax");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            format!(r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"auto","context_tokens":{context_tokens}}}"#),
+        )
+        .unwrap();
+    };
+
+    settings(200_000);
+    for args in [vec!["--trust-project", "-p", "BULK one"], vec!["--trust-project", "--continue", "-p", "BULK two"]] {
+        let out = cmd(&project, &home).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert!(requests.lock().unwrap().iter().all(|&(_, refused)| !refused));
+
+    settings(16_384);
+    window.store(16_384, std::sync::atomic::Ordering::SeqCst);
+    let before = requests.lock().unwrap().len();
+    let mut child = cmd(&project, &home)
+        .args(["--trust-project", "--continue", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"hello\""), "{line}");
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"transcript\""), "{line}");
+
+    writeln!(stdin, r#"{{"cmd":"user","text":"summarize both"}}"#).unwrap();
+    let (first, events) = stdio_turn(&mut reader);
+    assert_eq!(first, "error", "{events:?}");
+    let budget = events.iter().find(|e| e["type"] == "budget").expect("a budget line");
+    assert!(budget["used_tokens"].as_u64().unwrap() <= 16_384 - (4_096 + 1_024), "the estimate let it through: {budget}");
+    assert!(
+        events.iter().any(|e| e["type"] == "error" && e["message"].as_str().unwrap_or("").contains("maximum context length")),
+        "{events:?}"
+    );
+
+    writeln!(stdin, r#"{{"cmd":"user","text":"try again"}}"#).unwrap();
+    let (second, events) = stdio_turn(&mut reader);
+    writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
+    drop(stdin);
+    let out = finish_with_deadline(child);
+    assert_eq!(second, "stop", "the next turn must fit: {events:?}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(events.iter().any(|e| e["type"] == "message_done" && e["text"] == "ok"), "{events:?}");
+
+    let phase = requests.lock().unwrap()[before..].to_vec();
+    assert!(phase[0].1, "the continued session's first request is refused: {phase:?}");
+    let answered = phase.last().unwrap();
+    assert!(!answered.1 && answered.0 + 4_096 <= 16_384, "{phase:?}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

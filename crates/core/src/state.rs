@@ -71,7 +71,8 @@ pub struct SessionData {
     /// seeded by its first turn in another mode, which narrates nothing.
     pub seen_ledger_events: Option<HashSet<u64>>,
     /// Server-reported `prompt_tokens` over the local estimate of the same
-    /// request, as last observed on a turn's completion. The bytes/4
+    /// request, as last observed on a turn's completion, or the floor a
+    /// turn request the provider refused for length proved. The bytes/4
     /// estimator under-counts BPE tokenizers on code, by far more than the
     /// budget's headroom, so the send budget is scaled by this ratio and
     /// compaction fires before the provider refuses the request for length.
@@ -79,7 +80,8 @@ pub struct SessionData {
     /// model, URL, key, or header set tokenizes and templates differently,
     /// so after a switch the plain estimate applies until the new route
     /// reports. In memory only: a resumed session runs on the plain estimate
-    /// until its first response. See `agent::token_factor`.
+    /// until its first response or refusal for length. See
+    /// `agent::token_factor`.
     pub prompt_ratio: Option<(String, f64)>,
 }
 
