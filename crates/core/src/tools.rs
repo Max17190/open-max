@@ -655,6 +655,11 @@ fn read_all(mut file: std::fs::File) -> std::io::Result<String> {
 /// rename and the removal of the temp file, the file is written in place
 /// and the temp file, holding the new contents, is left beside it.
 ///
+/// A replacement is a new file under the old name, so whatever holds the
+/// old file keeps it: a mount of the file itself (a container's single-file
+/// bind mount) and another process's open descriptor or inode watch go on
+/// seeing the old contents, so mount or watch the directory instead.
+///
 /// The file tools read a path before they write it, and a named pipe
 /// swapped in between would hold a plain write's open waiting for a reader,
 /// in a mutation Esc cannot cancel. So the open here neither waits nor
