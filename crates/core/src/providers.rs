@@ -453,6 +453,13 @@ pub enum ResolveError {
     /// provider's model entry nor settings.json says how large it is, and the
     /// harness never guesses one.
     MissingContextTokens,
+    /// More than one of the endpoint, the model and the context window is
+    /// missing: the fresh-install case. One error names them all with an
+    /// example, because settings are read at launch, so each field reported
+    /// on its own cost an edit and a restart. `provider` marks the named
+    /// provider path, whose window can also live in providers.json. Built
+    /// only through `unconfigured`, which refuses a single missing field.
+    Unconfigured { endpoint: bool, model: bool, context_tokens: bool, provider: bool },
     /// Settings named a provider that is not in providers.json.
     UnknownProvider(String),
     /// providers.json exists but is not valid JSON: every provider is
@@ -477,6 +484,56 @@ impl std::fmt::Display for ResolveError {
                 f,
                 "no context window configured: set context_tokens in ~/.openmax/settings.json (read at launch; restart after editing) or in the model's entry in ~/.openmax/providers.json (hot) to what the endpoint actually serves; nothing is queried from the server"
             ),
+            ResolveError::Unconfigured { endpoint, model, context_tokens, provider } => {
+                let mut what = Vec::new();
+                let mut keys = Vec::new();
+                let mut example = Vec::new();
+                if *endpoint {
+                    what.push("endpoint");
+                    keys.push("base_url");
+                    example.push("  \"base_url\": \"http://localhost:8080/v1\"");
+                }
+                if *model {
+                    what.push("model");
+                    keys.push("model");
+                    example.push("  \"model\": \"the model id the server expects\"");
+                }
+                if *context_tokens {
+                    what.push("context window");
+                    keys.push("context_tokens");
+                    example.push("  \"context_tokens\": 128000");
+                }
+                if *endpoint {
+                    example.push("  \"api_key\": \"$MY_API_KEY\"");
+                }
+                // The first line stands on its own: /status and --check show
+                // only it, and a one-line renderer drops the newlines below.
+                write!(
+                    f,
+                    "no {} configured: set {} in ~/.openmax/settings.json, which is read at launch, then start openmax again",
+                    join_list(&what, "or"),
+                    join_list(&keys, "and"),
+                )?;
+                if *provider {
+                    write!(f, "; context_tokens can instead go in the model's entry in ~/.openmax/providers.json, which is read hot")?;
+                }
+                writeln!(f, ".")?;
+                writeln!(f, "For example:\n{{\n{}\n}}", example.join(",\n"))?;
+                if *context_tokens {
+                    write!(f, "Set context_tokens to the window the server actually serves for that model; nothing is queried from the server. ")?;
+                }
+                if *endpoint {
+                    write!(f, "api_key is needed only when the server checks one; $NAME reads that environment variable. ")?;
+                }
+                if *provider {
+                    write!(f, "In the TUI, /model <id> sets the model id without a restart.")
+                } else {
+                    write!(
+                        f,
+                        "For several servers, define them in ~/.openmax/providers.json and select one with settings.provider."
+                    )
+                }
+            }
             ResolveError::UnknownProvider(name) => write!(
                 f,
                 "unknown provider '{name}': add it to ~/.openmax/providers.json or clear settings.provider"
@@ -486,6 +543,25 @@ impl std::fmt::Display for ResolveError {
                 "~/.openmax/providers.json is invalid JSON: {err} — every provider is unavailable until it parses; fix the file (openmax --check names problems) or clear settings.provider"
             ),
         }
+    }
+}
+
+/// The multi-missing error. A single missing field has its own variant with
+/// its own guidance, so this refuses to stand in for one.
+fn unconfigured(endpoint: bool, model: bool, context_tokens: bool, provider: bool) -> ResolveError {
+    debug_assert!(
+        [endpoint, model, context_tokens].iter().filter(|m| **m).count() > 1,
+        "one missing field has its own variant"
+    );
+    ResolveError::Unconfigured { endpoint, model, context_tokens, provider }
+}
+
+/// "a", "a or b", "a, b or c": the missing settings as a sentence reads them.
+fn join_list(items: &[&str], last: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [head @ .., tail] => format!("{} {last} {tail}", head.join(", ")),
     }
 }
 
@@ -517,6 +593,13 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         }
         let model = settings.model.trim();
         if model.is_empty() {
+            // A catalog that sizes its models only lacks the choice; when
+            // nothing sizes any model, the window is missing as well.
+            let nothing_sized = settings.context_tokens.is_none()
+                && p.models.iter().all(|m| m.context_tokens.is_none());
+            if nothing_sized {
+                return Err(unconfigured(false, true, true, true));
+            }
             return Err(ResolveError::MissingModel);
         }
         let model_entry = p.models.iter().find(|m| m.id == model);
@@ -562,10 +645,14 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     // Flat settings path when no provider is selected. No endpoint or model
     // means no request: there is no default server to guess at.
     let base_url = settings.base_url.trim();
+    let model = settings.model.trim();
+    let missing = [base_url.is_empty(), model.is_empty(), settings.context_tokens.is_none()];
+    if missing.iter().filter(|m| **m).count() > 1 {
+        return Err(unconfigured(missing[0], missing[1], missing[2], false));
+    }
     if base_url.is_empty() {
         return Err(ResolveError::MissingEndpoint);
     }
-    let model = settings.model.trim();
     if model.is_empty() {
         return Err(ResolveError::MissingModel);
     }
@@ -1076,13 +1163,105 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let err = resolve(&Settings::default(), &dir).unwrap_err();
-        assert!(matches!(err, ResolveError::MissingEndpoint));
+        assert!(matches!(err, ResolveError::Unconfigured { endpoint: true, model: true, context_tokens: true, .. }), "{err:?}");
         let s = Settings {
             base_url: "http://127.0.0.1:11434/v1".into(),
+            context_tokens: Some(8192),
             ..Default::default()
         };
         let err = resolve(&s, &dir).unwrap_err();
-        assert!(matches!(err, ResolveError::MissingModel));
+        assert!(matches!(err, ResolveError::MissingModel), "{err:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fresh install is missing all three settings. Settings are read at
+    /// launch, so an error that named one field at a time cost an edit and a
+    /// restart per field; one error names them all, with an example that
+    /// holds the missing keys, plus api_key when the endpoint is missing, and
+    /// that loads as a settings file. A single missing field keeps its own
+    /// error. A provider whose catalog sizes its models only lacks the model
+    /// choice; one that sizes nothing lacks the window too.
+    #[test]
+    fn a_fresh_install_gets_one_error_naming_every_missing_setting() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        invalidate_providers_cache();
+        for case in 0..8u8 {
+            let (endpoint, model, window) = (case & 1 != 0, case & 2 != 0, case & 4 != 0);
+            let s = Settings {
+                base_url: if endpoint { String::new() } else { "http://127.0.0.1:11434/v1".into() },
+                model: if model { String::new() } else { "m".into() },
+                context_tokens: if window { None } else { Some(8192) },
+                ..Default::default()
+            };
+            let result = resolve(&s, &dir);
+            match [endpoint, model, window].iter().filter(|m| **m).count() {
+                0 => assert!(result.is_ok(), "{result:?}"),
+                1 if endpoint => assert!(matches!(result, Err(ResolveError::MissingEndpoint)), "{result:?}"),
+                1 if model => assert!(matches!(result, Err(ResolveError::MissingModel)), "{result:?}"),
+                1 => assert!(matches!(result, Err(ResolveError::MissingContextTokens)), "{result:?}"),
+                _ => {
+                    let err = result.unwrap_err();
+                    assert!(
+                        matches!(err, ResolveError::Unconfigured { endpoint: e, model: m, context_tokens: c, provider: false }
+                            if e == endpoint && m == model && c == window),
+                        "{err:?}"
+                    );
+                    let text = err.to_string();
+                    let first = text.lines().next().unwrap();
+                    assert!(first.ends_with("then start openmax again."), "the first line stands alone: {first}");
+                    let block = text
+                        .lines()
+                        .skip_while(|l| *l != "{")
+                        .take_while(|l| *l != "}")
+                        .chain(std::iter::once("}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let parsed: serde_json::Value = serde_json::from_str(&block).expect(&block);
+                    let _: Settings = serde_json::from_str(&block).expect("the example loads as a settings file");
+                    let mut expected = Vec::new();
+                    if endpoint {
+                        expected.push("base_url");
+                        expected.push("api_key");
+                    }
+                    if model {
+                        expected.push("model");
+                    }
+                    if window {
+                        expected.push("context_tokens");
+                    }
+                    expected.sort_unstable();
+                    let mut keys: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
+                    keys.sort_unstable();
+                    assert_eq!(keys, expected, "{text}");
+                    assert_eq!(text.contains("nothing is queried"), window, "{text}");
+                    assert_eq!(text.contains("api_key is needed only"), endpoint, "{text}");
+                    assert!(text.contains("For several servers"), "{text}");
+                }
+            }
+        }
+        let text = resolve(&Settings::default(), &dir).unwrap_err().to_string();
+        assert!(
+            text.starts_with("no endpoint, model or context window configured: set base_url, model and context_tokens in ~/.openmax/settings.json, which is read at launch, then start openmax again."),
+            "{text}"
+        );
+
+        write_providers(
+            &dir,
+            r#"{"providers":{"sized":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":32768}]},"bare":{"base_url":"http://t/v1","models":[{"id":"m"}]}}}"#,
+        );
+        invalidate_providers_cache();
+        let sized = resolve(&Settings { provider: Some("sized".into()), ..Default::default() }, &dir);
+        assert!(matches!(sized, Err(ResolveError::MissingModel)), "a sized catalog only lacks the choice: {sized:?}");
+        let err = resolve(&Settings { provider: Some("bare".into()), ..Default::default() }, &dir).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::Unconfigured { endpoint: false, model: true, context_tokens: true, provider: true }),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.starts_with("no model or context window configured: set model and context_tokens in ~/.openmax/settings.json"), "{text}");
+        assert!(text.contains("providers.json, which is read hot") && text.contains("/model <id>"), "{text}");
+        assert!(!text.contains("base_url") && !text.contains("For several servers"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -899,8 +899,9 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
         }
         // Headless and stdio runs fail fast on an unresolvable endpoint: there
         // is no interface behind them to fix it in. The interactive TUI starts
-        // anyway - /model and /provider are exactly how a first run gets
-        // configured, and every turn surfaces the same actionable error.
+        // anyway: every turn names every missing setting; /provider switches
+        // among endpoints already in providers.json and /model sets the model
+        // id, but neither adds an endpoint or a window.
         if let Err(e) = open_max_core::providers::resolve(&s, &core.data_dir) {
             if cli.stdio || cli.print {
                 eprintln!("openmax: {e}");
