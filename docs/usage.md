@@ -64,11 +64,15 @@ An unknown option after `-p` is refused with that advice. Every word after
 last turn can start with `-`:
 `openmax -p "list crates" -p -- "- summarize the first one"`.
 
-In print mode, text goes to stdout and tool progress to stderr. With `--json`,
-each `AgentEvent` is one JSON line on stdout. Mutating tools honor the
-project's approval mode, and a print run declines every approval request, so
-unattended runs need `auto`: the mode a trust grant records unless you pick
-another. For a project in `ask`, select `/approvals auto` once.
+In print mode, text goes to stdout, and tool progress and errors to stderr. A
+note the harness writes for the model (a `harness_note` event, such as the
+execution policy notice) stays in the transcript and is written to neither
+stream, so a parent agent reading a child run's stderr does not receive it.
+With `--json`, each `AgentEvent` is one JSON line on stdout, `harness_note`
+included. Mutating tools honor the project's approval mode, and a print run
+declines every approval request, so unattended runs need `auto`: the mode a
+trust grant records unless you pick another. For a project in `ask`, select
+`/approvals auto` once.
 
 A print run has no overall deadline, like a TUI or stdio session. A turn keeps
 going while the endpoint sends anything, keepalives and tool call arguments

@@ -1869,6 +1869,47 @@ fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
     );
 }
 
+/// A harness note is addressed to the model, which reads it in its own
+/// transcript, so print mode keeps it off stderr. A parent agent that runs
+/// `openmax -p` reads the child's stderr in its bash result, and the child's
+/// turn-start execution policy note used to arrive there on every call.
+/// Tool progress stays on stderr, and `--json` still carries the note as a
+/// `harness_note` line.
+#[test]
+fn a_print_run_keeps_harness_notes_off_stderr() {
+    let (project, home) = fresh_dirs("notes-off-stderr");
+    std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("read_file", serde_json::json!({"path": "a.txt"})), true),
+        (sse_text("read it"), true),
+        (sse_text("read it"), true),
+    ]);
+    write_settings(&home, &base_url);
+    // Trusted before the run, as a parent's project is: `--trust-project` on
+    // the run itself prints its own grant line.
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+
+    let out = cmd(&project, &home).args(["-p", "read a.txt"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let progress = stderr.lines().filter(|l| l.starts_with("→ ") || l.starts_with("← ")).count();
+    assert_eq!(progress, 2, "the call's progress still reaches stderr: {stderr}");
+    assert_eq!(stderr.lines().count(), progress, "stderr carries tool progress only: {stderr}");
+    let first = requests.lock().unwrap()[0].clone();
+    assert!(first.contains("[execution policy: auto"), "the model still reads the note: {first}");
+
+    let out = cmd(&project, &home).args(["--json", "-p", "say hi"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    let note = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("every stdout line is JSON"))
+        .find(|l| l["type"] == "harness_note")
+        .unwrap_or_else(|| panic!("--json carries the note: {stdout}"));
+    assert!(note["text"].as_str().unwrap().starts_with("[execution policy: auto"), "{note}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Run `openmax` with `args` and `commands` on stdin, then EOF, which quits a
 /// stdio session once its turn in flight drains, and hand back its stdout
 /// lines with the session's id, taken from `hello`, replaced by `S`.
