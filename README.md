@@ -83,8 +83,12 @@ Either way there is no Rust toolchain and no build. The script picks the right
 prebuilt binary for your machine, checks it against the published SHA-256, and
 puts `openmax` in `~/.openmax/bin` next to the settings and sessions the
 harness already keeps there. It adds that directory to your `PATH` through your
-shell profile, so open a new shell (or `source ~/.openmax/bin/env`) and run
-`openmax`.
+shell profile, which only a new shell reads, so open one (or
+`source ~/.openmax/bin/env`) before typing a bare `openmax`. The shell
+installer of releases after 2026.10.1 ends with the first command to run (see
+[Use](#use)), naming the binary by its absolute path, with the home
+directory spelled out (`/Users/you/.openmax/bin/openmax`, for example), so it
+works in the shell that ran the install.
 
 The check uses `sha256sum`, or `shasum -a 256` where there is no `sha256sum`
 (macOS 14 and earlier), and is skipped, with a message, only on a system with
@@ -121,7 +125,9 @@ Or run it in place with `cargo run --release -p openmax`.
 
 ## Configure
 
-Edit `~/.openmax/settings.json`:
+The first run can configure Open Max for you: pass the endpoint as flags, as
+in [Use](#use), and each flag whose key `~/.openmax/settings.json` does not set
+yet is written there before the turn. Or edit the file yourself:
 
 ```json
 {
@@ -134,7 +140,9 @@ Edit `~/.openmax/settings.json`:
 }
 ```
 
-`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. Set `context_tokens` to the context window the server actually serves for that model; nothing is queried, and a guessed window is wrong in one direction or the other. There is no default endpoint, model, or window: until all three are configured (here or through a named provider), Open Max refuses to start a turn with an error that says exactly what to set.
+`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. Set `context_tokens` to the context window the server actually serves for that model; nothing is queried, and a guessed window is wrong in one direction or the other. There is no default endpoint, model, or window: until all three are configured (here or through a named provider), Open Max refuses to start a turn with an error that names each missing key and the flag that writes it.
+
+`--base-url`, `--model`, `--api-key` and `--context-tokens` set the key of the same name. A flag whose key settings.json leaves unset (no file yet, an empty `base_url` or `model`, no `api_key` or `context_tokens`) is written to the file before the run, on a run that uses the endpoint the file selects, and the run says which keys it wrote. A key the file already sets is overridden for that run only: the file keeps its value, a `/model` or `/provider` save during the run keeps it too until the session changes that key or switches provider, and the run says which keys the command line overrode. A `--base-url` for another server than the file's is not sent the file's `api_key`. A flag equal to the file's value changes nothing. The full rule, with `--provider`, is in [configuration](docs/configuration.md#settings-from-the-command-line).
 
 Trusting a project records its approval mode: `auto` unless you pick `ask` or
 `readonly` at the trust prompt. Auto covers extension creation and repair
@@ -150,6 +158,25 @@ A settings file that exists but does not parse, uses an unknown key, or sets an 
 Named endpoints in `providers.json` and `compat` flags for picky gateways are covered in [configuration](docs/configuration.md).
 
 ## Use
+
+The first run is one command. In your project, give it your model server's
+API root, model id and context window, and a first task:
+
+```sh
+cd ~/code/my-app
+openmax --trust-project --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b --context-tokens 32768 -p "summarize this repo"   # from a terminal
+```
+
+It trusts the project in `auto` mode (a project trusted already keeps its
+mode), writes the endpoint to `~/.openmax/settings.json`, and prints the
+answer, with no file to write by hand and nothing to restart. For a server that checks a key, add
+`--api-key '$NAME'` naming the environment variable that holds it, exported
+before you run the command: the single quotes keep your shell from expanding
+it, so settings.json stores the variable's name and the key is read from the
+environment when a request is sent. A literal key works too, and is stored as
+given, in plain text in settings.json.
+
+After that, `openmax` alone starts the fullscreen session:
 
 ```sh
 cd ~/code/my-app

@@ -629,7 +629,10 @@ mod first_frame {
     /// `--trust-project` grant reports once the session ends, and ahead of
     /// the refusal when settings that do not parse then refuse the session
     /// (exit 2). A trust file that does not parse and a grant asked for from
-    /// an agent session refuse it too (exit 3).
+    /// an agent session refuse it too (exit 3). On a first run, the line that
+    /// says which keys the settings flags wrote prints after the grant's, and
+    /// a flag refused against settings.json refuses the session before the
+    /// grant (exit 2).
     #[test]
     fn a_grant_and_a_refusal_behind_the_first_frame_print_on_the_shell() {
         // The run's exit code and what it printed once it left the
@@ -706,6 +709,25 @@ mod first_frame {
         );
         assert_eq!(code, Some(3), "{shell:?}");
         assert!(shell.contains("openmax: trust grants are human actions"), "{shell:?}");
+
+        let first_run = ["--trust-project", "--base-url", "http://127.0.0.1:9/v1", "-m", "stub-model", "--context-tokens", "16384"];
+        let (code, shell) = on_the_shell("first-run", &|_, cmd| _ = cmd.args(first_run), true);
+        assert_eq!(code, Some(0), "{shell:?}");
+        let grant = shell.find("openmax: trusted project");
+        let wrote = shell.find("openmax: wrote base_url, model, context_tokens to ");
+        assert!(grant.is_some() && grant < wrote, "the grant's line, then the keys written: {shell:?}");
+
+        let (code, shell) = on_the_shell(
+            "key-beside-provider",
+            &|dir, cmd| {
+                std::fs::write(dir.join("settings.json"), r#"{"provider":"p","model":"m"}"#).unwrap();
+                cmd.args(["--trust-project", "--api-key", "sk-k"]);
+            },
+            false,
+        );
+        assert_eq!(code, Some(2), "{shell:?}");
+        assert!(shell.contains("openmax: --api-key is the key for settings.json's base_url"), "{shell:?}");
+        assert!(!shell.contains("openmax: trusted project"), "refused before the grant: {shell:?}");
     }
 
     /// Hold the pipe at `path` open to write once its reader has it open, so

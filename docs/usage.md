@@ -26,6 +26,7 @@ setting.
 ## Command line
 
 ```sh
+openmax --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b --context-tokens 32768
 openmax --continue                    # resume latest session here
 openmax -c
 openmax --provider ollama --model qwen2.5-coder:7b
@@ -37,6 +38,20 @@ openmax --recall "deploy port"        # search past sessions and memories
 openmax --stdio                       # full session over JSONL pipes
 openmax --mcp-list -- <server>        # list an MCP server's tools
 ```
+
+`--base-url`, `--model`, `--api-key` (a literal or `'$ENV_VAR'`) and
+`--context-tokens` set the settings key of the same name. Each one is written
+to `~/.openmax/settings.json` when the file leaves its key unset and the run
+uses the endpoint the file selects, so the first run configures the install,
+and the run prints the keys it wrote. A key the
+file already sets is overridden for that run only, an in-session `/model` or
+`/provider` save keeps the file's value for it until the session changes that
+key or switches provider, and the run prints the keys it overrode; a flag
+equal to the file's value does nothing. A `--base-url` for another server than
+the file's is not sent the file's `api_key`. With
+`--trust-project` and `-p`, the first run is one command that grants trust,
+writes the endpoint and answers a first task. The full rule, `--provider`
+included, is in [configuration](configuration.md#settings-from-the-command-line).
 
 `openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
 client, used by the proxy tool an MCP server is adopted through; see

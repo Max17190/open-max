@@ -1,7 +1,10 @@
 //! The thesis targets, one test each, named after the target it holds.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -511,5 +514,112 @@ mod first_frame {
         let rc = unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
         assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
         (controller, terminal)
+    }
+}
+
+/// A local OpenAI-compatible endpoint that answers every request with the
+/// same finished one-line completion, for as long as the test runs.
+fn spawn_answering_server() -> String {
+    const ANSWER: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"first answer\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            // Headers, then exactly Content-Length body bytes.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let length = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            let _ = stream.read_exact(&mut body);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{ANSWER}",
+                    ANSWER.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+/// A new, empty HOME and project directory: a fresh install.
+fn fresh_install(tag: &str, run: usize) -> (PathBuf, PathBuf) {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("openmax-thesis-{tag}-{}-{run}-{nonce}", std::process::id()));
+    let (project, home) = (base.join("project"), base.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    (project, home)
+}
+
+/// One command from a fresh install to a first real answer in under 30
+/// seconds, carrying the trust grant, the endpoint and the first turn. Nearly
+/// all of those 30 seconds are the download and the model's own latency, so
+/// what this gates is the harness's share: the wall time of
+/// `openmax --trust-project --base-url URL --model ID --api-key '$NAME'
+/// --context-tokens N -p TASK` on an empty HOME against a local endpoint that
+/// answers at once, from spawn to exit. Method: one warmup run, then the
+/// median of 11 runs, each on its own empty HOME and project, each required
+/// to exit 0 with the answer on stdout and the endpoint written to
+/// settings.json. Release builds assert the median is under 1 second; debug
+/// builds print it and assert under 20 seconds.
+#[test]
+fn one_command_from_a_fresh_install_answers_in_under_thirty_seconds() {
+    let base_url = spawn_answering_server();
+    let mut runs = Vec::new();
+    for run in 0..12 {
+        let (project, home) = fresh_install("first-answer", run);
+        let started = Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_openmax"))
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("OPENMAX_SESSION")
+            .env_remove("OPENMAX_API_KEY")
+            // Test automation is a human act with no terminal; the grant
+            // needs it said.
+            .env("OPENMAX_HUMAN_ATTEST", "1")
+            .env("THESIS_KEY", "k")
+            .args(["--trust-project", "--base-url", &base_url, "--model", "m", "--api-key", "$THESIS_KEY"])
+            .args(["--context-tokens", "32768", "-p", "first task"])
+            .output()
+            .unwrap();
+        let elapsed = started.elapsed();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("first answer"), "{stderr}");
+        let settings = std::fs::read_to_string(home.join(".openmax/settings.json")).unwrap();
+        assert!(settings.contains(&base_url), "{settings}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+        if run > 0 {
+            runs.push(elapsed);
+        }
+    }
+    runs.sort();
+    let median = runs[runs.len() / 2];
+    let target = Duration::from_secs(1);
+    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    eprintln!("first answer from a fresh install: median {median:?} over {} runs ({build} build)", runs.len());
+    if cfg!(debug_assertions) {
+        assert!(median < target * 20, "median {median:?}, runs {runs:?}");
+    } else {
+        assert!(median < target, "median {median:?}, runs {runs:?}");
     }
 }

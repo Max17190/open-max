@@ -24,8 +24,23 @@ usage: openmax [options] [prompt...]
 
 options:
   -c, --continue         resume the latest session in this directory
-  -m, --model <id>       use this model id for the run
+      --base-url <url>   the model server's API root (settings key base_url)
+  -m, --model <id>       the model id it expects (settings key model)
+      --api-key <key>    its key, a literal or '$ENV_VAR' naming a set variable
+                         (settings key api_key); refused beside a provider,
+                         which takes its key from providers.json
+      --context-tokens <n>
+                         the model's context window (settings key
+                         context_tokens). Each of these four writes its key to
+                         ~/.openmax/settings.json while the file leaves it
+                         unset, so a first run configures the install. A key
+                         the file sets, or any key on a run whose endpoint is
+                         not the one the file selects, is overridden for this
+                         run only, and no in-session save writes it; the run
+                         says which
       --provider <name>  use a named provider from ~/.openmax/providers.json
+                         for this run; --base-url and --api-key are refused
+                         beside it
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
       --json             with --print, emit AgentEvent envelopes as JSONL;
@@ -90,15 +105,18 @@ options:
                          already trusted keeps its mode), then run. With
                          neither -p nor --stdio and stdout not a terminal, no
                          session starts: the grant alone exits 0, and with
-                         --continue, --model or --provider it exits 1
+                         --continue or a settings flag it exits 1
   -V, --version          print the version
   -h, --help             this help
 
-point at any OpenAI-compatible endpoint via settings.json base_url, or register
-named providers in ~/.openmax/providers.json and switch with --provider.
-run inside a project directory; /help lists in-session commands.
+point at any OpenAI-compatible endpoint with --base-url (or settings.json
+base_url), or register named providers in ~/.openmax/providers.json and switch
+with --provider. run inside a project directory; /help lists in-session
+commands.
 
 examples:
+  openmax --trust-project --base-url http://127.0.0.1:11434/v1 \\
+    -m qwen2.5-coder:7b --context-tokens 32768 -p \"summarize this repo\"
   openmax
   openmax --provider ollama -m qwen2.5-coder:7b
   openmax -p \"summarize this repo\"
@@ -109,6 +127,11 @@ struct CliArgs {
     continue_session: bool,
     model: Option<String>,
     provider: Option<String>,
+    /// `--base-url`, `--api-key`, `--context-tokens`: with `--model`, the
+    /// settings keys a first run writes (see `config::KeyFlags`).
+    base_url: Option<String>,
+    api_key: Option<String>,
+    context_tokens: Option<usize>,
     print: bool,
     json: bool,
     stdio: bool,
@@ -155,6 +178,9 @@ where
         continue_session: false,
         model: None,
         provider: None,
+        base_url: None,
+        api_key: None,
+        context_tokens: None,
         print: false,
         json: false,
         stdio: false,
@@ -193,6 +219,9 @@ where
             Short('c') | Long("continue") => out.continue_session = true,
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
             Long("provider") => out.provider = Some(parser.value()?.string()?),
+            Long("base-url") => out.base_url = Some(parser.value()?.string()?),
+            Long("api-key") => out.api_key = Some(parser.value()?.string()?),
+            Long("context-tokens") => out.context_tokens = Some(parser.value()?.parse()?),
             Short('p') | Long("print") => {
                 if out.print {
                     // Subsequent -p closes the previous prompt; empty is an error.
@@ -349,6 +378,9 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         continue_session,
         model,
         provider,
+        base_url,
+        api_key,
+        context_tokens,
         print,
         json,
         stdio,
@@ -394,11 +426,14 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // Each option and the operations that read it.
     const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 8] = [
+    let options: [(bool, &str, &[Option<&str>]); 11] = [
         (*trust_project, "--trust-project", SESSIONS),
         (*continue_session, "--continue", SESSIONS),
         (model.is_some(), "--model", SESSIONS),
         (provider.is_some(), "--provider", SESSIONS),
+        (base_url.is_some(), "--base-url", SESSIONS),
+        (api_key.is_some(), "--api-key", SESSIONS),
+        (context_tokens.is_some(), "--context-tokens", SESSIONS),
         (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
         (*all, "--all", &[Some("--check")]),
@@ -451,7 +486,52 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     if mcp_timeout.is_some_and(|secs| !(1..=mcp::MAX_TIMEOUT_SECS).contains(&secs)) {
         return Err(format!("--mcp-timeout takes 1 to {} seconds", mcp::MAX_TIMEOUT_SECS));
     }
-    Ok(operation)
+    // A named provider carries its own base_url and key, so a flag for
+    // either beside it would be ignored or sent to the wrong server.
+    for (on, flag) in [(base_url.is_some(), "--base-url"), (api_key.is_some(), "--api-key")] {
+        if on && provider.is_some() {
+            return Err(format!(
+                "--provider and {flag} both choose the endpoint; a provider's base_url and key are in ~/.openmax/providers.json"
+            ));
+        }
+    }
+    key_flags(cli).problem().map_or(Ok(operation), Err)
+}
+
+/// The settings flags of this command line, for `Core::apply_key_flags`,
+/// trimmed once here, so the value checked is the value written and
+/// compared with the file's.
+fn key_flags(cli: &CliArgs) -> open_max_core::config::KeyFlags {
+    let trimmed = |value: &Option<String>| value.as_deref().map(|v| v.trim().to_string());
+    open_max_core::config::KeyFlags {
+        provider: trimmed(&cli.provider),
+        base_url: trimmed(&cli.base_url),
+        api_key: trimmed(&cli.api_key),
+        model: trimmed(&cli.model),
+        context_tokens: cli.context_tokens,
+    }
+}
+
+/// Why `--context-tokens` does not size this run, or None. settings.json's
+/// `context_tokens` is a provider's fallback: the window its providers.json
+/// entry gives the model wins, so the flag, written or not, is not the
+/// window the run uses.
+fn unused_window(flag: usize, endpoint: &open_max_core::providers::ActiveEndpoint) -> Option<String> {
+    let provider = endpoint.provider.as_deref().unwrap_or_default();
+    (flag != endpoint.context_tokens).then(|| {
+        format!(
+            "--context-tokens {flag} is not this run's window: provider '{provider}' gives model {} {} tokens in ~/.openmax/providers.json, which wins",
+            endpoint.model, endpoint.context_tokens
+        )
+    })
+}
+
+/// Why the settings flags cannot configure this run, read against
+/// settings.json before the trust grant so a refused flag writes nothing,
+/// or None (see `KeyFlags::conflict`). A settings file that does not parse
+/// is left for `Core::new` to report.
+fn settings_conflict(cli: &CliArgs, data_dir: &std::path::Path) -> Option<String> {
+    open_max_core::config::load(data_dir).ok().and_then(|file| key_flags(cli).conflict(&file))
 }
 
 fn main() -> std::io::Result<std::process::ExitCode> {
@@ -482,7 +562,8 @@ fn main() -> std::io::Result<std::process::ExitCode> {
 
 /// The runtime every run works on: the session's from behind its first
 /// frame, every other run's from the start. One that cannot start ends the
-/// run through `refuse`, after `granted`, the line of a grant made before it.
+/// run through `refuse`, after `granted`, the lines of a grant and of the
+/// settings flags made before it.
 fn runtime(granted: Option<&str>) -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -519,6 +600,9 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     signal_keys(true);
 
     let data_dir = default_data_dir();
+    if let Some(reason) = settings_conflict(&cli, &data_dir) {
+        refuse(2, &reason, None);
+    }
     let ask = || {
         on_the_shell(&mut terminal, || {
             prompt_trust(&mut std::io::stdin().lock(), &mut std::io::stderr(), &data_dir, &project)
@@ -526,7 +610,9 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     };
     let granted = ensure_project_trust(&cli, &data_dir, &project, ask).unwrap_or_else(|e| refuse(3, &e, None));
     let (core, core_rx) = Core::new(data_dir).unwrap_or_else(|e| refuse(2, &e, granted.as_deref()));
-    apply_endpoint_flags(&core, &cli);
+    let notes = apply_endpoint_flags(&core, &cli).unwrap_or_else(|e| refuse(1, &e, granted.as_deref()));
+    // What the settings flags did prints with the grant's line.
+    let granted = granted.into_iter().chain(notes).reduce(|lines, line| format!("{lines}\n{line}"));
     start_input();
     let runtime = runtime(granted.as_deref());
     let args = app::Args { continue_session: cli.continue_session, quit };
@@ -535,8 +621,9 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
 }
 
 /// End a run that cannot go on, on the shell: hand back the terminal a
-/// session that painted first holds, print `granted`, the line a trust grant
-/// made behind the first frame reports, then why, and exit with `code`.
+/// session that painted first holds, print `granted`, the lines a trust
+/// grant and the settings flags made behind the first frame report, then
+/// why, and exit with `code`.
 fn refuse(code: i32, reason: &str, granted: Option<&str>) -> ! {
     restore_terminal();
     if let Some(line) = granted {
@@ -1049,6 +1136,12 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
 
     let data_dir = default_data_dir();
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Refused before the trust grant, like a usage error, so a refused flag
+    // writes nothing.
+    if let Some(reason) = settings_conflict(&cli, &data_dir) {
+        eprintln!("openmax: {reason}");
+        std::process::exit(2);
+    }
     let ask = || prompt_trust(&mut std::io::stdin().lock(), &mut std::io::stderr(), &data_dir, &project);
     match ensure_project_trust(&cli, &data_dir, &project, ask) {
         Ok(Some(granted)) => eprintln!("{granted}"),
@@ -1072,7 +1165,17 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             std::process::exit(2);
         }
     };
-    apply_endpoint_flags(&core, &cli);
+    match apply_endpoint_flags(&core, &cli) {
+        Ok(lines) => {
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("openmax: {e}");
+            std::process::exit(1);
+        }
+    }
     // Headless and stdio runs fail fast on an unresolvable endpoint: there is
     // no interface behind them to fix it in. The interactive TUI starts
     // anyway: every turn names every missing setting; /provider switches
@@ -1140,15 +1243,37 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     end_session(result, warnings, None)
 }
 
-/// Apply `--provider` and `--model` to the settings this run uses.
-fn apply_endpoint_flags(core: &Core, cli: &CliArgs) {
-    let mut s = core.settings.lock().unwrap();
-    if let Some(provider) = &cli.provider {
-        s.provider = Some(provider.clone());
+/// Apply the settings flags to the settings this run uses, before the
+/// endpoint is resolved and before any turn, so the keys they write are the
+/// ones this launch reads (see `config::KeyFlags`). Returns the lines that
+/// say what they did, for the caller to print on the shell, or why
+/// settings.json could not be written.
+fn apply_endpoint_flags(core: &Core, cli: &CliArgs) -> Result<Vec<String>, String> {
+    let applied = core.apply_key_flags(&key_flags(cli)).map_err(|e| format!("cannot write settings: {e}"))?;
+    let path = open_max_core::config::settings_path(&core.data_dir);
+    let mut lines = Vec::new();
+    if !applied.written.is_empty() {
+        lines.push(format!("openmax: wrote {} to {}", applied.written.join(", "), path.display()));
     }
-    if let Some(model) = &cli.model {
-        s.model = model.clone();
+    if !applied.overridden.is_empty() {
+        lines.push(format!(
+            "openmax: for this run only, the command line overrides {} in {}; the file is unchanged, so set them there to keep them",
+            applied.overridden.join(", "),
+            path.display()
+        ));
     }
+    if applied.withheld_key {
+        lines.push(format!(
+            "openmax: this run sends no api_key: the one in {} is for the server its base_url names, and --base-url names another; pass --api-key to send one",
+            path.display()
+        ));
+    }
+    if let Some(flag) = cli.context_tokens {
+        if let Ok(endpoint) = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir) {
+            lines.extend(unused_window(flag, &endpoint).map(|note| format!("openmax: {note}")));
+        }
+    }
+    Ok(lines)
 }
 
 /// Start crossterm's input reader and the input modes a session reads.
@@ -1170,8 +1295,9 @@ fn start_input() {
 }
 
 /// Hand the terminal back once a session's loop has ended, print what had to
-/// wait for the shell (the line of a trust grant made behind the first frame,
-/// `granted`, then the session's exit warnings), and say how it ended.
+/// wait for the shell (the lines of a trust grant and of the settings flags
+/// made behind the first frame, `granted`, then the session's exit
+/// warnings), and say how it ended.
 fn end_session(
     result: std::io::Result<()>,
     warnings: Vec<String>,
@@ -2002,14 +2128,15 @@ fn print_usage_economics() {
 /// was wrong either way: with no controlling terminal (a CI job), starting
 /// the session failed after the grant was recorded and the run exited 1;
 /// with one, the session drew its frames into the pipe. The grant alone is
-/// the whole run and exits 0. `--continue`, `--model` and `--provider` ask
-/// for the session itself, so with any of them the run exits 1 rather than
-/// as if that session had run (see `operation`).
+/// the whole run and exits 0. `--continue` and the settings flags (`--model`,
+/// `--provider`, `--base-url`, `--api-key`, `--context-tokens`) ask for the
+/// session itself, so with any of them the run exits 1 rather than as if that
+/// session had run (see `operation`), and writes no settings.
 fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
     if !cli.trust_project || cli.print || cli.stdio || stdout_is_terminal {
         return None;
     }
-    let asks_for_a_session = cli.continue_session || cli.model.is_some() || cli.provider.is_some();
+    let asks_for_a_session = cli.continue_session || key_flags(cli) != Default::default();
     Some(if asks_for_a_session { 1 } else { 0 })
 }
 
@@ -2892,8 +3019,8 @@ mod tests {
     /// A grant with no session to start in ends the run: `--trust-project`
     /// ends after the grant when stdout is not a terminal, and goes on to the
     /// interactive session when it is. The grant alone exits 0; with
-    /// `--continue`, `--model` or `--provider` the session they ask for did
-    /// not start, so it exits 1. With `-p` or `--stdio` the session needs no
+    /// `--continue` or a settings flag the session they ask for did not
+    /// start, so it exits 1. With `-p` or `--stdio` the session needs no
     /// terminal, and without `--trust-project` there is no grant to end on.
     #[test]
     fn a_grant_without_a_terminal_ends_there_and_exits_0_only_alone() {
@@ -2905,7 +3032,14 @@ mod tests {
         assert_eq!(exit(&["--trust-project", "-p", "inspect"], false), None);
         assert_eq!(exit(&["--trust-project", "--stdio"], false), None);
         assert_eq!(exit(&[], false), None);
-        for session in [&["--continue"][..], &["-m", "m"], &["--provider", "p"]] {
+        let settings_flags = [
+            &["-m", "m"][..],
+            &["--provider", "p"],
+            &["--base-url", "http://h/v1"],
+            &["--api-key", "k"],
+            &["--context-tokens", "8"],
+        ];
+        for session in [&["--continue"][..]].into_iter().chain(settings_flags) {
             let args = [&["--trust-project"][..], session].concat();
             assert_eq!(exit(&args, false), Some(1), "{args:?}");
             assert_eq!(exit(&args, true), None, "{args:?}");
@@ -3055,11 +3189,14 @@ mod tests {
     #[test]
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
-        let options: [(&[&str], &str, &[&str]); 9] = [
+        let options: [(&[&str], &str, &[&str]); 12] = [
             (&["--trust-project"], "--trust-project", sessions),
             (&["--continue"], "--continue", sessions),
             (&["-m", "m"], "--model", sessions),
             (&["--provider", "p"], "--provider", sessions),
+            (&["--base-url", "http://h/v1"], "--base-url", sessions),
+            (&["--api-key", "k"], "--api-key", sessions),
+            (&["--context-tokens", "8"], "--context-tokens", sessions),
             (&["--json"], "--json", &["--print", "--check", "--recall", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
             (&["--all"], "--all", &["--check"]),
@@ -3087,6 +3224,8 @@ mod tests {
         for args in [
             &["--check", "--json", "--run-examples"][..],
             &["--trust-project", "--continue", "-m", "m", "--provider", "p", "-p", "--json", "x"],
+            &["--trust-project", "--base-url", "http://h/v1", "-m", "m", "--api-key", "sk-k", "--context-tokens", "8", "-p", "x"],
+            &["--provider", "p", "--context-tokens", "8", "--stdio"],
             &["--trust-project", "--continue", "--stdio"],
             &["--recall", "q", "--json"],
             &["--mcp-timeout", "60", "--mcp-list", "--json"],
@@ -3094,6 +3233,43 @@ mod tests {
         ] {
             assert_eq!(refusal_of(args), None, "{args:?} is a valid command line");
         }
+    }
+
+    /// A named provider carries its own base_url and key, so `--base-url` or
+    /// `--api-key` beside `--provider` is refused naming both, and a value
+    /// that configures nothing is refused before the run writes it: a
+    /// placeholder pasted unchanged from the installer or an error must not
+    /// land in settings.json. Values are trimmed before they are checked.
+    #[test]
+    fn settings_flags_that_cannot_configure_the_run_are_refused() {
+        for flag in ["--base-url", "--api-key"] {
+            let reason = refusal_of(&["--provider", "p", flag, "http://h/v1", "-p", "x"])
+                .unwrap_or_else(|| panic!("--provider with {flag} must be refused"));
+            assert!(names(&reason, "--provider") && names(&reason, flag), "{reason}");
+        }
+        let reason = refusal_of(&["--base-url", "URL", "-p", "x"]).unwrap();
+        assert!(reason.starts_with("--base-url takes"), "{reason}");
+        let reason = refusal_of(&["--context-tokens", "0", "-p", "x"]).unwrap();
+        assert!(reason.starts_with("--context-tokens takes"), "{reason}");
+        assert!(parse_args_from(["--context-tokens", "TOKENS"]).is_err(), "a window is a number");
+        let reason = refusal_of(&["-m", "", "-p", "x"]).unwrap();
+        assert_eq!(reason, "--model takes a non-empty value");
+        let reason = refusal_of(&["-m", " MODEL ", "-p", "x"]).unwrap();
+        assert!(reason.starts_with("--model takes the model id"), "a placeholder with spaces is still one: {reason}");
+        // Trimmed once, so the value checked is the value written.
+        let cli = parse_args_from(["--base-url", " http://h/v1 ", "--api-key", " $K ", "--context-tokens", "8", "-m", "m "]).unwrap();
+        assert_eq!(
+            key_flags(&cli),
+            open_max_core::config::KeyFlags {
+                provider: None,
+                base_url: Some("http://h/v1".into()),
+                api_key: Some("$K".into()),
+                model: Some("m".into()),
+                context_tokens: Some(8),
+            }
+        );
+        let cli = parse_args_from(["--provider", " p "]).unwrap();
+        assert_eq!(key_flags(&cli).provider.as_deref(), Some("p"));
     }
 
     /// An MCP server's command line belongs to the server: every word after
