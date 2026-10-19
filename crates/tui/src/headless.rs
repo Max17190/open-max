@@ -19,7 +19,7 @@ pub struct HeadlessArgs {
     pub prompts: Vec<String>,
     pub continue_session: bool,
     pub json: bool,
-    /// Notified on SIGTERM, SIGINT, or SIGHUP (see `watch_quit_signals`).
+    /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
 }
 

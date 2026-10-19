@@ -3046,6 +3046,48 @@ fn sighup_stops_a_text_print_run_and_its_tool_tree() {
     assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
 }
 
+/// SIGQUIT (Ctrl+\ at a shell) ends a process by default with a core
+/// dump and no cleanup, leaving the tool tree running under pid 1. The run
+/// stops it as SIGTERM does instead and exits 131, a status and not a
+/// death by signal, so no core is written.
+#[test]
+fn sigquit_stops_a_print_run_and_its_tool_tree() {
+    let tree = start_tool_tree("sigquit-print", &["--json", "-p", "start the tree"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGQUIT)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(128 + libc::SIGQUIT), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+}
+
+/// SIGUSR1 and SIGUSR2 end a process outright by default, so a supervisor
+/// that sends one to stop a run left its tool tree running. Each stops the
+/// run and exits 128 plus its number, which differs between macOS and Linux.
+#[test]
+fn sigusr1_stops_a_stdio_session_and_its_tool_tree() {
+    let tree = start_tool_tree("sigusr1-stdio", &["--stdio"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGUSR1)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(128 + libc::SIGUSR1), "{:?}\n{stderr}", output.status);
+    let done = last_event(&output.stdout);
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+}
+
+#[test]
+fn sigusr2_stops_a_text_print_run_and_its_tool_tree() {
+    let tree = start_tool_tree("sigusr2-print", &["-p", "start the tree"], "");
+    let (output, survivors) =
+        signal_tool_tree(tree, &[(std::time::Duration::ZERO, libc::SIGUSR2)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
+    assert_eq!(output.status.code(), Some(128 + libc::SIGUSR2), "{:?}\n{stderr}", output.status);
+    assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
+}
+
 /// A second signal while the first is still stopping the tools exits
 /// without waiting for that stop. Exiting runs no destructor, so the tool
 /// groups must still be killed on the way out. This tree ignores SIGTERM, so
