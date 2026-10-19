@@ -3835,10 +3835,16 @@ async fn run_loop(
     let tail = guard.messages().len() - stubs.len();
     let rewrite = stubs.iter().any(|&at| at < tail);
 
-    save_messages(core, session_id, guard.messages(), rewrite).await;
+    // The turn's end is recorded in the index write that dates the session
+    // anyway, and only once the transcript it counts is on disk: a turn
+    // whose closing save failed is counted with the next one that lands.
+    if save_messages(core, session_id, guard.messages(), rewrite).await {
+        sessions::end_turn(core, session_id, guard.messages());
+    } else {
+        sessions::touch(core, session_id);
+    }
     // Restore in-memory transcript under the async lock (Drop is try_lock only).
     guard.commit().await;
-    sessions::touch(core, session_id);
     {
         let delta = std::mem::take(&mut *turn_usage.lock().unwrap_or_else(|e| e.into_inner()));
         let _ = crate::ledger::record_usage(&core.data_dir, project_root, &delta.ledger);

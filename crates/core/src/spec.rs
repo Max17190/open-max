@@ -938,14 +938,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/6)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/7)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -961,6 +961,24 @@ Commands, one JSON object per line:
 - {"cmd":"reload"} re-freezes tools, skills, and the prompt from current
   config, like /reload; answered by a `refrozen` event, and refused with a
   `protocol_error` while a turn is in flight.
+- {"cmd":"fork"} branches the session at its end into a new session, and
+  {"cmd":"rewind","turn":N} branches it at the end of turn N (1-based):
+  where the Nth turn whose prompt stayed in the transcript sent its `done`,
+  so a completion gate's refusal stays in the turn it refused. A prompt
+  refused before it ran (an input gate, an unresolvable endpoint) is no
+  turn; one whose process died before its end counts with the next turn
+  that ends. Turns a compaction folded into its summary end together, just
+  after it. A session saved before this version counts one turn per run of
+  user messages, through the first turn this version ends. The original
+  session is not changed, and neither are files: a rewind does not undo
+  edits made after its cut. The new session holds the original's messages
+  up to that point and its frozen tools, skills, and prompt, and is the one
+  driven from then on: answered by
+  {"type":"forked","session_id":"...","parent_id":"...","message_index":N},
+  and every later line carries the new `session_id`. Refused with a
+  `protocol_error` while a turn is in flight, before the session holds any
+  message, or when turn N does not exist; the session driven is then
+  unchanged, and a refusal after the branch was made names it.
 - {"cmd":"cancel"} cancels the running turn.
 - {"cmd":"quit"} drains the in-flight turn, then exits. EOF behaves like quit.
   SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 cancels that turn
@@ -984,7 +1002,7 @@ replayed, so a `token` stream always means a running turn.
 Events: every event line carries `session_id`, a `type` discriminator, then
 fields. Parse by field name, never by key order. Only two lines carry no
 `session_id`: `protocol_error` and the `approval_mode` acknowledgement
-(`hello` and `transcript` are not events either, but carry one). Types: `token` (text), `thinking`
+(`hello`, `transcript`, and `forked` are not events either, but carry one). Types: `token` (text), `thinking`
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
 the frozen tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
