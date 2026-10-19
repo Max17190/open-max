@@ -57,6 +57,13 @@ approval; ask uses the documented approval and sandbox rules. It honors
 permission rules, `pre_tool_use` hooks, and `approval_mode` exactly as a turn
 does. See [extending](extending.md#proof-of-life).
 
+A print prompt that starts with `-` parses as options, not text. Put it
+last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
+An unknown option after `-p` is refused with that advice. Every word after
+`--` is prompt text, a later `-p` included, so in a multi-turn run only the
+last turn can start with `-`:
+`openmax -p "list crates" -p -- "- summarize the first one"`.
+
 In print mode, text goes to stdout and tool progress to stderr. With `--json`,
 each `AgentEvent` is one JSON line on stdout. Mutating tools honor the
 project's approval mode, and a print run declines every approval request, so
