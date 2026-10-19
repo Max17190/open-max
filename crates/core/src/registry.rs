@@ -1264,7 +1264,7 @@ async fn spawn_external(
         args: tool.args.iter().cloned().map(Into::into).collect(),
         cwd: root.to_path_buf(),
         stdin: StdinMode::json_line(args),
-        timeout: std::time::Duration::from_secs(tool.timeout_secs),
+        timeout: execution::timeout_secs(tool.timeout_secs),
         capture: CaptureSpec {
             head_bytes: 0,
             tail_bytes: caps.command_bytes,
@@ -2492,16 +2492,27 @@ mutatng = true
         let project = temp_dir("proj");
         let tools_dir = project.join(".openmax").join("tools");
         std::fs::create_dir_all(&tools_dir).unwrap();
-        // The timeout must outlast script startup by a wide margin, or a
-        // loaded runner kills the script before `echo` runs and there is
-        // legitimately no tail to report.
-        let slow = write_script(&project, "slow.sh", "#!/bin/sh\necho started-then-hung\nsleep 30\n");
+        // The timeout must outlast script startup, or a loaded runner kills
+        // the script before `echo` runs and there is legitimately no tail to
+        // report. The script marks that it got past the `echo`, and a run
+        // killed before that is tried again with longer seconds.
+        let echoed = project.join("echoed");
+        let slow = write_script(&project, "slow.sh", &format!("#!/bin/sh\necho started-then-hung\n: > '{}'\nsleep 30\n", echoed.display()));
         let fail = write_script(&project, "fail.sh", "#!/bin/sh\necho oops >&2\nexit 3\n");
         write_tool(&tools_dir, "slow.toml", &format!("name = \"slow\"\ndescription = \"s\"\ncommand = \"{}\"\ntimeout_secs = 3\n", slow.display()));
         write_tool(&tools_dir, "fail.toml", &format!("name = \"fail\"\ndescription = \"f\"\ncommand = \"{}\"\n", fail.display()));
         let registry = Registry::assemble(discover_external_in(std::slice::from_ref(&tools_dir)), Vec::new());
 
-        let out = registry.execute("slow", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await;
+        let mut out = None;
+        for second in execution::TRIAL_SECONDS {
+            let _second = execution::short_seconds(second);
+            out = Some(registry.execute("slow", &serde_json::json!({}), Path::new("/nonexistent-openmax-data"), &project, tools::OutputCaps::default(), no_cancel()).await);
+            if echoed.exists() {
+                break;
+            }
+        }
+        let out = out.unwrap();
+        assert!(echoed.exists(), "the script never got past its echo: {}", out.output);
         assert!(!out.ok);
         assert!(out.output.contains("timed out after 3s"), "{}", out.output);
         assert!(

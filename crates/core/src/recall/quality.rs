@@ -392,6 +392,14 @@ struct Measured {
     tokens: f64,
 }
 
+/// The one scored run the three tests below read. Building the corpus and
+/// ranking every query is the costly part and gives the same numbers each
+/// time, so it runs once per test binary instead of once per test.
+fn measured() -> &'static Measured {
+    static MEASURED: std::sync::OnceLock<Measured> = std::sync::OnceLock::new();
+    MEASURED.get_or_init(measure)
+}
+
 fn measure() -> Measured {
     let dir = std::env::temp_dir().join(format!("openmax-recall-quality-{}", uuid::Uuid::new_v4()));
     let project: PathBuf = dir.join("project");
@@ -471,7 +479,7 @@ fn measure() -> Measured {
 /// thing.
 #[test]
 fn recall_quality_fixture_resolves_every_gold() {
-    let m = measure();
+    let m = measured();
     assert!(
         m.unresolved.is_empty(),
         "the corpus is broken, not the ranking: {} case(s) name a gold session that was never \
@@ -484,7 +492,7 @@ fn recall_quality_fixture_resolves_every_gold() {
 /// The aggregate floors: how the ranker does across the whole labeled set.
 #[test]
 fn recall_quality_gate() {
-    let m = measure();
+    let m = measured();
     assert!(m.unresolved.is_empty(), "fixture is broken; see the fixture test");
     let mut failures = Vec::new();
     if m.hit1 < MIN_HIT_AT_1 {
@@ -514,7 +522,7 @@ fn recall_quality_gate() {
 /// labeled set exists to catch.
 #[test]
 fn recall_quality_per_query_floors() {
-    let m = measure();
+    let m = measured();
     assert!(m.unresolved.is_empty(), "fixture is broken; see the fixture test");
     let mut failures = Vec::new();
     for row in &m.rows {

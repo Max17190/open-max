@@ -602,7 +602,10 @@ fn approval_mode(home: &Path, project: &Path) -> ApprovalMode {
 #[test]
 fn trust_project_records_auto_for_a_project_it_newly_trusts() {
     let (project, home) = fresh_dirs("trust-mode");
-    write_settings(&home, "http://127.0.0.1:9/v1");
+    // An endpoint that answers: one that refuses holds each run for the
+    // whole retry backoff, which this test does not look at.
+    let (base_url, _requests, _server) = spawn_stub_server();
+    write_settings(&home, &base_url);
     let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto, "{stderr}");
@@ -1523,23 +1526,32 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
 /// the error says what to do, once. It used to print reqwest's whole source
 /// chain three times, count retries to a budget of 8 that a refused address
 /// never reaches, and repeat the failure as "stopped (error)".
+///
+/// Each run waits out the real backoff, so the three runs go at once.
 #[test]
 fn refused_connection_names_the_host_and_the_cause() {
     let (project, home) = fresh_dirs("refused");
     let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     write_settings(&home, &format!("http://{addr}/v1"));
-    let run = |env: &[(&str, &str)]| {
+    let start = |env: &[(&str, &str)]| {
         let mut command = cmd(&project, &home);
         for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
             command.env_remove(var);
         }
         command.envs(env.iter().copied());
-        let out = finish_with_deadline(
-            command.args(["--trust-project", "-p", "say hi"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
-        );
+        command.args(["--trust-project", "-p", "say hi"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let finish = |child: std::process::Child| {
+        let out = finish_with_deadline(child);
         assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
+    // Through a proxy that refuses, the refusal is the proxy's; a proxy
+    // that NO_PROXY exempts the endpoint from never sees the request.
+    let proxy = format!("http://{}", TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let direct = start(&[]);
+    let proxied = start(&[("HTTP_PROXY", &proxy)]);
+    let exempted = start(&[("HTTP_PROXY", &proxy), ("NO_PROXY", "127.0.0.1")]);
 
     let reason = format!("cannot connect to {addr} (connection refused)");
     let expected = [
@@ -1550,20 +1562,18 @@ fn refused_connection_names_the_host_and_the_cause() {
     let failure = |stderr: &str| -> Vec<String> {
         stderr.lines().skip_while(|line| !line.contains(&reason)).map(str::to_string).collect()
     };
-    let stderr = run(&[]);
+    let stderr = finish(direct);
     assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
 
-    // Through a proxy that refuses, the refusal is the proxy's: naming the
-    // endpoint and advising to start it would send the user the wrong way,
-    // so the error keeps the client's own account.
-    let proxy = format!("http://{}", TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
-    let stderr = run(&[("HTTP_PROXY", &proxy)]);
+    // Naming the endpoint and advising to start it would send the user the
+    // wrong way when the refusal is the proxy's, so the error keeps the
+    // client's own account.
+    let stderr = finish(proxied);
     assert!(!stderr.contains("cannot connect to") && !stderr.contains("start the server"), "stderr: {stderr}");
     assert!(stderr.contains("openmax: error: request failed: error sending request"), "stderr: {stderr}");
 
-    // A proxy that NO_PROXY exempts the endpoint from never saw the request,
-    // which is the common setup for a local server behind a proxy.
-    let stderr = run(&[("HTTP_PROXY", &proxy), ("NO_PROXY", "127.0.0.1")]);
+    // The common setup for a local server behind a proxy.
+    let stderr = finish(exempted);
     assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
@@ -3437,11 +3447,12 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     match held {
         IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal => {
             // The trust line comes just before the signal watcher starts, and
-            // the setup waits on the lock just after it.
+            // the setup waits on the lock just after it: opening the settings
+            // and registering the handlers take milliseconds.
             if !std::iter::from_fn(|| lines.recv_timeout(wait).ok()).any(|l| l.contains("trusted project")) {
                 fail(&mut child, "the run never reached its session setup");
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
         IndexHeld::BeforeTheTurn
         | IndexHeld::FreedAfterTheSignal
