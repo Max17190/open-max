@@ -99,11 +99,13 @@ the prompts after it.
 | 3 | The project is not trusted, or trust cannot be granted from this process |
 | 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue, though an `unverified` from a gate that could not start repeats until the hook is repaired |
 
-Tools run in a session of their own, so Ctrl+C at the shell reaches openmax
-and not them. SIGINT, SIGTERM, or SIGHUP to a print or stdio run cancels the
-running turn, which stops each tool's process group (SIGTERM, then SIGKILL),
-and exits 128 plus the signal number (130, 143, 129) once the turn has ended,
-waiting at most 3 seconds for it; a `turn_end` hook still running then is killed.
+Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
+openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a
+print or stdio run cancels the running turn, which stops each tool's process
+group (SIGTERM, then SIGKILL), and exits 128 plus the signal number (130, 143,
+129, 131; for SIGUSR1 and SIGUSR2, 158 and 159 on macOS and 138 and 140 on
+Linux) once the turn has ended, waiting at most 3 seconds for it; a `turn_end`
+hook still running then is killed. A SIGQUIT therefore writes no core dump.
 Removing a new session that nothing was saved to takes its share of the same 3
 seconds: while another openmax process holds the session index past them, the
 session stays indexed and the run says so on stderr. Once they are used up, the

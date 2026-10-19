@@ -163,11 +163,12 @@ the session could not be opened, 2 on a usage or configuration error or when
 not trusted or trust cannot be granted from this process, and 0
 otherwise, including `max_iterations`, `budget_exhausted`, and `unverified`:
 over this wire the client reads `done` and decides for itself, unlike `-p`,
-which exits 4 on those three. SIGTERM, SIGINT, or SIGHUP cancels the running
-turn instead of draining it, declines pending approvals, and exits 128 plus
-the signal number once that turn's `done` is written and, for a new session
-that nothing was saved to, its index entry is removed, or after 3 seconds if
-either has not finished, plus up to 100 ms to check that the session is empty
+which exits 4 on those three. SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, or
+SIGUSR2 cancels the running turn instead of draining it, declines pending
+approvals, and exits 128 plus the signal number once that turn's `done` is
+written and, for a new session that nothing was saved to, its index entry is
+removed, or after 3 seconds if either has not finished, plus up to 100 ms
+to check that the session is empty
 and up to 250 ms for a tool command still being started; an entry still in
 place then stays, and a warning says so on stderr. A tool command whose start
 outlasts those 250 ms is not stopped, and runs on after the exit.
