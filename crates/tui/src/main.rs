@@ -229,6 +229,14 @@ where
                     arg.unexpected()
                 )));
             }
+            // A prompt word that starts with a dash parses as an option; `--`
+            // ends the options, so every word after it is prompt text.
+            _ if out.print => {
+                return Err(lexopt::Error::from(format!(
+                    "{}; a prompt that starts with '-' goes last, after --",
+                    arg.unexpected()
+                )));
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -2676,6 +2684,25 @@ mod tests {
     fn empty_print_group_is_rejected() {
         assert!(parse_args_from(["-p", "-p", "second"]).is_err());
         assert!(parse_args_from(["-p"]).is_err());
+    }
+
+    /// A prompt that starts with a dash reads as an option, and the refusal
+    /// named only an option nobody typed (`invalid option '- '` for
+    /// `-p '- list the files'`). It now says where such a prompt goes, and
+    /// that place takes it, as the last turn of a multi-turn run too. A
+    /// command line without -p has no prompt to point at.
+    #[test]
+    fn a_print_prompt_that_starts_with_a_dash_is_told_to_go_after_double_dash() {
+        for prompt in ["- list the files", "--- heading", "-v is broken"] {
+            let err = parse_args_from(["-p", prompt]).err().unwrap_or_else(|| panic!("{prompt:?}")).to_string();
+            assert!(err.contains("a prompt that starts with '-' goes last, after --"), "{prompt:?}: {err}");
+            let cli = parse_args_from(["-p", "--", prompt]).unwrap();
+            assert_eq!(cli.prompts, [prompt]);
+        }
+        let cli = parse_args_from(["-p", "first", "-p", "--", "- second"]).unwrap();
+        assert_eq!(cli.prompts, ["first", "- second"]);
+        let err = parse_args_from(["--bogus"]).err().unwrap().to_string();
+        assert_eq!(err, "invalid option '--bogus'");
     }
 
     /// An operation that names one thing to act on, given twice, kept only

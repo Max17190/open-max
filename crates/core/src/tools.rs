@@ -1007,6 +1007,10 @@ impl ReadWindow {
                 "offset {offset} is past the end of {rel} ({total} lines); retry with a smaller offset"
             ));
         }
+        // The last line the window covers. An empty file passes the check
+        // above with any offset, so the sum saturates: near the integer
+        // limit it overflowed.
+        let end = (offset - 1).saturating_add(limit);
         if let Some(cut_at) = cut_at {
             // `cut_at` is the first line that did NOT fit, so the
             // continuation resumes exactly there. The former `+ 1` skipped
@@ -1015,8 +1019,8 @@ impl ReadWindow {
             out.push_str(&format!(
                 "… output limit reached at line {cut_at} (file has {total} lines; continue with offset={cut_at})\n"
             ));
-        } else if total > offset - 1 + limit {
-            out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - (offset - 1 + limit), offset + limit));
+        } else if total > end {
+            out.push_str(&format!("… {} more lines (file has {total} lines; continue with offset={})\n", total - end, end + 1));
         }
         if out.is_empty() {
             out = "(empty file)".into();
@@ -3882,6 +3886,27 @@ mod tests {
         std::fs::write(root.join("empty.txt"), "").unwrap();
         let out = read_file(&root, &json!({"path": "empty.txt", "offset": 5}));
         assert!(out.ok && out.output.contains("(empty file)"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The window's end, `offset - 1 + limit`, overflowed on an empty file
+    /// for an offset near the top of the integer range: a debug build
+    /// panicked, so the call failed as a crashed tool, and a release build
+    /// wrapped. The end saturates, so such an offset reads as any other
+    /// offset does, in either JSON form a model writes it.
+    #[test]
+    fn read_file_offset_at_the_integer_limit_does_not_overflow() {
+        let root = std::env::temp_dir().join(format!("openmax-read-max-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("small.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(root.join("empty.txt"), "").unwrap();
+        for offset in [json!(u64::MAX), json!(u64::MAX.to_string()), json!(u64::MAX - 1)] {
+            let out = read_file(&root, &json!({"path": "small.txt", "offset": offset}));
+            assert!(!out.ok && out.output.contains("past the end of small.txt (3 lines)"), "{offset}: {}", out.output);
+            let out = read_file(&root, &json!({"path": "empty.txt", "offset": offset}));
+            assert_eq!((out.ok, out.output.as_str()), (true, "(empty file)"), "{offset}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
