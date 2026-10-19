@@ -1217,9 +1217,10 @@ fn opaque(value: &Value) -> Option<Box<RawValue>> {
 /// Which call in `partials` a streamed tool-call delta adds to, opening a new
 /// one when the delta starts a call; None past [`MAX_TOOL_CALLS`]. A delta
 /// continues the latest call its `index` opened, or without an index the
-/// latest call, unless [`starts_call`] says it begins the next one. A call
-/// opened without an index counts as index 0, since servers that drop zero
-/// values can still mark its later pieces index 0.
+/// latest call with its id, else the latest call, unless [`starts_call`]
+/// says it begins the next one. A call opened without an index counts as
+/// index 0, since servers that drop zero values can still mark its later
+/// pieces index 0.
 fn tool_slot(
     partials: &mut Vec<PartialToolCall>,
     index: Option<u64>,
@@ -1232,7 +1233,9 @@ fn tool_slot(
     }
     let latest = match index {
         Some(index) => partials.iter().rposition(|call| call.index.unwrap_or(0) == index),
-        None => partials.len().checked_sub(1),
+        // A server that sends no index can still interleave the pieces of
+        // parallel calls, each marked with its call's id.
+        None => id.and_then(|id| partials.iter().rposition(|call| call.id == id)).or(partials.len().checked_sub(1)),
     };
     if let Some(at) = latest.filter(|&at| !starts_call(&partials[at], index.is_some(), id, name, args)) {
         return Some(at);
@@ -1916,6 +1919,32 @@ mod tests {
         let whole = |i: usize| json!([{"id": format!("c{i}"), "function": {"name": "bash", "arguments": "{}"}}]);
         assert_eq!(stream_calls((0..MAX_TOOL_CALLS).map(whole).collect()).await.tool_calls.len(), MAX_TOOL_CALLS);
         assert_eq!(stream_calls((0..=MAX_TOOL_CALLS).map(whole).collect()).await.finish_reason, TRUNCATED);
+    }
+
+    /// A server that sends no `index` can still stream parallel calls side
+    /// by side, marking each piece with its call's id, with or without the
+    /// name again. Each piece joined the latest call instead of the one its
+    /// id names: resending the name split two calls into four with torn
+    /// arguments and repeated ids, and sending only the id gave the second
+    /// call the first one's arguments.
+    #[tokio::test]
+    async fn interleaved_calls_without_an_index_join_the_call_their_id_names() {
+        let (a, b) = (r#"{"path":"a.txt"}"#, r#"{"pattern":"x"}"#);
+        let expected = vec![call("a", "read_file", a), call("b", "grep", b)];
+        let named = calls_of(vec![
+            json!([{"id": "a", "function": {"name": "read_file", "arguments": "{\"path\":"}}, {"id": "b", "function": {"name": "grep", "arguments": "{\"pattern\":"}}]),
+            json!([{"id": "a", "function": {"name": "read_file", "arguments": "\"a.txt\"}"}}, {"id": "b", "function": {"name": "grep", "arguments": "\"x\"}"}}]),
+        ])
+        .await;
+        assert_eq!(named, expected);
+        let ids_only = calls_of(vec![
+            json!([{"id": "a", "function": {"name": "read_file", "arguments": "{\"path\":"}}]),
+            json!([{"id": "b", "function": {"name": "grep", "arguments": "{\"pattern\":"}}]),
+            json!([{"id": "a", "function": {"arguments": "\"a.txt\"}"}}]),
+            json!([{"id": "b", "function": {"arguments": "\"x\"}"}}]),
+        ])
+        .await;
+        assert_eq!(ids_only, expected);
     }
 
     /// Some servers repeat the id and name on every delta of a call, some
