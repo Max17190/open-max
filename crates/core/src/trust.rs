@@ -201,9 +201,14 @@ fn update(data_dir: &Path, change: impl FnOnce(&mut TrustFile) -> Result<(), Str
         .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
 
     let mut file = load(data_dir)?;
+    let before = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
     change(&mut file)?;
     let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
-    crate::sessions::write_atomic(&trust_path(data_dir), json)?;
+    // A change that changes nothing (granting a listed root again) writes
+    // nothing: the replace costs two disk syncs on the way to the first frame.
+    if json != before {
+        crate::sessions::write_atomic(&trust_path(data_dir), json)?;
+    }
     Ok(())
 }
 
@@ -348,6 +353,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(fresh);
         let _ = std::fs::remove_dir_all(earlier);
+    }
+
+    /// A change that leaves the store as it is writes nothing. Every launch
+    /// with `--trust-project` on a project already trusted grants again, and
+    /// replacing trust.json there (temp file, rename, two disk syncs) sat on
+    /// the way to the first frame for a file that came out byte-identical.
+    /// The replace gives the file a new inode, so an unchanged inode proves
+    /// no write happened; a grant that does change the store still writes.
+    #[cfg(unix)]
+    #[test]
+    fn a_trust_change_that_changes_nothing_leaves_the_store_untouched() {
+        use std::os::unix::fs::MetadataExt;
+        let data = temp_dir("regrant-data");
+        let project = temp_dir("regrant-project");
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let store = || {
+            let path = trust_path(&data);
+            (std::fs::metadata(&path).unwrap().ino(), std::fs::read(&path).unwrap())
+        };
+
+        grant_trust(&data, &project, ApprovalMode::Auto).unwrap();
+        let first = store();
+        assert_eq!(grant_trust(&data, &project, ApprovalMode::Ask).unwrap().1, None);
+        trust_project(&data, &project).unwrap();
+        set_approval_mode(&data, &project, ApprovalMode::Auto).unwrap();
+        assert_eq!(store(), first, "an unchanged store must not be rewritten");
+
+        grant_trust(&data, &sub, ApprovalMode::Auto).unwrap();
+        assert_ne!(store().0, first.0, "a grant that lists a new root writes the store");
+        assert!(is_trusted(&data, &sub).unwrap());
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[test]

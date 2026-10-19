@@ -711,6 +711,35 @@ fn a_grant_with_no_terminal_exits_0_once_it_is_recorded() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// A launch with `--trust-project` on a project it already trusts writes
+/// nothing: trust.json keeps its bytes and its inode, where it used to be
+/// replaced (temp file, rename, two disk syncs) with identical bytes on the
+/// way to the first frame. The run still exits 0 and says the approval mode
+/// is unchanged.
+#[test]
+fn a_grant_on_an_already_trusted_project_leaves_trust_json_untouched() {
+    use std::os::unix::fs::MetadataExt;
+    let (project, home) = fresh_dirs("grant-again");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let grant = || {
+        let mut command = cmd(&project, &home);
+        command.arg("--trust-project").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        finish_with_deadline(without_controlling_terminal(&mut command).spawn().unwrap())
+    };
+    let out = grant();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let trust_file = home.join(".openmax/trust.json");
+    let store = || (std::fs::metadata(&trust_file).unwrap().ino(), std::fs::read(&trust_file).unwrap());
+    let first = store();
+
+    let out = grant();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("already trusted; its approval mode is unchanged"), "{stderr}");
+    assert_eq!(store(), first, "a grant that changes nothing must not rewrite trust.json");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 #[test]
 fn an_untrusted_project_fails_closed_with_exit_3() {
     let (project, home) = fresh_dirs("trust");

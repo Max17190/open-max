@@ -97,7 +97,8 @@ Each trusted project's mode is saved in `~/.openmax/trust.json` for its exact
 canonical path, and the trust grant records it in the same write: `auto`,
 unless you answer `a` (`ask`) or `r` (`readonly`) at the interactive trust
 prompt. `--trust-project` records `auto`. A project that is already trusted
-keeps its mode when trust is granted again. Change the mode with
+keeps its mode when trust is granted again, and a grant or mode selection that
+would leave `trust.json` as it is writes nothing. Change the mode with
 `/approvals auto|ask|readonly`, **Shift+Tab**, or the approval card's **Auto
 for project** choice; every selector saves the same choice. It survives new
 sessions and restarts, including headless and stdio runs, and does not change
