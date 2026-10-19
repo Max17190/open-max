@@ -1607,6 +1607,45 @@ fn a_call_id_repeated_across_iterations_is_answered_in_its_own_run() {
     truncated.resume(&run, &run.after);
 }
 
+/// Parallel calls from a server that sends no `index` and streams them side
+/// by side, resending each call's id and name on every piece, start once
+/// each with their own arguments and each run once. Joined to the latest
+/// call instead of the one its id names, the pieces made four calls with
+/// torn arguments out of two.
+#[test]
+fn interleaved_calls_without_an_index_start_and_run_once_each() {
+    let args = [bash_args("i1"), bash_args("i2")];
+    // Each piece of both calls carries its id and name; the first holds the
+    // arguments up to the redirect, the second the rest.
+    let piece = |head: bool| {
+        let calls: Vec<Value> = [("i1", &args[0]), ("i2", &args[1])]
+            .into_iter()
+            .map(|(id, args)| {
+                let (first, rest) = args.split_at(args.find(">>").unwrap());
+                json!({"id": id, "type": "function", "function": {"name": "bash", "arguments": if head { first } else { rest }}})
+            })
+            .collect();
+        data(&chunk(json!({"tool_calls": calls}), Value::Null))
+    };
+    let reply = format!("{}{}{}{DONE}", piece(true), piece(false), finish("tool_calls"));
+    let env = Env::new("interleaved", "parallel calls interleaved without an index", vec![
+        Step::Finished(reply),
+        Step::Finished(sse_text("after the calls")),
+        Step::Finished(sse_text("resumed")),
+    ]);
+    let run = env.first("go");
+    let log = run.log();
+    assert_eq!(run.code, Some(0), "{log}");
+    let starts: Vec<(&str, &str, &Value)> =
+        run.of("tool_start").map(|e| (e["call_id"].as_str().unwrap(), e["name"].as_str().unwrap(), &e["args"])).collect();
+    let expected: Vec<Value> = args.iter().map(|a| serde_json::from_str(a).unwrap()).collect();
+    assert_eq!(starts, [("i1", "bash", &expected[0]), ("i2", "bash", &expected[1])], "{log}");
+    let mut ran: Vec<String> = env.ran_log().lines().map(str::to_string).collect();
+    ran.sort();
+    assert_eq!(ran, ["i1", "i2"], "{log}");
+    env.resume(&run, &run.after);
+}
+
 /// An endpoint that reads the request and closes without a status line is
 /// a transport fault after connecting: resent once, with the same bytes.
 #[test]
