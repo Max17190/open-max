@@ -70,7 +70,7 @@ enum Command {
 
 pub struct StdioArgs {
     pub continue_session: bool,
-    /// Notified on SIGTERM, SIGINT, or SIGHUP (see `watch_quit_signals`).
+    /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
 }
 

@@ -1141,9 +1141,10 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
     }));
 }
 
-/// SIGTERM, SIGHUP (the terminal went away), and SIGINT (Ctrl+C at a shell
-/// in print and stdio mode; sent from outside in the TUI, where raw mode
-/// makes it a key) each end the process on the spot by default, with every
+/// SIGTERM, SIGHUP (the terminal went away), SIGINT and SIGQUIT (Ctrl+C
+/// and Ctrl+\ at a shell in print and stdio mode; sent from outside in the
+/// TUI, where raw mode makes them keys), SIGUSR1, and SIGUSR2 each end the
+/// process on the spot by default (SIGQUIT with a core dump), with every
 /// terminal mode still on and every tool still running. While the frontend
 /// runs, the first one reaches it as a quit, so the session ends through
 /// its normal exit path; a second means that path is stuck, so the tool
@@ -1170,12 +1171,18 @@ fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
             return;
         };
         runtime.block_on(async move {
-            let mut signals: Vec<_> =
-                [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()]
-                    .into_iter()
-                    .filter(|kind| !ignored(kind.as_raw_value()))
-                    .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
-                    .collect();
+            let mut signals: Vec<_> = [
+                SignalKind::terminate(),
+                SignalKind::hangup(),
+                SignalKind::interrupt(),
+                SignalKind::quit(),
+                SignalKind::user_defined1(),
+                SignalKind::user_defined2(),
+            ]
+            .into_iter()
+            .filter(|kind| !ignored(kind.as_raw_value()))
+            .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
+            .collect();
             let _ = registered.send(());
             if signals.is_empty() {
                 return;
