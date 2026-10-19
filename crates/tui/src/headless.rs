@@ -329,13 +329,12 @@ async fn run_turn_events(
                     let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills){what}");
                 }
             }
-            AgentEvent::HarnessNote { text, .. } => {
-                // The receipt the model sees; hook-authored control bytes
-                // cannot split or restyle the line (printable(), like the
-                // other harness-authored stderr text).
-                if !json {
-                    let _ = writeln!(stderr, "openmax: {}", one_line(text));
-                }
+            AgentEvent::HarnessNote { .. } => {
+                // Addressed to the model, which reads it in its transcript;
+                // `--json` carries it as a `harness_note` line. Not stderr:
+                // a parent agent running `openmax -p` reads this run's stderr
+                // in its tool result, so every note meant for this run's
+                // model would also cost the parent's.
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if !json {
