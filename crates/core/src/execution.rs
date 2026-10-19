@@ -118,6 +118,10 @@ pub(crate) struct ProcessRequest {
     /// human approved, and the approval binding hashes no code outside the
     /// project. Ignored under `sandbox`.
     pub self_link: bool,
+    /// Variables set for this child on top of the environment the fields
+    /// above give it, in every mode. The agent's shell takes its command text
+    /// this way, so the text never sits in the shell's argument list.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 /// Containment for a probe run: no network, filesystem reads allowed, writes
@@ -169,6 +173,11 @@ pub(crate) struct CaptureSpec {
     pub tail_bytes: usize,
     pub spill_dir: Option<PathBuf>,
     pub spill_bytes_per_stream: usize,
+    /// Keep only the final text of a line redrawn with carriage returns
+    /// (see [`Redraws`]). Applied as bytes arrive, before the head,
+    /// the tail, the spill log and `total_bytes` see them, so a progress bar
+    /// costs the cap one line instead of every frame it drew.
+    pub redraws: bool,
 }
 
 pub(crate) enum Termination {
@@ -256,6 +265,9 @@ impl std::error::Error for ProcessError {}
 
 struct StreamCapture {
     stream: CapturedStream,
+    /// Set when the capture keeps only the final text of a redrawn line,
+    /// with the buffer each chunk's kept bytes pass through.
+    redraws: Option<(Redraws, Vec<u8>)>,
     prefix: Vec<u8>,
     spill_path: Option<PathBuf>,
     spill_file: Option<tokio::fs::File>,
@@ -274,6 +286,7 @@ impl StreamCapture {
                 head: Vec::with_capacity(capture.head_bytes),
                 tail: Vec::with_capacity(capture.tail_bytes),
             },
+            redraws: capture.redraws.then(Default::default),
             prefix: Vec::with_capacity(capture.head_bytes.max(capture.tail_bytes)),
             spill_path: None,
             spill_file: None,
@@ -292,6 +305,16 @@ impl StreamCapture {
     }
 
     async fn push(&mut self, chunk: &[u8]) {
+        let Some((mut redraws, mut shown)) = self.redraws.take() else {
+            return self.keep(chunk).await;
+        };
+        shown.clear();
+        redraws.push(chunk, &mut shown);
+        self.keep(&shown).await;
+        self.redraws = Some((redraws, shown));
+    }
+
+    async fn keep(&mut self, chunk: &[u8]) {
         self.stream.total_bytes = self.stream.total_bytes.saturating_add(chunk.len() as u64);
 
         let head_remaining = self
@@ -385,6 +408,9 @@ impl StreamCapture {
     }
 
     async fn finish(mut self) -> io::Result<FinishedStream> {
+        if let Some((redraws, _)) = self.redraws.take() {
+            self.keep(&redraws.finish()).await;
+        }
         if let Some(mut file) = self.spill_file.take() {
             if self.omitted_from_spill > 0 {
                 let _ = file
@@ -411,6 +437,101 @@ struct FinishedStream {
     stream: CapturedStream,
     spill_path: Option<PathBuf>,
     omitted: bool,
+}
+
+/// Longest stretch of one line [`Redraws`] holds back in case a later `\r`
+/// replaces it. A real terminal wraps a line this long over many rows and a
+/// `\r` returns only to the start of the last one, so once a line's text
+/// since its last redraw passes it, that text and the rest of the line up to
+/// its next `\r` or `\n` are passed on as they arrive: memory stays bounded,
+/// a later redraw never replaces what was passed on, and where the pipe's
+/// reads end changes nothing. The `\r` that ends such text is passed on
+/// with it, so the frame drawn next does not run on from it.
+const REDRAW_LINE_BYTES: usize = 8 * 1024;
+
+/// The final text of a line that output redraws: a `\r` not followed by
+/// `\n` starts the line over, and the text after it replaces the whole line
+/// so far. Package managers, build tools and downloaders draw progress this
+/// way, and every frame they drew reached the model although a person at a
+/// terminal sees only the last. A terminal overwrites in place, so a shorter
+/// frame leaves the end of a longer one on screen; that leftover is dropped
+/// too. A line is held until its `\n` (or the end of the stream) so a later
+/// `\r` can still replace it; `\r\n` stays a line ending, byte for byte, a
+/// run of `\r` before a `\n` becomes one `\r\n`, and a `\r` with nothing
+/// after it on its line replaces nothing, so one at the end of the stream is
+/// dropped (`last\r` ends as `last`).
+#[derive(Default)]
+struct Redraws {
+    /// The current line's text since its last redraw.
+    line: Vec<u8>,
+    /// A `\r` came after the line's last text, and nothing yet after it.
+    returned: bool,
+    /// The line's text since its last redraw passed [`REDRAW_LINE_BYTES`]
+    /// and was passed on. The rest of it passes straight on until its next
+    /// `\r` or `\n`, so no later `\r` replaces part of a line already
+    /// passed on, whatever the reads. It stays set across that `\r`, so the
+    /// `\r` is passed on ahead of the next frame's text.
+    passing: bool,
+}
+
+impl Redraws {
+    fn push(&mut self, mut rest: &[u8], out: &mut Vec<u8>) {
+        // Most output redraws nothing: its whole lines pass on in one copy
+        // instead of a walk over every line ending.
+        if !self.returned && !rest.contains(&b'\r') {
+            if let Some(end) = rest.iter().rposition(|&b| b == b'\n') {
+                out.append(&mut self.line);
+                out.extend_from_slice(&rest[..=end]);
+                self.passing = false;
+                rest = &rest[end + 1..];
+            }
+            return self.text(rest, out);
+        }
+        let mut start = 0;
+        for (at, &byte) in rest.iter().enumerate() {
+            if byte != b'\r' && byte != b'\n' {
+                continue;
+            }
+            self.text(&rest[start..at], out);
+            if byte == b'\n' {
+                out.append(&mut self.line);
+                if std::mem::take(&mut self.returned) {
+                    out.push(b'\r');
+                }
+                out.push(b'\n');
+                self.passing = false;
+            } else {
+                self.returned = true;
+            }
+            start = at + 1;
+        }
+        self.text(&rest[start..], out);
+    }
+
+    fn text(&mut self, text: &[u8], out: &mut Vec<u8>) {
+        if text.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.returned) {
+            self.line.clear();
+            if std::mem::take(&mut self.passing) {
+                out.push(b'\r');
+            }
+        }
+        if self.passing || self.line.len() + text.len() > REDRAW_LINE_BYTES {
+            out.append(&mut self.line);
+            out.extend_from_slice(text);
+            self.passing = true;
+        } else {
+            self.line.extend_from_slice(text);
+        }
+    }
+
+    /// The end of the stream ends the line it was drawing: what is left to
+    /// pass on.
+    fn finish(self) -> Vec<u8> {
+        self.line
+    }
 }
 
 fn push_tail(tail: &mut Vec<u8>, limit: usize, bytes: &[u8]) {
@@ -727,6 +848,9 @@ pub(crate) async fn run_process(
         // names the cause. A credential helper or askpass program still
         // answers first.
         command.env("GIT_TERMINAL_PROMPT", "0");
+    }
+    for (name, value) in &request.env {
+        command.env(name, value);
     }
     // Mark every native child as agent-spawned. Trust grants are human
     // actions: the CLI refuses --trust-project (and the interactive trust
@@ -1265,10 +1389,11 @@ impl PausedSpawn {
                 cwd: std::env::temp_dir(),
                 stdin: StdinMode::Null,
                 timeout: Duration::from_secs(30),
-                capture: CaptureSpec { head_bytes: 64, tail_bytes: 64, spill_dir: None, spill_bytes_per_stream: 1024 },
+                capture: CaptureSpec { head_bytes: 64, tail_bytes: 64, spill_dir: None, spill_bytes_per_stream: 1024, redraws: false },
                 sandbox: None,
                 env_allowlist: None,
                 self_link: false,
+                env: Vec::new(),
             };
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let output = runtime.block_on(run_process(request, Arc::new(CancelToken::default())));
@@ -1373,10 +1498,12 @@ mod tests {
                 tail_bytes: 4,
                 spill_dir: None,
                 spill_bytes_per_stream: 1024,
+                redraws: false,
             },
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            env: Vec::new(),
         }
     }
 
@@ -1416,10 +1543,12 @@ mod tests {
                 tail_bytes: 1024,
                 spill_dir: None,
                 spill_bytes_per_stream: 0,
+                redraws: false,
             },
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            env: Vec::new(),
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout.head), "1");
@@ -1464,10 +1593,11 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
-            capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
+            capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            env: Vec::new(),
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         std::env::remove_var("OPENMAX_HUMAN_ATTEST");
@@ -1486,10 +1616,11 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
-            capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0 },
+            capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            env: Vec::new(),
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
         let got = String::from_utf8_lossy(&output.stdout.head).to_string();
@@ -1610,10 +1741,12 @@ mod tests {
                 tail_bytes: 4096,
                 spill_dir: None,
                 spill_bytes_per_stream: 0,
+                redraws: false,
             },
             sandbox: Some(SandboxPolicy { rw_scratch: scratch.to_path_buf() }),
             env_allowlist: None,
             self_link: false,
+            env: Vec::new(),
         }
     }
 
@@ -1732,6 +1865,53 @@ mod tests {
             tail: b"bcde".to_vec(),
         };
         assert_eq!(stream.rendered_bytes(), b"abcde");
+    }
+
+    /// A pipe read ends wherever the kernel cut the output, so a redraw has
+    /// to read the same whatever the cut: a `\r` that ends one read and the
+    /// `\n` that starts the next are still one `\r\n` line ending (as is a
+    /// run of `\r` before a `\n`), a frame split over two reads is still one
+    /// frame, a `\r` at the end of the stream is dropped, and a line past the
+    /// 8 KiB limit is passed on whole, with the `\r` that ends it, however
+    /// its reads were cut.
+    #[test]
+    fn a_redraw_reads_the_same_wherever_a_read_ends() {
+        let input = b"get 1%\rget 50%\rget 100%\nkept\r\ntwo\r\r\n\r\nx\r\ry\rlast\r";
+        let shown = b"get 100%\nkept\r\ntwo\r\n\r\nlast";
+        let run = |reads: &[&[u8]]| {
+            let (mut redraws, mut out) = (Redraws::default(), Vec::new());
+            for read in reads {
+                redraws.push(read, &mut out);
+            }
+            out.extend(redraws.finish());
+            out
+        };
+        for cut in 0..=input.len() {
+            assert_eq!(run(&[&input[..cut], &input[cut..]]), shown, "cut at {cut}");
+        }
+        let bytes: Vec<&[u8]> = input.chunks(1).collect();
+        assert_eq!(run(&bytes), shown);
+
+        // Text up to the 8 KiB the configuration docs state can still be
+        // replaced; past it, it is passed on as it arrives instead of held
+        // without bound, and the `\r` after it stays between it and the next
+        // frame instead of gluing the two together.
+        let held = "h".repeat(8 * 1024);
+        assert_eq!(run(&[format!("{held}\rnext\n").as_bytes()]), b"next\n");
+        let long = "l".repeat(8 * 1024 + 1);
+        assert_eq!(run(&[format!("{long}\rnext\n").as_bytes()]), format!("{long}\rnext\n").as_bytes());
+
+        // A line longer than the limit keeps all of it whatever the reads,
+        // including reads of the capture's own size; one `\r` follows it
+        // however many came, and the next redraw or line is held again.
+        let (l, m) = ("L".repeat(20_000), "M".repeat(9_000));
+        let input = format!("{l}\r\rmid\rnext\n{m}\nshort\rlast\n");
+        let shown = format!("{l}\rnext\n{m}\nlast\n");
+        assert_eq!(run(&[input.as_bytes()]), shown.as_bytes());
+        for size in [1, 7, 4096, READ_CHUNK_BYTES, READ_CHUNK_BYTES + 1] {
+            let reads: Vec<&[u8]> = input.as_bytes().chunks(size).collect();
+            assert_eq!(run(&reads), shown.as_bytes(), "reads of {size}");
+        }
     }
 
     /// A short timeout races process startup on a loaded runner (a 25ms
@@ -1905,6 +2085,7 @@ mod tests {
                 tail_bytes: 16,
                 spill_dir: None,
                 spill_bytes_per_stream: 0,
+                redraws: false,
             },
             "stdout",
             stop.clone(),

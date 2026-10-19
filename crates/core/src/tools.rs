@@ -19,6 +19,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -390,6 +391,9 @@ fn file_path_arg(args: &Value) -> Option<&str> {
     args["path"].as_str().filter(|p| !p.trim().is_empty())
 }
 
+/// Run one built-in tool as the only call of a session of its own, which no
+/// result has yet told about background processes. A session's calls go
+/// through [`execute_in_session`] instead.
 pub async fn execute(
     name: &str,
     args: &Value,
@@ -398,8 +402,23 @@ pub async fn execute(
     caps: OutputCaps,
     cancel: Arc<CancelToken>,
 ) -> ToolOutcome {
+    execute_in_session(name, args, data_dir, root, caps, cancel, &AtomicBool::new(false)).await
+}
+
+/// [`execute`] for one call of a session. `background_noted` is the
+/// session's record that a result has already explained why background
+/// processes do not outlive a call (see [`exited_outcome`]).
+pub(crate) async fn execute_in_session(
+    name: &str,
+    args: &Value,
+    data_dir: &Path,
+    root: &Path,
+    caps: OutputCaps,
+    cancel: Arc<CancelToken>,
+    background_noted: &AtomicBool,
+) -> ToolOutcome {
     if name == "bash" {
-        return bash_tool(data_dir, root, args, caps, cancel).await;
+        return run_bash(data_dir, root, args, caps, cancel, background_noted).await;
     }
     if cancel.is_cancelled() {
         return ToolOutcome::err("tool cancelled by user");
@@ -1976,6 +1995,39 @@ fn bash_shell() -> &'static str {
     .unwrap_or("/bin/sh")
 }
 
+/// The variable a bash call's command text reaches its shell in, and the
+/// script the shell runs with `-c` to run it. Passed as the `-c` argument
+/// itself, the text sat in the shell's argument list, where on Linux a
+/// `pkill -f` or `pgrep -f` pattern taken from the command matched the shell
+/// running it (macOS's leave out their own ancestors unless given `-a`):
+/// `pkill -f 'node server'; node server.js &` killed itself before the
+/// restart, and `ps | grep` listed the shell as the process it looked for.
+/// The script hands the text to `eval` in the shell itself, behind an
+/// `unset` of the variable that `eval` runs before the command's first
+/// word, so nothing the command starts inherits the text, with `allexport`
+/// on or off: the script assigns no variable for `allexport` to export, and
+/// bash gives each child its own `_`, although `$_` holds the text once the
+/// text has run. A `BASH_ENV` file runs before the `unset` and still sees
+/// the variable, and a value the harness's own environment gives
+/// `OPENMAX_COMMAND` is overwritten for the call. Only a pattern that also
+/// occurs in the shell's own argument list (its path, `-c` and this fixed
+/// script, so `bash`, `eval` or `OPENMAX_COMMAND`) still matches the shell.
+/// `$0` stays the shell's path and there are no positional parameters, as
+/// under `-c`; the README lists what `eval` changes that a command can see
+/// (`set -x` lines, `$_`, `BASH_EXECUTION_STRING`, syntax error text).
+/// Two exit statuses change, in bash and in dash as `/bin/sh`. A syntax
+/// error is reported by `eval` where it was by `-c`, and bash 3.2 exits 1
+/// for it where `-c` exited 2 (bash 5.3 and dash exit 2 either way). And
+/// the shell no longer execs a command in its own place: under `-c`, bash
+/// and dash exec'd a lone simple command, and dash and bash 5.1 and later
+/// also the last command of a list, but none of them does inside `eval`,
+/// whose text is a nested parse. Such a command killed by a signal now
+/// reads as the shell's exit of 128 plus the signal's number instead of as
+/// the signal; the shell's own stderr line names most signals (not SIGINT
+/// or SIGPIPE).
+const COMMAND_VAR: &str = "OPENMAX_COMMAND";
+const RUN_COMMAND: &str = r#"eval "unset OPENMAX_COMMAND; $OPENMAX_COMMAND""#;
+
 /// Seconds a bash call may run when the model sets no `timeout_secs`: long
 /// enough for a typical cold test run or dependency fetch, which a shorter
 /// default killed mid-way and then had to be rerun with a deadline.
@@ -2019,12 +2071,13 @@ impl BashDeadline {
     }
 }
 
-async fn bash_tool(
+async fn run_bash(
     data_dir: &Path,
     root: &Path,
     args: &Value,
     caps: OutputCaps,
     cancel: Arc<CancelToken>,
+    background_noted: &AtomicBool,
 ) -> ToolOutcome {
     let Some(command) = args["command"].as_str() else {
         return ToolOutcome::err("missing required argument: command");
@@ -2032,7 +2085,7 @@ async fn bash_tool(
     let deadline = bash_deadline(args);
     let request = ProcessRequest {
         program: bash_shell().into(),
-        args: vec!["-c".into(), command.into()],
+        args: vec!["-c".into(), RUN_COMMAND.into()],
         cwd: root.to_path_buf(),
         stdin: StdinMode::Null,
         timeout: execution::timeout_secs(deadline.secs),
@@ -2041,10 +2094,12 @@ async fn bash_tool(
             tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
             spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
+            redraws: true,
         },
         sandbox: None,
         env_allowlist: None,
         self_link: true,
+        env: vec![(COMMAND_VAR.into(), command.into())],
     };
     match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
@@ -2069,7 +2124,9 @@ async fn bash_tool(
                     truncated,
                 )
             }
-            Termination::Exited(status) => exited_outcome(&output, status, caps.command_bytes),
+            Termination::Exited(status) => {
+                exited_outcome(&output, status, caps.command_bytes, background_noted)
+            }
         },
     }
 }
@@ -2077,20 +2134,26 @@ async fn bash_tool(
 /// The result of a bash or external tool process that exited on its own.
 /// Both run in their own process group with the same cleanup on exit, so
 /// they share this rendering: a copy that drops the note below hands the
-/// caller a clean exit and a helper that is already gone.
+/// caller a clean exit and a helper that is already gone. The note explains
+/// the rule the first time in a session and is one line after that, and
+/// `background_noted` records which one is due.
 pub(crate) fn exited_outcome(
     output: &ProcessOutput,
     status: &std::process::ExitStatus,
     cap: usize,
+    background_noted: &AtomicBool,
 ) -> ToolOutcome {
+    let note = output.background_terminated.then(|| {
+        match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            false => BACKGROUND_TERMINATED_NOTE,
+            true => BACKGROUND_TERMINATED_AGAIN,
+        }
+    });
     // The note is the harness speaking, not captured output, but it
     // still has to fit the caller's cap, which `max_output_bytes`
     // can set as low as 1000 bytes. Reserve its length instead of
     // letting a fixed annotation push the result past the limit.
-    let reserved = match output.background_terminated {
-        true => BACKGROUND_TERMINATED_NOTE.len() + 1,
-        false => 0,
-    };
+    let reserved = note.map_or(0, |note| note.len() + 1);
     let budget = cap.saturating_sub(reserved).max(1);
     let (text, truncated) = render_process_output(output, budget);
     let (ok, text) = match status.success() {
@@ -2100,9 +2163,9 @@ pub(crate) fn exited_outcome(
     // A backgrounded server dies with the call and the exit status
     // is still 0, so without this the next step is a request to a
     // port nothing is listening on.
-    let text = match output.background_terminated {
-        true => format!("{text}\n{BACKGROUND_TERMINATED_NOTE}"),
-        false => text,
+    let text = match note {
+        Some(note) => format!("{text}\n{note}"),
+        None => text,
     };
     ToolOutcome::from_process(ok, text, output, truncated)
 }
@@ -2126,9 +2189,18 @@ pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
     "detach it from the group with `setsid`.]"
 );
 
+/// The note every later call in the session that leaves background processes
+/// behind gets instead, once the one above has explained the rule: a line
+/// that still says what happened and what to do instead, so it holds on its
+/// own when compaction has dropped the first.
+pub(crate) const BACKGROUND_TERMINATED_AGAIN: &str = "[openmax: background processes were \
+    terminated when this command returned; a named tmux session keeps one running.]";
+
 /// Describe a non-success exit honestly. A signal kill has no exit code, and
 /// the former "exit code -1" pointed diagnosis at a code nothing returned;
 /// naming the signal turns a segfault or an OOM kill into a readable fact.
+/// A bash command's signal can instead arrive as its shell's exit code (see
+/// [`RUN_COMMAND`]), and then that code is what this describes.
 pub(crate) fn describe_exit(status: &std::process::ExitStatus) -> String {
     #[cfg(unix)]
     {
@@ -2641,6 +2713,18 @@ mod tests {
     /// read_file in a call nothing cancels.
     fn read_file(root: &Path, args: &Value) -> ToolOutcome {
         super::read_file(root, args, &CancelToken::default())
+    }
+
+    /// A bash call in a session of its own, which no result has yet told
+    /// about background processes.
+    async fn bash_tool(
+        data_dir: &Path,
+        root: &Path,
+        args: &Value,
+        caps: OutputCaps,
+        cancel: Arc<CancelToken>,
+    ) -> ToolOutcome {
+        run_bash(data_dir, root, args, caps, cancel, &AtomicBool::new(false)).await
     }
 
     fn temp_project() -> PathBuf {
@@ -3473,6 +3557,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The command text sat in the shell's argument list (`bash -c <text>`),
+    /// so a `pkill -f` pattern taken from the command matched the shell
+    /// running it: `pkill -f 'node server'; node server.js &` killed itself
+    /// before the restart, and `ps | grep` listed the shell as the process it
+    /// was looking for. Linux's pkill matches its own ancestors; macOS's
+    /// leaves them out unless asked with `-a`, which this asks so both hosts
+    /// prove the same thing. `$0` and the positional parameters stay what
+    /// `-c` gave them, and nothing the command starts inherits the text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pkill_pattern_from_the_command_spares_its_own_shell() {
+        let root = temp_project();
+        let marker = format!("openmax-pkill-{}", uuid::Uuid::new_v4().simple());
+        let pkill = if cfg!(target_os = "macos") { "pkill -a" } else { "pkill" };
+        let cmd = format!(
+            "ps -o args= -p $$; printf '[%s|%s|%s]\\n' \"$0\" \"$#\" \"$(env | grep -c OPENMAX_COMMAND)\"; \
+             {pkill} -f {marker}; echo survived"
+        );
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("survived"), "{}", out.output);
+        assert!(!out.output.contains(&marker), "the shell's argv holds the command: {}", out.output);
+        assert!(out.output.contains(&format!("[{}|0|0]", bash_shell())), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Bash exports every assignment when it starts with `allexport` on, as
+    /// an exported `SHELLOPTS` or a `BASH_ENV` file can arrange, so a script
+    /// that kept the command text in a shell variable on its way to `eval`
+    /// would export it to every process the command started, and `env` would
+    /// print the whole command into the result. Only the `eval` that runs
+    /// the text reads it, so under `allexport` too no process the command
+    /// starts inherits it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_command_text_reaches_no_child_under_allexport() {
+        let marker = format!("openmax-allexport-{}", uuid::Uuid::new_v4().simple());
+        let command = format!(": {marker}; env | grep -c {marker}; printf '[%s|%s]' \"$0\" \"$#\"");
+        let request = ProcessRequest {
+            program: bash_shell().into(),
+            args: vec!["-c".into(), RUN_COMMAND.into()],
+            cwd: std::env::temp_dir(),
+            stdin: StdinMode::Null,
+            timeout: Duration::from_secs(30),
+            capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
+            sandbox: None,
+            env_allowlist: None,
+            self_link: false,
+            env: vec![(COMMAND_VAR.into(), command.into()), ("SHELLOPTS".into(), "allexport".into())],
+        };
+        let output = execution::run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        let shown = String::from_utf8_lossy(&output.stdout.head);
+        assert_eq!(shown, format!("0\n[{}|0]", bash_shell()), "a process the command started holds its text");
+    }
+
     /// A backgrounded process does not outlive the call that started it: the
     /// process group is cleaned up on exit while the exit status stays the
     /// shell's zero. A caller that started a server was handed success and no
@@ -3547,6 +3693,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The note is carved out of the cap by its own length: output that
+    /// fills exactly what the note leaves stays whole and the result is the
+    /// cap, one byte more is cut, and the one-line note of a session's later
+    /// results hands the output back the room the full one took.
+    #[test]
+    fn the_background_note_is_reserved_from_the_cap_by_its_own_length() {
+        let cap = 1_000;
+        let result = |len: usize, noted: bool| {
+            let body = "x".repeat(len);
+            let mut output =
+                rendered_output(stream(len as u64, b"", body.as_bytes()), stream(0, b"", b""), None, false);
+            output.background_terminated = true;
+            let Termination::Exited(status) = &output.termination else { unreachable!() };
+            exited_outcome(&output, status, cap, &AtomicBool::new(noted))
+        };
+        for (note, noted) in [(BACKGROUND_TERMINATED_NOTE, false), (BACKGROUND_TERMINATED_AGAIN, true)] {
+            let fits = cap - note.len() - 1;
+            let whole = result(fits, noted);
+            assert_eq!(whole.output, format!("{}\n{note}", "x".repeat(fits)));
+            assert!(!whole.process_truncated);
+            assert!(result(fits + 1, noted).process_truncated, "{note}");
+        }
+    }
+
     /// git asks for missing credentials on the terminal, and a bash call has
     /// none to offer, so that prompt can only fail. With terminal prompts
     /// off, git fails at once and names the cause, where a prompt it could
@@ -3618,6 +3788,58 @@ mod tests {
         .await;
         assert!(out.ok, "{}", out.output);
         assert_eq!(out.output.trim(), expected, "{} as a non-login shell: {}", bash_shell(), out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A progress bar redraws its line with `\r`, and every frame it drew
+    /// reached the model although a terminal shows only the last: thousands
+    /// of frames filled the cap, cut the result, and pushed out the lines
+    /// around them. Only the final text of a redrawn line is kept, before the
+    /// cap is counted, so the whole result fits; `\r\n` is still a line
+    /// ending, and stderr redraws the same way.
+    #[tokio::test]
+    async fn a_redrawn_line_keeps_only_its_final_text() {
+        let root = temp_project();
+        let frames = 5_000;
+        let cmd = format!(
+            "echo resolving; for i in $(seq 1 {frames}); do printf '\\rfetched %d of {frames}' $i; done; \
+             printf '\\ndone\\r\\nwindows\\r\\n'; printf 'warm 10%%\\rwarm 99%%\\r' >&2"
+        );
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        let (stdout, stderr) = (format!("resolving\nfetched {frames} of {frames}\ndone\r\nwindows\r\n"), "warm 99%");
+        assert_eq!(out.output, format!("{stdout}\n[stderr]\n{stderr}"));
+        assert!(!out.process_truncated);
+        assert_eq!(out.process_bytes, Some((stdout.len() + stderr.len()) as u64));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A line longer than the 8 KiB a redraw may replace reaches the model
+    /// whole, however the capture's reads of at most 8 KiB cut it, and keeps
+    /// the `\r` that ended it, so the frame drawn after it does not read as
+    /// more of the same line. The redraws after that frame still collapse.
+    #[tokio::test]
+    async fn a_line_past_the_redraw_limit_reaches_the_model_whole() {
+        let root = temp_project();
+        let cmd = "head -c 20000 /dev/zero | tr '\\0' L; printf '\\rmid\\rnext\\nshort\\rlast\\n'";
+        let out = bash_tool(
+            &root.join("data"),
+            &root,
+            &json!({"command": cmd}),
+            OutputCaps::default(),
+            Arc::new(CancelToken::default()),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(!out.process_truncated);
+        assert_eq!(out.output, format!("{}\rnext\nlast\n", "L".repeat(20_000)));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -83,8 +84,9 @@ pub struct ToolSpec {
 
 /// Frozen per freeze window: built at session creation and re-frozen only
 /// when extension files change on disk (checked by fingerprint at turn start)
-/// or the user forces /reload. Between freezes it is immutable, keeping the
-/// serialized schema bytes prompt-cache-stable.
+/// or the user forces /reload. Between freezes it is immutable apart from
+/// `background_noted`, keeping the serialized schema bytes
+/// prompt-cache-stable.
 pub struct Registry {
     /// Built-ins first in their fixed order, then external tools sorted by
     /// name — deterministic so two builds serialize identically.
@@ -153,6 +155,14 @@ pub struct Registry {
     /// exact same tool bytes every iteration without re-serializing Value.
     schemas_wire: Arc<str>,
     by_name: HashMap<String, usize>,
+    /// Set once a result of this session has explained why background
+    /// processes do not outlive a call, so later results say it in a line.
+    /// The one thing about a registry that changes between freezes, and it
+    /// changes only that note in tool results, never the schema bytes; a
+    /// resume or a refreeze starts it over, and explains once more. It is
+    /// set when the result is built, so a result that a cancelled turn
+    /// replaced still counts; the one-line note stands on its own.
+    background_noted: AtomicBool,
 }
 
 /// One immutable read generation of every file the registry can activate.
@@ -522,6 +532,7 @@ impl Registry {
             schemas,
             schemas_wire,
             by_name,
+            background_noted: AtomicBool::new(false),
         }
     }
 
@@ -575,9 +586,13 @@ impl Registry {
         cancel: Arc<CancelToken>,
     ) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
-            Some(ToolKind::Builtin) => tools::execute(name, args, data_dir, root, caps, cancel).await,
+            Some(ToolKind::Builtin) => {
+                let noted = &self.background_noted;
+                tools::execute_in_session(name, args, data_dir, root, caps, cancel, noted).await
+            }
             Some(ToolKind::External(tool)) => {
-                spawn_external(name, &tool, args, data_dir, root, caps, cancel, None).await
+                let noted = &self.background_noted;
+                spawn_external(name, &tool, args, data_dir, root, caps, cancel, None, noted).await
             }
             None => self.unknown_tool_error(name, root),
         }
@@ -601,7 +616,8 @@ impl Registry {
         match self.get(name).map(|s| s.kind.clone()) {
             Some(ToolKind::External(tool)) => {
                 let sandbox = execution::SandboxPolicy { rw_scratch: scratch.to_path_buf() };
-                spawn_external(name, &tool, args, data_dir, root, caps, cancel, Some(sandbox))
+                let noted = &self.background_noted;
+                spawn_external(name, &tool, args, data_dir, root, caps, cancel, Some(sandbox), noted)
                     .await
             }
             Some(ToolKind::Builtin) => {
@@ -1258,6 +1274,7 @@ async fn spawn_external(
     caps: tools::OutputCaps,
     cancel: Arc<CancelToken>,
     sandbox: Option<execution::SandboxPolicy>,
+    background_noted: &AtomicBool,
 ) -> ToolOutcome {
     let request = ProcessRequest {
         program: tool.command.clone().into(),
@@ -1270,10 +1287,12 @@ async fn spawn_external(
             tail_bytes: caps.command_bytes,
             spill_dir: Some(data_dir.join("cmd-logs")),
             spill_bytes_per_stream: 16 * 1024 * 1024,
+            redraws: false,
         },
         sandbox,
         env_allowlist: Some(tool.env.clone()),
         self_link: false,
+        env: Vec::new(),
     };
 
     match execution::run_process(request, cancel).await {
@@ -1311,7 +1330,7 @@ async fn spawn_external(
             // later) is killed with the group, and the exit is still 0. The
             // shared rendering carries the note that says so.
             Termination::Exited(status) => {
-                tools::exited_outcome(&output, status, caps.command_bytes)
+                tools::exited_outcome(&output, status, caps.command_bytes, background_noted)
             }
         },
     }
@@ -2472,6 +2491,9 @@ mutatng = true
         // output without a background process is the baseline: a reserved
         // note keeps the result within a line of it, an appended one adds
         // the whole note on top.
+        // A session's first note is the full one, and it is the one the cap
+        // has to make room for.
+        registry.background_noted.store(false, std::sync::atomic::Ordering::Relaxed);
         let tight = tools::OutputCaps { command_bytes: 1_000 };
         let plain = run("tight_plain", tight).await;
         assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
@@ -2484,6 +2506,49 @@ mutatng = true
             noted.output.len(),
             plain.output.len()
         );
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// The note explains a rule every call lives under, and it rode in full
+    /// on every call that left a process behind, so a model that kept
+    /// starting its server with `&` paid for the same explanation each time.
+    /// The first in a session explains; every later one, from bash or an
+    /// external tool, is one line that still says what happened and what to
+    /// do instead. A call that left nothing running spends nothing, and a new
+    /// session explains again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_background_note_explains_once_per_session() {
+        let project = temp_dir("bgonce");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        write_tool(
+            &tools_dir,
+            "serve.toml",
+            "name = \"serve\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30 & echo ok\"]\n",
+        );
+        let session = || Registry::assemble(discover_external_in(std::slice::from_ref(&tools_dir)), Vec::new());
+        let data = Path::new("/nonexistent-openmax-data");
+        let caps = tools::OutputCaps::default();
+        let calls = [
+            ("bash", serde_json::json!({"command": "echo quiet"})),
+            ("bash", serde_json::json!({"command": "sleep 30 & echo started"})),
+            ("serve", serde_json::json!({})),
+            ("bash", serde_json::json!({"command": "sleep 30 & echo started"})),
+        ];
+        let registry = session();
+        let mut outputs = Vec::new();
+        for (name, args) in &calls {
+            outputs.push(registry.execute(name, args, data, &project, caps, no_cancel()).await.output);
+        }
+        let (full, again) = (tools::BACKGROUND_TERMINATED_NOTE, tools::BACKGROUND_TERMINATED_AGAIN);
+        assert_eq!(outputs[0], "quiet\n");
+        assert_eq!(outputs[1], format!("started\n\n{full}"));
+        assert_eq!(outputs[2], format!("ok\n\n{again}"));
+        assert_eq!(outputs[3], format!("started\n\n{again}"));
+        let (name, args) = &calls[1];
+        let fresh = session().execute(name, args, data, &project, caps, no_cancel()).await;
+        assert_eq!(fresh.output, format!("started\n\n{full}"), "a new session explains again");
         let _ = std::fs::remove_dir_all(project);
     }
 
