@@ -32,8 +32,9 @@ options:
                          with --check, emit every finding as one JSON array
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
-                         \"reload\"|\"cancel\"|\"quit\"}), AgentEvent envelopes
-                         on stdout; the custom-frontend protocol
+                         \"reload\"|\"fork\"|\"rewind\"|\"cancel\"|\"quit\"}),
+                         AgentEvent envelopes on stdout; the custom-frontend
+                         protocol
       --recall <query>   search this project's past sessions, archives,
                          compaction digests, and memories; prints ranked
                          excerpts, each cited as file:line so the full record
